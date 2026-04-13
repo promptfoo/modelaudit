@@ -26,12 +26,15 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
     let lower = value.to_ascii_lowercase();
     if value.contains("__")
         && contains_magic_method(value)
-        && !is_common_dunder_metadata_literal(value)
+        && !contains_only_common_dunder_metadata_literals(value)
     {
         matches.push("magic method".to_string());
     }
     if lower.contains("base64.b64decode") {
         matches.push("base64.b64decode".to_string());
+    }
+    if contains_call_like(&lower, "compile") {
+        matches.push("compile(".to_string());
     }
     if contains_call_like(&lower, "eval") {
         matches.push("eval(".to_string());
@@ -39,13 +42,13 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
     if contains_call_like(&lower, "exec") {
         matches.push("exec(".to_string());
     }
-    if lower.contains("os.system") {
+    if contains_module_attr(&lower, "os", "system") {
         matches.push("os.system".to_string());
     }
-    if lower.contains("os.popen") {
+    if contains_module_attr(&lower, "os", "popen") {
         matches.push("os.popen".to_string());
     }
-    if lower.contains("os.spawn") {
+    if contains_module_attr_prefix(&lower, "os", "spawn") {
         matches.push("os.spawn*".to_string());
     }
     for needle in [
@@ -66,7 +69,11 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
     if lower.contains("import") && contains_import_statement(&lower) {
         matches.push("import statement".to_string());
     }
-    if lower.contains("importlib") {
+    if lower.contains("importlib")
+        && (lower.contains("importlib.import_module")
+            || lower.contains("importlib.reload")
+            || contains_import_statement(&lower))
+    {
         matches.push("importlib".to_string());
     }
     if contains_call_like(&lower, "__import__") {
@@ -243,7 +250,11 @@ fn has_suspicious_ascii_seed(bytes: &[u8]) -> bool {
                 }
             }
             b'c' => {
-                if starts_with_ascii_case_insensitive(bytes, index, b"commands") {
+                if starts_with_ascii_case_insensitive(bytes, index, b"commands")
+                    || starts_with_ascii_case_insensitive(bytes, index, b"compile")
+                    || starts_with_ascii_case_insensitive(bytes, index, b"ctypes")
+                    || starts_with_ascii_case_insensitive(bytes, index, b"codecs")
+                {
                     return true;
                 }
             }
@@ -265,12 +276,44 @@ fn has_suspicious_ascii_seed(bytes: &[u8]) -> bool {
                 }
             }
             b'o' => {
-                if starts_with_ascii_case_insensitive(bytes, index, b"os.") {
+                if starts_with_ascii_case_insensitive(bytes, index, b"os.")
+                    || starts_with_ascii_case_insensitive(bytes, index, b"os ")
+                    || starts_with_ascii_case_insensitive(bytes, index, b"os\t")
+                    || starts_with_ascii_case_insensitive(bytes, index, b"os\n")
+                    || starts_with_ascii_case_insensitive(bytes, index, b"os\r")
+                {
                     return true;
                 }
             }
             b's' => {
                 if starts_with_ascii_case_insensitive(bytes, index, b"subprocess") {
+                    return true;
+                }
+            }
+            b'w' => {
+                if starts_with_ascii_case_insensitive(bytes, index, b"webbrowser") {
+                    return true;
+                }
+            }
+            b'p' => {
+                if starts_with_ascii_case_insensitive(bytes, index, b"pickle")
+                    || starts_with_ascii_case_insensitive(bytes, index, b"popen")
+                {
+                    return true;
+                }
+            }
+            b'r' => {
+                if starts_with_ascii_case_insensitive(bytes, index, b"runpy") {
+                    return true;
+                }
+            }
+            b'm' => {
+                if starts_with_ascii_case_insensitive(bytes, index, b"marshal") {
+                    return true;
+                }
+            }
+            b'd' => {
+                if starts_with_ascii_case_insensitive(bytes, index, b"dill") {
                     return true;
                 }
             }
@@ -294,9 +337,38 @@ fn starts_with_ascii_case_insensitive(haystack: &[u8], start: usize, needle: &[u
 
 fn is_common_dunder_metadata_literal(value: &str) -> bool {
     matches!(
-        value,
+        value.trim(),
         "__version__" | "__metadata__" | "__schema__" | "__name__" | "__author__" | "__license__"
     )
+}
+
+fn contains_only_common_dunder_metadata_literals(value: &str) -> bool {
+    let chars: Vec<char> = value.chars().collect();
+    let mut index = 0usize;
+    let mut saw_dunder = false;
+    while index + 3 < chars.len() {
+        if chars[index] != '_' || chars[index + 1] != '_' {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 2;
+        while end + 1 < chars.len() {
+            if chars[end] == '_' && chars[end + 1] == '_' {
+                let token: String = chars[index..=end + 1].iter().collect();
+                if !is_common_dunder_metadata_literal(&token) {
+                    return false;
+                }
+                saw_dunder = true;
+                index = end + 2;
+                break;
+            }
+            end += 1;
+        }
+        if end + 1 >= chars.len() {
+            break;
+        }
+    }
+    saw_dunder
 }
 
 fn contains_call_like(lower: &str, name: &str) -> bool {
@@ -310,6 +382,53 @@ fn contains_call_like(lower: &str, name: &str) -> bool {
             return true;
         }
         offset = after;
+    }
+    false
+}
+
+fn contains_module_attr(lower: &str, module: &str, attr: &str) -> bool {
+    find_module_attr(lower, module, attr, false)
+}
+
+fn contains_module_attr_prefix(lower: &str, module: &str, attr_prefix: &str) -> bool {
+    find_module_attr(lower, module, attr_prefix, true)
+}
+
+fn find_module_attr(lower: &str, module: &str, attr: &str, prefix: bool) -> bool {
+    let chars: Vec<char> = lower.chars().collect();
+    let module_chars: Vec<char> = module.chars().collect();
+    let attr_chars: Vec<char> = attr.chars().collect();
+    if chars.len() < module_chars.len() + attr_chars.len() + 1 {
+        return false;
+    }
+
+    let max_start = chars.len().saturating_sub(module_chars.len());
+    for start in 0..=max_start {
+        if chars[start..start + module_chars.len()] != module_chars[..] {
+            continue;
+        }
+        let mut cursor = start + module_chars.len();
+        skip_whitespace(&chars, &mut cursor);
+        if !consume_char(&chars, &mut cursor, '.') {
+            continue;
+        }
+        skip_whitespace(&chars, &mut cursor);
+        if chars.len().saturating_sub(cursor) < attr_chars.len() {
+            continue;
+        }
+        if chars[cursor..cursor + attr_chars.len()] != attr_chars[..] {
+            continue;
+        }
+        if prefix {
+            return true;
+        }
+        let after = cursor + attr_chars.len();
+        if chars
+            .get(after)
+            .map_or(true, |ch| !is_python_word_char(*ch))
+        {
+            return true;
+        }
     }
     false
 }
@@ -522,6 +641,7 @@ mod tests {
         assert!(!suspicious_string_matches("__1__").contains(&"magic method".to_string()));
         assert!(!suspicious_string_matches("a__b__c").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__version__").is_empty());
+        assert!(suspicious_string_matches("['__version__']").is_empty());
     }
 
     #[test]
@@ -540,7 +660,17 @@ mod tests {
     #[test]
     fn suspicious_string_matching_keeps_case_insensitive_patterns() {
         assert!(suspicious_string_matches("OS.System('id')").contains(&"os.system".to_string()));
+        assert!(suspicious_string_matches("OS . system('id')").contains(&"os.system".to_string()));
         assert!(suspicious_string_matches("Import OS").contains(&"import statement".to_string()));
+    }
+
+    #[test]
+    fn suspicious_string_matching_ignores_importlib_comment_text() {
+        assert!(suspicious_string_matches("importlib # harmless").is_empty());
+        assert!(
+            suspicious_string_matches("import importlib; importlib.import_module('os')")
+                .contains(&"importlib".to_string())
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # PickleScan Rust Large-Corpus QA Notes - 2026-04-11
 
 These notes track the implementation and execution of
-`docs/maintainers/picklescan-rust-large-corpus-qa-plan.md` for the Rust-backed
+`docs/maintainers/archive/picklescan-rust-large-corpus-qa-plan.md` for the Rust-backed
 `modelaudit-picklescan` rewrite. Large artifacts and raw outputs are stored
 outside the repository under `/tmp/modelaudit-large-pickle-corpus`.
 

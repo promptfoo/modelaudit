@@ -46,6 +46,9 @@ __pycache__/
 
 # C extensions
 *.so
+packages/modelaudit-picklescan/src/modelaudit_picklescan/_rust*.pyd
+packages/modelaudit-picklescan/src/modelaudit_picklescan/_rust*.so
+packages/modelaudit-picklescan/src/modelaudit_picklescan/_rust*.dylib
 
 # Distribution / packaging
 .Python

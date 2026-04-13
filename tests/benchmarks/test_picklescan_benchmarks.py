@@ -178,9 +178,9 @@ def test_picklescan_multi_stream_padded_payload(
     )
 
     assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.UNKNOWN
-    assert not report.findings
-    assert any(notice.code == "parse_incomplete" for notice in report.notices)
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert report.findings
+    assert any(notice.code == "follow_on_stream_detected" for notice in report.notices)
 
 
 def test_picklescan_opcode_budget_tail_payload(

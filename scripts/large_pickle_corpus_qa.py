@@ -36,7 +36,6 @@ from urllib.request import Request, urlopen
 from modelaudit_picklescan import PickleReport, ScanOptions, ScanStatus, Severity
 from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
 from modelaudit_picklescan import scan_file as package_scan_file
-from modelaudit_picklescan._parity_corpus import raw_os_system_reduce_payload, raw_stack_global_eval_reduce_payload
 
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import PickleScanner
@@ -1076,6 +1075,14 @@ def _malicious_reduce_payload() -> bytes:
 
 def _stack_global_payload() -> bytes:
     return raw_stack_global_eval_reduce_payload()
+
+
+def raw_os_system_reduce_payload() -> bytes:
+    return b"\x80\x04cos\nsystem\n\x8c\x0cecho qa-noop\x85R."
+
+
+def raw_stack_global_eval_reduce_payload() -> bytes:
+    return b"\x80\x04\x8c\x08builtins\x8c\x04eval\x93\x8c\x031+1\x85R."
 
 
 def _write_synthetic_variants(output_dir: Path) -> list[dict[str, Any]]:

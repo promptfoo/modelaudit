@@ -403,12 +403,27 @@ jobs:
 
   build-picklescan-package:
     if: needs.release-please.outputs.release_created == 'true'
-    runs-on: ubuntu-latest
+    name: Build standalone pickle package (${{ matrix.artifact-suffix }})
+    runs-on: ${{ matrix.os }}
     needs: release-please
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact-suffix: linux
+            build-sdist: "true"
+          - os: macos-14
+            artifact-suffix: macos-arm64
+            build-sdist: "false"
+          - os: windows-latest
+            artifact-suffix: windows
+            build-sdist: "false"
     defaults:
       run:
+        shell: bash
         working-directory: packages/modelaudit-picklescan
     steps:
       - uses: actions/checkout@v6
@@ -468,7 +483,12 @@ jobs:
           cargo test --manifest-path Cargo.toml
 
       - name: Build standalone package
-        run: uv build --out-dir /tmp/modelaudit-picklescan-dist
+        run: |
+          if [[ "${{ matrix.build-sdist }}" == "true" ]]; then
+            uv build --out-dir /tmp/modelaudit-picklescan-dist
+          else
+            uv build --wheel --out-dir /tmp/modelaudit-picklescan-dist
+          fi
 
       - name: Validate standalone package metadata
         run: uvx twine check /tmp/modelaudit-picklescan-dist/*
@@ -509,7 +529,7 @@ jobs:
       - name: Upload standalone package artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: modelaudit-picklescan-dist
+          name: modelaudit-picklescan-dist-${{ matrix.artifact-suffix }}
           path: /tmp/modelaudit-picklescan-dist/
 
   publish-pypi:
@@ -532,8 +552,9 @@ jobs:
       - name: Download standalone pickle package artifacts
         uses: actions/download-artifact@v8
         with:
-          name: modelaudit-picklescan-dist
+          pattern: modelaudit-picklescan-dist-*
           path: dist/
+          merge-multiple: true
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
@@ -570,8 +591,9 @@ jobs:
       - name: Download standalone pickle package artifacts
         uses: actions/download-artifact@v8
         with:
-          name: modelaudit-picklescan-dist
+          pattern: modelaudit-picklescan-dist-*
           path: dist/
+          merge-multiple: true
 
       - name: Generate artifact attestations
         uses: actions/attest-build-provenance@v4

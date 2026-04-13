@@ -149,7 +149,11 @@ fn validate_pickle_stack_effect(
             true
         }
         "POP" => {
-            if mark_depths.last().copied() == Some(*stack_depth) || *stack_depth == 0 {
+            if mark_depths.last().copied() == Some(*stack_depth) {
+                mark_depths.pop();
+                return true;
+            }
+            if *stack_depth == 0 {
                 return false;
             }
             *stack_depth -= 1;
@@ -162,7 +166,7 @@ fn validate_pickle_stack_effect(
             }
             None => false,
         },
-        "TUPLE" | "LIST" | "DICT" | "SET" | "FROZENSET" => match mark_depths.pop() {
+        "TUPLE" | "LIST" | "DICT" | "FROZENSET" => match mark_depths.pop() {
             Some(mark_depth) => {
                 *stack_depth = mark_depth + 1;
                 true
@@ -265,7 +269,7 @@ pub(crate) fn has_pickle_prefix(value: &[u8]) -> bool {
     if value.len() < 2 {
         return false;
     }
-    value[0] == 0x80
+    (value[0] == 0x80 && matches!(value[1], 2..=5))
         || matches!(
             value[0],
             b'(' | b'c' | b'd' | b'l' | b'i' | b'I' | b'S' | b'V'
@@ -303,12 +307,7 @@ pub(crate) fn encoded_nested_literal_probe_windows(
         if windows.len() >= MAX_NESTED_PAYLOAD_PROBES {
             break;
         }
-        let candidate_starts_encoded_pickle = match bytes[index] {
-            b'g' => bytes[index..].starts_with(b"gA"),
-            b'8' => bytes[index..].starts_with(b"800"),
-            b'\\' => bytes[index..].starts_with(b"\\x80"),
-            _ => false,
-        };
+        let candidate_starts_encoded_pickle = starts_encoded_pickle_at(bytes, index);
         if !candidate_starts_encoded_pickle {
             continue;
         }
@@ -322,6 +321,38 @@ pub(crate) fn encoded_nested_literal_probe_windows(
     }
 
     windows
+}
+
+fn starts_encoded_pickle_at(bytes: &[u8], index: usize) -> bool {
+    let suffix = &bytes[index..];
+    match bytes[index] {
+        b'g' => suffix.starts_with(b"gA"),
+        b'K' => suffix.starts_with(b"KA"),
+        b'Y' => suffix.starts_with(b"Yw") || suffix.starts_with(b"Y2") || suffix.starts_with(b"Y3"),
+        b'Z' => suffix.starts_with(b"ZA"),
+        b'b' => suffix.starts_with(b"bA"),
+        b'a' => suffix.starts_with(b"aQ"),
+        b'S' => suffix.starts_with(b"SQ"),
+        b'U' => suffix.starts_with(b"Uw"),
+        b'V' => suffix.starts_with(b"Vg"),
+        b'8' => suffix.starts_with(b"800"),
+        b'2' => suffix.starts_with(b"28"),
+        b'4' => suffix.starts_with(b"49"),
+        b'5' => suffix.starts_with(b"53") || suffix.starts_with(b"56"),
+        b'6' => {
+            suffix.starts_with(b"63")
+                || suffix.starts_with(b"64")
+                || suffix.starts_with(b"6c")
+                || suffix.starts_with(b"69")
+                || suffix.starts_with(b"6C")
+        }
+        b'\\' => {
+            suffix.starts_with(b"\\x80")
+                || suffix.starts_with(b"\\x28")
+                || suffix.starts_with(b"\\x63")
+        }
+        _ => false,
+    }
 }
 
 fn encoded_prefix_has_pickle_prefix(value: &str) -> bool {
@@ -352,7 +383,9 @@ pub(crate) fn encoded_nested_window_char_limit(
     if chars_are_in_alphabet(probe.as_bytes(), BASE64_LITERAL_CHARS) {
         return 16.max(max_base64_chars);
     }
-    16
+    16.max(max_base64_chars)
+        .max(max_plain_hex_chars)
+        .max(max_escaped_hex_chars)
 }
 
 fn encoded_literal_probe(value: &str) -> String {
@@ -597,6 +630,16 @@ mod tests {
         let windows = encoded_nested_literal_probe_windows(&value, 64);
 
         assert!(windows.iter().any(|window| window.starts_with("gAR9Lg==")));
+    }
+
+    #[test]
+    fn encoded_probe_windows_keep_protocol0_embedded_encoded_pickle_candidates() {
+        let value = format!("{}Y29zCnN5c3RlbQopUi4={}", "A".repeat(128), "B".repeat(128));
+        let windows = encoded_nested_literal_probe_windows(&value, 64);
+
+        assert!(windows
+            .iter()
+            .any(|window| window.starts_with("Y29zCnN5c3RlbQopUi4=")));
     }
 
     #[test]

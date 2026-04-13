@@ -10,14 +10,14 @@ from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
-
-from modelaudit_picklescan import SafetyVerdict, ScanOptions, ScanStatus, scan_bytes, scan_file
-from modelaudit_picklescan._parity_corpus import (
+from parity_corpus import (
     generated_parity_payloads,
     malicious_reduce_payload,
     prefix_truncation_payloads,
 )
-from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE, _report_from_native_dict
+
+from modelaudit_picklescan import SafetyVerdict, ScanOptions, ScanStatus, scan_bytes, scan_file
+from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
 
 pytestmark = pytest.mark.skipif(
     find_spec(_RUST_EXTENSION_MODULE) is None, reason="Rust picklescan extension is not built"
@@ -104,11 +104,25 @@ def test_rust_policy_tables_keep_required_security_coverage() -> None:
 
 
 def test_rust_engine_scans_parity_payloads(parity_payloads: dict[str, tuple[bytes, ScanOptions | None]]) -> None:
+    expected_verdicts = {
+        "safe": SafetyVerdict.CLEAN,
+        "malicious_reduce": SafetyVerdict.MALICIOUS,
+        "stack_global": SafetyVerdict.MALICIOUS,
+        "suspicious_string": SafetyVerdict.SUSPICIOUS,
+        "non_magic_numeric_dunder_string": SafetyVerdict.CLEAN,
+        "non_magic_embedded_dunder_string": SafetyVerdict.CLEAN,
+        "getattr_whitespace_suspicious_string": SafetyVerdict.SUSPICIOUS,
+        "nested_raw": SafetyVerdict.MALICIOUS,
+        "nested_base64": SafetyVerdict.MALICIOUS,
+        "nested_hex": SafetyVerdict.MALICIOUS,
+    }
     for name, (payload, options) in parity_payloads.items():
         rust_report = scan_bytes(payload, source=f"{name}.pkl", options=options)
 
         assert rust_report.status in {ScanStatus.COMPLETE, ScanStatus.INCONCLUSIVE, ScanStatus.ERROR}
         assert all(notice.code != "engine_fallback" for notice in rust_report.notices)
+        if name in expected_verdicts:
+            assert rust_report.verdict == expected_verdicts[name], name
 
 
 def test_generated_payloads_scan_without_runtime_errors() -> None:
@@ -122,27 +136,6 @@ def test_generated_payloads_scan_without_runtime_errors() -> None:
             failures.append(name)
 
     assert failures == []
-
-
-def test_rust_report_conversion_rejects_non_bool_coverage_flags() -> None:
-    raw_report = {
-        "source": "native.pkl",
-        "status": "complete",
-        "verdict": "clean",
-        "findings": [],
-        "notices": [],
-        "errors": [],
-        "coverage": {
-            "bytes_scanned": 0,
-            "raw_scan_complete": "false",
-            "opcode_scan_complete": True,
-        },
-        "metadata": {},
-        "duration_s": 0.0,
-    }
-
-    with pytest.raises(TypeError, match="expected bool or None"):
-        _report_from_native_dict(raw_report)
 
 
 def test_prefix_truncations_scan_without_runtime_errors() -> None:

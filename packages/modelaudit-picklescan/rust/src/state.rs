@@ -28,6 +28,7 @@ const MAX_TRACKED_TUPLE_ITEMS: usize = 16;
 const MAX_STACK_BYTES_PREVIEW: usize = 4096;
 const MIN_SUSPICIOUS_LITERAL_SCAN_WINDOW_CHARS: usize = 8192;
 const SUSPICIOUS_LITERAL_SCAN_OVERLAP_CHARS: usize = 4096;
+const TIME_CHECK_INTERVAL_OPCODES: usize = 4096;
 
 const STACK_GLOBAL_STRING_OPCODES: &[&str] = &[
     "BINSTRING",
@@ -212,7 +213,6 @@ impl<'a> ScanState<'a> {
             } else {
                 self.record_empty_input_error();
             }
-            self.finalize_common_metadata();
             self.finalize_verdict();
             return;
         }
@@ -231,7 +231,7 @@ impl<'a> ScanState<'a> {
                     Ok(opcode) => opcode,
                     Err(error) => {
                         self.handle_parse_error(error, index);
-                        self.finalize_common_metadata();
+                        self.scan_follow_on_pickle_streams(index);
                         self.coalesce_redundant_global_findings();
                         self.finalize_verdict();
                         return;
@@ -287,7 +287,6 @@ impl<'a> ScanState<'a> {
                             });
                         }
                     }
-                    self.finalize_common_metadata();
                     self.coalesce_redundant_global_findings();
                     self.finalize_verdict();
                     return;
@@ -295,10 +294,7 @@ impl<'a> ScanState<'a> {
 
                 parsed_opcode = true;
                 let position = self.position_offset + parsed.pos;
-                self.bytes_scanned = self
-                    .bytes_scanned
-                    .max(parsed.next)
-                    .max(parsed.pos.saturating_add(1));
+                self.bytes_scanned = self.bytes_scanned.max(parsed.next);
                 self.opcode_count += 1;
                 index = parsed.next;
                 self.handle_opcode(&parsed, position);
@@ -326,7 +322,6 @@ impl<'a> ScanState<'a> {
                     ParseError::new("pickle exhausted before seeing STOP").at(index),
                     index,
                 );
-                self.finalize_common_metadata();
                 self.coalesce_redundant_global_findings();
                 self.finalize_verdict();
                 return;
@@ -343,7 +338,6 @@ impl<'a> ScanState<'a> {
             self.record_short_read();
         }
 
-        self.finalize_common_metadata();
         self.coalesce_redundant_global_findings();
         self.finalize_verdict();
     }
@@ -363,7 +357,7 @@ impl<'a> ScanState<'a> {
                 self.payload,
             )));
         }
-        if Instant::now() > self.deadline {
+        if self.opcode_count % TIME_CHECK_INTERVAL_OPCODES == 0 && Instant::now() > self.deadline {
             return Err(LimitError::Timeout);
         }
         Ok(())
@@ -461,12 +455,6 @@ impl<'a> ScanState<'a> {
         });
     }
 
-    fn finalize_common_metadata(&mut self) {
-        if !self.protocols.is_empty() {
-            // Kept in a side vector and serialized in to_py_report().
-        }
-    }
-
     fn handle_opcode(&mut self, opcode: &ParsedOpcode, position: usize) {
         match opcode.name {
             "PROTO" => {
@@ -494,19 +482,29 @@ impl<'a> ScanState<'a> {
                 repr: "False".to_string(),
             }),
             "BININT" | "BININT1" | "BININT2" | "LONG" | "LONG1" | "LONG4" | "INT" => {
-                self.stack.push(stack_value_from_integer_arg(&opcode.arg));
+                self.stack
+                    .push(stack_value_from_integer_arg(&opcode.arg, self.payload));
             }
             "FLOAT" | "BINFLOAT" => self.stack.push(StackValue::Other),
             "BINBYTES" | "BINBYTES8" | "SHORT_BINBYTES" | "BYTEARRAY8" => {
                 if let Some((start, end)) = opcode.arg.byte_span(self.payload.len()) {
                     let bytes = &self.payload[start..end];
-                    self.scan_raw_nested_pickle_bytes(bytes, position);
+                    self.scan_raw_nested_pickle_bytes(bytes, self.position_offset + start);
                     self.stack.push(StackValue::Bytes { start, end });
                 } else {
                     self.stack.push(StackValue::Bytes { start: 0, end: 0 });
                 }
             }
-            "NEXT_BUFFER" | "READONLY_BUFFER" => {}
+            "NEXT_BUFFER" => {
+                self.record_buffer_opcode(opcode.name, position);
+                self.stack.push(StackValue::Other);
+            }
+            "READONLY_BUFFER" => {
+                self.record_buffer_opcode(opcode.name, position);
+                if self.stack.is_empty() {
+                    self.stack.push(StackValue::Other);
+                }
+            }
             "MARK" => self.stack.push(StackValue::Mark),
             "POP" => {
                 self.stack.pop();
@@ -540,9 +538,9 @@ impl<'a> ScanState<'a> {
             "TUPLE2" => self.collapse_top_n(2),
             "TUPLE3" => self.collapse_top_n(3),
             "APPEND" | "SETITEM" => {
-                self.stack.pop();
+                self.pop_value_operand_preserving_mark();
                 if opcode.name == "SETITEM" {
-                    self.stack.pop();
+                    self.pop_value_operand_preserving_mark();
                 }
             }
             "APPENDS" | "SETITEMS" | "ADDITEMS" => {
@@ -565,12 +563,7 @@ impl<'a> ScanState<'a> {
                     if let Some(value) = self.memo.get(&index).cloned() {
                         self.stack.push(value);
                     } else {
-                        self.stack.push(StackValue::Global(GlobalRef {
-                            module: "__unknown__".to_string(),
-                            name: format!("memo_{}", index),
-                            position,
-                            malformed: true,
-                        }));
+                        self.stack.push(StackValue::Other);
                     }
                 }
             }
@@ -621,7 +614,68 @@ impl<'a> ScanState<'a> {
             }
             name if REDUCE_OPCODES.contains(&name) => {
                 if let Some(callable_ref) = self.consume_callable_opcode(opcode, position) {
-                    if let Some(severity) =
+                    if callable_ref.module == "copyreg.extension" {
+                        self.add_finding(Finding {
+                            message: format!(
+                                "Found {} opcode invoking opaque copyreg extension: {}",
+                                opcode.name,
+                                callable_ref.symbol()
+                            ),
+                            severity: "critical",
+                            location: Some(format!("{} (pos {})", self.source, position)),
+                            rule_code: Some("DANGEROUS_CALL"),
+                            details: vec![
+                                ("opcode".to_string(), DetailValue::String(opcode.name.to_string())),
+                                (
+                                    "module".to_string(),
+                                    DetailValue::String(callable_ref.module.clone()),
+                                ),
+                                ("name".to_string(), DetailValue::String(callable_ref.name.clone())),
+                                (
+                                    "import_reference".to_string(),
+                                    DetailValue::String(callable_ref.symbol()),
+                                ),
+                                (
+                                    "global_position".to_string(),
+                                    DetailValue::UInt(callable_ref.position as u64),
+                                ),
+                                ("opaque_extension".to_string(), DetailValue::Bool(true)),
+                            ],
+                            why: Some(
+                                "Copyreg extension opcodes resolve through process-local state and become executable when consumed by REDUCE-like opcodes.",
+                            ),
+                        });
+                    } else if callable_ref.module == "__main__" {
+                        self.add_finding(Finding {
+                            message: format!(
+                                "Found {} opcode invoking __main__ global: {}",
+                                opcode.name,
+                                callable_ref.symbol()
+                            ),
+                            severity: "critical",
+                            location: Some(format!("{} (pos {})", self.source, position)),
+                            rule_code: Some("DANGEROUS_CALL"),
+                            details: vec![
+                                ("opcode".to_string(), DetailValue::String(opcode.name.to_string())),
+                                (
+                                    "module".to_string(),
+                                    DetailValue::String(callable_ref.module.clone()),
+                                ),
+                                ("name".to_string(), DetailValue::String(callable_ref.name.clone())),
+                                (
+                                    "import_reference".to_string(),
+                                    DetailValue::String(callable_ref.symbol()),
+                                ),
+                                (
+                                    "global_position".to_string(),
+                                    DetailValue::UInt(callable_ref.position as u64),
+                                ),
+                            ],
+                            why: Some(
+                                "__main__ references depend on arbitrary application code and become executable when consumed by REDUCE-like opcodes.",
+                            ),
+                        });
+                    } else if let Some(severity) =
                         global_severity(&callable_ref.module, &callable_ref.name)
                     {
                         self.add_finding(Finding {
@@ -661,6 +715,35 @@ impl<'a> ScanState<'a> {
             }
             "FRAME" | "STOP" => {}
             _ => {}
+        }
+    }
+
+    fn record_buffer_opcode(&mut self, op_name: &'static str, position: usize) {
+        self.add_notice(Notice {
+            message: format!("Encountered protocol 5 buffer opcode: {op_name}"),
+            severity: "info",
+            location: Some(format!("{} (pos {})", self.source, position)),
+            code: Some("buffer_opcode"),
+            details: vec![
+                (
+                    "opcode".to_string(),
+                    DetailValue::String(op_name.to_string()),
+                ),
+                (
+                    "requires_external_buffer_context".to_string(),
+                    DetailValue::Bool(true),
+                ),
+            ],
+        });
+    }
+
+    fn pop_value_operand_preserving_mark(&mut self) -> Option<StackValue> {
+        match self.stack.pop() {
+            Some(StackValue::Mark) => {
+                self.stack.push(StackValue::Mark);
+                None
+            }
+            value => value,
         }
     }
 
@@ -725,6 +808,11 @@ impl<'a> ScanState<'a> {
         match callable_value {
             Some(StackValue::Global(reference) | StackValue::Constructed(reference))
                 if !reference.malformed =>
+            {
+                Some(reference)
+            }
+            Some(StackValue::Global(reference) | StackValue::Constructed(reference))
+                if reference.module == "copyreg.extension" =>
             {
                 Some(reference)
             }
@@ -880,43 +968,42 @@ impl<'a> ScanState<'a> {
     }
 
     fn scan_raw_nested_pickle_bytes(&mut self, value: &[u8], position: usize) {
-        if value.len() > self.options.max_nested_pickle_bytes {
-            for offset in nested_pickle_probe_offsets(value) {
-                let end = value
-                    .len()
-                    .min(offset.saturating_add(self.options.max_nested_pickle_bytes));
-                let candidate = &value[offset..end];
-                if looks_like_pickle_payload(candidate, self.options.max_nested_pickle_bytes) {
-                    self.add_nested_payload_finding(
-                        "raw",
-                        value.len(),
-                        position + offset,
-                        false,
-                        has_execution_opcode(candidate),
-                    );
-                    self.surface_nested_pickle_findings(candidate, "raw", position + offset);
-                    return;
+        for offset in nested_pickle_probe_offsets(value) {
+            let remaining_len = value.len().saturating_sub(offset);
+            let candidate_truncated = remaining_len > self.options.max_nested_pickle_bytes;
+            let end = value
+                .len()
+                .min(offset.saturating_add(self.options.max_nested_pickle_bytes));
+            let candidate = &value[offset..end];
+            if looks_like_pickle_payload(candidate, self.options.max_nested_pickle_bytes) {
+                self.add_nested_payload_finding(
+                    "raw",
+                    remaining_len,
+                    position + offset,
+                    candidate_truncated,
+                    has_execution_opcode(candidate),
+                );
+                if candidate_truncated {
+                    self.record_raw_nested_payload_truncated(remaining_len, position + offset);
                 }
+                self.surface_nested_pickle_findings(candidate, "raw", position + offset);
+                return;
             }
-            if has_pickle_prefix(value) {
-                self.add_nested_payload_finding("raw", value.len(), position, true, false);
-                self.record_raw_nested_payload_truncated(value.len(), position);
+            if candidate_truncated
+                && candidate.first() == Some(&0x80)
+                && has_pickle_prefix(candidate)
+            {
+                self.add_nested_payload_finding(
+                    "raw",
+                    remaining_len,
+                    position + offset,
+                    true,
+                    false,
+                );
+                self.record_raw_nested_payload_truncated(remaining_len, position + offset);
+                return;
             }
-            return;
         }
-
-        if !looks_like_pickle_payload(value, self.options.max_nested_pickle_bytes) {
-            return;
-        }
-
-        self.add_nested_payload_finding(
-            "raw",
-            value.len(),
-            position,
-            false,
-            has_execution_opcode(value),
-        );
-        self.surface_nested_pickle_findings(value, "raw", position);
     }
 
     fn add_nested_payload_finding(
@@ -959,38 +1046,52 @@ impl<'a> ScanState<'a> {
     }
 
     fn scan_encoded_nested_pickle_literal(&mut self, value: &str, position: usize) {
+        let mut found_candidate = false;
         if value.len() <= self.options.max_string_literal_scan_chars {
-            self.scan_encoded_nested_pickle_candidate(value, position);
-            return;
-        }
-
-        let value_len = string_char_len(value);
-        if value_len <= self.options.max_string_literal_scan_chars {
-            self.scan_encoded_nested_pickle_candidate(value, position);
-            return;
-        }
-
-        {
-            self.record_literal_scan_truncated(
-                "string",
-                value_len,
-                "encoded_nested_pickle",
-                position,
-            );
+            found_candidate |= self.scan_encoded_nested_pickle_candidate(value, position);
+        } else {
+            let value_len = string_char_len(value);
+            if value_len <= self.options.max_string_literal_scan_chars {
+                found_candidate |= self.scan_encoded_nested_pickle_candidate(value, position);
+            } else {
+                self.record_literal_scan_truncated(
+                    "string",
+                    value_len,
+                    "encoded_nested_pickle",
+                    position,
+                );
+            }
         }
 
         let max_window_chars =
             encoded_nested_window_char_limit(value, self.options.max_nested_pickle_bytes);
-        if value.len() <= max_window_chars || value.chars().count() <= max_window_chars {
-            self.scan_encoded_nested_pickle_candidate(value, position);
+        if !found_candidate
+            && (value.len() <= max_window_chars || value.chars().count() <= max_window_chars)
+        {
+            found_candidate |= self.scan_encoded_nested_pickle_candidate(value, position);
         }
 
         for candidate in encoded_nested_literal_probe_windows(value, max_window_chars) {
-            self.scan_encoded_nested_pickle_candidate(&candidate, position);
+            found_candidate |= self.scan_encoded_nested_pickle_candidate(&candidate, position);
+        }
+
+        if found_candidate {
+            return;
+        }
+
+        if value.len() > self.options.max_string_literal_scan_chars
+            && string_char_len(value) > self.options.max_string_literal_scan_chars
+        {
+            self.record_literal_scan_truncated(
+                "string",
+                string_char_len(value),
+                "encoded_nested_pickle",
+                position,
+            );
         }
     }
 
-    fn scan_encoded_nested_pickle_candidate(&mut self, value: &str, position: usize) {
+    fn scan_encoded_nested_pickle_candidate(&mut self, value: &str, position: usize) -> bool {
         let mut decoded_payload_found = false;
         for (encoding, decoded) in
             decode_possible_encoded_pickle(value, self.options.max_nested_pickle_bytes)
@@ -1006,15 +1107,18 @@ impl<'a> ScanState<'a> {
             self.surface_nested_pickle_findings(&decoded, encoding, position);
         }
         if decoded_payload_found {
-            return;
+            return true;
         }
 
+        let mut oversized_prefix_found = false;
         for (encoding, payload_size) in
             detect_oversized_encoded_pickle_prefixes(value, self.options.max_nested_pickle_bytes)
         {
+            oversized_prefix_found = true;
             self.add_encoded_nested_payload_finding(encoding, payload_size, position, true, false);
             self.record_encoded_nested_payload_truncated(encoding, payload_size, position);
         }
+        oversized_prefix_found
     }
 
     fn record_raw_nested_payload_truncated(&mut self, payload_size: usize, position: usize) {
@@ -1181,6 +1285,10 @@ impl<'a> ScanState<'a> {
                         "import_reference".to_string(),
                         DetailValue::String(reference.symbol()),
                     ),
+                    (
+                        "position".to_string(),
+                        DetailValue::UInt(reference.position as u64),
+                    ),
                 ],
                 why: Some(
                     "Dangerous globals can execute code or access sensitive system resources when unpickled.",
@@ -1205,6 +1313,10 @@ impl<'a> ScanState<'a> {
                     (
                         "import_reference".to_string(),
                         DetailValue::String(reference.symbol()),
+                    ),
+                    (
+                        "position".to_string(),
+                        DetailValue::UInt(reference.position as u64),
                     ),
                 ],
                 why: Some(
@@ -1344,32 +1456,38 @@ impl<'a> ScanState<'a> {
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect();
+            let mut details = vec![
+                (
+                    "nested_encoding".to_string(),
+                    DetailValue::String(encoding.to_string()),
+                ),
+                (
+                    "nested_source".to_string(),
+                    DetailValue::String(nested_source.clone()),
+                ),
+                (
+                    "nested_rule_code".to_string(),
+                    match nested_finding.rule_code {
+                        Some(rule_code) => DetailValue::String(rule_code.to_string()),
+                        None => DetailValue::None,
+                    },
+                ),
+                (
+                    "nested_details".to_string(),
+                    DetailValue::Dict(nested_details),
+                ),
+            ];
+            for key in ["import_reference", "module", "name", "opcode"] {
+                if let Some(value) = detail_string(&nested_finding.details, key) {
+                    details.push((key.to_string(), DetailValue::String(value)));
+                }
+            }
             self.add_finding(Finding {
                 message: format!("Nested pickle finding: {}", nested_finding.message),
                 severity: nested_finding.severity,
                 location: nested_finding.location,
                 rule_code: nested_finding.rule_code,
-                details: vec![
-                    (
-                        "nested_encoding".to_string(),
-                        DetailValue::String(encoding.to_string()),
-                    ),
-                    (
-                        "nested_source".to_string(),
-                        DetailValue::String(nested_source.clone()),
-                    ),
-                    (
-                        "nested_rule_code".to_string(),
-                        match nested_finding.rule_code {
-                            Some(rule_code) => DetailValue::String(rule_code.to_string()),
-                            None => DetailValue::None,
-                        },
-                    ),
-                    (
-                        "nested_details".to_string(),
-                        DetailValue::Dict(nested_details),
-                    ),
-                ],
+                details,
                 why: nested_finding.why,
             });
         }
@@ -1431,6 +1549,7 @@ impl<'a> ScanState<'a> {
             .saturating_sub(tail_prefix.len());
         let tail_start = read_offset.min(self.payload.len());
         let tail_end = tail_start.saturating_add(read_size).min(self.payload.len());
+        let tail_prefix_len = tail_prefix.len();
         let mut tail = tail_prefix;
         tail.extend_from_slice(&self.payload[tail_start..tail_end]);
         self.bytes_scanned = self
@@ -1439,20 +1558,44 @@ impl<'a> ScanState<'a> {
 
         for needle in [
             b"nt\nsystem".as_slice(),
+            b"nt\npopen".as_slice(),
+            b"nt\nspawn".as_slice(),
             b"os\nsystem".as_slice(),
+            b"os\npopen".as_slice(),
+            b"os\nspawn".as_slice(),
             b"posix\nsystem".as_slice(),
+            b"posix\npopen".as_slice(),
+            b"posix\nspawn".as_slice(),
+            b"commands\ngetoutput".as_slice(),
+            b"commands\ngetstatusoutput".as_slice(),
             b"subprocess\nPopen".as_slice(),
             b"builtins\neval".as_slice(),
+            b"builtins\nexec".as_slice(),
+            b"builtins\ncompile".as_slice(),
+            b"builtins\n__import__".as_slice(),
             b"__builtin__\neval".as_slice(),
+            b"__builtin__\nexec".as_slice(),
+            b"__builtin__\ncompile".as_slice(),
+            b"__builtin__\n__import__".as_slice(),
+            b"importlib\nimport_module".as_slice(),
+            b"marshal\nloads".as_slice(),
+            b"ctypes\nCDLL".as_slice(),
+            b"runpy\nrun_module".as_slice(),
+            b"runpy\nrun_path".as_slice(),
         ] {
             if let Some(offset) = find_bytes(&tail, needle) {
+                let absolute_position = if offset < tail_prefix_len {
+                    stream_offset.saturating_add(offset)
+                } else {
+                    read_offset.saturating_add(offset - tail_prefix_len)
+                };
                 self.add_finding(Finding {
                     message: "Dangerous global-like byte pattern found beyond opcode budget".to_string(),
                     severity: "warning",
                     location: Some(format!(
                         "{} (pos {})",
                         self.source,
-                        self.position_offset + stream_offset + offset
+                        self.position_offset + absolute_position
                     )),
                     rule_code: Some("POST_BUDGET_GLOBAL"),
                     details: vec![(
@@ -1463,6 +1606,66 @@ impl<'a> ScanState<'a> {
                         "Opcode analysis stopped early, but a byte-level tail scan still found suspicious global references.",
                     ),
                 });
+            }
+        }
+    }
+
+    fn scan_follow_on_pickle_streams(&mut self, start_index: usize) {
+        if self.options.post_budget_scan_bytes == 0 || start_index >= self.payload.len() {
+            return;
+        }
+        let scan_end = self
+            .payload
+            .len()
+            .min(start_index.saturating_add(self.options.post_budget_scan_bytes));
+        let tail = &self.payload[start_index..scan_end];
+        for relative_offset in nested_pickle_probe_offsets(tail) {
+            let absolute_offset = start_index.saturating_add(relative_offset);
+            if absolute_offset <= start_index {
+                continue;
+            }
+            let candidate = &self.payload[absolute_offset..scan_end];
+            let nested_source = format!(
+                "{} (follow-on pickle stream at pos {})",
+                self.source,
+                self.position_offset + absolute_offset
+            );
+            let mut follow_on_scan = ScanState::new(
+                nested_source,
+                candidate,
+                self.options,
+                Some(candidate.len()),
+                self.position_offset + absolute_offset,
+                self.nested_depth,
+                Some(self.deadline),
+            );
+            follow_on_scan.run();
+            let had_findings = !follow_on_scan.findings.is_empty();
+            for finding in follow_on_scan.findings {
+                self.add_finding(finding);
+            }
+            for reference in follow_on_scan.import_references {
+                self.import_references.push(reference);
+            }
+            if had_findings {
+                self.add_notice(Notice {
+                    message: "Follow-on pickle stream detected after malformed padding".to_string(),
+                    severity: "info",
+                    location: Some(format!(
+                        "{} (pos {})",
+                        self.source,
+                        self.position_offset + absolute_offset
+                    )),
+                    code: Some("follow_on_stream_detected"),
+                    details: vec![
+                        (
+                            "position".to_string(),
+                            DetailValue::UInt((self.position_offset + absolute_offset) as u64),
+                        ),
+                        ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
+                    ],
+                });
+                return;
             }
         }
     }
@@ -1490,7 +1693,8 @@ impl<'a> ScanState<'a> {
                 return true;
             }
             let import_reference = detail_string(&finding.details, "import_reference");
-            let location_position = finding.location.as_deref().and_then(location_position);
+            let location_position = detail_usize(&finding.details, "position")
+                .or_else(|| finding.location.as_deref().and_then(location_position));
             match (import_reference, location_position) {
                 (Some(import_reference), Some(position)) => {
                     !called_global_keys.contains(&(import_reference, position))
@@ -1669,17 +1873,6 @@ fn stack_value_text<'payload>(
             Some(String::from_utf8_lossy(&payload[*start..*end]))
         }
         StackValue::Primitive { repr, .. } => Some(Cow::Borrowed(repr)),
-        _ => None,
-    }
-}
-
-fn stack_value_string(value: &StackValue, payload: &[u8]) -> Option<String> {
-    match value {
-        StackValue::Text(text) => Some(text.clone()),
-        StackValue::TextSpan { start, end } if start <= end && *end <= payload.len() => {
-            Some(String::from_utf8_lossy(&payload[*start..*end]).to_string())
-        }
-        StackValue::Primitive { repr, .. } => Some(repr.clone()),
         StackValue::Bytes { start, end }
             if start <= end
                 && *end <= payload.len()
@@ -1687,11 +1880,14 @@ fn stack_value_string(value: &StackValue, payload: &[u8]) -> Option<String> {
         {
             std::str::from_utf8(&payload[*start..*end])
                 .ok()
-                .map(str::to_string)
+                .map(Cow::Borrowed)
         }
-        StackValue::Bytes { .. } => None,
         _ => None,
     }
+}
+
+fn stack_value_string(value: &StackValue, payload: &[u8]) -> Option<String> {
+    stack_value_text(value, payload).map(Cow::into_owned)
 }
 
 fn pytorch_storage_key(value: &StackValue, payload: &[u8]) -> Option<String> {
@@ -1721,7 +1917,7 @@ fn is_pytorch_storage_descriptor(value: &StackValue, payload: &[u8]) -> bool {
     }
 }
 
-fn stack_value_from_integer_arg(arg: &ArgValue) -> StackValue {
+fn stack_value_from_integer_arg(arg: &ArgValue, payload: &[u8]) -> StackValue {
     match arg {
         ArgValue::Int(value) => StackValue::Primitive {
             type_name: "int",
@@ -1731,8 +1927,46 @@ fn stack_value_from_integer_arg(arg: &ArgValue) -> StackValue {
             type_name: "int",
             repr: value.to_string(),
         },
+        ArgValue::Text(value) => {
+            integer_text_repr(value).map_or(StackValue::Other, |repr| StackValue::Primitive {
+                type_name: "int",
+                repr,
+            })
+        }
+        ArgValue::Bytes { start, end } if start <= end && *end <= payload.len() => {
+            little_endian_signed_integer_repr(&payload[*start..*end]).map_or(
+                StackValue::Other,
+                |repr| StackValue::Primitive {
+                    type_name: "int",
+                    repr,
+                },
+            )
+        }
         _ => StackValue::Other,
     }
+}
+
+fn integer_text_repr(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let trimmed = trimmed.strip_suffix('L').unwrap_or(trimmed);
+    if trimmed.parse::<i64>().is_ok() {
+        return Some(trimmed.to_string());
+    }
+    None
+}
+
+fn little_endian_signed_integer_repr(value: &[u8]) -> Option<String> {
+    if value.len() > 16 {
+        return None;
+    }
+    if value.is_empty() {
+        return Some("0".to_string());
+    }
+
+    let sign_extend = value.last().is_some_and(|byte| byte & 0x80 != 0);
+    let mut buffer = if sign_extend { [0xffu8; 16] } else { [0u8; 16] };
+    buffer[..value.len()].copy_from_slice(value);
+    Some(i128::from_le_bytes(buffer).to_string())
 }
 
 fn stack_value_from_text_arg(arg: &ArgValue, payload: &[u8]) -> StackValue {
@@ -1837,7 +2071,7 @@ mod tests {
     use crate::report::detail_string;
 
     #[test]
-    fn protocol5_buffer_opcodes_do_not_create_stack_operands() {
+    fn protocol5_buffer_opcodes_create_opaque_stack_context() {
         let options = ScanOptions {
             timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: DEFAULT_MAX_OPCODES,
@@ -1871,8 +2105,12 @@ mod tests {
         );
         assert_eq!(
             detail_string(&finding.details, "name_operand").as_deref(),
-            Some("NoneType:None")
+            Some("object")
         );
+        assert!(scan
+            .notices
+            .iter()
+            .any(|notice| notice.code == Some("buffer_opcode")));
     }
 
     #[test]
@@ -1908,5 +2146,40 @@ mod tests {
             detail_string(&finding.details, "opcode").as_deref(),
             Some("PERSID")
         );
+    }
+
+    #[test]
+    fn post_budget_tail_reports_expanded_needles_at_precise_positions() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: 1,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x04cos\npopen\n.";
+        let mut scan = ScanState::new(
+            "post-budget.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let finding = scan
+            .findings
+            .iter()
+            .find(|finding| finding.rule_code == Some("POST_BUDGET_GLOBAL"))
+            .expect("post-budget global finding");
+        assert_eq!(
+            detail_string(&finding.details, "pattern").as_deref(),
+            Some("os\npopen")
+        );
+        assert_eq!(finding.location.as_deref(), Some("post-budget.pkl (pos 3)"));
     }
 }

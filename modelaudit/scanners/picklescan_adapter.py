@@ -24,6 +24,7 @@ _INCONCLUSIVE_NOTICE_CODES = frozenset(
         "opcode_budget",
         "parse_incomplete",
         "timeout",
+        "unbounded_stream_truncated",
     }
 )
 _DEFAULT_SCAN_OPTIONS = ScanOptions()
@@ -31,15 +32,7 @@ _IMPORT_MODULE_ALIASES = {
     "nt": "os",
     "posix": "os",
 }
-_LEGACY_NOTICE_RULE_CODES = {
-    "encoded_nested_payload_truncated": "S902",
-    "literal_scan_truncated": "S902",
-    "nested_payload_truncated": "S902",
-    "nested_pickle_incomplete": "S902",
-    "opcode_budget": "S902",
-    "parse_incomplete": "S902",
-    "timeout": "S902",
-}
+_LEGACY_NOTICE_RULE_CODES = dict.fromkeys(_INCONCLUSIVE_NOTICE_CODES, "S902")
 _LEGACY_SCAN_OUTCOME_REASONS = {
     "encoded_nested_payload_truncated": "encoded_nested_payload_truncated",
     "literal_scan_truncated": "literal_scan_truncated",
@@ -48,6 +41,7 @@ _LEGACY_SCAN_OUTCOME_REASONS = {
     "opcode_budget": "opcode_budget_exceeded",
     "parse_incomplete": "pickle_analysis_incomplete",
     "timeout": "scan_timeout",
+    "unbounded_stream_truncated": "unbounded_stream_truncated",
 }
 _NESTED_PAYLOAD_RULE_CODES = frozenset({"S213", "S601", "S602"})
 _INT_TEXT_RE = re.compile(r"[+-]?\d+")
@@ -396,6 +390,8 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
 
     first_pickle_end_pos = report.metadata.get("first_pickle_end_pos")
     has_trusted_pickle_boundary = isinstance(first_pickle_end_pos, int) and first_pickle_end_pos >= 0
+    if not has_trusted_pickle_boundary:
+        return False
 
     for notice in report.notices:
         if notice.code != "parse_incomplete":
@@ -403,19 +399,20 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
 
         exception_type = notice.details.get("exception_type")
         exception_message = str(notice.details.get("exception", ""))
-        if exception_type == "UnicodeDecodeError" and has_trusted_pickle_boundary:
+        if (
+            exception_type == "UnicodeDecodeError"
+            and source_ext in {".bin", ".pkl", ".pickle"}
+            and _has_no_or_only_benign_serialization_tail_imports(report)
+        ):
             return True
 
         if exception_type not in {"ParseError", "ValueError"}:
             continue
 
-        if source_ext == ".bin" and has_trusted_pickle_boundary:
-            return True
-
         if (
-            has_trusted_pickle_boundary
-            and source_ext in {".pkl", ".pickle", ".joblib", ".dill"}
+            source_ext in {".bin", ".pkl", ".pickle", ".joblib", ".dill"}
             and _is_zero_padding_tail_parse_error(exception_message)
+            and _has_no_or_only_benign_serialization_tail_imports(report)
         ):
             return True
 
@@ -428,8 +425,7 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
             return True
 
         if (
-            has_trusted_pickle_boundary
-            and source_ext in {".dill", ".bin"}
+            source_ext in {".dill", ".bin"}
             and "opcode b'" in exception_message
             and exception_message.endswith(" unknown")
             and _has_only_benign_serialization_tail_imports(report)
@@ -470,6 +466,13 @@ def _has_only_benign_serialization_tail_imports(report: PickleReport) -> bool:
     return True
 
 
+def _has_no_or_only_benign_serialization_tail_imports(report: PickleReport) -> bool:
+    import_references = report.metadata.get("import_references")
+    if not _is_reference_sequence(import_references) or not import_references:
+        return True
+    return _has_only_benign_serialization_tail_imports(report)
+
+
 def _is_reference_sequence(value: object) -> bool:
     return isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray)
 
@@ -485,9 +488,6 @@ def _apply_member_context_to_record(
         record.location = member_location
         return
     if record.location == member_location or record.location.startswith(f"{member_location} "):
-        return
-    if "(pos " in record.location:
-        record.location = f"{member_location} {record.location}"
         return
     record.location = f"{member_location} {record.location}"
 
@@ -526,6 +526,12 @@ def _legacy_rule_code_for_finding(finding: Finding) -> str | None:
         module = finding.details.get("module")
         name = finding.details.get("name")
         if isinstance(module, str) and module.lower() in {"__builtin__", "__builtins__", "builtins"}:
+            if name in {"eval", "exec"}:
+                return "S104"
+            if name == "compile":
+                return "S105"
+            if name == "__import__":
+                return "S106"
             return "S115"
 
         opcode = finding.details.get("opcode")
@@ -571,9 +577,7 @@ def _legacy_rule_code_for_finding(finding: Finding) -> str | None:
 
 def _legacy_check_name_for_finding(finding: Finding) -> str:
     opcode = finding.details.get("opcode")
-    if finding.rule_code == "DANGEROUS_CALL" and isinstance(opcode, str):
-        return f"{opcode.upper()} Opcode Safety Check"
-    if finding.rule_code == "DANGEROUS_GLOBAL" and isinstance(opcode, str):
+    if finding.rule_code in {"DANGEROUS_CALL", "DANGEROUS_GLOBAL"} and isinstance(opcode, str):
         return f"{opcode.upper()} Opcode Safety Check"
     return "Standalone Pickle Finding"
 
@@ -619,6 +623,7 @@ def _add_legacy_supporting_finding_checks(
             in {
                 "eval",
                 "exec",
+                "compile",
                 "__import__",
             }
         ):
@@ -632,6 +637,17 @@ def _add_legacy_supporting_finding_checks(
                 why=_legacy_why_for_finding(finding),
                 rule_code="S201",
             )
+            if primary_rule_code != "S115":
+                result.add_check(
+                    name="REDUCE Opcode Safety Check",
+                    passed=False,
+                    message=finding.message,
+                    severity=severity,
+                    location=finding.location,
+                    details={**details, "legacy_rule_alias": True},
+                    why=_legacy_why_for_finding(finding),
+                    rule_code="S115",
+                )
         return
 
     if finding.rule_code == "DANGEROUS_GLOBAL":

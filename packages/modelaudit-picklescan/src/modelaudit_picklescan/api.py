@@ -58,7 +58,7 @@ class PickleScanner:
             position_offset = 0
 
         try:
-            payload = _read_stream_payload(
+            payload, stream_truncated = _read_stream_payload(
                 stream,
                 normalized_size,
                 max_unbounded_read_bytes=self.options.max_unbounded_stream_read_bytes,
@@ -81,18 +81,27 @@ class PickleScanner:
                 bytes_scanned=0,
                 bytes_total=normalized_size,
             )
-        return _scan_pickle_payload_native(
+        report = _scan_pickle_payload_native(
             payload,
             source=source,
             options=self.options,
             bytes_total=normalized_size,
             position_offset=position_offset,
         )
+        if stream_truncated:
+            return _with_unbounded_stream_notice(
+                report,
+                source=source,
+                bytes_scanned=len(payload),
+                max_unbounded_read_bytes=self.options.max_unbounded_stream_read_bytes,
+            )
+        return report
 
     def scan_file(self, path: str | Path) -> PickleReport:
         """Scan a pickle file path, including pickle members in PyTorch ZIP containers."""
         source = str(path)
         path_obj = Path(path)
+        size: int | None = None
         try:
             size = path_obj.stat().st_size
             if zipfile.is_zipfile(path_obj):
@@ -117,7 +126,7 @@ class PickleScanner:
                 category="zip_error",
                 exception=error,
                 bytes_scanned=0,
-                bytes_total=size if "size" in locals() else None,
+                bytes_total=size,
             )
 
     def _scan_pytorch_zip_file(self, path: Path, *, source: str, size: int) -> PickleReport | None:
@@ -198,7 +207,7 @@ class PickleScanner:
             return _combine_pytorch_zip_reports(
                 source=source,
                 size=size,
-                entries=entries,
+                entry_count=len(entries),
                 pickle_entries=pickle_entries,
                 member_reports=reports,
                 extra_notices=tuple(skipped_notices),
@@ -234,10 +243,11 @@ def scan_file(path: str | Path, *, options: ScanOptions | None = None) -> Pickle
 def _is_pytorch_zip_archive(path: Path, entries: list[zipfile.ZipInfo]) -> bool:
     names = [entry.filename for entry in entries if not entry.is_dir()]
     has_data_pickle = any(_is_data_pickle_member(name) for name in names)
-    if not has_data_pickle:
-        return False
     has_metadata_marker = any(Path(name).name in _PYTORCH_ZIP_METADATA_BASENAMES for name in names)
-    return has_metadata_marker or path.suffix.lower() in _PYTORCH_ZIP_EXTENSIONS
+    if has_data_pickle:
+        return has_metadata_marker or path.suffix.lower() in _PYTORCH_ZIP_EXTENSIONS
+    has_pickle_members = any(name.lower().endswith(_PICKLE_MEMBER_SUFFIXES) for name in names)
+    return has_pickle_members and (has_metadata_marker or path.suffix.lower() in _PYTORCH_ZIP_EXTENSIONS)
 
 
 def _discover_pytorch_zip_pickle_entries(entries: list[zipfile.ZipInfo]) -> list[zipfile.ZipInfo]:
@@ -292,7 +302,7 @@ def _combine_pytorch_zip_reports(
     *,
     source: str,
     size: int,
-    entries: list[zipfile.ZipInfo],
+    entry_count: int,
     pickle_entries: list[zipfile.ZipInfo],
     member_reports: list[PickleReport],
     extra_notices: tuple[Notice, ...],
@@ -322,7 +332,7 @@ def _combine_pytorch_zip_reports(
         metadata={
             "container_type": "pytorch_zip",
             "archive_size_bytes": size,
-            "archive_entry_count": len(entries),
+            "archive_entry_count": entry_count,
             "pickle_files": [entry.filename for entry in pickle_entries],
             "member_reports": [
                 {
@@ -366,6 +376,49 @@ def _combine_verdict(
     if status == ScanStatus.COMPLETE and member_reports:
         return SafetyVerdict.CLEAN
     return SafetyVerdict.UNKNOWN
+
+
+def _with_unbounded_stream_notice(
+    report: PickleReport,
+    *,
+    source: str,
+    bytes_scanned: int,
+    max_unbounded_read_bytes: int,
+) -> PickleReport:
+    notices = (
+        *report.notices,
+        Notice(
+            message="Unbounded pickle stream scan stopped at configured byte limit",
+            severity=Severity.INFO,
+            location=source,
+            code="unbounded_stream_truncated",
+            details={
+                "bytes_scanned": bytes_scanned,
+                "max_unbounded_stream_read_bytes": max_unbounded_read_bytes,
+                "analysis_incomplete": True,
+            },
+        ),
+    )
+    status = ScanStatus.INCONCLUSIVE
+    verdict = SafetyVerdict.UNKNOWN if report.verdict == SafetyVerdict.CLEAN else report.verdict
+    metadata = {**report.to_dict()["metadata"], "analysis_incomplete": True}
+    return PickleReport(
+        source=report.source,
+        status=status,
+        verdict=verdict,
+        findings=report.findings,
+        notices=notices,
+        errors=report.errors,
+        coverage=CoverageSummary(
+            bytes_scanned=report.coverage.bytes_scanned,
+            bytes_total=None,
+            opcode_count=report.coverage.opcode_count,
+            raw_scan_complete=False,
+            opcode_scan_complete=False,
+        ),
+        metadata=metadata,
+        duration_s=report.duration_s,
+    )
 
 
 def _io_error_report(
@@ -517,11 +570,9 @@ def _optional_str(value: object) -> str | None:
 def _optional_int(value: object) -> int | None:
     if value is None:
         return None
-    if isinstance(value, int):
+    if type(value) is int:
         return value
-    if isinstance(value, str | bytes | bytearray):
-        return int(value)
-    raise TypeError(f"expected int-compatible value, got {type(value).__name__}")
+    raise TypeError(f"expected int or None, got {type(value).__name__}")
 
 
 def _optional_bool(value: object) -> bool | None:
@@ -543,8 +594,9 @@ def _read_stream_payload(
     size: int | None,
     *,
     max_unbounded_read_bytes: int,
-) -> bytes:
+) -> tuple[bytes, bool]:
     with tempfile.SpooledTemporaryFile(max_size=max_unbounded_read_bytes, mode="w+b") as spool:
+        stream_truncated = False
         if size is None:
             remaining = max_unbounded_read_bytes
             while remaining > 0:
@@ -554,7 +606,7 @@ def _read_stream_payload(
                 spool.write(chunk)
                 remaining -= len(chunk)
             if remaining == 0 and stream.read(1):
-                raise ValueError("Unbounded stream exceeded max_unbounded_stream_read_bytes")
+                stream_truncated = True
         else:
             remaining = size
             bytes_read = 0
@@ -567,7 +619,7 @@ def _read_stream_payload(
                 remaining -= len(chunk)
 
         spool.seek(0)
-        return spool.read()
+        return spool.read(), stream_truncated
 
 
 def _engine_error_report(

@@ -11,10 +11,15 @@ COPY modelaudit ./modelaudit
 # This keeps the lightweight image small and fast to build
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 \
-    && apt-get install --yes --no-install-recommends build-essential cargo \
+    && apt-get install --yes --no-install-recommends build-essential ca-certificates curl \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain 1.74.1 \
+    && export PATH="/root/.cargo/bin:${PATH}" \
+    && rustc --version \
     && pip install --no-cache-dir ./packages/modelaudit-picklescan \
     && pip install --no-cache-dir . \
-    && apt-get purge --yes --auto-remove build-essential cargo rustc \
+    && rm -rf /root/.cargo /root/.rustup \
+    && apt-get purge --yes --auto-remove build-essential curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user

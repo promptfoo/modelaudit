@@ -29,10 +29,16 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = []
 
+[project.urls]
+Homepage = "https://github.com/promptfoo/modelaudit"
+Repository = "https://github.com/promptfoo/modelaudit"
+Issues = "https://github.com/promptfoo/modelaudit/issues"
+Changelog = "https://github.com/promptfoo/modelaudit/blob/main/CHANGELOG.md"
+
 [tool.maturin]
 python-source = "src"
 module-name = "modelaudit_picklescan._rust"
-features = ["extension-module"]
+features = ["extension-module", "abi3"]
 
 [tool.ruff]
 line-length = 120

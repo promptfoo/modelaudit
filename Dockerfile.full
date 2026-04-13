@@ -18,10 +18,15 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 # pickle scanner before installing the root package because it is a runtime
 # dependency of modelaudit.
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends build-essential cargo \
+    && apt-get install --yes --no-install-recommends build-essential ca-certificates curl \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain 1.74.1 \
+    && export PATH="/root/.cargo/bin:${PATH}" \
+    && rustc --version \
     && pip install --no-cache-dir ./packages/modelaudit-picklescan \
     && pip install --no-cache-dir . \
-    && apt-get purge --yes --auto-remove build-essential cargo rustc \
+    && rm -rf /root/.cargo /root/.rustup \
+    && apt-get purge --yes --auto-remove build-essential curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Install ML frameworks with minimal dependencies to avoid disk space issues

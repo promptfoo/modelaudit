@@ -9,7 +9,7 @@ import pickle
 import random
 import string
 
-from .options import ScanOptions
+from modelaudit_picklescan.options import ScanOptions
 
 ParityPayload = tuple[str, bytes, ScanOptions | None]
 

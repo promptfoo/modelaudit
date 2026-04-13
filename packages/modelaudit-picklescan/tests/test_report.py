@@ -15,6 +15,7 @@ from modelaudit_picklescan import (
     ScanStatus,
     Severity,
 )
+from modelaudit_picklescan.api import _report_from_native_dict
 
 
 def test_clean_report_requires_complete_status_and_clean_verdict() -> None:
@@ -143,3 +144,24 @@ def test_report_mappings_are_read_only_after_construction() -> None:
 
     assert finding.to_dict()["details"] == {"symbol": "os.system", "nested": {"symbols": ["os.system"]}}
     assert report.to_dict()["metadata"] == {"opcode_count": 3, "nested": {"globals": ["os.system"]}}
+
+
+def test_rust_report_conversion_rejects_non_bool_coverage_flags() -> None:
+    raw_report = {
+        "source": "native.pkl",
+        "status": "complete",
+        "verdict": "clean",
+        "findings": [],
+        "notices": [],
+        "errors": [],
+        "coverage": {
+            "bytes_scanned": 0,
+            "raw_scan_complete": "false",
+            "opcode_scan_complete": True,
+        },
+        "metadata": {},
+        "duration_s": 0.0,
+    }
+
+    with pytest.raises(TypeError, match="expected bool or None"):
+        _report_from_native_dict(raw_report)

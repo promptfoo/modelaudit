@@ -163,6 +163,13 @@ RULE_CATALOG: tuple[RuleCatalogEntry, ...] = (
         patterns=(r"pickle.*SETITEMS", r"SETITEMS.*opcode"),
     ),
     RuleCatalogEntry(
+        code="S211",
+        name="Pickle extension opcode",
+        severity="HIGH",
+        description="Copyreg extension reference via pickle EXT opcode",
+        patterns=(r"pickle.*EXT[124]", r"EXT[124].*opcode", r"copyreg.*extension"),
+    ),
+    RuleCatalogEntry(
         code="S212",
         name="Pickle persistent ID opcode",
         severity="MEDIUM",

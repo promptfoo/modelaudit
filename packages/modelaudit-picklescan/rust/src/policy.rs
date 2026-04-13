@@ -1,4 +1,8 @@
 pub(crate) fn global_severity(module: &str, name: &str) -> Option<&'static str> {
+    if (module == "os" && name == "path") || module == "os.path" {
+        return None;
+    }
+
     if let Some(warning_names) = warning_globals(module) {
         if warning_names.is_empty() || warning_names.contains(&name) {
             return Some("warning");
@@ -59,6 +63,7 @@ const BUILTIN_DANGEROUS_NAMES: &[&str] = &[
 ];
 const DANGEROUS_WILDCARD_MODULES: &[&str] = &[
     "_ctypes",
+    "_operator",
     "_pickle",
     "_signal",
     "_sqlite3",
@@ -83,18 +88,23 @@ const DANGEROUS_WILDCARD_MODULES: &[&str] = &[
     "http",
     "httplib",
     "idlelib",
+    "imaplib",
     "importlib",
     "lib2to3",
     "marshal",
     "mmap",
     "multiprocessing",
+    "nntplib",
     "nt",
+    "ntpath",
     "os",
     "pdb",
     "pexpect",
     "pickle",
     "pip",
+    "poplib",
     "posix",
+    "posixpath",
     "profile",
     "pty",
     "py_compile",
@@ -122,6 +132,9 @@ const DANGEROUS_WILDCARD_MODULES: &[&str] = &[
     "urllib2",
     "venv",
     "webbrowser",
+    "xmlrpc",
+    "xmlrpc.client",
+    "xmlrpc.server",
     "zipimport",
 ];
 const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
@@ -137,7 +150,12 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("codecs", "decode"),
     ("codecs", "encode"),
     ("collections", "eval"),
+    ("copyreg", "add_extension"),
+    ("copyreg", "remove_extension"),
     ("dill", "load"),
+    ("dill", "load_module"),
+    ("dill", "load_module_asdict"),
+    ("dill", "load_session"),
     ("dill", "loads"),
     ("functools", "reduce"),
     ("joblib", "_pickle_load"),
@@ -146,6 +164,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("logging.config", "fileConfig"),
     ("logging.config", "listen"),
     ("numpy", "load"),
+    ("numpy.f2py.crackfortran", "getlincoef"),
     ("numpy.testing._private.utils", "runstring"),
     ("operator", "attrgetter"),
     ("operator", "itemgetter"),
@@ -154,17 +173,29 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("pip._internal", "main"),
     ("pip._internal.cli.main", "main"),
     ("pip._vendor.distlib.scripts", "ScriptMaker"),
+    ("pkgutil", "get_importer"),
     ("pkgutil", "resolve_name"),
+    ("pkgutil", "walk_packages"),
     ("site", "main"),
     ("tarfile", "open"),
     ("test.support.script_helper", "assert_python_ok"),
     ("torch", "compile"),
     ("torch", "load"),
+    ("torch._dynamo.guards.GuardBuilder", "get"),
     ("torch._inductor.codecache", "compile_file"),
+    (
+        "torch.fx.experimental.symbolic_shapes.ShapeEnv",
+        "evaluate_guards_expression",
+    ),
     ("torch.hub", "load"),
     ("torch.hub", "load_state_dict_from_url"),
     ("torch.serialization", "load"),
     ("torch.storage", "_load_from_bytes"),
+    ("torch.utils._config_module.ConfigModule", "load_config"),
+    ("torch.utils.bottleneck.__main__", "run_autograd_prof"),
+    ("torch.utils.bottleneck.__main__", "run_cprofile"),
+    ("torch.utils.collect_env", "run"),
+    ("torch.utils.data.datapipes.utils.decoder", "basichandlers"),
     ("types", "CodeType"),
     ("types", "FunctionType"),
     ("uuid", "_arp_getnode"),

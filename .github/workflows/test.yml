@@ -309,6 +309,11 @@ jobs:
         run: |
           uv lock --check
 
+      - name: Check standalone picklescan uv.lock is in sync
+        working-directory: packages/modelaudit-picklescan
+        run: |
+          uv lock --check
+
   type-check:
     name: Type Check
     needs: changes
@@ -854,11 +859,15 @@ jobs:
           path: dist/
 
   picklescan-package:
-    name: Standalone Pickle Package
+    name: Standalone Pickle Package (${{ matrix.python-version }})
     needs: changes
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.picklescan == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     defaults:
       run:
         working-directory: packages/modelaudit-picklescan
@@ -873,10 +882,11 @@ jobs:
 
       - name: Pin Python version
         run: |
-          uv python pin 3.12
+          uv python pin ${{ matrix.python-version }}
 
       - name: Install Rust toolchain
         run: |
+          rustup toolchain install 1.74.0 --profile minimal
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
 

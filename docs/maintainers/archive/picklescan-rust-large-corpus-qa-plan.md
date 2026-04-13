@@ -713,8 +713,8 @@ Use this prompt for the coding agent that implements and runs the QA campaign:
 
 ```text
 You are working in ModelAudit on the Rust-backed modelaudit-picklescan rewrite.
-Implement the large-corpus QA harness and execute the QA plan in
-docs/maintainers/picklescan-rust-large-corpus-qa-plan.md.
+Implement the large-corpus QA harness and execute the archived QA plan in
+docs/maintainers/archive/picklescan-rust-large-corpus-qa-plan.md.
 
 Hard requirements:
 - Do not deserialize or execute pickle/model files.

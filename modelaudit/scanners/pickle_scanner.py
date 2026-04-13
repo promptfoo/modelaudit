@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import base64
 import binascii
-import os
+import hashlib
+import io
 import pickletools
 import re
 from pathlib import Path
@@ -18,18 +19,126 @@ from .base import BaseScanner, IssueSeverity, ScanResult, logger
 from .picklescan_adapter import pickle_report_to_scan_result, scan_options_from_config
 
 _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES = 64 * 1024
-_ROOT_RAW_SCAN_LIMIT_BYTES = 100 * 1024 * 1024
+_ROOT_RAW_SCAN_LIMIT_BYTES = 8 * 1024 * 1024
+_ROOT_EXPENSIVE_RAW_SCAN_LIMIT_BYTES = 1 * 1024 * 1024
 _KNOWN_PICKLE_EXTENSIONS = frozenset({".pkl", ".pickle", ".dill", ".joblib"})
 _PYTORCH_CONTAINER_EXTENSIONS = frozenset({".bin", ".pt", ".pth", ".ckpt", ".pkl"})
-_BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{16,}={0,2}(?![A-Za-z0-9+/=])")
+_BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{12,}={0,2}(?![A-Za-z0-9+/=])")
 _MAX_RAW_ENCODED_TOKENS = 64
 _MAX_RAW_ENCODED_BYTES = 1024 * 1024
+_MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES = 4096
+_BASE64_CODE_EXECUTION_SEEDS: tuple[bytes, ...] = (
+    b"ZXZhbCg",  # eval(
+    b"ZXhlYyg",  # exec(
+    b"b3Muc3lzdGVt",  # os.system
+    b"c3VicHJvY2Vzcw",  # subprocess
+    b"X19pbXBvcnRfXw",  # __import__
+)
 _ENCODED_CODE_EXECUTION_PATTERNS: tuple[tuple[bytes, str], ...] = (
     (b"eval(", "eval"),
     (b"exec(", "exec"),
     (b"os.system", "os.system"),
     (b"subprocess", "subprocess"),
     (b"__import__", "__import__"),
+)
+_RAW_READ_CHUNK_BYTES = 1024 * 1024
+_BINARY_TAIL_SIGNATURES: tuple[tuple[bytes, str, str], ...] = (
+    (b"MZ", "Windows executable (PE)", "S501"),
+    (b"\x7fELF", "Linux executable (ELF)", "S502"),
+    (b"\xfe\xed\xfa\xce", "macOS executable (Mach-O 32-bit)", "S503"),
+    (b"\xfe\xed\xfa\xcf", "macOS executable (Mach-O 64-bit)", "S503"),
+    (b"\xcf\xfa\xed\xfe", "macOS executable (Mach-O)", "S503"),
+    (b"#!/bin/sh", "Shell script", "S504"),
+    (b"#!/bin/bash", "Shell script", "S504"),
+    (b"powershell", "PowerShell script", "S506"),
+    (b"invoke-expression", "PowerShell script", "S506"),
+)
+_SECRET_SCAN_SEEDS: tuple[bytes, ...] = (
+    b"://",
+    b"-----begin ",
+    b"akia",
+    b"api",
+    b"auth",
+    b"aws_",
+    b"az",
+    b"bearer",
+    b"client_secret",
+    b"credential",
+    b"eyj",
+    b"gcp_api_key",
+    b"github_pat_",
+    b"ghp_",
+    b"ghs_",
+    b"glpat-",
+    b"hooks.slack.com",
+    b"key",
+    b"mailgun",
+    b"mongodb+srv://",
+    b"npm_",
+    b"openai_api_key",
+    b"passwd",
+    b"password",
+    b"pwd",
+    b"rg_",
+    b"secret",
+    b"seed phrase",
+    b"sendgrid",
+    b"sk-",
+    b"sk_live_",
+    b"slack://",
+    b"sq0",
+    b"stripe_live_",
+    b"token",
+    b"twilio",
+    b"xox",
+)
+_NETWORK_SCAN_SEEDS: tuple[bytes, ...] = (
+    b"://",
+    b"aiohttp",
+    b"backdoor",
+    b"beacon_url",
+    b"botnet",
+    b"callback_url",
+    b"c2_server",
+    b"command_server",
+    b"dns.resolver",
+    b"exfil_endpoint",
+    b"ftp",
+    b"grpc",
+    b"http",
+    b"imap",
+    b"malware",
+    b"mongo",
+    b"paramiko",
+    b"phone_home",
+    b"redis",
+    b"requests",
+    b"s3://",
+    b"socket",
+    b"smtp",
+    b"telnet",
+    b"trojan",
+    b"urllib",
+    b"webhook",
+    b"websocket",
+    b"zombie",
+)
+_JIT_SCAN_SEEDS: tuple[bytes, ...] = (
+    b"__import__",
+    b"class ",
+    b"compile",
+    b"def ",
+    b"eval",
+    b"exec",
+    b"lambda",
+    b"os.",
+    b"requests.",
+    b"socket.",
+    b"subprocess.",
+    b"tf.",
+    b"torch",
+    b"torchscript",
+    b"urllib.",
 )
 
 # Kept as small compatibility exports for callers/tests that inspect the policy.
@@ -128,10 +237,85 @@ def _contains_non_comment_token(data: bytes, token: bytes) -> bool:
         start = index + len(token)
 
 
+def _is_primarily_documentation(data: bytes) -> bool:
+    lines = [line.strip() for line in data.splitlines() if line.strip()]
+    if not lines:
+        return False
+    doc_lines = sum(1 for line in lines if line.startswith((b"#", b"//", b"/*", b"*")))
+    return doc_lines / len(lines) > 0.5
+
+
+def _contains_call_token(data: bytes, name: bytes) -> bool:
+    return re.search(rb"(?<![A-Za-z0-9_])" + re.escape(name) + rb"(?:\s|#[^\n]*\n)*\(", data) is not None
+
+
+def _contains_module_attr(data: bytes, module: bytes, attr: bytes) -> bool:
+    pattern = rb"(?<![A-Za-z0-9_])" + re.escape(module) + rb"\s*\.\s*" + re.escape(attr) + rb"(?![A-Za-z0-9_])"
+    return re.search(pattern, data) is not None
+
+
+def _contains_any_seed(data: bytes, seeds: tuple[bytes, ...]) -> bool:
+    lower = data.lower()
+    return any(seed in lower for seed in seeds)
+
+
+def _has_alnum_secret_shape(data: bytes) -> bool:
+    has_digit = False
+    has_alpha = False
+    for byte in data[:_ROOT_EXPENSIVE_RAW_SCAN_LIMIT_BYTES]:
+        if 48 <= byte <= 57:
+            has_digit = True
+        elif (65 <= byte <= 90) or (97 <= byte <= 122):
+            has_alpha = True
+        if has_digit and has_alpha:
+            return True
+    return False
+
+
+def _has_domain_or_ip_shape(data: bytes) -> bool:
+    if b"." not in data:
+        return False
+    has_digit = False
+    has_alpha = False
+    for byte in data[:_ROOT_EXPENSIVE_RAW_SCAN_LIMIT_BYTES]:
+        if 48 <= byte <= 57:
+            has_digit = True
+        elif (65 <= byte <= 90) or (97 <= byte <= 122):
+            has_alpha = True
+        if has_digit and has_alpha:
+            return True
+    return has_digit
+
+
+def _looks_like_portable_executable(data: bytes) -> bool:
+    if not data.startswith(b"MZ"):
+        return False
+    if b"This program cannot be run in DOS mode" in data[:512]:
+        return True
+    if len(data) < 0x40:
+        return False
+    pe_offset = int.from_bytes(data[0x3C:0x40], "little", signed=False)
+    return pe_offset > 0 and pe_offset + 4 <= len(data) and data[pe_offset : pe_offset + 4] == b"PE\x00\x00"
+
+
+def _stream_is_seekable(file_obj: BinaryIO) -> bool:
+    try:
+        return bool(file_obj.seekable())
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
 def _has_rule_for_import_reference(result: ScanResult, rule_code: str, import_reference: str) -> bool:
     return any(
         issue.rule_code == rule_code
         and issue.details.get("associated_global", issue.details.get("import_reference")) == import_reference
+        for issue in result.issues
+    )
+
+
+def _has_issue_for_import_reference(result: ScanResult, import_reference: str) -> bool:
+    return any(
+        issue.details.get("associated_global", issue.details.get("import_reference")) == import_reference
         for issue in result.issues
     )
 
@@ -199,12 +383,102 @@ def _is_legitimate_serialization_file(path: str) -> bool:
     return not report.has_security_findings and report.status.value != "error"
 
 
-def _contains_pickle_opcode(data: bytes, opcode_name: str) -> bool:
-    """Return whether a bounded pickle byte window contains a specific opcode."""
+def _path_prefix_looks_like_pickle(path: str) -> bool:
     try:
-        return any(opcode.name == opcode_name for opcode, _arg, _pos in pickletools.genops(data))
+        with open(path, "rb") as handle:
+            return _looks_like_pickle(handle.read(_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES))
+    except OSError:
+        return Path(path).suffix.lower() in _KNOWN_PICKLE_EXTENSIONS
+
+
+def _global_parts(arg: object) -> tuple[str, str] | None:
+    if isinstance(arg, str):
+        parts = arg.replace("\n", " ").split()
+        if len(parts) >= 2:
+            return parts[0], parts[1]
+    if isinstance(arg, tuple) and len(arg) >= 2 and all(isinstance(part, str) for part in arg[:2]):
+        return arg[0], arg[1]
+    return None
+
+
+def _pickle_opcode_summary(data: bytes) -> dict[str, Any]:
+    dangerous_opcodes = {
+        "REDUCE",
+        "INST",
+        "OBJ",
+        "NEWOBJ",
+        "NEWOBJ_EX",
+        "STACK_GLOBAL",
+        "GLOBAL",
+        "BUILD",
+    }
+    opcode_counts: dict[str, int] = {}
+    stack: list[str] = []
+    dangerous_globals: list[str] = []
+    protocol: int | None = None
+    total_opcodes = 0
+
+    try:
+        for opcode, arg, _position in pickletools.genops(data):
+            name = opcode.name
+            total_opcodes += 1
+            opcode_counts[name] = opcode_counts.get(name, 0) + 1
+            if name == "PROTO" and isinstance(arg, int):
+                protocol = arg
+            if name in {"STRING", "UNICODE", "BINSTRING", "SHORT_BINSTRING", "BINUNICODE", "SHORT_BINUNICODE"}:
+                stack.append(str(arg))
+                continue
+            if name == "GLOBAL":
+                parts = _global_parts(arg)
+                if parts is not None:
+                    module, global_name = parts
+                    if is_suspicious_global(module, global_name):
+                        dangerous_globals.append(f"{module}.{global_name}")
+                continue
+            if name == "STACK_GLOBAL" and len(stack) >= 2:
+                global_name = stack.pop()
+                module = stack.pop()
+                if is_suspicious_global(module, global_name):
+                    dangerous_globals.append(f"{module}.{global_name}")
+                continue
+            if name not in {"MEMOIZE", "PUT", "BINPUT", "LONG_BINPUT"}:
+                stack.clear()
+    except Exception as error:
+        return {"parse_error": str(error)}
+
+    observed_dangerous_opcodes = sorted(opcode for opcode in dangerous_opcodes if opcode_counts.get(opcode, 0) > 0)
+    return {
+        "dangerous_opcodes": observed_dangerous_opcodes,
+        "has_dangerous_opcodes": bool(observed_dangerous_opcodes),
+        "opcode_counts": opcode_counts,
+        "total_opcodes": total_opcodes,
+        "pickle_protocol": protocol,
+        "dangerous_globals": sorted(set(dangerous_globals)),
+    }
+
+
+def _rebuild_tensor_indicators_are_documentation_literals(data: bytes) -> bool:
+    """Return True when CVE-2026-24747 text indicators appear only in doc-like literals."""
+    saw_rebuild_tensor_literal = False
+    try:
+        for opcode, arg, _position in pickletools.genops(data):
+            if opcode.name not in {
+                "STRING",
+                "UNICODE",
+                "BINSTRING",
+                "SHORT_BINSTRING",
+                "BINUNICODE",
+                "SHORT_BINUNICODE",
+            }:
+                continue
+            if not isinstance(arg, str) or "_rebuild_tensor" not in arg:
+                continue
+            saw_rebuild_tensor_literal = True
+            if not _is_primarily_documentation(arg.encode("utf-8", errors="ignore")):
+                return False
     except Exception:
         return False
+    return saw_rebuild_tensor_literal
 
 
 def _copyreg_extension_reduce_references(data: bytes) -> list[tuple[str, int]]:
@@ -250,19 +524,12 @@ class PickleScanner(BaseScanner):
     def can_handle(cls, path: str) -> bool:
         """Check if the file is a raw pickle stream."""
         suffix = Path(path).suffix.lower()
-        if suffix in _KNOWN_PICKLE_EXTENSIONS and not os.path.isfile(path):
-            return True
-
         try:
             from modelaudit.utils.file.detection import detect_file_format, validate_file_type
 
             file_format = detect_file_format(path)
         except Exception:
-            try:
-                with open(path, "rb") as handle:
-                    return _looks_like_pickle(handle.read(_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES))
-            except OSError:
-                return suffix in _KNOWN_PICKLE_EXTENSIONS
+            return _path_prefix_looks_like_pickle(path)
 
         if file_format == "zip":
             return False
@@ -274,11 +541,7 @@ class PickleScanner(BaseScanner):
                 logger.warning("File type validation errored for potential pickle file %s: %s", path, validation_error)
             return True
         if suffix in _KNOWN_PICKLE_EXTENSIONS:
-            try:
-                with open(path, "rb") as handle:
-                    return _looks_like_pickle(handle.read(_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES))
-            except OSError:
-                return True
+            return _path_prefix_looks_like_pickle(path)
         return False
 
     def _prepare_scan_context(self, source: str) -> None:
@@ -308,9 +571,14 @@ class PickleScanner(BaseScanner):
             return None
         return PyTorchZipScanner(config=self.config).scan(path, timeout=self.timeout)
 
-    def _check_scan_stream_size_limit(self, file_size: int, source: str) -> ScanResult | None:
-        normalized_size = max(file_size, 0)
-        if self.max_file_read_size and self.max_file_read_size > 0 and normalized_size > self.max_file_read_size:
+    def _check_scan_stream_size_limit(self, file_size: int | None, source: str) -> ScanResult | None:
+        normalized_size = None if file_size is None else max(file_size, 0)
+        if (
+            normalized_size is not None
+            and self.max_file_read_size
+            and self.max_file_read_size > 0
+            and normalized_size > self.max_file_read_size
+        ):
             result = self._create_result()
             result.metadata["file_size"] = normalized_size
             result.add_check(
@@ -324,17 +592,6 @@ class PickleScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        if self._path_validation_result is None:
-            self._path_validation_result = ScanResult(scanner_name=self.name, scanner=self)
-        self._path_validation_result.metadata["file_size"] = normalized_size
-        if self.max_file_read_size and self.max_file_read_size > 0:
-            self._path_validation_result.add_check(
-                name="File Size Limit",
-                passed=True,
-                message="File size within limit",
-                location=source,
-                details={"file_size": normalized_size, "max_file_read_size": self.max_file_read_size},
-            )
         return None
 
     def _scan_standalone_stream(self, file_obj: BinaryIO, file_size: int | None, *, source: str) -> ScanResult:
@@ -350,13 +607,32 @@ class PickleScanner(BaseScanner):
         except (TypeError, ValueError, OverflowError):
             return _ROOT_RAW_SCAN_LIMIT_BYTES
 
+    def _root_expensive_raw_scan_limit(self) -> int:
+        limit = self.config.get("pickle_expensive_raw_scan_limit_bytes", _ROOT_EXPENSIVE_RAW_SCAN_LIMIT_BYTES)
+        try:
+            parsed_limit = int(limit)
+        except (TypeError, ValueError, OverflowError):
+            return _ROOT_EXPENSIVE_RAW_SCAN_LIMIT_BYTES
+        return max(parsed_limit, 0)
+
     def _read_root_raw_scan_window(self, path: str, file_size: int) -> bytes:
         parsed_limit = self._root_raw_scan_limit()
         if parsed_limit <= 0:
             return b""
         read_size = min(file_size, parsed_limit)
+        chunks: list[bytes] = []
+        remaining = read_size
         with open(path, "rb") as handle:
-            return handle.read(read_size)
+            while remaining > 0:
+                self.check_interrupted()
+                if self._check_timeout(allow_partial=True):
+                    break
+                chunk = handle.read(min(_RAW_READ_CHUNK_BYTES, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+        return b"".join(chunks)
 
     def _read_root_raw_scan_window_from_stream(self, file_obj: BinaryIO, file_size: int | None) -> bytes:
         parsed_limit = self._root_raw_scan_limit()
@@ -368,16 +644,67 @@ class PickleScanner(BaseScanner):
             return b""
 
         try:
-            if hasattr(file_obj, "seekable") and not file_obj.seekable():
+            if not _stream_is_seekable(file_obj):
                 return b""
             start_position = file_obj.tell()
             data = file_obj.read(read_size)
             file_obj.seek(start_position)
         except (AttributeError, OSError, ValueError):
             return b""
-        return bytes(data) if isinstance(data, bytes | bytearray | memoryview) else b""
+        return bytes(data)
 
-    def _run_root_raw_detectors(self, data: bytes, result: ScanResult, source: str) -> None:
+    def _read_stream_payload_for_root(self, file_obj: BinaryIO, file_size: int | None) -> bytes:
+        limit = (
+            self.max_file_read_size
+            if self.max_file_read_size and self.max_file_read_size > 0
+            else self._root_raw_scan_limit()
+        )
+        if limit <= 0:
+            return b""
+        remaining = file_size if file_size is not None else limit
+        chunks: list[bytes] = []
+        bytes_read = 0
+        while remaining is None or remaining > 0:
+            self.check_interrupted()
+            if self._check_timeout(allow_partial=True):
+                break
+            read_size = _RAW_READ_CHUNK_BYTES if remaining is None else min(_RAW_READ_CHUNK_BYTES, remaining)
+            chunk = file_obj.read(read_size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            bytes_read += len(chunk)
+            if bytes_read > limit:
+                raise ValueError(f"File read exceeds limit: {bytes_read} bytes (max: {limit})")
+            if remaining is not None:
+                remaining -= len(chunk)
+        return b"".join(chunks)
+
+    @staticmethod
+    def _raw_window_from_payload(payload: bytes, configured_limit: int) -> bytes:
+        if configured_limit <= 0:
+            return b""
+        return payload[:configured_limit]
+
+    def _add_stream_integrity_check(self, payload: bytes, result: ScanResult, source: str) -> None:
+        sha256 = hashlib.sha256(payload).hexdigest()
+        result.metadata.setdefault("file_hashes", {})["sha256"] = sha256
+        result.add_check(
+            name="File Integrity Check",
+            passed=True,
+            message="Stream SHA256 hash calculated",
+            location=source,
+            details={"sha256": sha256, "bytes_hashed": len(payload)},
+        )
+
+    def _run_root_raw_detectors(
+        self,
+        data: bytes,
+        result: ScanResult,
+        source: str,
+        *,
+        skip_expensive_detectors: bool = False,
+    ) -> None:
         """Run non-pickle-specific ModelAudit detectors over a bounded raw window."""
         if not data:
             return
@@ -385,9 +712,67 @@ class PickleScanner(BaseScanner):
         self._scan_raw_text_indicators(data, result, source)
         self._scan_encoded_text_indicators(data, result, source)
         self._analyze_cve_patterns(data, result, source)
-        self.check_for_embedded_secrets(data, result, source)
-        self.check_for_jit_script_code(data, result, model_type="pickle", context=source)
-        self.check_for_network_communication(data, result, context=source)
+        self._scan_binary_tail_if_needed(data, result, source)
+        if skip_expensive_detectors:
+            result.metadata["pickle_expensive_raw_detectors_skipped"] = True
+            return
+
+        expensive_limit = self._root_expensive_raw_scan_limit()
+        if expensive_limit <= 0:
+            result.metadata["pickle_expensive_raw_detectors_skipped"] = True
+            result.metadata["pickle_expensive_raw_detector_skip_reason"] = "disabled"
+            return
+        expensive_data = data[:expensive_limit]
+        if len(expensive_data) < len(data):
+            result.metadata["pickle_expensive_raw_detector_bytes_scanned"] = len(expensive_data)
+            result.metadata["pickle_expensive_raw_detector_bytes_available"] = len(data)
+
+        if _contains_any_seed(expensive_data, _SECRET_SCAN_SEEDS) or _has_alnum_secret_shape(expensive_data):
+            self.check_for_embedded_secrets(expensive_data, result, source)
+        else:
+            result.metadata["pickle_secrets_raw_detector_skipped"] = True
+
+        if _contains_any_seed(expensive_data, _JIT_SCAN_SEEDS):
+            self.check_for_jit_script_code(expensive_data, result, model_type="pickle", context=source)
+        else:
+            result.metadata["pickle_jit_raw_detector_skipped"] = True
+
+        if _contains_any_seed(expensive_data, _NETWORK_SCAN_SEEDS) or _has_domain_or_ip_shape(expensive_data):
+            self.check_for_network_communication(expensive_data, result, context=source)
+        else:
+            result.metadata["pickle_network_raw_detector_skipped"] = True
+
+    def _scan_binary_tail_if_needed(self, data: bytes, result: ScanResult, source: str) -> None:
+        if Path(source).suffix.lower() != ".bin":
+            return
+        first_pickle_end_pos = result.metadata.get("first_pickle_end_pos")
+        if not isinstance(first_pickle_end_pos, int) or first_pickle_end_pos <= 0 or first_pickle_end_pos >= len(data):
+            return
+        tail = data[first_pickle_end_pos:]
+        lower_tail = tail.lower()
+        for signature, label, rule_code in _BINARY_TAIL_SIGNATURES:
+            haystack = lower_tail if signature.isascii() else tail
+            needle = signature.lower() if signature.isascii() else signature
+            offset = haystack.find(needle)
+            if offset < 0:
+                continue
+            if signature == b"MZ" and not _looks_like_portable_executable(tail[offset : offset + 1024]):
+                continue
+            absolute_offset = first_pickle_end_pos + offset
+            result.add_check(
+                name="Pickle Binary Tail Detection",
+                passed=False,
+                message=f"Suspicious binary tail after pickle stream: {label}",
+                severity=IssueSeverity.CRITICAL,
+                location=f"{source} (pos {absolute_offset})",
+                details={
+                    "source": "pickle_binary_tail",
+                    "pattern": label,
+                    "offset": absolute_offset,
+                    "first_pickle_end_pos": first_pickle_end_pos,
+                },
+                rule_code=rule_code,
+            )
 
     def _add_root_legacy_metadata_detectors(self, result: ScanResult, source: str) -> None:
         references = result.metadata.get("import_references")
@@ -433,6 +818,7 @@ class PickleScanner(BaseScanner):
                 module == "__main__"
                 and not bool(reference.get("is_dangerous"))
                 and not _has_rule_for_import_reference(result, "S207", import_reference)
+                and not _has_issue_for_import_reference(result, import_reference)
             ):
                 result.add_check(
                     name="Pickle BUILD State Safety Check",
@@ -450,6 +836,8 @@ class PickleScanner(BaseScanner):
 
     def _scan_raw_text_indicators(self, data: bytes, result: ScanResult, source: str) -> None:
         lower = data.lower()
+        if _is_primarily_documentation(lower):
+            return
         indicators: list[tuple[str, bytes, dict[str, Any]]] = []
         warning_indicators: list[tuple[str, bytes, dict[str, Any]]] = []
         if b"import os" in lower:
@@ -458,14 +846,28 @@ class PickleScanner(BaseScanner):
             indicators.append(
                 ("importlib.import_module", b"importlib", {"associated_global": "importlib.import_module"})
             )
-        elif _contains_non_comment_token(lower, b"importlib"):
-            indicators.append(("importlib", b"importlib", {"associated_global": "importlib"}))
-        if b"eval(" in lower or b"eval (" in lower:
+        elif b"importlib" in lower:
+            importlib_method_added = False
+            for method in (b"import_module", b"reload", b"find_loader", b"load_module"):
+                if method in lower and _contains_non_comment_token(lower, b"importlib"):
+                    label = f"importlib.{method.decode('ascii')}"
+                    indicators.append((label, b"importlib", {"associated_global": label}))
+                    importlib_method_added = True
+                    break
+            if not importlib_method_added and _contains_non_comment_token(lower, b"importlib") and b"import " in lower:
+                indicators.append(("importlib", b"importlib", {"associated_global": "importlib"}))
+        if _contains_call_token(lower, b"eval"):
             indicators.append(("eval", b"eval", {"associated_global": "builtins.eval"}))
-        if b"exec(" in lower or b"exec (" in lower:
+        if _contains_call_token(lower, b"exec"):
             indicators.append(("exec", b"exec", {"associated_global": "builtins.exec"}))
-        if b"webbrowser.open" in lower or (b"webbrowser" in lower and b"open" in lower):
+        if _contains_module_attr(lower, b"webbrowser", b"open"):
             indicators.append(("webbrowser.open", b"webbrowser", {"associated_global": "webbrowser.open"}))
+        elif b"webbrowser" in lower:
+            for method in (b"open", b"open_new", b"open_new_tab"):
+                if method in lower and _contains_non_comment_token(lower, b"webbrowser"):
+                    label = f"webbrowser.{method.decode('ascii')}"
+                    indicators.append((label, b"webbrowser", {"associated_global": label}))
+                    break
         if b"runpy" in lower:
             runpy_global = "runpy.run_module" if b"run_module" in lower else "runpy"
             indicators.append((runpy_global, b"runpy", {"associated_global": runpy_global}))
@@ -478,15 +880,15 @@ class PickleScanner(BaseScanner):
         ):
             if module_token in lower:
                 indicators.append((associated_global, module_token, {"associated_global": associated_global}))
-        if b"os.system" in lower:
+        if _contains_module_attr(lower, b"os", b"system"):
             indicators.append(("os.system", b"os.system", {"associated_global": "os.system"}))
-        if b"posix.system" in lower:
+        if _contains_module_attr(lower, b"posix", b"system"):
             indicators.append(("posix.system", b"posix.system", {"associated_global": "posix.system"}))
-        if b"nt.system" in lower:
+        if _contains_module_attr(lower, b"nt", b"system"):
             indicators.append(("nt.system", b"nt.system", {"associated_global": "nt.system"}))
-        if b"os.popen" in lower:
+        if _contains_module_attr(lower, b"os", b"popen"):
             indicators.append(("os.popen", b"os.popen", {"associated_global": "os.popen"}))
-        if b"os.spawn" in lower:
+        if re.search(rb"(?<![A-Za-z0-9_])os\s*\.\s*spawn", lower):
             indicators.append(("os.spawn", b"os.spawn", {"associated_global": "os.spawn"}))
         for commands_api in (b"commands.getoutput", b"commands.getstatusoutput"):
             if commands_api in lower:
@@ -497,9 +899,7 @@ class PickleScanner(BaseScanner):
                 label = subprocess_api.decode("ascii")
                 indicators.append((label, subprocess_api, {"associated_global": label}))
 
-        for label, token, details in indicators:
-            if token == b"webbrowser" and b"webbrowser# safe comment" in lower:
-                continue
+        for label, _token, details in indicators:
             result.add_check(
                 name="Pickle Raw Content Detection",
                 passed=False,
@@ -577,6 +977,10 @@ class PickleScanner(BaseScanner):
                 continue
             seen_tokens.add(token)
             token_count += 1
+            if len(token) > _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES and not any(
+                seed in token for seed in _BASE64_CODE_EXECUTION_SEEDS
+            ):
+                continue
 
             padded_token = token + (b"=" * ((4 - (len(token) % 4)) % 4))
             try:
@@ -608,7 +1012,7 @@ class PickleScanner(BaseScanner):
                 result.add_check(
                     name="Encoded Code Execution Pattern Detection",
                     passed=False,
-                    message=f"Encoded pickle content decodes to dangerous code pattern: {label}",
+                    message=f"Legacy encoded dangerous pattern detected: {label}",
                     severity=IssueSeverity.CRITICAL,
                     location=source,
                     details={
@@ -616,6 +1020,7 @@ class PickleScanner(BaseScanner):
                         "pattern": label,
                         "source": "bounded_raw_pickle_window",
                         "decoded_size": len(decoded),
+                        "legacy_rule_alias": True,
                     },
                     rule_code="S104",
                 )
@@ -635,9 +1040,15 @@ class PickleScanner(BaseScanner):
             logger.warning("Error checking pickle CVE patterns: %s", error)
             return
 
+        opcode_summary = _pickle_opcode_summary(data)
+        opcode_counts = opcode_summary.get("opcode_counts", {})
+        has_setitem_opcode = isinstance(opcode_counts, dict) and (
+            opcode_counts.get("SETITEM", 0) > 0 or opcode_counts.get("SETITEMS", 0) > 0
+        )
+
         if (
             b"_rebuild_tensor" in data
-            and b"s" in data
+            and has_setitem_opcode
             and not any(attribution.cve_id == "CVE-2026-24747" for attribution in attributions)
         ):
             from modelaudit.detectors.cve_patterns import CVEAttribution
@@ -655,9 +1066,26 @@ class PickleScanner(BaseScanner):
                 )
             )
 
-        has_setitem_opcode = _contains_pickle_opcode(data, "SETITEM")
-        has_dangerous_system_global = (b"os" in data or b"posix" in data or b"nt" in data) and b"system" in data
+        pickle_parse_failed = "parse_error" in opcode_summary
+        attributions = [
+            attribution
+            for attribution in attributions
+            if not (
+                attribution.cve_id == "CVE-2026-24747"
+                and (
+                    (not has_setitem_opcode and not pickle_parse_failed)
+                    or _rebuild_tensor_indicators_are_documentation_literals(data)
+                )
+            )
+        ]
+
+        dangerous_globals = opcode_summary.get("dangerous_globals", [])
+        has_dangerous_system_global = isinstance(dangerous_globals, list) and any(
+            global_ref in {"os.system", "posix.system", "nt.system"} for global_ref in dangerous_globals
+        )
+        emitted_cve_rule_keys: set[tuple[str, str]] = set()
         if has_setitem_opcode and has_dangerous_system_global:
+            emitted_cve_rule_keys.add(("CVE-2026-24747", "S209"))
             result.add_check(
                 name="CVE-2026-24747 SETITEM Abuse Detection",
                 passed=False,
@@ -666,11 +1094,16 @@ class PickleScanner(BaseScanner):
                 location=source or self.current_file_path,
                 details={
                     "cve_id": "CVE-2026-24747",
+                    "cvss": 9.8,
+                    "cwe": "CWE-502",
+                    "description": "PyTorch weights_only restricted unpickler SETITEM abuse pattern",
+                    "remediation": "Upgrade PyTorch and avoid loading untrusted pickle checkpoints",
+                    "cve_risk_score": 9.8,
                     "pattern_type": "setitem_near_dangerous_global",
                     "associated_global": "os.system",
                     "analysis": "bounded_raw_pickle_window",
                 },
-                rule_code="S310",
+                rule_code="S209",
             )
 
         if not attributions:
@@ -681,6 +1114,11 @@ class PickleScanner(BaseScanner):
         result.metadata["primary_cve"] = max(attributions, key=lambda item: item.cvss).cve_id
 
         for attribution in attributions:
+            rule_code = self._rule_code_for_cve_attribution(attribution.patterns_matched)
+            cve_rule_key = (attribution.cve_id, rule_code)
+            if cve_rule_key in emitted_cve_rule_keys:
+                continue
+            emitted_cve_rule_keys.add(cve_rule_key)
             severity = (
                 IssueSeverity.CRITICAL
                 if attribution.severity.upper() in {"CRITICAL", "HIGH"}
@@ -692,9 +1130,34 @@ class PickleScanner(BaseScanner):
                 message=f"{attribution.cve_id}: {attribution.description}",
                 severity=severity,
                 location=source or self.current_file_path,
-                details=attribution.to_dict(),
-                rule_code="S310",
+                details={**attribution.to_dict(), "cve_risk_score": attribution.cvss},
+                rule_code=rule_code,
             )
+
+    @staticmethod
+    def _rule_code_for_cve_attribution(patterns_matched: list[str]) -> str:
+        joined = " ".join(patterns_matched).lower()
+        if "setitem" in joined:
+            return "S209"
+        if "eval" in joined or "exec" in joined:
+            return "S104"
+        if "compile" in joined:
+            return "S105"
+        if "__import__" in joined:
+            return "S106"
+        if "subprocess" in joined:
+            return "S103"
+        if "os.system" in joined or "system" in joined:
+            return "S101"
+        if "newobj_ex" in joined:
+            return "S204"
+        if "stack_global" in joined:
+            return "S205"
+        if "global" in joined:
+            return "S206"
+        if "build" in joined:
+            return "S207"
+        return "S115"
 
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         metadata = super().extract_metadata(file_path)
@@ -729,27 +1192,35 @@ class PickleScanner(BaseScanner):
             return metadata
 
         metadata["pickle_size"] = len(payload)
-        dangerous_opcodes = []
-        if b"R" in payload:
-            dangerous_opcodes.append("REDUCE")
-        if b"b" in payload:
-            dangerous_opcodes.append("BUILD")
-        if b"\x92" in payload:
-            dangerous_opcodes.append("NEWOBJ_EX")
-        metadata["dangerous_opcodes"] = sorted(set(dangerous_opcodes))
-        metadata["has_dangerous_opcodes"] = bool(dangerous_opcodes)
+        opcode_summary = _pickle_opcode_summary(payload)
+        metadata.update(opcode_summary)
         return metadata
 
-    def scan_stream(self, file_obj: BinaryIO, file_size: int, source: str = "<stream>") -> ScanResult:
+    def scan_stream(self, file_obj: BinaryIO, file_size: int | None, source: str = "<stream>") -> ScanResult:
         """Scan pickle bytes from an already-open stream."""
         self._prepare_scan_context(source)
         size_check = self._check_scan_stream_size_limit(file_size, source)
         if size_check:
             return size_check
-        standalone_size = file_size if file_size >= 0 else None
-        raw_data = self._read_root_raw_scan_window_from_stream(file_obj, standalone_size)
-        result = self._scan_standalone_stream(file_obj, standalone_size, source=source)
-        self._run_root_raw_detectors(raw_data, result, source)
+        standalone_size = file_size if file_size is not None and file_size >= 0 else None
+        if _stream_is_seekable(file_obj):
+            start_position = file_obj.tell()
+            result = self._scan_standalone_stream(file_obj, standalone_size, source=source)
+            file_obj.seek(start_position)
+            raw_data = self._read_root_raw_scan_window_from_stream(file_obj, standalone_size)
+            if standalone_size is not None and len(raw_data) == standalone_size:
+                self._add_stream_integrity_check(raw_data, result, source)
+        else:
+            payload = self._read_stream_payload_for_root(file_obj, standalone_size)
+            result = self._scan_standalone_stream(io.BytesIO(payload), standalone_size, source=source)
+            self._add_stream_integrity_check(payload, result, source)
+            raw_data = self._raw_window_from_payload(payload, self._root_raw_scan_limit())
+        self._run_root_raw_detectors(
+            raw_data,
+            result,
+            source,
+            skip_expensive_detectors=result.has_errors,
+        )
         self._add_root_legacy_metadata_detectors(result, source)
         return result
 
@@ -775,10 +1246,16 @@ class PickleScanner(BaseScanner):
         self.add_file_integrity_check(path, result)
 
         try:
-            raw_data = self._read_root_raw_scan_window(path, file_size)
-            self._run_root_raw_detectors(raw_data, result, path)
             with open(path, "rb") as handle:
                 scan_result = self._scan_standalone_stream(handle, file_size, source=path)
+            result.merge(scan_result)
+            raw_data = self._read_root_raw_scan_window(path, file_size)
+            self._run_root_raw_detectors(
+                raw_data,
+                result,
+                path,
+                skip_expensive_detectors=result.has_errors,
+            )
         except OSError as error:
             result.add_check(
                 name="Pickle File Open",
@@ -797,7 +1274,6 @@ class PickleScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.merge(scan_result)
         self._add_root_legacy_metadata_detectors(result, path)
         result.finish(success=scan_result.success)
         return result

@@ -25,6 +25,7 @@ from modelaudit_picklescan import (
     scan_file,
 )
 
+EXPECTED_SYSTEM_GLOBAL = "nt.system" if os.name == "nt" else "posix.system"
 SYSTEM_GLOBALS = frozenset({"nt.system", "os.system", "posix.system"})
 
 
@@ -99,11 +100,145 @@ def test_scan_bytes_detects_reduce_invoking_os_system() -> None:
     assert report.has_security_findings is True
     assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
     assert not any(finding.rule_code == "DANGEROUS_GLOBAL" for finding in report.findings)
-    assert any(any(symbol in finding.message for symbol in SYSTEM_GLOBALS) for finding in report.findings)
-    assert any(finding.details.get("import_reference") in SYSTEM_GLOBALS for finding in report.findings)
+    assert any(EXPECTED_SYSTEM_GLOBAL in finding.message for finding in report.findings)
+    assert any(finding.details.get("import_reference") == EXPECTED_SYSTEM_GLOBAL for finding in report.findings)
     assert any(
-        ref["import_reference"] in SYSTEM_GLOBALS and ref["is_dangerous"] is True
+        ref["import_reference"] == EXPECTED_SYSTEM_GLOBAL and ref["is_dangerous"] is True
         for ref in report.metadata["import_references"]
+    )
+
+
+def test_scan_bytes_treats_protocol5_buffer_stack_global_as_malformed() -> None:
+    payload = b"\x80\x05\x8c\x04safe\x94\x97\x8c\x08anything\x94\x93."
+
+    report = scan_bytes(payload, source="next-buffer-stack-global.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "MALFORMED_STACK_GLOBAL" for finding in report.findings)
+
+
+def test_scan_bytes_escalates_main_reduce_to_malicious() -> None:
+    report = scan_bytes(b"c__main__\nDanger\n)R.", source="main-reduce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == "__main__.Danger"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_ignores_comment_only_importlib_literal() -> None:
+    report = scan_bytes(pickle.dumps({"doc": "importlib # harmless"}, protocol=4), source="importlib-comment.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+def test_scan_bytes_ignores_wrapped_version_dunder_metadata() -> None:
+    report = scan_bytes(pickle.dumps({"doc": "['__version__']"}, protocol=4), source="version-metadata.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+def test_scan_bytes_detects_protocol0_encoded_nested_pickle_mid_literal() -> None:
+    nested = b"cos\nsystem\n)R."
+    encoded = "prefix-" + base64.b64encode(nested).decode("ascii")
+
+    report = scan_bytes(pickle.dumps({"outer": encoded}, protocol=4), source="protocol0-nested-b64.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "S601" for finding in report.findings)
+    assert any(finding.details.get("import_reference") in SYSTEM_GLOBALS for finding in report.findings)
+
+
+def test_scan_bytes_detects_junk_prefixed_small_raw_nested_pickle() -> None:
+    nested = b"cos\nsystem\n)R."
+
+    report = scan_bytes(pickle.dumps({"outer": b"JUNK" + nested}, protocol=4), source="junk-nested-raw.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "S213" for finding in report.findings)
+    assert any(finding.details.get("import_reference") in SYSTEM_GLOBALS for finding in report.findings)
+
+
+@pytest.mark.parametrize(
+    "separator",
+    [
+        b"\x00" * 64,
+        b"# padding that looks like text\n",
+        b"MARK" * 16,
+    ],
+)
+def test_scan_bytes_detects_follow_on_malicious_pickle_streams(separator: bytes) -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4) + separator + b"cos\nsystem\n)R."
+
+    report = scan_bytes(payload, source="multi-stream.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(notice.code == "follow_on_stream_detected" for notice in report.notices)
+    assert any(finding.details.get("import_reference") in SYSTEM_GLOBALS for finding in report.findings)
+
+
+def test_scan_bytes_detects_malicious_stream_after_malformed_prefix() -> None:
+    payload = b"\x80\x04\xff" + (b"\x00" * 32) + b"cos\nsystem\n)R."
+
+    report = scan_bytes(payload, source="malformed-prefix-stream.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.details.get("import_reference") in SYSTEM_GLOBALS for finding in report.findings)
+
+
+def test_scan_bytes_escalates_copyreg_extension_reduce() -> None:
+    report = scan_bytes(b"\x80\x04\x82\x01)R.", source="extension-reduce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("opaque_extension") is True
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    ("payload", "opcode", "code"),
+    [
+        (b"\x80\x04\x82\x01)R.", "EXT1", 1),
+        (b"\x80\x04\x83\x01\x00)R.", "EXT2", 1),
+        (b"\x80\x04\x84\x01\x00\x00\x00)R.", "EXT4", 1),
+    ],
+)
+def test_scan_bytes_escalates_all_copyreg_extension_reduce_opcodes(
+    payload: bytes,
+    opcode: str,
+    code: int,
+) -> None:
+    report = scan_bytes(payload, source=f"{opcode.lower()}-reduce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("opcode") == "REDUCE"
+        and finding.details.get("name") == f"code_{code}"
+        and finding.details.get("opaque_extension") is True
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_records_unresolved_copyreg_extension_without_reduce() -> None:
+    report = scan_bytes(b"\x80\x04\x82\x01.", source="extension-ref.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "EXTENSION_REF"
+        and finding.severity == Severity.WARNING
+        and finding.details.get("opcode") == "EXT1"
+        for finding in report.findings
     )
 
 
@@ -327,7 +462,7 @@ def test_scan_file_scans_pytorch_zip_data_pickle(tmp_path: Path) -> None:
 
 
 def test_scan_file_detects_malicious_pytorch_zip_data_pickle(tmp_path: Path) -> None:
-    archive_path = tmp_path / "model.bin"
+    archive_path = tmp_path / "model.pt"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("data.pkl", pickle.dumps(MaliciousPayload(), protocol=4))
         archive.writestr("version", "3\n")
@@ -340,6 +475,23 @@ def test_scan_file_detects_malicious_pytorch_zip_data_pickle(tmp_path: Path) -> 
     assert any(finding.rule_code == "DANGEROUS_CALL" for finding in report.findings)
     assert all(
         finding.location is not None and f"{archive_path}:data.pkl" in finding.location for finding in report.findings
+    )
+
+
+def test_scan_file_scans_pickle_members_without_data_pickle_in_pytorch_zip(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.bin"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("custom.pkl", pickle.dumps(MaliciousPayload(), protocol=4))
+        archive.writestr("version", "3\n")
+        archive.writestr("byteorder", "little")
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["custom.pkl"]
+    assert any(
+        finding.location is not None and f"{archive_path}:custom.pkl" in finding.location for finding in report.findings
     )
 
 
@@ -573,13 +725,11 @@ def test_scan_stream_enforces_total_unbounded_stream_read_limit() -> None:
         source="unknown-size-over-limit.pkl",
     )
 
-    assert report.status == ScanStatus.ERROR
+    assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.UNKNOWN
     assert report.findings == ()
-    assert len(report.errors) == 1
-    assert report.errors[0].category == "io_error"
-    assert report.errors[0].exception_type == "ValueError"
-    assert "max_unbounded_stream_read_bytes" in report.errors[0].message
+    assert not any(error.category == "io_error" for error in report.errors)
+    assert any(notice.code == "unbounded_stream_truncated" for notice in report.notices)
 
 
 def test_scan_stream_bounds_protocol_zero_readline_without_declared_size() -> None:
@@ -590,8 +740,11 @@ def test_scan_stream_bounds_protocol_zero_readline_without_declared_size() -> No
         source="unterminated-protocol-zero.pkl",
     )
 
-    assert report.status == ScanStatus.ERROR
-    assert report.errors[0].exception_type == "ValueError"
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert not any(error.category == "io_error" for error in report.errors)
+    assert any(notice.code == "unbounded_stream_truncated" for notice in report.notices)
     assert stream.unbounded_readline_attempted is False
     assert stream.max_seen_readline_size <= 8
 
@@ -768,6 +921,30 @@ def test_scan_bytes_flags_dill_loads_as_dangerous() -> None:
     )
 
 
+def test_scan_bytes_flags_dill_load_as_dangerous() -> None:
+    payload = b"cdill\nload\n."
+
+    report = scan_bytes(payload, source="dill-load.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_GLOBAL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == "dill.load"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_allows_benign_dill_text_literal() -> None:
+    payload = pickle.dumps({"note": "dill is mentioned in documentation only"}, protocol=4)
+
+    report = scan_bytes(payload, source="dill-note.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
 @pytest.mark.parametrize(
     ("payload", "expected_reference"),
     [
@@ -783,6 +960,12 @@ def test_scan_bytes_flags_dill_loads_as_dangerous() -> None:
         (b"cwebbrowser\nopen\n(tR.", "webbrowser.open"),
         (b"czipfile\nZipFile\n(tR.", "zipfile.ZipFile"),
         (b"cbuiltins\nglobals\n(tR.", "builtins.globals"),
+        (b"csmtplib\nSMTP\n(tR.", "smtplib.SMTP"),
+        (b"chttplib\nHTTPConnection\n(tR.", "httplib.HTTPConnection"),
+        (b"csqlite3\nconnect\n(tR.", "sqlite3.connect"),
+        (b"cmarshal\nloads\n(tR.", "marshal.loads"),
+        (b"ccloudpickle\nload\n(tR.", "cloudpickle.load"),
+        (b"cpkgutil\nresolve_name\n(tR.", "pkgutil.resolve_name"),
     ],
 )
 def test_scan_bytes_flags_expanded_high_risk_callables(payload: bytes, expected_reference: str) -> None:
@@ -794,6 +977,21 @@ def test_scan_bytes_flags_expanded_high_risk_callables(payload: bytes, expected_
         finding.rule_code == "DANGEROUS_CALL"
         and finding.severity == Severity.CRITICAL
         and finding.details.get("import_reference") == expected_reference
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_flags_newobj_ex_dangerous_class() -> None:
+    payload = b"\x80\x04cos\nsystem\n)}\x92."
+
+    report = scan_bytes(payload, source="newobj-ex.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("opcode") == "NEWOBJ_EX"
+        and finding.details.get("import_reference") == "os.system"
         for finding in report.findings
     )
 
@@ -970,6 +1168,9 @@ def test_scan_bytes_warns_on_main_module_global_references() -> None:
 
 
 def test_scan_bytes_does_not_scan_raw_binbytes_payloads_as_text_strings() -> None:
+    # Opaque tensor byte blobs are probed for nested pickle streams, but are not
+    # decoded as source text in the standalone package; root ModelAudit raw
+    # detectors own non-pickle text scanning on bounded file windows.
     payload = pickle.dumps({"blob": b"A" * 256 + b"subprocess.run exec("}, protocol=4)
 
     report = scan_bytes(payload, source="tensor-bytes.pkl")

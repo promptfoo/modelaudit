@@ -171,6 +171,8 @@ def pytest_runtest_setup(item):
             "test_file_iterator.py",  # Streaming file iterator memory regression tests
             "test_benchmark_report.py",  # benchmark CI summary and regression gate tests
             "test_large_pickle_corpus_qa.py",  # large PickleScan Rust corpus QA harness tests
+            "test_dill_joblib_enhanced.py",  # Dill/joblib pickle routing regression tests
+            "test_pickle_context_filtering.py",  # Pickle context filtering regression tests
             "test_xdist_status.py",  # xdist worker progress reporting tests
         ]
 

@@ -107,7 +107,8 @@ the native extension directly.
 
 ## Parity Gates
 
-Run these gates before enabling Rust by default:
+These gates were used to validate the Rust-only pickle scanner before removing
+the Python engine fallback:
 
 1. Existing standalone tests pass with the Rust-only package engine.
 2. Rust golden comparisons match for all committed pickle fixtures:

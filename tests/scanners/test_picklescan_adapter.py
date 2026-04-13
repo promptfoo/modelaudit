@@ -188,7 +188,7 @@ def test_pickle_report_to_scan_result_preserves_legacy_builtin_call_rule_alias()
 
     result = pickle_report_to_scan_result(report)
 
-    assert {issue.rule_code for issue in result.issues} >= {"S115", "S201"}
+    assert {issue.rule_code for issue in result.issues} >= {"S104", "S201"}
 
 
 def test_pickle_report_to_scan_result_preserves_warning_dangerous_calls() -> None:
@@ -312,7 +312,7 @@ def test_pickle_report_to_scan_result_falls_back_for_unmapped_persistent_id_opco
         ("PERSISTENT_ID", {"opcode": "CUSTOM_PERSISTENT_OPCODE"}, "S212"),
         ("DANGEROUS_CALL", {"opcode": "REDUCE"}, "S201"),
         ("DANGEROUS_CALL", {"module": "sys", "name": "exit"}, "S102"),
-        ("DANGEROUS_CALL", {"module": "builtins", "name": "exec"}, "S115"),
+        ("DANGEROUS_CALL", {"module": "builtins", "name": "exec"}, "S104"),
         ("DANGEROUS_CALL", {"module": "custom", "name": "loader"}, "S201"),
         ("DANGEROUS_GLOBAL", {"opcode": "GLOBAL"}, "S206"),
         ("DANGEROUS_GLOBAL", {"module": "posix", "name": "system"}, "S101"),
@@ -1017,7 +1017,7 @@ def test_pickle_report_to_scan_result_ignores_decompressed_wrapper_suffix_for_jo
     )
 
 
-def test_pickle_report_to_scan_result_allows_joblib_serialization_tail_without_boundary() -> None:
+def test_pickle_report_to_scan_result_requires_boundary_for_joblib_serialization_tail() -> None:
     report = PickleReport(
         source="numpy_arrays.joblib",
         status=ScanStatus.INCONCLUSIVE,
@@ -1054,8 +1054,8 @@ def test_pickle_report_to_scan_result_allows_joblib_serialization_tail_without_b
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata["analysis_incomplete"] is True
-    assert result.metadata["trusted_incomplete_tail"] is True
-    assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
+    assert "trusted_incomplete_tail" not in result.metadata
+    assert any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
 
 
 def test_pickle_report_to_scan_result_requires_boundary_for_non_joblib_tail_suppression() -> None:
