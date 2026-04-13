@@ -62,6 +62,10 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
+      - name: Run standalone picklescan Rust tests
+        run: |
+          cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+
       - name: Prepare benchmark temp directories
         id: paths
         run: |

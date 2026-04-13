@@ -546,7 +546,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] S-D2-29 — Document Rust toolchain requirement in contributor setup.
 - [x] S-D2-30 — Add standalone package project URLs.
 - [x] S-D2-33 — Validate standalone `uv.lock` in CI.
-- [ ] S-D2-34 — Run standalone `cargo test` in nightly/perf workflows.
+- [x] S-D2-34 — Run standalone `cargo test` in nightly/perf workflows.
 - [ ] S-D2-35 — Install Rust before release-please standalone lock refresh.
 - [ ] S-D2-37 — Add future annotations to large-corpus QA test.
 - [ ] S-D2-38 — Add new tests to `allowed_test_files`.
@@ -746,6 +746,9 @@ This section is the active implementation log for follow-up commits after revisi
   - `npx prettier --check .github/workflows/test.yml` — passed.
   - `uv lock --check` — passed at repo root.
   - `(cd packages/modelaudit-picklescan && uv lock --check)` — passed.
+- S-D2-34 — Same-item commit adds standalone `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` steps to both nightly jobs and the performance workflow before benchmark execution. Targeted QA:
+  - `npx prettier --check .github/workflows/nightly.yml .github/workflows/perf.yml` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 42 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

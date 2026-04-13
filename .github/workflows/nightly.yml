@@ -40,6 +40,10 @@ jobs:
         run: |
           uv sync --extra all-ci
 
+      - name: Run standalone picklescan Rust tests
+        run: |
+          cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+
       - name: Run all tests (fast + slow + integration + performance)
         run: |
           uv run pytest -n auto --tb=short --durations=20
@@ -67,6 +71,10 @@ jobs:
       - name: Sync dependencies
         run: |
           uv sync --extra all-ci-windows
+
+      - name: Run standalone picklescan Rust tests
+        run: |
+          cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
 
       - name: Run all tests
         run: |
