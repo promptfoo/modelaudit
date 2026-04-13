@@ -505,7 +505,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P2-24 — Clean redundant lowercase seed spelling.
 - [x] N-P2-26 — Replace remaining `_contains_non_comment_token` guards with scoped documentation analysis.
 - [x] N-P2-27 — Add Rust string seeds for joblib/cloudpickle/copyreg.
-- [ ] N-P2-28 — Add tests for encoded protocol 2-5 prefixes.
+- [x] N-P2-28 — Add tests for encoded protocol 2-5 prefixes.
 - [ ] N-P2-29 — Complete escaped-hex protocol-0 prefix table.
 - [ ] N-P2-30 — Bound `encoded_nested_literal_probe_windows` linear scan cost.
 - [ ] N-P2-31 — Optimize Rust dangerous-global policy lookup.
@@ -738,6 +738,16 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `uv run mypy packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_flags_expanded_suspicious_string_patterns packages/modelaudit-picklescan/tests/test_api.py -q` — passed, 155 tests.
+- N-P2-28 — Same-item commit adds explicit Rust prefix/window coverage for base64 and hex encoded binary pickle protocol 2, 3, 4, and 5 prefixes, plus Python API coverage for malicious encoded nested pickles across protocols 2-5. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 20 tests.
+  - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
+  - `uv run ruff format --check packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run ruff check packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run mypy packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_detects_binary_protocol_encoded_nested_pickle_mid_literal packages/modelaudit-picklescan/tests/test_api.py -q` — passed, 159 tests.
 
 ### Newly discovered gaps while remediating
 

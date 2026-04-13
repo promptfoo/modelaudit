@@ -198,6 +198,18 @@ def test_scan_bytes_detects_protocol0_encoded_nested_pickle_mid_literal() -> Non
     assert any(finding.details.get("import_reference") in SYSTEM_GLOBALS for finding in report.findings)
 
 
+@pytest.mark.parametrize("protocol", [2, 3, 4, 5])
+def test_scan_bytes_detects_binary_protocol_encoded_nested_pickle_mid_literal(protocol: int) -> None:
+    nested = pickle.dumps(MaliciousPayload(), protocol=protocol)
+    encoded = "prefix-" + base64.b64encode(nested).decode("ascii")
+
+    report = scan_bytes(pickle.dumps({"outer": encoded}, protocol=4), source=f"protocol{protocol}-nested-b64.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "S601" for finding in report.findings)
+    assert any(finding.details.get("import_reference") in SYSTEM_GLOBALS for finding in report.findings)
+
+
 def test_scan_bytes_detects_junk_prefixed_small_raw_nested_pickle() -> None:
     nested = b"cos\nsystem\n)R."
 

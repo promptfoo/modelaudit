@@ -603,6 +603,24 @@ mod tests {
     }
 
     #[test]
+    fn encoded_prefix_gates_recognize_binary_protocols_2_to_5() {
+        for encoded in ["gAJ9Lg==", "gAN9Lg==", "gAR9Lg==", "gAV9Lg=="] {
+            assert!(base64_prefix_has_pickle_prefix(encoded));
+            let wrapped = format!("prefix-{encoded}-suffix");
+            let windows = encoded_nested_literal_probe_windows(&wrapped, 64);
+            assert!(windows.iter().any(|window| window.starts_with(encoded)));
+        }
+
+        for protocol in 2..=5 {
+            let encoded = format!("800{protocol}7d2e");
+            assert!(hex_prefix_has_pickle_prefix(&encoded));
+            let wrapped = format!("prefix-{encoded}-suffix");
+            let windows = encoded_nested_literal_probe_windows(&wrapped, 64);
+            assert!(windows.iter().any(|window| window.starts_with(&encoded)));
+        }
+    }
+
+    #[test]
     fn encoded_prefix_gates_reject_benign_repeated_literals() {
         assert!(!base64_prefix_has_pickle_prefix("AAAAAAAAAAAAAAAA"));
         assert!(!hex_prefix_has_pickle_prefix("4141414141414141"));
