@@ -173,6 +173,18 @@ def test_scan_stream_does_not_flag_primarily_documentation_raw_text() -> None:
     assert not any(issue.details.get("source") == "bounded_raw_pickle_window" for issue in result.issues)
 
 
+def test_scan_stream_documentation_padding_does_not_suppress_raw_structural_evidence() -> None:
+    payload = (b"# documentation line\n" * 32) + b"cposix\nsystem\n."
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="doc-padded-evil.pkl")
+
+    assert any(
+        issue.details.get("source") == "bounded_raw_pickle_window"
+        and issue.details.get("associated_global") in {"os.system", "posix.system", "nt.system"}
+        for issue in result.issues
+    )
+
+
 def test_root_legacy_metadata_detectors_preserve_import_only_and_main_build_rules() -> None:
     scanner = PickleScanner()
     result = ScanResult(scanner_name="pickle", scanner=scanner)

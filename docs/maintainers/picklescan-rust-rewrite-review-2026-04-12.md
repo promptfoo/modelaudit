@@ -476,7 +476,7 @@ This section is the active implementation log for follow-up commits after revisi
 
 - [x] N-P0-1 — Fix uncaught `ValueError` for non-seekable streams above the raw-read cap.
 - [x] N-P0-2 / N-P1-16 — Pass buffered payload size to Rust for non-seekable streams to avoid spurious `short_read`.
-- [ ] N-P0-3 — Scope documentation/comment gating to the relevant literal or evidence window, not the entire raw detector pass.
+- [x] N-P0-3 — Scope documentation/comment gating to the relevant literal or evidence window, not the entire raw detector pass.
 - [ ] N-P0-4 — Prevent documentation-like `_rebuild_tensor` literals from suppressing real CVE-2026-24747 GLOBAL evidence.
 - [ ] N-P0-5 — Clamp user-controlled Rust timeout values before `Duration::from_secs_f64`.
 - [ ] N-P0-6 — Add a clean-Rust hot path that skips expensive raw detectors when full Rust analysis completed cleanly.
@@ -550,6 +550,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 30 tests.
   - Manual default-cap repro with a >8 MiB non-seekable pickle stream — returned `success=False`, `scan_outcome=inconclusive`, reasons `['pickle_analysis_incomplete', 'non_seekable_stream_truncated']`, no `operational_error_reason`, and zero `short_read` issues.
+- N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
+  - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 31 tests, including the doc-only negative and a doc-padded raw `cposix.system` positive.
 
 ### Newly discovered gaps while remediating
 

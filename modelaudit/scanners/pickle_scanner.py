@@ -124,6 +124,22 @@ _NETWORK_SCAN_SEEDS: tuple[bytes, ...] = (
     b"websocket",
     b"zombie",
 )
+_DOCUMENTATION_LINE_PREFIXES = (b"#", b"//", b"/*", b"*")
+_PICKLE_LITERAL_OPCODE_NAMES = frozenset(
+    {
+        "STRING",
+        "UNICODE",
+        "BINSTRING",
+        "SHORT_BINSTRING",
+        "BINUNICODE",
+        "SHORT_BINUNICODE",
+        "BINUNICODE8",
+        "BINBYTES",
+        "SHORT_BINBYTES",
+        "BINBYTES8",
+        "BYTEARRAY8",
+    }
+)
 _JIT_SCAN_SEEDS: tuple[bytes, ...] = (
     b"__import__",
     b"class ",
@@ -230,12 +246,19 @@ def _looks_like_pickle(data: bytes) -> bool:
     return first in {ord("("), ord("]"), ord("}"), ord("c"), ord("i"), ord("l"), ord("d"), ord("t")}
 
 
-def _contains_non_comment_token(data: bytes, token: bytes) -> bool:
+def _contains_non_comment_token(
+    data: bytes,
+    token: bytes,
+    documentation_spans: tuple[tuple[int, int], ...] = (),
+) -> bool:
     start = 0
     while True:
         index = data.find(token, start)
         if index < 0:
             return False
+        if _is_documentation_match(data, index, documentation_spans):
+            start = index + len(token)
+            continue
 
         after = index + len(token)
         while after < len(data) and data[after] in b" \t":
@@ -250,17 +273,102 @@ def _is_primarily_documentation(data: bytes) -> bool:
     lines = [line.strip() for line in data.splitlines() if line.strip()]
     if not lines:
         return False
-    doc_lines = sum(1 for line in lines if line.startswith((b"#", b"//", b"/*", b"*")))
+    doc_lines = sum(1 for line in lines if line.startswith(_DOCUMENTATION_LINE_PREFIXES))
     return doc_lines / len(lines) > 0.5
 
 
-def _contains_call_token(data: bytes, name: bytes) -> bool:
-    return re.search(rb"(?<![A-Za-z0-9_])" + re.escape(name) + rb"(?:\s|#[^\n]*\n)*\(", data) is not None
+def _literal_arg_bytes(arg: object) -> bytes | None:
+    if isinstance(arg, str):
+        return arg.encode("utf-8", errors="ignore")
+    if isinstance(arg, bytes):
+        return arg
+    return None
 
 
-def _contains_module_attr(data: bytes, module: bytes, attr: bytes) -> bool:
+def _documentation_literal_spans(data: bytes) -> tuple[tuple[int, int], ...]:
+    try:
+        operations = list(pickletools.genops(data))
+    except Exception:
+        return ()
+
+    spans: list[tuple[int, int]] = []
+    for index, (opcode, arg, position) in enumerate(operations):
+        if position is None or opcode.name not in _PICKLE_LITERAL_OPCODE_NAMES:
+            continue
+        literal = _literal_arg_bytes(arg)
+        if literal is None or not _is_primarily_documentation(literal):
+            continue
+        next_position = operations[index + 1][2] if index + 1 < len(operations) else None
+        end_position = next_position if isinstance(next_position, int) and next_position > position else len(data)
+        spans.append((position, end_position))
+    return tuple(spans)
+
+
+def _position_in_spans(position: int, spans: tuple[tuple[int, int], ...]) -> bool:
+    return any(start <= position < end for start, end in spans)
+
+
+def _line_looks_like_documentation(data: bytes, position: int) -> bool:
+    line_start = data.rfind(b"\n", 0, position) + 1
+    line_end = data.find(b"\n", position)
+    if line_end < 0:
+        line_end = len(data)
+    stripped = data[line_start:line_end].strip()
+    if stripped.startswith(_DOCUMENTATION_LINE_PREFIXES):
+        return True
+    return (
+        len(stripped) > 1
+        and stripped[:1] in {b"S", b"V", b"s", b"v"}
+        and stripped[1:].lstrip().startswith(_DOCUMENTATION_LINE_PREFIXES)
+    )
+
+
+def _is_documentation_match(data: bytes, position: int, spans: tuple[tuple[int, int], ...]) -> bool:
+    return _position_in_spans(position, spans) or _line_looks_like_documentation(data, position)
+
+
+def _contains_non_documentation_token(
+    data: bytes,
+    token: bytes,
+    documentation_spans: tuple[tuple[int, int], ...],
+) -> bool:
+    start = 0
+    while True:
+        index = data.find(token, start)
+        if index < 0:
+            return False
+        if not _is_documentation_match(data, index, documentation_spans):
+            return True
+        start = index + len(token)
+
+
+def _contains_non_documentation_pattern(
+    data: bytes,
+    pattern: bytes,
+    documentation_spans: tuple[tuple[int, int], ...],
+) -> bool:
+    return any(
+        not _is_documentation_match(data, match.start(), documentation_spans) for match in re.finditer(pattern, data)
+    )
+
+
+def _contains_call_token(
+    data: bytes,
+    name: bytes,
+    documentation_spans: tuple[tuple[int, int], ...] = (),
+) -> bool:
+    pattern = rb"(?<![A-Za-z0-9_])" + re.escape(name) + rb"(?:\s|#[^\n]*\n)*\("
+    return _contains_non_documentation_pattern(data, pattern, documentation_spans)
+
+
+def _contains_module_attr(
+    data: bytes,
+    module: bytes,
+    attr: bytes,
+    documentation_spans: tuple[tuple[int, int], ...] = (),
+) -> bool:
     pattern = rb"(?<![A-Za-z0-9_])" + re.escape(module) + rb"\s*\.\s*" + re.escape(attr) + rb"(?![A-Za-z0-9_])"
-    return re.search(pattern, data) is not None
+    return _contains_non_documentation_pattern(data, pattern, documentation_spans)
 
 
 def _contains_any_seed(data: bytes, seeds: tuple[bytes, ...]) -> bool:
@@ -888,66 +996,88 @@ class PickleScanner(BaseScanner):
 
     def _scan_raw_text_indicators(self, data: bytes, result: ScanResult, source: str) -> None:
         lower = data.lower()
-        if _is_primarily_documentation(lower):
-            return
+        documentation_spans = _documentation_literal_spans(data)
         indicators: list[tuple[str, bytes, dict[str, Any]]] = []
         warning_indicators: list[tuple[str, bytes, dict[str, Any]]] = []
-        if b"import os" in lower:
+        if _contains_non_documentation_token(lower, b"import os", documentation_spans):
             warning_indicators.append(("import os", b"import os", {"associated_global": "os"}))
-        if b"importlib.import_module" in lower or (b"import importlib" in lower and b"import_module" in lower):
+        if _contains_non_documentation_token(lower, b"importlib.import_module", documentation_spans) or (
+            _contains_non_documentation_token(lower, b"import importlib", documentation_spans)
+            and _contains_non_documentation_token(lower, b"import_module", documentation_spans)
+        ):
             indicators.append(
                 ("importlib.import_module", b"importlib", {"associated_global": "importlib.import_module"})
             )
-        elif b"importlib" in lower:
+        elif _contains_non_documentation_token(lower, b"importlib", documentation_spans):
             importlib_method_added = False
             for method in (b"import_module", b"reload", b"find_loader", b"load_module"):
-                if method in lower and _contains_non_comment_token(lower, b"importlib"):
+                if _contains_non_documentation_token(
+                    lower,
+                    method,
+                    documentation_spans,
+                ) and _contains_non_comment_token(lower, b"importlib", documentation_spans):
                     label = f"importlib.{method.decode('ascii')}"
                     indicators.append((label, b"importlib", {"associated_global": label}))
                     importlib_method_added = True
                     break
-            if not importlib_method_added and _contains_non_comment_token(lower, b"importlib") and b"import " in lower:
+            if (
+                not importlib_method_added
+                and _contains_non_comment_token(lower, b"importlib", documentation_spans)
+                and _contains_non_documentation_token(lower, b"import ", documentation_spans)
+            ):
                 indicators.append(("importlib", b"importlib", {"associated_global": "importlib"}))
-        if _contains_call_token(lower, b"eval"):
+        if _contains_call_token(lower, b"eval", documentation_spans):
             indicators.append(("eval", b"eval", {"associated_global": "builtins.eval"}))
-        if _contains_call_token(lower, b"exec"):
+        if _contains_call_token(lower, b"exec", documentation_spans):
             indicators.append(("exec", b"exec", {"associated_global": "builtins.exec"}))
-        if _contains_module_attr(lower, b"webbrowser", b"open"):
+        if _contains_module_attr(lower, b"webbrowser", b"open", documentation_spans):
             indicators.append(("webbrowser.open", b"webbrowser", {"associated_global": "webbrowser.open"}))
-        elif b"webbrowser" in lower:
+        elif _contains_non_documentation_token(lower, b"webbrowser", documentation_spans):
             for method in (b"open", b"open_new", b"open_new_tab"):
-                if method in lower and _contains_non_comment_token(lower, b"webbrowser"):
+                if _contains_non_documentation_token(
+                    lower,
+                    method,
+                    documentation_spans,
+                ) and _contains_non_comment_token(lower, b"webbrowser", documentation_spans):
                     label = f"webbrowser.{method.decode('ascii')}"
                     indicators.append((label, b"webbrowser", {"associated_global": label}))
                     break
-        if b"runpy" in lower:
-            runpy_global = "runpy.run_module" if b"run_module" in lower else "runpy"
+        if _contains_non_documentation_token(lower, b"runpy", documentation_spans):
+            runpy_global = (
+                "runpy.run_module"
+                if _contains_non_documentation_token(lower, b"run_module", documentation_spans)
+                else "runpy"
+            )
             indicators.append((runpy_global, b"runpy", {"associated_global": runpy_global}))
-        if b"__import__" in lower:
+        if _contains_non_documentation_token(lower, b"__import__", documentation_spans):
             indicators.append(("__import__", b"__import__", {"associated_global": "builtins.__import__"}))
         for module_token, associated_global in (
             (b"cos\nsystem\n", "os.system"),
             (b"cposix\nsystem\n", "posix.system"),
             (b"cnt\nsystem\n", "nt.system"),
         ):
-            if module_token in lower:
+            if _contains_non_documentation_token(lower, module_token, documentation_spans):
                 indicators.append((associated_global, module_token, {"associated_global": associated_global}))
-        if _contains_module_attr(lower, b"os", b"system"):
+        if _contains_module_attr(lower, b"os", b"system", documentation_spans):
             indicators.append(("os.system", b"os.system", {"associated_global": "os.system"}))
-        if _contains_module_attr(lower, b"posix", b"system"):
+        if _contains_module_attr(lower, b"posix", b"system", documentation_spans):
             indicators.append(("posix.system", b"posix.system", {"associated_global": "posix.system"}))
-        if _contains_module_attr(lower, b"nt", b"system"):
+        if _contains_module_attr(lower, b"nt", b"system", documentation_spans):
             indicators.append(("nt.system", b"nt.system", {"associated_global": "nt.system"}))
-        if _contains_module_attr(lower, b"os", b"popen"):
+        if _contains_module_attr(lower, b"os", b"popen", documentation_spans):
             indicators.append(("os.popen", b"os.popen", {"associated_global": "os.popen"}))
-        if re.search(rb"(?<![A-Za-z0-9_])os\s*\.\s*spawn", lower):
+        if _contains_non_documentation_pattern(
+            lower,
+            rb"(?<![A-Za-z0-9_])os\s*\.\s*spawn",
+            documentation_spans,
+        ):
             indicators.append(("os.spawn", b"os.spawn", {"associated_global": "os.spawn"}))
         for commands_api in (b"commands.getoutput", b"commands.getstatusoutput"):
-            if commands_api in lower:
+            if _contains_non_documentation_token(lower, commands_api, documentation_spans):
                 label = commands_api.decode("ascii")
                 indicators.append((label, commands_api, {"associated_global": label}))
         for subprocess_api in (b"subprocess.call", b"subprocess.run", b"subprocess.popen"):
-            if subprocess_api in lower:
+            if _contains_non_documentation_token(lower, subprocess_api, documentation_spans):
                 label = subprocess_api.decode("ascii")
                 indicators.append((label, subprocess_api, {"associated_global": label}))
 
@@ -972,7 +1102,7 @@ class PickleScanner(BaseScanner):
                     rule_code="S104",
                 )
 
-        if b"__import__" in lower:
+        if _contains_non_documentation_token(lower, b"__import__", documentation_spans):
             result.add_check(
                 name="Pickle Raw Content Detection",
                 passed=False,
@@ -988,7 +1118,7 @@ class PickleScanner(BaseScanner):
             )
 
         for label, token, details in warning_indicators:
-            if token not in lower:
+            if not _contains_non_documentation_token(lower, token, documentation_spans):
                 continue
             result.add_check(
                 name="Pickle Raw Content Detection",
