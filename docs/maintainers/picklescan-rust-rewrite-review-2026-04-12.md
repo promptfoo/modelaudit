@@ -548,7 +548,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] S-D2-33 — Validate standalone `uv.lock` in CI.
 - [x] S-D2-34 — Run standalone `cargo test` in nightly/perf workflows.
 - [x] S-D2-35 — Install Rust before release-please standalone lock refresh.
-- [ ] S-D2-37 — Add future annotations to large-corpus QA test.
+- [x] S-D2-37 — Add future annotations to large-corpus QA test.
 - [ ] S-D2-38 — Add new tests to `allowed_test_files`.
 - [ ] S-D2-39 — Move non-Rust report conversion test out of Rust-gated file.
 - [ ] S-D2-40 — Use canonical PyTorch suffix in package API test.
@@ -753,6 +753,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `npx prettier --check .github/workflows/release-please.yml` — passed.
   - `uv lock --check` — passed at repo root.
   - `(cd packages/modelaudit-picklescan && uv lock --check)` — passed.
+- S-D2-37 — Same-item commit records that `tests/scripts/test_large_pickle_corpus_qa.py` already has `from __future__ import annotations` at the top of the file in the current tree. Targeted QA:
+  - `uv run ruff format --check tests/scripts/test_large_pickle_corpus_qa.py` — passed.
+  - `uv run ruff check tests/scripts/test_large_pickle_corpus_qa.py` — passed.
+  - `uv run mypy tests/scripts/test_large_pickle_corpus_qa.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scripts/test_large_pickle_corpus_qa.py -q` — passed, 16 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
