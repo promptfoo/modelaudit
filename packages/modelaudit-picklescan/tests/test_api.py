@@ -476,6 +476,46 @@ def test_scan_bytes_flags_untrusted_persistent_ids(payload: bytes, opcode: str) 
     )
 
 
+def test_scan_bytes_recurses_into_nested_persid_payload() -> None:
+    inner = b"\x80\x04cos\nsystem\nPfake_id\n."
+    outer = pickle.dumps({"inner": inner}, protocol=4)
+
+    report = scan_bytes(outer, source="nested-persid.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213" and finding.details.get("nested_has_execution_opcode") is True
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_GLOBAL" and finding.details.get("import_reference") in SYSTEM_GLOBALS
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "PERSISTENT_ID" and finding.details.get("opcode") == "PERSID"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_fails_closed_on_malformed_nested_persid_payload() -> None:
+    inner = b"\x80\x04cos\nsystem\nP\nfake_id\n."
+    outer = pickle.dumps({"inner": inner}, protocol=4)
+
+    report = scan_bytes(outer, source="nested-malformed-persid.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213"
+        and finding.details.get("nested_has_execution_opcode") is True
+        and finding.details.get("analysis_incomplete") is True
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_GLOBAL" and finding.details.get("import_reference") in SYSTEM_GLOBALS
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_flags_canonical_pytorch_storage_persistent_ids() -> None:
     payload = (
         b"\x80\x04(\x8c\x07storage\x94\x8c\x05torch\x94\x8c\x0cFloatStorage\x94\x93\x8c\x01k\x94\x8c\x03cpu\x94K\x01tQ."

@@ -1225,6 +1225,16 @@ impl<'a> ScanState<'a> {
                 self.surface_nested_pickle_findings(candidate, "raw", position + offset);
                 return;
             }
+            if has_pickle_prefix(probe) && has_execution_opcode(probe) {
+                self.add_nested_payload_finding(raw_nested_payload_finding(
+                    probe.len(),
+                    position + offset,
+                    true,
+                    true,
+                ));
+                self.surface_nested_pickle_findings(probe, "raw", position + offset);
+                return;
+            }
             let candidate_truncated = remaining_len > self.options.max_nested_pickle_bytes;
             if candidate_truncated && probe.first() == Some(&0x80) && has_pickle_prefix(probe) {
                 self.add_nested_payload_finding(raw_nested_payload_finding(

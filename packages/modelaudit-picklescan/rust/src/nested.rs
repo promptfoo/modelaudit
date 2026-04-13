@@ -134,7 +134,7 @@ pub(crate) fn has_execution_opcode(value: &[u8]) -> bool {
         };
         if matches!(
             parsed.name,
-            "REDUCE" | "NEWOBJ" | "NEWOBJ_EX" | "OBJ" | "INST" | "BUILD"
+            "REDUCE" | "NEWOBJ" | "NEWOBJ_EX" | "OBJ" | "INST" | "BUILD" | "PERSID" | "BINPERSID"
         ) {
             return true;
         }
@@ -208,6 +208,10 @@ fn validate_pickle_stack_effect(
                 return false;
             }
             *stack_depth -= 1;
+            true
+        }
+        "PERSID" => {
+            *stack_depth += 1;
             true
         }
         "BINPERSID" => *stack_depth >= 1,
@@ -734,6 +738,11 @@ mod tests {
         assert!(!has_execution_opcode(b"\x80\x04}q\x00."));
         assert!(has_execution_opcode(
             b"\x80\x04\x8c\x08builtins\x94\x8c\x05print\x94\x93\x8c\x02hi\x85R."
+        ));
+        assert!(has_execution_opcode(b"\x80\x04cos\nsystem\nPfake_id\n."));
+        assert!(looks_like_pickle_payload(
+            b"\x80\x04cos\nsystem\nPfake_id\n.",
+            TEST_MAX_NESTED_PICKLE_BYTES
         ));
     }
 }
