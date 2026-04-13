@@ -13,6 +13,18 @@ from modelaudit.rules import RuleRegistry, Severity
 from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 
 
+@pytest.fixture
+def requires_symlinks(tmp_path: Path) -> None:
+    """Skip tests when creating symlinks is not supported in this environment."""
+    target = tmp_path / "target"
+    link = tmp_path / "link"
+    target.mkdir()
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks are not supported in this environment")
+
+
 class TestRuleRegistry:
     """Test the rule registry functionality."""
 
@@ -236,29 +248,30 @@ S301 = "HIGH"
         assert config.suppress == {"S710", "S801"}
         assert base_config.suppress == {"S710"}
 
-    def test_ignore_range_expansion(self):
+    def test_ignore_range_expansion(self) -> None:
         """Test that ignore ranges expand correctly."""
         config = ModelAuditConfig()
         config._parse_config({"ignore": {"tests/**": ["S200-S202", "S999"]}})
 
         assert "tests/**" in config.ignore
         assert set(config.ignore["tests/**"]) == {"S201", "S202", "S999"}
+        assert "S200" not in config.ignore["tests/**"]
         assert config.is_suppressed("S201", "tests/example.py")
         assert not config.is_suppressed("S203", "tests/example.py")
 
-    def test_parse_config_filters_unknown_codes(self):
+    def test_parse_config_filters_unknown_codes(self) -> None:
         """Unknown config rule codes should be ignored instead of persisted."""
         config = ModelAuditConfig()
         config._parse_config(
             {
                 "suppress": ["S710", "S700-S702", "s9999"],
                 "severity": {"s301": "HIGH", "S302": "INVALID", "S9999": "CRITICAL"},
+                # Lowercase "all" exercises keyword normalization to "ALL".
                 "ignore": {"tests/**": ["S200-S202", "S9999", "all"]},
             }
         )
 
-        # S700-S702 expands the whole numeric span, then filters out unknown S700.
-        assert "S700" not in RuleRegistry.get_all_rules()
+        # S700-S702 expands the whole numeric span, then filters out currently unknown S700.
         assert config.suppress == {"S701", "S702", "S710"}
         assert "S700" not in config.suppress
         assert config.severity == {"S301": Severity.HIGH}

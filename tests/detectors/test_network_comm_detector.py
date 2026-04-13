@@ -1,5 +1,6 @@
 """Tests for network communication detection."""
 
+from pathlib import Path
 from urllib.parse import urlparse
 
 from modelaudit.detectors.network_comm import NetworkCommDetector, detect_network_communication
@@ -80,7 +81,7 @@ class TestNetworkCommDetector:
         assert "SECRET_SIGNATURE" not in serialized
         assert cloud_finding["provider"] == "s3"
 
-    def test_detect_ipv4_addresses(self):
+    def test_detect_ipv4_addresses(self) -> None:
         """Test detection of IPv4 addresses."""
         detector = NetworkCommDetector()
 
@@ -103,7 +104,7 @@ class TestNetworkCommDetector:
         assert len(private_ips) == 3  # 192.168, 10.0, 172.16
         assert len(public_ips) == 1  # 8.8.8.8
 
-    def test_detect_ipv6_addresses(self):
+    def test_detect_ipv6_addresses(self) -> None:
         """Test detection of IPv6 addresses."""
         detector = NetworkCommDetector()
 
@@ -117,7 +118,7 @@ class TestNetworkCommDetector:
 
         assert len(ipv6_findings) == 2
 
-    def test_detect_domain_names(self):
+    def test_detect_domain_names(self) -> None:
         """Test detection of domain names."""
         detector = NetworkCommDetector()
 
@@ -136,7 +137,7 @@ class TestNetworkCommDetector:
         suspicious = [f for f in domain_findings if f["confidence"] > 0.6]
         assert len(suspicious) >= 2  # .tk and .ml are suspicious
 
-    def test_detect_network_libraries(self):
+    def test_detect_network_libraries(self) -> None:
         """Test detection of network library imports."""
         detector = NetworkCommDetector()
 
@@ -163,7 +164,7 @@ class TestNetworkCommDetector:
         critical = [f for f in lib_findings if f["severity"] == "CRITICAL"]
         assert len(critical) >= 2  # socket and paramiko are critical
 
-    def test_detect_network_functions(self):
+    def test_detect_network_functions(self) -> None:
         """Test detection of network function calls."""
         detector = NetworkCommDetector()
 
@@ -287,7 +288,7 @@ class TestNetworkCommDetector:
         lib_findings = [finding for finding in findings if finding["type"] == "network_library"]
         assert any(finding["library"] == "socket" for finding in lib_findings)
 
-    def test_detect_cc_patterns(self):
+    def test_detect_cc_patterns(self) -> None:
         """Test detection of command & control patterns."""
         detector = NetworkCommDetector()
 
@@ -344,7 +345,7 @@ class TestNetworkCommDetector:
             }
         )
 
-    def test_detect_suspicious_ports(self):
+    def test_detect_suspicious_ports(self) -> None:
         """Test detection of suspicious port numbers."""
         detector = NetworkCommDetector()
 
@@ -367,7 +368,7 @@ class TestNetworkCommDetector:
         assert 4444 in ports  # Metasploit
         assert 6379 in ports  # Redis
 
-    def test_suspicious_port_scan_performance(self):
+    def test_suspicious_port_scan_performance(self) -> None:
         """Ensure port scanning remains performant with precompiled patterns."""
         detector = NetworkCommDetector()
         data = b"connect to server:1337" * 100
@@ -386,7 +387,7 @@ class TestNetworkCommDetector:
 
         assert duration < 1.0
 
-    def test_blacklist_detection(self):
+    def test_blacklist_detection(self) -> None:
         """Test detection of blacklisted domains when configured."""
         # Configure with specific blacklisted domains
         config = {"custom_blacklist": [b"malicious-site.com", b"known-c2.net", b"phishing-domain.org"]}
@@ -407,7 +408,7 @@ class TestNetworkCommDetector:
         assert all(f["confidence"] == 1.0 for f in blacklist_findings)
         assert all(f["severity"] == "CRITICAL" for f in blacklist_findings)
 
-    def test_custom_config(self):
+    def test_custom_config(self) -> None:
         """Test custom configuration options."""
         config = {
             "custom_cc_patterns": [b"custom_beacon", b"my_backdoor"],
@@ -436,7 +437,7 @@ class TestNetworkCommDetector:
         assert "custom-evil.com" in domains
         assert "my-c2.net" in domains
 
-    def test_custom_patterns_isolated_between_instances(self):
+    def test_custom_patterns_isolated_between_instances(self) -> None:
         """Ensure custom patterns and blacklists do not leak between instances."""
         config = {
             "custom_cc_patterns": ["LEAK_PATTERN"],
@@ -455,7 +456,7 @@ class TestNetworkCommDetector:
         assert all(f["type"] != "cc_pattern" for f in findings_default)
         assert all(f["type"] != "blacklisted_domain" for f in findings_default)
 
-    def test_confidence_scoring(self):
+    def test_confidence_scoring(self) -> None:
         """Test confidence scoring for different patterns."""
         detector = NetworkCommDetector()
 
@@ -489,7 +490,7 @@ class TestNetworkCommDetector:
         malware_findings = [f for f in cc_findings if "malware" in f["pattern"]]
         assert all(f["confidence"] >= 0.95 for f in malware_findings)
 
-    def test_no_false_positives_on_clean_data(self):
+    def test_no_false_positives_on_clean_data(self) -> None:
         """Test that clean model data doesn't trigger false positives."""
         detector = NetworkCommDetector()
 
@@ -511,7 +512,7 @@ class TestNetworkCommDetector:
         # Should not detect any network patterns
         assert len(findings) == 0
 
-    def test_context_extraction(self):
+    def test_context_extraction(self) -> None:
         """Test that context/snippets are properly extracted."""
         detector = NetworkCommDetector()
 
@@ -534,7 +535,7 @@ class TestNetworkCommDetector:
 class TestDetectNetworkCommunication:
     """Test the convenience function."""
 
-    def test_scan_file(self, tmp_path):
+    def test_scan_file(self, tmp_path: Path) -> None:
         """Test scanning a file for network patterns."""
         test_file = tmp_path / "model.pkl"
         test_file.write_bytes(b"http://malicious.com/payload")
@@ -543,14 +544,14 @@ class TestDetectNetworkCommunication:
         assert len(findings) > 0
         assert any("malicious.com" in f.get("url", "") for f in findings)
 
-    def test_file_not_found(self):
+    def test_file_not_found(self) -> None:
         """Test handling of non-existent files."""
         findings = detect_network_communication("/non/existent/file.pkl")
         assert len(findings) == 1
         assert findings[0]["type"] == "error"
         assert "not found" in findings[0]["message"]
 
-    def test_with_config(self, tmp_path):
+    def test_with_config(self, tmp_path: Path) -> None:
         """Test scanning with custom configuration."""
         test_file = tmp_path / "model.pkl"
         test_file.write_bytes(b"my_custom_pattern")

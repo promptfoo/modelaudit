@@ -81,7 +81,7 @@ def get_import_rule_code(module: str, function: str | None = None) -> str | None
         return _rule("S404")
 
     # Pickle/serialization
-    elif module_lower in ["pickle", "cpickle", "_pickle"] or module_lower in ["dill", "cloudpickle"]:
+    elif module_lower in ["pickle", "cpickle", "_pickle", "dill", "cloudpickle"]:
         return _rule("S213")
 
     return None
@@ -194,7 +194,9 @@ def get_secret_rule_code(secret_type: str) -> str | None:
         return _rule("S704")
     elif "azure" in secret_lower or "gcp" in secret_lower:
         return _rule("S705")
-    elif any(db in secret_lower for db in ["mongodb", "postgresql", "mysql", "sqlite"]):
+    elif (
+        "mongodb" in secret_lower or "postgresql" in secret_lower or "mysql" in secret_lower or "sqlite" in secret_lower
+    ):
         return _rule("S706")
     elif "jwt" in secret_lower or "bearer" in secret_lower:
         return _rule("S707")
@@ -329,6 +331,7 @@ def get_generic_rule_code(message: str) -> str | None:
 
     # Check for specific patterns
     if "protocol" in msg_lower and "version" in msg_lower:
+        # Informational protocol/version context; intentionally not a security rule.
         return None
     elif (
         ("stack" in msg_lower and "depth" in msg_lower)
