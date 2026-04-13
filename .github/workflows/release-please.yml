@@ -494,13 +494,24 @@ jobs:
         run: |
           cargo test --manifest-path Cargo.toml
 
-      - name: Build standalone package
+      - name: Build standalone package sdist
+        if: matrix.build-sdist == 'true'
         run: |
-          if [[ "${{ matrix.build-sdist }}" == "true" ]]; then
-            uv build --out-dir /tmp/modelaudit-picklescan-dist
-          else
-            uv build --wheel --out-dir /tmp/modelaudit-picklescan-dist
-          fi
+          uv build --sdist --out-dir /tmp/modelaudit-picklescan-dist
+
+      - name: Build standalone package manylinux wheel
+        if: runner.os == 'Linux'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --wheel --out /tmp/modelaudit-picklescan-dist --compatibility manylinux_2_28
+          manylinux: "2_28"
+          working-directory: packages/modelaudit-picklescan
+
+      - name: Build standalone package wheel
+        if: runner.os != 'Linux'
+        run: |
+          uv build --wheel --out-dir /tmp/modelaudit-picklescan-dist
 
       - name: Validate standalone package metadata
         run: uvx twine check /tmp/modelaudit-picklescan-dist/*
