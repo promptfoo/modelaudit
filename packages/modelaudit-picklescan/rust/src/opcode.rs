@@ -26,6 +26,15 @@ impl ArgValue {
         }
     }
 
+    pub(crate) fn byte_span(&self, payload_len: usize) -> Option<(usize, usize)> {
+        match self {
+            ArgValue::Bytes { start, end } if start <= end && *end <= payload_len => {
+                Some((*start, *end))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn global_parts(&self) -> (String, String) {
         match self {
             ArgValue::Text(value) => {

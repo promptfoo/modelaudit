@@ -464,6 +464,35 @@ def test_scan_stream_large_clean_pickle_skips_expensive_raw_detectors() -> None:
     )
 
 
+def test_scan_stream_secret_prefilter_preserves_slack_token_detection() -> None:
+    slack_token = "xox" + "b-123456789012-123456789012-abcdefghijklmnopqrstuvwx"
+    payload = pickle.dumps({"slack": slack_token}, protocol=4)
+
+    result = PickleScanner().scan_stream(BytesIO(payload), len(payload), source="slack-secret.pkl")
+
+    assert result.metadata.get("embedded_secrets_scan_skipped") is not True
+    assert any(
+        check.name == "Embedded Secrets Detection"
+        and check.status == CheckStatus.FAILED
+        and "Slack Token" in str(check.details)
+        for check in result.checks
+    )
+
+
+def test_scan_stream_network_prefilter_preserves_bare_ip_detection() -> None:
+    payload = pickle.dumps({"endpoint": "8.8.8.8"}, protocol=4)
+
+    result = PickleScanner().scan_stream(BytesIO(payload), len(payload), source="network-ip.pkl")
+
+    assert result.metadata.get("network_communication_scan_skipped") is not True
+    assert any(
+        check.name == "Network Communication Detection"
+        and check.status == CheckStatus.FAILED
+        and "8.8.8.8" in str(check.details)
+        for check in result.checks
+    )
+
+
 def test_scan_stream_standalone_primary_does_not_inherit_legacy_operational_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

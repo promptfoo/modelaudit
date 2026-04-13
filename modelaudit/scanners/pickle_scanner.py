@@ -4,6 +4,7 @@ import contextlib
 import io
 import os
 import pickletools as pickletools
+import re
 import struct
 import tempfile
 import time
@@ -187,11 +188,14 @@ _SECRETS_RAW_SCAN_PREFILTER_BYTES: tuple[bytes, ...] = (
     b"bearer",
     b"private key",
     b"-----begin",
+    b"aws_access_key_id",
     b"sk-",
     b"akia",
     b"ghp_",
     b"github_pat_",
+    b"xox",
     b"mongodb://",
+    b"mongodb+srv://",
     b"postgres://",
 )
 _JIT_RAW_SCAN_PREFILTER_BYTES: tuple[bytes, ...] = (
@@ -212,15 +216,110 @@ _NETWORK_RAW_SCAN_PREFILTER_BYTES: tuple[bytes, ...] = (
     b"socket",
     b"requests",
     b"urllib",
+    b"httplib",
+    b"http.client",
+    b"ftplib",
+    b"telnetlib",
+    b"smtplib",
+    b"poplib",
+    b"imaplib",
+    b"paramiko",
+    b"pycurl",
+    b"aiohttp",
+    b"tornado",
+    b"twisted",
+    b"httpx",
     b"connect",
     b"evil.com",
     b"c2",
     b"ftp://",
+    b"ftps://",
+    b"ssh://",
+    b"telnet://",
     b"s3://",
+    b"gs://",
+    b"az://",
+    b"wasb://",
+    b"wasbs://",
+    b"abfs://",
+    b"abfss://",
     b"tcp",
     b"udp",
     b"websocket",
+    b"websockets",
     b"grpc",
+    b"zeromq",
+    b"paho.mqtt",
+    b"redis",
+    b"pymongo",
+    b"psycopg2",
+    b"mysql.connector",
+    b"urlopen",
+    b"urlretrieve",
+    b"getaddrinfo",
+    b"gethostbyname",
+    b"gethostbyaddr",
+    b"dns.resolver",
+    b"beacon_url",
+    b"callback_url",
+    b"c2_server",
+    b"command_server",
+    b"exfil_endpoint",
+    b"malware",
+    b"backdoor",
+    b"trojan",
+    b"botnet",
+    b"zombie",
+    b"phone_home",
+    b"check_in",
+    b"amazonaws.com",
+    b"storage.googleapis.com",
+    b"storage.cloud.google.com",
+    b"blob.core.windows.net",
+    b"dfs.core.windows.net",
+    b"huggingface.co",
+)
+_NETWORK_DOMAIN_TLD_PREFILTER_BYTES: tuple[bytes, ...] = (
+    b".com",
+    b".org",
+    b".net",
+    b".edu",
+    b".gov",
+    b".mil",
+    b".int",
+    b".io",
+    b".co",
+    b".uk",
+    b".de",
+    b".fr",
+    b".jp",
+    b".cn",
+    b".au",
+    b".us",
+    b".ru",
+    b".ch",
+    b".it",
+    b".nl",
+    b".se",
+    b".no",
+    b".es",
+    b".ca",
+    b".tk",
+    b".ml",
+    b".ga",
+    b".cf",
+    b".cc",
+    b".to",
+    b".pw",
+    b".ai",
+    b".app",
+    b".dev",
+    b".xyz",
+)
+_NETWORK_PREFILTER_RE = re.compile(
+    b"(?:"
+    + b"|".join(re.escape(seed) for seed in (*_NETWORK_RAW_SCAN_PREFILTER_BYTES, *_NETWORK_DOMAIN_TLD_PREFILTER_BYTES))
+    + rb"|\b\d{1,3}(?:\.\d{1,3}){3}\b)"
 )
 _DANGEROUS_STRING_PREFILTER_TEXT: tuple[str, ...] = (
     "os.",
@@ -242,6 +341,10 @@ def _contains_any_prefilter_seed(lower_data: bytes, seeds: tuple[bytes, ...]) ->
 def _contains_any_text_prefilter_seed(value: str, seeds: tuple[str, ...]) -> bool:
     lower_value = value.lower()
     return any(seed in lower_value for seed in seeds)
+
+
+def _could_match_network_prefilter(lower_data: bytes) -> bool:
+    return _NETWORK_PREFILTER_RE.search(lower_data) is not None
 
 
 def _could_match_potential_base64_string(value: str) -> bool:
@@ -6592,7 +6695,7 @@ class PickleScanner(BaseScanner):
             jit_findings = []
             result.metadata["jit_script_scan_skipped"] = True
             result.metadata["jit_script_scan_skip_reason"] = "no_prefilter_seed"
-        if _contains_any_prefilter_seed(lower_file_data, _NETWORK_RAW_SCAN_PREFILTER_BYTES):
+        if _could_match_network_prefilter(lower_file_data):
             network_findings = self.collect_network_communication_findings(
                 file_data,
                 context=self.current_file_path,

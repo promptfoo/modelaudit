@@ -58,8 +58,8 @@ enum StackValue {
     Mark,
     Text(String),
     Bytes {
-        preview: Vec<u8>,
-        len: usize,
+        start: usize,
+        end: usize,
     },
     Global(GlobalRef),
     Constructed(GlobalRef),
@@ -333,8 +333,7 @@ impl<'a> ScanState<'a> {
         }
 
         if self.status == "complete"
-            && self.bytes_total.is_some()
-            && self.payload.len() < self.bytes_total.unwrap()
+            && matches!(self.bytes_total, Some(bytes_total) if self.payload.len() < bytes_total)
         {
             self.record_short_read();
         }
@@ -471,9 +470,9 @@ impl<'a> ScanState<'a> {
             }
             name if STACK_GLOBAL_STRING_OPCODES.contains(&name) => {
                 let value = opcode.arg.coerce_text(self.payload);
-                self.stack.push(StackValue::Text(value.clone()));
                 self.scan_string_literal(&value, opcode.name, position);
                 self.scan_encoded_nested_pickle_literal(&value, position);
+                self.stack.push(StackValue::Text(value));
             }
             "NONE" => self.stack.push(StackValue::Primitive {
                 type_name: "NoneType",
@@ -492,9 +491,13 @@ impl<'a> ScanState<'a> {
             }
             "FLOAT" | "BINFLOAT" => self.stack.push(StackValue::Other),
             "BINBYTES" | "BINBYTES8" | "SHORT_BINBYTES" | "BYTEARRAY8" => {
-                let bytes = opcode.arg.bytes(self.payload).unwrap_or_default();
-                self.scan_raw_nested_pickle_bytes(bytes, position);
-                self.stack.push(stack_value_from_bytes(bytes));
+                if let Some((start, end)) = opcode.arg.byte_span(self.payload.len()) {
+                    let bytes = &self.payload[start..end];
+                    self.scan_raw_nested_pickle_bytes(bytes, position);
+                    self.stack.push(StackValue::Bytes { start, end });
+                } else {
+                    self.stack.push(StackValue::Bytes { start: 0, end: 0 });
+                }
             }
             "NEXT_BUFFER" | "READONLY_BUFFER" => {}
             "MARK" => self.stack.push(StackValue::Mark),
@@ -1192,7 +1195,7 @@ impl<'a> ScanState<'a> {
                 "persistent_id_preview".to_string(),
                 DetailValue::String(stack_value_preview(value, 0)),
             ));
-            if let Some(storage_key) = pytorch_storage_key(value) {
+            if let Some(storage_key) = pytorch_storage_key(value, self.payload) {
                 details.push((
                     "pytorch_storage_persistent_id".to_string(),
                     DetailValue::Bool(true),
@@ -1561,7 +1564,9 @@ fn operand_preview(value: Option<&StackValue>) -> String {
     match value {
         Some(StackValue::Global(reference)) => format!("_GlobalRef({})", reference.symbol()),
         Some(StackValue::Constructed(reference)) => format!("constructed:{}", reference.symbol()),
-        Some(StackValue::Bytes { len, .. }) => format!("bytes(len={len})"),
+        Some(StackValue::Bytes { start, end }) => {
+            format!("bytes(len={})", end.saturating_sub(*start))
+        }
         Some(StackValue::Mark) => "MARK".to_string(),
         Some(StackValue::Text(value)) => format!("str:{:?}", value),
         Some(StackValue::Tuple(values)) => format!("tuple(len={})", values.len()),
@@ -1591,7 +1596,7 @@ fn stack_value_preview(value: &StackValue, depth: usize) -> String {
     match value {
         StackValue::Mark => "MARK".to_string(),
         StackValue::Text(value) => format!("str:{:?}", value),
-        StackValue::Bytes { len, .. } => format!("bytes(len={len})"),
+        StackValue::Bytes { start, end } => format!("bytes(len={})", end.saturating_sub(*start)),
         StackValue::Global(reference) => format!("global:{}", reference.symbol()),
         StackValue::Constructed(reference) => format!("constructed:{}", reference.symbol()),
         StackValue::Tuple(values) => {
@@ -1618,19 +1623,25 @@ fn stack_value_text(value: &StackValue) -> Option<&str> {
     }
 }
 
-fn stack_value_string(value: &StackValue) -> Option<String> {
+fn stack_value_string(value: &StackValue, payload: &[u8]) -> Option<String> {
     match value {
         StackValue::Text(text) => Some(text.clone()),
         StackValue::Primitive { repr, .. } => Some(repr.clone()),
-        StackValue::Bytes { preview, len } if preview.len() == *len => {
-            std::str::from_utf8(preview).ok().map(str::to_string)
+        StackValue::Bytes { start, end }
+            if start <= end
+                && *end <= payload.len()
+                && end.saturating_sub(*start) <= MAX_STACK_BYTES_PREVIEW =>
+        {
+            std::str::from_utf8(&payload[*start..*end])
+                .ok()
+                .map(str::to_string)
         }
         StackValue::Bytes { .. } => None,
         _ => None,
     }
 }
 
-fn pytorch_storage_key(value: &StackValue) -> Option<String> {
+fn pytorch_storage_key(value: &StackValue, payload: &[u8]) -> Option<String> {
     let StackValue::Tuple(items) = value else {
         return None;
     };
@@ -1640,7 +1651,7 @@ fn pytorch_storage_key(value: &StackValue) -> Option<String> {
     if !is_pytorch_storage_descriptor(&items[1]) {
         return None;
     }
-    stack_value_string(&items[2])
+    stack_value_string(&items[2], payload)
 }
 
 fn is_pytorch_storage_descriptor(value: &StackValue) -> bool {
@@ -1664,13 +1675,6 @@ fn stack_value_from_integer_arg(arg: &ArgValue) -> StackValue {
             repr: value.to_string(),
         },
         _ => StackValue::Other,
-    }
-}
-
-fn stack_value_from_bytes(bytes: &[u8]) -> StackValue {
-    StackValue::Bytes {
-        preview: bytes[..bytes.len().min(MAX_STACK_BYTES_PREVIEW)].to_vec(),
-        len: bytes.len(),
     }
 }
 
