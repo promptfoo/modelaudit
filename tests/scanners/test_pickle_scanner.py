@@ -983,6 +983,28 @@ def test_raw_cve_rebuild_tensor_global_is_not_suppressed_by_documentation_litera
     assert result.metadata["primary_cve"] == "CVE-2026-24747"
 
 
+def test_raw_cve_rebuild_tensor_doc_filter_uses_rust_import_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "modelaudit.scanners.pickle_scanner._rebuild_tensor_indicators_are_documentation_literals",
+        lambda _data: True,
+    )
+    path = tmp_path / "rust-rebuild-tensor-global.pkl"
+    path.write_bytes(
+        b"(dS'doc'\nS'# _rebuild_tensor\\n# documentation only'\nsctorch\n_rebuild_tensor_v2\nS'value'\ns."
+    )
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(issue.details.get("cve_id") == "CVE-2026-24747" for issue in result.issues)
+    assert any(
+        reference.get("import_reference") == "torch._rebuild_tensor_v2"
+        for reference in result.metadata["import_references"]
+    )
+
+
 def test_opcode_summary_tracks_memoized_stack_global_through_structure(tmp_path: Path) -> None:
     payload = b"\x80\x04\x8c\x02os\x94}\x94\x8c\x06system\x94h\x00h\x02\x93s."
     path = tmp_path / "memoized-stack-global.pkl"

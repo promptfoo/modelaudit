@@ -581,6 +581,14 @@ def _result_import_references(result: ScanResult) -> list[dict[str, Any]]:
     return [dict(reference) for reference in references if isinstance(reference, dict)]
 
 
+def _result_has_rebuild_tensor_global(result: ScanResult) -> bool:
+    for reference in _result_import_references(result):
+        import_reference = reference.get("import_reference")
+        if isinstance(import_reference, str) and "_rebuild_tensor" in import_reference:
+            return True
+    return False
+
+
 def _result_parse_was_incomplete(result: ScanResult) -> bool:
     if result.metadata.get("parsing_failed") is True or result.metadata.get("analysis_incomplete") is True:
         return True
@@ -1628,7 +1636,10 @@ class PickleScanner(BaseScanner):
                     attribution.cve_id == "CVE-2026-24747"
                     and (
                         (not has_setitem_opcode and not pickle_parse_failed)
-                        or _rebuild_tensor_indicators_are_documentation_literals(data)
+                        or (
+                            not _result_has_rebuild_tensor_global(result)
+                            and _rebuild_tensor_indicators_are_documentation_literals(data)
+                        )
                     )
                 )
             ]
