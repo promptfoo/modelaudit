@@ -219,16 +219,13 @@ class _RootStreamPayloadRead:
     read_limit: int
 
 
-# Kept as small compatibility exports for callers/tests that inspect the policy.
-# The scanner itself no longer uses Python opcode analysis; Rust owns detection.
-ALWAYS_DANGEROUS_FUNCTIONS: frozenset[str] = frozenset(
+_BUILTIN_MODULES = frozenset({"builtins", "__builtin__", "__builtins__"})
+_SAFE_MODULE_POLICY_PREFIXES = ("os.path",)
+_DANGEROUS_FUNCTION_EXPORT_ALIASES = frozenset(
     {
-        "__import__",
-        "compile",
-        "eval",
-        "exec",
-        "execfile",
-        "getattr",
+        "__builtins__.execfile",
+        "__builtins__.raw_input",
+        "__builtins__.reload",
         "marshal.loads",
         "nt.system",
         "os.popen",
@@ -241,8 +238,6 @@ ALWAYS_DANGEROUS_FUNCTIONS: frozenset[str] = frozenset(
         "os.spawnvp",
         "os.spawnvpe",
         "os.system",
-        "pickle.load",
-        "pickle.loads",
         "posix.system",
         "subprocess.Popen",
         "subprocess.call",
@@ -251,21 +246,32 @@ ALWAYS_DANGEROUS_FUNCTIONS: frozenset[str] = frozenset(
         "subprocess.run",
     }
 )
-ALWAYS_DANGEROUS_MODULES: frozenset[str] = frozenset(
-    {
-        "__builtin__",
-        "__builtins__",
-        "builtins",
-        "ctypes",
-        "marshal",
-        "nt",
-        "os",
-        "posix",
-        "runpy",
-        "subprocess",
-        "sys",
-    }
+
+
+def _dangerous_function_exports_from_suspicious_globals() -> frozenset[str]:
+    exports: set[str] = set()
+    for module, functions in SUSPICIOUS_GLOBALS.items():
+        if functions == "*":
+            continue
+        function_names = (functions,) if isinstance(functions, str) else functions
+        for function_name in function_names:
+            exports.add(f"{module}.{function_name}")
+            if module in _BUILTIN_MODULES:
+                exports.add(function_name)
+    return frozenset(exports)
+
+
+def _dangerous_modules_from_suspicious_globals() -> frozenset[str]:
+    return frozenset(module for module, functions in SUSPICIOUS_GLOBALS.items() if functions == "*")
+
+
+# Kept as compatibility exports for callers/tests that inspect the policy. Values
+# are derived from the shared suspicious-symbol table, with a small alias layer
+# for historical fully-qualified names under wildcard modules.
+ALWAYS_DANGEROUS_FUNCTIONS: frozenset[str] = (
+    _dangerous_function_exports_from_suspicious_globals() | _DANGEROUS_FUNCTION_EXPORT_ALIASES
 )
+ALWAYS_DANGEROUS_MODULES: frozenset[str] = _dangerous_modules_from_suspicious_globals()
 ML_SAFE_GLOBALS: dict[str, list[str]] = {
     "collections": ["Counter", "OrderedDict", "defaultdict", "deque"],
     "numpy": ["dtype", "ndarray", "scalar"],
@@ -559,9 +565,35 @@ def _metadata_pickle_read_limit(configured_limit: Any) -> tuple[int | None, str 
 def _is_dangerous_module(module: str) -> bool:
     """Return whether a module path is always dangerous."""
     normalized = module.strip()
+    if _is_safe_module_policy_path(normalized):
+        return False
     return normalized in ALWAYS_DANGEROUS_MODULES or any(
         normalized.startswith(f"{dangerous}.") for dangerous in ALWAYS_DANGEROUS_MODULES
     )
+
+
+def _is_safe_module_policy_path(module: str) -> bool:
+    return any(module == safe or module.startswith(f"{safe}.") for safe in _SAFE_MODULE_POLICY_PREFIXES)
+
+
+def _suspicious_global_policy_matches(module: str, name: str) -> bool:
+    if _is_safe_module_policy_path(module):
+        return False
+
+    suspicious = SUSPICIOUS_GLOBALS.get(module)
+    if suspicious is None:
+        top_level_module = module.split(".", 1)[0]
+        suspicious = SUSPICIOUS_GLOBALS.get(top_level_module)
+        if suspicious != "*":
+            return False
+
+    if suspicious == "*":
+        return True
+    if isinstance(suspicious, (list, tuple, set, frozenset)):
+        return name in suspicious
+    if isinstance(suspicious, str):
+        return name == suspicious
+    return False
 
 
 def is_suspicious_global(module: str, name: str) -> bool:
@@ -569,33 +601,11 @@ def is_suspicious_global(module: str, name: str) -> bool:
     normalized_module = module.strip()
     normalized_name = name.strip()
     full_name = f"{normalized_module}.{normalized_name}"
-    if (
+    return (
         full_name in ALWAYS_DANGEROUS_FUNCTIONS
-        or normalized_name in ALWAYS_DANGEROUS_FUNCTIONS
-        or _is_dangerous_module(normalized_module)
-    ):
-        safe_builtin = normalized_module in {"builtins", "__builtin__", "__builtins__"} and normalized_name in {
-            "abs",
-            "dict",
-            "float",
-            "int",
-            "len",
-            "list",
-            "max",
-            "min",
-            "print",
-            "set",
-            "str",
-            "tuple",
-        }
-        return not safe_builtin
-
-    suspicious = SUSPICIOUS_GLOBALS.get(normalized_module)
-    if isinstance(suspicious, (list, tuple, set, frozenset)):
-        return normalized_name in suspicious
-    if isinstance(suspicious, str):
-        return normalized_name == suspicious
-    return False
+        or (not normalized_module and normalized_name in ALWAYS_DANGEROUS_FUNCTIONS)
+        or _suspicious_global_policy_matches(normalized_module, normalized_name)
+    )
 
 
 def _is_actually_dangerous_global(module: str, name: str, ml_context: dict[str, Any] | None = None) -> bool:

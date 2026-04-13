@@ -542,7 +542,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] S-P2-15 — Table-drive `_scan_raw_text_indicators`.
 - [x] S-P2-17 — Avoid duplicate CVE-2026-24747 attribution.
 - [x] S-P2-18 — Consolidate `extract_metadata` read-limit validation.
-- [ ] S-P2-19 — Reduce Python/Rust dangerous-policy drift.
+- [x] S-P2-19 — Reduce Python/Rust dangerous-policy drift.
 - [ ] S-D2-29 / S-D2-30 / S-D2-33 / S-D2-34 / S-D2-35 / S-D2-37 / S-D2-38 / S-D2-39 / S-D2-40 — Documentation and CI hygiene follow-ups.
 
 ### Completed item QA log
@@ -722,6 +722,13 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py::test_extract_metadata_uses_pickle_opcodes_not_raw_bytes tests/scanners/test_pickle_scanner.py::test_extract_metadata_validates_pickle_read_limit -q` — passed, 5 tests.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 75 tests.
+- S-P2-19 — Same-item commit derives Python compatibility policy exports from `SUSPICIOUS_GLOBALS`, keeps only a narrow historical alias layer for fully-qualified wildcard-module names, and aligns `os.path` with the Rust safe-module exception. Targeted QA:
+  - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py tests/detectors/test_builtin_detection.py` — passed.
+  - `uv run ruff format --check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py tests/detectors/test_builtin_detection.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py tests/detectors/test_builtin_detection.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py tests/detectors/test_builtin_detection.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py::test_policy_compatibility_exports_cover_required_dangerous_symbols tests/detectors/test_builtin_detection.py -q` — passed, 10 tests.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 75 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

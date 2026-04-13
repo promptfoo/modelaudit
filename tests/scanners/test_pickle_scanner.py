@@ -14,6 +14,7 @@ from modelaudit.scanners.pickle_scanner import (
     ALWAYS_DANGEROUS_FUNCTIONS,
     ALWAYS_DANGEROUS_MODULES,
     PickleScanner,
+    _is_dangerous_module,
     _is_legitimate_serialization_file,
     _looks_like_pickle,
     _pickle_opcode_summary,
@@ -893,6 +894,8 @@ def test_policy_compatibility_exports_cover_required_dangerous_symbols() -> None
     assert is_suspicious_global("builtins", "eval") is True
     assert is_suspicious_global("builtins", "len") is False
     assert is_suspicious_global("os", "system") is True
+    assert is_suspicious_global("os.path", "join") is False
+    assert _is_dangerous_module("os.path") is False
     assert is_suspicious_global("json", "loads") is False
 
 
