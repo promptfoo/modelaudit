@@ -82,18 +82,6 @@ def _rust_source_text() -> str:
     return "\n".join(path.read_text() for path in sorted(rust_src.glob("*.rs")))
 
 
-def _rust_string_array(source: str, name: str) -> set[str]:
-    match = re.search(rf"const {name}: &\[&str\] = &\[(.*?)\];", source, flags=re.DOTALL)
-    assert match is not None
-    return set(re.findall(r'"([^"]*)"', match.group(1)))
-
-
-def _rust_tuple_array(source: str, name: str) -> set[tuple[str, str]]:
-    match = re.search(rf"const {name}: &\[\(&str, &str\)\] = &\[(.*?)\];", source, flags=re.DOTALL)
-    assert match is not None
-    return set(re.findall(r'\("([^"]*)",\s*"([^"]*)"\)', match.group(1)))
-
-
 @pytest.fixture
 def parity_payloads() -> dict[str, tuple[bytes, ScanOptions | None]]:
     nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
@@ -137,23 +125,35 @@ def test_rust_parser_declares_all_pickletools_opcodes() -> None:
     assert rust_opcodes == {opcode.name for opcode in pickletools.opcodes}
 
 
-def test_rust_policy_tables_keep_required_security_coverage() -> None:
-    source = _rust_source_text()
-    builtin_names = _rust_string_array(source, "BUILTIN_DANGEROUS_NAMES")
-    wildcard_modules = _rust_string_array(source, "DANGEROUS_WILDCARD_MODULES")
-    dangerous_globals = _rust_tuple_array(source, "DANGEROUS_GLOBALS")
-
-    assert builtin_names, "Failed to extract BUILTIN_DANGEROUS_NAMES from Rust source"
-    assert wildcard_modules, "Failed to extract DANGEROUS_WILDCARD_MODULES from Rust source"
-    assert dangerous_globals, "Failed to extract DANGEROUS_GLOBALS from Rust source"
-
-    assert {"eval", "exec", "getattr", "open", "__import__"} <= builtin_names
-    assert {"os", "posix", "subprocess", "socket", "ctypes", "pickle"} <= wildcard_modules
-    assert {
+@pytest.mark.parametrize(
+    "module,name",
+    [
+        ("builtins", "eval"),
+        ("builtins", "exec"),
+        ("builtins", "getattr"),
+        ("builtins", "open"),
+        ("builtins", "__import__"),
+        ("os", "system"),
+        ("posix", "system"),
+        ("subprocess", "Popen"),
+        ("socket", "socket"),
+        ("ctypes", "CDLL"),
+        ("pickle", "loads"),
         ("numpy", "load"),
         ("torch", "load"),
         ("uuid", "_ip_getnode"),
-    } <= dangerous_globals
+    ],
+)
+def test_rust_policy_detects_required_security_coverage(module: str, name: str) -> None:
+    payload = f"c{module}\n{name}\n)R.".encode()
+
+    report = scan_bytes(payload, source=f"{module}-{name}.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == f"{module}.{name}"
+        for finding in report.findings
+    )
 
 
 def test_rust_engine_scans_parity_payloads(parity_payloads: dict[str, tuple[bytes, ScanOptions | None]]) -> None:
