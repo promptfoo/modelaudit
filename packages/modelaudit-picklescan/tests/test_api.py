@@ -1754,6 +1754,17 @@ def test_scan_bytes_collapses_protocol5_buffer_opcode_notices() -> None:
     assert buffer_notices[0].details["buffer_opcode_count"] == 5
     assert buffer_notices[0].details["next_buffer_count"] == 3
     assert buffer_notices[0].details["readonly_buffer_count"] == 2
+    assert buffer_notices[0].details["readonly_buffer_empty_stack_count"] == 0
+
+
+def test_scan_bytes_preserves_readonly_buffer_empty_stack_parity() -> None:
+    report = scan_bytes(b"\x80\x05\x98\x93.", source="readonly-empty-stack.pkl")
+
+    finding = next(finding for finding in report.findings if finding.rule_code == "MALFORMED_STACK_GLOBAL")
+    assert finding.details["module_operand"] == "NoneType:None"
+    assert finding.details["name_operand"] == "NoneType:None"
+    buffer_notice = next(notice for notice in report.notices if notice.code == "buffer_opcode")
+    assert buffer_notice.details["readonly_buffer_empty_stack_count"] == 1
 
 
 def test_scan_stream_preserves_absolute_offsets_from_current_stream_position() -> None:

@@ -500,7 +500,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P1-13 — Preserve stream integrity hashes for streams larger than the raw scan window.
 - [x] N-P1-18 — Pin or adjust primary DANGEROUS_CALL rule-code mapping for builtins.
 - [x] N-P1-20 — Collapse protocol-5 buffer opcode notices into bounded/count-based notices.
-- [ ] N-P1-21 — Review `READONLY_BUFFER` empty-stack parity behavior.
+- [x] N-P1-21 — Review `READONLY_BUFFER` empty-stack parity behavior.
 - [ ] N-P2-22 — Collapse encoded-text S604/S104 twin emissions.
 - [ ] N-P2-24 — Clean redundant lowercase seed spelling.
 - [ ] N-P2-26 — Replace remaining `_contains_non_comment_token` guards with scoped documentation analysis.
@@ -702,6 +702,16 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `uv run mypy packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q` — passed, 151 tests, including Python API coverage for five buffer opcodes collapsing into one notice.
+- N-P1-21 — Same-item commit stops treating `READONLY_BUFFER` on an empty stack as if it had pushed an opaque operand. Empty-stack `READONLY_BUFFER` is now counted in the coalesced buffer notice and subsequent malformed `STACK_GLOBAL` previews show both operands as missing. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 18 tests.
+  - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
+  - `uv run ruff format --check packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run ruff check packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run mypy packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_preserves_readonly_buffer_empty_stack_parity packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_collapses_protocol5_buffer_opcode_notices packages/modelaudit-picklescan/tests/test_api.py -q` — passed, 152 tests.
 
 ### Newly discovered gaps while remediating
 

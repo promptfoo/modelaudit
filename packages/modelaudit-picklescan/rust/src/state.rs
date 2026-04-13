@@ -234,6 +234,7 @@ pub(crate) struct ScanState<'a> {
     expansion_findings: Vec<ExpansionHeuristicFinding>,
     next_buffer_count: usize,
     readonly_buffer_count: usize,
+    readonly_buffer_empty_stack_count: usize,
     first_buffer_opcode_position: Option<usize>,
     status: &'static str,
     verdict: &'static str,
@@ -283,6 +284,7 @@ impl<'a> ScanState<'a> {
             expansion_findings: Vec::new(),
             next_buffer_count: 0,
             readonly_buffer_count: 0,
+            readonly_buffer_empty_stack_count: 0,
             first_buffer_opcode_position: None,
             status: "complete",
             verdict: "clean",
@@ -584,14 +586,11 @@ impl<'a> ScanState<'a> {
                 }
             }
             "NEXT_BUFFER" => {
-                self.record_buffer_opcode(opcode.name, position);
+                self.record_buffer_opcode(opcode.name, position, false);
                 self.stack.push(StackValue::Other);
             }
             "READONLY_BUFFER" => {
-                self.record_buffer_opcode(opcode.name, position);
-                if self.stack.is_empty() {
-                    self.stack.push(StackValue::Other);
-                }
+                self.record_buffer_opcode(opcode.name, position, self.stack.is_empty());
             }
             "MARK" => self.stack.push(StackValue::Mark),
             "POP" => {
@@ -806,13 +805,18 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn record_buffer_opcode(&mut self, op_name: &'static str, position: usize) {
+    fn record_buffer_opcode(&mut self, op_name: &'static str, position: usize, empty_stack: bool) {
         if self.first_buffer_opcode_position.is_none() {
             self.first_buffer_opcode_position = Some(position);
         }
         match op_name {
             "NEXT_BUFFER" => self.next_buffer_count += 1,
-            "READONLY_BUFFER" => self.readonly_buffer_count += 1,
+            "READONLY_BUFFER" => {
+                self.readonly_buffer_count += 1;
+                if empty_stack {
+                    self.readonly_buffer_empty_stack_count += 1;
+                }
+            }
             _ => {}
         }
     }
@@ -842,6 +846,10 @@ impl<'a> ScanState<'a> {
                 (
                     "readonly_buffer_count".to_string(),
                     DetailValue::UInt(self.readonly_buffer_count as u64),
+                ),
+                (
+                    "readonly_buffer_empty_stack_count".to_string(),
+                    DetailValue::UInt(self.readonly_buffer_empty_stack_count as u64),
                 ),
                 (
                     "requires_external_buffer_context".to_string(),
@@ -2709,6 +2717,53 @@ mod tests {
         assert_eq!(
             detail_usize(&notice.details, "readonly_buffer_count"),
             Some(2)
+        );
+    }
+
+    #[test]
+    fn readonly_buffer_empty_stack_does_not_fabricate_operand() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x05\x98\x93.";
+        let mut scan = ScanState::new(
+            "readonly-empty-stack.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let finding = scan
+            .findings
+            .iter()
+            .find(|finding| finding.rule_code == Some("MALFORMED_STACK_GLOBAL"))
+            .expect("malformed STACK_GLOBAL finding");
+        assert_eq!(
+            detail_string(&finding.details, "module_operand").as_deref(),
+            Some("NoneType:None")
+        );
+        assert_eq!(
+            detail_string(&finding.details, "name_operand").as_deref(),
+            Some("NoneType:None")
+        );
+        let notice = scan
+            .notices
+            .iter()
+            .find(|notice| notice.code == Some("buffer_opcode"))
+            .expect("buffer opcode notice");
+        assert_eq!(
+            detail_usize(&notice.details, "readonly_buffer_empty_stack_count"),
+            Some(1)
         );
     }
 
