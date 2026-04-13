@@ -621,7 +621,7 @@ def test_pickle_report_to_scan_result_fails_closed_for_encoded_nested_payload_mi
     assert result.issues[0].rule_code == "S601"
 
 
-def test_pickle_report_to_scan_result_downgrades_nested_payload_without_dangerous_inner_evidence() -> None:
+def test_pickle_report_to_scan_result_preserves_nested_payload_finding_severity() -> None:
     report = PickleReport(
         source="nested-benign.pkl",
         status=ScanStatus.COMPLETE,
@@ -640,8 +640,9 @@ def test_pickle_report_to_scan_result_downgrades_nested_payload_without_dangerou
     result = pickle_report_to_scan_result(report)
 
     assert result.success is True
-    assert result.issues[0].severity == IssueSeverity.INFO
-    assert result.issues[0].details["evidence"] == "nested_payload_detected"
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].rule_code == "S213"
+    assert result.issues[0].details["pickle_rule_code"] == "S213"
 
 
 def test_pickle_report_to_scan_result_fails_closed_for_raw_nested_truncation_notice() -> None:

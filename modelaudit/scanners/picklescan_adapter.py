@@ -45,7 +45,6 @@ _LEGACY_SCAN_OUTCOME_REASONS = {
     "timeout": "scan_timeout",
     "unbounded_stream_truncated": "unbounded_stream_truncated",
 }
-_NESTED_PAYLOAD_RULE_CODES = frozenset({"S213", "S601", "S602"})
 _INT_TEXT_RE = re.compile(r"[+-]?\d+")
 _LEGACY_RULE_CODE_RE = re.compile(r"^S\d+$")
 _LOCATION_POSITION_RE = re.compile(r"\(pos\s+(?P<position>\d+)\)\s*$")
@@ -184,8 +183,6 @@ def pickle_report_to_scan_result(
         result.metadata["parsing_failed"] = True
         result.metadata["failure_reason"] = "unknown_opcode_or_format_error"
 
-    dangerous_nested_encodings = _dangerous_nested_encodings(report.findings)
-
     for finding in report.findings:
         details = _add_legacy_detail_aliases(
             {
@@ -196,9 +193,6 @@ def pickle_report_to_scan_result(
         if finding.rule_code:
             details.setdefault("pickle_rule_code", finding.rule_code)
         severity = _to_issue_severity(finding.severity)
-        if _is_benign_nested_payload_detection(finding, dangerous_nested_encodings):
-            severity = IssueSeverity.INFO
-            details.setdefault("evidence", "nested_payload_detected")
         legacy_rule_code = _legacy_rule_code_for_finding(finding)
         _add_legacy_rule_alias_metadata(finding, details, legacy_rule_code)
         result.add_check(
@@ -368,37 +362,6 @@ def apply_pickle_member_context(result: ScanResult, *, archive_path: str, member
 
 def _to_issue_severity(severity: Severity) -> IssueSeverity:
     return IssueSeverity(severity.value)
-
-
-def _dangerous_nested_encodings(findings: Sequence[Finding]) -> frozenset[str]:
-    encodings: set[str] = set()
-    for finding in findings:
-        if finding.message.startswith("Nested pickle finding:") and finding.severity in {
-            Severity.WARNING,
-            Severity.CRITICAL,
-        }:
-            encoding = finding.details.get("nested_encoding")
-            if isinstance(encoding, str):
-                encodings.add(encoding)
-    return frozenset(encodings)
-
-
-def _is_benign_nested_payload_detection(finding: Finding, dangerous_nested_encodings: frozenset[str]) -> bool:
-    if finding.rule_code not in _NESTED_PAYLOAD_RULE_CODES:
-        return False
-    if finding.details.get("analysis_incomplete") is True:
-        return False
-    if finding.details.get("nested_has_execution_opcode") is not False:
-        return False
-    if not finding.message.startswith(("Nested pickle payload detected", "Encoded pickle payload detected")):
-        return False
-    encoding = finding.details.get("encoding")
-    if not isinstance(encoding, str):
-        if finding.rule_code == "S213":
-            encoding = "raw"
-        else:
-            return False
-    return encoding not in dangerous_nested_encodings
 
 
 def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:

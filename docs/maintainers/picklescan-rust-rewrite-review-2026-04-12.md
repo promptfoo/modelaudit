@@ -1087,7 +1087,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] V5-P1-27 — Close N5-P1-HOT-PATH-DEFEATED-BY-TORCH-SEED with realistic PyTorch/HF hot-path skip coverage.
 - [x] V5-P1-28 — Close N5-P1-SARIF-DUPLICATE-FINDINGS by filtering supporting-rule-code rows from SARIF primary results.
 - [x] V5-P1-29 — Close N5-P1-SARIF-NO-PICKLESCAN-RULE-COVERAGE with SARIF regression coverage for new picklescan rule codes.
-- [ ] V5-P1-30 — Close N5-P1-DEAD-ADAPTER-NESTED-DOWNGRADE by deleting the obsolete adapter downgrade path.
+- [x] V5-P1-30 — Close N5-P1-DEAD-ADAPTER-NESTED-DOWNGRADE by deleting the obsolete adapter downgrade path.
 - [ ] V5-P1-31 — Close N5-P1-RULE-CODE-CONFLATION-S902 by assigning PICKLE_EXPANSION a distinct DoS-oriented rule code.
 - [ ] V5-P1-32 — Close N5-P1-DOCKER-SINGLE-STAGE by moving Docker builds to a builder/runtime split.
 - [ ] V5-P2-33 — Close N5-P2-PACKAGE-CHANGELOG-THIN with a fuller standalone package changelog.
@@ -1253,6 +1253,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check tests/integrations/test_sarif_formatter.py` — passed.
   - `uv run mypy tests/integrations/test_sarif_formatter.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/integrations/test_sarif_formatter.py -q -k "pickle_rule_codes"` — passed, 1 test.
+- V5-P1-30 — Same-item commit deletes the obsolete adapter-side benign nested-payload severity downgrade. Rust now owns benign nested classification, so any nested finding that reaches ModelAudit preserves its Rust-assigned severity and rule code. Targeted QA:
+  - `uv run ruff format modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py` — passed.
+  - `uv run ruff check modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py` — passed.
+  - `uv run mypy modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_picklescan_adapter.py -q -k "nested_payload"` — passed, 2 tests.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
