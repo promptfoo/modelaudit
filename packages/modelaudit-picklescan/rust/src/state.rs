@@ -816,7 +816,7 @@ impl<'a> ScanState<'a> {
             return;
         }
 
-        let value_len = value.chars().count();
+        let value_len = string_char_len(value);
         if value_len <= max_chars {
             self.scan_string_literal_candidate(value, op_name, position);
             return;
@@ -937,7 +937,7 @@ impl<'a> ScanState<'a> {
             return;
         }
 
-        let value_len = value.chars().count();
+        let value_len = string_char_len(value);
         if value_len <= self.options.max_string_literal_scan_chars {
             self.scan_encoded_nested_pickle_candidate(value, position);
             return;
@@ -1707,12 +1707,23 @@ fn advance_chars_from(value: &str, start: usize, count: usize) -> usize {
     if count == 0 || start >= value.len() {
         return start;
     }
+    if value.is_ascii() {
+        return start.saturating_add(count).min(value.len());
+    }
     for (chars_seen, (offset, _)) in value[start..].char_indices().enumerate() {
         if chars_seen == count {
             return start + offset;
         }
     }
     value.len()
+}
+
+fn string_char_len(value: &str) -> usize {
+    if value.is_ascii() {
+        value.len()
+    } else {
+        value.chars().count()
+    }
 }
 
 fn capitalize(value: &str) -> String {

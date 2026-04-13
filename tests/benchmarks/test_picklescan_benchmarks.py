@@ -211,8 +211,8 @@ def test_picklescan_hidden_suspicious_string_budget(
     )
 
     assert report.status == ScanStatus.INCONCLUSIVE
-    assert report.verdict == SafetyVerdict.UNKNOWN
-    assert not report.findings
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
     assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 

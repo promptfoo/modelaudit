@@ -31,6 +31,7 @@ from modelaudit.detectors.suspicious_symbols import (
 )
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
+    _LARGE_RUST_FINDING_COMPATIBILITY_SKIP_BYTES,
     _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES,
     _RAW_PATTERN_SCAN_LIMIT_BYTES,
     _RESYNC_FAST_FORWARD_PROBE_BYTES,
@@ -415,6 +416,52 @@ def test_scan_stream_returns_standalone_package_findings_without_legacy_merge(
     assert result.metadata["package_only_metadata"] is True
     assert any(check.name == "Standalone Pickle Finding" for check in result.checks)
     assert {issue.rule_code for issue in result.issues} >= {"S999"}
+
+
+def test_scan_stream_large_rust_security_finding_skips_compatibility_scan() -> None:
+    suspicious_text = "A" * (_LARGE_RUST_FINDING_COMPATIBILITY_SKIP_BYTES + 2048) + "os.system('id')" + ("B" * 128)
+    payload = pickle.dumps({"text": suspicious_text}, protocol=4)
+
+    result = PickleScanner().scan_stream(
+        BytesIO(payload),
+        len(payload),
+        source="large-rust-finding.pkl",
+    )
+
+    assert result.metadata["compatibility_analysis_skipped"] is True
+    assert result.metadata["compatibility_analysis_skip_reason"] == "large_rust_security_finding"
+    assert result.metadata["pickle_primary_engine"] == "standalone"
+    assert any(
+        issue.rule_code == "S101" and "os.system" in issue.message
+        for issue in result.issues
+        if issue.severity == IssueSeverity.WARNING
+    )
+
+
+def test_scan_stream_large_clean_pickle_skips_expensive_raw_detectors() -> None:
+    payload = pickle.dumps(
+        {"blob": b"A" * (_LARGE_RUST_FINDING_COMPATIBILITY_SKIP_BYTES + 4096)},
+        protocol=4,
+    )
+
+    result = PickleScanner().scan_stream(BytesIO(payload), len(payload), source="large-clean.pkl")
+
+    assert result.success is True
+    assert result.metadata["raw_dangerous_pattern_scan_skipped"] is True
+    assert result.metadata["embedded_secrets_scan_skipped"] is True
+    assert result.metadata["jit_script_scan_skipped"] is True
+    assert result.metadata["network_communication_scan_skipped"] is True
+    assert any(
+        check.name == "Embedded Secrets Detection" and check.status == CheckStatus.PASSED for check in result.checks
+    )
+    assert any(
+        check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Network Communication Detection" and check.status == CheckStatus.PASSED
+        for check in result.checks
+    )
 
 
 def test_scan_stream_standalone_primary_does_not_inherit_legacy_operational_failure(
@@ -886,6 +933,14 @@ def test_padding_stripped_base64_candidate_still_flags_potential_base64() -> Non
     )
 
     assert _is_actually_dangerous_string(padding_stripped, {}) == "potential_base64"
+
+
+def test_dangerous_string_prefilter_rejects_large_benign_literal() -> None:
+    assert _is_actually_dangerous_string("A" * (1024 * 1024), {}) is None
+
+
+def test_dangerous_string_prefilter_preserves_code_execution_detection() -> None:
+    assert _is_actually_dangerous_string("__import__('os').system('id')", {}) is not None
 
 
 @pytest.mark.parametrize("file_ext", [".pkl", ".pt", ".pth", ".ckpt"])

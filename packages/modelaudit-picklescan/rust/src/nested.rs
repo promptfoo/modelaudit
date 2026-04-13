@@ -269,19 +269,26 @@ pub(crate) fn encoded_nested_literal_probe_windows(
     max_window_chars: usize,
 ) -> Vec<String> {
     let mut windows = Vec::new();
-    push_unique_window(&mut windows, take_chars(value, max_window_chars));
-    push_unique_window(&mut windows, take_last_chars(value, max_window_chars));
+    if encoded_prefix_has_pickle_prefix(value) {
+        push_unique_window(&mut windows, take_chars(value, max_window_chars));
+    }
+    let suffix_probe = take_last_chars(value, ENCODED_LITERAL_PROBE_CHARS);
+    if encoded_prefix_has_pickle_prefix(&suffix_probe) {
+        push_unique_window(&mut windows, take_last_chars(value, max_window_chars));
+    }
 
     let bytes = value.as_bytes();
-    let patterns: [&[u8]; 3] = [b"gA", b"800", b"\\x80"];
     for index in 0..bytes.len() {
         if windows.len() >= MAX_NESTED_PAYLOAD_PROBES {
             break;
         }
-        if !patterns
-            .iter()
-            .any(|pattern| bytes[index..].starts_with(pattern))
-        {
+        let candidate_starts_encoded_pickle = match bytes[index] {
+            b'g' => bytes[index..].starts_with(b"gA"),
+            b'8' => bytes[index..].starts_with(b"800"),
+            b'\\' => bytes[index..].starts_with(b"\\x80"),
+            _ => false,
+        };
+        if !candidate_starts_encoded_pickle {
             continue;
         }
         if !value.is_char_boundary(index) {
@@ -294,6 +301,10 @@ pub(crate) fn encoded_nested_literal_probe_windows(
     }
 
     windows
+}
+
+fn encoded_prefix_has_pickle_prefix(value: &str) -> bool {
+    base64_prefix_has_pickle_prefix(value) || hex_prefix_has_pickle_prefix(value)
 }
 
 fn push_unique_window(windows: &mut Vec<String>, candidate: String) {
@@ -505,10 +516,17 @@ fn estimate_hex_decoded_size(value: &str) -> usize {
 }
 
 fn take_chars(value: &str, count: usize) -> String {
+    if value.is_ascii() {
+        return value[..value.len().min(count)].to_string();
+    }
     value.chars().take(count).collect()
 }
 
 fn take_last_chars(value: &str, count: usize) -> String {
+    if value.is_ascii() {
+        let start = value.len().saturating_sub(count);
+        return value[start..].to_string();
+    }
     let len = value.chars().count();
     value.chars().skip(len.saturating_sub(count)).collect()
 }
@@ -543,5 +561,20 @@ mod tests {
             TEST_MAX_NESTED_PICKLE_BYTES
         )
         .is_empty());
+    }
+
+    #[test]
+    fn encoded_probe_windows_reject_benign_hexish_large_literals() {
+        let value = format!("{}os.system('id'){}", "A".repeat(4096), "B".repeat(4096));
+
+        assert!(encoded_nested_literal_probe_windows(&value, 4096).is_empty());
+    }
+
+    #[test]
+    fn encoded_probe_windows_keep_embedded_encoded_pickle_candidates() {
+        let value = format!("{}gAR9Lg=={}", "A".repeat(128), "B".repeat(128));
+        let windows = encoded_nested_literal_probe_windows(&value, 64);
+
+        assert!(windows.iter().any(|window| window.starts_with("gAR9Lg==")));
     }
 }

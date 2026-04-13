@@ -1,4 +1,8 @@
 pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
+    if !has_suspicious_ascii_seed(value.as_bytes()) {
+        return Vec::new();
+    }
+
     let lower = value.to_ascii_lowercase();
     let mut matches = Vec::new();
     if value.contains("__")
@@ -40,7 +44,7 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
     if lower.contains("commands.getoutput") || lower.contains("commands.getstatusoutput") {
         matches.push("commands call".to_string());
     }
-    if contains_import_statement(&lower) {
+    if lower.contains("import") && contains_import_statement(&lower) {
         matches.push("import statement".to_string());
     }
     if lower.contains("importlib") {
@@ -49,7 +53,7 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
     if contains_call_like(&lower, "__import__") {
         matches.push("__import__(".to_string());
     }
-    if contains_hex_escape(value) {
+    if lower.contains("\\x") && contains_hex_escape(value) {
         matches.push("hex escape".to_string());
     }
     if lower.contains("getattr") {
@@ -76,6 +80,78 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
         }
     }
     matches
+}
+
+fn has_suspicious_ascii_seed(bytes: &[u8]) -> bool {
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index].to_ascii_lowercase() {
+            b'_' => {
+                if bytes.get(index + 1) == Some(&b'_') {
+                    return true;
+                }
+            }
+            b'\\' => {
+                if bytes
+                    .get(index + 1)
+                    .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'x'))
+                {
+                    return true;
+                }
+            }
+            b'b' => {
+                if starts_with_ascii_case_insensitive(bytes, index, b"base64") {
+                    return true;
+                }
+            }
+            b'c' => {
+                if starts_with_ascii_case_insensitive(bytes, index, b"commands") {
+                    return true;
+                }
+            }
+            b'e' => {
+                if starts_with_ascii_case_insensitive(bytes, index, b"eval")
+                    || starts_with_ascii_case_insensitive(bytes, index, b"exec")
+                {
+                    return true;
+                }
+            }
+            b'g' => {
+                if starts_with_ascii_case_insensitive(bytes, index, b"getattr") {
+                    return true;
+                }
+            }
+            b'i' => {
+                if starts_with_ascii_case_insensitive(bytes, index, b"import") {
+                    return true;
+                }
+            }
+            b'o' => {
+                if starts_with_ascii_case_insensitive(bytes, index, b"os.") {
+                    return true;
+                }
+            }
+            b's' => {
+                if starts_with_ascii_case_insensitive(bytes, index, b"subprocess") {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+fn starts_with_ascii_case_insensitive(haystack: &[u8], start: usize, needle: &[u8]) -> bool {
+    haystack
+        .get(start..start.saturating_add(needle.len()))
+        .is_some_and(|candidate| {
+            candidate
+                .iter()
+                .zip(needle)
+                .all(|(actual, expected)| actual.to_ascii_lowercase() == *expected)
+        })
 }
 
 fn is_common_dunder_metadata_literal(value: &str) -> bool {
@@ -274,11 +350,17 @@ fn is_python_word_char(ch: char) -> bool {
 }
 
 fn contains_import_statement(lower: &str) -> bool {
-    lower
-        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '.')
-        .collect::<Vec<_>>()
-        .windows(2)
-        .any(|window| window[0] == "import" && !window[1].is_empty())
+    let mut previous_was_import = false;
+    for token in lower.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '.') {
+        if token.is_empty() {
+            continue;
+        }
+        if previous_was_import {
+            return true;
+        }
+        previous_was_import = token == "import";
+    }
+    false
 }
 
 fn contains_hex_escape(value: &str) -> bool {
@@ -310,5 +392,16 @@ mod tests {
 
         assert!(matches.contains(&"getattr popen".to_string()));
         assert!(matches.contains(&"getattr process call".to_string()));
+    }
+
+    #[test]
+    fn suspicious_string_matching_fast_rejects_benign_literals() {
+        assert!(suspicious_string_matches(&"A".repeat(1024 * 1024)).is_empty());
+    }
+
+    #[test]
+    fn suspicious_string_matching_keeps_case_insensitive_patterns() {
+        assert!(suspicious_string_matches("OS.System('id')").contains(&"os.system".to_string()));
+        assert!(suspicious_string_matches("Import OS").contains(&"import statement".to_string()));
     }
 }

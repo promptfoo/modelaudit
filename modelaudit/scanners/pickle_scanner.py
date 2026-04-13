@@ -147,6 +147,107 @@ _OPERATIONAL_PICKLE_LIMIT_REASONS: frozenset[str] = frozenset(
         "recursion_limit_on_legitimate_model",
     }
 )
+_LARGE_RUST_FINDING_COMPATIBILITY_SKIP_BYTES = 1024 * 1024
+_DANGEROUS_RAW_SCAN_PREFILTER_BYTES: tuple[bytes, ...] = tuple(
+    sorted(
+        {
+            b"os.",
+            b"posix",
+            b"nt.",
+            b"system",
+            b"popen",
+            b"spawn",
+            b"subprocess",
+            b"eval",
+            b"exec",
+            b"compile",
+            b"__import__",
+            b"importlib",
+            b"pickle",
+            b"joblib",
+            b"torch.load",
+            b"weights_only",
+            b"base64",
+            b"getattr",
+            *{pattern.lower() for pattern in BINARY_CODE_PATTERNS},
+            *{pattern.lower() for pattern in CVE_BINARY_PATTERNS},
+        }
+    )
+)
+_SECRETS_RAW_SCAN_PREFILTER_BYTES: tuple[bytes, ...] = (
+    b"api_key",
+    b"api-key",
+    b"apikey",
+    b"secret",
+    b"token",
+    b"password",
+    b"passwd",
+    b"credential",
+    b"authorization",
+    b"bearer",
+    b"private key",
+    b"-----begin",
+    b"sk-",
+    b"akia",
+    b"ghp_",
+    b"github_pat_",
+    b"mongodb://",
+    b"postgres://",
+)
+_JIT_RAW_SCAN_PREFILTER_BYTES: tuple[bytes, ...] = (
+    b"torch.jit",
+    b"torchscript",
+    b"__torch__",
+    b"jit",
+    b"script",
+    b"trace",
+    b"traced",
+    b"tensorflow",
+    b"tf.function",
+)
+_NETWORK_RAW_SCAN_PREFILTER_BYTES: tuple[bytes, ...] = (
+    b"http://",
+    b"https://",
+    b"://",
+    b"socket",
+    b"requests",
+    b"urllib",
+    b"connect",
+    b"evil.com",
+    b"c2",
+    b"ftp://",
+    b"s3://",
+    b"tcp",
+    b"udp",
+    b"websocket",
+    b"grpc",
+)
+_DANGEROUS_STRING_PREFILTER_TEXT: tuple[str, ...] = (
+    "os.",
+    "subprocess.",
+    "exec",
+    "eval",
+    "__import__",
+    "compile",
+    "open",
+    "popen",
+    "spawn",
+)
+
+
+def _contains_any_prefilter_seed(lower_data: bytes, seeds: tuple[bytes, ...]) -> bool:
+    return any(seed in lower_data for seed in seeds)
+
+
+def _contains_any_text_prefilter_seed(value: str, seeds: tuple[str, ...]) -> bool:
+    lower_value = value.lower()
+    return any(seed in lower_value for seed in seeds)
+
+
+def _could_match_potential_base64_string(value: str) -> bool:
+    if len(value) <= 100:
+        return False
+    return len(value) <= 10000 or any(char in value for char in "+/=")
 
 
 def _is_operational_pickle_issue(issue: Any) -> bool:
@@ -2987,38 +3088,45 @@ def _is_actually_dangerous_string(s: str, ml_context: dict) -> str | None:
     """
     import re
 
+    has_dangerous_seed = _contains_any_text_prefilter_seed(s, _DANGEROUS_STRING_PREFILTER_TEXT)
+    could_match_base64 = _could_match_potential_base64_string(s)
+    if not has_dangerous_seed and not could_match_base64:
+        return None
+
     # Check for ACTUAL dangerous patterns (not just ML magic methods)
-    for pattern in ACTUAL_DANGEROUS_STRING_PATTERNS:
-        match = re.search(pattern, s, re.IGNORECASE)
-        if match:
-            # If we found a dangerous pattern, check if it's actually valid Python code
-            # This helps reduce false positives from data that just happens to contain these strings
+    if has_dangerous_seed:
+        for pattern in ACTUAL_DANGEROUS_STRING_PATTERNS:
+            match = re.search(pattern, s, re.IGNORECASE)
+            if match:
+                # If we found a dangerous pattern, check if it's actually valid Python code
+                # This helps reduce false positives from data that just happens to contain these strings
 
-            # Try to extract a reasonable code snippet around the match
-            start = max(0, match.start() - 50)
-            end = min(len(s), match.end() + 50)
-            code_snippet = s[start:end].strip()
+                # Try to extract a reasonable code snippet around the match
+                start = max(0, match.start() - 50)
+                end = min(len(s), match.end() + 50)
+                code_snippet = s[start:end].strip()
 
-            # Check if this looks like actual Python code
-            is_valid, _ = validate_python_syntax(code_snippet)
-            if is_valid:
-                # It's valid Python! Check if it's actually dangerous
-                is_dangerous, risk_desc = is_code_potentially_dangerous(code_snippet, "low")
-                if is_dangerous:
-                    return f"{pattern} (validated as executable code: {risk_desc})"
-            else:
-                # Not valid Python syntax, might be a false positive
-                # Still flag it if it's a very clear pattern
-                if pattern in [r"eval\s*\(", r"exec\s*\(", r"__import__\s*\("]:
-                    return f"{pattern} (suspicious pattern, not valid Python)"
-                # Otherwise, likely a false positive
-                continue
+                # Check if this looks like actual Python code
+                is_valid, _ = validate_python_syntax(code_snippet)
+                if is_valid:
+                    # It's valid Python! Check if it's actually dangerous
+                    is_dangerous, risk_desc = is_code_potentially_dangerous(code_snippet, "low")
+                    if is_dangerous:
+                        return f"{pattern} (validated as executable code: {risk_desc})"
+                else:
+                    # Not valid Python syntax, might be a false positive
+                    # Still flag it if it's a very clear pattern
+                    if pattern in [r"eval\s*\(", r"exec\s*\(", r"__import__\s*\("]:
+                        return f"{pattern} (suspicious pattern, not valid Python)"
+                    # Otherwise, likely a false positive
+                    continue
 
     # Check for base64-like strings, but avoid common benign model metadata such
     # as repeated tokens and hex digests. Encoded nested payloads are handled
     # separately by decoding and validating the content.
     if (
-        len(s) > 100
+        could_match_base64
+        and len(s) > 100
         and re.match(r"^[A-Za-z0-9+/=]+$", s)
         and not re.match(r"^(.)\1*$", s)  # Not all same character (e.g., "===...")
         and len(set(s)) > 4  # Must have some character diversity
@@ -4546,6 +4654,18 @@ class PickleScanner(BaseScanner):
             scanner_name=self.name,
             scanner=self,
         )
+        if (
+            file_size >= _LARGE_RUST_FINDING_COMPATIBILITY_SKIP_BYTES
+            and not pickle_report.errors
+            and _scan_result_has_security_findings(package_result)
+        ):
+            package_result.metadata["compatibility_analysis_skipped"] = True
+            package_result.metadata["compatibility_analysis_skip_reason"] = "large_rust_security_finding"
+            package_result.metadata["compatibility_analysis_skip_min_bytes"] = (
+                _LARGE_RUST_FINDING_COMPATIBILITY_SKIP_BYTES
+            )
+            package_result.metadata["pickle_primary_engine"] = "standalone"
+            return package_result
 
         try:
             file_obj.seek(stream_start)
@@ -6432,24 +6552,55 @@ class PickleScanner(BaseScanner):
                 rule_code="S902",
             )
 
-        # CRITICAL FIX: Scan for dangerous patterns in embedded pickles
-        # This was missing and allowed malicious PyTorch models to pass undetected
-        self._scan_for_dangerous_patterns(file_data, result, self.current_file_path)
+        lower_file_data = file_data.lower()
 
-        # Check for embedded secrets in the pickle data
-        self.check_for_embedded_secrets(file_data, result, self.current_file_path)
+        # CRITICAL FIX: Scan for dangerous patterns in embedded pickles
+        # This was missing and allowed malicious PyTorch models to pass undetected.
+        # The detector performs many regex passes, so gate it behind cheap byte
+        # seeds once the Rust opcode scanner has already covered the primary
+        # pickle semantics.
+        if _contains_any_prefilter_seed(lower_file_data, _DANGEROUS_RAW_SCAN_PREFILTER_BYTES):
+            self._scan_for_dangerous_patterns(file_data, result, self.current_file_path)
+        else:
+            result.metadata["raw_dangerous_pattern_scan_skipped"] = True
+            result.metadata["raw_dangerous_pattern_scan_skip_reason"] = "no_prefilter_seed"
+
+        # Check for embedded secrets in the pickle data. The full detector is
+        # regex/entropy-heavy; clean tensor blobs should only pay a cheap seed
+        # pass while preserving a normal passing check.
+        if _contains_any_prefilter_seed(lower_file_data, _SECRETS_RAW_SCAN_PREFILTER_BYTES):
+            self.check_for_embedded_secrets(file_data, result, self.current_file_path)
+        elif self.config.get("check_secrets", True):
+            result.metadata["embedded_secrets_scan_skipped"] = True
+            result.metadata["embedded_secrets_scan_skip_reason"] = "no_prefilter_seed"
+            result.add_check(
+                name="Embedded Secrets Detection",
+                passed=True,
+                message="No embedded secrets detected",
+                location=self.current_file_path,
+            )
 
         # Check for JIT/Script code execution risks and network communication patterns
         # Collect findings without creating individual checks
-        jit_findings = self.collect_jit_script_findings(
-            file_data,
-            model_type="pytorch",  # Most pickle files in ML are PyTorch
-            context=self.current_file_path,
-        )
-        network_findings = self.collect_network_communication_findings(
-            file_data,
-            context=self.current_file_path,
-        )
+        if _contains_any_prefilter_seed(lower_file_data, _JIT_RAW_SCAN_PREFILTER_BYTES):
+            jit_findings = self.collect_jit_script_findings(
+                file_data,
+                model_type="pytorch",  # Most pickle files in ML are PyTorch
+                context=self.current_file_path,
+            )
+        else:
+            jit_findings = []
+            result.metadata["jit_script_scan_skipped"] = True
+            result.metadata["jit_script_scan_skip_reason"] = "no_prefilter_seed"
+        if _contains_any_prefilter_seed(lower_file_data, _NETWORK_RAW_SCAN_PREFILTER_BYTES):
+            network_findings = self.collect_network_communication_findings(
+                file_data,
+                context=self.current_file_path,
+            )
+        else:
+            network_findings = []
+            result.metadata["network_communication_scan_skipped"] = True
+            result.metadata["network_communication_scan_skip_reason"] = "no_prefilter_seed"
 
         # Emit explicit checks for the file (only if checks are enabled)
         check_jit = self._get_bool_config("check_jit_script", True)
