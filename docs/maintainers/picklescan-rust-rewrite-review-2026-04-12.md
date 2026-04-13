@@ -535,7 +535,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] T-P1-65 — Expand EXT1/EXT2/EXT4 extension-registry tests.
 - [x] T-P1-67 — Restore dill load and benign dill-string tests.
 - [x] S-R2-5 — Consolidate nested payload finding helpers.
-- [ ] S-R2-6 — Share `record_global_ref` detail base.
+- [x] S-R2-6 — Share `record_global_ref` detail base.
 - [ ] S-R2-8 — Table-drive suspicious string matches.
 - [ ] S-R2-9 — Merge `getattr` parsers.
 - [ ] S-R2-10 — Replace warning-global slice sentinel with an explicit enum.
@@ -665,6 +665,14 @@ This section is the active implementation log for follow-up commits after revisi
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 41 tests.
   - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q -k "nested"` — passed, 30 tests.
+- S-R2-6 — Same-item commit extracts the shared global-reference detail fields used by metadata, dangerous-global findings, and `__main__` warnings so future field additions cannot drift between those paths. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 41 tests.
+  - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_resolves_short_binstring_stack_global_operands packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_detects_reduce_invoking_os_system -q` — passed, 2 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

@@ -212,6 +212,35 @@ fn encoded_nested_payload_finding(
     }
 }
 
+fn global_ref_details(
+    reference: &GlobalRef,
+    symbol: &str,
+    op_name: &'static str,
+) -> Vec<(String, DetailValue)> {
+    vec![
+        (
+            "opcode".to_string(),
+            DetailValue::String(op_name.to_string()),
+        ),
+        (
+            "module".to_string(),
+            DetailValue::String(reference.module.clone()),
+        ),
+        (
+            "name".to_string(),
+            DetailValue::String(reference.name.clone()),
+        ),
+        (
+            "import_reference".to_string(),
+            DetailValue::String(symbol.to_string()),
+        ),
+        (
+            "position".to_string(),
+            DetailValue::UInt(reference.position as u64),
+        ),
+    ]
+}
+
 impl ExpansionHeuristicState {
     fn new(stream_id: usize) -> Self {
         Self {
@@ -1416,30 +1445,12 @@ impl<'a> ScanState<'a> {
         }
 
         self.global_count += 1;
+        let details = global_ref_details(reference, &symbol, op_name);
         if self.seen_global_reference_keys.insert(key) {
-            self.import_references.push(vec![
-                (
-                    "import_reference".to_string(),
-                    DetailValue::String(symbol.clone()),
-                ),
-                (
-                    "module".to_string(),
-                    DetailValue::String(reference.module.clone()),
-                ),
-                (
-                    "name".to_string(),
-                    DetailValue::String(reference.name.clone()),
-                ),
-                (
-                    "opcode".to_string(),
-                    DetailValue::String(op_name.to_string()),
-                ),
-                (
-                    "position".to_string(),
-                    DetailValue::UInt(reference.position as u64),
-                ),
-                ("is_dangerous".to_string(), DetailValue::Bool(is_dangerous)),
-            ]);
+            let mut import_reference_details = details.clone();
+            import_reference_details
+                .push(("is_dangerous".to_string(), DetailValue::Bool(is_dangerous)));
+            self.import_references.push(import_reference_details);
         }
 
         if let Some(global_severity) = severity {
@@ -1448,19 +1459,7 @@ impl<'a> ScanState<'a> {
                 severity: global_severity,
                 location: Some(format!("{} (pos {})", self.source, reference.position)),
                 rule_code: Some("DANGEROUS_GLOBAL"),
-                details: vec![
-                    ("opcode".to_string(), DetailValue::String(op_name.to_string())),
-                    ("module".to_string(), DetailValue::String(reference.module.clone())),
-                    ("name".to_string(), DetailValue::String(reference.name.clone())),
-                    (
-                        "import_reference".to_string(),
-                        DetailValue::String(reference.symbol()),
-                    ),
-                    (
-                        "position".to_string(),
-                        DetailValue::UInt(reference.position as u64),
-                    ),
-                ],
+                details: details.clone(),
                 why: Some(
                     "Dangerous globals can execute code or access sensitive system resources when unpickled.",
                 ),
@@ -1477,19 +1476,7 @@ impl<'a> ScanState<'a> {
                 severity: "warning",
                 location: Some(format!("{} (pos {})", self.source, reference.position)),
                 rule_code: Some("S203"),
-                details: vec![
-                    ("opcode".to_string(), DetailValue::String(op_name.to_string())),
-                    ("module".to_string(), DetailValue::String(reference.module.clone())),
-                    ("name".to_string(), DetailValue::String(reference.name.clone())),
-                    (
-                        "import_reference".to_string(),
-                        DetailValue::String(reference.symbol()),
-                    ),
-                    (
-                        "position".to_string(),
-                        DetailValue::UInt(reference.position as u64),
-                    ),
-                ],
+                details,
                 why: Some(
                     "Pickles that instantiate classes from __main__ depend on arbitrary application code and deserve manual review before loading.",
                 ),
