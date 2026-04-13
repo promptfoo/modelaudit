@@ -680,7 +680,7 @@ def test_structural_tamper_and_malicious_import_both_reported(tmp_path: Path) ->
     ), f"Expected CRITICAL os.system finding, got: {[issue.message for issue in result.issues]}"
 
 
-def test_structural_tamper_with_safe_ml_payload_only_info_severity(tmp_path: Path) -> None:
+def test_structural_tamper_with_safe_ml_payload_preserves_rust_warning_severity(tmp_path: Path) -> None:
     safe_payload = pickle.dumps({"layer": "linear", "shape": [4, 8]}, protocol=2)
     path = tmp_path / "safe-ml-duplicate-proto.pkl"
     path.write_bytes(b"\x80\x02" + safe_payload)
@@ -689,7 +689,7 @@ def test_structural_tamper_with_safe_ml_payload_only_info_severity(tmp_path: Pat
     structural_checks = [check for check in result.checks if check.name == "Pickle Structural Tamper Check"]
 
     assert structural_checks, "Expected structural tamper finding for duplicate/misplaced PROTO"
-    assert all(check.severity == IssueSeverity.INFO for check in structural_checks)
+    assert all(check.severity == IssueSeverity.WARNING for check in structural_checks)
 
 
 def test_root_legacy_metadata_detectors_preserve_import_only_and_main_build_rules() -> None:

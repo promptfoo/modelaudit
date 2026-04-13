@@ -186,8 +186,6 @@ def pickle_report_to_scan_result(
         if finding.rule_code:
             details.setdefault("pickle_rule_code", finding.rule_code)
         severity = _to_issue_severity(finding.severity)
-        if finding.rule_code == "STRUCTURAL_TAMPER":
-            severity = IssueSeverity.INFO
         if _is_benign_nested_payload_detection(finding, dangerous_nested_encodings):
             severity = IssueSeverity.INFO
             details.setdefault("evidence", "nested_payload_detected")

@@ -1077,7 +1077,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] V5-P1-17 — Close N5-SEC-F9 by collapsing persistent-id warning spam into a counted notice.
 - [x] V5-P1-18 — Close N5-PY1-1 / N5-PY1-4 by making non-seekable stream truncation explicit for known and unknown sizes.
 - [x] V5-P1-19 — Close N5-PY1-2 by scanning binary tails for stream-backed pickle content beyond the raw window.
-- [ ] V5-P1-20 — Close N5-PY1-3 / N5-SEC-F4 by preserving Rust STRUCTURAL_TAMPER warning severity through the adapter.
+- [x] V5-P1-20 — Close N5-PY1-3 / N5-SEC-F4 by preserving Rust STRUCTURAL_TAMPER warning severity through the adapter.
 - [ ] V5-P1-21 — Close N5-PY1-5 by assigning a deterministic fallback rule code to unknown dangerous globals.
 - [ ] V5-P1-22 — Close N5-PY1-6 by adding a standalone known-size stream read ceiling.
 - [ ] V5-P1-23 — Close N5-PY1-7 / N5-PY1-8 by scanning partial bytes on short reads, including ZIP member scans.
@@ -1197,6 +1197,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q -k "non_seekable_known_size or non_seekable_payload_above_root_cap or binary_tail_past_raw_window"` — passed, 3 tests.
+- V5-P1-20 — Same-item commit removes the adapter's unconditional STRUCTURAL_TAMPER INFO downgrade so Rust WARNING severity flows through ModelAudit. Targeted QA:
+  - `uv run ruff format modelaudit/scanners/picklescan_adapter.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/scanners/picklescan_adapter.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/picklescan_adapter.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q -k "structural_tamper"` — passed, 7 tests.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
