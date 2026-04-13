@@ -533,7 +533,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] T-P1-63 — Expand high-risk callable module coverage.
 - [x] T-P1-64 — Add real NEWOBJ_EX end-to-end test coverage.
 - [x] T-P1-65 — Expand EXT1/EXT2/EXT4 extension-registry tests.
-- [ ] T-P1-67 — Restore dill load and benign dill-string tests.
+- [x] T-P1-67 — Restore dill load and benign dill-string tests.
 - [ ] S-R2-5 / S-R2-6 / S-R2-8 / S-R2-9 / S-R2-10 — Rust readability refactors.
 - [ ] S-P2-15 / S-P2-17 / S-P2-18 / S-P2-19 — Python readability/drift refactors.
 - [ ] S-D2-29 / S-D2-30 / S-D2-33 / S-D2-34 / S-D2-35 / S-D2-37 / S-D2-38 / S-D2-39 / S-D2-40 — Documentation and CI hygiene follow-ups.
@@ -647,6 +647,12 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `uv run mypy packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q -k "extension"` — passed, 8 tests.
+- T-P1-67 — Same-item commit verifies the review-named `dill.load` and benign dill text literal regressions are present, then expands coverage to the remaining dangerous dill loader helpers `dill.load_module` and `dill.load_session`. Targeted QA:
+  - `uv run ruff format packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run ruff format --check packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run ruff check packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run mypy packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q -k "dill"` — passed, 7 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

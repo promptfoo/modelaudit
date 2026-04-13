@@ -1155,6 +1155,21 @@ def test_scan_bytes_flags_dill_load_as_dangerous() -> None:
     )
 
 
+@pytest.mark.parametrize("helper", ["load_module", "load_session"])
+def test_scan_bytes_flags_dill_loader_helpers_as_dangerous(helper: str) -> None:
+    payload = f"cdill\n{helper}\n.".encode()
+
+    report = scan_bytes(payload, source=f"dill-{helper}.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_GLOBAL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == f"dill.{helper}"
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_allows_benign_dill_text_literal() -> None:
     payload = pickle.dumps({"note": "dill is mentioned in documentation only"}, protocol=4)
 
