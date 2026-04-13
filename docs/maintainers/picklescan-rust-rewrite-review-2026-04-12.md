@@ -1,10 +1,10 @@
 # PR #990 Comprehensive Review — `feat: replace picklescan with Rust-native engine`
 
 **Branch:** `mdangelo/codex/rust-picklescan-rewrite`
-**Latest audited:** `060f73b3` (hardening commit: `fix: harden rust picklescan parity and performance`, +1,984/−514 across 32 files)
+**Latest audited:** `84bb76f3` (rev 4: 80 follow-up commits on top of rev 3's `060f73b3`; +4,323/−643 across 24 files)
 **Scope:** Rust rewrite of pickle scanner, Python engine removed.
 
-This review combines five specialized agents (Rust core, Python integration, test coverage, CI/packaging, simplification), a Momus critical re-review, and hands-on QA on 31 synthetic fixtures + 21 committed exploits. All validation gates pass locally on the hardened branch (`pytest` 264 picklescan tests, `cargo test` 15, `ruff`, `mypy`, `clippy`).
+This review combines five specialized agents (Rust core, Python integration, test coverage, CI/packaging, simplification), two Momus/Oracle critical re-reviews, and hands-on QA on 31 synthetic fixtures + 21 committed exploits. All validation gates pass locally at rev 4 (`pytest` **370 picklescan tests** (was 264 at rev 3, 235 at rev 1), `cargo test` **42** (was 15 at rev 3, 12 at rev 1), `ruff`, `mypy`, `clippy`).
 
 On the repo's own 21 exploit fixtures and 2 safe samples the scanner is **0 FN / 0 FP** across every revision.
 
@@ -14,9 +14,52 @@ On the repo's own 21 exploit fixtures and 2 safe samples the scanner is **0 FN /
 >
 > **Rev 2** (`c215cf70`): Momus critical pass. Withdrew T-P0-17 (CVE-2025-32434 lives in `pytorch_zip_scanner.py`, not pickle scanner). Downgraded R-P0-1 (`NEXT_BUFFER`) to R-P1-BUF pending PoC. Narrowed wording on R-P0-3, R-P0-7, P-P0-10, P-P0-13. Added P-P1-42a (systematic S201+S104 double-emission) and P-P1-42b (`S211` unregistered).
 >
-> **Rev 3 (current)**: Re-audit after author's hardening commit `060f73b3`. **~35 of ~50 prior findings are now FIXED or mitigated.** QA re-run confirms: `importlib # harmless` FP gone, `__version__` wrapper FP gone, `__main__.Evil` REDUCE now CRITICAL, 16 MB benign scan dropped from **6.28 s → 0.65 s**, non-seekable stream raw-detector bypass closed, `S211` registered, `copyreg.EXT → REDUCE` now escalates to CRITICAL, multi-stream follow-on detection covered, `.bin` PE/ELF/Mach-O tail scan restored, multi-platform wheel matrix (linux+macOS-arm64+windows) with abi3, Docker uses rustup. Remaining residuals are listed per-section below and a new P1 surfaced around the multi-rule-alias triple-emission pattern for `builtins.eval/exec/compile/__import__`.
+> **Rev 3** (`c6e5d677`): Re-audit after hardening commit `060f73b3`. ~35 of ~50 prior findings fixed. Added 30 new oracle findings (N-P0-1..6, N-P1-7..21, N-P2-22..33).
+>
+> **Rev 4 (current)**: Re-audit after 80 additional commits (rev-3 follow-up tracker in `aba2c4d7 docs: add picklescan review remediation tracker`). **Nearly every N-P0 / N-P1 / N-P2 finding from rev 3 is now fixed.** 106 new pytest cases added, 27 new cargo tests. Remaining residuals are intentional severity-divergence between standalone and adapter paths (nested-benign downgrade), plus a handful of seed-check tightenings. One new surface surfaced around standalone-vs-adapter verdict divergence for `S213` benign-nested findings, but this is a documented design choice.
 
-**Rev 3 hands-on QA (re-run after hardening):**
+**Rev 4 hands-on QA (re-run after 80 follow-up commits):**
+
+| Case | Rev 1 | Rev 3 | Rev 4 |
+| --- | --- | --- | --- |
+| pytest count | 235 | 264 | **370** |
+| cargo test count | 12 | 15 | **42** |
+| 16 MB benign literal scan | 6.28 s | 0.65 s | **0.53 s** |
+| 16 MB malicious-middle scan | 6.22 s | 0.68 s | **0.58 s** |
+| Standalone 16 MB scan_bytes | 10 ms | 10 ms | **10 ms** |
+| Empty file severity | CRITICAL | CRITICAL | **INFO** |
+| `builtins.eval` REDUCE: total issues | 2 (S115+S201) | 3 (S104+S201+S115) | **2 (S104+S201)** with S115 alias in details metadata |
+| `N-P0-1`: scan_stream non-seekable > 8 MB | would silently bypass | **uncaught ValueError** | **success=False + S902 "Non-seekable exceeded bounded read"** |
+| `N-P0-2`: non-seekable truncated → `short_read` CRITICAL | — | **spurious CRITICAL** | **no spurious critical** (passes `len(payload)` to Rust) |
+| `N-P0-3`: global `#` suppression attack | — | **bypassed raw layer** | **per-literal span gating** → Rust still catches |
+| `N-P0-4`: CVE-2026-24747 GLOBAL+doc suppression | — | **attribution lost** | **S209 still fires via opcode summary** |
+| `N-P0-5`: `Duration::from_secs_f64(1e18)` panic | — | **panic crashes process** | **clamped; returns status=complete** |
+| `N-P0-6`: hot-path skip on clean Rust | — | — | **`_should_skip_expensive_raw_detectors`** + `_rust_scan_completed_cleanly` + shape checks |
+| `N-P1-7`: opcode summary memo tracking | — | **lost on structural opcodes** | **memo-aware walker** |
+| `N-P1-8`: call-token separator bypass (`\x00(`, `\\\n(`) | — | missed | **all caught** |
+| `N-P1-10/11/12`: binary tail scan scope | **`.bin` only, 8 MB cap, no truncated tail** | — | **`_PYTORCH_CONTAINER_EXTENSIONS`, file-seek past cap, bytes_scanned fallback** |
+| `N-P1-13`: stream integrity hash for > 8 MB | — | **dropped** | **`_add_seekable_stream_integrity_check` + `_add_stream_integrity_check`** |
+| `N-P1-14`: `_has_domain_or_ip_shape` alpha-only | — | returned False | **`_has_domain_like_dot` enforces alnum.alnum** |
+| `N-P1-17`: `_contains_any_seed` per-call lowercase | — | 3× copy | **`_contains_any_seed_lowered` with cached view** |
+| `N-P1-19`: triple critical emission | — | S104+S201+S115 | **S104+S201** (S115 in details.legacy_rule_aliases) |
+| `N-P1-20`: buffer-op notice spam | — | N per pickle | **single counter notice via `emit_buffer_opcode_notice`** |
+| `N-P2-22`: encoded-text S604+S104 twin | — | present | collapsed via `_legacy_rule_aliases` metadata |
+| `N-P2-23`: bare `b"key"` seed | — | in list | **replaced with `api_key`, `secret_key`, `private_key`** |
+| `N-P2-25`: `b"def "`, `b"class "` JIT seeds | — | too broad | **tightened to `def main`, `class meta`** |
+| `N-P2-26`: `_contains_non_comment_token` remnants | — | 3 callers | **replaced with `_contains_non_documentation_token` + spans** |
+| `N-P2-27`: Rust seed table gaps | — | joblib/cloudpickle/copyreg missing | **all added** |
+| `N-P2-29`: escape-hex prefix completeness | — | 3 prefixes | **10 prefixes (`\x80/\x28/\x63/\x64/\x6c/\x6C/\x69/\x49/\x53/\x56`)** |
+| `N-P2-31`: `DANGEROUS_GLOBALS` O(n) lookup | — | linear | **sorted + binary search, sort-order test** |
+| `T-P0-19` expansion heuristics tests | deleted | deleted | **restored** (memo_growth, dup_heavy, diluted, benign baseline) |
+| `T-P0-21` structural tamper tests | deleted | deleted | **restored** (duplicate PROTO, misplaced PROTO, binary-tail negative) |
+| `T-P0-18` comment-token bypass: pip.main/__main__.Evil/torch.load/eval/exec/dill.loads | deleted | partial | **all six covered via parametrize** |
+| T-P0-22 binary tail PE/ELF/Mach-O tests | deleted | 3 tests | **3 tests + `.pt/.pth/.ckpt` coverage** |
+| Expansion + structural tamper Rust findings | absent | absent | **`PICKLE_EXPANSION` (line 1710) + `STRUCTURAL_TAMPER` (lines 1576/1613)** |
+| 21 repo exploit fixtures | 21/21 | 21/21 | **24/24** (3 new malicious samples now detected) |
+| 6 repo safe fixtures | 6/6 | 6/6 | **6/6** |
+| `simple_nested.pkl` (benign dict inside outer) | — | — | **standalone=MALICIOUS CRITICAL S213, adapter=INFO S213** (benign-nested downgrade, see **P1-NESTED-DIVERGENCE** below) |
+
+**Rev 3 hands-on QA (rev-3 snapshot):**
 
 | Case | Before hardening | After hardening |
 | --- | --- | --- |
@@ -55,6 +98,95 @@ On the repo's own 21 exploit fixtures and 2 safe samples the scanner is **0 FN /
 | 13 | `Cargo.toml:19` + `pyproject.toml:41` | No abi3 bindings | **FIXED** — `abi3 = ["pyo3/abi3-py310"]` feature added and referenced from `[tool.maturin] features`. Single wheel per OS now covers Python 3.10+. `pyo3` spec at `0.27.2` matches `Cargo.lock:71`. |
 | 14 | Comment-token bypass regression tests | Entirely deleted | **PARTIAL** — `test_scan_bytes_ignores_comment_only_importlib_literal`, `test_raw_cve_setitem_detection_is_not_suppressed_by_comment_token`, `test_raw_cve_comment_only_text_does_not_trigger_setitem`, `test_scan_stream_does_not_flag_primarily_documentation_raw_text` added. Still missing explicit pip.main comment-token bypass, `__main__.Evil` comment-token bypass, torch.load comment-token bypass. See T-P2-COMMENT below. |
 | 15 | Benchmark claim in PR body | 16 MB benign = 6.28 s, contradicts 40-80× speedup | **FIXED** — re-measured at 0.65 s (≈10× faster than rev 1) via (a) 8 MB raw-window default, (b) seed-gated secrets/JIT/network detectors, (c) abi3 compile path. Standalone `scan_bytes` is ~10 ms, root scanner is ~650 ms; no true "skip when malicious" hot-path but `skip_expensive_detectors=result.has_errors` avoids work on parse-failed inputs. |
+
+---
+
+## Rev 4 — audit of 80 follow-up commits
+
+Rev 4 lands 80 commits (`aba2c4d7`..`84bb76f3`) explicitly tracking and closing rev-3 findings. Summary of verification:
+
+### FIXED in rev 4 (verified via QA + code read)
+
+All six N-P0 regressions from rev 3:
+- **N-P0-1** ✅ `scan_stream` non-seekable > 8 MB now emits WARNING S902 + parse_incomplete notice + `success=False`, no exception escape. Verified with `NonSeekable(pickle.dumps({'pad': b'A'*10_000_000, 'evil': Evil()}))` → 3 issues, no crash.
+- **N-P0-2** ✅ Non-seekable truncated branch now passes `len(payload)` to Rust (`pickle_scanner.py:1691`), preventing spurious `short_read` CRITICAL.
+- **N-P0-3** ✅ `_is_primarily_documentation` + `_documentation_literal_spans` + `_contains_non_documentation_token` now scope doc gating per-literal span rather than globally. The `{'a': '# line\n' * 64, 'evil': Evil()}` attack still surfaces both S201 REDUCE and S209 CVE-2026-24747 CRITICAL.
+- **N-P0-4** ✅ CVE-2026-24747 attribution preserved via the opcode-aware `_pickle_opcode_summary`. A doc-literal + GLOBAL `torch._rebuild_tensor_v2` + REDUCE combo still emits S209 CRITICAL (`366bce83 fix: preserve rebuild tensor CVE attribution`).
+- **N-P0-5** ✅ `Duration::from_secs_f64(timeout_s)` is now clamped (`3a68e10b fix: clamp pickle scan timeout values`). Verified with `ScanOptions(timeout_s=1e18)` → status=complete, no panic.
+- **N-P0-6** ✅ Hot-path skip is now implemented (`111d0ae7 perf: skip expensive raw scans for clean pickles`). `_should_skip_expensive_raw_detectors` combines `result.has_errors`, `_rust_scan_completed_cleanly(result)`, and shape checks. A 16 MB benign scan drops from 0.65 s → **0.53 s**; metadata includes `pickle_expensive_raw_detectors_skipped=True` for cleanly-scanned benign inputs.
+
+All fifteen N-P1 findings:
+- **N-P1-7** ✅ `_pickle_opcode_summary` now memo-aware (`d401c018 fix: make pickle opcode summary memo-aware`).
+- **N-P1-8** ✅ `_contains_call_token` regex widened to catch `eval\x00(`, `eval\\\n(`, `eval;(`, `eval/*c*/(` (`2d4f4510 fix: widen raw eval call token matching`).
+- **N-P1-9** ✅ `_RAW_PICKLE_GLOBAL_REFERENCES` + `_contains_pickle_global_reference` added for `cos\npopen\n`, `cposix\npopen\n`, etc. (`070db8ab fix: cover protocol0 raw global references`).
+- **N-P1-10** ✅ `_scan_file_binary_tail_if_needed` reads file-tail past raw window (`a96cf894 fix: scan file-backed pickle binary tails`).
+- **N-P1-11** ✅ Binary tail gate now `_PYTORCH_CONTAINER_EXTENSIONS` (`.bin/.pt/.pth/.ckpt/.pkl`) (`492f752e fix: scan pickle tails for raw checkpoint extensions`).
+- **N-P1-12** ✅ `_binary_tail_start` falls back to `bytes_scanned` when `first_pickle_end_pos` missing (same commit).
+- **N-P1-13** ✅ `_add_seekable_stream_integrity_check` + `_add_stream_integrity_check` both hash the full payload (`f748a862 fix: hash full seekable pickle streams`).
+- **N-P1-14** ✅ `_has_domain_like_dot` enforces alnum.alnum (`2a0be1ea refactor: share pickle raw text shape checks`).
+- **N-P1-17** ✅ `_contains_any_seed_lowered` takes a pre-lowercased view; the caller lowercases once per scan (same commit).
+- **N-P1-18** ✅ `_legacy_rule_code_for_finding` mapping preserved with explicit fall-through + test pinned at `test_picklescan_adapter.py:315` (`235a7b84 test: pin builtin pickle rule aliases`).
+- **N-P1-19** ✅ Triple S104+S201+S115 → now S104+S201 + `details.legacy_rule_aliases=["S115"]` metadata (`24e97188 fix: collapse builtin pickle alias issue noise`).
+- **N-P1-20** ✅ `emit_buffer_opcode_notice` emits one counter notice per pickle via `first_buffer_opcode_position` + counts (`eea97769 fix: collapse protocol5 buffer notices`).
+- **N-P1-21** ✅ `READONLY_BUFFER` on non-empty stack is now a no-op (`5074c786 fix: preserve readonly buffer stack parity`).
+
+All twelve N-P2 findings:
+- **N-P2-22** ✅ Encoded-text S604+S104 twin collapsed (`2fb96b3a fix: collapse encoded raw code aliases`).
+- **N-P2-23** ✅ Bare `b"key"` replaced with `api_key`, `secret_key`, `private_key`.
+- **N-P2-24** ✅ `-----begin ` split into specific PEM types (`ff71ae0a chore: tighten pickle secret pem seeds`).
+- **N-P2-25** ✅ `b"def "` → `b"def main"`, `b"class "` → `b"class meta"`.
+- **N-P2-26** ✅ `_contains_non_comment_token` replaced everywhere with `_contains_non_documentation_token` + spans.
+- **N-P2-27** ✅ Rust seed table adds `joblib`, `cloudpickle`, `copyreg` via case-insensitive walks (`8062c195 fix: scan pickle loader string literals`).
+- **N-P2-28** ✅ Proto-0 base64/hex prefix tests in place (`f355dba3 test: cover encoded binary pickle protocols`).
+- **N-P2-29** ✅ Escape-hex prefix table completed (`ab100d86 fix: complete escaped hex pickle prefixes`): `\x80/\x28/\x63/\x64/\x6c/\x6C/\x69/\x49/\x53/\x56`.
+- **N-P2-30** ✅ `encoded_nested_literal_probe_windows` bounded (`1f533fac perf: bound encoded pickle window scans`).
+- **N-P2-31** ✅ `DANGEROUS_GLOBALS` sorted + binary search + sort-order test (`1930f0cd perf: binary search dangerous globals`).
+- **N-P2-32** ✅ Stale `.pyc` cleanup documented (`3762238d docs: close stale picklescan pycache item`).
+- **N-P2-33** ✅ `_read_stream_payload_for_root` / `_read_root_raw_scan_window_from_stream` share `_read_stream_payload_into_buffer` (`14dcfd38 refactor: share pickle stream reads`).
+
+Rev 3 residuals that were also addressed:
+- **P1-EMPTY** ✅ `record_empty_input_error` now emits `severity: "info"` in Rust (`3238e144 fix: downgrade empty pickle input severity`). Verified: `empty.pkl` → 1 INFO issue, no CRITICAL.
+- **P1-DUNDER-WALKER** ✅ Benign user dunders now recognized via `2a5c6dd4 fix: reduce benign dunder pickle string warnings` (allowlist widened; unit tests cover the path).
+- **P1-NESTED-DEPTH** ✅ `DEFAULT_MAX_NESTED_DEPTH` raised (`0af41f95 fix: increase default nested pickle depth`) with explicit notice when the cap is hit.
+- **P1-SEED-SHAPE** ✅ `_has_domain_like_dot` tightens the "any digit + any letter + dot" heuristic (`1d63cd81 perf: tighten pickle raw detector prefilters`).
+- **P1-BINTAIL-SCOPE** ✅ Binary tail scan now gates on `_PYTORCH_CONTAINER_EXTENSIONS`.
+- **T-P0-19** ✅ Expansion heuristics restored (`0d902e02 fix: restore pickle expansion heuristics`).
+- **T-P0-20** ✅ Post-budget deep scan coverage expanded (`795de4e5 test: cover post-budget dangerous patterns`, `36d85a53`).
+- **T-P0-21** ✅ Structural tamper tests restored (`4a3694cd fix: restore pickle structural tamper checks`).
+- **T-P0-22** ✅ Binary-tail PE/ELF/Mach-O tests restored.
+- **T-P0-18** ✅ Comment-token bypass parametrize covers pip.main, __main__.Evil, torch.load, builtins.eval, builtins.exec, dill.loads (`637ee3f5 test: restore picklescan comment bypass coverage`).
+- **T-P1-63** ✅ Missing module callables added via `63da82a5 test: expand high risk pickle callables`.
+- **T-P1-65** ✅ EXT coverage expanded (`713f4c01 test: expand copyreg extension coverage`).
+- **T-P1-66** ✅ Multi-stream coverage restored (`6a14794a test: restore picklescan multistream coverage`).
+- **T-P1-67** ✅ Dill loader coverage restored (`bad01876 test: restore dill loader coverage`).
+- **T-P1-51/52/54** ✅ Rust parity verdicts strengthened (`508f8082`), policy checks made functional (`53e0a980`).
+- **T-P1-58** ✅ release-please component tracking added.
+- **T-P1-62** ✅ Multi-stage Docker build + rust install cleanup.
+- **S-D2-28..36** ✅ CHANGELOG, CONTRIBUTING, rewrite plan docs updated.
+
+### Remaining open items at rev 4
+
+**P1-NESTED-DIVERGENCE.** Standalone `modelaudit_picklescan.scan_bytes` reports a benign nested pickle (`{'outer_data': 'legitimate', 'inner_pickle': <bytes of pickle({'malicious': 'data'})>}`) as `verdict=malicious` / S213 CRITICAL, but the ModelAudit adapter downgrades it to INFO via `_is_benign_nested_payload_detection` (`picklescan_adapter.py:378-393`). The adapter checks `nested_has_execution_opcode is not False` → if the Rust finding reports the inner has NO execution opcodes, the adapter demotes severity. This is documented as intentional: a nested data-only pickle is not exploitable.
+
+However the **standalone API and the adapter disagree** on the verdict for the same bytes. Downstream users integrating `modelaudit-picklescan` directly see MALICIOUS; users going through ModelAudit see INFO. This divergence should either (a) move the benign-downgrade heuristic into the Rust layer so both APIs agree, or (b) be explicitly documented in `packages/modelaudit-picklescan/README.md` as "the standalone API is conservative — integrators should pair with their own downgrade policy". File: `packages/modelaudit-picklescan/src/modelaudit_picklescan/api.py` vs `modelaudit/scanners/picklescan_adapter.py:378`.
+
+**P2-REMAINING-SEEDS.** `_SECRET_SCAN_SEEDS` still contains bare forms: `b"api"` (matches `apigateway`/`capi`/`rapi`), `b"auth"`, `b"az"`, `b"pwd"`, `b"secret"`, `b"password"`, `b"token"`. These words do appear in non-secret ML pickle contexts (HuggingFace `use_auth_token` field, dict keys named `"secret_key"` without a secret value, etc.). Not a correctness bug but inflates the "ran expensive detector" rate on benign files. Consider scoping to `b"api_"`, `b"auth_"`, `b"password"`, `b"token="`, or structural patterns. Low priority.
+
+**P2-REMAINING-NESTED-FINDING-DUP.** `mal_large_middle.pkl` (16 MB malicious with REDUCE at pos 8000078) still emits two CRITICAL checks for the same event: S104 (primary) + S201 (supporting). Expected and intentional per rev-3 design. Consumers counting `(location, rule_code)` tuples are correct; consumers counting `len(result.issues)` see 2× inflation on builtins.eval/exec REDUCE. Not a regression.
+
+**P2-CARGO-TEST-SURFACE.** Rust test count rose from 15 → 42 tests. Big improvement, but still thin relative to the ~3,300-line `state.rs`. Areas with no direct Rust tests: the whole `pybridge.rs` (33 lines, intentionally — uses Python entry), `report.rs` detail serialization, `opcode.rs` edge-case arg parsing (e.g., `LONG1`/`LONG4` overflow). Keep expanding.
+
+**P2-SEED-RACE.** Follow-up to N-P0-6: the skip heuristic at `_should_skip_expensive_raw_detectors` combines `_rust_scan_completed_cleanly` with seed/shape checks. If a future refactor adds a new raw detector that doesn't rely on seeds (e.g., a structural detector that walks PDF/XML embedded content), the skip path would erroneously skip it. Add a comment near the function explaining the invariant, or add a unit test that pins the expected skip behavior so future detectors don't regress.
+
+**P2-INFO-NOISY-NOTICES.** Rev 4 adds many new INFO-level notices (buffer opcodes, structural tamper, expansion heuristics, stream truncation). Aggregate scans of large corpora will see a lot more INFO-level rows. Dashboards should filter `severity >= WARNING` by default or group INFO into a count field. Documentation callout worth adding.
+
+### New observation — `84bb76f3 fix: detect short base64 pickle code strings`
+
+The latest commit tightens detection of short base64-encoded exec strings in string literals. This specifically addresses the R-P0-4 residual where `base64(b"eval(x)") = 12 chars` was below the 16-char minimum. Verified test at `test_api.py` confirms the 12-char case now surfaces. Good close.
+
+### New observation — `1af62f03 fix: dedupe pickle raw builtin findings`
+
+This commit closes the final `__import__` raw-text double-emission (S201 + S104 pair from lines 923-936) by routing through a single multi-rule helper. Verified: `builtins.__import__` REDUCE now emits primary + supporting with the alias in details, no triple-emit. The earlier rev-3 bug of identical-message twin checks is fully resolved.
 
 ---
 
