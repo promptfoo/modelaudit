@@ -245,6 +245,10 @@ def test_scan_stream_non_seekable_payload_above_root_cap_returns_truncated_resul
 
     assert result.metadata["pickle_stream_truncated_for_root_scan"] is True
     assert result.metadata["pickle_stream_bytes_buffered"] == 64
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata.get("operational_error_reason") != "short_read"
+    assert result.success is False
+    assert not any(issue.details.get("category") == "short_read" for issue in result.issues)
     assert any(check.name == "Pickle Stream Read Limit" for check in result.checks)
 
 

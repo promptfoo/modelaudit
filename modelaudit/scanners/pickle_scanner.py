@@ -16,7 +16,7 @@ from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
 
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 
-from .base import BaseScanner, IssueSeverity, ScanResult, logger
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
 from .picklescan_adapter import pickle_report_to_scan_result, scan_options_from_config
 
 _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES = 64 * 1024
@@ -725,6 +725,11 @@ class PickleScanner(BaseScanner):
         result.metadata["pickle_stream_truncated_for_root_scan"] = True
         result.metadata["pickle_stream_root_scan_read_limit"] = read_result.read_limit
         result.metadata["pickle_stream_bytes_buffered"] = len(read_result.payload)
+        result.metadata["analysis_incomplete"] = True
+        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        scan_outcome_reasons = result.metadata.setdefault("scan_outcome_reasons", [])
+        if isinstance(scan_outcome_reasons, list) and "non_seekable_stream_truncated" not in scan_outcome_reasons:
+            scan_outcome_reasons.append("non_seekable_stream_truncated")
         if declared_size is not None:
             result.metadata["pickle_stream_declared_size"] = declared_size
         result.add_check(
@@ -742,6 +747,7 @@ class PickleScanner(BaseScanner):
             },
             rule_code="S902",
         )
+        result.finish(success=False)
 
     def _run_root_raw_detectors(
         self,
@@ -1259,7 +1265,8 @@ class PickleScanner(BaseScanner):
         else:
             stream_read = self._read_stream_payload_for_root(file_obj, standalone_size)
             payload = stream_read.payload
-            result = self._scan_standalone_stream(io.BytesIO(payload), standalone_size, source=source)
+            rust_stream_size = len(payload) if stream_read.truncated else standalone_size
+            result = self._scan_standalone_stream(io.BytesIO(payload), rust_stream_size, source=source)
             self._add_stream_integrity_check(payload, result, source)
             self._add_stream_truncation_check(stream_read, result, source, standalone_size)
             raw_data = self._raw_window_from_payload(payload, self._root_raw_scan_limit())
