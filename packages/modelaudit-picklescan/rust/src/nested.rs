@@ -318,16 +318,7 @@ fn protocol0_global_or_inst_prefix_has_lines(value: &[u8]) -> bool {
     if !matches!(value.first().copied(), Some(b'c' | b'i')) {
         return false;
     }
-    let mut newline_count = 0usize;
-    for byte in &value[1..] {
-        if *byte == b'\n' {
-            newline_count += 1;
-            if newline_count >= 2 {
-                return true;
-            }
-        }
-    }
-    false
+    value[1..].contains(&b'\n')
 }
 
 pub(crate) fn nested_pickle_probe_offsets(value: &[u8]) -> Vec<usize> {
