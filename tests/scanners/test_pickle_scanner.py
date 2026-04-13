@@ -92,6 +92,25 @@ def test_expensive_raw_prefilters_preserve_secret_and_network_findings(tmp_path:
     assert not result.metadata.get("pickle_network_raw_detector_skipped")
 
 
+def test_expensive_raw_prefilters_preserve_bare_alpha_domain_findings(tmp_path: Path) -> None:
+    path = tmp_path / "bare-domain.pkl"
+    path.write_bytes(pickle.dumps({"endpoint": "attacker.example/model"}, protocol=4))
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(check.name == "Network Communication Detection" for check in result.checks)
+    assert not result.metadata.get("pickle_network_raw_detector_skipped")
+
+
+def test_expensive_raw_prefilters_skip_plain_key_substrings(tmp_path: Path) -> None:
+    path = tmp_path / "plain-key.pkl"
+    path.write_bytes(pickle.dumps({"key": "value"}, protocol=4))
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.metadata["pickle_expensive_raw_detectors_skipped"] is True
+
+
 def test_scan_malicious_pickle_reports_rust_finding(tmp_path: Path) -> None:
     path = tmp_path / "evil.pkl"
     path.write_bytes(pickle.dumps(MaliciousPayload(), protocol=4))

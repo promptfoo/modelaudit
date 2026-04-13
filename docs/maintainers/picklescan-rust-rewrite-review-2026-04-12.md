@@ -484,7 +484,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] P1-PARSE — Decide and document parse-failure suppression semantics, or tighten them.
 - [x] P1-EMPTY — Map empty pickle input to a non-CRITICAL operational outcome.
 - [x] P1-BINTAIL-SCOPE / N-P1-11 — Broaden binary-tail scan beyond `.bin`.
-- [ ] P1-SEED-SHAPE / N-P1-14 / N-P1-15 / N-P1-17 / N-P2-23 / N-P2-25 — Tighten and de-duplicate expensive raw-detector seed/shape helpers.
+- [x] P1-SEED-SHAPE / N-P1-14 / N-P1-15 / N-P1-17 / N-P2-23 / N-P2-25 — Tighten and de-duplicate expensive raw-detector seed/shape helpers.
 - [ ] P1-DUNDER-WALKER — Reduce benign user-dunder false positives.
 - [ ] P1-NESTED-DEPTH — Raise nested depth or fail closed when nested analysis depth is exhausted.
 - [ ] T-P1-WHEEL — Add missing macOS x86_64 and Linux aarch64 wheel coverage or document the gap.
@@ -593,6 +593,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 33 tests, including a raw `.pt` pickle with trailing ELF bytes.
+- P1-SEED-SHAPE / N-P1-14 / N-P1-15 / N-P1-17 / N-P2-23 / N-P2-25 — Same-item commit caches the expensive raw lowercase buffer once, replaces the bare `key` seed with specific key names, narrows generic JIT `def`/`class` seeds, and uses a domain-like dot shape so alpha-only bare domains still trigger network analysis without treating pickle `STOP` as a domain. Targeted QA:
+  - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 35 tests, including seeded secret/network preservation, bare alpha-only domain detection, and a plain `key` substring skip regression.
 
 ### Newly discovered gaps while remediating
 

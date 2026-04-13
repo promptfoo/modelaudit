@@ -72,16 +72,18 @@ _SECRET_SCAN_SEEDS: tuple[bytes, ...] = (
     b"ghs_",
     b"glpat-",
     b"hooks.slack.com",
-    b"key",
     b"mailgun",
     b"mongodb+srv://",
     b"npm_",
     b"openai_api_key",
     b"passwd",
     b"password",
+    b"api_key",
+    b"private_key",
     b"pwd",
     b"rg_",
     b"secret",
+    b"secret_key",
     b"seed phrase",
     b"sendgrid",
     b"sk-",
@@ -142,9 +144,9 @@ _PICKLE_LITERAL_OPCODE_NAMES = frozenset(
 )
 _JIT_SCAN_SEEDS: tuple[bytes, ...] = (
     b"__import__",
-    b"class ",
     b"compile",
-    b"def ",
+    b"class meta",
+    b"def main",
     b"eval",
     b"exec",
     b"lambda",
@@ -373,8 +375,11 @@ def _contains_module_attr(
 
 
 def _contains_any_seed(data: bytes, seeds: tuple[bytes, ...]) -> bool:
-    lower = data.lower()
-    return any(seed in lower for seed in seeds)
+    return _contains_any_seed_lowered(data.lower(), seeds)
+
+
+def _contains_any_seed_lowered(lower_data: bytes, seeds: tuple[bytes, ...]) -> bool:
+    return any(seed in lower_data for seed in seeds)
 
 
 def _has_alnum_secret_shape(data: bytes) -> bool:
@@ -390,8 +395,28 @@ def _has_alnum_secret_shape(data: bytes) -> bool:
     return False
 
 
+def _is_ascii_alnum_byte(byte: int) -> bool:
+    return (48 <= byte <= 57) or (65 <= byte <= 90) or (97 <= byte <= 122)
+
+
+def _has_domain_like_dot(data: bytes) -> bool:
+    start = 0
+    while True:
+        index = data.find(b".", start)
+        if index < 0:
+            return False
+        if (
+            index > 0
+            and index + 1 < len(data)
+            and _is_ascii_alnum_byte(data[index - 1])
+            and _is_ascii_alnum_byte(data[index + 1])
+        ):
+            return True
+        start = index + 1
+
+
 def _has_domain_or_ip_shape(data: bytes) -> bool:
-    if b"." not in data:
+    if not _has_domain_like_dot(data):
         return False
     has_digit = False
     has_alpha = False
@@ -402,7 +427,7 @@ def _has_domain_or_ip_shape(data: bytes) -> bool:
             has_alpha = True
         if has_digit and has_alpha:
             return True
-    return has_digit
+    return has_digit or has_alpha
 
 
 def _looks_like_portable_executable(data: bytes) -> bool:
@@ -769,7 +794,11 @@ class PickleScanner(BaseScanner):
         expensive_limit = self._root_expensive_raw_scan_limit()
         if expensive_limit <= 0:
             return True
-        return not _contains_any_seed(raw_data[:expensive_limit], _EXPENSIVE_RAW_SCAN_SEEDS)
+        expensive_data = raw_data[:expensive_limit]
+        return not _has_domain_like_dot(expensive_data) and not _contains_any_seed_lowered(
+            expensive_data.lower(),
+            _EXPENSIVE_RAW_SCAN_SEEDS,
+        )
 
     def _read_root_raw_scan_window(self, path: str, file_size: int) -> bytes:
         parsed_limit = self._root_raw_scan_limit()
@@ -925,21 +954,22 @@ class PickleScanner(BaseScanner):
             result.metadata["pickle_expensive_raw_detector_skip_reason"] = "disabled"
             return
         expensive_data = data[:expensive_limit]
+        expensive_lower = expensive_data.lower()
         if len(expensive_data) < len(data):
             result.metadata["pickle_expensive_raw_detector_bytes_scanned"] = len(expensive_data)
             result.metadata["pickle_expensive_raw_detector_bytes_available"] = len(data)
 
-        if _contains_any_seed(expensive_data, _SECRET_SCAN_SEEDS) or _has_alnum_secret_shape(expensive_data):
+        if _contains_any_seed_lowered(expensive_lower, _SECRET_SCAN_SEEDS) or _has_alnum_secret_shape(expensive_data):
             self.check_for_embedded_secrets(expensive_data, result, source)
         else:
             result.metadata["pickle_secrets_raw_detector_skipped"] = True
 
-        if _contains_any_seed(expensive_data, _JIT_SCAN_SEEDS):
+        if _contains_any_seed_lowered(expensive_lower, _JIT_SCAN_SEEDS):
             self.check_for_jit_script_code(expensive_data, result, model_type="pickle", context=source)
         else:
             result.metadata["pickle_jit_raw_detector_skipped"] = True
 
-        if _contains_any_seed(expensive_data, _NETWORK_SCAN_SEEDS) or _has_domain_or_ip_shape(expensive_data):
+        if _contains_any_seed_lowered(expensive_lower, _NETWORK_SCAN_SEEDS) or _has_domain_or_ip_shape(expensive_data):
             self.check_for_network_communication(expensive_data, result, context=source)
         else:
             result.metadata["pickle_network_raw_detector_skipped"] = True
