@@ -24,7 +24,11 @@ from modelaudit.utils.sources.cloud_storage import (
 def make_fs_mock() -> MagicMock:
     fs = MagicMock()
     fs.__enter__.return_value = fs
-    fs.__exit__.side_effect = lambda exc_type, exc, tb: fs.close()
+
+    def close_context(_exc_type: object, _exc: object, _tb: object) -> None:
+        fs.close()
+
+    fs.__exit__.side_effect = close_context
     return fs
 
 
@@ -147,7 +151,7 @@ def test_filter_scannable_files_handles_signed_cloud_urls() -> None:
 
 
 @patch("fsspec.filesystem")
-def test_download_from_cloud(mock_fs, tmp_path):
+def test_download_from_cloud(mock_fs: MagicMock, tmp_path: Path) -> None:
     fs_meta = make_fs_mock()
     fs_meta.info.return_value = {"type": "file", "size": 1024}
 
@@ -168,7 +172,6 @@ def test_download_from_cloud(mock_fs, tmp_path):
     # Result should be a path containing the filename
     assert isinstance(result, Path)
     assert result.name == "model.pt"
-    assert result.exists() or True  # Mock doesn't create actual files
 
     # Note: fsspec filesystems don't need explicit cleanup according to implementation
 
@@ -731,7 +734,7 @@ class TestCloudCacheSafety:
         cached_path = cache.get_cached_path("s3://bucket/model.bin")
         assert cached_path is not None
         assert cached_path.resolve() != source_file.resolve()
-        cached_path.resolve().relative_to(cache.cache_dir.resolve())
+        assert cached_path.resolve().is_relative_to(cache.cache_dir.resolve())
         assert source_file.exists()
 
     def test_clean_old_cache_does_not_delete_outside_cache(

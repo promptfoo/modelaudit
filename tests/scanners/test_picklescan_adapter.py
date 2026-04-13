@@ -26,20 +26,22 @@ from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
 
 
-def test_scan_options_from_config_parses_string_values_and_falls_back_for_bad_values() -> None:
-    defaults = ScanOptions()
-
+def test_scan_options_from_config_parses_string_values() -> None:
     parsed = scan_options_from_config(
         {
             "timeout": "2.5",
             "max_opcodes": "4096",
-            "post_budget_global_scan_limit_bytes": "not-an-int",
+            "post_budget_global_scan_limit_bytes": "8192",
         }
     )
 
     assert parsed.timeout_s == 2.5
     assert parsed.max_opcodes == 4096
-    assert parsed.post_budget_scan_bytes == defaults.post_budget_scan_bytes
+    assert parsed.post_budget_scan_bytes == 8192
+
+
+def test_scan_options_from_config_falls_back_for_bad_values() -> None:
+    defaults = ScanOptions()
 
     fallback = scan_options_from_config(
         {
