@@ -322,6 +322,7 @@ pub(crate) struct ScanState<'a> {
     protocols: Vec<i64>,
     import_references: Vec<Vec<(String, DetailValue)>>,
     opcode_count: usize,
+    opcode_counts: HashMap<&'static str, usize>,
     global_count: usize,
     bytes_scanned: usize,
     first_pickle_end_pos: Option<usize>,
@@ -375,6 +376,7 @@ impl<'a> ScanState<'a> {
             protocols: Vec::new(),
             import_references: Vec::new(),
             opcode_count: 0,
+            opcode_counts: HashMap::new(),
             global_count: 0,
             bytes_scanned: 0,
             first_pickle_end_pos: None,
@@ -493,6 +495,7 @@ impl<'a> ScanState<'a> {
                 let position = self.position_offset + parsed.pos;
                 self.bytes_scanned = self.bytes_scanned.max(parsed.next);
                 self.opcode_count += 1;
+                *self.opcode_counts.entry(parsed.name).or_insert(0) += 1;
                 index = parsed.next;
                 self.record_structural_opcode(&parsed, position);
                 self.record_expansion_opcode(&parsed, position);
@@ -2289,6 +2292,11 @@ impl<'a> ScanState<'a> {
 
         let metadata = PyDict::new(py);
         metadata.set_item("opcode_count", self.opcode_count)?;
+        let opcode_counts = PyDict::new(py);
+        for (opcode, count) in &self.opcode_counts {
+            opcode_counts.set_item(opcode, count)?;
+        }
+        metadata.set_item("opcode_counts", opcode_counts)?;
         metadata.set_item("globals_count", self.global_count)?;
         let import_references = PyList::empty(py);
         for reference in &self.import_references {

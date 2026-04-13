@@ -562,6 +562,32 @@ def _append_raw_indicator(
     indicators.append((label, {"associated_global": associated_global or label}))
 
 
+def _result_opcode_counts(result: ScanResult) -> dict[str, int]:
+    counts = result.metadata.get("opcode_counts")
+    if not isinstance(counts, dict):
+        return {}
+
+    parsed_counts: dict[str, int] = {}
+    for opcode, count in counts.items():
+        if isinstance(opcode, str) and isinstance(count, int):
+            parsed_counts[opcode] = count
+    return parsed_counts
+
+
+def _result_import_references(result: ScanResult) -> list[dict[str, Any]]:
+    references = result.metadata.get("import_references")
+    if not isinstance(references, list):
+        return []
+    return [dict(reference) for reference in references if isinstance(reference, dict)]
+
+
+def _result_parse_was_incomplete(result: ScanResult) -> bool:
+    if result.metadata.get("parsing_failed") is True or result.metadata.get("analysis_incomplete") is True:
+        return True
+    status = result.metadata.get("pickle_report_status")
+    return isinstance(status, str) and status != "complete"
+
+
 def _metadata_pickle_read_limit(configured_limit: Any) -> tuple[int | None, str | None]:
     try:
         read_limit = int(configured_limit)
@@ -1570,11 +1596,8 @@ class PickleScanner(BaseScanner):
             logger.warning("Error checking pickle CVE patterns: %s", error)
             return
 
-        opcode_summary = _pickle_opcode_summary(data)
-        opcode_counts = opcode_summary.get("opcode_counts", {})
-        has_setitem_opcode = isinstance(opcode_counts, dict) and (
-            opcode_counts.get("SETITEM", 0) > 0 or opcode_counts.get("SETITEMS", 0) > 0
-        )
+        opcode_counts = _result_opcode_counts(result)
+        has_setitem_opcode = opcode_counts.get("SETITEM", 0) > 0 or opcode_counts.get("SETITEMS", 0) > 0
 
         if (
             b"_rebuild_tensor" in data
@@ -1596,7 +1619,7 @@ class PickleScanner(BaseScanner):
                 )
             )
 
-        pickle_parse_failed = "parse_error" in opcode_summary
+        pickle_parse_failed = _result_parse_was_incomplete(result)
         attributions = self._dedupe_cve_attributions(
             [
                 attribution
@@ -1611,9 +1634,9 @@ class PickleScanner(BaseScanner):
             ]
         )
 
-        dangerous_globals = opcode_summary.get("dangerous_globals", [])
-        has_dangerous_system_global = isinstance(dangerous_globals, list) and any(
-            global_ref in {"os.system", "posix.system", "nt.system"} for global_ref in dangerous_globals
+        has_dangerous_system_global = any(
+            reference.get("import_reference") in {"os.system", "posix.system", "nt.system"}
+            for reference in _result_import_references(result)
         )
         emitted_cve_rule_keys: set[tuple[str, str]] = set()
         if has_setitem_opcode and has_dangerous_system_global:

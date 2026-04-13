@@ -125,6 +125,15 @@ def test_scan_bytes_returns_clean_report_for_safe_pickle() -> None:
     assert report.coverage.opcode_count > 0
 
 
+def test_scan_bytes_reports_opcode_counts_metadata() -> None:
+    report = scan_bytes(b"\x80\x04}\x94\x8c\x03key\x94K\x01s.", source="opcode-counts.pkl")
+
+    opcode_counts = report.metadata["opcode_counts"]
+    assert opcode_counts["PROTO"] == 1
+    assert opcode_counts["EMPTY_DICT"] == 1
+    assert opcode_counts["SETITEM"] == 1
+
+
 def test_scan_bytes_clamps_excessive_timeout_without_engine_error() -> None:
     report = scan_bytes(
         pickle.dumps({"weights": [1, 2, 3]}, protocol=4),

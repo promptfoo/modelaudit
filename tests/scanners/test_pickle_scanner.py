@@ -997,6 +997,24 @@ def test_opcode_summary_tracks_memoized_stack_global_through_structure(tmp_path:
     )
 
 
+def test_raw_cve_setitem_scan_uses_rust_metadata_not_python_opcode_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    def fail_opcode_summary(_payload: bytes) -> dict[str, Any]:
+        raise AssertionError("scan path should use Rust opcode metadata")
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner._pickle_opcode_summary", fail_opcode_summary)
+    path = tmp_path / "rust-metadata-stack-global.pkl"
+    path.write_bytes(b"\x80\x04\x8c\x02os\x94}\x94\x8c\x06system\x94h\x00h\x02\x93s.")
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        issue.rule_code == "S209" and issue.details.get("associated_global") == "os.system" for issue in result.issues
+    )
+
+
 def test_opcode_summary_uses_cpython_memoize_indexing_after_explicit_put() -> None:
     payload = b"\x80\x04\x8c\x02osq\x05\x8c\x06system\x94h\x05h\x01\x93."
 

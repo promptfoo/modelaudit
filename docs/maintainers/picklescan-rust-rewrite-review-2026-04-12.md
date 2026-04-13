@@ -1082,7 +1082,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] V5-P1-22 — Close N5-PY1-6 by adding a standalone known-size stream read ceiling.
 - [x] V5-P1-23 — Close N5-PY1-7 / N5-PY1-8 by scanning partial bytes on short reads, including ZIP member scans.
 - [x] V5-P1-24 — Close N5-PY1-9 by failing closed when parse failure suppression has no import-reference evidence.
-- [ ] V5-P1-25 — Close N5-PY1-10 by avoiding or retiring the incomplete parallel Python opcode walker where Rust metadata is authoritative.
+- [x] V5-P1-25 — Close N5-PY1-10 by avoiding or retiring the incomplete parallel Python opcode walker where Rust metadata is authoritative.
 - [ ] V5-P1-26 — Close N5-PY1-11 by making rebuild-tensor documentation checks memo-aware or delegating to Rust metadata.
 - [ ] V5-P1-27 — Close N5-P1-HOT-PATH-DEFEATED-BY-TORCH-SEED with realistic PyTorch/HF hot-path skip coverage.
 - [ ] V5-P1-28 — Close N5-P1-SARIF-DUPLICATE-FINDINGS by filtering supporting-rule-code rows from SARIF primary results.
@@ -1222,6 +1222,17 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py` — passed.
   - `uv run mypy modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_picklescan_adapter.py -q -k "tail_suppression or parse_failure"` — passed, 7 tests.
+- V5-P1-25 — Same-item commit adds per-opcode count metadata to the Rust report and changes scan-time CVE bridging to use Rust `opcode_counts`, Rust `import_references`, and Rust completeness metadata instead of the incomplete Python `_pickle_opcode_summary` walker. The bounded Python summary remains only for explicit metadata extraction/tests. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 58 tests.
+  - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
+  - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q -k "opcode_counts"` — passed, 1 test.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q -k "rust_metadata or opcode_summary_tracks or raw_cve_setitem"` — passed, 4 tests.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
