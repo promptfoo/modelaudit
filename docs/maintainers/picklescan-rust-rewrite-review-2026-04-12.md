@@ -1058,7 +1058,7 @@ This section is the active implementation log for follow-up commits after revisi
 
 ### Rev 5 active remediation tracker
 
-- [ ] V5-P0-01 — Close N5-CRITICAL-RCE-BYPASS / N5-SEC-F2 / N5-SEC-F3 by deriving post-budget dangerous-global coverage from policy, promoting REDUCE-proximate matches to CRITICAL, and running the tail scan on timeout exhaustion.
+- [x] V5-P0-01 — Close N5-CRITICAL-RCE-BYPASS / N5-SEC-F2 / N5-SEC-F3 by deriving post-budget dangerous-global coverage from policy, promoting REDUCE-proximate matches to CRITICAL, and running the tail scan on timeout exhaustion.
 - [ ] V5-P0-02 — Close N5-EXPLOIT-PERSID-NESTED / N5-R10 by recognizing PERSID/BINPERSID nested execution semantics and preserving recursive detection.
 - [ ] V5-P0-03 — Re-run and resolve N5-FAIL-1..14, including current scanner-suite legacy rule-code regressions.
 - [ ] V5-P0-04 — Close N5-P0-WHEEL-MANYLINUX by producing manylinux-compatible standalone wheels in release automation.
@@ -1098,6 +1098,11 @@ This section is the active implementation log for follow-up commits after revisi
 
 ### Completed item QA log
 
+- V5-P0-01 — Same-item commit replaces the hardcoded post-budget dangerous-global needle list with a byte-level GLOBAL parser that consults the shared Rust policy, including wildcard modules like `subprocess`, explicit policy entries like `ctypes.CDLL`, and `__main__` references. REDUCE/OBJ/BUILD/NEWOBJ/NEWOBJ_EX proximity now promotes the post-budget finding to CRITICAL, and timeout exhaustion invokes the same tail scan. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml post_budget -- --nocapture` — passed, 4 tests.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

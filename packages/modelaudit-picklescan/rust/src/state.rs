@@ -54,33 +54,8 @@ const EXPANSION_MEMO_GROWTH_MIN_WRITES: usize = 64;
 const EXPANSION_MEMO_GROWTH_STEPS_THRESHOLD: usize = 32;
 const EXPANSION_RATIO_SUPPORTING_DUP_THRESHOLD: usize = 64;
 const EXPANSION_RATIO_SUPPORTING_GROWTH_THRESHOLD: usize = 16;
-const POST_BUDGET_DANGEROUS_GLOBAL_PATTERNS: &[&[u8]] = &[
-    b"nt\nsystem",
-    b"nt\npopen",
-    b"nt\nspawn",
-    b"os\nsystem",
-    b"os\npopen",
-    b"os\nspawn",
-    b"posix\nsystem",
-    b"posix\npopen",
-    b"posix\nspawn",
-    b"commands\ngetoutput",
-    b"commands\ngetstatusoutput",
-    b"subprocess\nPopen",
-    b"builtins\neval",
-    b"builtins\nexec",
-    b"builtins\ncompile",
-    b"builtins\n__import__",
-    b"__builtin__\neval",
-    b"__builtin__\nexec",
-    b"__builtin__\ncompile",
-    b"__builtin__\n__import__",
-    b"importlib\nimport_module",
-    b"marshal\nloads",
-    b"ctypes\nCDLL",
-    b"runpy\nrun_module",
-    b"runpy\nrun_path",
-];
+const POST_BUDGET_REDUCE_PROXIMITY_BYTES: usize = 64;
+const POST_BUDGET_REDUCE_BYTES: &[u8] = b"Rob\x81\x92";
 
 #[derive(Clone)]
 struct GlobalRef {
@@ -478,6 +453,8 @@ impl<'a> ScanState<'a> {
                             self.scan_post_budget_tail(parsed.pos, parsed.next, tail_prefix);
                         }
                         LimitError::Timeout => {
+                            let tail_prefix =
+                                post_budget_opcode_prefix(&parsed, &self.stack, self.payload);
                             self.add_notice(Notice {
                                 message: format!(
                                     "Opcode analysis timed out after {:.3} seconds",
@@ -498,6 +475,7 @@ impl<'a> ScanState<'a> {
                                     ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
                                 ],
                             });
+                            self.scan_post_budget_tail(parsed.pos, parsed.next, tail_prefix);
                         }
                     }
                     self.finish_analysis();
@@ -1987,37 +1965,51 @@ impl<'a> ScanState<'a> {
             .bytes_scanned
             .max(stream_offset.saturating_add(tail.len()));
 
-        for needle in POST_BUDGET_DANGEROUS_GLOBAL_PATTERNS {
-            if let Some(offset) = find_bytes(&tail, needle) {
-                let absolute_position = if offset < tail_prefix_len {
-                    stream_offset.saturating_add(offset)
-                } else {
-                    read_offset.saturating_add(offset - tail_prefix_len)
-                };
-                self.add_finding(Finding {
-                    message: "Dangerous global-like byte pattern found beyond opcode budget".to_string(),
-                    severity: "warning",
-                    location: Some(format!(
-                        "{} (pos {})",
-                        self.source,
-                        self.position_offset + absolute_position
-                    )),
-                    rule_code: Some("POST_BUDGET_GLOBAL"),
-                    details: vec![
-                        (
-                            "pattern".to_string(),
-                            DetailValue::String(String::from_utf8_lossy(needle).to_string()),
-                        ),
-                        (
-                            "position".to_string(),
-                            DetailValue::UInt((self.position_offset + absolute_position) as u64),
-                        ),
-                    ],
-                    why: Some(
-                        "Opcode analysis stopped early, but a byte-level tail scan still found suspicious global references.",
+        for global_match in post_budget_global_matches(&tail, tail_prefix_len) {
+            let absolute_position = post_budget_absolute_position(
+                stream_offset,
+                read_offset,
+                tail_prefix_len,
+                global_match.pattern_start,
+            );
+            let severity = if global_match.reduce_proximate {
+                "critical"
+            } else {
+                global_match.severity
+            };
+            self.add_finding(Finding {
+                message: "Dangerous global-like byte pattern found after analysis limit"
+                    .to_string(),
+                severity,
+                location: Some(format!(
+                    "{} (pos {})",
+                    self.source,
+                    self.position_offset + absolute_position
+                )),
+                rule_code: Some("POST_BUDGET_GLOBAL"),
+                details: vec![
+                    (
+                        "pattern".to_string(),
+                        DetailValue::String(global_match.pattern()),
                     ),
-                });
-            }
+                    (
+                        "module".to_string(),
+                        DetailValue::String(global_match.module),
+                    ),
+                    ("name".to_string(), DetailValue::String(global_match.name)),
+                    (
+                        "position".to_string(),
+                        DetailValue::UInt((self.position_offset + absolute_position) as u64),
+                    ),
+                    (
+                        "reduce_proximate".to_string(),
+                        DetailValue::Bool(global_match.reduce_proximate),
+                    ),
+                ],
+                why: Some(
+                    "Opcode analysis stopped early, but a byte-level tail scan still found dangerous pickle global references.",
+                ),
+            });
         }
 
         let expansion_findings = detect_expansion_findings_in_tail(
@@ -2729,13 +2721,119 @@ fn capitalize(value: &str) -> String {
     }
 }
 
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
+struct PostBudgetGlobalMatch {
+    module: String,
+    name: String,
+    pattern_start: usize,
+    reduce_proximate: bool,
+    severity: &'static str,
+}
+
+impl PostBudgetGlobalMatch {
+    fn pattern(&self) -> String {
+        format!("{}\n{}", self.module, self.name)
     }
+}
+
+fn post_budget_global_matches(tail: &[u8], tail_prefix_len: usize) -> Vec<PostBudgetGlobalMatch> {
+    let mut matches = Vec::new();
+    let mut seen = HashSet::new();
+
+    if tail_prefix_len > 0 {
+        record_post_budget_module_name_pair(tail, 0, 0, &mut seen, &mut matches);
+    }
+
+    let mut index = 0;
+    while index < tail.len() {
+        if tail[index] == b'c' {
+            record_post_budget_module_name_pair(
+                tail,
+                index + 1,
+                index + 1,
+                &mut seen,
+                &mut matches,
+            );
+        }
+        index += 1;
+    }
+
+    matches
+}
+
+fn record_post_budget_module_name_pair(
+    tail: &[u8],
+    module_start: usize,
+    pattern_start: usize,
+    seen: &mut HashSet<(usize, String, String)>,
+    matches: &mut Vec<PostBudgetGlobalMatch>,
+) {
+    let Some(module_end) = find_byte_from(tail, module_start, b'\n') else {
+        return;
+    };
+    let name_start = module_end.saturating_add(1);
+    let Some(name_end) = find_byte_from(tail, name_start, b'\n') else {
+        return;
+    };
+    if module_start == module_end || name_start == name_end {
+        return;
+    }
+    let Ok(module) = std::str::from_utf8(&tail[module_start..module_end]) else {
+        return;
+    };
+    let Ok(name) = std::str::from_utf8(&tail[name_start..name_end]) else {
+        return;
+    };
+    let Some(severity) = post_budget_global_severity(module, name) else {
+        return;
+    };
+    if !seen.insert((pattern_start, module.to_string(), name.to_string())) {
+        return;
+    }
+    let reduce_proximate = has_reduce_class_byte_nearby(tail, name_end.saturating_add(1));
+    matches.push(PostBudgetGlobalMatch {
+        module: module.to_string(),
+        name: name.to_string(),
+        pattern_start,
+        reduce_proximate,
+        severity,
+    });
+}
+
+fn post_budget_global_severity(module: &str, name: &str) -> Option<&'static str> {
+    if module == "__main__" {
+        return Some("warning");
+    }
+    global_severity(module, name)
+}
+
+fn has_reduce_class_byte_nearby(tail: &[u8], start: usize) -> bool {
+    let end = start
+        .saturating_add(POST_BUDGET_REDUCE_PROXIMITY_BYTES)
+        .min(tail.len());
+    tail[start..end]
+        .iter()
+        .any(|byte| POST_BUDGET_REDUCE_BYTES.contains(byte))
+}
+
+fn find_byte_from(haystack: &[u8], start: usize, needle: u8) -> Option<usize> {
     haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+        .get(start..)?
+        .iter()
+        .position(|byte| *byte == needle)
+        .map(|offset| start + offset)
+}
+
+fn post_budget_absolute_position(
+    stream_offset: usize,
+    read_offset: usize,
+    tail_prefix_len: usize,
+    tail_offset: usize,
+) -> usize {
+    if tail_offset < tail_prefix_len {
+        stream_offset.saturating_add(tail_offset)
+    } else {
+        read_offset.saturating_add(tail_offset - tail_prefix_len)
+    }
 }
 
 fn notice_dedupe_key(notice: &Notice) -> NoticeDedupeKey {
@@ -3437,7 +3535,7 @@ mod tests {
     }
 
     #[test]
-    fn post_budget_tail_detects_every_dangerous_pattern() {
+    fn post_budget_tail_detects_policy_dangerous_globals() {
         let options = ScanOptions {
             timeout_s: DEFAULT_TIMEOUT_S,
             max_opcodes: 1,
@@ -3447,11 +3545,20 @@ mod tests {
             max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
         };
 
-        for needle in POST_BUDGET_DANGEROUS_GLOBAL_PATTERNS {
+        for (module, name) in [
+            ("subprocess", "run"),
+            ("subprocess", "check_call"),
+            ("importlib", "reload"),
+            ("ctypes", "CDLL"),
+            ("runpy", "run_path"),
+            ("__main__", "Evil"),
+        ] {
             let mut payload = b"\x80\x04c".to_vec();
-            payload.extend_from_slice(needle);
+            payload.extend_from_slice(module.as_bytes());
+            payload.push(b'\n');
+            payload.extend_from_slice(name.as_bytes());
             payload.extend_from_slice(b"\n.");
-            let expected_pattern = String::from_utf8_lossy(needle);
+            let expected_pattern = format!("{module}\n{name}");
             let mut scan = ScanState::new(
                 format!("post-budget-{expected_pattern}.pkl"),
                 &payload,
@@ -3468,10 +3575,77 @@ mod tests {
                 scan.findings.iter().any(|finding| {
                     finding.rule_code == Some("POST_BUDGET_GLOBAL")
                         && detail_string(&finding.details, "pattern").as_deref()
-                            == Some(expected_pattern.as_ref())
+                            == Some(expected_pattern.as_str())
                 }),
                 "missing post-budget pattern {expected_pattern:?}"
             );
         }
+    }
+
+    #[test]
+    fn post_budget_tail_promotes_reduce_proximate_globals_to_critical() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: 1,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x04cos\npopen\n)R.";
+        let mut scan = ScanState::new(
+            "post-budget-critical.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let finding = scan
+            .findings
+            .iter()
+            .find(|finding| finding.rule_code == Some("POST_BUDGET_GLOBAL"))
+            .expect("post-budget global finding");
+        assert_eq!(finding.severity, "critical");
+        assert_eq!(
+            detail_string(&finding.details, "pattern").as_deref(),
+            Some("os\npopen")
+        );
+    }
+
+    #[test]
+    fn timeout_limit_still_scans_post_budget_tail() {
+        let options = ScanOptions {
+            timeout_s: 0.001,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x04csubprocess\nrun\n)R.";
+        let mut scan = ScanState::new(
+            "post-budget-timeout.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            Some(Instant::now() - Duration::from_secs(1)),
+        );
+
+        scan.run();
+
+        assert!(scan
+            .notices
+            .iter()
+            .any(|notice| notice.code == Some("timeout")));
+        assert!(scan.findings.iter().any(|finding| {
+            finding.rule_code == Some("POST_BUDGET_GLOBAL") && finding.severity == "critical"
+        }));
     }
 }
