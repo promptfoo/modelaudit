@@ -19,6 +19,59 @@ from parity_corpus import (
 from modelaudit_picklescan import SafetyVerdict, ScanOptions, ScanStatus, scan_bytes, scan_file
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
 
+_SUSPICIOUS_STRING_LITERAL_INDICES = {*range(8, 20), *range(22, 31)}
+_GENERATED_EXPECTED_VERDICTS: dict[str, SafetyVerdict] = {
+    **{
+        f"string-{index}-protocol-{protocol}": SafetyVerdict.SUSPICIOUS
+        for index in _SUSPICIOUS_STRING_LITERAL_INDICES
+        for protocol in range(6)
+    },
+    "bytes-2": SafetyVerdict.MALICIOUS,
+    "bytes-small-limit-2": SafetyVerdict.MALICIOUS,
+    "base64-2": SafetyVerdict.MALICIOUS,
+    "hex-2": SafetyVerdict.MALICIOUS,
+    "bytes-3": SafetyVerdict.MALICIOUS,
+    "bytes-small-limit-3": SafetyVerdict.MALICIOUS,
+    "base64-3": SafetyVerdict.MALICIOUS,
+    "hex-3": SafetyVerdict.MALICIOUS,
+    "bytes-4": SafetyVerdict.MALICIOUS,
+    "bytes-small-limit-4": SafetyVerdict.MALICIOUS,
+    "base64-4": SafetyVerdict.MALICIOUS,
+    "hex-4": SafetyVerdict.MALICIOUS,
+    "raw-0": SafetyVerdict.SUSPICIOUS,
+    "raw-1": SafetyVerdict.SUSPICIOUS,
+    "raw-4": SafetyVerdict.MALICIOUS,
+    "raw-5": SafetyVerdict.MALICIOUS,
+    "raw-6": SafetyVerdict.MALICIOUS,
+    "raw-7": SafetyVerdict.MALICIOUS,
+    "raw-8": SafetyVerdict.MALICIOUS,
+    "raw-9": SafetyVerdict.MALICIOUS,
+    "raw-10": SafetyVerdict.MALICIOUS,
+    "raw-11": SafetyVerdict.MALICIOUS,
+    "raw-12": SafetyVerdict.MALICIOUS,
+    "raw-15": SafetyVerdict.MALICIOUS,
+    "raw-16": SafetyVerdict.MALICIOUS,
+    "raw-17": SafetyVerdict.SUSPICIOUS,
+    "raw-18": SafetyVerdict.SUSPICIOUS,
+    "raw-19": SafetyVerdict.SUSPICIOUS,
+    "raw-20": SafetyVerdict.MALICIOUS,
+    "raw-21": SafetyVerdict.MALICIOUS,
+    "budget-1": SafetyVerdict.SUSPICIOUS,
+    "budget-2": SafetyVerdict.MALICIOUS,
+    "budget-3": SafetyVerdict.MALICIOUS,
+    "budget-5": SafetyVerdict.MALICIOUS,
+    "budget-10": SafetyVerdict.MALICIOUS,
+    "budget-ext-boundary": SafetyVerdict.SUSPICIOUS,
+}
+_PREFIX_FULL_PAYLOAD_EXPECTED_VERDICTS: dict[str, SafetyVerdict] = {
+    "malicious": SafetyVerdict.MALICIOUS,
+    "proto0-string": SafetyVerdict.SUSPICIOUS,
+    "proto4-string": SafetyVerdict.SUSPICIOUS,
+    "nested-malicious": SafetyVerdict.MALICIOUS,
+    "global-call": SafetyVerdict.MALICIOUS,
+    "stack-global-call": SafetyVerdict.MALICIOUS,
+}
+
 pytestmark = pytest.mark.skipif(
     find_spec(_RUST_EXTENSION_MODULE) is None, reason="Rust picklescan extension is not built"
 )
@@ -134,6 +187,10 @@ def test_generated_payloads_scan_without_runtime_errors() -> None:
             error.category == "rust_engine_error" for error in rust_report.errors
         ):
             failures.append(name)
+        expected_verdict = _GENERATED_EXPECTED_VERDICTS.get(name)
+        if expected_verdict is not None:
+            assert rust_report.verdict == expected_verdict, name
+            assert rust_report.findings, name
 
     assert failures == []
 
@@ -149,6 +206,9 @@ def test_prefix_truncations_scan_without_runtime_errors() -> None:
                 error.category == "rust_engine_error" for error in rust_report.errors
             ):
                 failures.append(f"{name}:{prefix_len}")
+            if prefix_len == len(payload) and name in _PREFIX_FULL_PAYLOAD_EXPECTED_VERDICTS:
+                assert rust_report.verdict == _PREFIX_FULL_PAYLOAD_EXPECTED_VERDICTS[name], name
+                assert rust_report.findings, name
 
     assert failures == []
 

@@ -525,7 +525,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] R-P1-38 — Document or raise `DEFAULT_MAX_NESTED_DEPTH`.
 - [x] R-P1-39 — Add more Rust unit coverage for dispatch, policy, report, and bridge behavior.
 - [ ] R-P2-40 — Decide whether to support embedded-Python cargo tests for `pybridge`; bridge coverage currently runs through Python package tests.
-- [ ] T-P1-51 / T-P1-52 — Strengthen parity/fuzz tests with expected verdicts.
+- [x] T-P1-51 / T-P1-52 — Strengthen parity/fuzz tests with expected verdicts.
 - [ ] T-P1-53 / T-P1-66 — Restore multi-stream regression coverage.
 - [ ] T-P1-54 — Replace Rust policy source-text tests with functional tests.
 - [ ] T-P1-55 / T-P1-56 — Strengthen weak negative/overbroad assertions.
@@ -607,6 +607,12 @@ This section is the active implementation log for follow-up commits after revisi
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 41 tests.
   - `uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_detects_reduce_invoking_os_system -q` — passed, 1 test.
   - Note: an attempted direct embedded-Python `cargo test` for `pybridge::scan_bytes` failed because the cargo test binary could not initialize Python stdlib encodings in this workspace. Bridge coverage remains in the Python package tests; the embedded-test decision is tracked as R-P2-40.
+- T-P1-51 / T-P1-52 — Same-item commit expands `test_rust_engine.py` so deterministic parity payloads, generated malicious/suspicious corpus entries, and full-length malicious prefix-fuzz payloads assert expected verdicts and non-empty findings instead of only asserting "no rust_engine_error". Targeted QA:
+  - `uv run ruff format packages/modelaudit-picklescan/tests/test_rust_engine.py` — passed.
+  - `uv run ruff format --check packages/modelaudit-picklescan/tests/test_rust_engine.py` — passed.
+  - `uv run ruff check packages/modelaudit-picklescan/tests/test_rust_engine.py` — passed.
+  - `uv run mypy packages/modelaudit-picklescan/tests/test_rust_engine.py` — passed.
+  - `uv run pytest packages/modelaudit-picklescan/tests/test_rust_engine.py -q` — passed, 7 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
