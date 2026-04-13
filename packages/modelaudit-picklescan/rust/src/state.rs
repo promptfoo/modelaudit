@@ -708,10 +708,22 @@ impl<'a> ScanState<'a> {
             "EMPTY_TUPLE" => {
                 self.stack.push(StackValue::Tuple(Vec::new()));
             }
-            "EMPTY_LIST" | "EMPTY_DICT" | "EMPTY_SET" => {
+            "EMPTY_LIST" => {
                 self.stack.push(StackValue::Primitive {
-                    type_name: "tuple",
-                    repr: "()".to_string(),
+                    type_name: "list",
+                    repr: "[]".to_string(),
+                });
+            }
+            "EMPTY_DICT" => {
+                self.stack.push(StackValue::Primitive {
+                    type_name: "dict",
+                    repr: "{}".to_string(),
+                });
+            }
+            "EMPTY_SET" => {
+                self.stack.push(StackValue::Primitive {
+                    type_name: "set",
+                    repr: "set()".to_string(),
                 });
             }
             "TUPLE" => {
@@ -3403,6 +3415,50 @@ mod tests {
             detail_usize(&notice.details, "readonly_buffer_empty_stack_count"),
             Some(1)
         );
+    }
+
+    #[test]
+    fn empty_collection_operands_report_precise_stack_preview_types() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+
+        for (opcode, expected_preview) in
+            [(b']', "list:[]"), (b'}', "dict:{}"), (b'\x8f', "set:set()")]
+        {
+            let payload = [
+                b"\x80\x04".as_slice(),
+                &[opcode],
+                b"\x8c\x06system\x94\x93.".as_slice(),
+            ]
+            .concat();
+            let mut scan = ScanState::new(
+                format!("empty-operand-{expected_preview}.pkl"),
+                &payload,
+                &options,
+                Some(payload.len()),
+                0,
+                0,
+                None,
+            );
+
+            scan.run();
+
+            let finding = scan
+                .findings
+                .iter()
+                .find(|finding| finding.rule_code == Some("MALFORMED_STACK_GLOBAL"))
+                .expect("malformed STACK_GLOBAL finding");
+            assert_eq!(
+                detail_string(&finding.details, "module_operand").as_deref(),
+                Some(expected_preview)
+            );
+        }
     }
 
     #[test]

@@ -1063,7 +1063,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] V5-P0-03 — Re-run and resolve N5-FAIL-1..14, including current scanner-suite legacy rule-code regressions.
 - [x] V5-P0-04 — Close N5-P0-WHEEL-MANYLINUX by producing manylinux-compatible standalone wheels in release automation.
 - [x] V5-P0-05 — Close N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS so standalone package versions are bumped by release-please.
-- [ ] V5-P1-06 — Close N5-R1 / N5-SEC-F8 by fixing empty list/dict/set stack operand previews.
+- [x] V5-P1-06 — Close N5-R1 / N5-SEC-F8 by fixing empty list/dict/set stack operand previews.
 - [ ] V5-P1-07 — Close N5-R2 by emitting truncated nested-pickle notices/findings for proto-0 as well as binary-protocol payloads.
 - [ ] V5-P1-08 — Close N5-R3 / N5-SEC-F7 by enforcing left word boundaries for suspicious call and module-attribute string matching.
 - [ ] V5-P1-09 — Close N5-R11 by preventing stack-state wipes on operand underflow.
@@ -1123,6 +1123,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run python - <<'PY' ... yaml.safe_load('.github/workflows/release-please.yml') ... PY` — passed.
 - V5-P0-05 — Same-item commit adds release-please inline version markers to the standalone package `pyproject.toml` and Rust crate `Cargo.toml`, matching the existing generic `extra-files` release-please configuration. Targeted QA:
   - `uv run python - <<'PY' ... tomllib.loads(...) ... PY` — passed for `packages/modelaudit-picklescan/pyproject.toml` and `packages/modelaudit-picklescan/Cargo.toml`.
+- V5-P1-06 — Same-item commit fixes `EMPTY_LIST`, `EMPTY_DICT`, and `EMPTY_SET` stack values so malformed `STACK_GLOBAL` diagnostics report `list:[]`, `dict:{}`, and `set:set()` instead of `tuple:()`. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml empty_collection_operands_report_precise_stack_preview_types -- --nocapture` — passed, 1 test.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
