@@ -17,7 +17,7 @@ pub(crate) fn global_severity(module: &str, name: &str) -> Option<&'static str> 
         };
     }
 
-    if DANGEROUS_GLOBALS.contains(&(module, name)) {
+    if dangerous_global_is_listed(module, name) {
         return Some("critical");
     }
 
@@ -29,6 +29,17 @@ pub(crate) fn global_severity(module: &str, name: &str) -> Option<&'static str> 
     }
 
     None
+}
+
+fn dangerous_global_is_listed(module: &str, name: &str) -> bool {
+    DANGEROUS_GLOBALS
+        .binary_search_by(|&(candidate_module, candidate_name)| {
+            match candidate_module.cmp(module) {
+                std::cmp::Ordering::Equal => candidate_name.cmp(name),
+                ordering => ordering,
+            }
+        })
+        .is_ok()
 }
 
 fn warning_globals(module: &str) -> Option<&'static [&'static str]> {
@@ -209,3 +220,25 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("zipfile", "PyZipFile"),
     ("zipfile", "ZipFile"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dangerous_global_table_is_sorted_for_binary_search() {
+        for pair in DANGEROUS_GLOBALS.windows(2) {
+            assert!(pair[0] < pair[1], "DANGEROUS_GLOBALS must stay sorted");
+        }
+    }
+
+    #[test]
+    fn dangerous_global_lookup_uses_sorted_table() {
+        assert_eq!(global_severity("joblib", "load"), Some("critical"));
+        assert_eq!(
+            global_severity("copyreg", "add_extension"),
+            Some("critical")
+        );
+        assert_eq!(global_severity("custom", "load"), None);
+    }
+}
