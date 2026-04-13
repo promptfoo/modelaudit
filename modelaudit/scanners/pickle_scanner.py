@@ -8,6 +8,7 @@ import hashlib
 import io
 import pickletools
 import re
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, ClassVar
@@ -1015,6 +1016,55 @@ class PickleScanner(BaseScanner):
             details={"sha256": sha256, "bytes_hashed": len(payload)},
         )
 
+    def _add_seekable_stream_integrity_check(
+        self,
+        file_obj: BinaryIO,
+        result: ScanResult,
+        source: str,
+        start_position: int,
+        file_size: int | None,
+    ) -> None:
+        hasher = hashlib.sha256()
+        bytes_hashed = 0
+        remaining = file_size if file_size is not None and file_size >= 0 else None
+        hash_complete = False
+        try:
+            file_obj.seek(start_position)
+            while remaining is None or remaining > 0:
+                self.check_interrupted()
+                if self._check_timeout(allow_partial=True):
+                    break
+                read_size = _RAW_READ_CHUNK_BYTES if remaining is None else min(_RAW_READ_CHUNK_BYTES, remaining)
+                chunk = file_obj.read(read_size)
+                if not chunk:
+                    hash_complete = True
+                    break
+                hasher.update(chunk)
+                bytes_hashed += len(chunk)
+                if remaining is not None:
+                    remaining -= len(chunk)
+            if remaining == 0:
+                hash_complete = True
+        except (AttributeError, OSError, ValueError):
+            return
+        finally:
+            with suppress(AttributeError, OSError, ValueError):
+                file_obj.seek(start_position)
+
+        sha256 = hasher.hexdigest()
+        result.metadata.setdefault("file_hashes", {})["sha256"] = sha256
+        result.add_check(
+            name="File Integrity Check",
+            passed=True,
+            message="Stream SHA256 hash calculated",
+            location=source,
+            details={
+                "sha256": sha256,
+                "bytes_hashed": bytes_hashed,
+                "hash_complete": hash_complete,
+            },
+        )
+
     def _add_stream_truncation_check(
         self,
         read_result: _RootStreamPayloadRead,
@@ -1631,8 +1681,7 @@ class PickleScanner(BaseScanner):
             result = self._scan_standalone_stream(file_obj, standalone_size, source=source)
             file_obj.seek(start_position)
             raw_data = self._read_root_raw_scan_window_from_stream(file_obj, standalone_size)
-            if standalone_size is not None and len(raw_data) == standalone_size:
-                self._add_stream_integrity_check(raw_data, result, source)
+            self._add_seekable_stream_integrity_check(file_obj, result, source, start_position, standalone_size)
         else:
             stream_read = self._read_stream_payload_for_root(file_obj, standalone_size)
             payload = stream_read.payload

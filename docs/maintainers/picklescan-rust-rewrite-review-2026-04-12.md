@@ -497,7 +497,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P1-8 — Widen `_contains_call_token` separator handling.
 - [x] N-P1-9 — Add raw-layer pickle GLOBAL newline-form module attribute coverage.
 - [x] N-P1-10 / N-P1-12 — Scan binary tails past the 8 MB raw window and after malformed/truncated pickle prefixes.
-- [ ] N-P1-13 — Preserve stream integrity hashes for streams larger than the raw scan window.
+- [x] N-P1-13 — Preserve stream integrity hashes for streams larger than the raw scan window.
 - [ ] N-P1-18 — Pin or adjust primary DANGEROUS_CALL rule-code mapping for builtins.
 - [ ] N-P1-20 — Collapse protocol-5 buffer opcode notices into bounded/count-based notices.
 - [ ] N-P1-21 — Review `READONLY_BUFFER` empty-stack parity behavior.
@@ -682,6 +682,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 68 tests, including an executable tail beyond a 64-byte raw window and an executable tail after a malformed pickle prefix with no `first_pickle_end_pos`.
+- N-P1-13 — Same-item commit adds a seekable-stream integrity hashing path that reads the full declared stream in chunks, records the complete SHA-256 hash, and restores the original stream position independent of the bounded raw detector window. Non-seekable streams remain bounded and continue to hash only the buffered payload. Targeted QA:
+  - `uv run ruff format --check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 69 tests, including a seekable stream whose full payload is larger than a 64-byte root raw scan window.
 
 ### Newly discovered gaps while remediating
 

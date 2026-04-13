@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import pickle
@@ -191,6 +192,22 @@ def test_scan_stream_detects_base64_encoded_execution_text() -> None:
     result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="encoded-raw.pkl")
 
     assert any(issue.rule_code == "S604" for issue in result.issues)
+
+
+def test_scan_stream_hashes_seekable_stream_past_raw_scan_window() -> None:
+    payload = pickle.dumps({"pad": b"A" * 256}, protocol=4)
+
+    result = PickleScanner(config={"pickle_root_raw_scan_limit_bytes": 64}).scan_stream(
+        io.BytesIO(payload),
+        len(payload),
+        source="large-seekable-stream.pkl",
+    )
+
+    integrity_checks = [check for check in result.checks if check.name == "File Integrity Check"]
+    assert integrity_checks
+    assert integrity_checks[-1].details["bytes_hashed"] == len(payload)
+    assert integrity_checks[-1].details["hash_complete"] is True
+    assert result.metadata["file_hashes"]["sha256"] == hashlib.sha256(payload).hexdigest()
 
 
 def test_scan_stream_preserves_legacy_raw_eval_exec_importlib_detection() -> None:
