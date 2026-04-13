@@ -1,18 +1,20 @@
 # PR #990 Comprehensive Review — `feat: replace picklescan with Rust-native engine`
 
 **Branch:** `mdangelo/codex/rust-picklescan-rewrite`
-**Latest audited:** `22b2d0df` (rev 5: `fix: close picklescan follow-up review items`, +542/−89 across 14 files)
+**Latest audited:** `19e7de7a` (rev 6: 45 commits on top of rev 5's `22b2d0df`; closes most rev 5 items but surfaces a new P0)
 **Scope:** Rust rewrite of pickle scanner, Python engine removed.
 
-This review combines five specialized agents (Rust core, Python integration, test coverage, CI/packaging, simplification), three Momus/Oracle critical re-reviews, and hands-on QA on 31 synthetic fixtures + 21 committed exploits. **At rev 5, validation gates are partially regressed**: `cargo test` **46 passed**, `ruff`/`mypy`/`clippy` clean — but **`pytest packages/modelaudit-picklescan/tests/test_api.py` has 10 FAILING tests** and the broader suite has **4 additional regressions** in numpy/joblib scanners. All 14 are real implementation gaps that landed with `22b2d0df` itself (test files added without the corresponding Rust/Python wiring, or behavior changes that broke consumer tests).
+This review combines five specialized agents (Rust core, Python integration, test coverage, CI/packaging, simplification), three Momus/Oracle critical re-reviews, and hands-on QA on 31 synthetic fixtures + 21 committed exploits. At rev 6, **validation gates are fully green**: `pytest` **399 passed**, `cargo test` **62 passed**, `ruff`/`mypy`/`clippy` clean. All 14 rev 5 test failures are resolved.
 
 On the repo's own 21 exploit fixtures and 2 safe samples the scanner is **0 FN / 0 FP** across every revision.
 
-> **Rev 5 release-readiness verdict: NOT READY.** 14 test failures + 1 confirmed exploitable PERSID nested-pickle bypass + 2 P0 release-mechanics issues (no manylinux wheels, release-please can't bump the standalone package). Detailed list below.
+> **Rev 6 release-readiness verdict: STILL NOT READY.** The rev 5 PERSID bypass (N5-EXPLOIT-PERSID-NESTED) and 14 test failures are fixed, BUT the rev 5 N5-CRITICAL-RCE-BYPASS was only partially closed — the post-budget tail scanner is now policy-driven via `global_severity()` but still only recognizes the protocol-0/2 text `c<module>\n<name>\n` pattern. It does **not** recognize the protocol-4/5 `\x8c<module>\x94\x8c<name>\x94\x93` (SHORT_BINUNICODE + STACK_GLOBAL) format that `pickle.dumps(obj)` produces **by default on every modern Python**. Verified empirically: **11 out of 11** major dangerous globals (`subprocess.run`, `subprocess.Popen`, `os.system`, `os.popen`, `builtins.eval`, `builtins.exec`, `importlib.reload`, `ctypes.CDLL`, `marshal.loads`, `pickle.loads`, `_ctypes.dlopen`) bypass the post-budget scan when wrapped with 4.5M cheap filler opcodes. I executed `pickle.loads(mal)` on the `subprocess.run(['echo', 'PWNED'])` payload in a sandbox and confirmed `PWNED` prints to stdout. Detailed in **Rev 6 — new findings** below.
 
 ## Revision history
 
-> **Rev 5 (current)**: Re-audit at `22b2d0df` after `fix: close picklescan follow-up review items`. **Closed** P2-DIRECTORY-ERROR-SEVERITY (now INFO), P2-PROTO6-FORWARD-COMPAT (proto 6 magic recognized), P2-OVERSIZED-FRAME-NOT-FLAGGED (record_oversized_frame_notice added but the Rust→Python notice path is broken — see N5-FRAME-NOTICE), P2-WHEEL-MATRIX-INCOMPLETE (macos-15-intel + ubuntu-24.04-arm jobs added). **Surfaced** 14 test failures, 1 exploitable PERSID nested bypass, 2 P0 release-mechanics blockers, 21 P1 Rust correctness gaps, 6 P1 Python integration gaps, and ~30 P2 hygiene items. Details in **Rev 5 — new findings** section below.
+> **Rev 6 (current)**: Re-audit at `19e7de7a` after 45 commits addressing rev 5. **Closed**: 14 test failures (N5-FAIL-1..14), N5-EXPLOIT-PERSID-NESTED (PERSID now modeled correctly in `validate_pickle_stack_effect` + `has_execution_opcode`), N5-P0-WHEEL-MANYLINUX (maturin-action with `manylinux: 2_28`), N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS (`# x-release-please-version` annotations added), N5-PY1-3/N5-SEC-F4 (STRUCTURAL_TAMPER downgrade removed), N5-P1-DEAD-ADAPTER-NESTED-DOWNGRADE, N5-P1-RULE-CODE-CONFLATION-S902 (`PICKLE_EXPANSION → S214`), most P1 Rust gaps (N5-R1..R20), N5-SEC-F5 (multi-line base64 probe widened), N5-SEC-F6 (memo indexing aligned), N5-SEC-F7 (suspicious string word boundaries), N5-SEC-F9 (PERSID counter dedupe), N5-PY1-5 (DANGEROUS_GLOBAL rule code fallback), N5-PY1-1/2/4/7/8 (scan_stream truncation / short-read / ZIP member), N5-PY1-10 (opcode summary memo aligned with CPython), N5-P1-HOT-PATH-DEFEATED-BY-TORCH-SEED (partially — `b"torch"` → `b"torch.jit"`), N5-P1-SARIF-DUPLICATE-FINDINGS + N5-P1-SARIF-NO-PICKLESCAN-RULE-COVERAGE (supporting rows filtered + new SARIF tests), docs/CHANGELOG/security-model coverage. **NOT closed**: N5-CRITICAL-RCE-BYPASS was only partially fixed (post-budget tail now scans dangerous-global policy but still misses STACK_GLOBAL — see N6-CRITICAL-RCE-BYPASS-V2 below), hot-path skip still defeated for secrets/network on most real ML pickles (shape checks `_has_alnum_secret_shape` / `_has_domain_or_ip_shape` return True for any pickle with letters+digits or an alnum-dot pattern).
+>
+> **Rev 5** (`088835b4`/`9d3862d6`): Re-audit at `22b2d0df` after `fix: close picklescan follow-up review items`. **Closed** P2-DIRECTORY-ERROR-SEVERITY (now INFO), P2-PROTO6-FORWARD-COMPAT (proto 6 magic recognized), P2-OVERSIZED-FRAME-NOT-FLAGGED (record_oversized_frame_notice added but the Rust→Python notice path is broken — see N5-FRAME-NOTICE), P2-WHEEL-MATRIX-INCOMPLETE (macos-15-intel + ubuntu-24.04-arm jobs added). **Surfaced** 14 test failures, 1 exploitable PERSID nested bypass, 2 P0 release-mechanics blockers, 21 P1 Rust correctness gaps, 6 P1 Python integration gaps, and ~30 P2 hygiene items. Details in **Rev 5 — new findings** section below.
 >
 > **Rev 4** (`1f087343`): Re-audit after 80 hardening commits + follow-up. Closed nearly all rev 3 N-P0/N-P1/N-P2 items. Confirmed P1-NESTED-DIVERGENCE / P2-CONFIRMED-SEEDS / P2-WHEEL-MATRIX / P2-DIRECTORY-SEVERITY / P2-PROTO6 / P2-OVERSIZED-FRAME as remaining residuals.
 >
@@ -86,6 +88,183 @@ On the repo's own 21 exploit fixtures and 2 safe samples the scanner is **0 FN /
 | `S211` stderr noise                      | warning per process            | **gone** (S211 registered) |
 | Mid-string proto-0 encoded nested        | not probed                     | **detected (S601)**        |
 | `{"outer": b"JUNK" + nested}` small-blob | not probed                     | **detected (S213)**        |
+
+---
+
+## Rev 6 — new findings
+
+After re-pulling at `19e7de7a`, the test suite is back to green (399 pytest + 62 cargo test), the PERSID bypass is fixed, and 14 of the rev 5 findings are closed. **One critical residual**: the post-budget tail scanner's policy-driven rewrite only matches the protocol-0/2 text `c<module>\n<name>\n` pattern and does NOT recognize the protocol-4/5 STACK_GLOBAL format (`\x8c<len><module>\x94\x8c<len><name>\x94\x93`) — which is the default format used by every modern `pickle.dumps(obj)` call.
+
+### **N6-CRITICAL-RCE-BYPASS-V2** (validated end-to-end)
+
+Same architectural gap as rev 5 N5-CRITICAL-RCE-BYPASS — the author fixed the needle table to query `global_severity()` from `policy.rs`, but the scanner's pattern match at `state.rs:2844-2867` only scans for bytes `b'c'` (protocol-0 GLOBAL opcode) followed by text module/name separated by `\n`:
+
+```rust
+fn post_budget_global_matches(tail: &[u8], tail_prefix_len: usize) -> Vec<PostBudgetGlobalMatch> {
+    let mut matches = Vec::new();
+    let mut seen = HashSet::new();
+
+    if tail_prefix_len > 0 {
+        record_post_budget_module_name_pair(tail, 0, 0, &mut seen, &mut matches);
+    }
+
+    let mut index = 0;
+    while index < tail.len() {
+        if tail[index] == b'c' {     // <-- ONLY text-form GLOBAL
+            record_post_budget_module_name_pair(tail, index + 1, index + 1, &mut seen, &mut matches);
+        }
+        index += 1;
+    }
+    matches
+}
+```
+
+The three cargo tests (`post_budget_tail_detects_policy_dangerous_globals`, `post_budget_tail_promotes_reduce_proximate_globals_to_critical`, `timeout_limit_still_scans_post_budget_tail`) all use hand-constructed `b"\x80\x04csubprocess\nrun\n...` payloads, which pass because they use the text form. But `pickle.dumps(Evil(), protocol=4)` (the DEFAULT) never emits `c` — it emits:
+
+```
+\x8c<len><module>\x94\x8c<len><name>\x94\x93
+=  SHORT_BINUNICODE  MEMOIZE SHORT_BINUNICODE MEMOIZE STACK_GLOBAL
+```
+
+**Reproduction (validated end-to-end, printed PWNED to stdout):**
+
+```python
+import pickle, subprocess
+class Evil:
+    def __reduce__(self):
+        return (subprocess.run, (['echo', 'PWNED'],))
+header = b'\x80\x04'
+filler = b'\x880' * 4_500_000          # 4.5M NEWTRUE+POP pairs = 9M opcodes, exhausts 1M budget
+mal = header + filler + pickle.dumps(Evil(), protocol=4)[2:]
+
+from modelaudit_picklescan import scan_bytes
+r = scan_bytes(mal)
+assert r.verdict.value == 'unknown'    # NOT MALICIOUS
+assert len(r.findings) == 0            # ZERO findings (only INFO opcode_budget notice)
+
+pickle.loads(mal)
+# → subprocess.run(['echo', 'PWNED']) actually executes; 'PWNED' printed to stdout
+```
+
+**Full bypass matrix** (all 11 tested via manual SHORT_BINUNICODE+STACK_GLOBAL+REDUCE tail past 1M opcode budget):
+
+| Global | Protocol 2/3 (text) | **Protocol 4/5 (STACK_GLOBAL)** |
+|---|---|---|
+| `subprocess.run` | ✅ detected | ❌ **bypass** (`unknown`, 0 findings) |
+| `subprocess.Popen` | ✅ detected | ❌ **bypass** |
+| `os.system` | ✅ detected (critical) | ❌ **bypass** |
+| `os.popen` | ✅ detected (warning) | ❌ **bypass** |
+| `builtins.eval` | ✅ detected | ❌ **bypass** |
+| `builtins.exec` | ✅ detected | ❌ **bypass** |
+| `importlib.reload` | ✅ detected | ❌ **bypass** |
+| `ctypes.CDLL` | ✅ detected (warning) | ❌ **bypass** |
+| `marshal.loads` | ✅ detected | ❌ **bypass** |
+| `pickle.loads` | ✅ detected | ❌ **bypass** |
+| `_ctypes.dlopen` | ✅ detected | ❌ **bypass** |
+
+Also confirmed: `BINUNICODE` (`\x8d`) variants, `INST` opcodes, and `EXT1` opcodes past budget all bypass. The ONLY format the post-budget scanner catches is protocol-0/2 text `c<module>\n<name>\n` — which `pickle.dumps(obj)` has not emitted by default since Python 3.0 (2008). Python 3.8+ defaults to protocol 5. Attackers don't need to do anything special to hit this bypass — they just call `pickle.dumps(evil_obj)` without specifying a protocol.
+
+**Full `PickleScanner().scan()` result on the validated payload:**
+```
+success=False
+total issues: 1
+crits: 0  warns: 0
+sev=info rule=S902 msg=Opcode analysis stopped after reaching max_opcodes=1000000
+```
+
+**Required fix:** `post_budget_global_matches` must also scan for:
+1. `\x8c<len><module>\x94?\x8c<len><name>\x94?\x93` (SHORT_BINUNICODE + optional MEMOIZE + SHORT_BINUNICODE + optional MEMOIZE + STACK_GLOBAL)
+2. `\x8d<u32 len><module>\x94?\x8d<u32 len><name>\x94?\x93` (BINUNICODE variant)
+3. `\x8e<u64 len><module>\x94?\x8e<u64 len><name>\x94?\x93` (BINUNICODE8 variant)
+4. `(i<module>\n<name>\n` (INST opcode with text args)
+5. `\x82<u8>` / `\x83<u16 le>` / `\x84<u32 le>` (EXT1/EXT2/EXT4, which resolve via copyreg extension registry — already catch-all-critical in the fix)
+
+All five patterns should feed through the same `global_severity(module, name)` check that the current text path uses. Or, equivalently, the scanner could re-parse the tail using a bounded opcode walker (reusing `parse_opcode` from `opcode.rs`) and look at any resolved GLOBAL/STACK_GLOBAL/INST target — the opcode walker already handles all these cases correctly for the in-budget scan.
+
+**This is the same P0 RCE-bypass merge blocker from rev 5. The rev 6 fix is incomplete.**
+
+### N6-SKIP-PARTIAL — hot-path skip still defeated for secrets/network on realistic ML pickles
+
+The rev 6 commit `7a25ed97 perf: avoid torch metadata raw detector slow path` narrows `_JIT_SCAN_SEEDS` from `b"torch"` to `b"torch.jit"` — good, the JIT scanner is now correctly skipped on PyTorch state dicts. But the **secrets and network detectors still always run** on any non-trivial pickle because:
+
+- `_has_alnum_secret_shape` returns True when the first 1 MB of the raw window contains at least one digit AND one letter. Every pickle with a dict has this.
+- `_has_domain_or_ip_shape` returns True when the raw window contains any `alnum.alnum` pattern. Every pickle with dotted names (`torch.nn.Linear`, `torch.layer.1.weight`, `transformers_version`) has this.
+
+Verified empirically on a 1.8 MB PyTorch state dict (`{f'torch.layer.{i}.weight': i/100.0 for i in range(50000)}`):
+
+```
+pickle_expensive_raw_detectors_skipped: None
+pickle_secrets_raw_detector_skipped: None       # secrets detector ran
+pickle_jit_raw_detector_skipped: True            # JIT detector correctly skipped
+pickle_network_raw_detector_skipped: None       # network detector ran
+elapsed: 0.97s  (vs ~0.01s if fully skipped)
+```
+
+The advertised 40-80× speedup in the PR body applies only to synthetic `b"A"*N` literals, not realistic ML pickles. Real HuggingFace/PyTorch checkpoints consistently trigger the 1-second full-secrets/network regex pass.
+
+**Recommended fix:** Tighten the seed/shape predicates. Replace `_has_alnum_secret_shape` with a structural check requiring a sequence like `[-=_]<8+ chars of base64/hex>` (the minimum shape of a real secret), and replace `_has_domain_or_ip_shape` with something like `[a-z]+://[a-z]+\.[a-z]+` or `\d+\.\d+\.\d+\.\d+` (IPv4). Bare `alnum.alnum` matches every dotted Python identifier.
+
+### Rev 5 items FIXED in rev 6 (verified)
+
+- **N5-FAIL-1** (oversized FRAME notice): FIXED — `pickle.dumps({}, protocol=4)` with 0xFFFFFFFFFFFFFFFE FRAME now emits `oversized_frame` notice via PyO3 boundary. Test passes.
+- **N5-FAIL-2..10** (data_only nested as notice): FIXED — `scan_bytes(pickle.dumps({'outer': pickle.dumps({'inner': 'data'})}))` now returns `verdict=clean` + `nested_payload_detected` notice.
+- **N5-FAIL-11/12** (numpy/joblib test regressions): FIXED — tests updated.
+- **N5-FAIL-13/14** (2 unenumerated): all 399 pytest now pass.
+- **N5-EXPLOIT-PERSID-NESTED**: FIXED — `validate_pickle_stack_effect` and `has_execution_opcode` now model PERSID correctly. The rev 5 24-byte reproducer `pickle.dumps({'inner': b'\x80\x04cos\nsystem\nP\nfake_id\n.'})` now returns `verdict=malicious, findings=4` (S213 nested payload + DANGEROUS_GLOBAL os.system + PERSISTENT_ID warning + nested analysis).
+- **N5-P0-WHEEL-MANYLINUX**: FIXED — `release-please.yml:502-508` uses `PyO3/maturin-action@v1` with `args: --compatibility manylinux_2_28` and `manylinux: "2_28"`.
+- **N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS**: FIXED — `# x-release-please-version` annotations added to `packages/modelaudit-picklescan/pyproject.toml:7` and `packages/modelaudit-picklescan/Cargo.toml:3`.
+- **N5-PY1-3 / N5-SEC-F4** (STRUCTURAL_TAMPER WARNING→INFO downgrade): FIXED — scanner now emits WARNING directly; 2 `S902` warnings for duplicate/misplaced PROTO.
+- **N5-P1-HOT-PATH-DEFEATED-BY-TORCH-SEED**: PARTIALLY FIXED — JIT detector is now correctly skipped on PyTorch state dicts, but secrets and network detectors still run (see N6-SKIP-PARTIAL).
+- **N5-P1-DEAD-ADAPTER-NESTED-DOWNGRADE**: FIXED — `e56947f0 fix: remove adapter nested severity downgrade`.
+- **N5-P1-RULE-CODE-CONFLATION-S902** (PICKLE_EXPANSION): FIXED — `01191818 fix: assign pickle expansion rule code` — now uses dedicated `S214`.
+- **N5-P1-SARIF-DUPLICATE-FINDINGS**: FIXED — `df785428 fix: omit supporting pickle rows from sarif`.
+- **N5-P1-SARIF-NO-PICKLESCAN-RULE-COVERAGE**: FIXED — `c1932c29 test: cover pickle rule codes in sarif` added regression coverage.
+- **N5-R1** (EMPTY_LIST/DICT/SET mislabeled as tuple): FIXED — `4e05e624 fix: report precise empty collection operands`.
+- **N5-R11** (consume_top_operands wipes stack on underflow): FIXED — `65b22117 fix: preserve stack on operand underflow`.
+- **N5-R13** (collapse_top_n wraps Mark in Tuple): FIXED — `45d8340c fix: avoid wrapping mark sentinels`.
+- **N5-R15** (INST module/name space-split): FIXED — `846dcd2a fix: preserve global operand parts`.
+- **N5-R17** (follow-on streams use nested_depth): FIXED — `dace71d3 fix: keep follow-on streams at sibling depth`.
+- **N5-R18** (unbounded import_references): FIXED — `617e1bd7 fix: cap import reference metadata`.
+- **N5-R19** (uppercase hex prefix): FIXED — `bcb5679d fix: accept uppercase escaped hex pickles`.
+- **N5-R2** (proto-0 truncated nested silently dropped): FIXED — `e31c0c28 fix: preserve truncated protocol0 nested fail closed` + `532639f3 fix: flag truncated proto0 nested pickles`.
+- **N5-SEC-F2** (POST_BUDGET_GLOBAL severity WARNING): FIXED — `has_reduce_class_byte_nearby` promotes to critical on REDUCE proximity (still affected by N6-CRITICAL-RCE-BYPASS-V2 because the pattern match is broken upstream).
+- **N5-SEC-F3** (timeout skips post-budget tail): FIXED — timeout branch at `state.rs:492` now calls `scan_post_budget_tail`.
+- **N5-SEC-F5** (multi-line wrapped base64 nested): FIXED — `7a96c67b fix: detect wrapped encoded nested pickles`.
+- **N5-SEC-F6** (memo PUT/MEMOIZE collision): FIXED — `5eef1d95 fix: align pickle memoize indexing`.
+- **N5-SEC-F7** (find_module_attr left boundary): FIXED — `50002a5b fix: enforce suspicious string word boundaries`.
+- **N5-SEC-F9** (PERSID per-position dedupe): FIXED — `0dab2fa2 fix: summarize repeated persistent ids`.
+- **N5-PY1-1** (non-seekable known-size truncation): FIXED — `e970767b fix: bound known-size pickle streams`.
+- **N5-PY1-2** (scan_stream binary-tail past 8 MB): FIXED — `2a6247a3 fix: scan stream pickle binary tails`.
+- **N5-PY1-4** (non-seekable unbounded stream silent cap): FIXED — `422c0d8f fix: report unknown stream truncation`.
+- **N5-PY1-5** (DANGEROUS_GLOBAL unknown module returns None): FIXED — `f3b5f736 fix: map unknown dangerous globals`.
+- **N5-PY1-6** (standalone scan_stream no DoS ceiling): FIXED — `19e7de7a fix: preserve bounded known stream semantics`.
+- **N5-PY1-7** (short-read discards partial bytes): FIXED — `b9f633a6 fix: scan short-read pickle payloads`.
+- **N5-PY1-9** (parse-failure suppression too permissive): FIXED — `cc3a5e0e fix: require import evidence for tail suppression`.
+- **N5-PY1-10** (opcode summary walker stack effects): FIXED — `362b830e fix: use rust opcode metadata for cve bridging` — now drives CVE attribution from Rust metadata instead of a parallel Python walker.
+- **N5-PY1-11** (rebuild_tensor walker): FIXED — `4bb48631 fix: trust rust rebuild tensor metadata`.
+- **N5-P1-DOCKER-SINGLE-STAGE**: FIXED — `b6da1ac5 build: split docker rust build stages`.
+- **N5-P2-PACKAGE-CHANGELOG-THIN**: FIXED — `c8f78b03 docs: expand picklescan package changelog`.
+- **N5-P2-CHANGELOG-RULE-CODES**: FIXED — `e9f35f5f docs: document pickle rule codes`.
+- **N5-P2-PYPROJECT-URLS-CHANGELOG**: FIXED — `d49bb8a7 docs: point picklescan changelog url`.
+- **N5-P2-DOCKERFILE-RUST-VERSION-DRIFT**: FIXED — `b5c2875b build: document docker rust toolchain sync`.
+- **N5-P2-PICKLESCAN-PACKAGE-CARGO-TEST-ORDERING**: FIXED — `393df3c9 ci: run picklescan cargo checks first`.
+
+### Rev 6 release-readiness
+
+| Status | Severity | Item |
+|---|---|---|
+| ❌ | **P0 RCE BYPASS** | **N6-CRITICAL-RCE-BYPASS-V2** — post-budget tail scan still misses STACK_GLOBAL/protocol 4+ format (the default); 11/11 dangerous globals bypass |
+| ⚠️ | P1 perf | N6-SKIP-PARTIAL — hot-path skip only narrowed JIT seed; secrets/network still run on realistic ML pickles |
+| ✅ | — | All 14 rev 5 test failures resolved |
+| ✅ | — | N5-EXPLOIT-PERSID-NESTED fixed |
+| ✅ | — | N5-P0-WHEEL-MANYLINUX + N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS |
+| ✅ | — | STRUCTURAL_TAMPER severity + dead adapter code + S214 rule code + SARIF filtering + SARIF regression |
+| ✅ | — | Most P1 Rust correctness (N5-R1/R2/R11/R13/R15/R17/R18/R19) |
+| ✅ | — | Most Python integration gaps (N5-PY1-1/2/4/5/6/7/9/10/11) |
+| ✅ | — | All N5-SEC-F2..F9 security items |
+| ✅ | — | Docker multi-stage + CHANGELOG + docs + CI ordering |
+
+**Verdict: STILL NOT MERGE READY.** Rev 6 closes all 14 test failures and most P1/P2 items (40+ findings fixed). The one remaining blocker is N6-CRITICAL-RCE-BYPASS-V2 — the post-budget tail scanner fix in rev 6 (`660cf3c8 fix: harden post-budget pickle global scan`) added policy-driven severity lookup but didn't update the byte-pattern matcher to handle STACK_GLOBAL / SHORT_BINUNICODE / INST / BINUNICODE / EXT formats. Since `pickle.dumps(obj)` defaults to protocol 4 (Python 3.4+) or 5 (Python 3.8+) and **never emits the text `c<module>\n<name>\n` pattern by default**, the scanner is effectively still blind to every realistic post-budget attack. The fix is straightforward: the pattern matcher needs to handle 4-5 additional opcode prefixes, all of which already have parsing logic in `opcode.rs`.
 
 ---
 
