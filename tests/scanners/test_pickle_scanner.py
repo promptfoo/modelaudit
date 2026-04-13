@@ -677,6 +677,28 @@ def test_extract_metadata_uses_pickle_opcodes_not_raw_bytes(tmp_path: Path) -> N
     assert metadata["total_opcodes"] > 0
 
 
+@pytest.mark.parametrize(
+    ("configured_limit", "expected_error"),
+    [
+        (0, "max_metadata_pickle_read_size must be greater than 0"),
+        (-1, "max_metadata_pickle_read_size must be greater than 0"),
+        ("invalid", "max_metadata_pickle_read_size must be greater than 0"),
+        (10 * 1024 * 1024 + 1, "max_metadata_pickle_read_size too large (max: 10485760)"),
+    ],
+)
+def test_extract_metadata_validates_pickle_read_limit(
+    tmp_path: Path,
+    configured_limit: object,
+    expected_error: str,
+) -> None:
+    path = tmp_path / "safe.pkl"
+    path.write_bytes(pickle.dumps({"safe": True}, protocol=4))
+
+    metadata = PickleScanner(config={"max_metadata_pickle_read_size": configured_limit}).extract_metadata(str(path))
+
+    assert metadata["extraction_error"] == expected_error
+
+
 def test_scan_bin_file_detects_executable_tail_after_pickle_stream(tmp_path: Path) -> None:
     path = tmp_path / "model.bin"
     path.write_bytes(pickle.dumps({"safe": True}, protocol=4) + b"\x7fELF/bin/sh\x00")

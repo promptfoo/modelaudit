@@ -23,6 +23,7 @@ from .picklescan_adapter import pickle_report_to_scan_result, scan_options_from_
 _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES = 64 * 1024
 _ROOT_RAW_SCAN_LIMIT_BYTES = 8 * 1024 * 1024
 _ROOT_EXPENSIVE_RAW_SCAN_LIMIT_BYTES = 1 * 1024 * 1024
+_MAX_METADATA_PICKLE_READ_BYTES = 10 * 1024 * 1024
 _KNOWN_PICKLE_EXTENSIONS = frozenset({".pkl", ".pickle", ".dill", ".joblib"})
 _PYTORCH_CONTAINER_EXTENSIONS = frozenset({".bin", ".pt", ".pth", ".ckpt", ".pkl"})
 _BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{12,}={0,2}(?![A-Za-z0-9+/=])")
@@ -540,6 +541,19 @@ def _append_raw_indicator(
     associated_global: str | None = None,
 ) -> None:
     indicators.append((label, {"associated_global": associated_global or label}))
+
+
+def _metadata_pickle_read_limit(configured_limit: Any) -> tuple[int | None, str | None]:
+    try:
+        read_limit = int(configured_limit)
+    except (TypeError, ValueError, OverflowError):
+        return None, "max_metadata_pickle_read_size must be greater than 0"
+
+    if read_limit <= 0:
+        return None, "max_metadata_pickle_read_size must be greater than 0"
+    if read_limit > _MAX_METADATA_PICKLE_READ_BYTES:
+        return None, f"max_metadata_pickle_read_size too large (max: {_MAX_METADATA_PICKLE_READ_BYTES})"
+    return read_limit, None
 
 
 def _is_dangerous_module(module: str) -> bool:
@@ -1631,18 +1645,9 @@ class PickleScanner(BaseScanner):
 
         file_size = self.get_file_size(file_path)
         configured_limit = self.config.get("max_metadata_pickle_read_size", _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES)
-        try:
-            read_limit = int(configured_limit)
-        except (TypeError, ValueError, OverflowError):
-            metadata["extraction_error"] = "max_metadata_pickle_read_size must be greater than 0"
-            return metadata
-
-        max_limit = 10 * 1024 * 1024
-        if read_limit <= 0:
-            metadata["extraction_error"] = "max_metadata_pickle_read_size must be greater than 0"
-            return metadata
-        if read_limit > max_limit:
-            metadata["extraction_error"] = f"max_metadata_pickle_read_size too large (max: {max_limit})"
+        read_limit, limit_error = _metadata_pickle_read_limit(configured_limit)
+        if read_limit is None:
+            metadata["extraction_error"] = limit_error
             return metadata
         if file_size > read_limit:
             metadata["extraction_error"] = f"pickle metadata read limit exceeded: {file_size} > {read_limit}"
