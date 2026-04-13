@@ -422,6 +422,29 @@ def test_scan_bytes_records_unresolved_copyreg_extension_without_reduce() -> Non
     )
 
 
+def test_scan_bytes_keeps_copyreg_extension_data_reference_suspicious() -> None:
+    report = scan_bytes(b"\x80\x04\x82\x01\x85.", source="extension-data-ref.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(finding.rule_code == "EXTENSION_REF" for finding in report.findings)
+    assert all(finding.rule_code != "DANGEROUS_CALL" for finding in report.findings)
+
+
+def test_scan_bytes_detects_follow_on_copyreg_extension_reduce() -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4) + (b"\x00" * 256) + b"\x80\x04\x82\x01)R."
+
+    report = scan_bytes(payload, source="follow-on-extension-reduce.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(notice.code == "follow_on_stream_detected" for notice in report.notices)
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("opaque_extension") is True
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_detects_build_on_constructed_dangerous_global() -> None:
     payload = b"cos\nsystem\n)R}b."
 
