@@ -555,7 +555,7 @@ def _legacy_rule_code_for_finding(finding: Finding) -> str | None:
             )
             if mapped:
                 return mapped
-        return "S201" if finding.rule_code == "DANGEROUS_CALL" else None
+        return "S201" if finding.rule_code == "DANGEROUS_CALL" else "S206"
     if finding.rule_code == "SUSPICIOUS_STRING":
         pattern = finding.details.get("pattern")
         if isinstance(pattern, str):

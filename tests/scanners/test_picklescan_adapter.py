@@ -339,7 +339,7 @@ def test_pickle_report_to_scan_result_falls_back_for_unmapped_persistent_id_opco
         ("DANGEROUS_CALL", {"module": "custom", "name": "loader"}, "S201"),
         ("DANGEROUS_GLOBAL", {"opcode": "GLOBAL"}, "S206"),
         ("DANGEROUS_GLOBAL", {"module": "posix", "name": "system"}, "S101"),
-        ("DANGEROUS_GLOBAL", {"module": "custom", "name": "loader"}, None),
+        ("DANGEROUS_GLOBAL", {"module": "custom", "name": "loader"}, "S206"),
         ("SUSPICIOUS_STRING", {"pattern": "eval(user_input)"}, "S104"),
         ("SUSPICIOUS_STRING", {"pattern": "os.system(payload)"}, "S101"),
         ("SUSPICIOUS_STRING", {"pattern": "subprocess.Popen(payload)"}, "S103"),
