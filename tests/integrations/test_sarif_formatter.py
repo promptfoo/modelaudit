@@ -322,6 +322,25 @@ class TestCreateResults:
 
         assert [result["ruleId"] for result in results] == ["S104"]
 
+    def test_pickle_rule_codes_are_preserved_as_sarif_rule_ids(self) -> None:
+        pickle_rule_codes = ["S209", "S213", "S214", "S601", "S602", "S604", "S902"]
+        issues = [
+            Issue(
+                message=f"Pickle rule {rule_code}",
+                severity=IssueSeverity.WARNING,
+                rule_code=rule_code,
+                timestamp=time.time(),
+            )
+            for rule_code in pickle_rule_codes
+        ]
+
+        results = _create_results(issues)
+        rules = _create_rules(issues)
+
+        assert [result["ruleId"] for result in results] == pickle_rule_codes
+        assert [rule["id"] for rule in rules] == pickle_rule_codes
+        assert [result["properties"]["rule_code"] for result in results] == pickle_rule_codes
+
 
 class TestCreateArtifacts:
     """Tests for _create_artifacts function."""
