@@ -382,17 +382,24 @@ def _contains_any_seed_lowered(lower_data: bytes, seeds: tuple[bytes, ...]) -> b
     return any(seed in lower_data for seed in seeds)
 
 
-def _has_alnum_secret_shape(data: bytes) -> bool:
+def _has_text_shape(data: bytes, *, require_dot: bool = False, require_alnum_pair: bool = False) -> bool:
+    if require_dot and not _has_domain_like_dot(data):
+        return False
+
     has_digit = False
     has_alpha = False
-    for byte in data[:_ROOT_EXPENSIVE_RAW_SCAN_LIMIT_BYTES]:
+    for byte in data:
         if 48 <= byte <= 57:
             has_digit = True
         elif (65 <= byte <= 90) or (97 <= byte <= 122):
             has_alpha = True
         if has_digit and has_alpha:
             return True
-    return False
+    return False if require_alnum_pair else has_digit or has_alpha
+
+
+def _has_alnum_secret_shape(data: bytes) -> bool:
+    return _has_text_shape(data, require_alnum_pair=True)
 
 
 def _is_ascii_alnum_byte(byte: int) -> bool:
@@ -416,18 +423,7 @@ def _has_domain_like_dot(data: bytes) -> bool:
 
 
 def _has_domain_or_ip_shape(data: bytes) -> bool:
-    if not _has_domain_like_dot(data):
-        return False
-    has_digit = False
-    has_alpha = False
-    for byte in data[:_ROOT_EXPENSIVE_RAW_SCAN_LIMIT_BYTES]:
-        if 48 <= byte <= 57:
-            has_digit = True
-        elif (65 <= byte <= 90) or (97 <= byte <= 122):
-            has_alpha = True
-        if has_digit and has_alpha:
-            return True
-    return has_digit or has_alpha
+    return _has_text_shape(data, require_dot=True)
 
 
 def _looks_like_portable_executable(data: bytes) -> bool:

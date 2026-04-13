@@ -492,7 +492,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] T-P2-EXPANSION — Restore expansion/memo-growth regression coverage.
 - [x] T-P2-STRUCTURAL — Restore structural tamper / duplicate-PROTO regression coverage.
 - [x] P2-STALE-PYCACHE — Remove stale `_parity_corpus` pycache artifact or ignore it explicitly.
-- [ ] P2-NEW-HELPER-DUP — Refactor duplicated text-shape helper loops.
+- [x] P2-NEW-HELPER-DUP — Refactor duplicated text-shape helper loops.
 - [ ] N-P1-7 — Make `_pickle_opcode_summary` memo-aware instead of clearing the string stack too aggressively.
 - [ ] N-P1-8 — Widen `_contains_call_token` separator handling.
 - [ ] N-P1-9 — Add raw-layer pickle GLOBAL newline-form module attribute coverage.
@@ -657,6 +657,11 @@ This section is the active implementation log for follow-up commits after revisi
 - P2-STALE-PYCACHE / N-P2-32 — The stale moved `_parity_corpus.cpython-311.pyc` artifact was local ignored state rather than a tracked file; it was removed from `packages/modelaudit-picklescan/src/modelaudit_picklescan/__pycache__`, and `.gitignore` already ignores `__pycache__/`. Targeted QA:
   - `git ls-files 'packages/modelaudit-picklescan/src/modelaudit_picklescan/__pycache__/*'` — passed, no tracked pycache entries.
   - `find packages/modelaudit-picklescan/src/modelaudit_picklescan -maxdepth 2 -type f -path '*/__pycache__/*' -name '_parity_corpus*.pyc' -print` — passed, no stale parity-corpus pycache remains.
+- P2-NEW-HELPER-DUP — Same-item commit replaces the duplicate digit/alpha scan loops in `_has_alnum_secret_shape` and `_has_domain_or_ip_shape` with shared `_has_text_shape(...)`, while preserving the domain-like-dot gate and allowing configured expensive raw windows larger than the default cap to be inspected. Targeted QA:
+  - `uv run ruff format --check modelaudit/scanners/pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 56 tests.
 
 ### Newly discovered gaps while remediating
 
