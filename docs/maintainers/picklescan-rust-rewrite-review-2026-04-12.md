@@ -512,7 +512,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P2-32 — Clean stale moved parity-corpus pycache.
 - [x] N-P2-33 — Refactor duplicate stream-read helpers.
 - [x] N-P0-34 — Bound recursive follow-on pickle probing for pickle-like binary tails.
-- [ ] R-P0-2 — Preserve integer stack values for `INT`/`LONG` variants.
+- [x] R-P0-2 — Preserve integer stack values for `INT`/`LONG` variants.
 - [ ] R-P1-BUF / R-P1-20 / R-P1-21 — Protocol-5 buffer stack and notice parity follow-up.
 - [ ] R-P1-27 — Include malformed state in global-reference dedupe.
 - [ ] R-P1-28 — Push `Other` for missing memo GET/BINGET/LONG_BINGET.
@@ -768,6 +768,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 70 tests.
+- R-P0-2 — Same-item commit pins the Rust integer stack-value behavior for protocol-0 text `INT`/`LONG` operands and little-endian `LONG1`/`LONG4` byte operands. The implementation already preserved these paths; this adds direct regression coverage so future parser refactors cannot degrade them back to opaque `Other` values. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 25 tests.
 
 ### Newly discovered gaps while remediating
 

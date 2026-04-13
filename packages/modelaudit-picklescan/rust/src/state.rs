@@ -2637,6 +2637,25 @@ mod tests {
     }
 
     #[test]
+    fn integer_stack_values_preserve_text_and_long_byte_operands() {
+        for (arg, expected) in [
+            (ArgValue::Text("42".to_string()), "42"),
+            (ArgValue::Text("-7L".to_string()), "-7"),
+            (ArgValue::Bytes { start: 0, end: 1 }, "-1"),
+            (ArgValue::Bytes { start: 1, end: 3 }, "1"),
+        ] {
+            let payload = [0xff, 0x01, 0x00];
+            match stack_value_from_integer_arg(&arg, &payload) {
+                StackValue::Primitive { type_name, repr } => {
+                    assert_eq!(type_name, "int");
+                    assert_eq!(repr, expected);
+                }
+                _ => panic!("integer operand did not produce primitive stack value"),
+            }
+        }
+    }
+
+    #[test]
     fn protocol5_buffer_opcodes_create_opaque_stack_context() {
         let options = ScanOptions {
             timeout_s: DEFAULT_TIMEOUT_S,
