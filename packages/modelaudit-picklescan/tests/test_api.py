@@ -975,6 +975,26 @@ def test_scan_stream_enforces_total_unbounded_stream_read_limit() -> None:
     assert any(notice.code == "unbounded_stream_truncated" for notice in report.notices)
 
 
+def test_scan_stream_enforces_total_known_stream_read_limit() -> None:
+    payload = pickle.dumps(b"a" * 64, protocol=4)
+    stream = NoBulkReadStream(payload, max_read_size=8)
+
+    report = PickleScanner(ScanOptions(max_known_stream_read_bytes=8)).scan_stream(
+        stream,
+        source="known-size-over-limit.pkl",
+        size=len(payload),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert not any(error.category == "io_error" for error in report.errors)
+    notice = next(notice for notice in report.notices if notice.code == "known_stream_truncated")
+    assert notice.details["bytes_scanned"] == 8
+    assert report.coverage.bytes_total == len(payload)
+    assert stream.max_seen_read_size <= 8
+
+
 def test_scan_stream_bounds_protocol_zero_readline_without_declared_size() -> None:
     stream = NoUnboundedReadlineStream(b"S'" + (b"a" * 64))
 
@@ -995,6 +1015,11 @@ def test_scan_stream_bounds_protocol_zero_readline_without_declared_size() -> No
 def test_scan_options_rejects_invalid_unbounded_stream_read_limit() -> None:
     with pytest.raises(ValueError, match="max_unbounded_stream_read_bytes"):
         ScanOptions(max_unbounded_stream_read_bytes=0)
+
+
+def test_scan_options_rejects_invalid_known_stream_read_limit() -> None:
+    with pytest.raises(ValueError, match="max_known_stream_read_bytes"):
+        ScanOptions(max_known_stream_read_bytes=0)
 
 
 def test_scan_bytes_flags_malformed_stack_global_operands() -> None:

@@ -14,6 +14,7 @@ def test_scan_options_defaults_are_safe_and_finite() -> None:
     assert options.timeout_s > 0
     assert options.max_opcodes > 0
     assert options.post_budget_scan_bytes >= 0
+    assert options.max_known_stream_read_bytes > 0
 
 
 def test_scan_options_clamps_excessive_timeout() -> None:
@@ -36,6 +37,8 @@ def test_scan_options_clamps_excessive_timeout() -> None:
         ({"post_budget_scan_bytes": True}, "post_budget_scan_bytes must be greater than or equal to 0"),
         ({"post_budget_scan_bytes": 1.5}, "post_budget_scan_bytes must be greater than or equal to 0"),
         ({"post_budget_scan_bytes": "1024"}, "post_budget_scan_bytes must be greater than or equal to 0"),
+        ({"max_known_stream_read_bytes": 0}, "max_known_stream_read_bytes must be greater than 0"),
+        ({"max_known_stream_read_bytes": True}, "max_known_stream_read_bytes must be greater than 0"),
         ({"max_string_literal_scan_chars": -1}, "max_string_literal_scan_chars must be greater than or equal to 0"),
         ({"max_string_literal_scan_chars": True}, "max_string_literal_scan_chars must be greater than or equal to 0"),
         ({"max_nested_pickle_bytes": -1}, "max_nested_pickle_bytes must be greater than or equal to 0"),

@@ -23,6 +23,7 @@ _INCONCLUSIVE_NOTICE_CODES = frozenset(
         "nested_pickle_incomplete",
         "opcode_budget",
         "parse_incomplete",
+        "known_stream_truncated",
         "timeout",
         "unbounded_stream_truncated",
     }
@@ -40,6 +41,7 @@ _LEGACY_SCAN_OUTCOME_REASONS = {
     "nested_pickle_incomplete": "nested_pickle_incomplete",
     "opcode_budget": "opcode_budget_exceeded",
     "parse_incomplete": "pickle_analysis_incomplete",
+    "known_stream_truncated": "known_stream_truncated",
     "timeout": "scan_timeout",
     "unbounded_stream_truncated": "unbounded_stream_truncated",
 }
@@ -108,6 +110,14 @@ def scan_options_from_config(config: Mapping[str, Any]) -> ScanOptions:
                 _DEFAULT_SCAN_OPTIONS.max_unbounded_stream_read_bytes,
             ),
             _DEFAULT_SCAN_OPTIONS.max_unbounded_stream_read_bytes,
+            minimum=1,
+        ),
+        max_known_stream_read_bytes=_parse_min_int(
+            config.get(
+                "max_known_stream_read_bytes",
+                _DEFAULT_SCAN_OPTIONS.max_known_stream_read_bytes,
+            ),
+            _DEFAULT_SCAN_OPTIONS.max_known_stream_read_bytes,
             minimum=1,
         ),
         max_string_literal_scan_chars=_parse_min_int(

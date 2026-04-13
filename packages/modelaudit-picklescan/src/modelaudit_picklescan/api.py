@@ -61,6 +61,7 @@ class PickleScanner:
             payload, stream_truncated = _read_stream_payload(
                 stream,
                 normalized_size,
+                max_known_read_bytes=self.options.max_known_stream_read_bytes,
                 max_unbounded_read_bytes=self.options.max_unbounded_stream_read_bytes,
             )
         except _StreamShortReadError as error:
@@ -89,11 +90,19 @@ class PickleScanner:
             position_offset=position_offset,
         )
         if stream_truncated:
-            return _with_unbounded_stream_notice(
+            if normalized_size is None:
+                return _with_unbounded_stream_notice(
+                    report,
+                    source=source,
+                    bytes_scanned=len(payload),
+                    max_unbounded_read_bytes=self.options.max_unbounded_stream_read_bytes,
+                )
+            return _with_known_stream_notice(
                 report,
                 source=source,
                 bytes_scanned=len(payload),
-                max_unbounded_read_bytes=self.options.max_unbounded_stream_read_bytes,
+                bytes_total=normalized_size,
+                max_known_read_bytes=self.options.max_known_stream_read_bytes,
             )
         return report
 
@@ -421,6 +430,51 @@ def _with_unbounded_stream_notice(
     )
 
 
+def _with_known_stream_notice(
+    report: PickleReport,
+    *,
+    source: str,
+    bytes_scanned: int,
+    bytes_total: int,
+    max_known_read_bytes: int,
+) -> PickleReport:
+    notices = (
+        *report.notices,
+        Notice(
+            message="Known-size pickle stream scan stopped at configured byte limit",
+            severity=Severity.INFO,
+            location=source,
+            code="known_stream_truncated",
+            details={
+                "bytes_scanned": bytes_scanned,
+                "bytes_total": bytes_total,
+                "max_known_stream_read_bytes": max_known_read_bytes,
+                "analysis_incomplete": True,
+            },
+        ),
+    )
+    status = ScanStatus.INCONCLUSIVE
+    verdict = SafetyVerdict.UNKNOWN if report.verdict == SafetyVerdict.CLEAN else report.verdict
+    metadata = {**report.to_dict()["metadata"], "analysis_incomplete": True}
+    return PickleReport(
+        source=report.source,
+        status=status,
+        verdict=verdict,
+        findings=report.findings,
+        notices=notices,
+        errors=report.errors,
+        coverage=CoverageSummary(
+            bytes_scanned=report.coverage.bytes_scanned,
+            bytes_total=bytes_total,
+            opcode_count=report.coverage.opcode_count,
+            raw_scan_complete=False,
+            opcode_scan_complete=False,
+        ),
+        metadata=metadata,
+        duration_s=report.duration_s,
+    )
+
+
 def _io_error_report(
     *,
     source: str,
@@ -593,6 +647,7 @@ def _read_stream_payload(
     stream: BinaryIO,
     size: int | None,
     *,
+    max_known_read_bytes: int,
     max_unbounded_read_bytes: int,
 ) -> tuple[bytes, bool]:
     with tempfile.SpooledTemporaryFile(max_size=max_unbounded_read_bytes, mode="w+b") as spool:
@@ -608,7 +663,8 @@ def _read_stream_payload(
             if remaining == 0 and stream.read(1):
                 stream_truncated = True
         else:
-            remaining = size
+            remaining = min(size, max_known_read_bytes)
+            stream_truncated = size > max_known_read_bytes
             bytes_read = 0
             while remaining > 0:
                 chunk = stream.read(min(_RUST_STREAM_READ_CHUNK_SIZE, remaining))
