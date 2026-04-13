@@ -477,7 +477,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P0-1 — Fix uncaught `ValueError` for non-seekable streams above the raw-read cap.
 - [x] N-P0-2 / N-P1-16 — Pass buffered payload size to Rust for non-seekable streams to avoid spurious `short_read`.
 - [x] N-P0-3 — Scope documentation/comment gating to the relevant literal or evidence window, not the entire raw detector pass.
-- [ ] N-P0-4 — Prevent documentation-like `_rebuild_tensor` literals from suppressing real CVE-2026-24747 GLOBAL evidence.
+- [x] N-P0-4 — Prevent documentation-like `_rebuild_tensor` literals from suppressing real CVE-2026-24747 GLOBAL evidence.
 - [ ] N-P0-5 — Clamp user-controlled Rust timeout values before `Duration::from_secs_f64`.
 - [ ] N-P0-6 — Add a clean-Rust hot path that skips expensive raw detectors when full Rust analysis completed cleanly.
 - [ ] P1-TRIPLE / N-P1-19 — Reduce or explicitly downgrade triple CRITICAL emissions for builtins eval/exec/compile/import aliases.
@@ -555,6 +555,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 31 tests, including the doc-only negative and a doc-padded raw `cposix.system` positive.
+- N-P0-4 — Same-item commit teaches `_rebuild_tensor_indicators_are_documentation_literals` to treat real `GLOBAL` and direct `STACK_GLOBAL` rebuild references as non-documentation evidence before applying doc-literal suppression. Targeted QA:
+  - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 32 tests, including a doc-literal plus real `torch._rebuild_tensor_v2` GLOBAL regression that preserves `primary_cve=CVE-2026-24747`.
 
 ### Newly discovered gaps while remediating
 

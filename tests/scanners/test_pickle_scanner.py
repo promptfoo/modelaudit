@@ -338,6 +338,18 @@ def test_raw_cve_comment_only_text_does_not_trigger_setitem(tmp_path: Path) -> N
     assert not any(issue.details.get("cve_id") == "CVE-2026-24747" for issue in result.issues)
 
 
+def test_raw_cve_rebuild_tensor_global_is_not_suppressed_by_documentation_literal(tmp_path: Path) -> None:
+    path = tmp_path / "doc-literal-real-global.pkl"
+    path.write_bytes(
+        b"(dS'doc'\nS'# _rebuild_tensor\\n# documentation only'\nsctorch\n_rebuild_tensor_v2\nS'value'\ns."
+    )
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(issue.details.get("cve_id") == "CVE-2026-24747" for issue in result.issues)
+    assert result.metadata["primary_cve"] == "CVE-2026-24747"
+
+
 def test_scan_stream_enforces_size_limit() -> None:
     payload = pickle.dumps({"safe": True}, protocol=4)
 

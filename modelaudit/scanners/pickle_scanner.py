@@ -577,8 +577,22 @@ def _pickle_opcode_summary(data: bytes) -> dict[str, Any]:
 def _rebuild_tensor_indicators_are_documentation_literals(data: bytes) -> bool:
     """Return True when CVE-2026-24747 text indicators appear only in doc-like literals."""
     saw_rebuild_tensor_literal = False
+    stack: list[str] = []
     try:
         for opcode, arg, _position in pickletools.genops(data):
+            if opcode.name == "GLOBAL":
+                parts = _global_parts(arg)
+                if parts is not None and "_rebuild_tensor" in f"{parts[0]}.{parts[1]}":
+                    return False
+                stack.clear()
+                continue
+            if opcode.name == "STACK_GLOBAL":
+                if len(stack) >= 2:
+                    global_name = stack.pop()
+                    module = stack.pop()
+                    if "_rebuild_tensor" in f"{module}.{global_name}":
+                        return False
+                continue
             if opcode.name not in {
                 "STRING",
                 "UNICODE",
@@ -588,6 +602,8 @@ def _rebuild_tensor_indicators_are_documentation_literals(data: bytes) -> bool:
                 "SHORT_BINUNICODE",
             }:
                 continue
+            if isinstance(arg, str):
+                stack.append(arg)
             if not isinstance(arg, str) or "_rebuild_tensor" not in arg:
                 continue
             saw_rebuild_tensor_literal = True
