@@ -15,6 +15,7 @@ from modelaudit.scanners.pickle_scanner import (
     PickleScanner,
     _is_legitimate_serialization_file,
     _looks_like_pickle,
+    _pickle_opcode_summary,
     is_suspicious_global,
 )
 from tests.helpers import create_mock_pytorch_zip
@@ -691,6 +692,20 @@ def test_raw_cve_rebuild_tensor_global_is_not_suppressed_by_documentation_litera
 
     assert any(issue.details.get("cve_id") == "CVE-2026-24747" for issue in result.issues)
     assert result.metadata["primary_cve"] == "CVE-2026-24747"
+
+
+def test_opcode_summary_tracks_memoized_stack_global_through_structure(tmp_path: Path) -> None:
+    payload = b"\x80\x04\x8c\x02os\x94}\x94\x8c\x06system\x94h\x00h\x02\x93s."
+    path = tmp_path / "memoized-stack-global.pkl"
+    path.write_bytes(payload)
+
+    summary = _pickle_opcode_summary(payload)
+    result = PickleScanner().scan(str(path))
+
+    assert summary["dangerous_globals"] == ["os.system"]
+    assert any(
+        issue.rule_code == "S209" and issue.details.get("associated_global") == "os.system" for issue in result.issues
+    )
 
 
 def test_scan_stream_enforces_size_limit() -> None:

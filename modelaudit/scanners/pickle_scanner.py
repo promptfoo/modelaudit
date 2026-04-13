@@ -552,10 +552,25 @@ def _pickle_opcode_summary(data: bytes) -> dict[str, Any]:
         "BUILD",
     }
     opcode_counts: dict[str, int] = {}
-    stack: list[str] = []
+    stack: list[str | None] = []
+    memo: dict[int, str | None] = {}
+    next_memo_index = 0
     dangerous_globals: list[str] = []
     protocol: int | None = None
     total_opcodes = 0
+
+    def _memo_index(value: object) -> int | None:
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            try:
+                return int(value)
+            except ValueError:
+                return None
+        return None
+
+    def _pop_value() -> str | None:
+        return stack.pop() if stack else None
 
     try:
         for opcode, arg, _position in pickletools.genops(data):
@@ -567,21 +582,62 @@ def _pickle_opcode_summary(data: bytes) -> dict[str, Any]:
             if name in {"STRING", "UNICODE", "BINSTRING", "SHORT_BINSTRING", "BINUNICODE", "SHORT_BINUNICODE"}:
                 stack.append(str(arg))
                 continue
+            if name == "MEMOIZE":
+                if stack:
+                    memo[next_memo_index] = stack[-1]
+                next_memo_index += 1
+                continue
+            if name in {"PUT", "BINPUT", "LONG_BINPUT"}:
+                index = _memo_index(arg)
+                if index is not None and stack:
+                    memo[index] = stack[-1]
+                    next_memo_index = max(next_memo_index, index + 1)
+                continue
+            if name in {"GET", "BINGET", "LONG_BINGET"}:
+                index = _memo_index(arg)
+                stack.append(memo.get(index) if index is not None else None)
+                continue
             if name == "GLOBAL":
                 parts = _global_parts(arg)
                 if parts is not None:
                     module, global_name = parts
                     if is_suspicious_global(module, global_name):
                         dangerous_globals.append(f"{module}.{global_name}")
+                stack.append(None)
                 continue
             if name == "STACK_GLOBAL" and len(stack) >= 2:
-                global_name = stack.pop()
-                module = stack.pop()
-                if is_suspicious_global(module, global_name):
-                    dangerous_globals.append(f"{module}.{global_name}")
+                stack_global_name = _pop_value()
+                stack_module = _pop_value()
+                if (
+                    stack_module is not None
+                    and stack_global_name is not None
+                    and is_suspicious_global(stack_module, stack_global_name)
+                ):
+                    dangerous_globals.append(f"{stack_module}.{stack_global_name}")
+                stack.append(None)
                 continue
-            if name not in {"MEMOIZE", "PUT", "BINPUT", "LONG_BINPUT"}:
-                stack.clear()
+            if name == "POP":
+                _pop_value()
+            elif name in {
+                "EMPTY_DICT",
+                "EMPTY_LIST",
+                "EMPTY_SET",
+                "EMPTY_TUPLE",
+                "MARK",
+                "NONE",
+                "NEWFALSE",
+                "NEWTRUE",
+                "INT",
+                "BININT",
+                "BININT1",
+                "BININT2",
+                "LONG",
+                "LONG1",
+                "LONG4",
+                "FLOAT",
+                "BINFLOAT",
+            }:
+                stack.append(None)
     except Exception as error:
         return {"parse_error": str(error)}
 

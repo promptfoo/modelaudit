@@ -493,7 +493,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] T-P2-STRUCTURAL — Restore structural tamper / duplicate-PROTO regression coverage.
 - [x] P2-STALE-PYCACHE — Remove stale `_parity_corpus` pycache artifact or ignore it explicitly.
 - [x] P2-NEW-HELPER-DUP — Refactor duplicated text-shape helper loops.
-- [ ] N-P1-7 — Make `_pickle_opcode_summary` memo-aware instead of clearing the string stack too aggressively.
+- [x] N-P1-7 — Make `_pickle_opcode_summary` memo-aware instead of clearing the string stack too aggressively.
 - [ ] N-P1-8 — Widen `_contains_call_token` separator handling.
 - [ ] N-P1-9 — Add raw-layer pickle GLOBAL newline-form module attribute coverage.
 - [ ] N-P1-10 / N-P1-12 — Scan binary tails past the 8 MB raw window and after malformed/truncated pickle prefixes.
@@ -662,6 +662,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py` — passed.
   - `uv run mypy modelaudit/scanners/pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 56 tests.
+- N-P1-7 — Same-item commit makes `_pickle_opcode_summary` retain a small memo-aware stack for string operands instead of clearing it on structural opcodes. This restores CVE-2026-24747 S209 attribution for protocol 4/5 `STACK_GLOBAL` payloads that memoize module/name strings around ordinary container structure. Targeted QA:
+  - `uv run ruff format --check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 57 tests, including a memoized `os.system` `STACK_GLOBAL` regression that emits `S209`.
 
 ### Newly discovered gaps while remediating
 
