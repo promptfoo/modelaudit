@@ -2054,10 +2054,7 @@ impl<'a> ScanState<'a> {
     }
 
     fn scan_follow_on_pickle_streams(&mut self, start_index: usize) {
-        if self.options.post_budget_scan_bytes == 0
-            || self.nested_depth >= self.options.max_nested_depth
-            || start_index >= self.payload.len()
-        {
+        if self.options.post_budget_scan_bytes == 0 || start_index >= self.payload.len() {
             return;
         }
         let scan_end = self
@@ -2092,7 +2089,7 @@ impl<'a> ScanState<'a> {
                 self.options,
                 Some(candidate.len()),
                 self.position_offset + absolute_offset,
-                self.nested_depth + 1,
+                self.nested_depth,
                 Some(self.deadline),
             );
             follow_on_scan.run();
@@ -3565,6 +3562,39 @@ mod tests {
         assert_eq!(scan.stack.len(), 2);
         assert!(matches!(scan.stack[0], StackValue::Mark));
         assert!(matches!(scan.stack[1], StackValue::Other));
+    }
+
+    #[test]
+    fn follow_on_streams_do_not_consume_nested_depth_budget() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: 1,
+        };
+        let payload = b"padding\x00\x80\x04cos\nsystem\n)R.";
+        let mut scan = ScanState::new(
+            "follow-on-depth.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            1,
+            None,
+        );
+
+        scan.scan_follow_on_pickle_streams(0);
+
+        assert!(scan
+            .findings
+            .iter()
+            .any(|finding| finding.rule_code == Some("DANGEROUS_CALL")));
+        assert!(scan
+            .notices
+            .iter()
+            .any(|notice| notice.code == Some("follow_on_stream_detected")));
     }
 
     #[test]

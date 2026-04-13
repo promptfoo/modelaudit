@@ -1069,7 +1069,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] V5-P1-09 — Close N5-R11 by preventing stack-state wipes on operand underflow.
 - [x] V5-P1-10 — Close N5-R13 by preventing MARK from being wrapped into tuple values.
 - [x] V5-P1-11 — Close N5-R15 by preserving INST module/name operands without space-splitting ambiguity.
-- [ ] V5-P1-12 — Close N5-R17 by keeping follow-on sibling pickle streams at the current nested depth.
+- [x] V5-P1-12 — Close N5-R17 by keeping follow-on sibling pickle streams at the current nested depth.
 - [ ] V5-P1-13 — Close N5-R18 by capping import-reference metadata and surfacing truncation as a notice.
 - [ ] V5-P1-14 — Close N5-R19 by accepting uppercase escaped-hex pickle prefixes.
 - [ ] V5-P1-15 — Close N5-SEC-F5 by detecting wrapped/multiline encoded nested pickles.
@@ -1153,6 +1153,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
   - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml parse_global_operands_preserve_spaces -- --nocapture` — passed, 1 test.
+- V5-P1-12 — Same-item commit treats follow-on pickle streams as siblings rather than nested payloads: the follow-on scanner now uses the current nested depth and is not skipped merely because the nested-depth budget has been reached. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml follow_on_streams_do_not_consume_nested_depth_budget -- --nocapture` — passed, 1 test.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
