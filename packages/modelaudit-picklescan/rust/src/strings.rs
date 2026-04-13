@@ -511,6 +511,10 @@ fn contains_call_like(lower: &str, name: &str) -> bool {
     while let Some(found) = lower[offset..].find(name) {
         let start = offset + found;
         let after = start + name.len();
+        if start > 0 && is_python_word_byte(lower.as_bytes()[start - 1]) {
+            offset = after;
+            continue;
+        }
         let rest = &lower[after..];
         if rest.trim_start().starts_with('(') || lower[start..].starts_with(&needle) {
             return true;
@@ -530,6 +534,9 @@ fn find_module_attr(lower: &str, module: &str, attr: &str, prefix: bool) -> bool
 
     let max_start = chars.len().saturating_sub(module_chars.len());
     for start in 0..=max_start {
+        if start > 0 && is_python_word_char(chars[start - 1]) {
+            continue;
+        }
         if chars[start..start + module_chars.len()] != module_chars[..] {
             continue;
         }
@@ -762,6 +769,10 @@ fn is_hex_byte(byte: u8) -> bool {
     byte.is_ascii_hexdigit()
 }
 
+fn is_python_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,6 +816,15 @@ mod tests {
         assert!(suspicious_string_matches("OS.System('id')").contains(&"os.system".to_string()));
         assert!(suspicious_string_matches("OS . system('id')").contains(&"os.system".to_string()));
         assert!(suspicious_string_matches("Import OS").contains(&"import statement".to_string()));
+    }
+
+    #[test]
+    fn suspicious_string_matching_keeps_word_boundaries() {
+        assert!(suspicious_string_matches("eval(x)").contains(&"eval(".to_string()));
+        assert!(suspicious_string_matches("os.system('id')").contains(&"os.system".to_string()));
+        assert!(suspicious_string_matches("recompile(x)").is_empty());
+        assert!(suspicious_string_matches("foos.system('id')").is_empty());
+        assert!(suspicious_string_matches("subprocess_eval_guard").is_empty());
     }
 
     #[test]
