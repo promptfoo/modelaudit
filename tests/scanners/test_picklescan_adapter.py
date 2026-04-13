@@ -611,7 +611,7 @@ def test_pickle_report_to_scan_result_fails_closed_for_encoded_nested_truncation
     assert notice_check.message == "Encoded pickle payload exceeds configured deep-scan byte limit"
 
 
-def test_pickle_report_to_scan_result_fails_closed_for_encoded_nested_payload_missing_encoding() -> None:
+def test_pickle_report_to_scan_result_preserves_critical_s601_for_encoded_nested_payload_missing_encoding() -> None:
     report = PickleReport(
         source="encoded.pkl",
         status=ScanStatus.COMPLETE,

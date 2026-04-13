@@ -249,6 +249,21 @@ def test_expensive_raw_prefilters_skip_common_torch_metadata_without_jit_markers
     assert not result.issues
 
 
+def test_expensive_raw_prefilters_skip_realistic_torch_state_dict_names(tmp_path: Path) -> None:
+    path = tmp_path / "torch-state-dict.pkl"
+    state_dict = {f"torch.layer.{index}.weight": index / 100.0 for index in range(20_000)}
+    path.write_bytes(pickle.dumps(state_dict, protocol=4))
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.metadata["pickle_expensive_raw_detectors_skipped"] is True
+    assert result.metadata["pickle_expensive_raw_detector_skip_reason"] == "rust_complete_clean_no_expensive_raw_seeds"
+    assert result.metadata.get("pickle_secrets_raw_detector_skipped") is None
+    assert result.metadata.get("pickle_jit_raw_detector_skipped") is None
+    assert result.metadata.get("pickle_network_raw_detector_skipped") is None
+    assert not result.issues
+
+
 def test_expensive_raw_prefilters_preserve_torch_jit_markers(tmp_path: Path) -> None:
     path = tmp_path / "torch-jit-metadata.pkl"
     path.write_bytes(pickle.dumps({"loader": "torch.jit.load('model.pt')"}, protocol=4))

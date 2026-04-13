@@ -197,6 +197,19 @@ _NETWORK_SCAN_SEEDS: tuple[bytes, ...] = (
     b"websocket",
     b"zombie",
 )
+_SECRET_ASSIGNMENT_SHAPE_RE = re.compile(
+    rb"(?i)\b[a-z0-9_.-]{0,64}(?:api[_-]?key|secret|token|password|passwd|pwd|credential|access[_-]?key)"
+    rb"[a-z0-9_.-]{0,64}\s*[:=]\s*['\"]?[A-Za-z0-9_./+=:-]{8,}"
+)
+_SECRET_SHAPE_KEYWORDS: tuple[bytes, ...] = (
+    b"credential",
+    b"password",
+    b"passwd",
+    b"secret",
+    b"token",
+    b"key",
+    b"pwd",
+)
 _DOCUMENTATION_LINE_PREFIXES = (b"#", b"//", b"/*", b"*")
 _PICKLE_LITERAL_OPCODE_NAMES = frozenset(
     {
@@ -526,50 +539,91 @@ def _contains_any_seed_lowered(lower_data: bytes, seeds: tuple[bytes, ...]) -> b
     return any(seed in lower_data for seed in seeds)
 
 
-def _has_text_shape(data: bytes, *, require_dot: bool = False, require_alnum_pair: bool = False) -> bool:
-    if require_dot and not _has_domain_like_dot(data):
-        return False
-
-    has_digit = False
-    has_alpha = False
-    for byte in data:
-        if 48 <= byte <= 57:
-            has_digit = True
-        elif (65 <= byte <= 90) or (97 <= byte <= 122):
-            has_alpha = True
-        if has_digit and has_alpha:
-            return True
-    return False if require_alnum_pair else has_digit or has_alpha
-
-
 def _has_alnum_secret_shape(data: bytes) -> bool:
-    return _has_text_shape(data, require_alnum_pair=True)
-
-
-def _is_ascii_alnum_byte(byte: int) -> bool:
-    return (48 <= byte <= 57) or (65 <= byte <= 90) or (97 <= byte <= 122)
-
-
-def _has_domain_like_dot(data: bytes) -> bool:
-    start = 0
-    while True:
-        index = data.find(b".", start)
-        if index < 0:
-            return False
-        if (
-            index > 0
-            and index + 1 < len(data)
-            and _is_ascii_alnum_byte(data[index - 1])
-            and _is_ascii_alnum_byte(data[index + 1])
-        ):
-            return True
-        start = index + 1
+    lower = data.lower()
+    if not _contains_any_seed_lowered(lower, _SECRET_SHAPE_KEYWORDS):
+        return False
+    return _SECRET_ASSIGNMENT_SHAPE_RE.search(data) is not None
 
 
 def _has_domain_or_ip_shape(data: bytes) -> bool:
-    if not _has_text_shape(data, require_dot=True):
+    if b"://" in data:
+        return True
+    return _has_domain_with_path_shape(data) or _has_ipv4_shape(data)
+
+
+def _has_domain_with_path_shape(data: bytes) -> bool:
+    start = 0
+    while True:
+        slash_index = data.find(b"/", start)
+        if slash_index < 0:
+            return False
+        host_start = slash_index
+        while host_start > 0 and _is_domain_host_byte(data[host_start - 1]):
+            host_start -= 1
+        if _is_plausible_domain_host(data[host_start:slash_index]):
+            return True
+        start = slash_index + 1
+
+
+def _has_ipv4_shape(data: bytes) -> bool:
+    start = 0
+    while True:
+        dot_index = data.find(b".", start)
+        if dot_index < 0:
+            return False
+        candidate_start = dot_index
+        while candidate_start > 0 and _is_ipv4_candidate_byte(data[candidate_start - 1]):
+            candidate_start -= 1
+        candidate_end = dot_index + 1
+        while candidate_end < len(data) and _is_ipv4_candidate_byte(data[candidate_end]):
+            candidate_end += 1
+        if _is_plausible_ipv4(data[candidate_start:candidate_end]):
+            return True
+        start = dot_index + 1
+
+
+def _is_domain_host_byte(byte: int) -> bool:
+    return byte == 45 or byte == 46 or (48 <= byte <= 57) or (65 <= byte <= 90) or (97 <= byte <= 122)
+
+
+def _is_domain_label_byte(byte: int) -> bool:
+    return byte == 45 or (48 <= byte <= 57) or (65 <= byte <= 90) or (97 <= byte <= 122)
+
+
+def _is_ascii_alpha_byte(byte: int) -> bool:
+    return (65 <= byte <= 90) or (97 <= byte <= 122)
+
+
+def _is_plausible_domain_host(host: bytes) -> bool:
+    if not 3 <= len(host) <= 253 or b"." not in host:
         return False
-    return any(marker in data for marker in (b"://", b"/", b"?", b"=", b":", b"@"))
+    labels = host.split(b".")
+    if len(labels) < 2:
+        return False
+    for label in labels:
+        if not label or len(label) > 63 or label.startswith(b"-") or label.endswith(b"-"):
+            return False
+        if not all(_is_domain_label_byte(byte) for byte in label):
+            return False
+    tld = labels[-1]
+    return len(tld) >= 2 and any(_is_ascii_alpha_byte(byte) for byte in tld)
+
+
+def _is_ipv4_candidate_byte(byte: int) -> bool:
+    return byte == 46 or (48 <= byte <= 57)
+
+
+def _is_plausible_ipv4(candidate: bytes) -> bool:
+    parts = candidate.split(b".")
+    if len(parts) != 4:
+        return False
+    for part in parts:
+        if not 1 <= len(part) <= 3 or not part.isdigit():
+            return False
+        if int(part) > 255:
+            return False
+    return True
 
 
 def _looks_like_portable_executable(data: bytes) -> bool:

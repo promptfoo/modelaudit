@@ -416,9 +416,28 @@ class NumPyScanner(BaseScanner):
                             )
                             result.bytes_scanned = file_size
                             result.metadata.update(
-                                {"shape": shape, "dtype": str(dtype), "fortran_order": fortran},
+                                embedded_result.metadata,
                             )
-                            result.finish(success=True)
+                            result.metadata.update(
+                                {
+                                    "shape": shape,
+                                    "dtype": str(dtype),
+                                    "fortran_order": fortran,
+                                    "embedded_pickle_scan_success": embedded_result.success,
+                                },
+                            )
+                            if (
+                                result.metadata.get("analysis_incomplete") is True
+                                or result.metadata.get("operational_error") is True
+                                or result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+                            ):
+                                _mark_inconclusive_scan_result(
+                                    result,
+                                    "numpy_object_embedded_pickle_incomplete",
+                                )
+                                _finish_with_inconclusive_contract(result, default_success=False)
+                            else:
+                                result.finish(success=embedded_result.success)
                             return result
 
                         self._validate_dtype(dtype)

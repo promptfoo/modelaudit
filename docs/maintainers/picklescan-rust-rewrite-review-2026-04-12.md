@@ -148,23 +148,24 @@ pickle.loads(mal)
 
 **Full bypass matrix** (all 11 tested via manual SHORT_BINUNICODE+STACK_GLOBAL+REDUCE tail past 1M opcode budget):
 
-| Global | Protocol 2/3 (text) | **Protocol 4/5 (STACK_GLOBAL)** |
-|---|---|---|
-| `subprocess.run` | ✅ detected | ❌ **bypass** (`unknown`, 0 findings) |
-| `subprocess.Popen` | ✅ detected | ❌ **bypass** |
-| `os.system` | ✅ detected (critical) | ❌ **bypass** |
-| `os.popen` | ✅ detected (warning) | ❌ **bypass** |
-| `builtins.eval` | ✅ detected | ❌ **bypass** |
-| `builtins.exec` | ✅ detected | ❌ **bypass** |
-| `importlib.reload` | ✅ detected | ❌ **bypass** |
-| `ctypes.CDLL` | ✅ detected (warning) | ❌ **bypass** |
-| `marshal.loads` | ✅ detected | ❌ **bypass** |
-| `pickle.loads` | ✅ detected | ❌ **bypass** |
-| `_ctypes.dlopen` | ✅ detected | ❌ **bypass** |
+| Global             | Protocol 2/3 (text)    | **Protocol 4/5 (STACK_GLOBAL)**       |
+| ------------------ | ---------------------- | ------------------------------------- |
+| `subprocess.run`   | ✅ detected            | ❌ **bypass** (`unknown`, 0 findings) |
+| `subprocess.Popen` | ✅ detected            | ❌ **bypass**                         |
+| `os.system`        | ✅ detected (critical) | ❌ **bypass**                         |
+| `os.popen`         | ✅ detected (warning)  | ❌ **bypass**                         |
+| `builtins.eval`    | ✅ detected            | ❌ **bypass**                         |
+| `builtins.exec`    | ✅ detected            | ❌ **bypass**                         |
+| `importlib.reload` | ✅ detected            | ❌ **bypass**                         |
+| `ctypes.CDLL`      | ✅ detected (warning)  | ❌ **bypass**                         |
+| `marshal.loads`    | ✅ detected            | ❌ **bypass**                         |
+| `pickle.loads`     | ✅ detected            | ❌ **bypass**                         |
+| `_ctypes.dlopen`   | ✅ detected            | ❌ **bypass**                         |
 
 Also confirmed: `BINUNICODE` (`\x8d`) variants, `INST` opcodes, and `EXT1` opcodes past budget all bypass. The ONLY format the post-budget scanner catches is protocol-0/2 text `c<module>\n<name>\n` — which `pickle.dumps(obj)` has not emitted by default since Python 3.0 (2008). Python 3.8+ defaults to protocol 5. Attackers don't need to do anything special to hit this bypass — they just call `pickle.dumps(evil_obj)` without specifying a protocol.
 
 **Full `PickleScanner().scan()` result on the validated payload:**
+
 ```
 success=False
 total issues: 1
@@ -173,6 +174,7 @@ sev=info rule=S902 msg=Opcode analysis stopped after reaching max_opcodes=100000
 ```
 
 **Required fix:** `post_budget_global_matches` must also scan for:
+
 1. `\x8c<len><module>\x94?\x8c<len><name>\x94?\x93` (SHORT_BINUNICODE + optional MEMOIZE + SHORT_BINUNICODE + optional MEMOIZE + STACK_GLOBAL)
 2. `\x8d<u32 len><module>\x94?\x8d<u32 len><name>\x94?\x93` (BINUNICODE variant)
 3. `\x8e<u64 len><module>\x94?\x8e<u64 len><name>\x94?\x93` (BINUNICODE8 variant)
@@ -251,20 +253,27 @@ The advertised 40-80× speedup in the PR body applies only to synthetic `b"A"*N`
 
 ### Rev 6 release-readiness
 
-| Status | Severity | Item |
-|---|---|---|
-| ❌ | **P0 RCE BYPASS** | **N6-CRITICAL-RCE-BYPASS-V2** — post-budget tail scan still misses STACK_GLOBAL/protocol 4+ format (the default); 11/11 dangerous globals bypass |
-| ⚠️ | P1 perf | N6-SKIP-PARTIAL — hot-path skip only narrowed JIT seed; secrets/network still run on realistic ML pickles |
-| ✅ | — | All 14 rev 5 test failures resolved |
-| ✅ | — | N5-EXPLOIT-PERSID-NESTED fixed |
-| ✅ | — | N5-P0-WHEEL-MANYLINUX + N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS |
-| ✅ | — | STRUCTURAL_TAMPER severity + dead adapter code + S214 rule code + SARIF filtering + SARIF regression |
-| ✅ | — | Most P1 Rust correctness (N5-R1/R2/R11/R13/R15/R17/R18/R19) |
-| ✅ | — | Most Python integration gaps (N5-PY1-1/2/4/5/6/7/9/10/11) |
-| ✅ | — | All N5-SEC-F2..F9 security items |
-| ✅ | — | Docker multi-stage + CHANGELOG + docs + CI ordering |
+| Status | Severity          | Item                                                                                                                                             |
+| ------ | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| ❌     | **P0 RCE BYPASS** | **N6-CRITICAL-RCE-BYPASS-V2** — post-budget tail scan still misses STACK_GLOBAL/protocol 4+ format (the default); 11/11 dangerous globals bypass |
+| ⚠️     | P1 perf           | N6-SKIP-PARTIAL — hot-path skip only narrowed JIT seed; secrets/network still run on realistic ML pickles                                        |
+| ✅     | —                 | All 14 rev 5 test failures resolved                                                                                                              |
+| ✅     | —                 | N5-EXPLOIT-PERSID-NESTED fixed                                                                                                                   |
+| ✅     | —                 | N5-P0-WHEEL-MANYLINUX + N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS                                                                                 |
+| ✅     | —                 | STRUCTURAL_TAMPER severity + dead adapter code + S214 rule code + SARIF filtering + SARIF regression                                             |
+| ✅     | —                 | Most P1 Rust correctness (N5-R1/R2/R11/R13/R15/R17/R18/R19)                                                                                      |
+| ✅     | —                 | Most Python integration gaps (N5-PY1-1/2/4/5/6/7/9/10/11)                                                                                        |
+| ✅     | —                 | All N5-SEC-F2..F9 security items                                                                                                                 |
+| ✅     | —                 | Docker multi-stage + CHANGELOG + docs + CI ordering                                                                                              |
 
-**Verdict: STILL NOT MERGE READY.** Rev 6 closes all 14 test failures and most P1/P2 items (40+ findings fixed). The one remaining blocker is N6-CRITICAL-RCE-BYPASS-V2 — the post-budget tail scanner fix in rev 6 (`660cf3c8 fix: harden post-budget pickle global scan`) added policy-driven severity lookup but didn't update the byte-pattern matcher to handle STACK_GLOBAL / SHORT_BINUNICODE / INST / BINUNICODE / EXT formats. Since `pickle.dumps(obj)` defaults to protocol 4 (Python 3.4+) or 5 (Python 3.8+) and **never emits the text `c<module>\n<name>\n` pattern by default**, the scanner is effectively still blind to every realistic post-budget attack. The fix is straightforward: the pattern matcher needs to handle 4-5 additional opcode prefixes, all of which already have parsing logic in `opcode.rs`.
+**Original rev 6 verdict: STILL NOT MERGE READY.** Rev 6 closes all 14 test failures and most P1/P2 items (40+ findings fixed). The one remaining blocker is N6-CRITICAL-RCE-BYPASS-V2 — the post-budget tail scanner fix in rev 6 (`660cf3c8 fix: harden post-budget pickle global scan`) added policy-driven severity lookup but didn't update the byte-pattern matcher to handle STACK_GLOBAL / SHORT_BINUNICODE / INST / BINUNICODE / EXT formats. Since `pickle.dumps(obj)` defaults to protocol 4 (Python 3.4+) or 5 (Python 3.8+) and **never emits the text `c<module>\n<name>\n` pattern by default**, the scanner is effectively still blind to every realistic post-budget attack. The fix is straightforward: the pattern matcher needs to handle 4-5 additional opcode prefixes, all of which already have parsing logic in `opcode.rs`.
+
+### Codex follow-up on rev 6 findings
+
+- **N6-CRITICAL-RCE-BYPASS-V2: fixed after review.** The Rust post-budget matcher now recognizes modern `STACK_GLOBAL` tails built from `SHORT_BINUNICODE`, `BINUNICODE`, and `BINUNICODE8` operands with optional `MEMOIZE`, plus text `INST` and opaque `EXT1`/`EXT2`/`EXT4` references. All matches feed through the same post-budget severity and REDUCE-proximity promotion path. QA: `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml post_budget -- --nocapture` passes, and the standalone low-budget reproduction using `pickle.dumps(Evil(), protocol=4)[2:]` now returns `verdict=malicious` with a critical `POST_BUDGET_GLOBAL` finding for `subprocess.run`.
+- **N6-SKIP-PARTIAL: fixed after review.** The Python wrapper no longer treats any letter+digit pair as a secret shape or any dotted identifier plus incidental punctuation as a network shape. Secrets now require a structured secret-like assignment shape when no explicit seed is present; network shape fallback now requires URL, IPv4, or domain-with-path syntax. QA: the 1.8 MB realistic PyTorch state-dict reproduction now sets `pickle_expensive_raw_detectors_skipped=True` with zero issues, while targeted secret, URL, bare-domain-with-path, and Torch JIT marker regressions still preserve detector coverage.
+
+**Updated status after Codex follow-up:** both rev 6 findings are addressed in this PR with regression coverage; no rev 6 merge blocker remains from this review document pending CI.
 
 ---
 

@@ -373,7 +373,7 @@ def test_truncated_npy_fails_safely(tmp_path: Path) -> None:
     scanner = NumPyScanner()
     result = scanner.scan(str(path))
 
-    assert result.success is True
+    assert result.success is False
     assert result.has_errors is True
     assert any("exec" in i.message.lower() and i.severity == IssueSeverity.CRITICAL for i in result.issues)
     assert any(

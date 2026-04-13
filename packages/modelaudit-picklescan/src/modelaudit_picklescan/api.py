@@ -13,7 +13,6 @@ from .options import ScanOptions
 from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdict, ScanError, ScanStatus, Severity
 
 _RUST_STREAM_READ_CHUNK_SIZE = 1024 * 1024
-_PYTORCH_ZIP_EXTENSIONS = frozenset({".pt", ".pth", ".ckpt", ".pkl", ".bin"})
 _PYTORCH_ZIP_METADATA_BASENAMES = frozenset({"version", "byteorder"})
 _PICKLE_MEMBER_SUFFIXES = (".pkl", ".pickle")
 _MAX_PYTORCH_ZIP_ENTRIES = 10_000
@@ -156,7 +155,7 @@ class PickleScanner:
     def _scan_pytorch_zip_file(self, path: Path, *, source: str, size: int) -> PickleReport | None:
         with zipfile.ZipFile(path, "r") as archive:
             entries = archive.infolist()
-            if not _is_pytorch_zip_archive(path, entries):
+            if not _is_pytorch_zip_archive(entries):
                 return None
             if len(entries) > _MAX_PYTORCH_ZIP_ENTRIES:
                 return _pytorch_zip_notice_report(
@@ -264,14 +263,16 @@ def scan_file(path: str | Path, *, options: ScanOptions | None = None) -> Pickle
     return PickleScanner(options=options).scan_file(path)
 
 
-def _is_pytorch_zip_archive(path: Path, entries: list[zipfile.ZipInfo]) -> bool:
+def _is_pytorch_zip_archive(entries: list[zipfile.ZipInfo]) -> bool:
     names = [entry.filename for entry in entries if not entry.is_dir()]
     has_data_pickle = any(_is_data_pickle_member(name) for name in names)
     has_metadata_marker = any(Path(name).name in _PYTORCH_ZIP_METADATA_BASENAMES for name in names)
+    if not has_metadata_marker:
+        return False
     if has_data_pickle:
-        return has_metadata_marker or path.suffix.lower() in _PYTORCH_ZIP_EXTENSIONS
+        return True
     has_pickle_members = any(name.lower().endswith(_PICKLE_MEMBER_SUFFIXES) for name in names)
-    return has_pickle_members and (has_metadata_marker or path.suffix.lower() in _PYTORCH_ZIP_EXTENSIONS)
+    return has_pickle_members
 
 
 def _discover_pytorch_zip_pickle_entries(entries: list[zipfile.ZipInfo]) -> list[zipfile.ZipInfo]:

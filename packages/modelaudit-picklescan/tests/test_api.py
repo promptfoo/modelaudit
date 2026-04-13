@@ -712,6 +712,18 @@ def test_scan_file_scans_strict_pickle_path(tmp_path: Path) -> None:
     assert report.coverage.bytes_total == payload_path.stat().st_size
 
 
+def test_scan_file_does_not_treat_suffix_only_zip_as_pytorch(tmp_path: Path) -> None:
+    archive_path = tmp_path / "not-a-checkpoint.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("data.pkl", pickle.dumps({"safe": True}, protocol=4))
+
+    report = scan_file(archive_path)
+
+    assert report.metadata.get("container_type") != "pytorch_zip"
+    assert report.status == ScanStatus.ERROR
+    assert report.verdict == SafetyVerdict.UNKNOWN
+
+
 def test_scan_file_scans_pytorch_zip_data_pickle(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     with zipfile.ZipFile(archive_path, "w") as archive:
@@ -1202,6 +1214,25 @@ def test_scan_bytes_post_budget_tail_handles_stack_global_at_boundary() -> None:
 
     assert report.status == ScanStatus.INCONCLUSIVE
     assert any(finding.rule_code == "POST_BUDGET_GLOBAL" for finding in report.findings)
+
+
+def test_scan_bytes_post_budget_tail_detects_default_protocol_stack_global() -> None:
+    payload = b"\x80\x04\x88\x88" + pickle.dumps(MaliciousPayload(), protocol=4)[2:]
+
+    report = scan_bytes(
+        payload,
+        source="budget-default-protocol-stack-global.pkl",
+        options=ScanOptions(max_opcodes=2, post_budget_scan_bytes=4096),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "POST_BUDGET_GLOBAL"
+        and finding.severity == Severity.CRITICAL
+        and f"{finding.details.get('module')}.{finding.details.get('name')}" in SYSTEM_GLOBALS
+        for finding in report.findings
+    )
 
 
 def test_scan_bytes_handles_multiple_pickle_streams() -> None:

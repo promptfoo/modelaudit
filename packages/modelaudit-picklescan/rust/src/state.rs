@@ -290,7 +290,7 @@ fn deadline_from_timeout(timeout_s: f64) -> Instant {
     let duration = timeout_duration(timeout_s);
     now.checked_add(duration).unwrap_or_else(|| {
         now.checked_add(Duration::from_secs_f64(DEFAULT_TIMEOUT_S))
-            .unwrap_or(now)
+            .unwrap_or_else(|| now + Duration::from_secs(1))
     })
 }
 
@@ -2841,6 +2841,14 @@ impl PostBudgetGlobalMatch {
     }
 }
 
+struct PostBudgetGlobalCandidate<'a> {
+    module: &'a str,
+    name: &'a str,
+    pattern_start: usize,
+    proximity_start: usize,
+    severity: &'static str,
+}
+
 fn post_budget_global_matches(tail: &[u8], tail_prefix_len: usize) -> Vec<PostBudgetGlobalMatch> {
     let mut matches = Vec::new();
     let mut seen = HashSet::new();
@@ -2851,7 +2859,7 @@ fn post_budget_global_matches(tail: &[u8], tail_prefix_len: usize) -> Vec<PostBu
 
     let mut index = 0;
     while index < tail.len() {
-        if tail[index] == b'c' {
+        if matches!(tail[index], b'c' | b'i') {
             record_post_budget_module_name_pair(
                 tail,
                 index + 1,
@@ -2860,6 +2868,8 @@ fn post_budget_global_matches(tail: &[u8], tail_prefix_len: usize) -> Vec<PostBu
                 &mut matches,
             );
         }
+        record_post_budget_stack_global_pattern(tail, index, &mut seen, &mut matches);
+        record_post_budget_extension_ref(tail, index, &mut seen, &mut matches);
         index += 1;
     }
 
@@ -2902,6 +2912,181 @@ fn record_post_budget_module_name_pair(
         pattern_start,
         reduce_proximate,
         severity,
+    });
+}
+
+fn record_post_budget_stack_global_pattern(
+    tail: &[u8],
+    index: usize,
+    seen: &mut HashSet<(usize, String, String)>,
+    matches: &mut Vec<PostBudgetGlobalMatch>,
+) {
+    let Some((module, after_module)) = read_post_budget_text_operand(tail, index) else {
+        return;
+    };
+    let name_start = skip_post_budget_memoize(tail, after_module);
+    let Some((name, after_name)) = read_post_budget_text_operand(tail, name_start) else {
+        return;
+    };
+    let stack_global_position = skip_post_budget_memoize(tail, after_name);
+    if tail.get(stack_global_position) != Some(&0x93) {
+        return;
+    }
+    record_post_budget_global(
+        module,
+        name,
+        index,
+        stack_global_position.saturating_add(1),
+        tail,
+        seen,
+        matches,
+    );
+}
+
+fn read_post_budget_text_operand(tail: &[u8], index: usize) -> Option<(&str, usize)> {
+    let opcode = *tail.get(index)?;
+    let (start, end) = match opcode {
+        b'U' | 0x8c => {
+            let len = *tail.get(index.saturating_add(1))? as usize;
+            let start = index.saturating_add(2);
+            (start, start.checked_add(len)?)
+        }
+        b'T' | b'X' => {
+            let len_start = index.saturating_add(1);
+            let len_end = len_start.checked_add(4)?;
+            let len = usize::try_from(u32::from_le_bytes(
+                tail.get(len_start..len_end)?.try_into().ok()?,
+            ))
+            .ok()?;
+            let start = len_end;
+            (start, start.checked_add(len)?)
+        }
+        0x8d => {
+            let len_start = index.saturating_add(1);
+            let len_end = len_start.checked_add(8)?;
+            let len = usize::try_from(u64::from_le_bytes(
+                tail.get(len_start..len_end)?.try_into().ok()?,
+            ))
+            .ok()?;
+            let start = len_end;
+            (start, start.checked_add(len)?)
+        }
+        b'V' => {
+            let start = index.saturating_add(1);
+            let end = find_byte_from(tail, start, b'\n')?;
+            (start, end)
+        }
+        _ => return None,
+    };
+    let value = std::str::from_utf8(tail.get(start..end)?).ok()?;
+    Some((value, end))
+}
+
+fn skip_post_budget_memoize(tail: &[u8], mut index: usize) -> usize {
+    while tail.get(index) == Some(&0x94) {
+        index = index.saturating_add(1);
+    }
+    index
+}
+
+fn record_post_budget_extension_ref(
+    tail: &[u8],
+    index: usize,
+    seen: &mut HashSet<(usize, String, String)>,
+    matches: &mut Vec<PostBudgetGlobalMatch>,
+) {
+    let Some((extension_code, next)) = read_post_budget_extension_code(tail, index) else {
+        return;
+    };
+    record_post_budget_global_with_severity(
+        PostBudgetGlobalCandidate {
+            module: "copyreg.extension",
+            name: &format!("code_{extension_code}"),
+            pattern_start: index,
+            proximity_start: next,
+            severity: "warning",
+        },
+        tail,
+        seen,
+        matches,
+    );
+}
+
+fn read_post_budget_extension_code(tail: &[u8], index: usize) -> Option<(u64, usize)> {
+    match *tail.get(index)? {
+        0x82 => Some((
+            *tail.get(index.saturating_add(1))? as u64,
+            index.saturating_add(2),
+        )),
+        0x83 => {
+            let start = index.saturating_add(1);
+            let end = start.checked_add(2)?;
+            Some((
+                u16::from_le_bytes(tail.get(start..end)?.try_into().ok()?) as u64,
+                end,
+            ))
+        }
+        0x84 => {
+            let start = index.saturating_add(1);
+            let end = start.checked_add(4)?;
+            Some((
+                u32::from_le_bytes(tail.get(start..end)?.try_into().ok()?) as u64,
+                end,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn record_post_budget_global(
+    module: &str,
+    name: &str,
+    pattern_start: usize,
+    proximity_start: usize,
+    tail: &[u8],
+    seen: &mut HashSet<(usize, String, String)>,
+    matches: &mut Vec<PostBudgetGlobalMatch>,
+) {
+    let Some(severity) = post_budget_global_severity(module, name) else {
+        return;
+    };
+    record_post_budget_global_with_severity(
+        PostBudgetGlobalCandidate {
+            module,
+            name,
+            pattern_start,
+            proximity_start,
+            severity,
+        },
+        tail,
+        seen,
+        matches,
+    );
+}
+
+fn record_post_budget_global_with_severity(
+    candidate: PostBudgetGlobalCandidate<'_>,
+    tail: &[u8],
+    seen: &mut HashSet<(usize, String, String)>,
+    matches: &mut Vec<PostBudgetGlobalMatch>,
+) {
+    if candidate.module.is_empty() || candidate.name.is_empty() {
+        return;
+    }
+    if !seen.insert((
+        candidate.pattern_start,
+        candidate.module.to_string(),
+        candidate.name.to_string(),
+    )) {
+        return;
+    }
+    let reduce_proximate = has_reduce_class_byte_nearby(tail, candidate.proximity_start);
+    matches.push(PostBudgetGlobalMatch {
+        module: candidate.module.to_string(),
+        name: candidate.name.to_string(),
+        pattern_start: candidate.pattern_start,
+        reduce_proximate,
+        severity: candidate.severity,
     });
 }
 
@@ -3940,6 +4125,119 @@ mod tests {
                 "missing post-budget pattern {expected_pattern:?}"
             );
         }
+    }
+
+    #[test]
+    fn post_budget_tail_detects_modern_stack_global_forms() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: 2,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let forms = [
+            (
+                "short-binunicode",
+                b"\x8c\nsubprocess\x94\x8c\x03run\x94\x93)R.".to_vec(),
+            ),
+            ("binunicode", {
+                let mut payload = Vec::new();
+                payload.push(b'X');
+                payload.extend_from_slice(&10u32.to_le_bytes());
+                payload.extend_from_slice(b"subprocess\x94X");
+                payload.extend_from_slice(&3u32.to_le_bytes());
+                payload.extend_from_slice(b"run\x94\x93)R.");
+                payload
+            }),
+            ("binunicode8", {
+                let mut payload = Vec::new();
+                payload.push(0x8d);
+                payload.extend_from_slice(&10u64.to_le_bytes());
+                payload.extend_from_slice(b"subprocess\x94\x8d");
+                payload.extend_from_slice(&3u64.to_le_bytes());
+                payload.extend_from_slice(b"run\x94\x93)R.");
+                payload
+            }),
+        ];
+
+        for (label, tail) in forms {
+            let mut payload = b"\x80\x04\x88\x88".to_vec();
+            payload.extend_from_slice(&tail);
+            let mut scan = ScanState::new(
+                format!("post-budget-{label}.pkl"),
+                &payload,
+                &options,
+                Some(payload.len()),
+                0,
+                0,
+                None,
+            );
+
+            scan.run();
+
+            let finding = scan
+                .findings
+                .iter()
+                .find(|finding| finding.rule_code == Some("POST_BUDGET_GLOBAL"))
+                .unwrap_or_else(|| panic!("missing post-budget STACK_GLOBAL finding for {label}"));
+            assert_eq!(finding.severity, "critical");
+            assert_eq!(
+                detail_string(&finding.details, "pattern").as_deref(),
+                Some("subprocess\nrun")
+            );
+        }
+    }
+
+    #[test]
+    fn post_budget_tail_detects_inst_and_extension_refs() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: 2,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+
+        let inst_payload = b"\x80\x04\x88\x88(isubprocess\nrun\n.".to_vec();
+        let mut inst_scan = ScanState::new(
+            "post-budget-inst.pkl".to_string(),
+            &inst_payload,
+            &options,
+            Some(inst_payload.len()),
+            0,
+            0,
+            None,
+        );
+        inst_scan.run();
+        assert!(inst_scan.findings.iter().any(|finding| {
+            finding.rule_code == Some("POST_BUDGET_GLOBAL")
+                && detail_string(&finding.details, "pattern").as_deref() == Some("subprocess\nrun")
+        }));
+
+        let ext_payload = b"\x80\x04\x88\x88\x82\x07R.".to_vec();
+        let mut ext_scan = ScanState::new(
+            "post-budget-ext.pkl".to_string(),
+            &ext_payload,
+            &options,
+            Some(ext_payload.len()),
+            0,
+            0,
+            None,
+        );
+        ext_scan.run();
+        let finding = ext_scan
+            .findings
+            .iter()
+            .find(|finding| finding.rule_code == Some("POST_BUDGET_GLOBAL"))
+            .expect("post-budget extension finding");
+        assert_eq!(finding.severity, "critical");
+        assert_eq!(
+            detail_string(&finding.details, "pattern").as_deref(),
+            Some("copyreg.extension\ncode_7")
+        );
     }
 
     #[test]
