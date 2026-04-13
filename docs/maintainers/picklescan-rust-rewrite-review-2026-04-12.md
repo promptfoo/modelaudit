@@ -537,7 +537,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] S-R2-5 — Consolidate nested payload finding helpers.
 - [x] S-R2-6 — Share `record_global_ref` detail base.
 - [x] S-R2-8 — Table-drive suspicious string matches.
-- [ ] S-R2-9 — Merge `getattr` parsers.
+- [x] S-R2-9 — Merge `getattr` parsers.
 - [ ] S-R2-10 — Replace warning-global slice sentinel with an explicit enum.
 - [ ] S-P2-15 / S-P2-17 / S-P2-18 / S-P2-19 — Python readability/drift refactors.
 - [ ] S-D2-29 / S-D2-30 / S-D2-33 / S-D2-34 / S-D2-35 / S-D2-37 / S-D2-38 / S-D2-39 / S-D2-40 — Documentation and CI hygiene follow-ups.
@@ -679,6 +679,15 @@ This section is the active implementation log for follow-up commits after revisi
   - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
   - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml strings::tests` — passed, 7 tests.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 41 tests.
+  - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q -k "string or high_risk"` — passed, 32 tests.
+- S-R2-9 — Same-item commit merges the duplicated `getattr` target and nested-call parsers into one scan that records target flags plus nested evidence, and adds a direct nested-`getattr` Rust assertion. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml strings::tests::suspicious_string_matching_detects_getattr_variants` — passed, 1 test.
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 41 tests.
   - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q -k "string or high_risk"` — passed, 32 tests.

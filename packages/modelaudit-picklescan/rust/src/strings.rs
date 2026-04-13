@@ -64,6 +64,52 @@ const GETATTR_TARGET_PATTERNS: &[(&str, &str)] = &[
 ];
 const GETATTR_PROCESS_TARGETS: &[&str] = &["spawn", "call", "run", "popen"];
 
+#[derive(Default)]
+struct GetattrMatches {
+    system: bool,
+    exec: bool,
+    eval: bool,
+    popen: bool,
+    spawn: bool,
+    call: bool,
+    run: bool,
+    nested: bool,
+}
+
+impl GetattrMatches {
+    fn record_target(&mut self, target: &str) {
+        match target {
+            "system" => self.system = true,
+            "exec" => self.exec = true,
+            "eval" => self.eval = true,
+            "popen" => self.popen = true,
+            "spawn" => self.spawn = true,
+            "call" => self.call = true,
+            "run" => self.run = true,
+            _ => {}
+        }
+    }
+
+    fn contains_target(&self, target: &str) -> bool {
+        match target {
+            "system" => self.system,
+            "exec" => self.exec,
+            "eval" => self.eval,
+            "popen" => self.popen,
+            "spawn" => self.spawn,
+            "call" => self.call,
+            "run" => self.run,
+            _ => false,
+        }
+    }
+
+    fn contains_process_target(&self) -> bool {
+        GETATTR_PROCESS_TARGETS
+            .iter()
+            .any(|target| self.contains_target(target))
+    }
+}
+
 pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
     let has_plain_seed = has_suspicious_ascii_seed(value.as_bytes());
     let has_encoded_seed = has_base64_dangerous_seed(value);
@@ -131,18 +177,16 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
         matches.push("hex escape".to_string());
     }
     if lower.contains("getattr") {
+        let getattr_matches = find_getattr_matches(value);
         for (target, label) in GETATTR_TARGET_PATTERNS {
-            if contains_getattr_target(value, target) {
+            if getattr_matches.contains_target(target) {
                 matches.push((*label).to_string());
             }
         }
-        if GETATTR_PROCESS_TARGETS
-            .iter()
-            .any(|target| contains_getattr_target(value, target))
-        {
+        if getattr_matches.contains_process_target() {
             matches.push("getattr process call".to_string());
         }
-        if contains_nested_getattr(value) {
+        if getattr_matches.nested {
             matches.push("nested getattr".to_string());
         }
     }
@@ -561,75 +605,73 @@ fn contains_magic_method(value: &str) -> bool {
     false
 }
 
-fn contains_getattr_target(value: &str, target: &str) -> bool {
+fn find_getattr_matches(value: &str) -> GetattrMatches {
     let chars: Vec<char> = value.chars().collect();
     let lower_chars: Vec<char> = value.to_ascii_lowercase().chars().collect();
+    let mut matches = GetattrMatches::default();
     let mut index = 0usize;
     while let Some(start) = find_ascii_word(&lower_chars, "getattr", index) {
-        let mut cursor = start + "getattr".len();
-        skip_whitespace(&chars, &mut cursor);
-        if !consume_char(&chars, &mut cursor, '(') {
-            index = start + 1;
-            continue;
+        if let Some(target) = parse_getattr_target_at(&chars, start) {
+            matches.record_target(&target);
         }
-        skip_whitespace(&chars, &mut cursor);
-        if !consume_python_word(&chars, &mut cursor) {
-            index = start + 1;
-            continue;
-        }
-        skip_whitespace(&chars, &mut cursor);
-        if !consume_char(&chars, &mut cursor, ',') {
-            index = start + 1;
-            continue;
-        }
-        skip_whitespace(&chars, &mut cursor);
-        let Some(quote) = chars
-            .get(cursor)
-            .copied()
-            .filter(|ch| *ch == '\'' || *ch == '"')
-        else {
-            index = start + 1;
-            continue;
-        };
-        cursor += 1;
-        if !consume_case_insensitive_literal(&chars, &mut cursor, target) {
-            index = start + 1;
-            continue;
-        }
-        if !consume_char(&chars, &mut cursor, quote) {
-            index = start + 1;
-            continue;
-        }
-        skip_whitespace(&chars, &mut cursor);
-        if consume_char(&chars, &mut cursor, ')') {
-            return true;
+        if starts_nested_getattr_at(&chars, start) {
+            matches.nested = true;
         }
         index = start + 1;
     }
-    false
+    matches
 }
 
-fn contains_nested_getattr(value: &str) -> bool {
-    let chars: Vec<char> = value.chars().collect();
-    let lower_chars: Vec<char> = value.to_ascii_lowercase().chars().collect();
-    let mut index = 0usize;
-    while let Some(start) = find_ascii_word(&lower_chars, "getattr", index) {
-        let mut cursor = start + "getattr".len();
-        skip_whitespace(&chars, &mut cursor);
-        if !consume_char(&chars, &mut cursor, '(') {
-            index = start + 1;
-            continue;
-        }
-        skip_whitespace(&chars, &mut cursor);
-        if consume_case_insensitive_literal(&chars, &mut cursor, "getattr") {
-            skip_whitespace(&chars, &mut cursor);
-            if consume_char(&chars, &mut cursor, '(') {
-                return true;
-            }
-        }
-        index = start + 1;
+fn parse_getattr_target_at(chars: &[char], start: usize) -> Option<String> {
+    let mut cursor = start + "getattr".len();
+    skip_whitespace(chars, &mut cursor);
+    if !consume_char(chars, &mut cursor, '(') {
+        return None;
     }
-    false
+    skip_whitespace(chars, &mut cursor);
+    if !consume_python_word(chars, &mut cursor) {
+        return None;
+    }
+    skip_whitespace(chars, &mut cursor);
+    if !consume_char(chars, &mut cursor, ',') {
+        return None;
+    }
+    skip_whitespace(chars, &mut cursor);
+    let quote = chars
+        .get(cursor)
+        .copied()
+        .filter(|ch| *ch == '\'' || *ch == '"')?;
+    cursor += 1;
+    let target_start = cursor;
+    while chars.get(cursor).is_some_and(|ch| *ch != quote) {
+        cursor += 1;
+    }
+    let target = chars[target_start..cursor]
+        .iter()
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if !consume_char(chars, &mut cursor, quote) {
+        return None;
+    }
+    skip_whitespace(chars, &mut cursor);
+    if !consume_char(chars, &mut cursor, ')') {
+        return None;
+    }
+    Some(target)
+}
+
+fn starts_nested_getattr_at(chars: &[char], start: usize) -> bool {
+    let mut cursor = start + "getattr".len();
+    skip_whitespace(chars, &mut cursor);
+    if !consume_char(chars, &mut cursor, '(') {
+        return false;
+    }
+    skip_whitespace(chars, &mut cursor);
+    if !consume_case_insensitive_literal(chars, &mut cursor, "getattr") {
+        return false;
+    }
+    skip_whitespace(chars, &mut cursor);
+    consume_char(chars, &mut cursor, '(')
 }
 
 fn find_ascii_word(chars: &[char], word: &str, start: usize) -> Option<usize> {
@@ -745,6 +787,11 @@ mod tests {
 
         assert!(matches.contains(&"getattr popen".to_string()));
         assert!(matches.contains(&"getattr process call".to_string()));
+
+        let nested_matches =
+            suspicious_string_matches(r#"getattr(getattr(obj, "runner"), "system")"#);
+
+        assert!(nested_matches.contains(&"nested getattr".to_string()));
     }
 
     #[test]
