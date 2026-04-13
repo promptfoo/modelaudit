@@ -250,7 +250,7 @@ class TestNemoArchiveVulnerabilityCoverage:
                 raise RuntimeError("nested boom")
 
         monkeypatch.setattr(
-            "modelaudit.scanners.get_scanner_for_file",
+            "modelaudit.scanners.nemo_scanner._get_nested_scanner_for_file",
             lambda _path, config=None: RaisingScanner(),
         )
 
@@ -278,7 +278,7 @@ class TestNemoArchiveVulnerabilityCoverage:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(
-            "modelaudit.scanners.get_scanner_for_file",
+            "modelaudit.scanners.nemo_scanner._get_nested_scanner_for_file",
             lambda _path, config=None: None,
         )
 
