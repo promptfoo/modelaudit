@@ -205,6 +205,18 @@ def test_scan_stream_preserves_legacy_raw_eval_exec_importlib_detection() -> Non
     assert any(issue.rule_code == "S104" for issue in result.issues)
 
 
+@pytest.mark.parametrize("separator", ["\x00", "\\\n", ";", "/* comment */"])
+def test_scan_stream_detects_legacy_raw_eval_with_obscured_separator(separator: str) -> None:
+    payload = pickle.dumps({"script": f"eval{separator}(1)"}, protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="raw-eval-separator.pkl")
+
+    assert any(
+        issue.rule_code == "S104" and issue.details.get("associated_global") == "builtins.eval"
+        for issue in result.issues
+    )
+
+
 def test_scan_stream_does_not_flag_importlib_comment_as_critical() -> None:
     payload = pickle.dumps(
         {"documentation": "This model does not use importlib# Safe comment", "config": {"safe": True}},

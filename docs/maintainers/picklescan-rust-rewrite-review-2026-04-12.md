@@ -494,7 +494,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] P2-STALE-PYCACHE — Remove stale `_parity_corpus` pycache artifact or ignore it explicitly.
 - [x] P2-NEW-HELPER-DUP — Refactor duplicated text-shape helper loops.
 - [x] N-P1-7 — Make `_pickle_opcode_summary` memo-aware instead of clearing the string stack too aggressively.
-- [ ] N-P1-8 — Widen `_contains_call_token` separator handling.
+- [x] N-P1-8 — Widen `_contains_call_token` separator handling.
 - [ ] N-P1-9 — Add raw-layer pickle GLOBAL newline-form module attribute coverage.
 - [ ] N-P1-10 / N-P1-12 — Scan binary tails past the 8 MB raw window and after malformed/truncated pickle prefixes.
 - [ ] N-P1-13 — Preserve stream integrity hashes for streams larger than the raw scan window.
@@ -667,6 +667,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 57 tests, including a memoized `os.system` `STACK_GLOBAL` regression that emits `S209`.
+- N-P1-8 — Same-item commit replaces the raw `eval`/`exec` call-token regex with a bounded byte scanner that accepts control/null separators, Python line continuations, semicolons, hash comments, and short C-style comments before `(` while still respecting documentation spans and identifier boundaries. Targeted QA:
+  - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 61 tests, including `eval` separated by `\x00`, `\\\n`, `;`, and `/* comment */`.
 
 ### Newly discovered gaps while remediating
 

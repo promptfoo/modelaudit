@@ -28,6 +28,7 @@ _BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{12,}={0,2}(?![
 _MAX_RAW_ENCODED_TOKENS = 64
 _MAX_RAW_ENCODED_BYTES = 1024 * 1024
 _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES = 4096
+_CALL_TOKEN_SEPARATOR_SCAN_LIMIT_BYTES = 4096
 _BASE64_CODE_EXECUTION_SEEDS: tuple[bytes, ...] = (
     b"ZXZhbCg",  # eval(
     b"ZXhlYyg",  # exec(
@@ -360,8 +361,48 @@ def _contains_call_token(
     name: bytes,
     documentation_spans: tuple[tuple[int, int], ...] = (),
 ) -> bool:
-    pattern = rb"(?<![A-Za-z0-9_])" + re.escape(name) + rb"(?:\s|#[^\n]*\n)*\("
-    return _contains_non_documentation_pattern(data, pattern, documentation_spans)
+    start = 0
+    while True:
+        index = data.find(name, start)
+        if index < 0:
+            return False
+        if index > 0 and (data[index - 1 : index].isalnum() or data[index - 1] == ord("_")):
+            start = index + len(name)
+            continue
+        if _is_documentation_match(data, index, documentation_spans):
+            start = index + len(name)
+            continue
+
+        position = index + len(name)
+        separator_end = min(len(data), position + _CALL_TOKEN_SEPARATOR_SCAN_LIMIT_BYTES)
+        while position < separator_end:
+            byte = data[position]
+            if byte == ord("("):
+                return True
+            if byte <= 0x20 or byte == ord(";"):
+                position += 1
+                continue
+            if byte == ord("#"):
+                newline = data.find(b"\n", position + 1, separator_end)
+                if newline < 0:
+                    break
+                position = newline + 1
+                continue
+            if data.startswith(b"\\\r\n", position):
+                position += 3
+                continue
+            if data.startswith(b"\\\n", position) or data.startswith(b"\\\r", position):
+                position += 2
+                continue
+            if data.startswith(b"/*", position):
+                comment_end = data.find(b"*/", position + 2, separator_end)
+                if comment_end < 0:
+                    break
+                position = comment_end + 2
+                continue
+            break
+
+        start = index + len(name)
 
 
 def _contains_module_attr(
