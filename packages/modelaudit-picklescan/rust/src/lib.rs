@@ -1608,6 +1608,15 @@ fn stack_value_text(value: &StackValue) -> Option<&str> {
     }
 }
 
+fn stack_value_string(value: &StackValue) -> Option<String> {
+    match value {
+        StackValue::Text(text) => Some(text.clone()),
+        StackValue::Primitive { repr, .. } => Some(repr.clone()),
+        StackValue::Bytes(bytes) => std::str::from_utf8(bytes).ok().map(str::to_string),
+        _ => None,
+    }
+}
+
 fn pytorch_storage_key(value: &StackValue) -> Option<String> {
     let StackValue::Tuple(items) = value else {
         return None;
@@ -1618,7 +1627,7 @@ fn pytorch_storage_key(value: &StackValue) -> Option<String> {
     if !is_pytorch_storage_descriptor(&items[1]) {
         return None;
     }
-    stack_value_text(&items[2]).map(str::to_string)
+    stack_value_string(&items[2])
 }
 
 fn is_pytorch_storage_descriptor(value: &StackValue) -> bool {
