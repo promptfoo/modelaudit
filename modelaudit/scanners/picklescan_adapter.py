@@ -555,7 +555,7 @@ def _legacy_rule_code_for_finding(finding: Finding) -> str | None:
                 return mapped
         return "S206"
     if finding.rule_code == "PICKLE_EXPANSION":
-        return "S902"
+        return "S214"
     if finding.rule_code == "STRUCTURAL_TAMPER":
         return "S902"
     return finding.rule_code

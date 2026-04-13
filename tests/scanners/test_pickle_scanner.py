@@ -516,6 +516,7 @@ def test_pickle_expansion_heuristics_detect_iterative_memo_growth(tmp_path: Path
     assert len(expansion_checks) == 1, f"Expected one failed expansion heuristic check, got: {result.checks}"
     check = expansion_checks[0]
     assert check.severity == IssueSeverity.WARNING
+    assert check.rule_code == "S214"
     assert any("memo_growth_chain" in finding["triggers"] for finding in check.details["findings"]), check.details
 
 
@@ -581,6 +582,7 @@ def test_post_budget_expansion_scan_detects_follow_on_stream(tmp_path: Path) -> 
         if check.name == "Post-Budget Pickle Expansion Heuristic Check" and check.status.value == "failed"
     ]
     assert len(post_budget_checks) == 1, f"Expected one failed post-budget expansion check, got: {result.checks}"
+    assert post_budget_checks[0].rule_code == "S214"
     assert any("memo_growth_chain" in finding["triggers"] for finding in post_budget_checks[0].details["findings"]), (
         post_budget_checks[0].details
     )

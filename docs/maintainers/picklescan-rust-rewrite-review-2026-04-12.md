@@ -1088,7 +1088,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] V5-P1-28 — Close N5-P1-SARIF-DUPLICATE-FINDINGS by filtering supporting-rule-code rows from SARIF primary results.
 - [x] V5-P1-29 — Close N5-P1-SARIF-NO-PICKLESCAN-RULE-COVERAGE with SARIF regression coverage for new picklescan rule codes.
 - [x] V5-P1-30 — Close N5-P1-DEAD-ADAPTER-NESTED-DOWNGRADE by deleting the obsolete adapter downgrade path.
-- [ ] V5-P1-31 — Close N5-P1-RULE-CODE-CONFLATION-S902 by assigning PICKLE_EXPANSION a distinct DoS-oriented rule code.
+- [x] V5-P1-31 — Close N5-P1-RULE-CODE-CONFLATION-S902 by assigning PICKLE_EXPANSION a distinct DoS-oriented rule code.
 - [ ] V5-P1-32 — Close N5-P1-DOCKER-SINGLE-STAGE by moving Docker builds to a builder/runtime split.
 - [ ] V5-P2-33 — Close N5-P2-PACKAGE-CHANGELOG-THIN with a fuller standalone package changelog.
 - [ ] V5-P2-34 — Close N5-P2-CHANGELOG-RULE-CODES by documenting new rule codes in the root changelog.
@@ -1258,6 +1258,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py` — passed.
   - `uv run mypy modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_picklescan_adapter.py -q -k "nested_payload"` — passed, 2 tests.
+- V5-P1-31 — Same-item commit adds catalog rule `S214` for pickle expansion denial-of-service, maps Rust `PICKLE_EXPANSION` findings to `S214` instead of generic `S902`, and pins scanner/adapter coverage for normal and post-budget expansion findings. Targeted QA:
+  - `uv run ruff format modelaudit/rule_catalog.py modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/rule_catalog.py modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/rule_catalog.py modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_picklescan_adapter.py tests/scanners/test_pickle_scanner.py tests/scanners/test_rule_code_registry_consistency.py -q -k "PICKLE_EXPANSION or expansion_heuristics or rule_codes_are_registered"` — passed, 6 tests.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

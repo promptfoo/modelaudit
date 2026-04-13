@@ -349,6 +349,7 @@ def test_pickle_report_to_scan_result_falls_back_for_unmapped_persistent_id_opco
         ("SUSPICIOUS_STRING", {"pattern": "ordinary string literal"}, None),
         ("POST_BUDGET_GLOBAL", {"pattern": "posix\nsystem"}, "S101"),
         ("POST_BUDGET_GLOBAL", {"pattern": "custom\nloader"}, "S206"),
+        ("PICKLE_EXPANSION", {}, "S214"),
         ("UNKNOWN_PICKLE_RULE", {}, "UNKNOWN_PICKLE_RULE"),
     ],
 )

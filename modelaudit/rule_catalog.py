@@ -184,6 +184,13 @@ RULE_CATALOG: tuple[RuleCatalogEntry, ...] = (
         patterns=(r"nested.*pickle", r"encoded.*pickle", r"pickle.*payload"),
     ),
     RuleCatalogEntry(
+        code="S214",
+        name="Pickle expansion denial-of-service",
+        severity="HIGH",
+        description="Pickle graph expansion pattern can consume excessive memory or CPU",
+        patterns=(r"pickle.*expansion", r"memo.*growth", r"excessive.*dup"),
+    ),
+    RuleCatalogEntry(
         code="S301",
         name="socket module usage",
         severity="HIGH",
