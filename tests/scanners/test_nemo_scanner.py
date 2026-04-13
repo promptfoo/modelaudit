@@ -184,7 +184,7 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23360"]
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23250"]
 
-    def test_malicious_checkpoint_detects_ne_mo_deserialization_cve(self, tmp_path: Path) -> None:
+    def test_malicious_checkpoint_detects_nemo_deserialization_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-rce.nemo"
         with tarfile.open(nemo_path, "w") as tar:
             _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
@@ -201,7 +201,7 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert "CVE-2026-24157" in details["related_cves"]
         assert details["nested_scanner"] == "pickle"
 
-    def test_symlink_checkpoint_alias_detects_ne_mo_deserialization_cve(self, tmp_path: Path) -> None:
+    def test_symlink_checkpoint_alias_detects_nemo_deserialization_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-symlink-alias.nemo"
         with tarfile.open(nemo_path, "w") as tar:
             _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
@@ -307,7 +307,7 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert len(unsupported_checks) == 1
         assert unsupported_checks[0].details["entry"] == "model_weights.ckpt"
 
-    def test_benign_checkpoint_pickle_no_ne_mo_deserialization_cve(self, tmp_path: Path) -> None:
+    def test_benign_checkpoint_pickle_no_nemo_deserialization_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-safe.nemo"
         with tarfile.open(nemo_path, "w") as tar:
             _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
@@ -317,7 +317,7 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
 
-    def test_metadata_referenced_misnamed_payload_detects_ne_mo_deserialization_cve(self, tmp_path: Path) -> None:
+    def test_metadata_referenced_misnamed_payload_detects_nemo_deserialization_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "referenced-misnamed-payload.nemo"
         config = {
             "model": {"_target_": "nemo.Model"},
