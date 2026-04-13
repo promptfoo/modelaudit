@@ -1039,9 +1039,15 @@ class PickleScanner(BaseScanner):
             return _RootStreamPayloadRead(payload=b"", truncated=False, read_limit=limit)
 
         payload = self._read_stream_bytes(file_obj, read_target)
+        truncated = file_size is not None and file_size > read_target and len(payload) >= read_target
+        if file_size is None and len(payload) >= read_target:
+            try:
+                truncated = bool(file_obj.read(1))
+            except (AttributeError, OSError, ValueError):
+                truncated = False
         return _RootStreamPayloadRead(
             payload=payload,
-            truncated=file_size is not None and file_size > read_target and len(payload) >= read_target,
+            truncated=truncated,
             read_limit=limit,
         )
 

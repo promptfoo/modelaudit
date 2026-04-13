@@ -769,6 +769,22 @@ def test_scan_stream_non_seekable_payload_above_root_cap_returns_truncated_resul
     assert any(check.name == "Pickle Stream Read Limit" for check in result.checks)
 
 
+def test_scan_stream_unknown_size_non_seekable_payload_above_root_cap_reports_truncation() -> None:
+    payload = pickle.dumps({"pad": b"A" * 4096}, protocol=4)
+
+    result = PickleScanner(config={"pickle_root_raw_scan_limit_bytes": 64}).scan_stream(
+        NonSeekableBytesIO(payload),
+        None,
+        source="unknown-large-nonseek.pkl",
+    )
+
+    assert result.metadata["pickle_stream_truncated_for_root_scan"] is True
+    assert result.metadata["pickle_stream_bytes_buffered"] == 64
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.success is False
+    assert any(check.name == "Pickle Stream Read Limit" for check in result.checks)
+
+
 def test_extract_metadata_uses_pickle_opcodes_not_raw_bytes(tmp_path: Path) -> None:
     path = tmp_path / "safe.pkl"
     path.write_bytes(pickle.dumps({"letter": "R", "word": "build"}, protocol=4))
