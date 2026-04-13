@@ -258,6 +258,29 @@ def test_scan_stream_documentation_padding_does_not_suppress_raw_structural_evid
 
 
 @pytest.mark.parametrize(
+    ("payload", "expected_reference"),
+    [
+        (b"cos\npopen\n.", "os.popen"),
+        (b"cos\nspawnv\n.", "os.spawnv"),
+        (b"cposix\npopen\n.", "posix.popen"),
+        (b"csubprocess\nPopen\n.", "subprocess.Popen"),
+        (b"ccommands\ngetoutput\n.", "commands.getoutput"),
+    ],
+)
+def test_scan_stream_detects_protocol0_global_newline_raw_references(
+    payload: bytes,
+    expected_reference: str,
+) -> None:
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="protocol0-global.pkl")
+
+    assert any(
+        issue.details.get("source") == "bounded_raw_pickle_window"
+        and issue.details.get("associated_global") == expected_reference
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize(
     ("payload_tail", "expected_reference"),
     [
         (b"cpip\nmain\n)R.", "pip.main"),

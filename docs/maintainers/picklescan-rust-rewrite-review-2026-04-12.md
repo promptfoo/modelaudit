@@ -495,7 +495,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] P2-NEW-HELPER-DUP — Refactor duplicated text-shape helper loops.
 - [x] N-P1-7 — Make `_pickle_opcode_summary` memo-aware instead of clearing the string stack too aggressively.
 - [x] N-P1-8 — Widen `_contains_call_token` separator handling.
-- [ ] N-P1-9 — Add raw-layer pickle GLOBAL newline-form module attribute coverage.
+- [x] N-P1-9 — Add raw-layer pickle GLOBAL newline-form module attribute coverage.
 - [ ] N-P1-10 / N-P1-12 — Scan binary tails past the 8 MB raw window and after malformed/truncated pickle prefixes.
 - [ ] N-P1-13 — Preserve stream integrity hashes for streams larger than the raw scan window.
 - [ ] N-P1-18 — Pin or adjust primary DANGEROUS_CALL rule-code mapping for builtins.
@@ -672,6 +672,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 61 tests, including `eval` separated by `\x00`, `\\\n`, `;`, and `/* comment */`.
+- N-P1-9 — Same-item commit replaces the three hardcoded protocol-0 `GLOBAL` `system` byte checks with a shared raw protocol-0 GLOBAL reference table covering `system`, `popen`, `os.spawn*`, `commands.*`, and `subprocess.*` newline-form references. Targeted QA:
+  - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 66 tests, including raw-window assertions for `cos\npopen\n`, `cos\nspawnv\n`, `cposix\npopen\n`, `csubprocess\nPopen\n`, and `ccommands\ngetoutput\n`.
 
 ### Newly discovered gaps while remediating
 

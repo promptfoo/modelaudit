@@ -55,6 +55,27 @@ _BINARY_TAIL_SIGNATURES: tuple[tuple[bytes, str, str], ...] = (
     (b"powershell", "PowerShell script", "S506"),
     (b"invoke-expression", "PowerShell script", "S506"),
 )
+_RAW_PICKLE_GLOBAL_REFERENCES: tuple[tuple[bytes, bytes, str], ...] = (
+    (b"os", b"system", "os.system"),
+    (b"posix", b"system", "posix.system"),
+    (b"nt", b"system", "nt.system"),
+    (b"os", b"popen", "os.popen"),
+    (b"posix", b"popen", "posix.popen"),
+    (b"nt", b"popen", "nt.popen"),
+    (b"os", b"spawnl", "os.spawnl"),
+    (b"os", b"spawnle", "os.spawnle"),
+    (b"os", b"spawnlp", "os.spawnlp"),
+    (b"os", b"spawnlpe", "os.spawnlpe"),
+    (b"os", b"spawnv", "os.spawnv"),
+    (b"os", b"spawnve", "os.spawnve"),
+    (b"os", b"spawnvp", "os.spawnvp"),
+    (b"os", b"spawnvpe", "os.spawnvpe"),
+    (b"commands", b"getoutput", "commands.getoutput"),
+    (b"commands", b"getstatusoutput", "commands.getstatusoutput"),
+    (b"subprocess", b"call", "subprocess.call"),
+    (b"subprocess", b"run", "subprocess.run"),
+    (b"subprocess", b"popen", "subprocess.Popen"),
+)
 _SECRET_SCAN_SEEDS: tuple[bytes, ...] = (
     b"://",
     b"-----begin ",
@@ -413,6 +434,15 @@ def _contains_module_attr(
 ) -> bool:
     pattern = rb"(?<![A-Za-z0-9_])" + re.escape(module) + rb"\s*\.\s*" + re.escape(attr) + rb"(?![A-Za-z0-9_])"
     return _contains_non_documentation_pattern(data, pattern, documentation_spans)
+
+
+def _contains_pickle_global_reference(
+    data: bytes,
+    module: bytes,
+    attr: bytes,
+    documentation_spans: tuple[tuple[int, int], ...],
+) -> bool:
+    return _contains_non_documentation_token(data, b"c" + module + b"\n" + attr + b"\n", documentation_spans)
 
 
 def _contains_any_seed(data: bytes, seeds: tuple[bytes, ...]) -> bool:
@@ -1216,13 +1246,9 @@ class PickleScanner(BaseScanner):
             indicators.append((runpy_global, b"runpy", {"associated_global": runpy_global}))
         if _contains_non_documentation_token(lower, b"__import__", documentation_spans):
             indicators.append(("__import__", b"__import__", {"associated_global": "builtins.__import__"}))
-        for module_token, associated_global in (
-            (b"cos\nsystem\n", "os.system"),
-            (b"cposix\nsystem\n", "posix.system"),
-            (b"cnt\nsystem\n", "nt.system"),
-        ):
-            if _contains_non_documentation_token(lower, module_token, documentation_spans):
-                indicators.append((associated_global, module_token, {"associated_global": associated_global}))
+        for module_token, attr_token, associated_global in _RAW_PICKLE_GLOBAL_REFERENCES:
+            if _contains_pickle_global_reference(lower, module_token, attr_token, documentation_spans):
+                indicators.append((associated_global, attr_token, {"associated_global": associated_global}))
         if _contains_module_attr(lower, b"os", b"system", documentation_spans):
             indicators.append(("os.system", b"os.system", {"associated_global": "os.system"}))
         if _contains_module_attr(lower, b"posix", b"system", documentation_spans):
