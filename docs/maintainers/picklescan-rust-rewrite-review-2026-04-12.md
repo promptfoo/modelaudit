@@ -551,7 +551,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] S-D2-37 — Add future annotations to large-corpus QA test.
 - [x] S-D2-38 — Add new tests to `allowed_test_files`.
 - [x] S-D2-39 — Move non-Rust report conversion test out of Rust-gated file.
-- [ ] S-D2-40 — Use canonical PyTorch suffix in package API test.
+- [x] S-D2-40 — Use canonical PyTorch suffix in package API test.
 
 ### Completed item QA log
 
@@ -768,6 +768,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check packages/modelaudit-picklescan/tests/test_report.py packages/modelaudit-picklescan/tests/test_rust_engine.py` — passed.
   - `uv run mypy packages/modelaudit-picklescan/tests/test_report.py packages/modelaudit-picklescan/tests/test_rust_engine.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_report.py -q` — passed, 8 tests.
+- S-D2-40 — Same-item commit records that `test_scan_file_detects_malicious_pytorch_zip_data_pickle` already uses the canonical `model.pt` suffix; separate `.bin` coverage remains only for the fallback member-routing test that intentionally has no `data.pkl`. Targeted QA:
+  - `uv run ruff format --check packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run ruff check packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run mypy packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_file_detects_malicious_pytorch_zip_data_pickle -q` — passed, 1 test.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
