@@ -2709,6 +2709,45 @@ mod tests {
     }
 
     #[test]
+    fn missing_memo_gets_push_opaque_operands() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+
+        for (name, payload) in [
+            ("GET", b"g0\n)R.".as_slice()),
+            ("BINGET", b"h\x00)R.".as_slice()),
+            ("LONG_BINGET", b"j\x00\x00\x00\x00)R.".as_slice()),
+        ] {
+            let mut scan = ScanState::new(
+                format!("missing-memo-{name}.pkl"),
+                payload,
+                &options,
+                Some(payload.len()),
+                0,
+                0,
+                None,
+            );
+
+            scan.run();
+
+            assert_eq!(scan.verdict, "clean", "{name} should be opaque");
+            assert!(scan.import_references.is_empty(), "{name} import refs");
+            assert!(
+                scan.findings
+                    .iter()
+                    .all(|finding| finding.rule_code != Some("MALFORMED_STACK_GLOBAL")),
+                "{name} should not synthesize malformed globals"
+            );
+        }
+    }
+
+    #[test]
     fn protocol5_buffer_opcodes_create_opaque_stack_context() {
         let options = ScanOptions {
             timeout_s: DEFAULT_TIMEOUT_S,
