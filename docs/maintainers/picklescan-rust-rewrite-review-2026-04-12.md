@@ -1062,7 +1062,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] V5-P0-02 — Close N5-EXPLOIT-PERSID-NESTED / N5-R10 by recognizing PERSID/BINPERSID nested execution semantics and preserving recursive detection.
 - [x] V5-P0-03 — Re-run and resolve N5-FAIL-1..14, including current scanner-suite legacy rule-code regressions.
 - [x] V5-P0-04 — Close N5-P0-WHEEL-MANYLINUX by producing manylinux-compatible standalone wheels in release automation.
-- [ ] V5-P0-05 — Close N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS so standalone package versions are bumped by release-please.
+- [x] V5-P0-05 — Close N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS so standalone package versions are bumped by release-please.
 - [ ] V5-P1-06 — Close N5-R1 / N5-SEC-F8 by fixing empty list/dict/set stack operand previews.
 - [ ] V5-P1-07 — Close N5-R2 by emitting truncated nested-pickle notices/findings for proto-0 as well as binary-protocol payloads.
 - [ ] V5-P1-08 — Close N5-R3 / N5-SEC-F7 by enforcing left word boundaries for suspicious call and module-attribute string matching.
@@ -1121,6 +1121,8 @@ This section is the active implementation log for follow-up commits after revisi
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py tests/scanners/test_numpy_scanner.py tests/scanners/test_joblib_scanner.py tests/scanners/test_executorch_scanner.py tests/scanners/test_pytorch_zip_scanner.py tests/scanners/test_picklescan_adapter.py -q --maxfail=30` — passed, 355 tests; 1 skipped because `joblib` is not installed in this environment.
 - V5-P0-04 — Same-item commit switches Linux standalone package release builds to `PyO3/maturin-action` with `manylinux_2_28` compatibility while preserving the source distribution from the Linux x86_64 lane and existing wheel smoke checks. Targeted QA:
   - `uv run python - <<'PY' ... yaml.safe_load('.github/workflows/release-please.yml') ... PY` — passed.
+- V5-P0-05 — Same-item commit adds release-please inline version markers to the standalone package `pyproject.toml` and Rust crate `Cargo.toml`, matching the existing generic `extra-files` release-please configuration. Targeted QA:
+  - `uv run python - <<'PY' ... tomllib.loads(...) ... PY` — passed for `packages/modelaudit-picklescan/pyproject.toml` and `packages/modelaudit-picklescan/Cargo.toml`.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

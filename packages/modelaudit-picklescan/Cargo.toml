@@ -1,6 +1,6 @@
 [package]
 name = "modelaudit-picklescan-rust"
-version = "0.1.0"
+version = "0.1.0" # x-release-please-version
 edition = "2021"
 rust-version = "1.74"
 description = "Native pickle security scanner engine for modelaudit-picklescan"
