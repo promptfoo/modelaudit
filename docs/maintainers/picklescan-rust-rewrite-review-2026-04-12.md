@@ -514,7 +514,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] N-P0-34 — Bound recursive follow-on pickle probing for pickle-like binary tails.
 - [x] R-P0-2 — Preserve integer stack values for `INT`/`LONG` variants.
 - [x] R-P1-BUF / R-P1-20 / R-P1-21 — Protocol-5 buffer stack and notice parity follow-up.
-- [ ] R-P1-27 — Include malformed state in global-reference dedupe.
+- [x] R-P1-27 — Include malformed state in global-reference dedupe.
 - [ ] R-P1-28 — Push `Other` for missing memo GET/BINGET/LONG_BINGET.
 - [ ] R-P1-29 — Correct post-budget tail position reporting.
 - [ ] R-P1-30 — Confirm timeout checks are amortized.
@@ -551,6 +551,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 30 tests.
   - Manual default-cap repro with a >8 MiB non-seekable pickle stream — returned `success=False`, `scan_outcome=inconclusive`, reasons `['pickle_analysis_incomplete', 'non_seekable_stream_truncated']`, no `operational_error_reason`, and zero `short_read` issues.
+- R-P1-27 — Same-item commit adds `reference.malformed` to the Rust global-reference dedupe key and records malformed references in the dedupe set without surfacing them as import references. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 26 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

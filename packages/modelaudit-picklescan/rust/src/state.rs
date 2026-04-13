@@ -141,6 +141,8 @@ impl ExpansionHeuristicState {
     }
 }
 
+type GlobalReferenceDedupeKey = (String, String, usize, &'static str, bool);
+
 pub(crate) struct ScanOptions {
     timeout_s: f64,
     max_opcodes: usize,
@@ -240,7 +242,7 @@ pub(crate) struct ScanState<'a> {
     verdict: &'static str,
     seen_finding_keys: HashSet<(String, Option<String>, Option<&'static str>)>,
     seen_notice_keys: HashSet<(Option<&'static str>, Option<String>, String)>,
-    seen_global_reference_keys: HashSet<(String, String, usize, &'static str)>,
+    seen_global_reference_keys: HashSet<GlobalReferenceDedupeKey>,
 }
 
 impl<'a> ScanState<'a> {
@@ -1349,29 +1351,35 @@ impl<'a> ScanState<'a> {
     }
 
     fn record_global_ref(&mut self, reference: &GlobalRef, op_name: &'static str) {
-        if reference.malformed {
-            return;
-        }
-
-        self.global_count += 1;
+        let symbol = reference.symbol();
         let severity = global_severity(&reference.module, &reference.name);
         let is_dangerous = severity.is_some();
-        let reference_kind = if is_dangerous {
+        let reference_kind = if reference.malformed {
+            "malformed"
+        } else if is_dangerous {
             "dangerous"
         } else {
             "observed"
         };
         let key = (
-            reference.symbol(),
+            symbol.clone(),
             op_name.to_string(),
             reference.position,
             reference_kind,
+            reference.malformed,
         );
+
+        if reference.malformed {
+            self.seen_global_reference_keys.insert(key);
+            return;
+        }
+
+        self.global_count += 1;
         if self.seen_global_reference_keys.insert(key) {
             self.import_references.push(vec![
                 (
                     "import_reference".to_string(),
-                    DetailValue::String(reference.symbol()),
+                    DetailValue::String(symbol.clone()),
                 ),
                 (
                     "module".to_string(),
@@ -1395,7 +1403,7 @@ impl<'a> ScanState<'a> {
 
         if let Some(global_severity) = severity {
             self.add_finding(Finding {
-                message: format!("Found dangerous global reference: {}", reference.symbol()),
+                message: format!("Found dangerous global reference: {}", symbol),
                 severity: global_severity,
                 location: Some(format!("{} (pos {})", self.source, reference.position)),
                 rule_code: Some("DANGEROUS_GLOBAL"),
@@ -2653,6 +2661,51 @@ mod tests {
                 _ => panic!("integer operand did not produce primitive stack value"),
             }
         }
+    }
+
+    #[test]
+    fn global_reference_dedupe_preserves_malformed_state() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b".";
+        let mut scan = ScanState::new(
+            "global-dedupe.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+        let malformed = GlobalRef {
+            module: "os".to_string(),
+            name: "system".to_string(),
+            position: 7,
+            malformed: true,
+        };
+        let well_formed = GlobalRef {
+            malformed: false,
+            ..malformed.clone()
+        };
+
+        scan.record_global_ref(&malformed, "STACK_GLOBAL");
+        scan.record_global_ref(&well_formed, "STACK_GLOBAL");
+        scan.record_global_ref(&well_formed, "STACK_GLOBAL");
+
+        assert_eq!(scan.seen_global_reference_keys.len(), 2);
+        assert_eq!(scan.import_references.len(), 1);
+        assert_eq!(scan.global_count, 2);
+        assert!(scan.findings.iter().any(|finding| {
+            finding.rule_code == Some("DANGEROUS_GLOBAL")
+                && detail_string(&finding.details, "import_reference").as_deref()
+                    == Some("os.system")
+        }));
     }
 
     #[test]
