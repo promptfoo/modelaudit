@@ -8,6 +8,7 @@ pub(crate) enum ArgValue {
     Text(String),
     TextSpan { start: usize, end: usize },
     Bytes { start: usize, end: usize },
+    Global { module: String, name: String },
 }
 
 impl ArgValue {
@@ -39,6 +40,7 @@ impl ArgValue {
             }
             ArgValue::Int(value) => Cow::Owned(value.to_string()),
             ArgValue::UInt(value) => Cow::Owned(value.to_string()),
+            ArgValue::Global { module, name } => Cow::Owned(format!("{module} {name}")),
             ArgValue::None => Cow::Borrowed(""),
             _ => Cow::Borrowed(""),
         }
@@ -46,6 +48,7 @@ impl ArgValue {
 
     pub(crate) fn global_parts(&self, payload: &[u8]) -> (String, String) {
         match self {
+            ArgValue::Global { module, name } => (module.clone(), name.clone()),
             ArgValue::Text(_) | ArgValue::TextSpan { .. } | ArgValue::Bytes { .. } => {
                 let value = self.text(payload);
                 let mut parts = value.splitn(2, ' ');
@@ -370,7 +373,7 @@ pub(crate) fn parse_opcode(
             let name = read_line_text(payload, &mut cursor, limit)?;
             ParsedOpcode {
                 name: "GLOBAL",
-                arg: ArgValue::Text(format!("{} {}", module, name)),
+                arg: ArgValue::Global { module, name },
                 pos: index,
                 next: cursor,
             }
@@ -383,7 +386,7 @@ pub(crate) fn parse_opcode(
             let name = read_line_text(payload, &mut cursor, limit)?;
             ParsedOpcode {
                 name: "INST",
-                arg: ArgValue::Text(format!("{} {}", module, name)),
+                arg: ArgValue::Global { module, name },
                 pos: index,
                 next: cursor,
             }
@@ -748,6 +751,18 @@ mod tests {
         assert_eq!(
             opcode.arg.global_parts(payload),
             ("os".to_string(), "system".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_global_operands_preserve_spaces() {
+        let payload = b"imodule with space\ncallable name\n.";
+        let opcode = parse_opcode(payload, 0, payload.len()).expect("INST opcode");
+
+        assert_eq!(opcode.name, "INST");
+        assert_eq!(
+            opcode.arg.global_parts(payload),
+            ("module with space".to_string(), "callable name".to_string())
         );
     }
 
