@@ -1273,6 +1273,24 @@ def test_scan_bytes_flags_suspicious_literal_content_across_default_long_literal
     assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 
+def test_scan_bytes_flags_suspicious_literal_content_beyond_default_prefix_suffix_windows() -> None:
+    gap_padding = "A" * (8 * 1024 * 1024 + 4096)
+    hidden_payload = gap_padding + "os.system('id')" + gap_padding
+
+    report = scan_bytes(
+        pickle.dumps({"code": hidden_payload}, protocol=4),
+        source="middle-hidden-large-string.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "SUSPICIOUS_STRING" and finding.details.get("pattern") == "os.system"
+        for finding in report.findings
+    )
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
 def test_scan_bytes_still_checks_bounded_encoded_nested_windows_for_truncated_literals() -> None:
     nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
     padded_encoded_payload = base64.b64encode(nested_payload).decode("ascii") + ("A" * 128)
