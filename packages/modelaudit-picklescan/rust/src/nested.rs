@@ -33,8 +33,10 @@ pub(crate) fn decode_possible_encoded_pickle(
 
     if hex_prefix_has_pickle_prefix(stripped) {
         let encoding = hex_encoding_label(stripped);
-        let hex_candidate =
-            take_bytes_str(stripped, max_escaped_hex_nested_pickle_chars).replace("\\x", "");
+        let hex_candidate = strip_escaped_hex_markers(&take_bytes_str(
+            stripped,
+            max_escaped_hex_nested_pickle_chars,
+        ));
         if hex_candidate.len() >= 16
             && hex_candidate.len() % 2 == 0
             && is_hex_candidate(&hex_candidate)
@@ -79,7 +81,8 @@ pub(crate) fn detect_oversized_encoded_pickle_prefixes(
     if hex_prefix_has_pickle_prefix(stripped) {
         let encoding = hex_encoding_label(stripped);
         let max_hex_probe_chars = (probe_decoded_bytes * 4).max(16);
-        let mut hex_candidate = take_bytes_str(stripped, max_hex_probe_chars).replace("\\x", "");
+        let mut hex_candidate =
+            strip_escaped_hex_markers(&take_bytes_str(stripped, max_hex_probe_chars));
         if hex_candidate.len() % 2 == 1 {
             hex_candidate.pop();
         }
@@ -278,7 +281,7 @@ fn validate_pickle_stack_effect(
 }
 
 fn hex_encoding_label(value: &str) -> &'static str {
-    if value.contains("\\x") {
+    if contains_escaped_hex_marker(value) {
         "escaped_hex"
     } else {
         "hex"
@@ -378,6 +381,16 @@ fn starts_encoded_pickle_at(bytes: &[u8], index: usize) -> bool {
                 || suffix.starts_with(b"\\x49")
                 || suffix.starts_with(b"\\x53")
                 || suffix.starts_with(b"\\x56")
+                || suffix.starts_with(b"\\X80")
+                || suffix.starts_with(b"\\X28")
+                || suffix.starts_with(b"\\X63")
+                || suffix.starts_with(b"\\X64")
+                || suffix.starts_with(b"\\X6c")
+                || suffix.starts_with(b"\\X6C")
+                || suffix.starts_with(b"\\X69")
+                || suffix.starts_with(b"\\X49")
+                || suffix.starts_with(b"\\X53")
+                || suffix.starts_with(b"\\X56")
         }
         _ => false,
     }
@@ -402,7 +415,7 @@ pub(crate) fn encoded_nested_window_char_limit(
     let max_plain_hex_chars = max_nested_pickle_bytes * 2;
     let max_escaped_hex_chars = max_nested_pickle_bytes * 4;
     let probe = encoded_literal_probe(value);
-    if probe.contains("\\x") {
+    if contains_escaped_hex_marker(&probe) {
         return 16.max(max_escaped_hex_chars);
     }
     if chars_are_in_alphabet(probe.as_bytes(), HEX_LITERAL_CHARS) {
@@ -505,7 +518,7 @@ fn hex_prefix_has_pickle_prefix(value: &str) -> bool {
     let mut index = 0usize;
 
     while index < bytes.len() && decoded_len < decoded.len() {
-        if bytes[index] == b'\\' && bytes.get(index + 1) == Some(&b'x') {
+        if bytes[index] == b'\\' && matches!(bytes.get(index + 1), Some(b'x' | b'X')) {
             index += 2;
             continue;
         }
@@ -594,7 +607,15 @@ fn estimate_base64_decoded_size(value: &str) -> usize {
 }
 
 fn estimate_hex_decoded_size(value: &str) -> usize {
-    value.replace("\\x", "").len() / 2
+    strip_escaped_hex_markers(value).len() / 2
+}
+
+fn strip_escaped_hex_markers(value: &str) -> String {
+    value.replace("\\x", "").replace("\\X", "")
+}
+
+fn contains_escaped_hex_marker(value: &str) -> bool {
+    value.contains("\\x") || value.contains("\\X")
 }
 
 fn take_chars(value: &str, count: usize) -> String {
@@ -719,6 +740,7 @@ mod tests {
             r"\x53\x27\x78\x27\x0a\x2e",
             r"\x56\x78\x0a\x2e",
             r"\x63\x6f\x73\x0a\x73\x79\x73\x74\x65\x6d\x0a\x2e",
+            r"\X63\X6f\X73\X0a\X73\X79\X73\X74\X65\X6d\X0a\X2e",
             r"\x64\x2e",
             r"\x6c\x2e",
             r"\x69\x6f\x73\x0a\x73\x79\x73\x74\x65\x6d\x0a\x2e",

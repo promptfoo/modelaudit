@@ -1071,7 +1071,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] V5-P1-11 — Close N5-R15 by preserving INST module/name operands without space-splitting ambiguity.
 - [x] V5-P1-12 — Close N5-R17 by keeping follow-on sibling pickle streams at the current nested depth.
 - [x] V5-P1-13 — Close N5-R18 by capping import-reference metadata and surfacing truncation as a notice.
-- [ ] V5-P1-14 — Close N5-R19 by accepting uppercase escaped-hex pickle prefixes.
+- [x] V5-P1-14 — Close N5-R19 by accepting uppercase escaped-hex pickle prefixes.
 - [ ] V5-P1-15 — Close N5-SEC-F5 by detecting wrapped/multiline encoded nested pickles.
 - [ ] V5-P1-16 — Close N5-SEC-F6 by aligning `_pickle_opcode_summary` implicit MEMOIZE indexing with CPython.
 - [ ] V5-P1-17 — Close N5-SEC-F9 by collapsing persistent-id warning spam into a counted notice.
@@ -1163,6 +1163,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
   - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml import_reference_metadata_is_capped_with_notice -- --nocapture` — passed, 1 test.
+- V5-P1-14 — Same-item commit accepts uppercase `\XNN` escaped-hex markers anywhere the nested-pickle encoded literal logic accepts lowercase `\xNN`: prefix gating, mid-string probe windows, decoded-size estimates, and escaped-marker stripping. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml encoded_probe_windows_keep_protocol0_escaped_hex_pickle_candidates -- --nocapture` — passed, 1 test.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
