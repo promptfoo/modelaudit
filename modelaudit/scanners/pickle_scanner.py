@@ -1479,23 +1479,9 @@ class PickleScanner(BaseScanner):
                         "pattern": label,
                         "source": "bounded_raw_pickle_window",
                         "decoded_size": len(decoded),
+                        "legacy_rule_aliases": ["S104"],
                     },
                     rule_code="S604",
-                )
-                result.add_check(
-                    name="Encoded Code Execution Pattern Detection",
-                    passed=False,
-                    message=f"Legacy encoded dangerous pattern detected: {label}",
-                    severity=IssueSeverity.CRITICAL,
-                    location=source,
-                    details={
-                        "encoding": "base64",
-                        "pattern": label,
-                        "source": "bounded_raw_pickle_window",
-                        "decoded_size": len(decoded),
-                        "legacy_rule_alias": True,
-                    },
-                    rule_code="S104",
                 )
                 return
 

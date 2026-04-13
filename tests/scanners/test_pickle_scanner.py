@@ -191,7 +191,14 @@ def test_scan_stream_detects_base64_encoded_execution_text() -> None:
 
     result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="encoded-raw.pkl")
 
-    assert any(issue.rule_code == "S604" for issue in result.issues)
+    encoded_issues = [
+        issue
+        for issue in result.issues
+        if issue.message.startswith("Encoded pickle content decodes to dangerous code pattern")
+    ]
+    assert [issue.rule_code for issue in encoded_issues] == ["S604"]
+    assert encoded_issues[0].details["legacy_rule_aliases"] == ["S104"]
+    assert not any(issue.message.startswith("Legacy encoded dangerous pattern detected") for issue in result.issues)
 
 
 def test_scan_stream_hashes_seekable_stream_past_raw_scan_window() -> None:
