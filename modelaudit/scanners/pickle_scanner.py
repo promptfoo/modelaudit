@@ -8,6 +8,7 @@ import hashlib
 import io
 import pickletools
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, BinaryIO, ClassVar
 
@@ -140,6 +141,14 @@ _JIT_SCAN_SEEDS: tuple[bytes, ...] = (
     b"torchscript",
     b"urllib.",
 )
+
+
+@dataclass(frozen=True)
+class _RootStreamPayloadRead:
+    payload: bytes
+    truncated: bool
+    read_limit: int
+
 
 # Kept as small compatibility exports for callers/tests that inspect the policy.
 # The scanner itself no longer uses Python opcode analysis; Rust owns detection.
@@ -653,32 +662,38 @@ class PickleScanner(BaseScanner):
             return b""
         return bytes(data)
 
-    def _read_stream_payload_for_root(self, file_obj: BinaryIO, file_size: int | None) -> bytes:
+    def _read_stream_payload_for_root(self, file_obj: BinaryIO, file_size: int | None) -> _RootStreamPayloadRead:
         limit = (
             self.max_file_read_size
             if self.max_file_read_size and self.max_file_read_size > 0
             else self._root_raw_scan_limit()
         )
         if limit <= 0:
-            return b""
-        remaining = file_size if file_size is not None else limit
+            return _RootStreamPayloadRead(payload=b"", truncated=False, read_limit=0)
+
+        read_target = limit if file_size is None else min(file_size, limit)
+        if read_target <= 0:
+            return _RootStreamPayloadRead(payload=b"", truncated=False, read_limit=limit)
+
+        remaining = read_target
         chunks: list[bytes] = []
         bytes_read = 0
-        while remaining is None or remaining > 0:
+        while remaining > 0:
             self.check_interrupted()
             if self._check_timeout(allow_partial=True):
                 break
-            read_size = _RAW_READ_CHUNK_BYTES if remaining is None else min(_RAW_READ_CHUNK_BYTES, remaining)
+            read_size = min(_RAW_READ_CHUNK_BYTES, remaining)
             chunk = file_obj.read(read_size)
             if not chunk:
                 break
             chunks.append(chunk)
             bytes_read += len(chunk)
-            if bytes_read > limit:
-                raise ValueError(f"File read exceeds limit: {bytes_read} bytes (max: {limit})")
-            if remaining is not None:
-                remaining -= len(chunk)
-        return b"".join(chunks)
+            remaining -= len(chunk)
+        return _RootStreamPayloadRead(
+            payload=b"".join(chunks),
+            truncated=file_size is not None and file_size > read_target and bytes_read >= read_target,
+            read_limit=limit,
+        )
 
     @staticmethod
     def _raw_window_from_payload(payload: bytes, configured_limit: int) -> bytes:
@@ -695,6 +710,37 @@ class PickleScanner(BaseScanner):
             message="Stream SHA256 hash calculated",
             location=source,
             details={"sha256": sha256, "bytes_hashed": len(payload)},
+        )
+
+    def _add_stream_truncation_check(
+        self,
+        read_result: _RootStreamPayloadRead,
+        result: ScanResult,
+        source: str,
+        declared_size: int | None,
+    ) -> None:
+        if not read_result.truncated:
+            return
+
+        result.metadata["pickle_stream_truncated_for_root_scan"] = True
+        result.metadata["pickle_stream_root_scan_read_limit"] = read_result.read_limit
+        result.metadata["pickle_stream_bytes_buffered"] = len(read_result.payload)
+        if declared_size is not None:
+            result.metadata["pickle_stream_declared_size"] = declared_size
+        result.add_check(
+            name="Pickle Stream Read Limit",
+            passed=False,
+            message="Non-seekable pickle stream exceeded the bounded root scan read limit",
+            severity=IssueSeverity.WARNING,
+            location=source,
+            details={
+                "source": "pickle_stream_buffer",
+                "bytes_buffered": len(read_result.payload),
+                "declared_size": declared_size,
+                "read_limit": read_result.read_limit,
+                "analysis_incomplete": True,
+            },
+            rule_code="S902",
         )
 
     def _run_root_raw_detectors(
@@ -1211,9 +1257,11 @@ class PickleScanner(BaseScanner):
             if standalone_size is not None and len(raw_data) == standalone_size:
                 self._add_stream_integrity_check(raw_data, result, source)
         else:
-            payload = self._read_stream_payload_for_root(file_obj, standalone_size)
+            stream_read = self._read_stream_payload_for_root(file_obj, standalone_size)
+            payload = stream_read.payload
             result = self._scan_standalone_stream(io.BytesIO(payload), standalone_size, source=source)
             self._add_stream_integrity_check(payload, result, source)
+            self._add_stream_truncation_check(stream_read, result, source, standalone_size)
             raw_data = self._raw_window_from_payload(payload, self._root_raw_scan_limit())
         self._run_root_raw_detectors(
             raw_data,

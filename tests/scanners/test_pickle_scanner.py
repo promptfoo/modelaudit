@@ -23,6 +23,11 @@ class MaliciousPayload:
         return (os.system, ("id",))
 
 
+class NonSeekableBytesIO(io.BytesIO):
+    def seekable(self) -> bool:
+        return False
+
+
 def test_pickle_scanner_star_import_exports_scanner_class() -> None:
     namespace: dict[str, object] = {}
 
@@ -227,6 +232,20 @@ def test_scan_stream_accepts_unknown_size_stream() -> None:
 
     assert result.success is True
     assert result.metadata["pickle_primary_engine"] == "rust"
+
+
+def test_scan_stream_non_seekable_payload_above_root_cap_returns_truncated_result() -> None:
+    payload = pickle.dumps({"pad": b"A" * 4096}, protocol=4)
+
+    result = PickleScanner(config={"pickle_root_raw_scan_limit_bytes": 64}).scan_stream(
+        NonSeekableBytesIO(payload),
+        len(payload),
+        source="large-nonseek.pkl",
+    )
+
+    assert result.metadata["pickle_stream_truncated_for_root_scan"] is True
+    assert result.metadata["pickle_stream_bytes_buffered"] == 64
+    assert any(check.name == "Pickle Stream Read Limit" for check in result.checks)
 
 
 def test_extract_metadata_uses_pickle_opcodes_not_raw_bytes(tmp_path: Path) -> None:
