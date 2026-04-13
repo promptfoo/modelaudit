@@ -1060,7 +1060,7 @@ This section is the active implementation log for follow-up commits after revisi
 
 - [x] V5-P0-01 — Close N5-CRITICAL-RCE-BYPASS / N5-SEC-F2 / N5-SEC-F3 by deriving post-budget dangerous-global coverage from policy, promoting REDUCE-proximate matches to CRITICAL, and running the tail scan on timeout exhaustion.
 - [x] V5-P0-02 — Close N5-EXPLOIT-PERSID-NESTED / N5-R10 by recognizing PERSID/BINPERSID nested execution semantics and preserving recursive detection.
-- [ ] V5-P0-03 — Re-run and resolve N5-FAIL-1..14, including current scanner-suite legacy rule-code regressions.
+- [x] V5-P0-03 — Re-run and resolve N5-FAIL-1..14, including current scanner-suite legacy rule-code regressions.
 - [ ] V5-P0-04 — Close N5-P0-WHEEL-MANYLINUX by producing manylinux-compatible standalone wheels in release automation.
 - [ ] V5-P0-05 — Close N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS so standalone package versions are bumped by release-please.
 - [ ] V5-P1-06 — Close N5-R1 / N5-SEC-F8 by fixing empty list/dict/set stack operand previews.
@@ -1110,6 +1110,15 @@ This section is the active implementation log for follow-up commits after revisi
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml execution_opcode_detection_distinguishes_structural_nested_payloads -- --nocapture` — passed, 1 test.
   - `uv run pip install -e packages/modelaudit-picklescan` — passed, rebuilt the editable native extension for Python API QA.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q -k "persid_payload"` — passed, 2 tests.
+- V5-P0-03 — Same-item commit re-ran the reported API/scanner failure set after rebuilding the native extension. The package API failures no longer reproduced except for the STACK_GLOBAL post-budget boundary, which was fixed by making the synthetic STACK_GLOBAL tail prefix parseable by the policy-backed post-budget scanner. Consumer tests were updated to assert the current compatibility contract: primary Rust rule code plus `legacy_rule_aliases` metadata instead of resurrecting duplicate legacy findings. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml post_budget -- --nocapture` — passed, 4 tests.
+  - `uv run pip install -e packages/modelaudit-picklescan` — passed, rebuilt the editable native extension for Python API/scanner QA.
+  - `uv run ruff format packages/modelaudit-picklescan/tests/test_api.py tests/scanners/test_numpy_scanner.py tests/scanners/test_executorch_scanner.py tests/scanners/test_pytorch_zip_scanner.py` — passed.
+  - `uv run ruff check packages/modelaudit-picklescan/tests/test_api.py tests/scanners/test_numpy_scanner.py tests/scanners/test_executorch_scanner.py tests/scanners/test_pytorch_zip_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py tests/scanners/test_numpy_scanner.py tests/scanners/test_joblib_scanner.py tests/scanners/test_executorch_scanner.py tests/scanners/test_pytorch_zip_scanner.py tests/scanners/test_picklescan_adapter.py -q --maxfail=30` — passed, 355 tests; 1 skipped because `joblib` is not installed in this environment.
 - N-P0-1 — Same-item commit adds a bounded `_RootStreamPayloadRead` result for non-seekable root stream buffering, records truncation metadata, and emits an `S902` warning instead of raising when the stream exceeds the root raw-scan cap. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

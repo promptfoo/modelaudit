@@ -2433,6 +2433,7 @@ fn post_budget_opcode_prefix(
             let mut prefix = module.as_bytes().to_vec();
             prefix.push(b'\n');
             prefix.extend_from_slice(name.as_bytes());
+            prefix.push(b'\n');
             return prefix;
         }
     }
