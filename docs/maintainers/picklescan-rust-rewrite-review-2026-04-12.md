@@ -468,6 +468,84 @@ Net effect: weaker fail-closed posture on analysis-incomplete scans.
 
 ---
 
+## Remediation tracker
+
+This section is the active implementation log for follow-up commits after revision 3. Each review item below should be fixed in its own commit with targeted QA recorded here. Historical findings that the table above already marks FIXED are not reopened unless a later item depends on them.
+
+### Active todo
+
+- [ ] N-P0-1 — Fix uncaught `ValueError` for non-seekable streams above the raw-read cap.
+- [ ] N-P0-2 / N-P1-16 — Pass buffered payload size to Rust for non-seekable streams to avoid spurious `short_read`.
+- [ ] N-P0-3 — Scope documentation/comment gating to the relevant literal or evidence window, not the entire raw detector pass.
+- [ ] N-P0-4 — Prevent documentation-like `_rebuild_tensor` literals from suppressing real CVE-2026-24747 GLOBAL evidence.
+- [ ] N-P0-5 — Clamp user-controlled Rust timeout values before `Duration::from_secs_f64`.
+- [ ] N-P0-6 — Add a clean-Rust hot path that skips expensive raw detectors when full Rust analysis completed cleanly.
+- [ ] P1-TRIPLE / N-P1-19 — Reduce or explicitly downgrade triple CRITICAL emissions for builtins eval/exec/compile/import aliases.
+- [ ] P1-PARSE — Decide and document parse-failure suppression semantics, or tighten them.
+- [ ] P1-EMPTY — Map empty pickle input to a non-CRITICAL operational outcome.
+- [ ] P1-BINTAIL-SCOPE / N-P1-11 — Broaden binary-tail scan beyond `.bin`.
+- [ ] P1-SEED-SHAPE / N-P1-14 / N-P1-15 / N-P1-17 / N-P2-23 / N-P2-25 — Tighten and de-duplicate expensive raw-detector seed/shape helpers.
+- [ ] P1-DUNDER-WALKER — Reduce benign user-dunder false positives.
+- [ ] P1-NESTED-DEPTH — Raise nested depth or fail closed when nested analysis depth is exhausted.
+- [ ] T-P1-WHEEL — Add missing macOS x86_64 and Linux aarch64 wheel coverage or document the gap.
+- [ ] T-P2-COMMENT — Restore missing comment-token bypass regression coverage.
+- [ ] T-P2-EXPANSION — Restore expansion/memo-growth regression coverage.
+- [ ] T-P2-STRUCTURAL — Restore structural tamper / duplicate-PROTO regression coverage.
+- [ ] P2-STALE-PYCACHE — Remove stale `_parity_corpus` pycache artifact or ignore it explicitly.
+- [ ] P2-NEW-HELPER-DUP — Refactor duplicated text-shape helper loops.
+- [ ] N-P1-7 — Make `_pickle_opcode_summary` memo-aware instead of clearing the string stack too aggressively.
+- [ ] N-P1-8 — Widen `_contains_call_token` separator handling.
+- [ ] N-P1-9 — Add raw-layer pickle GLOBAL newline-form module attribute coverage.
+- [ ] N-P1-10 / N-P1-12 — Scan binary tails past the 8 MB raw window and after malformed/truncated pickle prefixes.
+- [ ] N-P1-13 — Preserve stream integrity hashes for streams larger than the raw scan window.
+- [ ] N-P1-18 — Pin or adjust primary DANGEROUS_CALL rule-code mapping for builtins.
+- [ ] N-P1-20 — Collapse protocol-5 buffer opcode notices into bounded/count-based notices.
+- [ ] N-P1-21 — Review `READONLY_BUFFER` empty-stack parity behavior.
+- [ ] N-P2-22 — Collapse encoded-text S604/S104 twin emissions.
+- [ ] N-P2-24 — Clean redundant lowercase seed spelling.
+- [ ] N-P2-26 — Replace remaining `_contains_non_comment_token` guards with scoped documentation analysis.
+- [ ] N-P2-27 — Add Rust string seeds for joblib/cloudpickle/copyreg.
+- [ ] N-P2-28 — Add tests for encoded protocol 2-5 prefixes.
+- [ ] N-P2-29 — Complete escaped-hex protocol-0 prefix table.
+- [ ] N-P2-30 — Bound `encoded_nested_literal_probe_windows` linear scan cost.
+- [ ] N-P2-31 — Optimize Rust dangerous-global policy lookup.
+- [ ] N-P2-32 — Clean stale moved parity-corpus pycache.
+- [ ] N-P2-33 — Refactor duplicate stream-read helpers.
+- [ ] R-P0-2 — Preserve integer stack values for `INT`/`LONG` variants.
+- [ ] R-P1-BUF / R-P1-20 / R-P1-21 — Protocol-5 buffer stack and notice parity follow-up.
+- [ ] R-P1-27 — Include malformed state in global-reference dedupe.
+- [ ] R-P1-28 — Push `Other` for missing memo GET/BINGET/LONG_BINGET.
+- [ ] R-P1-29 — Correct post-budget tail position reporting.
+- [ ] R-P1-30 — Confirm timeout checks are amortized.
+- [ ] R-P1-31 — Replace location-string parsing with structured positions where possible.
+- [ ] R-P1-32 — Expand post-budget dangerous needle table.
+- [ ] R-P1-33 — Decide/fuzz STACK_GLOBAL byte operand behavior.
+- [ ] R-P1-34 — Rebuild notice dedupe state if notices are ever coalesced.
+- [ ] R-P1-38 — Document or raise `DEFAULT_MAX_NESTED_DEPTH`.
+- [ ] R-P1-39 — Add more Rust unit coverage for dispatch, policy, report, and bridge behavior.
+- [ ] T-P1-51 / T-P1-52 — Strengthen parity/fuzz tests with expected verdicts.
+- [ ] T-P1-53 / T-P1-66 — Restore multi-stream regression coverage.
+- [ ] T-P1-54 — Replace Rust policy source-text tests with functional tests.
+- [ ] T-P1-55 / T-P1-56 — Strengthen weak negative/overbroad assertions.
+- [ ] T-P1-57 — Document BINBYTES text-scan design decision.
+- [ ] T-P1-63 — Expand high-risk callable module coverage.
+- [ ] T-P1-64 — Add real NEWOBJ_EX end-to-end test coverage.
+- [ ] T-P1-65 — Expand EXT1/EXT2/EXT4 extension-registry tests.
+- [ ] T-P1-67 — Restore dill load and benign dill-string tests.
+- [ ] S-R2-5 / S-R2-6 / S-R2-8 / S-R2-9 / S-R2-10 — Rust readability refactors.
+- [ ] S-P2-15 / S-P2-17 / S-P2-18 / S-P2-19 — Python readability/drift refactors.
+- [ ] S-D2-29 / S-D2-30 / S-D2-33 / S-D2-34 / S-D2-35 / S-D2-37 / S-D2-38 / S-D2-39 / S-D2-40 — Documentation and CI hygiene follow-ups.
+
+### Completed item QA log
+
+- None yet after revision 3. Subsequent commits should add one entry here with the review ID, commit hash, implementation summary, and targeted QA commands/results.
+
+### Newly discovered gaps while remediating
+
+- None yet.
+
+---
+
 ## What's working well
 
 - Core opcode parser bounds safety: zero hot-path `unwrap`/`panic`/`expect`.
