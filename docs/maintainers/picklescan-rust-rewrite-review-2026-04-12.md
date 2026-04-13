@@ -552,6 +552,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] S-D2-38 — Add new tests to `allowed_test_files`.
 - [x] S-D2-39 — Move non-Rust report conversion test out of Rust-gated file.
 - [x] S-D2-40 — Use canonical PyTorch suffix in package API test.
+- [x] A-P1-68 — Close missed P-P1-42a raw eval/exec/__import__ duplicate emissions found during closure audit.
 
 ### Completed item QA log
 
@@ -776,6 +777,12 @@ This section is the active implementation log for follow-up commits after revisi
 - R-P2-40 — Same-item commit records the decision not to add direct embedded-Python cargo tests for `pybridge` in this PR. The PyO3 bridge remains covered through Python package tests after native extension build, while pure Rust parser/state/policy/report behavior remains covered by `cargo test`; direct embedded cargo tests can be reconsidered only with a stable Python-home/path harness. Targeted QA:
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 42 tests.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_native_interface.py packages/modelaudit-picklescan/tests/test_report.py -q` — passed, 10 tests.
+- A-P1-68 — Closure audit showed P-P1-42a was not explicitly tracked and still reproduced: raw `eval`/`exec`/`__import__` literals emitted a generic `S201` critical plus a legacy critical for the same bounded raw-window evidence. Same-item commit keeps the legacy raw rule signal and suppresses the duplicate generic raw `S201` emission for those builtins. Targeted QA:
+  - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py::test_scan_stream_deduplicates_legacy_raw_eval_exec_import_patterns tests/scanners/test_pickle_scanner.py::test_scan_stream_preserves_legacy_raw_eval_exec_importlib_detection tests/scanners/test_pickle_scanner.py::test_scan_stream_detects_legacy_raw_eval_with_obscured_separator -q` — passed, 6 tests.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 76 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
@@ -1007,6 +1014,7 @@ This section is the active implementation log for follow-up commits after revisi
 
 - N-P0-34 — Follow-on stream probing could recurse through pickle-like binary tails; fixed and tracked in the remediation checklist above.
 - R-P2-40 — Resolved decision: direct PyO3 `pybridge` cargo tests require an embedded-Python initialization strategy; a naive `Python::initialize()` unit test failed with `ModuleNotFoundError: No module named 'encodings'` from the cargo test binary. Keep bridge behavior covered through Python package tests unless/until the Rust test harness sets a reliable Python home/path.
+- A-P1-68 — Closure audit found P-P1-42a was not listed in the active tracker and was still reproducible; fixed by keeping one legacy raw builtins issue per `eval`/`exec`/`__import__` evidence item instead of emitting a duplicate generic `S201`.
 
 ---
 

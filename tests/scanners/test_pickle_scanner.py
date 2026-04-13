@@ -241,6 +241,27 @@ def test_scan_stream_preserves_legacy_raw_eval_exec_importlib_detection() -> Non
     assert any(issue.rule_code == "S104" for issue in result.issues)
 
 
+def test_scan_stream_deduplicates_legacy_raw_eval_exec_import_patterns() -> None:
+    payload = pickle.dumps({"script": "eval(1); exec(x); __import__('os')"}, protocol=4)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="raw-code-dedupe.pkl")
+
+    raw_builtin_issues = [
+        issue
+        for issue in result.issues
+        if issue.details.get("source") == "bounded_raw_pickle_window"
+        and issue.details.get("associated_global") in {"builtins.eval", "builtins.exec", "builtins.__import__"}
+    ]
+
+    assert len(raw_builtin_issues) == 3
+    assert {issue.details["associated_global"] for issue in raw_builtin_issues} == {
+        "builtins.eval",
+        "builtins.exec",
+        "builtins.__import__",
+    }
+    assert {issue.rule_code for issue in raw_builtin_issues} == {"S104"}
+
+
 @pytest.mark.parametrize("separator", ["\x00", "\\\n", ";", "/* comment */"])
 def test_scan_stream_detects_legacy_raw_eval_with_obscured_separator(separator: str) -> None:
     payload = pickle.dumps({"script": f"eval{separator}(1)"}, protocol=4)

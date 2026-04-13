@@ -1390,15 +1390,6 @@ class PickleScanner(BaseScanner):
                 _append_raw_indicator(indicators, label, associated_global)
 
         for label, details in indicators:
-            result.add_check(
-                name="Pickle Raw Content Detection",
-                passed=False,
-                message=f"Raw pickle content references dangerous helper: {label}",
-                severity=IssueSeverity.CRITICAL,
-                location=source,
-                details={"pattern": label, "source": "bounded_raw_pickle_window", **details},
-                rule_code="S201",
-            )
             if label in {"eval", "exec"}:
                 result.add_check(
                     name="Pickle Raw Content Detection",
@@ -1409,20 +1400,26 @@ class PickleScanner(BaseScanner):
                     details={"pattern": f"{label}(", "source": "bounded_raw_pickle_window", **details},
                     rule_code="S104",
                 )
-
-        if _contains_non_documentation_token(lower, b"__import__", documentation_spans):
+                continue
+            if label == "__import__":
+                result.add_check(
+                    name="Pickle Raw Content Detection",
+                    passed=False,
+                    message="Legacy dangerous pattern detected: __import__",
+                    severity=IssueSeverity.CRITICAL,
+                    location=source,
+                    details={"pattern": "__import__", "source": "bounded_raw_pickle_window", **details},
+                    rule_code="S104",
+                )
+                continue
             result.add_check(
                 name="Pickle Raw Content Detection",
                 passed=False,
-                message="Legacy dangerous pattern detected: __import__",
+                message=f"Raw pickle content references dangerous helper: {label}",
                 severity=IssueSeverity.CRITICAL,
                 location=source,
-                details={
-                    "pattern": "__import__",
-                    "source": "bounded_raw_pickle_window",
-                    "associated_global": "builtins.__import__",
-                },
-                rule_code="S104",
+                details={"pattern": label, "source": "bounded_raw_pickle_window", **details},
+                rule_code="S201",
             )
 
         for label, details in warning_indicators:
