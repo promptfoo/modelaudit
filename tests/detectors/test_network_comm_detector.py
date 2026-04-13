@@ -8,7 +8,7 @@ from modelaudit.detectors.network_comm import NetworkCommDetector, detect_networ
 
 
 def _is_ci_environment() -> bool:
-    """Return True when running in a CI environment."""
+    """Check CI/GitHub Actions env vars to determine whether tests run in CI."""
     return bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
 
 
