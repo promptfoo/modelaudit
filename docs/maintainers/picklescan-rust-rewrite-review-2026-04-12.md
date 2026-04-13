@@ -549,7 +549,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] S-D2-34 — Run standalone `cargo test` in nightly/perf workflows.
 - [x] S-D2-35 — Install Rust before release-please standalone lock refresh.
 - [x] S-D2-37 — Add future annotations to large-corpus QA test.
-- [ ] S-D2-38 — Add new tests to `allowed_test_files`.
+- [x] S-D2-38 — Add new tests to `allowed_test_files`.
 - [ ] S-D2-39 — Move non-Rust report conversion test out of Rust-gated file.
 - [ ] S-D2-40 — Use canonical PyTorch suffix in package API test.
 
@@ -758,6 +758,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check tests/scripts/test_large_pickle_corpus_qa.py` — passed.
   - `uv run mypy tests/scripts/test_large_pickle_corpus_qa.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scripts/test_large_pickle_corpus_qa.py -q` — passed, 16 tests.
+- S-D2-38 — Same-item commit records that `tests/conftest.py` already allowlists both `test_dill_joblib_enhanced.py` and `test_pickle_context_filtering.py` for reduced Python-version CI lanes. Targeted QA:
+  - `uv run ruff format --check tests/conftest.py tests/test_dill_joblib_enhanced.py tests/test_pickle_context_filtering.py` — passed.
+  - `uv run ruff check tests/conftest.py tests/test_dill_joblib_enhanced.py tests/test_pickle_context_filtering.py` — passed.
+  - `uv run mypy tests/conftest.py tests/test_dill_joblib_enhanced.py tests/test_pickle_context_filtering.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/test_dill_joblib_enhanced.py tests/test_pickle_context_filtering.py -q` — passed, 7 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
