@@ -491,7 +491,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] T-P2-COMMENT — Restore missing comment-token bypass regression coverage.
 - [x] T-P2-EXPANSION — Restore expansion/memo-growth regression coverage.
 - [x] T-P2-STRUCTURAL — Restore structural tamper / duplicate-PROTO regression coverage.
-- [ ] P2-STALE-PYCACHE — Remove stale `_parity_corpus` pycache artifact or ignore it explicitly.
+- [x] P2-STALE-PYCACHE — Remove stale `_parity_corpus` pycache artifact or ignore it explicitly.
 - [ ] P2-NEW-HELPER-DUP — Refactor duplicated text-shape helper loops.
 - [ ] N-P1-7 — Make `_pickle_opcode_summary` memo-aware instead of clearing the string stack too aggressively.
 - [ ] N-P1-8 — Widen `_contains_call_token` separator handling.
@@ -509,7 +509,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [ ] N-P2-29 — Complete escaped-hex protocol-0 prefix table.
 - [ ] N-P2-30 — Bound `encoded_nested_literal_probe_windows` linear scan cost.
 - [ ] N-P2-31 — Optimize Rust dangerous-global policy lookup.
-- [ ] N-P2-32 — Clean stale moved parity-corpus pycache.
+- [x] N-P2-32 — Clean stale moved parity-corpus pycache.
 - [ ] N-P2-33 — Refactor duplicate stream-read helpers.
 - [x] N-P0-34 — Bound recursive follow-on pickle probing for pickle-like binary tails.
 - [ ] R-P0-2 — Preserve integer stack values for `INT`/`LONG` variants.
@@ -654,6 +654,9 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/picklescan_adapter.py tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `uv run mypy modelaudit/scanners/picklescan_adapter.py tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py tests/scanners/test_pickle_scanner.py -q` — passed, 206 tests.
+- P2-STALE-PYCACHE / N-P2-32 — The stale moved `_parity_corpus.cpython-311.pyc` artifact was local ignored state rather than a tracked file; it was removed from `packages/modelaudit-picklescan/src/modelaudit_picklescan/__pycache__`, and `.gitignore` already ignores `__pycache__/`. Targeted QA:
+  - `git ls-files 'packages/modelaudit-picklescan/src/modelaudit_picklescan/__pycache__/*'` — passed, no tracked pycache entries.
+  - `find packages/modelaudit-picklescan/src/modelaudit_picklescan -maxdepth 2 -type f -path '*/__pycache__/*' -name '_parity_corpus*.pyc' -print` — passed, no stale parity-corpus pycache remains.
 
 ### Newly discovered gaps while remediating
 
