@@ -538,7 +538,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] S-R2-6 — Share `record_global_ref` detail base.
 - [x] S-R2-8 — Table-drive suspicious string matches.
 - [x] S-R2-9 — Merge `getattr` parsers.
-- [ ] S-R2-10 — Replace warning-global slice sentinel with an explicit enum.
+- [x] S-R2-10 — Replace warning-global slice sentinel with an explicit enum.
 - [ ] S-P2-15 / S-P2-17 / S-P2-18 / S-P2-19 — Python readability/drift refactors.
 - [ ] S-D2-29 / S-D2-30 / S-D2-33 / S-D2-34 / S-D2-35 / S-D2-37 / S-D2-38 / S-D2-39 / S-D2-40 — Documentation and CI hygiene follow-ups.
 
@@ -691,6 +691,15 @@ This section is the active implementation log for follow-up commits after revisi
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 41 tests.
   - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q -k "string or high_risk"` — passed, 32 tests.
+- S-R2-10 — Same-item commit replaces `warning_globals`' empty-slice wildcard sentinel with explicit `WarningGlobalMatch::AnyName` / `OneOf` variants and pins wildcard-vs-specific behavior in Rust tests. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml policy::tests` — passed, 3 tests.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 42 tests.
+  - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_warns_on_functools_partial_without_marking_benign_partial_malicious -q` — passed, 1 test.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

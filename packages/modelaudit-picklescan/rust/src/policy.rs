@@ -3,10 +3,8 @@ pub(crate) fn global_severity(module: &str, name: &str) -> Option<&'static str> 
         return None;
     }
 
-    if let Some(warning_names) = warning_globals(module) {
-        if warning_names.is_empty() || warning_names.contains(&name) {
-            return Some("warning");
-        }
+    if warning_globals(module).is_some_and(|warning_match| warning_match.matches(name)) {
+        return Some("warning");
     }
 
     if BUILTIN_MODULES.contains(&module) {
@@ -31,6 +29,21 @@ pub(crate) fn global_severity(module: &str, name: &str) -> Option<&'static str> 
     None
 }
 
+#[derive(Clone, Copy)]
+enum WarningGlobalMatch {
+    AnyName,
+    OneOf(&'static [&'static str]),
+}
+
+impl WarningGlobalMatch {
+    fn matches(self, name: &str) -> bool {
+        match self {
+            Self::AnyName => true,
+            Self::OneOf(names) => names.contains(&name),
+        }
+    }
+}
+
 fn dangerous_global_is_listed(module: &str, name: &str) -> bool {
     DANGEROUS_GLOBALS
         .binary_search_by(|&(candidate_module, candidate_name)| {
@@ -42,12 +55,12 @@ fn dangerous_global_is_listed(module: &str, name: &str) -> bool {
         .is_ok()
 }
 
-fn warning_globals(module: &str) -> Option<&'static [&'static str]> {
+fn warning_globals(module: &str) -> Option<WarningGlobalMatch> {
     match module {
-        "functools" => Some(&["partial", "partialmethod"]),
-        "glob" => Some(&[]),
-        "linecache" => Some(&["getline"]),
-        "tempfile" => Some(&["mktemp"]),
+        "functools" => Some(WarningGlobalMatch::OneOf(&["partial", "partialmethod"])),
+        "glob" => Some(WarningGlobalMatch::AnyName),
+        "linecache" => Some(WarningGlobalMatch::OneOf(&["getline"])),
+        "tempfile" => Some(WarningGlobalMatch::OneOf(&["mktemp"])),
         _ => None,
     }
 }
@@ -240,5 +253,13 @@ mod tests {
             Some("critical")
         );
         assert_eq!(global_severity("custom", "load"), None);
+    }
+
+    #[test]
+    fn warning_global_matching_uses_explicit_any_name_policy() {
+        assert_eq!(global_severity("glob", "anything"), Some("warning"));
+        assert_eq!(global_severity("functools", "partial"), Some("warning"));
+        assert_eq!(global_severity("functools", "reduce"), Some("critical"));
+        assert_eq!(global_severity("linecache", "clearcache"), None);
     }
 }
