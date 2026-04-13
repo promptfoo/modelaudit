@@ -517,7 +517,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] R-P1-27 — Include malformed state in global-reference dedupe.
 - [x] R-P1-28 — Push `Other` for missing memo GET/BINGET/LONG_BINGET.
 - [x] R-P1-29 — Correct post-budget tail position reporting.
-- [ ] R-P1-30 — Confirm timeout checks are amortized.
+- [x] R-P1-30 — Confirm timeout checks are amortized.
 - [ ] R-P1-31 — Replace location-string parsing with structured positions where possible.
 - [ ] R-P1-32 — Expand post-budget dangerous needle table.
 - [ ] R-P1-33 — Decide/fuzz STACK_GLOBAL byte operand behavior.
@@ -567,6 +567,12 @@ This section is the active implementation log for follow-up commits after revisi
   - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml post_budget_tail_reports_expanded_needles_at_precise_positions` — passed.
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 27 tests.
+- R-P1-30 — Same-item commit verifies `check_limits` skips the clock read between `TIME_CHECK_INTERVAL_OPCODES` boundaries and still times out on the interval boundary. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml timeout_checks_are_amortized_by_opcode_interval` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 28 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

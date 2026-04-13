@@ -2754,6 +2754,43 @@ mod tests {
     }
 
     #[test]
+    fn timeout_checks_are_amortized_by_opcode_interval() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b".";
+        let mut scan = ScanState::new(
+            "timeout-amortized.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            Instant::now().checked_sub(Duration::from_secs(1)),
+        );
+        let opcode = ParsedOpcode {
+            name: "NONE",
+            arg: ArgValue::None,
+            pos: 0,
+            next: 1,
+        };
+
+        scan.opcode_count = TIME_CHECK_INTERVAL_OPCODES - 1;
+        assert!(matches!(scan.check_limits(&opcode), Ok(())));
+
+        scan.opcode_count = TIME_CHECK_INTERVAL_OPCODES;
+        assert!(matches!(
+            scan.check_limits(&opcode),
+            Err(LimitError::Timeout)
+        ));
+    }
+
+    #[test]
     fn protocol5_buffer_opcodes_create_opaque_stack_context() {
         let options = ScanOptions {
             timeout_s: DEFAULT_TIMEOUT_S,
