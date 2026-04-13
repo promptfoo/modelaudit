@@ -158,6 +158,60 @@ struct ExpansionHeuristicFinding {
     triggers: Vec<&'static str>,
 }
 
+struct NestedPayloadFinding {
+    encoding: &'static str,
+    payload_size: usize,
+    position: usize,
+    analysis_incomplete: bool,
+    nested_has_execution_opcode: bool,
+    rule_code: &'static str,
+    complete_message: &'static str,
+    incomplete_message: &'static str,
+    why: &'static str,
+    include_limit_when_complete: bool,
+}
+
+fn raw_nested_payload_finding(
+    payload_size: usize,
+    position: usize,
+    analysis_incomplete: bool,
+    nested_has_execution_opcode: bool,
+) -> NestedPayloadFinding {
+    NestedPayloadFinding {
+        encoding: "raw",
+        payload_size,
+        position,
+        analysis_incomplete,
+        nested_has_execution_opcode,
+        rule_code: "S213",
+        complete_message: "Nested pickle payload detected",
+        incomplete_message: "Nested pickle payload exceeds deep-scan byte limit",
+        why: "This pickle contains another serialized pickle payload inside a byte field. Nested payloads can hide code execution paths from shallow scanners.",
+        include_limit_when_complete: true,
+    }
+}
+
+fn encoded_nested_payload_finding(
+    encoding: &'static str,
+    payload_size: usize,
+    position: usize,
+    analysis_incomplete: bool,
+    nested_has_execution_opcode: bool,
+) -> NestedPayloadFinding {
+    NestedPayloadFinding {
+        encoding,
+        payload_size,
+        position,
+        analysis_incomplete,
+        nested_has_execution_opcode,
+        rule_code: if encoding == "base64" { "S601" } else { "S602" },
+        complete_message: "Encoded pickle payload detected",
+        incomplete_message: "Encoded pickle payload exceeds deep-scan byte limit",
+        why: "Encoded nested pickle payloads can hide deserialization gadgets inside apparently inert metadata strings.",
+        include_limit_when_complete: false,
+    }
+}
+
 impl ExpansionHeuristicState {
     fn new(stream_id: usize) -> Self {
         Self {
@@ -1128,13 +1182,12 @@ impl<'a> ScanState<'a> {
                 .min(offset.saturating_add(self.options.max_nested_pickle_bytes));
             let candidate = &value[offset..end];
             if looks_like_pickle_payload(candidate, self.options.max_nested_pickle_bytes) {
-                self.add_nested_payload_finding(
-                    "raw",
+                self.add_nested_payload_finding(raw_nested_payload_finding(
                     remaining_len,
                     position + offset,
                     candidate_truncated,
                     has_execution_opcode(candidate),
-                );
+                ));
                 if candidate_truncated {
                     self.record_raw_nested_payload_truncated(remaining_len, position + offset);
                 }
@@ -1145,56 +1198,16 @@ impl<'a> ScanState<'a> {
                 && candidate.first() == Some(&0x80)
                 && has_pickle_prefix(candidate)
             {
-                self.add_nested_payload_finding(
-                    "raw",
+                self.add_nested_payload_finding(raw_nested_payload_finding(
                     remaining_len,
                     position + offset,
                     true,
                     false,
-                );
+                ));
                 self.record_raw_nested_payload_truncated(remaining_len, position + offset);
                 return;
             }
         }
-    }
-
-    fn add_nested_payload_finding(
-        &mut self,
-        encoding: &'static str,
-        payload_size: usize,
-        position: usize,
-        analysis_incomplete: bool,
-        nested_has_execution_opcode: bool,
-    ) {
-        self.add_finding(Finding {
-            message: if analysis_incomplete {
-                "Nested pickle payload exceeds deep-scan byte limit".to_string()
-            } else {
-                "Nested pickle payload detected".to_string()
-            },
-            severity: "critical",
-            location: Some(format!("{} (pos {})", self.source, position)),
-            rule_code: Some("S213"),
-            details: vec![
-                ("encoding".to_string(), DetailValue::String(encoding.to_string())),
-                ("payload_size".to_string(), DetailValue::UInt(payload_size as u64)),
-                (
-                    "max_nested_pickle_bytes".to_string(),
-                    DetailValue::UInt(self.options.max_nested_pickle_bytes as u64),
-                ),
-                (
-                    "analysis_incomplete".to_string(),
-                    DetailValue::Bool(analysis_incomplete),
-                ),
-                (
-                    "nested_has_execution_opcode".to_string(),
-                    DetailValue::Bool(nested_has_execution_opcode),
-                ),
-            ],
-            why: Some(
-                "This pickle contains another serialized pickle payload inside a byte field. Nested payloads can hide code execution paths from shallow scanners.",
-            ),
-        });
     }
 
     fn scan_encoded_nested_pickle_literal(&mut self, value: &str, position: usize) {
@@ -1249,13 +1262,13 @@ impl<'a> ScanState<'a> {
             decode_possible_encoded_pickle(value, self.options.max_nested_pickle_bytes)
         {
             decoded_payload_found = true;
-            self.add_encoded_nested_payload_finding(
+            self.add_nested_payload_finding(encoded_nested_payload_finding(
                 encoding,
                 decoded.len(),
                 position,
                 false,
                 has_execution_opcode(&decoded),
-            );
+            ));
             self.surface_nested_pickle_findings(&decoded, encoding, position);
         }
         if decoded_payload_found {
@@ -1267,7 +1280,13 @@ impl<'a> ScanState<'a> {
             detect_oversized_encoded_pickle_prefixes(value, self.options.max_nested_pickle_bytes)
         {
             oversized_prefix_found = true;
-            self.add_encoded_nested_payload_finding(encoding, payload_size, position, true, false);
+            self.add_nested_payload_finding(encoded_nested_payload_finding(
+                encoding,
+                payload_size,
+                position,
+                true,
+                false,
+            ));
             self.record_encoded_nested_payload_truncated(encoding, payload_size, position);
         }
         oversized_prefix_found
@@ -1300,49 +1319,43 @@ impl<'a> ScanState<'a> {
         });
     }
 
-    fn add_encoded_nested_payload_finding(
-        &mut self,
-        encoding: &'static str,
-        payload_size: usize,
-        position: usize,
-        analysis_incomplete: bool,
-        nested_has_execution_opcode: bool,
-    ) {
+    fn add_nested_payload_finding(&mut self, finding: NestedPayloadFinding) {
         let mut details = vec![
             (
                 "encoding".to_string(),
-                DetailValue::String(encoding.to_string()),
+                DetailValue::String(finding.encoding.to_string()),
             ),
             (
                 "payload_size".to_string(),
-                DetailValue::UInt(payload_size as u64),
+                DetailValue::UInt(finding.payload_size as u64),
             ),
         ];
-        if analysis_incomplete {
+        if finding.analysis_incomplete || finding.include_limit_when_complete {
             details.push((
                 "max_nested_pickle_bytes".to_string(),
                 DetailValue::UInt(self.options.max_nested_pickle_bytes as u64),
             ));
-            details.push(("analysis_incomplete".to_string(), DetailValue::Bool(true)));
+            details.push((
+                "analysis_incomplete".to_string(),
+                DetailValue::Bool(finding.analysis_incomplete),
+            ));
         }
         details.push((
             "nested_has_execution_opcode".to_string(),
-            DetailValue::Bool(nested_has_execution_opcode),
+            DetailValue::Bool(finding.nested_has_execution_opcode),
         ));
 
         self.add_finding(Finding {
-            message: if analysis_incomplete {
-                "Encoded pickle payload exceeds deep-scan byte limit".to_string()
+            message: if finding.analysis_incomplete {
+                finding.incomplete_message.to_string()
             } else {
-                "Encoded pickle payload detected".to_string()
+                finding.complete_message.to_string()
             },
             severity: "critical",
-            location: Some(format!("{} (pos {})", self.source, position)),
-            rule_code: Some(if encoding == "base64" { "S601" } else { "S602" }),
+            location: Some(format!("{} (pos {})", self.source, finding.position)),
+            rule_code: Some(finding.rule_code),
             details,
-            why: Some(
-                "Encoded nested pickle payloads can hide deserialization gadgets inside apparently inert metadata strings.",
-            ),
+            why: Some(finding.why),
         });
     }
 

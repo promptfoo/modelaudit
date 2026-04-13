@@ -534,7 +534,11 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] T-P1-64 — Add real NEWOBJ_EX end-to-end test coverage.
 - [x] T-P1-65 — Expand EXT1/EXT2/EXT4 extension-registry tests.
 - [x] T-P1-67 — Restore dill load and benign dill-string tests.
-- [ ] S-R2-5 / S-R2-6 / S-R2-8 / S-R2-9 / S-R2-10 — Rust readability refactors.
+- [x] S-R2-5 — Consolidate nested payload finding helpers.
+- [ ] S-R2-6 — Share `record_global_ref` detail base.
+- [ ] S-R2-8 — Table-drive suspicious string matches.
+- [ ] S-R2-9 — Merge `getattr` parsers.
+- [ ] S-R2-10 — Replace warning-global slice sentinel with an explicit enum.
 - [ ] S-P2-15 / S-P2-17 / S-P2-18 / S-P2-19 — Python readability/drift refactors.
 - [ ] S-D2-29 / S-D2-30 / S-D2-33 / S-D2-34 / S-D2-35 / S-D2-37 / S-D2-38 / S-D2-39 / S-D2-40 — Documentation and CI hygiene follow-ups.
 
@@ -653,6 +657,14 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `uv run mypy packages/modelaudit-picklescan/tests/test_api.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q -k "dill"` — passed, 7 tests.
+- S-R2-5 — Same-item commit consolidates raw and encoded nested-payload finding construction behind one spec-driven helper while preserving the existing rule codes, messages, metadata shape, and truncation behavior. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 41 tests.
+  - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q -k "nested"` — passed, 30 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
