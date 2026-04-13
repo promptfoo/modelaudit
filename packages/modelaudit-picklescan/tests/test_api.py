@@ -1162,6 +1162,7 @@ def test_scan_bytes_allows_benign_dill_text_literal() -> None:
         (b"csqlite3\nconnect\n(tR.", "sqlite3.connect"),
         (b"cmarshal\nloads\n(tR.", "marshal.loads"),
         (b"ccloudpickle\nload\n(tR.", "cloudpickle.load"),
+        (b"ccloudpickle\nloads\n(tR.", "cloudpickle.loads"),
         (b"cpkgutil\nresolve_name\n(tR.", "pkgutil.resolve_name"),
     ],
 )

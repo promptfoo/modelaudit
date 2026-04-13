@@ -530,7 +530,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] T-P1-54 — Replace Rust policy source-text tests with functional tests.
 - [x] T-P1-55 / T-P1-56 — Strengthen weak negative/overbroad assertions.
 - [x] T-P1-57 — Document BINBYTES text-scan design decision.
-- [ ] T-P1-63 — Expand high-risk callable module coverage.
+- [x] T-P1-63 — Expand high-risk callable module coverage.
 - [ ] T-P1-64 — Add real NEWOBJ_EX end-to-end test coverage.
 - [ ] T-P1-65 — Expand EXT1/EXT2/EXT4 extension-registry tests.
 - [ ] T-P1-67 — Restore dill load and benign dill-string tests.
@@ -634,6 +634,11 @@ This section is the active implementation log for follow-up commits after revisi
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py::test_scan_malicious_pickle_reports_rust_finding tests/scanners/test_pickle_scanner.py::test_scan_stream_does_not_treat_system_name_as_setitem_cve packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_detects_reduce_invoking_os_system -q` — passed, 3 tests.
 - T-P1-57 — Same-item commit clarifies the standalone package changelog entry: BINBYTES/tensor blobs are probed for nested pickle streams, but arbitrary non-pickle text extraction remains a root ModelAudit raw-detector responsibility. The existing test already carries the same design comment. Targeted QA:
   - `uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_does_not_scan_raw_binbytes_payloads_as_text_strings -q` — passed, 1 test.
+- T-P1-63 — Same-item commit verifies expanded high-risk callable coverage includes the review-listed `smtplib`, `httplib`, `sqlite3`, `marshal`, `cloudpickle`, and `pkgutil.resolve_name` cases, plus both `cloudpickle.load` and `cloudpickle.loads`. Targeted QA:
+  - `uv run ruff format --check packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run ruff check packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run mypy packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_flags_expanded_high_risk_callables -q` — passed, 19 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
