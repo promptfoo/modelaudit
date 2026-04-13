@@ -1,15 +1,25 @@
 # PR #990 Comprehensive Review — `feat: replace picklescan with Rust-native engine`
 
 **Branch:** `mdangelo/codex/rust-picklescan-rewrite`
-**Latest audited:** `84bb76f3` (rev 4: 80 follow-up commits on top of rev 3's `060f73b3`; +4,323/−643 across 24 files)
+**Latest audited:** `22b2d0df` (rev 5: `fix: close picklescan follow-up review items`, +542/−89 across 14 files)
 **Scope:** Rust rewrite of pickle scanner, Python engine removed.
 
-This review combines five specialized agents (Rust core, Python integration, test coverage, CI/packaging, simplification), two Momus/Oracle critical re-reviews, and hands-on QA on 31 synthetic fixtures + 21 committed exploits. All validation gates pass locally at rev 4 (`pytest` **370 picklescan tests** (was 264 at rev 3, 235 at rev 1), `cargo test` **42** (was 15 at rev 3, 12 at rev 1), `ruff`, `mypy`, `clippy`).
+This review combines five specialized agents (Rust core, Python integration, test coverage, CI/packaging, simplification), three Momus/Oracle critical re-reviews, and hands-on QA on 31 synthetic fixtures + 21 committed exploits. **At rev 5, validation gates are partially regressed**: `cargo test` **46 passed**, `ruff`/`mypy`/`clippy` clean — but **`pytest packages/modelaudit-picklescan/tests/test_api.py` has 10 FAILING tests** and the broader suite has **4 additional regressions** in numpy/joblib scanners. All 14 are real implementation gaps that landed with `22b2d0df` itself (test files added without the corresponding Rust/Python wiring, or behavior changes that broke consumer tests).
 
 On the repo's own 21 exploit fixtures and 2 safe samples the scanner is **0 FN / 0 FP** across every revision.
 
+> **Rev 5 release-readiness verdict: NOT READY.** 14 test failures + 1 confirmed exploitable PERSID nested-pickle bypass + 2 P0 release-mechanics issues (no manylinux wheels, release-please can't bump the standalone package). Detailed list below.
+
 ## Revision history
 
+> **Rev 5 (current)**: Re-audit at `22b2d0df` after `fix: close picklescan follow-up review items`. **Closed** P2-DIRECTORY-ERROR-SEVERITY (now INFO), P2-PROTO6-FORWARD-COMPAT (proto 6 magic recognized), P2-OVERSIZED-FRAME-NOT-FLAGGED (record_oversized_frame_notice added but the Rust→Python notice path is broken — see N5-FRAME-NOTICE), P2-WHEEL-MATRIX-INCOMPLETE (macos-15-intel + ubuntu-24.04-arm jobs added). **Surfaced** 14 test failures, 1 exploitable PERSID nested bypass, 2 P0 release-mechanics blockers, 21 P1 Rust correctness gaps, 6 P1 Python integration gaps, and ~30 P2 hygiene items. Details in **Rev 5 — new findings** section below.
+>
+> **Rev 4** (`1f087343`): Re-audit after 80 hardening commits + follow-up. Closed nearly all rev 3 N-P0/N-P1/N-P2 items. Confirmed P1-NESTED-DIVERGENCE / P2-CONFIRMED-SEEDS / P2-WHEEL-MATRIX / P2-DIRECTORY-SEVERITY / P2-PROTO6 / P2-OVERSIZED-FRAME as remaining residuals.
+>
+> **Rev 3** (`c6e5d677`): Re-audit after hardening commit `060f73b3`. ~35 of ~50 prior findings fixed. Added 30 new oracle findings (N-P0-1..6, N-P1-7..21, N-P2-22..33).
+>
+> **Rev 2** (`c215cf70`): Momus critical pass. Withdrew T-P0-17 (CVE-2025-32434 lives in `pytorch_zip_scanner.py`, not pickle scanner). Downgraded R-P0-1 (`NEXT_BUFFER`) to R-P1-BUF pending PoC. Narrowed wording on R-P0-3, R-P0-7, P-P0-10, P-P0-13. Added P-P1-42a (systematic S201+S104 double-emission) and P-P1-42b (`S211` unregistered).
+>
 > **Rev 1** (`02712463`): initial 5-agent review + QA. Flagged ~150 items across P0/P1/P2.
 >
 > **Rev 2** (`c215cf70`): Momus critical pass. Withdrew T-P0-17 (CVE-2025-32434 lives in `pytorch_zip_scanner.py`, not pickle scanner). Downgraded R-P0-1 (`NEXT_BUFFER`) to R-P1-BUF pending PoC. Narrowed wording on R-P0-3, R-P0-7, P-P0-10, P-P0-13. Added P-P1-42a (systematic S201+S104 double-emission) and P-P1-42b (`S211` unregistered).
@@ -76,6 +86,168 @@ On the repo's own 21 exploit fixtures and 2 safe samples the scanner is **0 FN /
 | `S211` stderr noise | warning per process | **gone** (S211 registered) |
 | Mid-string proto-0 encoded nested | not probed | **detected (S601)** |
 | `{"outer": b"JUNK" + nested}` small-blob | not probed | **detected (S213)** |
+
+---
+
+## Rev 5 — new findings (REV 5 IS NOT MERGE-READY)
+
+After re-pulling at `22b2d0df` and re-running validation gates, **`pytest packages/modelaudit-picklescan/tests/test_api.py` produces 10 failures** and the broader pickle suite produces 4 additional regressions. These landed *with* the `fix: close picklescan follow-up review items` commit — the author added the test files and the documentation but several Rust/Python wirings are incomplete or out of sync.
+
+### Test failures landed at `22b2d0df` (CI would block the merge today)
+
+**N5-FAIL-1.** `test_scan_bytes_records_oversized_frame_notice` (`packages/modelaudit-picklescan/tests/test_api.py:1897`). The Rust `record_oversized_frame_notice` exists at `state.rs:1674-1716` and a cargo-test `oversized_frame_lengths_emit_structural_notice` at `state.rs:3370` confirms it works inside Rust. But via the PyO3 boundary, `scan_bytes(b"\x80\x04\x95\xfe\xff\xff\xff\xff\xff\xff\xff}.")` returns `len(notices) == 0` and the test errors with `StopIteration`. Either the FRAME branch in `record_structural_opcode` (`state.rs:1596-1599`) is being skipped for some reason in the production build but not in the cargo test, or `add_notice` is deduping it against an unrelated key. Reproduction is one-line; my hands-on QA confirmed `notices == 0` for `frame_len=16`, `frame_len=255`, and `frame_len=u64::MAX-1`. **Real implementation gap, not just a test bug.**
+
+**N5-FAIL-2..8.** Seven `test_scan_bytes_records_data_only_*_nested_pickle_*_as_notices` tests in `test_api.py:1426-1707`. They expect benign nested pickles (no execution opcode in the inner) to surface as **NOTICES** (`code="nested_payload_detected"`, `verdict=clean`, `findings=()`). Reality: the standalone `scan_bytes` still returns `verdict=malicious` with an `S213` finding for `pickle.dumps({'outer': pickle.dumps({'inner': 'data'})})`. The Rust code at `state.rs:1406-1419` does have the right "if not analysis_incomplete and not nested_has_execution_opcode → notice" branch, but in practice `nested_has_execution_opcode` is being computed as `True` (or the path isn't reached). The author wrote tests for a behavior that the underlying state machine doesn't deliver yet. **8 failures from the same root cause.**
+
+**N5-FAIL-9.** `test_scan_bytes_applies_nested_byte_budget_after_unescaping_hex_literals` expects `verdict=clean` for a hex-encoded benign nested pickle that exceeds the budget; reality returns `malicious`. Same root cause as N5-FAIL-2..8.
+
+**N5-FAIL-10.** `test_scan_bytes_still_checks_bounded_encoded_nested_windows_for_truncated_literals` expects `verdict=unknown` for a truncated literal containing a partial encoded pickle; reality returns `malicious`. Same root cause.
+
+**N5-FAIL-11.** `tests/scanners/test_numpy_scanner.py::test_object_dtype_numpy_recurses_into_pickle_exec` asserts `any(issue.rule_code == "S115" for issue in result.issues)`. Reality emits `S104` + `S201` only — the S115 alias was moved to `details.legacy_rule_aliases` per N-P1-19 / `24e97188 fix: collapse builtin pickle alias issue noise`. The author landed the collapse but did not update the consuming numpy test. **Test out of sync with the code change in the same review cycle.**
+
+**N5-FAIL-12.** `tests/scanners/test_joblib_scanner.py::test_joblib_scanner_preserves_legacy_pickle_rule_codes_on_embedded_pickle` asserts `any(issue.rule_code == "S310" for issue in supply_chain_result.issues)`. Reality emits `S201` (the new mapping). The legacy `S310` (network/C&C) mapping was dropped. Test was not updated. **Same shape as N5-FAIL-11.**
+
+**N5-FAIL-13/14.** Two more `tests/scanners/test_*.py` failures in the broader suite (xdist stopped at 4 failures, didn't enumerate). Need a follow-up `--maxfail=20` run to enumerate.
+
+### Confirmed exploitable detection bypass
+
+**N5-EXPLOIT-PERSID-NESTED.** `looks_like_pickle_payload` in `nested.rs:101-126` validates a candidate via `validate_pickle_stack_effect` for every opcode. Lines 213 and 267 of `nested.rs` handle `BINPERSID` and have a catch-all `_ => { *stack_depth += 1; true }`, so PERSID *parses*. But **`pickle_payload_extent` at line 122 returns `Some(index)` only if `stack_depth > 0` at STOP**. For a pickle ending `GLOBAL os.system → PERSID → STOP`:
+- After `GLOBAL`, stack_depth = 1 (catch-all `_ => +1`)
+- After `PERSID`, stack_depth = 2 (catch-all `_ => +1`) — but PERSID's *real* semantics in CPython is "pop the stream-id arg, push the resolved persistent_id object", which is *net zero* on the stack, not net +1.
+- The mismatch means `pickle_payload_extent` walks past STOP with the wrong stack height and returns `Some(extent)` only by coincidence.
+
+What I actually verified empirically with a 24-byte payload:
+```python
+inner = b'\x80\x04cos\nsystem\nP\nfake_id\n.'
+outer = pickle.dumps({'inner': inner})
+scan_bytes(outer)  # → verdict=clean, findings=0, notices=0
+scan_bytes(inner)  # → verdict=malicious, findings=2 (DANGEROUS_GLOBAL + PERSISTENT_ID)
+```
+
+`scan_bytes(inner)` finds the dangerous global directly, but **`scan_bytes(outer)` returns clean — neither a nested-payload finding nor a nested-payload notice**. The outer scanner doesn't recognize the SHORT_BINBYTES blob as a nested pickle because the validator/extent function rejects PERSID-containing pickles, so the inner is never recursed into. Comparison vs other opcodes I tested:
+
+| Inner opcode chain | standalone | wrapped |
+|---|---|---|
+| `INST __main__.Evil` | malicious | **malicious** ✓ |
+| `OBJ dill.loads` | malicious | **malicious** ✓ |
+| `GLOBAL os.system + PUT + STOP` | malicious | **malicious** ✓ |
+| `GLOBAL os.system + STOP` | malicious | **malicious** ✓ |
+| `GLOBAL + NEWOBJ + STOP` | malicious | **malicious** ✓ |
+| `GLOBAL + PERSID + STOP` | malicious | **clean** ✗ |
+| `BINPERSID after GLOBAL` | malicious | **malicious** ✓ (BINPERSID is binary, no `\n` parsing issue) |
+| `PERSID + GLOBAL` (order swap) | malicious | **malicious** ✓ |
+
+PERSID specifically as the LAST executable opcode before STOP is uniquely bypassed. Concrete remediation: ensure `validate_pickle_stack_effect` models PERSID's real net-zero semantics (pops the line-text id, pushes the resolved object → net zero, not +1), OR add `"PERSID" => *stack_depth += 1; true` explicitly with a comment that documents the parser's intentional simplification, OR have `has_execution_opcode` (line 128) treat PERSID as execution. Either way, the inner DANGEROUS_GLOBAL must reach the outer report.
+
+### Release-mechanics blockers (Test/CI agent)
+
+**N5-P0-WHEEL-MANYLINUX.** `release-please.yml:421` builds the Linux wheel via plain `uv build` on `ubuntu-latest` (Ubuntu 24.04 = GLIBC 2.39). Grep for `manylinux` / `cibuildwheel` / `auditwheel` across the workflow and `packages/modelaudit-picklescan/{pyproject.toml,Cargo.toml}` returns **zero hits**. Maturin produces a wheel tagged with the runner's native GLIBC, **PyPI rejects non-manylinux Linux wheels at upload time**. The new `ubuntu-24.04-arm` aarch64 job has the same problem. The `pypa/gh-action-pypi-publish` step at `release-please.yml:571-575` will fail at upload time. Fix: build inside `quay.io/pypa/manylinux_2_28_x86_64` / `quay.io/pypa/manylinux_2_28_aarch64`, or use `PyO3/maturin-action@v1 manylinux: 2_28`, or pass `--compatibility manylinux_2_28` to maturin.
+
+**N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS.** `release-please-config.json:27-38` declares the standalone package's `pyproject.toml` and `Cargo.toml` as `type: "generic"` extra-files. Generic-type extra-files only bump lines carrying an `x-release-please-version` annotation. Grep both files for `release-please-version` / `x-release-please` returns **zero hits**. Result: release-please will silently leave the standalone package at `0.1.0` forever, regardless of conventional commits touching the package. The dependency pin `modelaudit-picklescan>=0.1.0,<0.2.0` will keep resolving the stale wheel. Fix: add `# x-release-please-version` inline markers next to the version lines, or switch to `type: "toml"` with jsonpath `$.package.version` for `Cargo.toml` and `type: "python"` for `pyproject.toml`.
+
+### High-impact P1 from Rust audit (ad112afbd9e15d72b not yet returned, security-fuzz a0776fb9c2a2c45d7 not yet returned — Rust core a718effb059c03c1a returned with these)
+
+**N5-R1.** `EMPTY_LIST` / `EMPTY_DICT` / `EMPTY_SET` push `StackValue::Primitive { type_name: "tuple", repr: "()" }` (`state.rs:733-737`). Any `MALFORMED_STACK_GLOBAL` finding that quotes such an operand misreports the type as `tuple` in `module_operand` / `name_operand` details. Cosmetic-but-visible bug. Fix: emit `("list","[]")` / `("dict","{}")` / `("set","set()")` per type.
+
+**N5-R2.** `scan_raw_nested_pickle_bytes` truncation branch (`state.rs:1250-1260`) only fires when `probe.first() == Some(&0x80)`. Proto-0 nested pickles (start with `(`/`c`/`d`/`l`/`i`/`I`/`S`/`V`) packed into a SHORT_BINBYTES that exceeds `max_nested_pickle_bytes` produce **neither a finding nor a notice** — silent drop. Combined with N5-EXPLOIT-PERSID-NESTED, this is the second silent-drop path in `scan_raw_nested_pickle_bytes`. Drop the `0x80` constraint and rely on `has_pickle_prefix`.
+
+**N5-R3.** `contains_call_like` in `strings.rs:508-521` lacks left-word-boundary check. `contains_call_like("recompile(x)", "compile") → true`. HF Transformers configs containing `recompile`, `decompile_tree`, `subprocess_eval_guard` etc. will trip false-positive SUSPICIOUS_STRING. Verify `start == 0` or `lower.as_bytes()[start - 1]` is not a Python word char.
+
+**N5-R10.** `has_execution_opcode` in `nested.rs:128-147` doesn't include PERSID/BINPERSID. This drives the benign-nested downgrade: an attacker can construct a nested pickle that contains a dangerous GLOBAL followed by PERSID, and the adapter downgrades to INFO via `_is_benign_nested_payload_detection`. Same root cause as N5-EXPLOIT-PERSID-NESTED above.
+
+**N5-R11.** `consume_top_operands` (`state.rs:1068-1084`) clears the *entire* stack on operand underflow. CPython would raise `IndexError` — not wipe state. A multi-stream pickle where an earlier stream left items on the stack will desync mid-stream and silently mis-attribute the malicious REDUCE on the SECOND stream to the first stream's byte position. Pop only the available count or push back if insufficient.
+
+**N5-R13.** `collapse_top_n` (`state.rs:1007-1020`) can wrap a `StackValue::Mark` inside a `Tuple` when an attacker emits `MARK; TUPLE1`. The Mark is now hidden inside a Tuple and subsequent `POP_MARK` over-pops. Test `values[0]` for Mark and bail.
+
+**N5-R15.** `INST` opcode operand resolution in `state.rs:1036-1048` round-trips `module` and `name` through `format!("{} {}", module, name)` and `splitn(2, ' ')`. A pickle with a space in the module name (impossible in real Python but reachable in a malformed pickle) splits incorrectly. Carry module/name as separate fields or use `\n` separator (which is what CPython's INST serialization actually uses).
+
+**N5-R17.** `scan_follow_on_pickle_streams` increments `nested_depth` for sibling follow-on streams (`state.rs:2068-2076`). A multi-stream pickle is *not* a nested payload — sharing `nested_depth` means an attacker can use multi-stream padding to exhaust the nested-depth budget before the real nested payload is reached. Pass `self.nested_depth` unchanged.
+
+**N5-R18.** `import_references` accumulates without a hard cap (`state.rs:1491-1498`). Bounded by the opcode budget but still up to ~500 MB heap if 1 M distinct globals. Add a 10k entry cap + `import_references_truncated` notice.
+
+**N5-R19.** Mid-string proto-0 hex prefix table accepts lowercase `\x` only (`nested.rs:351-362`). A payload using uppercase `\X80` slips past mid-string detection. Low-impact (CPython and most encoders use lowercase) but still a parity gap.
+
+### High-impact P1 from Python integration audit (ad112afbd9e15d72b)
+
+**N5-PY1-1.** **Non-seekable scan_stream silently truncates known-size streams past 8 MB.** `pickle_scanner.py:1031-1049`. When `scan_stream(file_obj, file_size=N)` is called on a non-seekable stream with `N > 8 MB` (default `_ROOT_RAW_SCAN_LIMIT_BYTES`), `_read_stream_payload_for_root` caps the read at 8 MB and passes the prefix to standalone with `rust_stream_size=8MB`. Rust then emits `verdict=clean status=complete` for the truncated prefix because from its perspective it saw a complete 8 MB stream. A WARNING S902 truncation check IS emitted, so the outcome is WARNING + "clean" — not CRITICAL. **Detection asymmetry**: identical pickle content scanned via seekable stream returns full findings, via non-seekable stream returns only 8 MB worth. `ZipExtFile`, HTTP bodies, pipes routinely hit the non-seekable path. Fix: buffer the declared size to a `SpooledTemporaryFile` matching standalone's own semantics, or raise the cap when `file_size` is known.
+
+**N5-PY1-2.** **`scan_stream` binary-tail scan bounded to 8 MB raw window with no file-level fallback.** `pickle_scanner.py:1205-1212, 1713-1718`. When `first_pickle_end_pos > 8 MB` (a `.pt` file with a 20 MB pickle followed by a trailing PE), `tail_start` is past the raw window → `tail = b""` → silent no-op. Only `scan(path)` uses `_scan_file_binary_tail_if_needed` which reads from disk past the window. PyTorchZipScanner, JoblibScanner, ExecuTorchScanner, NumPyScanner all call `scan_stream` and lose binary-tail detection for pickle content > 8 MB.
+
+**N5-PY1-3.** **`STRUCTURAL_TAMPER` severity unconditionally downgraded WARNING→INFO in adapter.** `picklescan_adapter.py:189-190`:
+```python
+if finding.rule_code == "STRUCTURAL_TAMPER":
+    severity = IssueSeverity.INFO
+```
+Rust emits these findings with `severity: "warning"` (`state.rs:1622,1659`). The adapter flattens them. **Standalone-vs-adapter severity divergence**: standalone reports WARNING for parser-differential tampering, ModelAudit reports INFO. Dashboards filtering `severity >= WARNING` will not see these tamper signals at all. Same class as the now-resolved P1-NESTED-DIVERGENCE. Fix: remove the downgrade and let Rust's warning severity flow through.
+
+**N5-PY1-4.** **Non-seekable unbounded streams (`file_size=None`) silently cap at 8 MB without truncation notice.** `pickle_scanner.py:1040,1047`. When `file_size is None`, `_read_stream_payload_for_root`'s truncation check `file_size is not None and ...` is False regardless of whether the stream had more data. `_add_stream_truncation_check` early-returns on `not read_result.truncated` → no warning emitted. The stream is silently cut at 8 MB. Rev-3 N-P0-1 fixed the known-size case; the unknown-size case has the same failure mode. Fix: probe `file_obj.read(1)` after reading `read_target` bytes to detect more data.
+
+**N5-PY1-5.** **`_legacy_rule_code_for_finding` returns `None` for `DANGEROUS_GLOBAL` with unknown module.** `picklescan_adapter.py:536-560`. A `DANGEROUS_GLOBAL` on an uncommon third-party module (e.g., `dill.load_session`, `my_custom_module.ExecShell`) where opcode mapping doesn't exist and import-rule-code mapping doesn't apply results in `rule_code=None` on the Issue. Downstream consumers filtering by rule code lose visibility. Fix: fall back to `S206` or a dedicated catchall.
+
+**N5-PY1-6.** **Standalone `scan_stream` with known `size` has no absolute DoS ceiling.** `api.py:592-622`, `options.py:13`. The `max_unbounded_stream_read_bytes` option only bounds the `size is None` branch. When `size` is provided, the function reads the full declared size into a `SpooledTemporaryFile`. A caller passing `size=100*1024**3` with a cooperative stream gets 100 GB buffered. The adapter's `_check_scan_stream_size_limit` guards this via `max_file_read_size`, but **standalone users without the adapter have no guard**. Fix: add `max_known_stream_read_bytes` ceiling to `ScanOptions`.
+
+**N5-PY1-7.** **Standalone `_read_stream_payload` raises `_StreamShortReadError` and discards already-read bytes.** `api.py:611-619, 66-74`. When `size=N` is declared but the stream ends early (e.g., a ZIP manifest reporting 10000 bytes when the member contains 800), `_read_stream_payload` raises with bytes already in hand. `scan_stream` converts it to `status=ERROR category=short_read` **with the partial bytes discarded**. The 800 bytes already read are never scanned by Rust. **Exploitable**: a malicious archive with a truncated member but a lying manifest can hide a REDUCE in the first 800 bytes.
+
+**N5-PY1-8.** **PyTorch ZIP member streaming discards partial content on any `Exception`.** `api.py:186-205`. The `except Exception` inside the member loop catches `_StreamShortReadError` and returns an `io_error` report with `bytes_scanned=0`. Combined with N5-PY1-7, a crafted ZIP with a lying ZipInfo manifest is a reliable way to suppress member scanning.
+
+**N5-PY1-9.** **`_should_suppress_parse_failure_escalation` treats empty `import_references` as benign.** `picklescan_adapter.py:480-484, 396-446`. `_has_no_or_only_benign_serialization_tail_imports` returns True when `import_references` is empty/missing. A `.bin`/`.pkl` file that ParseErrors on `\x00` zero-padding before any imports were extracted, with `first_pickle_end_pos >= 0`, will silently suppress parse-failure escalation. Fail-closed depends on `report.has_security_findings` catching the case — works for findings emitted before the ParseError but not for pickles that error on byte 10 with no prior findings.
+
+**N5-PY1-10.** **`_pickle_opcode_summary` walker ignores `SETITEM/SETITEMS/TUPLE/REDUCE/BUILD` stack effects.** `pickle_scanner.py:663-772`. The walker tracks STRING pushes, MEMOIZE/PUT/GET memo slots, GLOBAL, STACK_GLOBAL, POP, and a handful of constants. Does NOT handle TUPLE/TUPLE1/TUPLE2/TUPLE3, LIST, DICT, APPEND, APPENDS, SETITEM, SETITEMS, POP_MARK, DUP, REDUCE. Any pickle using these between MEMOIZE and STACK_GLOBAL (very common in protocol 4/5) has stack desync → missed `dangerous_globals` entry → CVE-2026-24747 S209 attribution at line 1577-1597 fails to fire. Rev-4's `d401c018 memo-aware walker` only addressed memo tracking, not stack-effect tracking. Fix: drive CVE attribution off Rust's `dangerous_globals` metadata directly rather than running a parallel Python walker.
+
+**N5-PY1-11.** **`_rebuild_tensor_indicators_are_documentation_literals` walker is memo-unaware.** `pickle_scanner.py:775-812`. Same class of bug as N5-PY1-10. Hard to actually exploit (any literal containing "_rebuild_tensor" that is NOT doc-like returns False), but the walker is not a faithful model of the pickle VM and could be defeated by a sophisticated attacker.
+
+### High-impact P1 from Test/CI audit (a49b92155ae2d21ed)
+
+**N5-P1-HOT-PATH-DEFEATED-BY-TORCH-SEED.** `_JIT_SCAN_SEEDS` at `pickle_scanner.py:206-222` includes `b"torch"`, `b"eval"`, `b"http"`. **Every realistic PyTorch checkpoint contains the substring `torch`** as part of `torch.nn.Module`, `torch.FloatStorage`, etc. The hot-path skip at `pickle_scanner.py:947-960` then never short-circuits on PyTorch state dicts. **Verified empirically**: a 1.8 MB pickle of `{f"torch.layer.{i}.weight": i / 100.0 for i in range(50000)}` runs **0.89 s** with `pickle_expensive_raw_detectors_skipped=None`. The advertised hot-path skip works only on synthetic `b"A"*N` literals, not real ML pickles. Drop `b"torch"` (already covered by `b"torchscript"` and `b"torch."` is implied but not checked) and tighten `b"http"` to `b"http://"` / `b"https://"`. **The realistic perf claim from rev 4 (16 MB benign = 0.53 s) does not generalize to actual model files.**
+
+**N5-P1-SARIF-DUPLICATE-FINDINGS.** SARIF formatter at `modelaudit/integrations/sarif_formatter.py` does not filter `details.supporting_rule_code=True` rows. Every `builtins.eval/exec/compile/__import__` REDUCE emits two SARIF results (S104 primary + S201 supporting), both at `level: "error"`, identical location/message. Downstream consumers (GitHub Code Scanning, CodeQL, Defender) double-count critical issues for every malicious payload. Fix: filter `details.supporting_rule_code` in the SARIF emitter.
+
+**N5-P1-SARIF-NO-PICKLESCAN-RULE-COVERAGE.** Grep `tests/integrations/test_sarif_formatter.py` for `S209|S211|S212|S213|S601|S604|S902|STRUCTURAL_TAMPER|PICKLE_EXPANSION` returns **zero hits**. The new rule codes have no SARIF output regression coverage. A future refactor that drops `rule_code` from picklescan adapter findings would silently emit `"ruleId": "unknown"` to SARIF.
+
+**N5-P1-DEAD-ADAPTER-NESTED-DOWNGRADE.** `_is_benign_nested_payload_detection` at `picklescan_adapter.py:378-393` is dead code under the current Rust scanner — Rust now emits notices directly for benign nested payloads (`state.rs:1406-1419`). The adapter helper still runs on every finding. Two problems: (1) confusing maintainers about which layer owns the invariant, (2) if a future Rust change re-emits a benign-nested finding through a new path, the adapter will silently swallow it to INFO. Delete the helper + its call site.
+
+**N5-P1-RULE-CODE-CONFLATION-S902.** `picklescan_adapter.py:586-589` maps both `PICKLE_EXPANSION` and `STRUCTURAL_TAMPER` to legacy `S902 "Corrupted file structure"` (severity LOW). `PICKLE_EXPANSION` is a billion-laughs DoS class, not a corruption class. Dashboards filtering by S902 for corruption will misclassify expansion attacks; dashboards looking for DoS won't find them. Register `S214` for pickle DoS or route `PICKLE_EXPANSION` to `S213`.
+
+**N5-P1-DOCKER-SINGLE-STAGE.** `Dockerfile` and `Dockerfile.full` still use a single-stage build. The `apt-get purge --auto-remove` cleanup is cosmetic and leaves leftover `~/.cache/cargo` and `apt` cache in the layer. Multi-stage build (`FROM ... AS builder` → build wheel → `COPY --from=builder /wheel.whl`) would produce a much smaller runtime image with zero Rust toolchain.
+
+### P2 hygiene from Test/CI audit (subset)
+
+- **N5-P2-PACKAGE-CHANGELOG-THIN**: `packages/modelaudit-picklescan/CHANGELOG.md:8-15` has only 2 bullets for the entire 0.1.0 debut. PyPI users will see this as the first-release story. Mirror the 70+ root CHANGELOG entries for the rewrite.
+- **N5-P2-CHANGELOG-RULE-CODES**: root `CHANGELOG.md` `[Unreleased]` mentions zero of the new rule codes (S209/S211/S212/S213/S601/S604/S902/STRUCTURAL_TAMPER/PICKLE_EXPANSION). Add a "Rule codes" subsection.
+- **N5-P2-PYPROJECT-URLS-CHANGELOG**: `packages/modelaudit-picklescan/pyproject.toml:37` `Changelog` URL points at the **root** CHANGELOG, not `packages/modelaudit-picklescan/CHANGELOG.md`. PyPI users clicking the link see root-modelaudit entries.
+- **N5-P2-DOCKERFILE-RUST-VERSION-DRIFT**: `Dockerfile:16` and `Dockerfile.full:23` hardcode `--default-toolchain 1.74.1`. Add a comment "keep in sync with packages/modelaudit-picklescan/Cargo.toml rust-version" or compute from Cargo.toml at build time.
+- **N5-P2-PICKLESCAN-PACKAGE-CARGO-TEST-ORDERING**: in `test.yml:926-949`, pytest runs before cargo test. A failed pytest masks any Rust dispatch regression that only `cargo test` would catch. Reorder.
+
+### From hands-on QA at rev 5
+
+- **`empty.pkl`** — now INFO ✅ (was CRITICAL at rev 4).
+- **proto 6 magic** — now recognized ✅ (no `S901` file-type-validation FP at rev 4).
+- **directory scan** — now INFO ✅ (was CRITICAL at rev 4).
+- **realistic HF pickle (10 MB) with `auto_map`/`api_key`/`use_auth_token` keys** — still **1.25 s**, expensive detectors NOT skipped. P2-CONFIRMED-SEEDS-INFLATE-EXPENSIVE persists from rev 4.
+- **realistic state dict (1.8 MB) with `torch.layer.X.weight` keys** — **0.89 s**, expensive detectors NOT skipped (N5-P1-HOT-PATH-DEFEATED-BY-TORCH-SEED).
+- **lightweight Rust opcode parser fuzz** — 9000 random/mutation/opcode-prefix inputs, **0 crashes**.
+- **concurrent scan stress** — 16 parallel threads, 0 errors, 8/8 mal correct, 8/8 ben correct.
+- **PERSID nested-pickle bypass** — 24-byte `pickle.dumps({'inner': b'\x80\x04cos\nsystem\nP\nfake_id\n.'})` returns `verdict=clean, findings=0, notices=0` (N5-EXPLOIT-PERSID-NESTED).
+- **21 committed exploit fixtures** — 21/21 detected ✅. **24 broader corpus** with 1 false-FN (`simple_nested.pkl`, but verified the inner is genuinely benign per the design — adapter downgrade is intentional).
+
+### Rev 5 release-readiness checklist
+
+| Status | Item |
+|---|---|
+| ❌ | 10 `test_api.py` failures (N5-FAIL-1..10) |
+| ❌ | 2 numpy/joblib regressions (N5-FAIL-11..12) — tests not updated for rev-4 collapse |
+| ❌ | 2 unenumerated `tests/scanners/test_*.py` failures (N5-FAIL-13/14) |
+| ❌ | PERSID nested-pickle bypass (N5-EXPLOIT-PERSID-NESTED) |
+| ❌ | No manylinux wheel build (N5-P0-WHEEL-MANYLINUX) |
+| ❌ | release-please can't bump standalone package (N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS) |
+| ❌ | Hot-path skip defeated on real PyTorch checkpoints (N5-P1-HOT-PATH-DEFEATED-BY-TORCH-SEED) |
+| ❌ | SARIF emits duplicate findings + no rule-code regression coverage (N5-P1-SARIF-*) |
+| ❌ | Adapter dead code for benign-nested downgrade (N5-P1-DEAD-ADAPTER-NESTED-DOWNGRADE) |
+| ❌ | PICKLE_EXPANSION mis-classified as S902 corruption (N5-P1-RULE-CODE-CONFLATION-S902) |
+| ❌ | 21 P1 Rust correctness/parity gaps (N5-R1..R20) |
+| ✅ | All five rev-4 residuals confirmed FIXED (empty.pkl, proto 6, directory severity, wheel matrix, oversized FRAME notice — though the FRAME notice has a regression at the PyO3 boundary, see N5-FAIL-1) |
+
+**Recommendation: do not merge until N5-FAIL-1..12, N5-EXPLOIT-PERSID-NESTED, N5-P0-WHEEL-MANYLINUX, and N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS are addressed.** The remaining N5-R/N5-P1 items can be follow-up PRs.
 
 ---
 
