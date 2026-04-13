@@ -732,3 +732,53 @@ fn hex_value(byte: u8) -> Option<u8> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_global_operands_and_positions() {
+        let payload = b"cos\nsystem\n.";
+        let opcode = parse_opcode(payload, 0, payload.len()).expect("GLOBAL opcode");
+
+        assert_eq!(opcode.name, "GLOBAL");
+        assert_eq!(opcode.pos, 0);
+        assert_eq!(opcode.next, 11);
+        assert_eq!(
+            opcode.arg.global_parts(payload),
+            ("os".to_string(), "system".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_variable_bytes_as_payload_spans() {
+        let payload = b"C\x03abc.";
+        let opcode = parse_opcode(payload, 0, payload.len()).expect("SHORT_BINBYTES opcode");
+
+        assert_eq!(opcode.name, "SHORT_BINBYTES");
+        assert_eq!(opcode.arg.byte_span(payload.len()), Some((2, 5)));
+        assert_eq!(opcode.arg.text(payload).as_ref(), "abc");
+    }
+
+    #[test]
+    fn parse_protocol0_string_escapes() {
+        let payload = b"S'\\x6f\\163\\n'\n.";
+        let opcode = parse_opcode(payload, 0, payload.len()).expect("STRING opcode");
+
+        assert_eq!(opcode.name, "STRING");
+        assert_eq!(opcode.arg.text(payload).as_ref(), "os\n");
+    }
+
+    #[test]
+    fn parse_truncated_frame_reports_value_error() {
+        let error = match parse_opcode(b"\x95\x01", 0, 2) {
+            Ok(_) => panic!("truncated FRAME should fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.exception_type, "ValueError");
+        assert!(error.message.contains("not enough data"));
+        assert_eq!(error.report_index, Some(2));
+    }
+}

@@ -201,3 +201,74 @@ fn detail_dict_to_py(py: Python<'_>, details: &[(String, DetailValue)]) -> PyRes
     }
     Ok(dict.unbind())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detail_accessors_extract_typed_values() {
+        let details = vec![
+            (
+                "import_reference".to_string(),
+                DetailValue::String("os.system".to_string()),
+            ),
+            ("position".to_string(), DetailValue::UInt(42)),
+            ("signed_position".to_string(), DetailValue::Int(7)),
+            ("negative".to_string(), DetailValue::Int(-1)),
+        ];
+
+        assert_eq!(
+            detail_string(&details, "import_reference").as_deref(),
+            Some("os.system")
+        );
+        assert_eq!(detail_usize(&details, "position"), Some(42));
+        assert_eq!(detail_usize(&details, "signed_position"), Some(7));
+        assert_eq!(detail_usize(&details, "negative"), None);
+    }
+
+    #[test]
+    fn notice_and_error_detail_values_preserve_contract_fields() {
+        let notice = Notice {
+            message: "partial".to_string(),
+            severity: "info",
+            location: Some("nested.pkl".to_string()),
+            code: Some("parse_incomplete"),
+            details: vec![("analysis_incomplete".to_string(), DetailValue::Bool(true))],
+        };
+        let error = ScanError {
+            message: "bad opcode".to_string(),
+            category: "parse_error",
+            location: None,
+            exception_type: Some("ValueError"),
+            details: vec![("position".to_string(), DetailValue::UInt(3))],
+        };
+
+        match notice_to_detail_value(&notice) {
+            DetailValue::Dict(details) => {
+                assert_eq!(
+                    detail_string(&details, "message").as_deref(),
+                    Some("partial")
+                );
+                assert_eq!(
+                    detail_string(&details, "code").as_deref(),
+                    Some("parse_incomplete")
+                );
+            }
+            _ => panic!("notice detail should be a dict"),
+        }
+        match scan_error_to_detail_value(&error) {
+            DetailValue::Dict(details) => {
+                assert_eq!(
+                    detail_string(&details, "message").as_deref(),
+                    Some("bad opcode")
+                );
+                assert_eq!(
+                    detail_string(&details, "exception_type").as_deref(),
+                    Some("ValueError")
+                );
+            }
+            _ => panic!("error detail should be a dict"),
+        }
+    }
+}

@@ -2972,6 +2972,99 @@ mod tests {
     }
 
     #[test]
+    fn inst_dispatch_flags_dangerous_global_calls() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"(ios\nsystem\n.";
+        let mut scan = ScanState::new(
+            "inst-dispatch.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert!(scan.findings.iter().any(|finding| {
+            finding.rule_code == Some("DANGEROUS_CALL")
+                && detail_string(&finding.details, "opcode").as_deref() == Some("INST")
+                && detail_string(&finding.details, "import_reference").as_deref()
+                    == Some("os.system")
+        }));
+    }
+
+    #[test]
+    fn obj_dispatch_uses_first_mark_value_as_callable() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"(cos\nsystem\nU\x04echoo.";
+        let mut scan = ScanState::new(
+            "obj-dispatch.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert!(scan.findings.iter().any(|finding| {
+            finding.rule_code == Some("DANGEROUS_CALL")
+                && detail_string(&finding.details, "opcode").as_deref() == Some("OBJ")
+                && detail_string(&finding.details, "import_reference").as_deref()
+                    == Some("os.system")
+        }));
+    }
+
+    #[test]
+    fn newobj_ex_dispatch_consumes_callable_args_and_kwargs() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x04cos\nsystem\n)}\x92.";
+        let mut scan = ScanState::new(
+            "newobj-ex-dispatch.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert!(scan.findings.iter().any(|finding| {
+            finding.rule_code == Some("DANGEROUS_CALL")
+                && detail_string(&finding.details, "opcode").as_deref() == Some("NEWOBJ_EX")
+                && detail_string(&finding.details, "import_reference").as_deref()
+                    == Some("os.system")
+        }));
+    }
+
+    #[test]
     fn protocol5_buffer_opcodes_create_opaque_stack_context() {
         let options = ScanOptions {
             timeout_s: DEFAULT_TIMEOUT_S,

@@ -523,7 +523,8 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] R-P1-33 — Decide/fuzz STACK_GLOBAL byte operand behavior.
 - [x] R-P1-34 — Rebuild notice dedupe state if notices are ever coalesced.
 - [x] R-P1-38 — Document or raise `DEFAULT_MAX_NESTED_DEPTH`.
-- [ ] R-P1-39 — Add more Rust unit coverage for dispatch, policy, report, and bridge behavior.
+- [x] R-P1-39 — Add more Rust unit coverage for dispatch, policy, report, and bridge behavior.
+- [ ] R-P2-40 — Decide whether to support embedded-Python cargo tests for `pybridge`; bridge coverage currently runs through Python package tests.
 - [ ] T-P1-51 / T-P1-52 — Strengthen parity/fuzz tests with expected verdicts.
 - [ ] T-P1-53 / T-P1-66 — Restore multi-stream regression coverage.
 - [ ] T-P1-54 — Replace Rust policy source-text tests with functional tests.
@@ -599,6 +600,13 @@ This section is the active implementation log for follow-up commits after revisi
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 32 tests.
 - R-P1-38 — Same-item commit documents the default `max_nested_depth=2` in the standalone package README and notes the depth/byte budget tradeoff. Targeted QA:
   - `uv run pytest packages/modelaudit-picklescan/tests/test_api.py -q -k default_depth_surfaces_two_layer` — passed, 1 test.
+- R-P1-39 — Same-item commit raises Rust unit coverage from 32 to 41 tests, adding direct coverage for opcode parsing/truncation, report detail helpers, `INST`/`OBJ`/`NEWOBJ_EX` dispatch, and bridge behavior through the Python package API. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 41 tests.
+  - `uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_detects_reduce_invoking_os_system -q` — passed, 1 test.
+  - Note: an attempted direct embedded-Python `cargo test` for `pybridge::scan_bytes` failed because the cargo test binary could not initialize Python stdlib encodings in this workspace. Bridge coverage remains in the Python package tests; the embedded-test decision is tracked as R-P2-40.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
@@ -829,6 +837,7 @@ This section is the active implementation log for follow-up commits after revisi
 ### Newly discovered gaps while remediating
 
 - N-P0-34 — Follow-on stream probing could recurse through pickle-like binary tails; fixed and tracked in the remediation checklist above.
+- R-P2-40 — Direct PyO3 `pybridge` cargo tests currently require an embedded-Python initialization strategy; a naive `Python::initialize()` unit test failed with `ModuleNotFoundError: No module named 'encodings'` from the cargo test binary. Keep bridge behavior covered through Python package tests unless/until the Rust test harness sets a reliable Python home/path.
 
 ---
 
