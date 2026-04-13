@@ -1112,6 +1112,24 @@ def test_scan_stream_enforces_total_known_stream_read_limit() -> None:
     assert stream.max_seen_read_size <= 8
 
 
+def test_scan_stream_known_size_cap_does_not_report_native_short_read() -> None:
+    pickle_prefix = pickle.dumps({"safe": True}, protocol=4)
+    payload = pickle_prefix + (b"ignored-tail" * 8)
+
+    report = PickleScanner(ScanOptions(max_known_stream_read_bytes=len(pickle_prefix))).scan_stream(
+        io.BytesIO(payload),
+        source="known-size-complete-prefix.pkl",
+        size=len(payload),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.errors == ()
+    assert any(notice.code == "known_stream_truncated" for notice in report.notices)
+    assert report.coverage.bytes_scanned == len(pickle_prefix)
+    assert report.coverage.bytes_total == len(payload)
+
+
 def test_scan_stream_bounds_protocol_zero_readline_without_declared_size() -> None:
     stream = NoUnboundedReadlineStream(b"S'" + (b"a" * 64))
 

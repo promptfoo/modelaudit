@@ -96,11 +96,12 @@ class PickleScanner:
                 bytes_scanned=0,
                 bytes_total=normalized_size,
             )
+        native_bytes_total = len(payload) if stream_truncated and normalized_size is not None else normalized_size
         report = _scan_pickle_payload_native(
             payload,
             source=source,
             options=self.options,
-            bytes_total=normalized_size,
+            bytes_total=native_bytes_total,
             position_offset=position_offset,
         )
         if stream_truncated:
