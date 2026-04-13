@@ -97,7 +97,7 @@ def scan_options_from_config(config: Mapping[str, Any]) -> ScanOptions:
         post_budget_scan_bytes=_parse_min_int(
             config.get(
                 "post_budget_global_scan_limit_bytes",
-                _DEFAULT_SCAN_OPTIONS.post_budget_scan_bytes,
+                config.get("post_budget_expansion_scan_limit_bytes", _DEFAULT_SCAN_OPTIONS.post_budget_scan_bytes),
             ),
             _DEFAULT_SCAN_OPTIONS.post_budget_scan_bytes,
             minimum=0,
@@ -581,6 +581,8 @@ def _legacy_rule_code_for_finding(finding: Finding) -> str | None:
             if mapped:
                 return mapped
         return "S206"
+    if finding.rule_code == "PICKLE_EXPANSION":
+        return "S902"
     return finding.rule_code
 
 
@@ -602,6 +604,10 @@ def _add_legacy_rule_alias_metadata(
 
 
 def _legacy_check_name_for_finding(finding: Finding) -> str:
+    if finding.rule_code == "PICKLE_EXPANSION":
+        if finding.details.get("post_budget") is True:
+            return "Post-Budget Pickle Expansion Heuristic Check"
+        return "Pickle Expansion Heuristic Check"
     opcode = finding.details.get("opcode")
     if finding.rule_code in {"DANGEROUS_CALL", "DANGEROUS_GLOBAL"} and isinstance(opcode, str):
         return f"{opcode.upper()} Opcode Safety Check"

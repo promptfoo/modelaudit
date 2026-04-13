@@ -40,6 +40,12 @@ def test_scan_options_from_config_parses_string_values() -> None:
     assert parsed.post_budget_scan_bytes == 8192
 
 
+def test_scan_options_from_config_accepts_legacy_expansion_limit_key() -> None:
+    parsed = scan_options_from_config({"post_budget_expansion_scan_limit_bytes": "4096"})
+
+    assert parsed.post_budget_scan_bytes == 4096
+
+
 def test_scan_options_from_config_falls_back_for_bad_values() -> None:
     defaults = ScanOptions()
 

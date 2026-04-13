@@ -41,6 +41,18 @@ const STACK_GLOBAL_STRING_OPCODES: &[&str] = &[
     "UNICODE",
 ];
 const REDUCE_OPCODES: &[&str] = &["REDUCE", "NEWOBJ", "NEWOBJ_EX", "OBJ", "INST", "BUILD"];
+const EXPANSION_EVENT_WINDOW: usize = 6;
+const EXPANSION_GROWTH_BUILDERS: &[&str] = &[
+    "APPEND", "APPENDS", "LIST", "TUPLE", "TUPLE1", "TUPLE2", "TUPLE3",
+];
+const EXPANSION_DUP_COUNT_THRESHOLD: usize = 128;
+const EXPANSION_DUP_DENSITY_THRESHOLD: f64 = 0.10;
+const EXPANSION_GET_PUT_RATIO_THRESHOLD: f64 = 32.0;
+const EXPANSION_GET_PUT_MIN_READS: usize = 128;
+const EXPANSION_MEMO_GROWTH_MIN_WRITES: usize = 64;
+const EXPANSION_MEMO_GROWTH_STEPS_THRESHOLD: usize = 32;
+const EXPANSION_RATIO_SUPPORTING_DUP_THRESHOLD: usize = 64;
+const EXPANSION_RATIO_SUPPORTING_GROWTH_THRESHOLD: usize = 16;
 
 #[derive(Clone)]
 struct GlobalRef {
@@ -81,6 +93,52 @@ enum StackValue {
 enum LimitError {
     OpcodeBudgetExceeded(Vec<u8>),
     Timeout,
+}
+
+#[derive(Clone)]
+enum ExpansionEvent {
+    Op(&'static str),
+    Read(i64),
+}
+
+#[derive(Clone, Default)]
+struct ExpansionHeuristicState {
+    stream_id: usize,
+    opcode_count: usize,
+    memo_reads: usize,
+    memo_writes: usize,
+    dup_count: usize,
+    memo_growth_steps: usize,
+    max_memo_index: i64,
+    next_memo_index: i64,
+    last_written_index: Option<i64>,
+    last_position: usize,
+    event_window: Vec<ExpansionEvent>,
+}
+
+#[derive(Clone)]
+struct ExpansionHeuristicFinding {
+    stream_id: usize,
+    position: usize,
+    opcode_count: usize,
+    memo_reads: usize,
+    memo_writes: usize,
+    get_put_ratio: f64,
+    dup_count: usize,
+    dup_density: f64,
+    memo_growth_steps: usize,
+    memo_slots_used: usize,
+    triggers: Vec<&'static str>,
+}
+
+impl ExpansionHeuristicState {
+    fn new(stream_id: usize) -> Self {
+        Self {
+            stream_id,
+            max_memo_index: -1,
+            ..Self::default()
+        }
+    }
 }
 
 pub(crate) struct ScanOptions {
@@ -169,6 +227,8 @@ pub(crate) struct ScanState<'a> {
     global_count: usize,
     bytes_scanned: usize,
     first_pickle_end_pos: Option<usize>,
+    expansion_state: ExpansionHeuristicState,
+    expansion_findings: Vec<ExpansionHeuristicFinding>,
     status: &'static str,
     verdict: &'static str,
     seen_finding_keys: HashSet<(String, Option<String>, Option<&'static str>)>,
@@ -210,6 +270,8 @@ impl<'a> ScanState<'a> {
             global_count: 0,
             bytes_scanned: 0,
             first_pickle_end_pos: None,
+            expansion_state: ExpansionHeuristicState::new(0),
+            expansion_findings: Vec::new(),
             status: "complete",
             verdict: "clean",
             seen_finding_keys: HashSet::new(),
@@ -226,7 +288,7 @@ impl<'a> ScanState<'a> {
             } else {
                 self.record_empty_input_error();
             }
-            self.finalize_verdict();
+            self.finish_analysis();
             return;
         }
 
@@ -245,8 +307,7 @@ impl<'a> ScanState<'a> {
                     Err(error) => {
                         self.handle_parse_error(error, index);
                         self.scan_follow_on_pickle_streams(index);
-                        self.coalesce_redundant_global_findings();
-                        self.finalize_verdict();
+                        self.finish_analysis();
                         return;
                     }
                 };
@@ -300,8 +361,7 @@ impl<'a> ScanState<'a> {
                             });
                         }
                     }
-                    self.coalesce_redundant_global_findings();
-                    self.finalize_verdict();
+                    self.finish_analysis();
                     return;
                 }
 
@@ -310,6 +370,7 @@ impl<'a> ScanState<'a> {
                 self.bytes_scanned = self.bytes_scanned.max(parsed.next);
                 self.opcode_count += 1;
                 index = parsed.next;
+                self.record_expansion_opcode(&parsed, position);
                 self.handle_opcode(&parsed, position);
 
                 if parsed.name == "STOP" {
@@ -335,8 +396,7 @@ impl<'a> ScanState<'a> {
                     ParseError::new("pickle exhausted before seeing STOP").at(index),
                     index,
                 );
-                self.coalesce_redundant_global_findings();
-                self.finalize_verdict();
+                self.finish_analysis();
                 return;
             }
 
@@ -351,8 +411,7 @@ impl<'a> ScanState<'a> {
             self.record_short_read();
         }
 
-        self.coalesce_redundant_global_findings();
-        self.finalize_verdict();
+        self.finish_analysis();
     }
 
     fn scan_limit(&self) -> usize {
@@ -1398,6 +1457,96 @@ impl<'a> ScanState<'a> {
         }
     }
 
+    fn record_expansion_opcode(&mut self, opcode: &ParsedOpcode, position: usize) {
+        let should_finish_stream =
+            record_expansion_state_opcode(&mut self.expansion_state, opcode, position);
+        if should_finish_stream {
+            flush_expansion_state(&mut self.expansion_state, &mut self.expansion_findings);
+        }
+    }
+
+    fn finish_analysis(&mut self) {
+        flush_expansion_state(&mut self.expansion_state, &mut self.expansion_findings);
+        self.emit_collected_expansion_finding();
+        self.coalesce_redundant_global_findings();
+        self.finalize_verdict();
+    }
+
+    fn emit_collected_expansion_finding(&mut self) {
+        if self.expansion_findings.is_empty() {
+            return;
+        }
+        let findings = std::mem::take(&mut self.expansion_findings);
+        self.add_expansion_finding(&findings, false);
+    }
+
+    fn add_expansion_finding(
+        &mut self,
+        expansion_findings: &[ExpansionHeuristicFinding],
+        post_budget: bool,
+    ) {
+        let Some(primary_finding) = expansion_findings.first() else {
+            return;
+        };
+
+        let trigger_labels = primary_finding
+            .triggers
+            .iter()
+            .map(|trigger| expansion_trigger_label(trigger).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let additional_streams = expansion_findings.len().saturating_sub(1);
+        let additional_note = if additional_streams > 0 {
+            format!(
+                " (+{} more stream{})",
+                additional_streams,
+                if additional_streams == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        };
+        let message = if post_budget {
+            format!(
+                "Suspicious pickle expansion/resource-exhaustion pattern found beyond opcode budget: {}{}",
+                trigger_labels, additional_note
+            )
+        } else {
+            format!(
+                "Suspicious pickle expansion/resource-exhaustion pattern detected: {}{}",
+                trigger_labels, additional_note
+            )
+        };
+        let mut details = vec![
+            (
+                "findings".to_string(),
+                DetailValue::List(
+                    expansion_findings
+                        .iter()
+                        .map(expansion_finding_to_detail)
+                        .collect(),
+                ),
+            ),
+            (
+                "suspicious_streams".to_string(),
+                DetailValue::UInt(expansion_findings.len() as u64),
+            ),
+        ];
+        if post_budget {
+            details.push(("post_budget".to_string(), DetailValue::Bool(true)));
+        }
+
+        self.add_finding(Finding {
+            message,
+            severity: "warning",
+            location: Some(format!("{} (pos {})", self.source, primary_finding.position)),
+            rule_code: Some("PICKLE_EXPANSION"),
+            details,
+            why: Some(
+                "Memo and DUP-heavy pickle streams can cause resource exhaustion when deserialized. Bounded expansion heuristics preserve this signal without materializing expanded objects.",
+            ),
+        });
+    }
+
     fn record_literal_scan_truncated(
         &mut self,
         literal_type: &'static str,
@@ -1620,6 +1769,17 @@ impl<'a> ScanState<'a> {
                     ),
                 });
             }
+        }
+
+        let expansion_findings = detect_expansion_findings_in_tail(
+            &tail,
+            stream_offset,
+            read_offset,
+            tail_prefix_len,
+            self.position_offset,
+        );
+        if !expansion_findings.is_empty() {
+            self.add_expansion_finding(&expansion_findings, true);
         }
     }
 
@@ -2029,6 +2189,252 @@ fn post_budget_opcode_prefix(
     prefix.extend_from_slice(name.as_bytes());
     prefix.push(b'\n');
     prefix
+}
+
+fn record_expansion_state_opcode(
+    state: &mut ExpansionHeuristicState,
+    opcode: &ParsedOpcode,
+    position: usize,
+) -> bool {
+    state.opcode_count += 1;
+    state.last_position = position;
+
+    if opcode.name == "DUP" {
+        state.dup_count += 1;
+    }
+
+    let is_memo_read = is_memo_read_opcode(opcode.name);
+    if is_memo_read {
+        state.memo_reads += 1;
+    } else if is_memo_write_opcode(opcode.name) {
+        state.memo_writes += 1;
+        let memo_index = if opcode.name == "MEMOIZE" {
+            let index = state.next_memo_index;
+            state.next_memo_index += 1;
+            Some(index)
+        } else {
+            let index = opcode.arg.as_i64();
+            if let Some(index) = index {
+                state.next_memo_index = state.next_memo_index.max(index.saturating_add(1));
+            }
+            index
+        };
+
+        let previous_memo_index = state.last_written_index;
+        let repeated_previous_read = previous_memo_index.is_some_and(|index| {
+            state
+                .event_window
+                .iter()
+                .filter(|event| matches!(event, ExpansionEvent::Read(read_index) if *read_index == index))
+                .count()
+                >= 2
+        });
+        let has_growth_builder = state.event_window.iter().any(|event| {
+            matches!(event, ExpansionEvent::Op(op_name) if EXPANSION_GROWTH_BUILDERS.contains(op_name))
+        });
+        let is_sequential_growth = previous_memo_index
+            .zip(memo_index)
+            .is_some_and(|(previous, current)| current == previous.saturating_add(1));
+        if is_sequential_growth && repeated_previous_read && has_growth_builder {
+            state.memo_growth_steps += 1;
+        }
+
+        if let Some(index) = memo_index {
+            state.max_memo_index = state.max_memo_index.max(index);
+            state.last_written_index = Some(index);
+        }
+    }
+
+    if is_memo_read {
+        state
+            .event_window
+            .push(ExpansionEvent::Read(opcode.arg.as_i64().unwrap_or(-1)));
+    } else {
+        state.event_window.push(ExpansionEvent::Op(opcode.name));
+    }
+    if state.event_window.len() > EXPANSION_EVENT_WINDOW {
+        state.event_window.remove(0);
+    }
+
+    opcode.name == "STOP"
+}
+
+fn flush_expansion_state(
+    state: &mut ExpansionHeuristicState,
+    findings: &mut Vec<ExpansionHeuristicFinding>,
+) {
+    let next_stream_id = state.stream_id.saturating_add(1);
+    if let Some(finding) = build_expansion_heuristic_finding(state) {
+        findings.push(finding);
+    }
+    *state = ExpansionHeuristicState::new(next_stream_id);
+}
+
+fn build_expansion_heuristic_finding(
+    state: &ExpansionHeuristicState,
+) -> Option<ExpansionHeuristicFinding> {
+    if state.opcode_count == 0 {
+        return None;
+    }
+
+    let get_put_ratio = if state.memo_writes == 0 {
+        0.0
+    } else {
+        state.memo_reads as f64 / state.memo_writes as f64
+    };
+    let dup_density = state.dup_count as f64 / state.opcode_count as f64;
+
+    let mut triggers = Vec::new();
+    if state.memo_writes >= EXPANSION_MEMO_GROWTH_MIN_WRITES
+        && state.memo_growth_steps >= EXPANSION_MEMO_GROWTH_STEPS_THRESHOLD
+    {
+        triggers.push("memo_growth_chain");
+    }
+    if state.dup_count >= EXPANSION_DUP_COUNT_THRESHOLD
+        && dup_density >= EXPANSION_DUP_DENSITY_THRESHOLD
+    {
+        triggers.push("excessive_dup_usage");
+    }
+    if state.memo_reads >= EXPANSION_GET_PUT_MIN_READS
+        && get_put_ratio >= EXPANSION_GET_PUT_RATIO_THRESHOLD
+        && (state.dup_count >= EXPANSION_RATIO_SUPPORTING_DUP_THRESHOLD
+            || state.memo_growth_steps >= EXPANSION_RATIO_SUPPORTING_GROWTH_THRESHOLD)
+    {
+        triggers.push("suspicious_get_put_ratio");
+    }
+    if triggers.is_empty() {
+        return None;
+    }
+
+    let memo_slots_used = if state.max_memo_index >= 0 {
+        usize::try_from(state.max_memo_index.saturating_add(1)).unwrap_or(usize::MAX)
+    } else {
+        0
+    };
+
+    Some(ExpansionHeuristicFinding {
+        stream_id: state.stream_id,
+        position: state.last_position,
+        opcode_count: state.opcode_count,
+        memo_reads: state.memo_reads,
+        memo_writes: state.memo_writes,
+        get_put_ratio: round_float(get_put_ratio, 100.0),
+        dup_count: state.dup_count,
+        dup_density: round_float(dup_density, 10_000.0),
+        memo_growth_steps: state.memo_growth_steps,
+        memo_slots_used,
+        triggers,
+    })
+}
+
+fn detect_expansion_findings_in_tail(
+    tail: &[u8],
+    stream_offset: usize,
+    read_offset: usize,
+    tail_prefix_len: usize,
+    position_offset: usize,
+) -> Vec<ExpansionHeuristicFinding> {
+    let mut findings = Vec::new();
+    let mut state = ExpansionHeuristicState::new(0);
+    let mut index = 0usize;
+    while index < tail.len() {
+        let parsed = match parse_opcode(tail, index, tail.len()) {
+            Ok(opcode) => opcode,
+            Err(_) => break,
+        };
+        let local_position = if parsed.pos < tail_prefix_len {
+            stream_offset.saturating_add(parsed.pos)
+        } else {
+            read_offset.saturating_add(parsed.pos - tail_prefix_len)
+        };
+        let should_finish_stream = record_expansion_state_opcode(
+            &mut state,
+            &parsed,
+            position_offset.saturating_add(local_position),
+        );
+        index = parsed.next;
+        if should_finish_stream {
+            flush_expansion_state(&mut state, &mut findings);
+        }
+    }
+    flush_expansion_state(&mut state, &mut findings);
+    findings
+}
+
+fn expansion_finding_to_detail(finding: &ExpansionHeuristicFinding) -> DetailValue {
+    DetailValue::Dict(vec![
+        (
+            "stream_id".to_string(),
+            DetailValue::UInt(finding.stream_id as u64),
+        ),
+        (
+            "position".to_string(),
+            DetailValue::UInt(finding.position as u64),
+        ),
+        (
+            "opcode_count".to_string(),
+            DetailValue::UInt(finding.opcode_count as u64),
+        ),
+        (
+            "memo_reads".to_string(),
+            DetailValue::UInt(finding.memo_reads as u64),
+        ),
+        (
+            "memo_writes".to_string(),
+            DetailValue::UInt(finding.memo_writes as u64),
+        ),
+        (
+            "get_put_ratio".to_string(),
+            DetailValue::Float(finding.get_put_ratio),
+        ),
+        (
+            "dup_count".to_string(),
+            DetailValue::UInt(finding.dup_count as u64),
+        ),
+        (
+            "dup_density".to_string(),
+            DetailValue::Float(finding.dup_density),
+        ),
+        (
+            "memo_growth_steps".to_string(),
+            DetailValue::UInt(finding.memo_growth_steps as u64),
+        ),
+        (
+            "memo_slots_used".to_string(),
+            DetailValue::UInt(finding.memo_slots_used as u64),
+        ),
+        (
+            "triggers".to_string(),
+            DetailValue::List(
+                finding
+                    .triggers
+                    .iter()
+                    .map(|trigger| DetailValue::String((*trigger).to_string()))
+                    .collect(),
+            ),
+        ),
+    ])
+}
+
+fn is_memo_read_opcode(name: &str) -> bool {
+    matches!(name, "GET" | "BINGET" | "LONG_BINGET")
+}
+
+fn is_memo_write_opcode(name: &str) -> bool {
+    matches!(name, "PUT" | "BINPUT" | "LONG_BINPUT" | "MEMOIZE")
+}
+
+fn expansion_trigger_label(trigger: &str) -> &str {
+    match trigger {
+        "suspicious_get_put_ratio" => "high memo GET/PUT ratio",
+        "excessive_dup_usage" => "dense DUP usage",
+        "memo_growth_chain" => "iterative memo growth chain",
+        _ => trigger,
+    }
+}
+
+fn round_float(value: f64, factor: f64) -> f64 {
+    (value * factor).round() / factor
 }
 
 fn advance_chars_from(value: &str, start: usize, count: usize) -> usize {

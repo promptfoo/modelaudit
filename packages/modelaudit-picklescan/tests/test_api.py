@@ -29,6 +29,39 @@ EXPECTED_SYSTEM_GLOBAL = "nt.system" if os.name == "nt" else "posix.system"
 SYSTEM_GLOBALS = frozenset({"nt.system", "os.system", "posix.system"})
 
 
+def _make_opcode_padding_stream(opcode_pairs: int) -> bytes:
+    return b"\x80\x02" + (b"K\x010" * opcode_pairs) + b"."
+
+
+def _make_memo_expansion_pickle(iterations: int, *, inert_writes: int = 0) -> bytes:
+    total_writes = iterations + inert_writes
+    if not 1 <= iterations <= 255 or total_writes > 255:
+        raise ValueError("iterations + inert_writes must fit in BINPUT/BINGET opcodes")
+
+    payload = bytearray(b"\x80\x02)q\x000")
+    for memo_index in range(1, iterations + 1):
+        previous_index = memo_index - 1
+        payload += b"h" + bytes([previous_index])
+        payload += b"h" + bytes([previous_index])
+        payload += b"\x86"
+        payload += b"q" + bytes([memo_index])
+        payload += b"0"
+    for memo_index in range(iterations + 1, total_writes + 1):
+        payload += b"K\x01"
+        payload += b"q" + bytes([memo_index])
+        payload += b"0"
+    payload += b"h" + bytes([iterations]) + b"."
+    return bytes(payload)
+
+
+def _make_dup_heavy_pickle(iterations: int) -> bytes:
+    payload = bytearray(b"\x80\x02]q\x00")
+    for _ in range(iterations):
+        payload += b"h\x002a0"
+    payload += b"."
+    return bytes(payload)
+
+
 def _corrupt_first_byte(payload: bytes) -> bytes:
     corrupted = bytearray(payload)
     corrupted[0] ^= 0xFF
@@ -202,6 +235,60 @@ def test_scan_bytes_detects_malicious_stream_after_malformed_prefix() -> None:
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert any(finding.details.get("import_reference") in SYSTEM_GLOBALS for finding in report.findings)
+
+
+def test_scan_bytes_warns_on_iterative_memo_growth() -> None:
+    report = scan_bytes(_make_memo_expansion_pickle(iterations=80), source="memo-expansion.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "PICKLE_EXPANSION"
+        and finding.severity == Severity.WARNING
+        and "memo_growth_chain" in finding.details["findings"][0]["triggers"]
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_warns_on_dup_heavy_expansion_payload() -> None:
+    report = scan_bytes(_make_dup_heavy_pickle(iterations=200), source="dup-heavy.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "PICKLE_EXPANSION"
+        and "excessive_dup_usage" in finding.details["findings"][0]["triggers"]
+        and "suspicious_get_put_ratio" in finding.details["findings"][0]["triggers"]
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_does_not_warn_on_benign_shared_references() -> None:
+    shared = [1, 2, 3]
+    report = scan_bytes(pickle.dumps([shared] * 1000, protocol=4), source="shared-reference.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert all(finding.rule_code != "PICKLE_EXPANSION" for finding in report.findings)
+
+
+def test_scan_bytes_warns_on_post_budget_memo_growth_tail() -> None:
+    payload = _make_opcode_padding_stream(64) + _make_memo_expansion_pickle(iterations=80)
+
+    report = scan_bytes(
+        payload,
+        source="post-budget-expansion.pkl",
+        options=ScanOptions(max_opcodes=64, post_budget_scan_bytes=4096),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert any(
+        finding.rule_code == "PICKLE_EXPANSION"
+        and finding.details.get("post_budget") is True
+        and "memo_growth_chain" in finding.details["findings"][0]["triggers"]
+        for finding in report.findings
+    )
 
 
 def test_scan_bytes_escalates_copyreg_extension_reduce() -> None:

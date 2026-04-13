@@ -489,7 +489,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] P1-NESTED-DEPTH — Raise nested depth or fail closed when nested analysis depth is exhausted.
 - [x] T-P1-WHEEL — Add missing macOS x86_64 and Linux aarch64 wheel coverage or document the gap.
 - [x] T-P2-COMMENT — Restore missing comment-token bypass regression coverage.
-- [ ] T-P2-EXPANSION — Restore expansion/memo-growth regression coverage.
+- [x] T-P2-EXPANSION — Restore expansion/memo-growth regression coverage.
 - [ ] T-P2-STRUCTURAL — Restore structural tamper / duplicate-PROTO regression coverage.
 - [ ] P2-STALE-PYCACHE — Remove stale `_parity_corpus` pycache artifact or ignore it explicitly.
 - [ ] P2-NEW-HELPER-DUP — Refactor duplicated text-shape helper loops.
@@ -622,6 +622,17 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run mypy tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 42 tests.
+- T-P2-EXPANSION — Initial QA showed the old memo-growth, diluted memo-growth, and DUP-heavy expansion payloads scanned clean under Rust. Same-item commit adds bounded native Rust expansion heuristics, restores the legacy Python check names/rule mapping, preserves the old `post_budget_expansion_scan_limit_bytes` config alias, and restores the six Python-level expansion regressions plus standalone package coverage. Targeted QA:
+  - Manual repro for iterative memo growth, diluted memo growth, DUP-heavy, benign shared references, and post-budget expansion tail — confirmed the first three initially scanned clean before the fix.
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed after replacing an MSRV-incompatible `Option::inspect`.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 16 tests.
+  - `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
+  - `uv run ruff format --check modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run ruff check modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `uv run mypy modelaudit/scanners/picklescan_adapter.py tests/scanners/test_picklescan_adapter.py tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_picklescan_adapter.py tests/scanners/test_pickle_scanner.py packages/modelaudit-picklescan/tests/test_api.py -q` — passed, 258 tests.
 
 ### Newly discovered gaps while remediating
 
