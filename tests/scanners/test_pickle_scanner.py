@@ -760,6 +760,52 @@ def test_raw_cve_setitem_detection_is_not_suppressed_by_comment_token(tmp_path: 
     assert any(issue.rule_code == "S209" for issue in result.issues)
 
 
+def test_raw_cve_attributions_are_deduplicated_by_rule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from modelaudit.detectors import cve_patterns
+
+    def duplicate_analyze_cve_patterns(_content: str, _binary_content: bytes = b"") -> list[Any]:
+        return [
+            cve_patterns.CVEAttribution(
+                cve_id="CVE-2026-24747",
+                description="PyTorch weights_only restricted unpickler SETITEM abuse pattern",
+                severity="CRITICAL",
+                cvss=9.8,
+                cwe="CWE-502",
+                affected_versions="PyTorch versions before the fixed release",
+                remediation="Upgrade PyTorch and avoid loading untrusted pickle checkpoints",
+                patterns_matched=["_rebuild_tensor", "SETITEM opcode"],
+            ),
+            cve_patterns.CVEAttribution(
+                cve_id="CVE-2026-24747",
+                description="Duplicate SETITEM attribution",
+                severity="CRITICAL",
+                cvss=9.8,
+                cwe="CWE-502",
+                affected_versions="PyTorch versions before the fixed release",
+                remediation="Upgrade PyTorch and avoid loading untrusted pickle checkpoints",
+                patterns_matched=["_rebuild_tensor", "SETITEM opcode"],
+            ),
+        ]
+
+    monkeypatch.setattr(cve_patterns, "analyze_cve_patterns", duplicate_analyze_cve_patterns)
+    path = tmp_path / "duplicate-setitem-attribution.pkl"
+    path.write_bytes(b"(dS'_rebuild_tensor # comment token is not a bypass'\nS'value'\ns.")
+
+    result = PickleScanner().scan(str(path))
+
+    cve_issues = [
+        issue
+        for issue in result.issues
+        if issue.rule_code == "S209" and issue.details.get("cve_id") == "CVE-2026-24747"
+    ]
+    assert len(cve_issues) == 1
+    assert result.metadata["cve_count"] == 1
+    assert len(result.metadata["cve_attributions"]) == 1
+
+
 def test_raw_cve_comment_only_text_does_not_trigger_setitem(tmp_path: Path) -> None:
     path = tmp_path / "comment-only.pkl"
     path.write_bytes(

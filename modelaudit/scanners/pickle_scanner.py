@@ -1517,17 +1517,19 @@ class PickleScanner(BaseScanner):
             )
 
         pickle_parse_failed = "parse_error" in opcode_summary
-        attributions = [
-            attribution
-            for attribution in attributions
-            if not (
-                attribution.cve_id == "CVE-2026-24747"
-                and (
-                    (not has_setitem_opcode and not pickle_parse_failed)
-                    or _rebuild_tensor_indicators_are_documentation_literals(data)
+        attributions = self._dedupe_cve_attributions(
+            [
+                attribution
+                for attribution in attributions
+                if not (
+                    attribution.cve_id == "CVE-2026-24747"
+                    and (
+                        (not has_setitem_opcode and not pickle_parse_failed)
+                        or _rebuild_tensor_indicators_are_documentation_literals(data)
+                    )
                 )
-            )
-        ]
+            ]
+        )
 
         dangerous_globals = opcode_summary.get("dangerous_globals", [])
         has_dangerous_system_global = isinstance(dangerous_globals, list) and any(
@@ -1608,6 +1610,18 @@ class PickleScanner(BaseScanner):
         if "build" in joined:
             return "S207"
         return "S115"
+
+    def _dedupe_cve_attributions(self, attributions: list[Any]) -> list[Any]:
+        deduped: list[Any] = []
+        seen_rule_keys: set[tuple[str, str]] = set()
+        for attribution in attributions:
+            rule_code = self._rule_code_for_cve_attribution(attribution.patterns_matched)
+            cve_rule_key = (attribution.cve_id, rule_code)
+            if cve_rule_key in seen_rule_keys:
+                continue
+            seen_rule_keys.add(cve_rule_key)
+            deduped.append(attribution)
+        return deduped
 
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         metadata = super().extract_metadata(file_path)

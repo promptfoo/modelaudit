@@ -540,7 +540,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] S-R2-9 — Merge `getattr` parsers.
 - [x] S-R2-10 — Replace warning-global slice sentinel with an explicit enum.
 - [x] S-P2-15 — Table-drive `_scan_raw_text_indicators`.
-- [ ] S-P2-17 — Avoid duplicate CVE-2026-24747 attribution.
+- [x] S-P2-17 — Avoid duplicate CVE-2026-24747 attribution.
 - [ ] S-P2-18 — Consolidate `extract_metadata` read-limit validation.
 - [ ] S-P2-19 — Reduce Python/Rust dangerous-policy drift.
 - [ ] S-D2-29 / S-D2-30 / S-D2-33 / S-D2-34 / S-D2-35 / S-D2-37 / S-D2-38 / S-D2-39 / S-D2-40 — Documentation and CI hygiene follow-ups.
@@ -709,6 +709,13 @@ This section is the active implementation log for follow-up commits after revisi
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 70 tests.
+- S-P2-17 — Same-item commit adds a CVE attribution de-duplication pass keyed by `(cve_id, derived_rule_code)` before metadata/check emission, plus a monkeypatched regression proving duplicate CVE-2026-24747 SETITEM attributions become one metadata entry and one `S209` issue. Targeted QA:
+  - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff format --check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `uv run mypy modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py::test_raw_cve_attributions_are_deduplicated_by_rule tests/scanners/test_pickle_scanner.py::test_raw_cve_setitem_detection_is_not_suppressed_by_comment_token -q` — passed, 2 tests.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 71 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
