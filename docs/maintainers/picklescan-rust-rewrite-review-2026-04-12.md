@@ -518,7 +518,7 @@ This section is the active implementation log for follow-up commits after revisi
 - [x] R-P1-28 — Push `Other` for missing memo GET/BINGET/LONG_BINGET.
 - [x] R-P1-29 — Correct post-budget tail position reporting.
 - [x] R-P1-30 — Confirm timeout checks are amortized.
-- [ ] R-P1-31 — Replace location-string parsing with structured positions where possible.
+- [x] R-P1-31 — Replace location-string parsing with structured positions where possible.
 - [ ] R-P1-32 — Expand post-budget dangerous needle table.
 - [ ] R-P1-33 — Decide/fuzz STACK_GLOBAL byte operand behavior.
 - [ ] R-P1-34 — Rebuild notice dedupe state if notices are ever coalesced.
@@ -573,6 +573,12 @@ This section is the active implementation log for follow-up commits after revisi
   - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml timeout_checks_are_amortized_by_opcode_interval` — passed.
   - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 28 tests.
+- R-P1-31 — Same-item commit removes the brittle `(pos N)` location-string fallback from redundant global coalescing and verifies coalescing only happens when structured `position` details are present. Targeted QA:
+  - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
+  - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
+  - `cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml global_finding_coalesce_uses_structured_positions_only` — passed.
+  - `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, 29 tests.
 - N-P0-3 — Same-item commit removes the global raw-window documentation short-circuit, records documentation-like pickle literal spans, and filters only matches that fall inside documentation spans or comment-like lines. Targeted QA:
   - `uv run ruff format modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.
   - `uv run ruff check modelaudit/scanners/pickle_scanner.py tests/scanners/test_pickle_scanner.py` — passed.

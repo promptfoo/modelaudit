@@ -2020,8 +2020,7 @@ impl<'a> ScanState<'a> {
                 return true;
             }
             let import_reference = detail_string(&finding.details, "import_reference");
-            let location_position = detail_usize(&finding.details, "position")
-                .or_else(|| finding.location.as_deref().and_then(location_position));
+            let location_position = detail_usize(&finding.details, "position");
             match (import_reference, location_position) {
                 (Some(import_reference), Some(position)) => {
                     !called_global_keys.contains(&(import_reference, position))
@@ -2631,13 +2630,6 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn location_position(location: &str) -> Option<usize> {
-    let marker = "(pos ";
-    let start = location.rfind(marker)? + marker.len();
-    let end = location[start..].strip_suffix(')')?;
-    end.parse::<usize>().ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2788,6 +2780,84 @@ mod tests {
             scan.check_limits(&opcode),
             Err(LimitError::Timeout)
         ));
+    }
+
+    #[test]
+    fn global_finding_coalesce_uses_structured_positions_only() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b".";
+        let mut scan = ScanState::new(
+            "structured-position.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+        let call_finding = Finding {
+            message: "call".to_string(),
+            severity: "critical",
+            location: Some("structured-position.pkl (pos 9)".to_string()),
+            rule_code: Some("DANGEROUS_CALL"),
+            details: vec![
+                (
+                    "import_reference".to_string(),
+                    DetailValue::String("os.system".to_string()),
+                ),
+                ("global_position".to_string(), DetailValue::UInt(4)),
+            ],
+            why: None,
+        };
+        let global_without_position = Finding {
+            message: "global".to_string(),
+            severity: "critical",
+            location: Some("source-with-text-(pos 4).pkl (pos 4)".to_string()),
+            rule_code: Some("DANGEROUS_GLOBAL"),
+            details: vec![(
+                "import_reference".to_string(),
+                DetailValue::String("os.system".to_string()),
+            )],
+            why: None,
+        };
+
+        scan.findings = vec![call_finding.clone(), global_without_position];
+        scan.coalesce_redundant_global_findings();
+        assert!(scan
+            .findings
+            .iter()
+            .any(|finding| finding.rule_code == Some("DANGEROUS_GLOBAL")));
+
+        let global_with_position = Finding {
+            details: vec![
+                (
+                    "import_reference".to_string(),
+                    DetailValue::String("os.system".to_string()),
+                ),
+                ("position".to_string(), DetailValue::UInt(4)),
+            ],
+            ..call_finding.clone()
+        };
+        scan.findings = vec![
+            call_finding,
+            Finding {
+                message: "global".to_string(),
+                rule_code: Some("DANGEROUS_GLOBAL"),
+                ..global_with_position
+            },
+        ];
+        scan.coalesce_redundant_global_findings();
+        assert!(scan
+            .findings
+            .iter()
+            .all(|finding| finding.rule_code != Some("DANGEROUS_GLOBAL")));
     }
 
     #[test]
