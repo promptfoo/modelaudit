@@ -10,5 +10,6 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Introduce the Rust-native pickle scanning engine and standalone Python API package.
-- Probe binary pickle operands for nested pickle streams while leaving arbitrary
-  non-pickle text extraction to the root ModelAudit raw detector layer.
+- Probe binary pickle operands for nested pickle streams while intentionally
+  leaving arbitrary non-pickle text extraction from BINBYTES/tensor blobs to the
+  root ModelAudit raw detector layer.
