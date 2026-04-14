@@ -191,6 +191,264 @@ Remaining non-blocking P2 items I have not re-verified at rev 10 (unchanged from
 
 ---
 
+## Rev 10 — QA / verification checklist for follow-up work
+
+This section tracks what I did **not** exhaustively verify at rev 10 and what future reviewers / maintainers should QA before closing the residual risk. The items are grouped by risk category and each has a concrete repro/probe recipe so the verification can be automated in CI or a follow-up PR. Before merging any rev 11+ hardening commit, run through this list and check off items that were re-verified.
+
+### A. Adversarial oracle corpus coverage gap (P1, concrete)
+
+**Gap:** `packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py` parametrizes 326 cases but only uses `subprocess.run` as the monkey-patched sentinel. If a policy-lookup gap exists for a different dangerous global, the corpus misses it. I partially mitigated this with an independent 64-case cross-global sweep (16 dangerous globals × 4 N9 attack shapes), but that's far short of the 326-case depth the oracle achieves for `subprocess.run`.
+
+**Concrete gap list (no parametrized oracle coverage):**
+
+- `os.system`
+- `os.popen`
+- `os.execv*` / `os.spawn*`
+- `builtins.eval`
+- `builtins.exec`
+- `builtins.__import__`
+- `builtins.compile`
+- `importlib.reload`
+- `importlib.import_module`
+- `ctypes.CDLL`
+- `_ctypes.dlopen`
+- `marshal.loads`
+- `pickle.loads`
+- `dill.loads`
+- `joblib.load`
+- `runpy.run_path` / `runpy.run_module`
+- `torch.load`
+- `copyreg.add_extension`
+
+**QA recipe:** Generalize `_calls_subprocess_run_under_cpython` into a generic `_calls_dangerous_global_under_cpython(payload, module, name, monkeypatch)` that installs a call-counter sentinel on `getattr(importlib.import_module(module), name)`. Parametrize `_build_adversarial_cases()` across a `DANGEROUS_ORACLE_TARGETS` list containing at least the 18 globals above. Expected result: 326 × 18 = ~5900 parametrized tests, all asserting "CPython execution reaches target ⇒ scanner emits CRITICAL finding with `details.module == module and details.name == name`". Some combinations will not actually reach the sentinel (e.g., `marshal.loads('\x00')` raises before calling the sentinel), which is fine — those are skipped from the "must-flag" assertion.
+
+**Acceptance criteria:** All cases where CPython reaches the sentinel must produce a scanner CRITICAL finding with the matching `module`/`name` details.
+
+### B. Architectural — delegate `post_budget.rs` to `parse_opcode` (P2, strategic)
+
+**Gap:** `packages/modelaudit-picklescan/rust/src/post_budget.rs` is ~1000 LOC of byte-pattern matching that partially re-implements `parse_opcode` from `opcode.rs`. Every N5–N9 bypass was a specific hole in this byte-pattern matcher that the in-budget opcode walker would have caught automatically. The in-budget walker is the source of truth for opcode semantics; the post-budget walker should re-use it rather than re-implement.
+
+**QA recipe:**
+1. Build a branch that replaces `post_budget_global_matches()` with a call to the same opcode walker used for in-budget scanning, seeded with the `self.memo` snapshot at budget exhaustion and a synthesized stack prefix from `post_budget_opcode_prefix()`.
+2. Run the full 326-case adversarial oracle corpus against the new branch. All cases must still pass.
+3. Run the N5–N9 historical bypass reproducers against the new branch. All must be detected.
+4. Benchmark: the new path should not be slower than the byte-pattern scanner for the 9 MB + 4.5M filler payload (rev 10 takes ~0.2s at release mode).
+5. Measure `post_budget.rs` line count after the refactor. Target: ≤300 LOC (vs ~1000 today).
+
+**Acceptance criteria:** Post-refactor `cargo test` + the adversarial oracle suite + 10 historical reproducers all pass; line count reduced by at least half; no new test failures in the full `pytest -n auto` run.
+
+### C. Attack shapes NOT probed at rev 10 (P1-P2 probes to add)
+
+#### C1. Timing / budget-stall attacks
+
+**Hypothesis:** An attacker crafts a pickle where opcode parsing takes longer than `options.timeout_s` but the dangerous REDUCE is reached after the timeout fires. Scanner may flip verdict from `complete`/`malicious` to `inconclusive`/`unknown` with the tail scan unable to see the REDUCE.
+
+**QA recipe:**
+```python
+# Slow-parsing pickle: deeply nested FRAME with long BINUNICODE payloads
+import pickle, struct
+from modelaudit_picklescan import scan_bytes, ScanOptions
+
+def slow_frame(depth, payload_len):
+    inner = b"\x8c" + bytes([payload_len]) + b"A" * payload_len
+    return b"\x95" + struct.pack("<Q", payload_len + 2) + inner
+
+# Build N nested FRAMEs each with a 250-byte BINUNICODE
+payload = b"\x80\x04"
+for _ in range(100000):
+    payload += slow_frame(1, 250)
+# Append dangerous REDUCE at end
+payload += b"csubprocess\nrun\n)R."
+
+# Scan with a tight timeout
+r = scan_bytes(payload, options=ScanOptions(timeout_s=0.01))
+# EXPECTED: verdict=malicious OR at least verdict=inconclusive + WARNING
+# BYPASS: verdict=unknown, findings=0 means timeout skipped the tail scan
+```
+
+**Acceptance criteria:** A timeout-induced fail-closed must produce at least a WARNING severity finding identifying the dangerous REDUCE in the tail, OR an explicit `analysis_incomplete=True` notice with the verdict escalated to `suspicious`.
+
+#### C2. Deep nested-pickle chain
+
+**Hypothesis:** Rev 10 has `DEFAULT_MAX_NESTED_DEPTH = 2`. A 3-deep base64/hex encoding chain may silently truncate without surfacing the inner payload.
+
+**QA recipe:**
+```python
+import pickle, base64
+class Evil:
+    def __reduce__(self):
+        return (eval, ("1+1",))
+innermost = pickle.dumps(Evil())
+layer1 = pickle.dumps({"x": base64.b64encode(innermost).decode()})
+layer2 = pickle.dumps({"x": base64.b64encode(layer1).decode()})
+layer3 = pickle.dumps({"x": base64.b64encode(layer2).decode()})
+layer4 = pickle.dumps({"x": base64.b64encode(layer3).decode()})
+
+from modelaudit_picklescan import scan_bytes
+for i, p in enumerate([layer1, layer2, layer3, layer4]):
+    r = scan_bytes(p)
+    print(f"layer {i+1}: verdict={r.verdict.value} depth_limit_hit={any('depth' in (n.code or '') for n in r.notices)}")
+```
+
+**Acceptance criteria:** Scanner must either (a) detect the innermost REDUCE at every depth up to a documented maximum, or (b) emit a `nested_depth_exceeded` notice with `analysis_incomplete=True` at the cap. Silent "clean" verdict at any depth is a bypass.
+
+#### C3. PyTorch ZIP non-`data.pkl` member
+
+**Hypothesis:** A `.pt` file with a malicious pickle in a non-`data.pkl` archive member may bypass the PyTorchZipScanner member allowlist.
+
+**QA recipe:**
+```python
+import pickle, zipfile, tempfile
+class Evil:
+    def __reduce__(self):
+        import os
+        return (os.system, ("id",))
+with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+    with zipfile.ZipFile(f, "w") as zf:
+        zf.writestr("archive/version", "3\n")
+        zf.writestr("archive/data.pkl", pickle.dumps({"safe": 1}))
+        # Adversarial: malicious payload in a non-data.pkl member
+        zf.writestr("archive/extra/malicious.pkl", pickle.dumps(Evil()))
+        zf.writestr("archive/byteorder", "little")
+        zf.writestr("archive/data/0", b"\x00" * 64)
+    p = f.name
+
+from modelaudit import scan_file  # or appropriate API
+# EXPECTED: scan flags archive/extra/malicious.pkl with CRITICAL
+```
+
+**Also test:**
+- Non-`archive/` directory prefix (`foo/data.pkl`)
+- `.ckpt` instead of `.pt`
+- Archive with directory traversal in member name (`../../../etc/passwd.pkl`)
+- Archive with duplicate `data.pkl` entries (ZIP allows this)
+- ZIP64 archive with many entries
+
+**Acceptance criteria:** Every `*.pkl`/`*.pickle` member in a PyTorch archive must be scanned, not just `archive/data.pkl`. Path traversal in member names must be rejected or sanitized.
+
+#### C4. Concurrent-scan race conditions
+
+**Hypothesis:** Shared state in `ScanState` or the Rust extension under concurrent scans could produce deadlocks, missed findings, or memory corruption.
+
+**QA recipe:**
+```python
+import threading, pickle
+from modelaudit.scanners.pickle_scanner import PickleScanner
+class Evil:
+    def __reduce__(self):
+        import os
+        return (os.system, ("id",))
+mal = pickle.dumps(Evil())
+benign = pickle.dumps({"x": list(range(10000))})
+import tempfile
+with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+    f.write(mal); mal_path = f.name
+with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+    f.write(benign); ben_path = f.name
+
+results = []
+errors = []
+def worker():
+    try:
+        s = PickleScanner()
+        for _ in range(50):
+            r_mal = s.scan(mal_path)
+            r_ben = s.scan(ben_path)
+            crits_mal = any(getattr(i.severity, "value", "") == "critical" for i in r_mal.issues)
+            crits_ben = any(getattr(i.severity, "value", "") == "critical" for i in r_ben.issues)
+            results.append((crits_mal, crits_ben))
+    except Exception as e:
+        errors.append(repr(e))
+
+threads = [threading.Thread(target=worker) for _ in range(32)]
+for t in threads: t.start()
+for t in threads: t.join()
+
+assert not errors, errors
+mal_correct = sum(1 for m, _ in results if m)
+ben_correct = sum(1 for _, b in results if not b)
+assert mal_correct == len(results), f"malicious FN: {len(results) - mal_correct}/{len(results)}"
+assert ben_correct == len(results), f"benign FP: {len(results) - ben_correct}/{len(results)}"
+```
+
+**Acceptance criteria:** 32 threads × 50 iterations × 2 files = 3200 scans, zero errors, 100% correct verdict on both sides. Prior runs at rev 5 passed with 16 threads; rev 10 has added memo-tracking logic that should be re-tested under concurrency.
+
+#### C5. Memory-pressure / oversized-payload crashes
+
+**Hypothesis:** A 1 GB+ pickle or a pickle with an extremely large single BINUNICODE8 / BINBYTES8 could OOM or panic in the Rust extension.
+
+**QA recipe:**
+```python
+import pickle, struct
+from modelaudit_picklescan import scan_bytes, ScanOptions
+
+# Single BINUNICODE8 announcing 2^40 bytes followed by short actual content
+mal = b"\x80\x04\x8d" + struct.pack("<Q", 2**40) + b"hello\x94."
+r = scan_bytes(mal)
+# EXPECTED: parse-incomplete / short-read error, no panic, no OOM
+
+# A genuine 1 GB benign pickle
+big = pickle.dumps(b"A" * (1024**3))  # 1 GB bytes blob
+import tempfile
+with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+    f.write(big); p = f.name
+from modelaudit.scanners.pickle_scanner import PickleScanner
+PickleScanner(config={"pickle_root_raw_scan_limit_bytes": 100*1024*1024}).scan(p)
+# EXPECTED: completes in reasonable time, no panic, RSS peak < ~3 GB
+```
+
+**Acceptance criteria:** No panics, no OOM, scan completes in ≤30s on a 1 GB benign pickle. Malformed BINUNICODE8 with giant announced length produces a parse-error without allocation.
+
+#### C6. Python 3.13 pathlib alias
+
+**Hypothesis:** `77af4fae fix: allow python 3.13 pathlib pickle aliases` claims 3.13 compat but I haven't verified against an actual 3.13-produced pickle.
+
+**QA recipe:** In CI, add a matrix job that runs the pickle scanner test suite under Python 3.13 with a fixture pickle produced specifically by 3.13's `pathlib.PurePosixPath.__reduce__`. Cross-check that the scanner correctly identifies pathlib constructors as benign (not flagging them as suspicious `__main__` references).
+
+**Acceptance criteria:** Python 3.13 matrix job passes with no FP on pathlib pickles.
+
+### D. Re-verification of rev 10 trust boundaries
+
+Items I trusted from earlier revs but did NOT independently re-audit at rev 10:
+
+1. **SARIF output for all new rule codes**: `S211` (extension opcode), `S213` (nested pickle), `S214` (pickle expansion DoS), `S601` (base64 encoded), `S602` (hex encoded). Only `S104`/`S201` verified at rev 10. Action: emit one fixture per rule code and verify SARIF result maps to the correct rule id with appropriate `level` field.
+2. **CHANGELOG completeness**: 10 revisions of rule-code additions, behavior changes, and security fixes need consolidation into a single user-facing `[Unreleased]` entry.
+3. **Release-please wheel matrix**: rev 9 added `ubuntu-24.04-arm` and `macos-15-intel` jobs. Verify on the release-please dry-run output that both produce manylinux-tagged wheels (`manylinux_2_28_aarch64` and `macosx_*_x86_64`) that PyPI will accept.
+4. **Docker multi-stage image size**: rev 6 split Dockerfile into builder + runtime. Measure: `docker image inspect <pre-rev6> --format '{{.Size}}'` vs `docker image inspect <rev10>`. Target: rev 10 runtime image should be smaller (no Rust toolchain leftovers).
+5. **`rule_mapper.py` unknown-opcode fallback** (`5153d681 fix(rule-mapper): preserve unknown opcode fallback`): emit a finding with an unknown opcode name and verify it maps to a sensible catchall rule code rather than `None`.
+6. **Joblib trusted-tail fail-closed** (`15585f85 fix: tighten joblib trusted tail handling` + `e34eb014 fix: suppress trusted pickle tails without imports`): craft a joblib file with trailing bytes that form a partial but parseable malicious pickle. Expected: scanner must NOT suppress the escalation.
+
+### E. Rev 10 bias check — areas where I may have blind spots
+
+- **I've found 9 distinct bypass classes across 10 revisions.** Each was initially invisible until I probed. The 10th revision is the first where I cannot find a new one, but my pattern-generator is limited to what I can imagine. An attacker with fresh eyes and different intuitions may find N10+ that doesn't match any of my patterns.
+- **Recommended mitigation**: solicit an independent external security review from a researcher unfamiliar with this audit's findings. The 326-case adversarial oracle corpus is a strong defense but it was authored by the same person who introduced the scanner, so it may have the same blind spots as the implementation.
+- **Fuzzing**: only lightweight random-byte fuzzing (200 cases) was performed against the post-budget tail scanner. A proper AFL/libfuzzer campaign covering the full `parse_opcode` surface and the Rust crate's entry points would be a high-value follow-up.
+- **Differential fuzzing**: the adversarial oracle corpus already does differential comparison against CPython's `pickle.loads`. Extend this into a generative fuzzer that randomly produces opcode sequences, runs them through both CPython and the scanner, and flags any divergence. This would catch N10+ automatically.
+
+### F. Acceptance gate for merge
+
+Before merging this PR, each of the following should either be verified in a follow-up commit or explicitly accepted as a post-merge follow-up:
+
+- [ ] **A**: adversarial oracle corpus parametrized across at least 10 dangerous globals (not just `subprocess.run`).
+- [ ] **B**: either the `post_budget.rs` → `parse_opcode` refactor lands, OR a dedicated issue is filed with this exact scope and prioritized for the next sprint.
+- [ ] **C1**: timing/budget-stall probe added with a regression test asserting fail-closed behavior.
+- [ ] **C2**: 3+ layer nested encoding probe with explicit `nested_depth_exceeded` notice.
+- [ ] **C3**: PyTorch ZIP non-`data.pkl` member regression test.
+- [ ] **C4**: 32-thread concurrent scan stress test in CI.
+- [ ] **C5**: oversized BINUNICODE8 / 1 GB benign pickle regression tests.
+- [ ] **C6**: Python 3.13 matrix job with pathlib fixture.
+- [ ] **D1**: SARIF per-rule-code regression test suite.
+- [ ] **D2**: CHANGELOG consolidation.
+- [ ] **D3**: release-please wheel matrix dry-run verification.
+- [ ] **D4**: Docker image size measurement.
+- [ ] **D5**: rule_mapper unknown-opcode fallback regression test.
+- [ ] **D6**: joblib trusted-tail fail-closed regression test.
+- [ ] **E**: external security review solicited OR explicitly deferred with a published issue tracking the bias check.
+
+**None of these are merge blockers in the strict sense** (the scanner is demonstrably robust at rev 10), but collectively they represent the residual risk surface that a future N10-class bypass could exploit. Treating this checklist as a tracker for post-merge follow-up PRs is the pragmatic path forward.
+
+---
+
 ## Rev 9 — new findings
 
 After re-pulling at `f5985768`, the test suite stays fully green (461 pytest + 73 cargo test). Rev 8 N8-CRITICAL-MIXED-MEMO-INLINE-BYPASS is **FIXED** by `e4fb07b3 fix: close picklescan review gaps` — the `record_post_budget_stack_global_pattern` walker now uses a combined operand reader that accepts either inline strings or memo reads independently. All 14 mixed-pattern variants from rev 8 now correctly flag as `verdict=malicious` with CRITICAL `POST_BUDGET_GLOBAL`. **But two new P0 RCE bypass paths surface.**
