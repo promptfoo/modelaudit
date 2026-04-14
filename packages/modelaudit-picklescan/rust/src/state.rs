@@ -29,8 +29,8 @@ use crate::report::{
 };
 use crate::stack::{
     collapse_tuple_values, operand_preview, pytorch_storage_key, resolve_global_operand,
-    stack_value_from_integer_arg, stack_value_from_text_arg, stack_value_preview,
-    stack_value_string, GlobalRef, StackValue,
+    stack_value_from_integer_arg, stack_value_from_text_arg, stack_value_preview, GlobalRef,
+    StackValue,
 };
 use crate::strings::suspicious_string_matches;
 
@@ -51,7 +51,7 @@ const STACK_GLOBAL_STRING_OPCODES: &[&str] = &[
 const REDUCE_OPCODES: &[&str] = &["REDUCE", "NEWOBJ", "NEWOBJ_EX", "OBJ", "INST", "BUILD"];
 
 enum LimitError {
-    OpcodeBudgetExceeded(Vec<u8>),
+    OpcodeBudgetExceeded,
     Timeout,
 }
 
@@ -266,7 +266,7 @@ impl<'a> ScanState<'a> {
                 if let Err(limit_error) = self.check_limits(&parsed) {
                     self.status = ScanStatus::Inconclusive;
                     match limit_error {
-                        LimitError::OpcodeBudgetExceeded(tail_prefix) => {
+                        LimitError::OpcodeBudgetExceeded => {
                             self.add_notice(Notice {
                                 message: format!(
                                     "Opcode analysis stopped after reaching max_opcodes={}",
@@ -287,11 +287,9 @@ impl<'a> ScanState<'a> {
                                     ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
                                 ],
                             });
-                            self.scan_post_budget_tail(parsed.pos, parsed.next, tail_prefix);
+                            self.scan_post_budget_tail(parsed.pos);
                         }
                         LimitError::Timeout => {
-                            let tail_prefix =
-                                post_budget_opcode_prefix(&parsed, &self.stack, self.payload);
                             self.add_notice(Notice {
                                 message: format!(
                                     "Opcode analysis timed out after {:.3} seconds",
@@ -312,7 +310,7 @@ impl<'a> ScanState<'a> {
                                     ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
                                 ],
                             });
-                            self.scan_post_budget_tail(parsed.pos, parsed.next, tail_prefix);
+                            self.scan_post_budget_tail(parsed.pos);
                         }
                     }
                     self.finish_analysis();
@@ -377,13 +375,9 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn check_limits(&self, opcode: &ParsedOpcode) -> Result<(), LimitError> {
+    fn check_limits(&self, _opcode: &ParsedOpcode) -> Result<(), LimitError> {
         if self.opcode_count >= self.options.max_opcodes {
-            return Err(LimitError::OpcodeBudgetExceeded(post_budget_opcode_prefix(
-                opcode,
-                &self.stack,
-                self.payload,
-            )));
+            return Err(LimitError::OpcodeBudgetExceeded);
         }
         if self.opcode_count % TIME_CHECK_INTERVAL_OPCODES == 0 && Instant::now() > self.deadline {
             return Err(LimitError::Timeout);
@@ -1915,33 +1909,39 @@ impl<'a> ScanState<'a> {
         outcome
     }
 
-    fn scan_post_budget_tail(
-        &mut self,
-        stream_offset: usize,
-        read_offset: usize,
-        tail_prefix: Vec<u8>,
-    ) {
+    fn scan_post_budget_tail(&mut self, read_offset: usize) {
         if self.options.post_budget_scan_bytes == 0 {
             return;
         }
-        let read_size = self
-            .options
-            .post_budget_scan_bytes
-            .saturating_sub(tail_prefix.len());
         let tail_start = read_offset.min(self.payload.len());
-        let tail_end = tail_start.saturating_add(read_size).min(self.payload.len());
-        let tail_prefix_len = tail_prefix.len();
-        let mut tail = tail_prefix;
-        tail.extend_from_slice(&self.payload[tail_start..tail_end]);
+        let tail_end = tail_start
+            .saturating_add(self.options.post_budget_scan_bytes)
+            .min(self.payload.len());
+        let tail_prefix_len = 0;
+        let tail = &self.payload[tail_start..tail_end];
         self.bytes_scanned = self
             .bytes_scanned
-            .max(stream_offset.saturating_add(tail.len()));
+            .max(tail_start.saturating_add(tail.len()));
 
-        for global_match in post_budget_global_matches(&tail, tail_prefix_len, |memo_index| {
-            resolve_global_operand(self.memo.get(&memo_index), self.payload)
-        }) {
+        let initial_stack = self
+            .stack
+            .iter()
+            .map(|value| post_budget_owned_stack_value(value, self.payload))
+            .collect::<Vec<_>>();
+        let memo_snapshot = self
+            .memo
+            .iter()
+            .map(|(index, value)| (*index, post_budget_owned_stack_value(value, self.payload)))
+            .collect::<HashMap<_, _>>();
+        for global_match in post_budget_global_matches(
+            tail,
+            tail_prefix_len,
+            &initial_stack,
+            memo_snapshot.len(),
+            |memo_index| memo_snapshot.get(&memo_index).cloned(),
+        ) {
             let absolute_position = post_budget_absolute_position(
-                stream_offset,
+                read_offset,
                 read_offset,
                 tail_prefix_len,
                 global_match.pattern_start,
@@ -1987,8 +1987,8 @@ impl<'a> ScanState<'a> {
         }
 
         let expansion_findings = detect_expansion_findings_in_tail(
-            &tail,
-            stream_offset,
+            tail,
+            read_offset,
             read_offset,
             tail_prefix_len,
             self.position_offset,
@@ -2208,39 +2208,25 @@ fn nested_scan_has_only_allowlisted_constructor_refs(scan: &ScanState<'_>) -> bo
     saw_import_reference
 }
 
-fn post_budget_opcode_prefix(
-    opcode: &ParsedOpcode,
-    stack: &[StackValue],
-    payload: &[u8],
-) -> Vec<u8> {
-    if opcode.name == "STACK_GLOBAL" && stack.len() >= 2 {
-        if let (Some(module), Some(name)) = (
-            stack_value_string(&stack[stack.len() - 2], payload),
-            stack_value_string(&stack[stack.len() - 1], payload),
-        ) {
-            let mut prefix = module.as_bytes().to_vec();
-            prefix.push(b'\n');
-            prefix.extend_from_slice(name.as_bytes());
-            prefix.push(b'\n');
-            return prefix;
+fn post_budget_owned_stack_value(value: &StackValue, payload: &[u8]) -> StackValue {
+    match value {
+        StackValue::TextSpan { start, end } if start <= end && *end <= payload.len() => {
+            StackValue::Text(String::from_utf8_lossy(&payload[*start..*end]).to_string())
         }
+        StackValue::Bytes { start, end } if start <= end && *end <= payload.len() => {
+            StackValue::Bytes {
+                start: *start,
+                end: *end,
+            }
+        }
+        StackValue::Tuple(values) => StackValue::Tuple(
+            values
+                .iter()
+                .map(|item| post_budget_owned_stack_value(item, payload))
+                .collect(),
+        ),
+        other => other.clone(),
     }
-
-    if !matches!(opcode.name, "GLOBAL" | "INST") {
-        return Vec::new();
-    }
-
-    let (module, name) = opcode.arg.global_parts(payload);
-    if module.is_empty() || name.is_empty() {
-        return Vec::new();
-    }
-    let mut prefix = Vec::new();
-    prefix.push(if opcode.name == "GLOBAL" { b'c' } else { b'i' });
-    prefix.extend_from_slice(module.as_bytes());
-    prefix.push(b'\n');
-    prefix.extend_from_slice(name.as_bytes());
-    prefix.push(b'\n');
-    prefix
 }
 
 fn advance_chars_from(value: &str, start: usize, count: usize) -> usize {
@@ -3360,8 +3346,8 @@ mod tests {
             detail_string(&finding.details, "pattern").as_deref(),
             Some("os\npopen")
         );
-        assert_eq!(detail_usize(&finding.details, "position"), Some(3));
-        assert_eq!(finding.location.as_deref(), Some("post-budget.pkl (pos 3)"));
+        assert_eq!(detail_usize(&finding.details, "position"), Some(2));
+        assert_eq!(finding.location.as_deref(), Some("post-budget.pkl (pos 2)"));
     }
 
     #[test]
@@ -3606,6 +3592,152 @@ mod tests {
                 detail_string(&finding.details, "pattern").as_deref(),
                 Some("subprocess\nrun")
             );
+        }
+    }
+
+    #[test]
+    fn post_budget_tail_detects_interleaved_memoized_stack_global_operands() {
+        let options = post_budget_prememo_options();
+        let variants = [
+            ("dup-pop", b"h\x00h\x0120\x93)R.".as_slice()),
+            ("mark-pop", b"h\x00(0h\x01\x93)R.".as_slice()),
+            ("none-pop", b"h\x00N0h\x01\x93)R.".as_slice()),
+        ];
+
+        for (label, tail) in variants {
+            let payload = pre_memoized_post_budget_stack_global_payload(tail);
+            let mut scan = ScanState::new(
+                format!("post-budget-interleaved-{label}.pkl"),
+                &payload,
+                &options,
+                Some(payload.len()),
+                0,
+                0,
+                None,
+            );
+
+            scan.run();
+
+            assert!(
+                scan.findings.iter().any(|finding| {
+                    finding.rule_code == Some("POST_BUDGET_GLOBAL")
+                        && finding.severity == "critical"
+                        && detail_string(&finding.details, "pattern").as_deref()
+                            == Some("subprocess\nrun")
+                }),
+                "missing interleaved post-budget global finding for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn post_budget_tail_treats_tuple_wrapped_stack_global_operands_as_malformed() {
+        let options = post_budget_prememo_options();
+        let payload = pre_memoized_post_budget_stack_global_payload(b"h\x00h\x01\x86\x93)R.");
+        let mut scan = ScanState::new(
+            "post-budget-tuple-wrapped-stack-global.pkl".to_string(),
+            &payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert!(
+            !scan.findings.iter().any(|finding| {
+                finding.rule_code == Some("POST_BUDGET_GLOBAL")
+                    && detail_string(&finding.details, "pattern").as_deref()
+                        == Some("subprocess\nrun")
+            }),
+            "tuple-wrapped STACK_GLOBAL operands are malformed and should not be reported as a resolved executable global"
+        );
+    }
+
+    fn tail_only_post_budget_payload(tail: &[u8]) -> Vec<u8> {
+        let mut payload = b"\x80\x04\x88".to_vec();
+        payload.extend_from_slice(tail);
+        payload
+    }
+
+    fn assert_post_budget_subprocess_run_finding(payload: &[u8], label: &str) {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: 2,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            format!("post-budget-tail-local-{label}.pkl"),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert!(
+            scan.findings.iter().any(|finding| {
+                finding.rule_code == Some("POST_BUDGET_GLOBAL")
+                    && finding.severity == "critical"
+                    && detail_string(&finding.details, "pattern").as_deref()
+                        == Some("subprocess\nrun")
+            }),
+            "missing tail-local memo post-budget global finding for {label}"
+        );
+    }
+
+    #[test]
+    fn post_budget_tail_tracks_tail_local_put_and_get_memos() {
+        let variants = [
+            ("binput-binget", {
+                let mut tail = short_binunicode(b"subprocess");
+                tail.extend_from_slice(b"q\x05");
+                tail.extend_from_slice(&short_binunicode(b"run"));
+                tail.extend_from_slice(b"q\x06h\x05h\x06\x93)R.");
+                tail
+            }),
+            ("put-get", {
+                let mut tail = short_binunicode(b"subprocess");
+                tail.extend_from_slice(b"p5\n");
+                tail.extend_from_slice(&short_binunicode(b"run"));
+                tail.extend_from_slice(b"p6\ng5\ng6\n\x93)R.");
+                tail
+            }),
+            ("long-binput-long-binget", {
+                let mut tail = short_binunicode(b"subprocess");
+                tail.push(b'r');
+                tail.extend_from_slice(&5u32.to_le_bytes());
+                tail.extend_from_slice(&short_binunicode(b"run"));
+                tail.push(b'r');
+                tail.extend_from_slice(&6u32.to_le_bytes());
+                tail.push(b'j');
+                tail.extend_from_slice(&5u32.to_le_bytes());
+                tail.push(b'j');
+                tail.extend_from_slice(&6u32.to_le_bytes());
+                tail.extend_from_slice(b"\x93)R.");
+                tail
+            }),
+            ("memoize-binget", {
+                let mut tail = short_binunicode(b"subprocess");
+                tail.push(0x94);
+                tail.extend_from_slice(&short_binunicode(b"run"));
+                tail.push(0x94);
+                tail.extend_from_slice(b"h\x00h\x01\x93)R.");
+                tail
+            }),
+        ];
+
+        for (label, tail) in variants {
+            let payload = tail_only_post_budget_payload(&tail);
+            assert_post_budget_subprocess_run_finding(&payload, label);
         }
     }
 

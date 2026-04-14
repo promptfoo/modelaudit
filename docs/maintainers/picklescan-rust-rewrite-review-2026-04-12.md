@@ -143,12 +143,12 @@ pickle.loads(mal)
 
 **Bypass matrix (all confirmed BYPASS):**
 
-| Interleave | Tail bytes | Verdict |
-|---|---|---|
-| `BINGET 0, BINGET 1, DUP, POP, STACK_GLOBAL` | `h\x00h\x012` `0` `\x93...` | ❌ bypass |
-| `BINGET 0, MARK, POP_MARK, BINGET 1, STACK_GLOBAL` | `h\x00(0h\x01\x93...` | ❌ bypass |
-| `BINGET 0, NONE, POP, BINGET 1, STACK_GLOBAL` | `h\x00N0h\x01\x93...` | ❌ bypass |
-| `BINGET 0, BINGET 1, TUPLE2, STACK_GLOBAL` | `h\x00h\x01\x86\x93...` | ❌ bypass |
+| Interleave                                         | Tail bytes                  | Verdict   |
+| -------------------------------------------------- | --------------------------- | --------- |
+| `BINGET 0, BINGET 1, DUP, POP, STACK_GLOBAL`       | `h\x00h\x012` `0` `\x93...` | ❌ bypass |
+| `BINGET 0, MARK, POP_MARK, BINGET 1, STACK_GLOBAL` | `h\x00(0h\x01\x93...`       | ❌ bypass |
+| `BINGET 0, NONE, POP, BINGET 1, STACK_GLOBAL`      | `h\x00N0h\x01\x93...`       | ❌ bypass |
+| `BINGET 0, BINGET 1, TUPLE2, STACK_GLOBAL`         | `h\x00h\x01\x86\x93...`     | ❌ bypass |
 
 **Root cause:** `read_post_budget_text_operand` and `read_post_budget_memo_read` in `post_budget.rs` both return the position of the byte immediately after the operand. The combined walker then expects the next byte (modulo MEMOIZE markers) to be either another operand or `\x93`. There's no provision for stack-effect-neutral opcodes like DUP/POP/MARK/POP_MARK/NONE/EMPTY_TUPLE/etc. between the operands.
 
@@ -189,6 +189,7 @@ pickle.loads(mal)
 ```
 
 **Root cause:** Two separate gaps:
+
 1. The all-inline walker `record_post_budget_stack_global_pattern` requires operands to be adjacent (modulo `\x94`). `q<u8>` BINPUT inserts a 2-byte gap between SHORT_BINUNICODE and the next operand → match breaks.
 2. The all-memo walker `record_post_budget_memo_stack_global_pattern` only resolves memo indices against `self.memo` populated during the in-budget walk. Memos created in the post-budget tail (by BINPUT) are never added to `self.memo` because the tail walker is a byte-pattern scanner, not an opcode runner.
 
@@ -212,15 +213,31 @@ pickle.loads(mal)
 
 ### Rev 9 release-readiness
 
-| Status | Severity | Item |
-|---|---|---|
-| ❌ | **P0 RCE BYPASS** | **N9-CRITICAL-INTERLEAVED-OPCODE-BYPASS** — DUP/POP/MARK/NONE between operands; 4 variants validated, end-to-end RCE |
-| ❌ | **P0 RCE BYPASS** | **N9-CRITICAL-PUT-GET-IN-TAIL-BYPASS** — fully memoize+retrieve in the tail, no pre-memo needed; end-to-end RCE |
-| ✅ | — | N8-CRITICAL-MIXED-MEMO-INLINE-BYPASS closed (14/14 variants detected) |
-| ✅ | — | rule-mapper unknown opcode fallback preserved |
-| ✅ | — | All test gates green: 461 pytest + 73 cargo test, ruff/mypy/clippy clean |
+| Status | Severity          | Item                                                                                                                 |
+| ------ | ----------------- | -------------------------------------------------------------------------------------------------------------------- |
+| ❌     | **P0 RCE BYPASS** | **N9-CRITICAL-INTERLEAVED-OPCODE-BYPASS** — DUP/POP/MARK/NONE between operands; 4 variants validated, end-to-end RCE |
+| ❌     | **P0 RCE BYPASS** | **N9-CRITICAL-PUT-GET-IN-TAIL-BYPASS** — fully memoize+retrieve in the tail, no pre-memo needed; end-to-end RCE      |
+| ✅     | —                 | N8-CRITICAL-MIXED-MEMO-INLINE-BYPASS closed (14/14 variants detected)                                                |
+| ✅     | —                 | rule-mapper unknown opcode fallback preserved                                                                        |
+| ✅     | —                 | All test gates green: 461 pytest + 73 cargo test, ruff/mypy/clippy clean                                             |
 
 **Verdict: STILL NOT MERGE READY.** Rev 9 fixed the rev 8 mixed memo+inline bypass but the post-budget walker is still architecturally a byte-pattern scanner that cannot keep up with arbitrary opcode shuffling between operands. The proper fix is to **re-use `parse_opcode` from `opcode.rs`** to re-parse the post-budget tail as a normal opcode stream, tracking stack + memo (seeded from `self.memo`), and emit findings whenever STACK_GLOBAL/REDUCE/OBJ/NEWOBJ/NEWOBJ_EX/INST resolves to a dangerous global. This sheds the entire `post_budget.rs` byte-pattern matcher in favor of the same logic the in-budget scanner already uses. Until then, this class of bypass will continue to surface in different forms at every revision.
+
+### Codex follow-up — Rev 9 fixed
+
+Both Rev 9 P0 findings are fixed after replacing the fragile adjacent-byte `STACK_GLOBAL` tail matcher with an opcode-aware post-budget interpreter:
+
+- **N9-CRITICAL-INTERLEAVED-OPCODE-BYPASS:** fixed. The post-budget path now reparses the bounded tail with `parse_opcode`, seeds stack state from the in-budget scan, and models stack effects for `DUP`, `POP`, `MARK`, `POP_MARK`, `NONE`, tuple/list/dict/set builders, memo reads/writes, `STACK_GLOBAL`, and REDUCE-class opcodes.
+- **N9-CRITICAL-PUT-GET-IN-TAIL-BYPASS:** fixed. The tail interpreter now maintains a tail-local memo overlay for `PUT`, `BINPUT`, `LONG_BINPUT`, and `MEMOIZE`, and resolves later `GET`, `BINGET`, and `LONG_BINGET` reads against that overlay before falling back to the seeded in-budget memo.
+- The budget-triggering opcode is now included in the post-budget tail window instead of starting after it, so limit exhaustion on `STACK_GLOBAL`, tail-local memo writes, or `GLOBAL`/`INST` cannot skip the opcode that matters.
+- Regression coverage added at the Rust engine, standalone Python API, and root `PickleScanner` wrapper levels for interleaved pre-memoized operands and tail-local memo write/read payloads.
+- The `BINGET 0, BINGET 1, TUPLE2, STACK_GLOBAL` row above is now explicitly modeled as malformed stack semantics, matching CPython's `UnpicklingError: STACK_GLOBAL requires str`; it is not reported as a resolved executable global.
+
+Focused verification:
+
+- `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml post_budget_tail -- --nocapture` passed, 11 tests.
+- `uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_post_budget_tail_detects_interleaved_prememoized_stack_global packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_post_budget_tail_tracks_tail_local_memo_writes -q` passed, 6 tests.
+- `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py::test_post_budget_scan_detects_interleaved_prememoized_stack_global_tail tests/scanners/test_pickle_scanner.py::test_post_budget_scan_tracks_tail_local_memo_stack_global_tail -q` passed, 6 tests.
 
 ---
 

@@ -606,10 +606,6 @@ fn read_line_raw_unicode(
     )?))
 }
 
-pub(crate) fn parse_pickle_string_literal(value: &[u8]) -> String {
-    String::from_utf8_lossy(&parse_pickle_string_literal_bytes(value)).to_string()
-}
-
 pub(crate) fn parse_pickle_string_literal_bytes(value: &[u8]) -> Vec<u8> {
     let mut start = 0usize;
     let mut end = value.len();

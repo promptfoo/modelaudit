@@ -705,6 +705,59 @@ def test_post_budget_scan_detects_mixed_prememoized_stack_global_tail(tmp_path: 
     assert result.success is False
 
 
+@pytest.mark.parametrize(
+    "tail",
+    [
+        b"h\x00h\x0120\x93)R.",
+        b"h\x00(0h\x01\x93)R.",
+        b"h\x00N0h\x01\x93)R.",
+    ],
+    ids=["dup-pop", "mark-pop", "none-pop"],
+)
+def test_post_budget_scan_detects_interleaved_prememoized_stack_global_tail(
+    tmp_path: Path,
+    tail: bytes,
+) -> None:
+    path = tmp_path / "post-budget-prememo-interleaved-stack-global.pkl"
+    path.write_bytes(_make_pre_memoized_post_budget_stack_global_payload(tail))
+
+    result = PickleScanner({"max_opcodes": 7, "post_budget_global_scan_limit_bytes": 4096}).scan(str(path))
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("pickle_rule_code") == "POST_BUDGET_GLOBAL"
+        and issue.details.get("module") == "subprocess"
+        and issue.details.get("name") == "run"
+        for issue in result.issues
+    ), result.issues
+    assert result.success is False
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        _short_binunicode(b"subprocess") + b"q\x05" + _short_binunicode(b"run") + b"q\x06h\x05h\x06\x93)R.",
+        _short_binunicode(b"subprocess") + b"p5\n" + _short_binunicode(b"run") + b"p6\ng5\ng6\n\x93)R.",
+        _short_binunicode(b"subprocess") + b"\x94" + _short_binunicode(b"run") + b"\x94h\x00h\x01\x93)R.",
+    ],
+    ids=["binput-binget", "put-get", "memoize-binget"],
+)
+def test_post_budget_scan_tracks_tail_local_memo_stack_global_tail(tmp_path: Path, tail: bytes) -> None:
+    path = tmp_path / "post-budget-tail-local-memo-stack-global.pkl"
+    path.write_bytes(b"\x80\x04\x88" + tail)
+
+    result = PickleScanner({"max_opcodes": 2, "post_budget_global_scan_limit_bytes": 4096}).scan(str(path))
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("pickle_rule_code") == "POST_BUDGET_GLOBAL"
+        and issue.details.get("module") == "subprocess"
+        and issue.details.get("name") == "run"
+        for issue in result.issues
+    ), result.issues
+    assert result.success is False
+
+
 def test_scan_bounds_follow_on_probe_recursion_for_pickle_like_binary_tail(tmp_path: Path) -> None:
     path = tmp_path / "binary-tail.pkl"
     path.write_bytes(pickle.dumps({"safe": True}, protocol=2) + (b"XYZNmore-binary-data" * 20))

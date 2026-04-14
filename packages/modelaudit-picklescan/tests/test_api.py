@@ -1437,6 +1437,64 @@ def test_scan_bytes_post_budget_tail_detects_mixed_prememoized_stack_global(tail
     )
 
 
+@pytest.mark.parametrize(
+    "tail",
+    [
+        b"h\x00h\x0120\x93)R.",
+        b"h\x00(0h\x01\x93)R.",
+        b"h\x00N0h\x01\x93)R.",
+    ],
+    ids=["dup-pop", "mark-pop", "none-pop"],
+)
+def test_scan_bytes_post_budget_tail_detects_interleaved_prememoized_stack_global(tail: bytes) -> None:
+    payload = _make_pre_memoized_post_budget_stack_global_payload(tail)
+
+    report = scan_bytes(
+        payload,
+        source="budget-prememo-interleaved-stack-global.pkl",
+        options=ScanOptions(max_opcodes=7, post_budget_scan_bytes=4096),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "POST_BUDGET_GLOBAL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "subprocess"
+        and finding.details.get("name") == "run"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        _short_binunicode(b"subprocess") + b"q\x05" + _short_binunicode(b"run") + b"q\x06h\x05h\x06\x93)R.",
+        _short_binunicode(b"subprocess") + b"p5\n" + _short_binunicode(b"run") + b"p6\ng5\ng6\n\x93)R.",
+        _short_binunicode(b"subprocess") + b"\x94" + _short_binunicode(b"run") + b"\x94h\x00h\x01\x93)R.",
+    ],
+    ids=["binput-binget", "put-get", "memoize-binget"],
+)
+def test_scan_bytes_post_budget_tail_tracks_tail_local_memo_writes(tail: bytes) -> None:
+    payload = b"\x80\x04\x88" + tail
+
+    report = scan_bytes(
+        payload,
+        source="budget-tail-local-memo-stack-global.pkl",
+        options=ScanOptions(max_opcodes=2, post_budget_scan_bytes=4096),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "POST_BUDGET_GLOBAL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "subprocess"
+        and finding.details.get("name") == "run"
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_handles_multiple_pickle_streams() -> None:
     payload = pickle.dumps({"a": 1}, protocol=4) + pickle.dumps(MaliciousPayload(), protocol=4)
 
