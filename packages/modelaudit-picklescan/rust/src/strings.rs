@@ -53,6 +53,10 @@ impl GetattrMatches {
 }
 
 pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
+    if value.len() >= 1024 && is_repeated_single_byte(value.as_bytes()) {
+        return Vec::new();
+    }
+
     let has_plain_seed = has_suspicious_ascii_seed(value.as_bytes());
     let has_encoded_seed = has_base64_dangerous_seed(value);
     if !has_plain_seed && !has_encoded_seed {
@@ -149,6 +153,13 @@ fn has_base64_dangerous_seed(value: &str) -> bool {
     BASE64_DANGEROUS_SEEDS
         .iter()
         .any(|seed| value.contains(seed))
+}
+
+pub(crate) fn is_repeated_single_byte(bytes: &[u8]) -> bool {
+    let Some(first) = bytes.first() else {
+        return false;
+    };
+    bytes.iter().all(|byte| byte == first)
 }
 
 fn encoded_dangerous_string_matches(value: &str) -> Vec<String> {

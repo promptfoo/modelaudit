@@ -10,9 +10,10 @@ use crate::expansion::{
 };
 use crate::nested::{
     decode_possible_encoded_pickle, detect_oversized_encoded_pickle_prefixes,
-    encoded_nested_literal_probe_windows, encoded_nested_window_char_limit, has_execution_opcode,
-    has_pickle_prefix, looks_like_pickle_payload, nested_pickle_probe_offsets,
-    pickle_payload_extent, truncated_pickle_prefix_requires_fail_closed,
+    encoded_literal_may_contain_pickle, encoded_nested_literal_probe_windows,
+    encoded_nested_window_char_limit, has_execution_opcode, has_pickle_prefix,
+    looks_like_pickle_payload, nested_pickle_probe_offsets, pickle_payload_extent,
+    truncated_pickle_prefix_requires_fail_closed,
 };
 use crate::nested_surface::{
     encoded_nested_payload_finding, is_allowlisted_nested_constructor_ref,
@@ -32,7 +33,7 @@ use crate::stack::{
     stack_value_from_integer_arg, stack_value_from_text_arg, stack_value_preview, GlobalRef,
     StackValue,
 };
-use crate::strings::suspicious_string_matches;
+use crate::strings::{is_repeated_single_byte, suspicious_string_matches};
 
 const MIN_SUSPICIOUS_LITERAL_SCAN_WINDOW_CHARS: usize = 8192;
 const SUSPICIOUS_LITERAL_SCAN_OVERLAP_CHARS: usize = 4096;
@@ -486,9 +487,12 @@ impl<'a> ScanState<'a> {
             }
             name if STACK_GLOBAL_STRING_OPCODES.contains(&name) => {
                 let value = opcode.arg.text(self.payload);
-                let suppress_hex_escape = self.is_data_only_encoded_nested_pickle_literal(&value);
-                self.scan_string_literal(&value, opcode.name, position, suppress_hex_escape);
-                self.scan_encoded_nested_pickle_literal(&value, position);
+                if !self.is_large_uninteresting_repeated_literal(&value) {
+                    let suppress_hex_escape = contains_escaped_hex_marker(&value)
+                        && self.is_data_only_encoded_nested_pickle_literal(&value);
+                    self.scan_string_literal(&value, opcode.name, position, suppress_hex_escape);
+                    self.scan_encoded_nested_pickle_literal(&value, position);
+                }
                 match opcode.name {
                     "BINSTRING" | "SHORT_BINSTRING" => {
                         if let Some((start, end)) = opcode.arg.byte_span(self.payload.len()) {
@@ -1136,7 +1140,17 @@ impl<'a> ScanState<'a> {
             .any(|(_, decoded)| !has_execution_opcode(&decoded))
     }
 
+    fn is_large_uninteresting_repeated_literal(&self, value: &str) -> bool {
+        value.len() >= 1024
+            && value.len() <= self.options.max_string_literal_scan_chars
+            && is_repeated_single_byte(value.as_bytes())
+    }
+
     fn scan_encoded_nested_pickle_literal(&mut self, value: &str, position: usize) {
+        if !encoded_literal_may_contain_pickle(value) {
+            return;
+        }
+
         let mut found_candidate = false;
         if value.len() <= self.options.max_string_literal_scan_chars {
             found_candidate |= self.scan_encoded_nested_pickle_candidate(value, position);
@@ -2252,6 +2266,10 @@ fn string_char_len(value: &str) -> usize {
     }
 }
 
+fn contains_escaped_hex_marker(value: &str) -> bool {
+    value.contains("\\x") || value.contains("\\X")
+}
+
 fn capitalize(value: &str) -> String {
     let mut chars = value.chars();
     match chars.next() {
@@ -2332,6 +2350,44 @@ mod tests {
                 && detail_string(&finding.details, "import_reference").as_deref()
                     == Some("os.system")
         }));
+    }
+
+    #[test]
+    fn large_repeated_literals_skip_expensive_text_and_encoded_probes_only_when_complete() {
+        let mut options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b".";
+        let scan = ScanState::new(
+            "large-repeated.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        assert!(scan.is_large_uninteresting_repeated_literal(&"A".repeat(1024 * 1024)));
+        assert!(!scan.is_large_uninteresting_repeated_literal(&"A".repeat(1023)));
+        assert!(!scan.is_large_uninteresting_repeated_literal("AAAos.system('id')AAA"));
+
+        options.max_string_literal_scan_chars = 8;
+        let truncated_scan = ScanState::new(
+            "large-repeated-truncated.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+        assert!(!truncated_scan.is_large_uninteresting_repeated_literal(&"A".repeat(1024)));
     }
 
     #[test]

@@ -12,7 +12,7 @@ pub(crate) fn decode_possible_encoded_pickle(
     max_nested_pickle_bytes: usize,
 ) -> Vec<(&'static str, Vec<u8>)> {
     let stripped = value.trim();
-    if stripped.len() < 16 {
+    if stripped.len() < 16 || !encoded_literal_may_contain_pickle(stripped) {
         return Vec::new();
     }
 
@@ -83,7 +83,7 @@ pub(crate) fn detect_oversized_encoded_pickle_prefixes(
     max_nested_pickle_bytes: usize,
 ) -> Vec<(&'static str, usize)> {
     let stripped = value.trim();
-    if stripped.len() < 16 {
+    if stripped.len() < 16 || !encoded_literal_may_contain_pickle(stripped) {
         return Vec::new();
     }
 
@@ -485,6 +485,29 @@ pub(crate) fn encoded_nested_literal_probe_windows(
     windows
 }
 
+pub(crate) fn encoded_literal_may_contain_pickle(value: &str) -> bool {
+    let stripped = value.trim();
+    if stripped.is_empty() {
+        return false;
+    }
+    if encoded_prefix_has_pickle_prefix(stripped) {
+        return true;
+    }
+
+    let suffix_probe = take_last_chars(stripped, ENCODED_LITERAL_PROBE_CHARS);
+    if encoded_prefix_has_pickle_prefix(&suffix_probe) {
+        return true;
+    }
+
+    let bytes = stripped.as_bytes();
+    for index in 0..bytes.len() {
+        if starts_encoded_pickle_at(bytes, index) && stripped.is_char_boundary(index) {
+            return true;
+        }
+    }
+    false
+}
+
 fn starts_encoded_pickle_at(bytes: &[u8], index: usize) -> bool {
     let suffix = &bytes[index..];
     match bytes[index] {
@@ -881,6 +904,7 @@ mod tests {
     fn encoded_prefix_gates_reject_benign_repeated_literals() {
         assert!(!base64_prefix_has_pickle_prefix("AAAAAAAAAAAAAAAA"));
         assert!(!hex_prefix_has_pickle_prefix("4141414141414141"));
+        assert!(!encoded_literal_may_contain_pickle(&"A".repeat(1024)));
         assert!(
             decode_possible_encoded_pickle(&"A".repeat(1024), TEST_MAX_NESTED_PICKLE_BYTES)
                 .is_empty()
@@ -904,6 +928,7 @@ mod tests {
         let value = format!("{}gAR9Lg=={}", "A".repeat(128), "B".repeat(128));
         let windows = encoded_nested_literal_probe_windows(&value, 64);
 
+        assert!(encoded_literal_may_contain_pickle(&value));
         assert!(windows.iter().any(|window| window.starts_with("gAR9Lg==")));
     }
 
