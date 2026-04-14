@@ -154,22 +154,23 @@ pickle.loads(mal)
 
 **Full bypass matrix (10 variants validated):**
 
-| Module operand | Name operand | Verdict |
-|---|---|---|
-| memo (BINGET 0) | inline SHORT_BINUNICODE | ❌ bypass |
-| inline SHORT_BINUNICODE | memo (BINGET 0) | ❌ bypass |
-| memo | inline SHORT_BINSTRING (`U`) | ❌ bypass |
-| memo | inline STRING text (`V<chars>\n`) | ❌ bypass |
-| memo + DUP/POP padding | memo | ❌ bypass |
-| memo (`subprocess`) | inline `run` | ❌ bypass (subprocess.run) |
-| memo (`os`) | inline `system` | ❌ bypass (os.system) |
-| memo (`builtins`) | inline `eval` | ❌ bypass (builtins.eval) |
-| memo (`importlib`) | inline `reload` | ❌ bypass (importlib.reload) |
-| memo (`marshal`) | inline `loads` | ❌ bypass (marshal.loads) |
+| Module operand          | Name operand                      | Verdict                      |
+| ----------------------- | --------------------------------- | ---------------------------- |
+| memo (BINGET 0)         | inline SHORT_BINUNICODE           | ❌ bypass                    |
+| inline SHORT_BINUNICODE | memo (BINGET 0)                   | ❌ bypass                    |
+| memo                    | inline SHORT_BINSTRING (`U`)      | ❌ bypass                    |
+| memo                    | inline STRING text (`V<chars>\n`) | ❌ bypass                    |
+| memo + DUP/POP padding  | memo                              | ❌ bypass                    |
+| memo (`subprocess`)     | inline `run`                      | ❌ bypass (subprocess.run)   |
+| memo (`os`)             | inline `system`                   | ❌ bypass (os.system)        |
+| memo (`builtins`)       | inline `eval`                     | ❌ bypass (builtins.eval)    |
+| memo (`importlib`)      | inline `reload`                   | ❌ bypass (importlib.reload) |
+| memo (`marshal`)        | inline `loads`                    | ❌ bypass (marshal.loads)    |
 
 All 10 dangerous globals × pattern combinations bypass. By contrast the same-source patterns (all-inline OR all-memo) are correctly detected.
 
 **Required fix:** In `post_budget.rs`, add a third walk that handles a mixed sequence:
+
 1. Read first operand: try `read_post_budget_text_operand` first, then fall back to `read_post_budget_memo_read` + `resolve_memo_string`.
 2. Read second operand: same.
 3. Skip MEMOIZE bytes between operands.
@@ -198,15 +199,15 @@ Or, simpler: rewrite `record_post_budget_stack_global_pattern` to accept a gener
 
 ### Rev 8 release-readiness
 
-| Status | Severity | Item |
-|---|---|---|
-| ❌ | **P0 RCE BYPASS** | **N8-CRITICAL-MIXED-MEMO-INLINE-BYPASS** — mixed memo+inline patterns; 10/10 variants validated end-to-end |
-| ✅ | — | N7-CRITICAL-PRE-MEMO-BYPASS (same-source case) closed |
-| ✅ | — | N6-SKIP-PARTIAL closed (1.8 MB realistic PyTorch state dict: 0.97s → 0.20s) |
-| ✅ | — | Rust crate modularized (5 new source files, no behavior regression) |
-| ✅ | — | Protocol 0 post-budget STACK_GLOBAL coverage |
-| ✅ | — | Python 3.13 pickle alias compat |
-| ✅ | — | All test gates green: 453 pytest + 72 cargo test, ruff/mypy/clippy clean |
+| Status | Severity          | Item                                                                                                       |
+| ------ | ----------------- | ---------------------------------------------------------------------------------------------------------- |
+| ❌     | **P0 RCE BYPASS** | **N8-CRITICAL-MIXED-MEMO-INLINE-BYPASS** — mixed memo+inline patterns; 10/10 variants validated end-to-end |
+| ✅     | —                 | N7-CRITICAL-PRE-MEMO-BYPASS (same-source case) closed                                                      |
+| ✅     | —                 | N6-SKIP-PARTIAL closed (1.8 MB realistic PyTorch state dict: 0.97s → 0.20s)                                |
+| ✅     | —                 | Rust crate modularized (5 new source files, no behavior regression)                                        |
+| ✅     | —                 | Protocol 0 post-budget STACK_GLOBAL coverage                                                               |
+| ✅     | —                 | Python 3.13 pickle alias compat                                                                            |
+| ✅     | —                 | All test gates green: 453 pytest + 72 cargo test, ruff/mypy/clippy clean                                   |
 
 **Verdict: STILL NOT MERGE READY.** Rev 8 fixed both rev 7 P0 items (pre-memo bypass and hot-path skip) but introduced no protection for mixed memo+inline operand patterns. The fix is straightforward: refactor `post_budget.rs` to use a single combined operand-reader that tries text first, then memo lookup. The scanner already has all the data — `read_post_budget_text_operand` and `read_post_budget_memo_read` already exist; they just need to be composed into one mixed walk instead of two separate walks.
 
