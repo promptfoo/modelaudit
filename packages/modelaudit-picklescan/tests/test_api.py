@@ -1284,6 +1284,34 @@ def test_scan_bytes_post_budget_tail_detects_default_protocol_stack_global() -> 
     )
 
 
+@pytest.mark.parametrize(
+    "payload_suffix",
+    [
+        b"S'sub\\x70rocess'\nS'run'\n\x93)R.",
+        b"Vsub\\u0070rocess\nVrun\n\x93)R.",
+    ],
+    ids=["string-escape", "unicode-escape"],
+)
+def test_scan_bytes_post_budget_tail_detects_protocol0_stack_global(payload_suffix: bytes) -> None:
+    payload = b"\x80\x04\x88\x88" + payload_suffix
+
+    report = scan_bytes(
+        payload,
+        source="budget-protocol0-stack-global.pkl",
+        options=ScanOptions(max_opcodes=2, post_budget_scan_bytes=4096),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "POST_BUDGET_GLOBAL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "subprocess"
+        and finding.details.get("name") == "run"
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_post_budget_tail_detects_prememoized_stack_global() -> None:
     payload = _make_pre_memoized_post_budget_stack_global_payload(b"h\x00h\x01\x93)R.")
 

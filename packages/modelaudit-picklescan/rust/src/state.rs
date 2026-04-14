@@ -11,7 +11,10 @@ use crate::nested::{
     has_pickle_prefix, looks_like_pickle_payload, nested_pickle_probe_offsets,
     pickle_payload_extent, truncated_pickle_prefix_requires_fail_closed,
 };
-use crate::opcode::{parse_opcode, ArgValue, ParseError, ParsedOpcode};
+use crate::opcode::{
+    decode_raw_unicode_escape, parse_opcode, parse_pickle_string_literal, ArgValue, ParseError,
+    ParsedOpcode,
+};
 use crate::policy::global_severity;
 use crate::report::{
     detail_string, detail_usize, notice_to_detail_value, scan_error_to_detail_value, DetailValue,
@@ -2948,8 +2951,8 @@ fn record_post_budget_stack_global_pattern(
         return;
     }
     record_post_budget_global(
-        module,
-        name,
+        module.as_ref(),
+        name.as_ref(),
         index,
         stack_global_position.saturating_add(1),
         tail,
@@ -3017,9 +3020,17 @@ fn read_post_budget_memo_read(tail: &[u8], index: usize) -> Option<(i64, usize)>
     }
 }
 
-fn read_post_budget_text_operand(tail: &[u8], index: usize) -> Option<(&str, usize)> {
+fn read_post_budget_text_operand(tail: &[u8], index: usize) -> Option<(Cow<'_, str>, usize)> {
     let opcode = *tail.get(index)?;
     let (start, end) = match opcode {
+        b'S' => {
+            let start = index.saturating_add(1);
+            let end = find_byte_from(tail, start, b'\n')?;
+            return Some((
+                Cow::Owned(parse_pickle_string_literal(tail.get(start..end)?)),
+                end.saturating_add(1),
+            ));
+        }
         b'U' | 0x8c => {
             let len = *tail.get(index.saturating_add(1))? as usize;
             let start = index.saturating_add(2);
@@ -3048,12 +3059,15 @@ fn read_post_budget_text_operand(tail: &[u8], index: usize) -> Option<(&str, usi
         b'V' => {
             let start = index.saturating_add(1);
             let end = find_byte_from(tail, start, b'\n')?;
-            (start, end)
+            return Some((
+                Cow::Owned(decode_raw_unicode_escape(tail.get(start..end)?)),
+                end.saturating_add(1),
+            ));
         }
         _ => return None,
     };
     let value = std::str::from_utf8(tail.get(start..end)?).ok()?;
-    Some((value, end))
+    Some((Cow::Borrowed(value), end))
 }
 
 fn skip_post_budget_memoize(tail: &[u8], mut index: usize) -> usize {
@@ -4215,6 +4229,14 @@ mod tests {
             (
                 "short-binunicode",
                 b"\x8c\nsubprocess\x94\x8c\x03run\x94\x93)R.".to_vec(),
+            ),
+            (
+                "protocol0-string",
+                b"S'sub\\x70rocess'\nS'run'\n\x93)R.".to_vec(),
+            ),
+            (
+                "protocol0-unicode",
+                b"Vsub\\u0070rocess\nVrun\n\x93)R.".to_vec(),
             ),
             ("binunicode", {
                 let mut payload = Vec::new();

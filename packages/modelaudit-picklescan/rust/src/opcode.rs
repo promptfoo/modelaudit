@@ -584,7 +584,7 @@ fn read_line_raw_unicode(
     )?))
 }
 
-fn parse_pickle_string_literal(value: &[u8]) -> String {
+pub(crate) fn parse_pickle_string_literal(value: &[u8]) -> String {
     let mut start = 0usize;
     let mut end = value.len();
     while start < end && value[start].is_ascii_whitespace() {
@@ -602,7 +602,7 @@ fn parse_pickle_string_literal(value: &[u8]) -> String {
     String::from_utf8_lossy(&value[start..end]).to_string()
 }
 
-fn decode_raw_unicode_escape(value: &[u8]) -> String {
+pub(crate) fn decode_raw_unicode_escape(value: &[u8]) -> String {
     let mut decoded = String::new();
     let mut index = 0usize;
     while index < value.len() {
