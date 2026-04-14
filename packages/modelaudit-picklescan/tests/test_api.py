@@ -29,6 +29,21 @@ EXPECTED_SYSTEM_GLOBAL = "nt.system" if os.name == "nt" else "posix.system"
 SYSTEM_GLOBALS = frozenset({"nt.system", "os.system", "posix.system"})
 
 
+def _short_binunicode(data: bytes) -> bytes:
+    if len(data) > 0xFF:
+        raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+def _make_pre_memoized_post_budget_stack_global_payload(tail: bytes) -> bytes:
+    payload = bytearray(b"\x80\x04")
+    payload += _short_binunicode(b"subprocess") + b"\x94"
+    payload += _short_binunicode(b"run") + b"\x94"
+    payload += b"\x880" * 4
+    payload += tail
+    return bytes(payload)
+
+
 def _make_opcode_padding_stream(opcode_pairs: int) -> bytes:
     return b"\x80\x02" + (b"K\x010" * opcode_pairs) + b"."
 
@@ -1265,6 +1280,26 @@ def test_scan_bytes_post_budget_tail_detects_default_protocol_stack_global() -> 
         finding.rule_code == "POST_BUDGET_GLOBAL"
         and finding.severity == Severity.CRITICAL
         and f"{finding.details.get('module')}.{finding.details.get('name')}" in SYSTEM_GLOBALS
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_post_budget_tail_detects_prememoized_stack_global() -> None:
+    payload = _make_pre_memoized_post_budget_stack_global_payload(b"h\x00h\x01\x93)R.")
+
+    report = scan_bytes(
+        payload,
+        source="budget-prememo-stack-global.pkl",
+        options=ScanOptions(max_opcodes=7, post_budget_scan_bytes=4096),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "POST_BUDGET_GLOBAL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "subprocess"
+        and finding.details.get("name") == "run"
         for finding in report.findings
     )
 

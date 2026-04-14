@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **pickle:** increase Rust stream read chunks to reduce scan overhead on large file and archive-member inputs
 - **pickle:** store Rust byte stack operands as source spans instead of copied previews to reduce large-pickle scan overhead
+- **pickle:** skip no-seed raw-text and CVE fallback passes on clean Rust-complete pickle scans, tightening benign state-dict CLI performance while preserving targeted raw-detector positives
 - **pickle:** document and pin parse-incomplete tail suppression to trusted pickle boundaries without dangerous import references; parse failures with security findings or dangerous imports still fail closed
 - **security:** temporarily bump the optional ONNX dependency to `1.21.0rc3`, which removes the vulnerable `onnx.hub` module flagged by CVE-2026-28500.
 
@@ -54,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **pickle:** detect modern `STACK_GLOBAL`, `INST`, and copyreg extension references in post-budget pickle tails, avoid a second Rust-boundary copy of Python byte payloads, and skip expensive raw detectors for realistic benign PyTorch state-dict key streams
 - **pickle:** route crafted protocol-1 binary pickle headers and nested protocol-1 payload prefixes through the same scanner paths as newer binary protocols
 - **pickle:** enforce PyTorch ZIP entry limits with a bounded EOCD preflight before opening over-cap archives
+- **pickle:** resolve memoized `GET`/`BINGET`/`LONG_BINGET` operands in post-budget `STACK_GLOBAL` tails so pre-memoized dangerous globals cannot bypass the Rust scanner
 - **numpy:** propagate incomplete embedded-pickle scan status from object-dtype `.npy` payloads so partial recursive pickle coverage fails closed
 - **license:** bound binary header scans and reuse compiled patterns to avoid full-file regex passes on large model archives
 - **security:** stop iterating malformed TFLite models after excessive subgraph counts are detected

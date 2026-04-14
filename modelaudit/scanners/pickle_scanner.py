@@ -29,6 +29,7 @@ _KNOWN_PICKLE_EXTENSIONS = frozenset({".pkl", ".pickle", ".dill", ".joblib"})
 _PYTORCH_CONTAINER_EXTENSIONS = frozenset({".bin", ".pt", ".pth", ".ckpt", ".pkl"})
 _BASE64_TOKEN_RE = re.compile(rb"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{10,}={0,2}(?![A-Za-z0-9+/=])")
 _HEX_TOKEN_RE = re.compile(rb"(?<![A-Fa-f0-9])[A-Fa-f0-9]{20,}(?![A-Fa-f0-9])")
+_IPV4_DOT_DIGIT_RE = re.compile(rb"\d\.\d")
 _MAX_RAW_ENCODED_TOKENS = 64
 _MAX_RAW_ENCODED_BYTES = 1024 * 1024
 _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES = 4096
@@ -110,6 +111,26 @@ _RAW_TEXT_TOKEN_INDICATORS: tuple[tuple[bytes, str, str], ...] = (
 )
 _RAW_IMPORTLIB_METHODS: tuple[bytes, ...] = (b"import_module", b"reload", b"find_loader", b"load_module")
 _RAW_WEBBROWSER_METHODS: tuple[bytes, ...] = (b"open", b"open_new", b"open_new_tab")
+_RAW_TEXT_SCAN_SEEDS: tuple[bytes, ...] = (
+    b"__import__",
+    b"commands",
+    b"eval",
+    b"exec",
+    b"find_loader",
+    b"getoutput",
+    b"getstatusoutput",
+    b"import",
+    b"import_module",
+    b"importlib",
+    b"load_module",
+    b"popen",
+    b"reload",
+    b"runpy",
+    b"spawn",
+    b"subprocess",
+    b"system",
+    b"webbrowser",
+)
 _SECRET_SCAN_SEEDS: tuple[bytes, ...] = (
     b"://",
     b"-----begin dsa private key-----",
@@ -244,6 +265,49 @@ _JIT_SCAN_SEEDS: tuple[bytes, ...] = (
     b"urllib.",
 )
 _EXPENSIVE_RAW_SCAN_SEEDS = tuple(dict.fromkeys(_SECRET_SCAN_SEEDS + _NETWORK_SCAN_SEEDS + _JIT_SCAN_SEEDS))
+_CVE_RAW_SCAN_SEEDS: tuple[bytes, ...] = (
+    b"__import__",
+    b"_rebuild_tensor",
+    b"bfloat16storage",
+    b"builtins.eval",
+    b"builtins.exec",
+    b"compile",
+    b"deserializ",
+    b"element_size",
+    b"eval",
+    b"exec",
+    b"floatstorage",
+    b"halfstorage",
+    b"jit.annotations",
+    b"joblib",
+    b"longstorage",
+    b"nbytes",
+    b"numel",
+    b"numpy_pickle",
+    b"numpyarraywrapper",
+    b"os.system",
+    b"parse_type_line",
+    b"pickle.load",
+    b"pythonudf",
+    b"read_array",
+    b"remote_module_pickled",
+    b"remotemodule",
+    b"rpc_async",
+    b"rpc_sync",
+    b"setitem",
+    b"setitems",
+    b"sklearn",
+    b"storage_offset",
+    b"storage_size",
+    b"subprocess",
+    b"torch._utils",
+    b"torch.distributed.rpc",
+    b"torch.jit.annotations",
+    b"torch.storage",
+    b"unpickl",
+    b"untyped_storage",
+)
+_COPYREG_EXTENSION_OPCODES = (b"\x82", b"\x83", b"\x84")
 
 
 @dataclass(frozen=True)
@@ -539,6 +603,14 @@ def _contains_any_seed_lowered(lower_data: bytes, seeds: tuple[bytes, ...]) -> b
     return any(seed in lower_data for seed in seeds)
 
 
+def _has_raw_text_indicator_shape(data: bytes, lower_data: bytes, *, rust_clean: bool) -> bool:
+    if _contains_any_seed_lowered(lower_data, _RAW_TEXT_SCAN_SEEDS):
+        return True
+    if rust_clean:
+        return False
+    return b"R" in data and any(opcode in data for opcode in _COPYREG_EXTENSION_OPCODES)
+
+
 def _has_alnum_secret_shape(data: bytes) -> bool:
     lower = data.lower()
     if not _contains_any_seed_lowered(lower, _SECRET_SHAPE_KEYWORDS):
@@ -549,7 +621,9 @@ def _has_alnum_secret_shape(data: bytes) -> bool:
 def _has_domain_or_ip_shape(data: bytes) -> bool:
     if b"://" in data:
         return True
-    return _has_domain_with_path_shape(data) or _has_ipv4_shape(data)
+    if b"/" in data and _has_domain_with_path_shape(data):
+        return True
+    return _IPV4_DOT_DIGIT_RE.search(data) is not None and _has_ipv4_shape(data)
 
 
 def _has_domain_with_path_shape(data: bytes) -> bool:
@@ -1738,6 +1812,9 @@ class PickleScanner(BaseScanner):
 
     def _scan_raw_text_indicators(self, data: bytes, result: ScanResult, source: str) -> None:
         lower = data.lower()
+        if not _has_raw_text_indicator_shape(data, lower, rust_clean=self._rust_scan_completed_cleanly(result)):
+            result.metadata["pickle_raw_text_detector_skipped"] = True
+            return
         documentation_spans = _documentation_literal_spans(data)
         indicators: list[tuple[str, dict[str, Any]]] = []
         warning_indicators: list[tuple[str, dict[str, Any]]] = []
@@ -1959,30 +2036,37 @@ class PickleScanner(BaseScanner):
 
     def _analyze_cve_patterns(self, data: bytes, result: ScanResult, source: str | None = None) -> None:
         """Add CVE attribution checks from a bounded raw pickle scan window."""
+        opcode_counts = _result_opcode_counts(result)
+        has_setitem_opcode = opcode_counts.get("SETITEM", 0) > 0 or opcode_counts.get("SETITEMS", 0) > 0
+        import_references = _result_import_references(result)
+        has_dangerous_system_global = any(
+            reference.get("import_reference") in {"os.system", "posix.system", "nt.system"}
+            for reference in import_references
+        )
+        lower = data.lower()
+        if not _contains_any_seed_lowered(lower, _CVE_RAW_SCAN_SEEDS) and not (
+            has_setitem_opcode and has_dangerous_system_global
+        ):
+            result.metadata["pickle_cve_raw_detector_skipped"] = True
+            return
+
         try:
             from modelaudit.detectors.cve_patterns import analyze_cve_patterns
         except ImportError:
             return
 
-        text = data.decode("utf-8", errors="ignore")
+        text = lower.decode("utf-8", errors="ignore")
         try:
             attributions = analyze_cve_patterns(text, data)
         except Exception as error:
             logger.warning("Error checking pickle CVE patterns: %s", error)
             return
 
-        opcode_counts = _result_opcode_counts(result)
-        has_setitem_opcode = opcode_counts.get("SETITEM", 0) > 0 or opcode_counts.get("SETITEMS", 0) > 0
-        import_references = _result_import_references(result)
         has_rebuild_tensor_setitem_abuse = (
             _pickle_has_rebuild_tensor_setitem_abuse(data) if has_setitem_opcode else False
         )
         has_rebuild_tensor_literal = _pickle_has_parsed_rebuild_tensor_literal(data) if has_setitem_opcode else False
         has_cve_2026_setitem_evidence = has_rebuild_tensor_setitem_abuse or has_rebuild_tensor_literal
-        has_dangerous_system_global = any(
-            reference.get("import_reference") in {"os.system", "posix.system", "nt.system"}
-            for reference in import_references
-        )
         has_dangerous_system_setitem_abuse = (
             _pickle_has_dangerous_system_setitem_abuse(data)
             if has_setitem_opcode and has_dangerous_system_global

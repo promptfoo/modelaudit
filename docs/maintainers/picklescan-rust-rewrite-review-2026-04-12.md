@@ -8,7 +8,11 @@ This review combines five specialized agents (Rust core, Python integration, tes
 
 On the repo's own 21 exploit fixtures and 2 safe samples the scanner is **0 FN / 0 FP** across every revision.
 
-> **Rev 7 release-readiness verdict: STILL NOT READY.** Rev 6's N6-CRITICAL-RCE-BYPASS-V2 is **FIXED** for all 5 string-push opcode variants (SHORT_BINUNICODE / BINUNICODE / BINUNICODE8 / SHORT_BINSTRING / BINSTRING) and all 11 tested dangerous globals now correctly detected. The default `pickle.dumps(evil_obj)` payload past the 1M opcode budget is CRITICAL `POST_BUDGET_GLOBAL`. OBJ / NEWOBJ_EX post-budget are also detected via the reduce-class-byte proximity check. **But a new P0 surfaced**: **N7-CRITICAL-PRE-MEMO-BYPASS**. An attacker who memoizes dangerous module/name strings BEFORE the 1M opcode budget exhausts and then uses `BINGET`/`LONG_BINGET`/`GET` to retrieve them past budget followed by `STACK_GLOBAL + REDUCE` completely bypasses the post-budget tail scan. End-to-end validated: `pickle.loads(mal)` actually executes `subprocess.run(['id'])` and prints `uid=501(mdangelo)...` to stdout; scanner reports `verdict=unknown, findings=0, criticals=0, warnings=0`.
+> **Original rev 7 release-readiness verdict: STILL NOT READY.** Rev 6's N6-CRITICAL-RCE-BYPASS-V2 is **FIXED** for all 5 string-push opcode variants (SHORT_BINUNICODE / BINUNICODE / BINUNICODE8 / SHORT_BINSTRING / BINSTRING) and all 11 tested dangerous globals now correctly detected. The default `pickle.dumps(evil_obj)` payload past the 1M opcode budget is CRITICAL `POST_BUDGET_GLOBAL`. OBJ / NEWOBJ_EX post-budget are also detected via the reduce-class-byte proximity check. **But a new P0 surfaced**: **N7-CRITICAL-PRE-MEMO-BYPASS**. An attacker who memoizes dangerous module/name strings BEFORE the 1M opcode budget exhausts and then uses `BINGET`/`LONG_BINGET`/`GET` to retrieve them past budget followed by `STACK_GLOBAL + REDUCE` completely bypasses the post-budget tail scan. End-to-end validated: `pickle.loads(mal)` actually executes `subprocess.run(['id'])` and prints `uid=501(mdangelo)...` to stdout; scanner reports `verdict=unknown, findings=0, criticals=0, warnings=0`.
+>
+> **Codex follow-up (2026-04-13): N7-CRITICAL-PRE-MEMO-BYPASS is fixed after this rev 7 audit snapshot.** The Rust post-budget tail scanner now resolves post-budget `GET` / `BINGET` / `LONG_BINGET` operands through the already-populated memo table when two memo reads feed `STACK_GLOBAL`, then applies the same policy and REDUCE-class proximity checks as inline string operands. Coverage includes Rust unit tests for all three memo-read opcodes and REDUCE/OBJ/NEWOBJ/NEWOBJ_EX proximity, standalone Python API coverage, root `PickleScanner` coverage, and a default 1,000,000-opcode reproducer that now returns `verdict=malicious` with CRITICAL `POST_BUDGET_GLOBAL subprocess.run`.
+>
+> **Codex follow-up (2026-04-13): N6-SKIP-PARTIAL is fixed after this rev 7 audit snapshot.** The current branch no longer reproduces the rev 7 secrets/network/JIT raw-detector miss on realistic ML pickles. It now globally skips expensive raw detectors for clean Rust-complete pickles without detector seeds, skips legacy raw-text/CVE fallback passes on the same clean/no-seed path, and uses a cheaper domain/IP shape prefilter so dotted tensor keys do not force network scanning. Targeted timing probe: `torch.layer.*.weight` 20k state dict median **0.423 s → 0.283 s**; `model.layers.*.self_attn.q_proj.weight` 50k state dict median **1.259 s → 0.849 s**. Both record `pickle_expensive_raw_detectors_skipped=True`, `pickle_raw_text_detector_skipped=True`, `pickle_cve_raw_detector_skipped=True`, and no per-detector secrets/network/JIT execution.
 
 ## Revision history
 
@@ -135,15 +139,16 @@ pickle.loads(mal)
 
 **Full bypass matrix for pre-memo + GET past budget:**
 
-| GET opcode variant | Verdict |
-|---|---|
-| `BINGET` (`h<u8>`) + STACK_GLOBAL + REDUCE | ❌ **bypass** |
+| GET opcode variant                                  | Verdict       |
+| --------------------------------------------------- | ------------- |
+| `BINGET` (`h<u8>`) + STACK_GLOBAL + REDUCE          | ❌ **bypass** |
 | `LONG_BINGET` (`j<u32 le>`) + STACK_GLOBAL + REDUCE | ❌ **bypass** |
-| `GET` (text `g<int>\n`) + STACK_GLOBAL + REDUCE | ❌ **bypass** |
-| `BINGET` + STACK_GLOBAL + OBJ | ❌ **bypass** |
-| `BINGET` + STACK_GLOBAL + NEWOBJ | ❌ **bypass** |
+| `GET` (text `g<int>\n`) + STACK_GLOBAL + REDUCE     | ❌ **bypass** |
+| `BINGET` + STACK_GLOBAL + OBJ                       | ❌ **bypass** |
+| `BINGET` + STACK_GLOBAL + NEWOBJ                    | ❌ **bypass** |
 
 **Full `PickleScanner().scan()` result on the validated payload:**
+
 ```
 success=False
 total issues: 1
@@ -155,11 +160,20 @@ sev=info rule=S902 msg=Opcode analysis stopped after reaching max_opcodes=100000
 
 **Required fix:** When encountering a `BINGET`/`LONG_BINGET`/`GET` opcode in the post-budget tail, look up the memoized `StackValue` from `self.memo` (which already contains the pre-budget-populated string literals). If the GET resolves to a string, use it as the module operand; if two consecutive GETs precede a `STACK_GLOBAL` (`\x93`), resolve both from memo and run them through `global_severity()`. The scanner already has all the data it needs — `self.memo` is built during the in-budget walk — the post-budget tail scan just doesn't consult it.
 
+**Codex follow-up implementation:** Implemented the direct fix rather than the over-eager memo-table approximation. `scan_post_budget_tail` passes `self.memo` and the original payload into `post_budget_global_matches`; `record_post_budget_memo_stack_global_pattern` parses `GET`, `BINGET`, and `LONG_BINGET` tail operands, resolves memoized `Text`/`TextSpan` values, requires a following `STACK_GLOBAL`, and reuses `record_post_budget_global` so severity, deduping, location, and REDUCE-class promotion stay aligned with inline post-budget globals.
+
 **Alternative / simpler fix:** Before entering the post-budget tail scan, iterate `self.memo` looking for any entry whose `StackValue` is a `Text` / `TextSpan` containing a module/name pair that `global_severity()` considers dangerous. Emit a CRITICAL immediately, regardless of whether those memos are ever GET'd in the tail. (This is over-eager — a pickle might memo 'subprocess' innocently — but it's a safe over-approximation for the post-budget case where analysis is already incomplete.)
 
 **Attacker effort to exploit: trivial.** Replace `pickle.dumps(evil_obj)` with a small custom encoder that emits the pre-memo prefix and cheap filler. No protocol knowledge required beyond what's already public in the Python pickle module docs.
 
 **This is a P0 RCE-bypass merge blocker. Rev 7 is NOT merge ready.**
+
+**Post-fix QA evidence (Codex, 2026-04-13):**
+
+- `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml memoized -- --nocapture` — passed, 2 tests.
+- `uv run --with 'maturin>=1.9,<2' maturin develop --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed, rebuilt the editable native extension.
+- `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest packages/modelaudit-picklescan/tests/test_api.py::test_scan_bytes_post_budget_tail_detects_prememoized_stack_global tests/scanners/test_pickle_scanner.py::test_post_budget_scan_detects_prememoized_stack_global_tail -q` — passed, 2 tests.
+- Manual default-budget repro with 500,010 `NEWTRUE+POP` pairs plus `BINGET 0` / `BINGET 1` / `STACK_GLOBAL` / `REDUCE` — now returns `status=inconclusive`, `verdict=malicious`, and CRITICAL `POST_BUDGET_GLOBAL` for `subprocess.run`.
 
 ### Rev 6 items FIXED in rev 7 (verified)
 
@@ -175,22 +189,30 @@ sev=info rule=S902 msg=Opcode analysis stopped after reaching max_opcodes=100000
 - **N6 ZIP entry DoS hardening**: rev 7 adds a pre-open `_MAX_PYTORCH_ZIP_ENTRIES = 10_000` check via `_read_zip_entry_count` that avoids opening pathological archives (`9124f929`).
 - **N6 protocol 1 nested pickle routing**: `b119ead8` + `ec6e7810` add protocol-1 magic byte recognition in the file-type detector and the nested-pickle prefix check.
 
-### Rev 6 items NOT closed in rev 7
+### Rev 6 items closed after rev 7 snapshot
 
-- **N6-SKIP-PARTIAL**: UNCHANGED. Hot-path skip still only narrowed `b"torch"` → `b"torch.jit"`. Secrets + network detectors still always run on realistic ML pickles because `_has_alnum_secret_shape` and `_has_domain_or_ip_shape` are trivially true. Realistic 1.8 MB PyTorch state dict still takes ~0.95 s with `pickle_secrets_raw_detector_skipped=None, pickle_network_raw_detector_skipped=None, pickle_jit_raw_detector_skipped=True`. Perf claim does not generalize to real workloads.
+- **N6-SKIP-PARTIAL**: FIXED after this audit snapshot. The rev 7 reproduction is no longer valid on the current branch: realistic state-dict pickles now take the clean Rust-complete no-seed skip path, secrets/network/JIT raw detectors do not run, and the wrapper also skips legacy raw-text/CVE fallback passes when their own seed gates are absent. Positive safety coverage remains in place for structured secrets, `torch.jit`, bare domains, and bare IPv4 network indicators.
+
+**Post-fix QA evidence (Codex, 2026-04-13):**
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_pickle_scanner.py -q` — passed, 94 tests, including review-style state-dict skip coverage and bare IPv4 preservation.
+- Targeted timing probe over 7 warm runs:
+  - `torch.layer.{i}.weight` 20k state dict, 709,036 bytes — median **0.283 s** after fix (baseline measured before this change: **0.423 s**).
+  - `model.layers.{i}.self_attn.q_proj.weight` 50k state dict, 2,689,375 bytes — median **0.849 s** after fix (baseline measured before this change: **1.259 s**).
+  - 2 MiB torch metadata blob, 2,097,291 bytes — median **0.148 s**, `pickle_expensive_raw_detectors_skipped=True`, `pickle_raw_text_detector_skipped=True`, `pickle_cve_raw_detector_skipped=True`.
 
 ### Rev 7 release-readiness
 
-| Status | Severity | Item |
-|---|---|---|
-| ❌ | **P0 RCE BYPASS** | **N7-CRITICAL-PRE-MEMO-BYPASS** — pre-memoized strings + BINGET past budget; validated end-to-end with `pickle.loads()` executing `subprocess.run(['id'])` |
-| ⚠️ | P1 perf | N6-SKIP-PARTIAL — hot-path skip still defeated for secrets/network on realistic ML pickles |
-| ✅ | — | N6-CRITICAL-RCE-BYPASS-V2 fully fixed for 5 inline string-push opcode variants |
-| ✅ | — | ZIP entry DoS preflight check |
-| ✅ | — | Protocol 1 nested pickle routing |
-| ✅ | — | All rev 6 test cases still pass (403 pytest + 62 cargo test) |
+| Status | Severity          | Item                                                                                                                                     |
+| ------ | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| ✅     | Fixed after rev 7 | **N7-CRITICAL-PRE-MEMO-BYPASS** — post-budget memo-read `STACK_GLOBAL` tails now resolve `GET`/`BINGET`/`LONG_BINGET` through memo state |
+| ✅     | Fixed after rev 7 | N6-SKIP-PARTIAL — clean Rust-complete ML state dicts now skip expensive secrets/network/JIT plus no-seed legacy raw-text/CVE fallbacks   |
+| ✅     | —                 | N6-CRITICAL-RCE-BYPASS-V2 fully fixed for 5 inline string-push opcode variants                                                           |
+| ✅     | —                 | ZIP entry DoS preflight check                                                                                                            |
+| ✅     | —                 | Protocol 1 nested pickle routing                                                                                                         |
+| ✅     | —                 | All rev 6 test cases still pass (403 pytest + 62 cargo test)                                                                             |
 
-**Verdict: STILL NOT MERGE READY.** Rev 7 closed the inline-string bypass surface but the same class of attack is trivially replicable via memo reads. The fix is straightforward: look up BINGET references in `self.memo` during the post-budget tail walk, or iterate the memo table for dangerous string pairs as a safe over-approximation. The scanner already populates the memo during the in-budget walk — only the post-budget lookup is missing.
+**Original rev 7 verdict: STILL NOT MERGE READY.** Rev 7 closed the inline-string bypass surface but the same class of attack was trivially replicable via memo reads. **Post-fix Codex note:** N7-CRITICAL-PRE-MEMO-BYPASS is now closed by memo-aware post-budget tail scanning, and N6-SKIP-PARTIAL is closed by clean/no-seed raw-detector fast rejects plus targeted regression/performance coverage.
 
 ---
 

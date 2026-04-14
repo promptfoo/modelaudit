@@ -53,6 +53,15 @@ def _make_opcode_padding_stream(opcode_pairs: int) -> bytes:
     return b"\x80\x02" + (b"K\x010" * opcode_pairs) + b"."
 
 
+def _make_pre_memoized_post_budget_stack_global_payload(tail: bytes) -> bytes:
+    payload = bytearray(b"\x80\x04")
+    payload += _short_binunicode(b"subprocess") + b"\x94"
+    payload += _short_binunicode(b"run") + b"\x94"
+    payload += b"\x880" * 4
+    payload += tail
+    return bytes(payload)
+
+
 def _make_memo_expansion_pickle(iterations: int, *, inert_writes: int = 0) -> bytes:
     total_writes = iterations + inert_writes
     if not 1 <= iterations <= 255 or total_writes > 255:
@@ -261,6 +270,24 @@ def test_expensive_raw_prefilters_skip_realistic_torch_state_dict_names(tmp_path
     assert result.metadata.get("pickle_secrets_raw_detector_skipped") is None
     assert result.metadata.get("pickle_jit_raw_detector_skipped") is None
     assert result.metadata.get("pickle_network_raw_detector_skipped") is None
+    assert result.metadata["pickle_raw_text_detector_skipped"] is True
+    assert result.metadata["pickle_cve_raw_detector_skipped"] is True
+    assert not result.issues
+
+
+def test_raw_prefilters_skip_review_style_state_dict_without_detector_seeds(tmp_path: Path) -> None:
+    path = tmp_path / "review-style-state-dict.pkl"
+    state_dict = {f"model.layers.{index}.self_attn.q_proj.weight": index / 100.0 for index in range(50_000)}
+    path.write_bytes(pickle.dumps(state_dict, protocol=4))
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.metadata["pickle_expensive_raw_detectors_skipped"] is True
+    assert result.metadata["pickle_raw_text_detector_skipped"] is True
+    assert result.metadata["pickle_cve_raw_detector_skipped"] is True
+    assert result.metadata.get("pickle_secrets_raw_detector_skipped") is None
+    assert result.metadata.get("pickle_jit_raw_detector_skipped") is None
+    assert result.metadata.get("pickle_network_raw_detector_skipped") is None
     assert not result.issues
 
 
@@ -282,6 +309,16 @@ def test_expensive_raw_prefilters_preserve_structured_secret_assignments(tmp_pat
 
     assert any(check.name == "Embedded Secrets Detection" for check in result.checks)
     assert not result.metadata.get("pickle_secrets_raw_detector_skipped")
+
+
+def test_expensive_raw_prefilters_preserve_bare_ipv4_network_findings(tmp_path: Path) -> None:
+    path = tmp_path / "bare-ipv4.pkl"
+    path.write_bytes(pickle.dumps({"callback": "192.168.1.100"}, protocol=4))
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(check.name == "Network Communication Detection" for check in result.checks)
+    assert not result.metadata.get("pickle_network_raw_detector_skipped")
 
 
 def test_scan_malicious_pickle_reports_rust_finding(tmp_path: Path) -> None:
@@ -625,6 +662,22 @@ def test_post_budget_expansion_scan_ignores_benign_follow_on_stream(tmp_path: Pa
         check.name == "Post-Budget Pickle Expansion Heuristic Check" and check.status.value == "failed"
         for check in result.checks
     ), result.checks
+
+
+def test_post_budget_scan_detects_prememoized_stack_global_tail(tmp_path: Path) -> None:
+    path = tmp_path / "post-budget-prememo-stack-global.pkl"
+    path.write_bytes(_make_pre_memoized_post_budget_stack_global_payload(b"h\x00h\x01\x93)R."))
+
+    result = PickleScanner({"max_opcodes": 7, "post_budget_global_scan_limit_bytes": 4096}).scan(str(path))
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("pickle_rule_code") == "POST_BUDGET_GLOBAL"
+        and issue.details.get("module") == "subprocess"
+        and issue.details.get("name") == "run"
+        for issue in result.issues
+    ), result.issues
+    assert result.success is False
 
 
 def test_scan_bounds_follow_on_probe_recursion_for_pickle_like_binary_tail(tmp_path: Path) -> None:

@@ -2068,7 +2068,9 @@ impl<'a> ScanState<'a> {
             .bytes_scanned
             .max(stream_offset.saturating_add(tail.len()));
 
-        for global_match in post_budget_global_matches(&tail, tail_prefix_len) {
+        for global_match in
+            post_budget_global_matches(&tail, tail_prefix_len, &self.memo, self.payload)
+        {
             let absolute_position = post_budget_absolute_position(
                 stream_offset,
                 read_offset,
@@ -2849,7 +2851,12 @@ struct PostBudgetGlobalCandidate<'a> {
     severity: &'static str,
 }
 
-fn post_budget_global_matches(tail: &[u8], tail_prefix_len: usize) -> Vec<PostBudgetGlobalMatch> {
+fn post_budget_global_matches(
+    tail: &[u8],
+    tail_prefix_len: usize,
+    memo: &HashMap<i64, StackValue>,
+    payload: &[u8],
+) -> Vec<PostBudgetGlobalMatch> {
     let mut matches = Vec::new();
     let mut seen = HashSet::new();
 
@@ -2869,6 +2876,14 @@ fn post_budget_global_matches(tail: &[u8], tail_prefix_len: usize) -> Vec<PostBu
             );
         }
         record_post_budget_stack_global_pattern(tail, index, &mut seen, &mut matches);
+        record_post_budget_memo_stack_global_pattern(
+            tail,
+            index,
+            memo,
+            payload,
+            &mut seen,
+            &mut matches,
+        );
         record_post_budget_extension_ref(tail, index, &mut seen, &mut matches);
         index += 1;
     }
@@ -2941,6 +2956,65 @@ fn record_post_budget_stack_global_pattern(
         seen,
         matches,
     );
+}
+
+fn record_post_budget_memo_stack_global_pattern(
+    tail: &[u8],
+    index: usize,
+    memo: &HashMap<i64, StackValue>,
+    payload: &[u8],
+    seen: &mut HashSet<(usize, String, String)>,
+    matches: &mut Vec<PostBudgetGlobalMatch>,
+) {
+    let Some((module_index, after_module)) = read_post_budget_memo_read(tail, index) else {
+        return;
+    };
+    let Some(module) = resolve_global_operand(memo.get(&module_index), payload) else {
+        return;
+    };
+    let name_start = skip_post_budget_memoize(tail, after_module);
+    let Some((name_index, after_name)) = read_post_budget_memo_read(tail, name_start) else {
+        return;
+    };
+    let Some(name) = resolve_global_operand(memo.get(&name_index), payload) else {
+        return;
+    };
+    let stack_global_position = skip_post_budget_memoize(tail, after_name);
+    if tail.get(stack_global_position) != Some(&0x93) {
+        return;
+    }
+    record_post_budget_global(
+        &module,
+        &name,
+        index,
+        stack_global_position.saturating_add(1),
+        tail,
+        seen,
+        matches,
+    );
+}
+
+fn read_post_budget_memo_read(tail: &[u8], index: usize) -> Option<(i64, usize)> {
+    match *tail.get(index)? {
+        b'g' => {
+            let digits_start = index.saturating_add(1);
+            let digits_end = find_byte_from(tail, digits_start, b'\n')?;
+            let digits = std::str::from_utf8(tail.get(digits_start..digits_end)?).ok()?;
+            let memo_index = digits.parse::<i64>().ok()?;
+            Some((memo_index, digits_end.saturating_add(1)))
+        }
+        b'h' => Some((
+            i64::from(*tail.get(index.saturating_add(1))?),
+            index.saturating_add(2),
+        )),
+        b'j' => {
+            let start = index.saturating_add(1);
+            let end = start.checked_add(4)?;
+            let memo_index = u32::from_le_bytes(tail.get(start..end)?.try_into().ok()?);
+            Some((i64::from(memo_index), end))
+        }
+        _ => None,
+    }
 }
 
 fn read_post_budget_text_operand(tail: &[u8], index: usize) -> Option<(&str, usize)> {
@@ -4186,6 +4260,112 @@ mod tests {
             assert_eq!(
                 detail_string(&finding.details, "pattern").as_deref(),
                 Some("subprocess\nrun")
+            );
+        }
+    }
+
+    fn short_binunicode(value: &[u8]) -> Vec<u8> {
+        assert!(value.len() <= u8::MAX as usize);
+        let mut payload = vec![0x8c, value.len() as u8];
+        payload.extend_from_slice(value);
+        payload
+    }
+
+    fn pre_memoized_post_budget_stack_global_payload(tail: &[u8]) -> Vec<u8> {
+        let mut payload = b"\x80\x04".to_vec();
+        payload.extend_from_slice(&short_binunicode(b"subprocess"));
+        payload.push(0x94);
+        payload.extend_from_slice(&short_binunicode(b"run"));
+        payload.push(0x94);
+        payload.extend_from_slice(b"\x880\x880\x880\x880");
+        payload.extend_from_slice(tail);
+        payload
+    }
+
+    fn post_budget_prememo_options() -> ScanOptions {
+        ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: 7,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        }
+    }
+
+    #[test]
+    fn post_budget_tail_resolves_memoized_stack_global_gets() {
+        let options = post_budget_prememo_options();
+        let variants = [
+            ("binget", b"h\x00h\x01\x93)R.".as_slice()),
+            (
+                "long-binget",
+                b"j\x00\x00\x00\x00j\x01\x00\x00\x00\x93)R.".as_slice(),
+            ),
+            ("get", b"g0\ng1\n\x93)R.".as_slice()),
+        ];
+
+        for (label, tail) in variants {
+            let payload = pre_memoized_post_budget_stack_global_payload(tail);
+            let mut scan = ScanState::new(
+                format!("post-budget-prememo-{label}.pkl"),
+                &payload,
+                &options,
+                Some(payload.len()),
+                0,
+                0,
+                None,
+            );
+
+            scan.run();
+
+            let finding = scan
+                .findings
+                .iter()
+                .find(|finding| finding.rule_code == Some("POST_BUDGET_GLOBAL"))
+                .unwrap_or_else(|| {
+                    panic!("missing memoized post-budget global finding for {label}")
+                });
+            assert_eq!(finding.severity, "critical");
+            assert_eq!(
+                detail_string(&finding.details, "pattern").as_deref(),
+                Some("subprocess\nrun")
+            );
+        }
+    }
+
+    #[test]
+    fn post_budget_tail_promotes_memoized_stack_global_reduce_class_opcodes() {
+        let options = post_budget_prememo_options();
+        let variants = [
+            ("reduce", b"h\x00h\x01\x93)R.".as_slice()),
+            ("obj", b"h\x00h\x01\x93o.".as_slice()),
+            ("newobj", b"h\x00h\x01\x93\x81.".as_slice()),
+            ("newobj-ex", b"h\x00h\x01\x93\x92.".as_slice()),
+        ];
+
+        for (label, tail) in variants {
+            let payload = pre_memoized_post_budget_stack_global_payload(tail);
+            let mut scan = ScanState::new(
+                format!("post-budget-prememo-{label}.pkl"),
+                &payload,
+                &options,
+                Some(payload.len()),
+                0,
+                0,
+                None,
+            );
+
+            scan.run();
+
+            assert!(
+                scan.findings.iter().any(|finding| {
+                    finding.rule_code == Some("POST_BUDGET_GLOBAL")
+                        && finding.severity == "critical"
+                        && detail_string(&finding.details, "pattern").as_deref()
+                            == Some("subprocess\nrun")
+                }),
+                "missing critical memoized post-budget finding for {label}"
             );
         }
     }
