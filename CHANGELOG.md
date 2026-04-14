@@ -7,12 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.38](https://github.com/promptfoo/modelaudit/compare/v0.2.37...v0.2.38) (2026-04-14)
 
-
 ### Bug Fixes
 
-* avoid per-call rule mapper closures ([fa0dc70](https://github.com/promptfoo/modelaudit/commit/fa0dc70ef2e1ca133a2eca9409c8b5ce86977caa))
-* define analysis lazy exports ([8aeeadd](https://github.com/promptfoo/modelaudit/commit/8aeeadd8ffd4943b8c6007c58d9bef3f44eeba09))
-* **rule-mapper:** preserve unknown opcode fallback ([5153d68](https://github.com/promptfoo/modelaudit/commit/5153d68101e6e5c67d64419c6d391ec405b4daa1))
+- avoid per-call rule mapper closures ([fa0dc70](https://github.com/promptfoo/modelaudit/commit/fa0dc70ef2e1ca133a2eca9409c8b5ce86977caa))
+- define analysis lazy exports ([8aeeadd](https://github.com/promptfoo/modelaudit/commit/8aeeadd8ffd4943b8c6007c58d9bef3f44eeba09))
+- **rule-mapper:** preserve unknown opcode fallback ([5153d68](https://github.com/promptfoo/modelaudit/commit/5153d68101e6e5c67d64419c6d391ec405b4daa1))
 
 ## [Unreleased]
 
