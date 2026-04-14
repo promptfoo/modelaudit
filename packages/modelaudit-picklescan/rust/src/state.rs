@@ -675,6 +675,20 @@ impl<'a> ScanState<'a> {
                 let suppress_hex_escape = self.is_data_only_encoded_nested_pickle_literal(&value);
                 self.scan_string_literal(&value, opcode.name, position, suppress_hex_escape);
                 self.scan_encoded_nested_pickle_literal(&value, position);
+                match opcode.name {
+                    "BINSTRING" | "SHORT_BINSTRING" => {
+                        if let Some((start, end)) = opcode.arg.byte_span(self.payload.len()) {
+                            let bytes = &self.payload[start..end];
+                            self.scan_raw_nested_pickle_bytes(bytes, self.position_offset + start);
+                        }
+                    }
+                    "STRING" => {
+                        if let Some(bytes) = opcode.arg.raw_bytes(self.payload) {
+                            self.scan_raw_nested_pickle_bytes(bytes.as_ref(), position);
+                        }
+                    }
+                    _ => {}
+                }
                 self.stack
                     .push(stack_value_from_text_arg(&opcode.arg, self.payload));
             }
@@ -1253,14 +1267,19 @@ impl<'a> ScanState<'a> {
                 pickle_payload_extent(probe, self.options.max_nested_pickle_bytes)
             {
                 let candidate = &probe[..payload_len];
+                let nested_has_execution_opcode = has_execution_opcode(candidate);
                 self.add_nested_payload_finding(raw_nested_payload_finding(
                     candidate.len(),
                     position + offset,
                     false,
-                    has_execution_opcode(candidate),
+                    nested_has_execution_opcode,
                 ));
-                self.surface_nested_pickle_findings(candidate, "raw", position + offset);
-                return;
+                let surfaced_unsafe =
+                    self.surface_nested_pickle_findings(candidate, "raw", position + offset);
+                if nested_has_execution_opcode || surfaced_unsafe {
+                    return;
+                }
+                continue;
             }
             if has_pickle_prefix(probe) && has_execution_opcode(probe) {
                 self.add_nested_payload_finding(raw_nested_payload_finding(
@@ -1925,9 +1944,9 @@ impl<'a> ScanState<'a> {
         payload: &[u8],
         encoding: &'static str,
         position: usize,
-    ) {
+    ) -> bool {
         if self.nested_depth >= self.options.max_nested_depth {
-            return;
+            return false;
         }
 
         let nested_source = format!(
@@ -1944,6 +1963,9 @@ impl<'a> ScanState<'a> {
             Some(self.deadline),
         );
         nested_scan.run();
+
+        let nested_had_findings = !nested_scan.findings.is_empty();
+        let nested_incomplete = nested_scan.status != "complete";
 
         for nested_finding in nested_scan.findings {
             let nested_details = nested_finding
@@ -1987,7 +2009,7 @@ impl<'a> ScanState<'a> {
             });
         }
 
-        if nested_scan.status != "complete" {
+        if nested_incomplete {
             if self.status == "complete" {
                 self.status = "inconclusive";
             }
@@ -2047,6 +2069,7 @@ impl<'a> ScanState<'a> {
                 ],
             });
         }
+        nested_had_findings || nested_incomplete
     }
 
     fn scan_post_budget_tail(
@@ -2463,7 +2486,7 @@ fn stack_value_from_integer_arg(arg: &ArgValue, payload: &[u8]) -> StackValue {
             type_name: "int",
             repr: value.to_string(),
         },
-        ArgValue::Text(value) => {
+        ArgValue::Text(value) | ArgValue::DecodedString { text: value, .. } => {
             integer_text_repr(value).map_or(StackValue::Other, |repr| StackValue::Primitive {
                 type_name: "int",
                 repr,
@@ -2507,7 +2530,9 @@ fn little_endian_signed_integer_repr(value: &[u8]) -> Option<String> {
 
 fn stack_value_from_text_arg(arg: &ArgValue, payload: &[u8]) -> StackValue {
     match arg {
-        ArgValue::Text(value) => StackValue::Text(value.clone()),
+        ArgValue::Text(value) | ArgValue::DecodedString { text: value, .. } => {
+            StackValue::Text(value.clone())
+        }
         ArgValue::TextSpan { start, end } | ArgValue::Bytes { start, end }
             if start <= end && *end <= payload.len() =>
         {
@@ -4096,6 +4121,105 @@ mod tests {
             detail_string(&notice.details, "encoding").as_deref(),
             Some("raw")
         );
+    }
+
+    #[test]
+    fn raw_nested_payload_scan_continues_after_data_only_payloads() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let nested_bytes = b"AAAAAA\x80\x04}.BBBBBBcos\nsystem\n)R.CCCC";
+        let mut payload = b"\x80\x04B".to_vec();
+        payload.extend_from_slice(&(nested_bytes.len() as u32).to_le_bytes());
+        payload.extend_from_slice(nested_bytes);
+        payload.push(b'.');
+        let mut scan = ScanState::new(
+            "raw-nested-benign-before-malicious.pkl".to_string(),
+            &payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert_eq!(scan.verdict, "malicious");
+        assert!(scan
+            .notices
+            .iter()
+            .any(|notice| notice.code == Some("nested_payload_detected")));
+        assert!(scan.findings.iter().any(|finding| {
+            finding.rule_code == Some("S213")
+                && detail_string(&finding.details, "encoding").as_deref() == Some("raw")
+                && detail_usize(&finding.details, "payload_size") == Some(14)
+        }));
+        assert!(scan.findings.iter().any(|finding| {
+            finding.rule_code == Some("DANGEROUS_CALL")
+                && detail_string(&finding.details, "import_reference").as_deref()
+                    == Some("os.system")
+        }));
+    }
+
+    #[test]
+    fn legacy_string_opcodes_scan_raw_nested_payloads() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let nested_bytes = b"AAAAAAcos\nsystem\n)R.BBBB";
+        let mut binstring_payload = b"\x80\x02T".to_vec();
+        binstring_payload.extend_from_slice(&(nested_bytes.len() as u32).to_le_bytes());
+        binstring_payload.extend_from_slice(nested_bytes);
+        binstring_payload.push(b'.');
+        let mut short_binstring_payload = b"\x80\x02U".to_vec();
+        short_binstring_payload.push(nested_bytes.len() as u8);
+        short_binstring_payload.extend_from_slice(nested_bytes);
+        short_binstring_payload.push(b'.');
+        let payloads = [
+            ("binstring", binstring_payload),
+            ("short-binstring", short_binstring_payload),
+            (
+                "protocol0-string",
+                b"\x80\x02S'AAAAAAcos\\x0asystem\\x0a)R.BBBB'\n.".to_vec(),
+            ),
+        ];
+
+        for (label, payload) in payloads {
+            let mut scan = ScanState::new(
+                format!("legacy-string-raw-nested-{label}.pkl"),
+                &payload,
+                &options,
+                Some(payload.len()),
+                0,
+                0,
+                None,
+            );
+
+            scan.run();
+
+            assert_eq!(scan.verdict, "malicious", "missed {label}");
+            assert!(scan.findings.iter().any(|finding| {
+                finding.rule_code == Some("S213")
+                    && detail_string(&finding.details, "encoding").as_deref() == Some("raw")
+                    && detail_usize(&finding.details, "payload_size") == Some(14)
+            }));
+            assert!(scan.findings.iter().any(|finding| {
+                finding.rule_code == Some("DANGEROUS_CALL")
+                    && detail_string(&finding.details, "import_reference").as_deref()
+                        == Some("os.system")
+            }));
+        }
     }
 
     #[test]

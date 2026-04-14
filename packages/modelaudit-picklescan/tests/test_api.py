@@ -538,6 +538,71 @@ def test_scan_bytes_recurses_into_nested_persid_payload() -> None:
     )
 
 
+def test_scan_bytes_continues_raw_nested_scan_after_data_only_payload() -> None:
+    nested_bytes = b"AAAAAA\x80\x04}.BBBBBBcos\nsystem\n)R.CCCC"
+    payload = b"\x80\x04B" + len(nested_bytes).to_bytes(4, "little") + nested_bytes + b"."
+
+    report = scan_bytes(payload, source="nested-benign-before-malicious.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(notice.code == "nested_payload_detected" for notice in report.notices)
+    assert any(
+        finding.rule_code == "S213"
+        and finding.details.get("encoding") == "raw"
+        and finding.details.get("payload_size") == len(b"cos\nsystem\n)R.")
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_continues_encoded_nested_scan_after_data_only_payload() -> None:
+    decoded = b"\x80\x04}." + b"cos\nsystem\n)R."
+    payload = pickle.dumps(base64.b64encode(decoded).decode("ascii"), protocol=4)
+
+    report = scan_bytes(payload, source="encoded-benign-before-malicious.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(notice.code == "encoded_nested_payload_detected" for notice in report.notices)
+    assert any(
+        finding.rule_code == "S601"
+        and finding.details.get("encoding") == "base64"
+        and finding.details.get("payload_size") == len(b"cos\nsystem\n)R.")
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\x80\x02T\x18\x00\x00\x00AAAAAAcos\nsystem\n)R.BBBB.",
+        b"\x80\x02U\x18AAAAAAcos\nsystem\n)R.BBBB.",
+        b"\x80\x02S'AAAAAAcos\\x0asystem\\x0a)R.BBBB'\n.",
+    ],
+    ids=["binstring", "short-binstring", "protocol0-string"],
+)
+def test_scan_bytes_scans_legacy_string_opcodes_for_raw_nested_payloads(payload: bytes) -> None:
+    report = scan_bytes(payload, source="legacy-string-raw-nested.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "S213"
+        and finding.details.get("encoding") == "raw"
+        and finding.details.get("payload_size") == len(b"cos\nsystem\n)R.")
+        for finding in report.findings
+    )
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL" and finding.details.get("import_reference") == "os.system"
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_fails_closed_on_malformed_nested_persid_payload() -> None:
     inner = b"\x80\x04cos\nsystem\nP\nfake_id\n."
     outer = pickle.dumps({"inner": inner}, protocol=4)

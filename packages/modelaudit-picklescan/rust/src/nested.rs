@@ -26,9 +26,8 @@ pub(crate) fn decode_possible_encoded_pickle(
             let bounded = take_bytes_str(&candidate, max_base64_nested_pickle_chars);
             let padded = pad_base64(&bounded);
             if let Some(decoded) = decode_base64(&padded) {
-                if let Some(payload_len) = pickle_payload_extent(&decoded, max_nested_pickle_bytes)
-                {
-                    decoded_values.push(("base64", decoded[..payload_len].to_vec()));
+                for payload in decoded_pickle_payloads(&decoded, max_nested_pickle_bytes) {
+                    decoded_values.push(("base64", payload));
                 }
             }
         }
@@ -47,10 +46,8 @@ pub(crate) fn decode_possible_encoded_pickle(
                 let bounded_hex_candidate =
                     take_bytes_str(&hex_candidate, max_hex_nested_pickle_chars);
                 if let Some(decoded) = decode_hex(&bounded_hex_candidate) {
-                    if let Some(payload_len) =
-                        pickle_payload_extent(&decoded, max_nested_pickle_bytes)
-                    {
-                        decoded_values.push((encoding, decoded[..payload_len].to_vec()));
+                    for payload in decoded_pickle_payloads(&decoded, max_nested_pickle_bytes) {
+                        decoded_values.push((encoding, payload));
                     }
                 }
             }
@@ -58,6 +55,27 @@ pub(crate) fn decode_possible_encoded_pickle(
     }
 
     decoded_values
+}
+
+fn decoded_pickle_payloads(decoded: &[u8], max_nested_pickle_bytes: usize) -> Vec<Vec<u8>> {
+    let mut payloads = Vec::new();
+    let mut seen_spans = Vec::new();
+    for offset in nested_pickle_probe_offsets(decoded) {
+        let end = decoded
+            .len()
+            .min(offset.saturating_add(max_nested_pickle_bytes));
+        let probe = &decoded[offset..end];
+        let Some(payload_len) = pickle_payload_extent(probe, max_nested_pickle_bytes) else {
+            continue;
+        };
+        let span = (offset, offset.saturating_add(payload_len));
+        if seen_spans.contains(&span) {
+            continue;
+        }
+        seen_spans.push(span);
+        payloads.push(decoded[span.0..span.1].to_vec());
+    }
+    payloads
 }
 
 pub(crate) fn detect_oversized_encoded_pickle_prefixes(
@@ -836,6 +854,21 @@ mod tests {
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].0, "base64");
         assert_eq!(decoded[0].1, b"cos\nsystem\n)R.");
+    }
+
+    #[test]
+    fn encoded_nested_literals_keep_later_decoded_payloads() {
+        let decoded = decode_possible_encoded_pickle(
+            "gAR9LmNvcwpzeXN0ZW0KKVIu",
+            TEST_MAX_NESTED_PICKLE_BYTES,
+        );
+
+        assert!(decoded
+            .iter()
+            .any(|(encoding, payload)| *encoding == "base64" && payload == b"\x80\x04}."));
+        assert!(decoded
+            .iter()
+            .any(|(encoding, payload)| *encoding == "base64" && payload == b"cos\nsystem\n)R."));
     }
 
     #[test]

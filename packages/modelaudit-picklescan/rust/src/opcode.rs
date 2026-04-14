@@ -6,6 +6,7 @@ pub(crate) enum ArgValue {
     Int(i64),
     UInt(usize),
     Text(String),
+    DecodedString { text: String, bytes: Vec<u8> },
     TextSpan { start: usize, end: usize },
     Bytes { start: usize, end: usize },
     Global { module: String, name: String },
@@ -17,6 +18,7 @@ impl ArgValue {
             ArgValue::Int(value) => Some(*value),
             ArgValue::UInt(value) => i64::try_from(*value).ok(),
             ArgValue::Text(value) => value.parse::<i64>().ok(),
+            ArgValue::DecodedString { text, .. } => text.parse::<i64>().ok(),
             _ => None,
         }
     }
@@ -30,9 +32,23 @@ impl ArgValue {
         }
     }
 
+    pub(crate) fn raw_bytes<'payload>(
+        &'payload self,
+        payload: &'payload [u8],
+    ) -> Option<Cow<'payload, [u8]>> {
+        match self {
+            ArgValue::Bytes { start, end } if start <= end && *end <= payload.len() => {
+                Some(Cow::Borrowed(&payload[*start..*end]))
+            }
+            ArgValue::DecodedString { bytes, .. } => Some(Cow::Borrowed(bytes.as_slice())),
+            _ => None,
+        }
+    }
+
     pub(crate) fn text<'payload>(&self, payload: &'payload [u8]) -> Cow<'payload, str> {
         match self {
             ArgValue::Text(value) => Cow::Owned(value.clone()),
+            ArgValue::DecodedString { text, .. } => Cow::Owned(text.clone()),
             ArgValue::TextSpan { start, end } | ArgValue::Bytes { start, end }
                 if start <= end && *end <= payload.len() =>
             {
@@ -49,7 +65,10 @@ impl ArgValue {
     pub(crate) fn global_parts(&self, payload: &[u8]) -> (String, String) {
         match self {
             ArgValue::Global { module, name } => (module.clone(), name.clone()),
-            ArgValue::Text(_) | ArgValue::TextSpan { .. } | ArgValue::Bytes { .. } => {
+            ArgValue::Text(_)
+            | ArgValue::DecodedString { .. }
+            | ArgValue::TextSpan { .. }
+            | ArgValue::Bytes { .. } => {
                 let value = self.text(payload);
                 let mut parts = value.splitn(2, ' ');
                 let module = parts.next().unwrap_or_default().to_string();
@@ -164,16 +183,19 @@ pub(crate) fn parse_opcode(
                 next: cursor,
             }
         }
-        b'S' => ParsedOpcode {
-            name: "STRING",
-            arg: ArgValue::Text(parse_pickle_string_literal(&read_line_bytes(
-                payload,
-                &mut cursor,
-                limit,
-            )?)),
-            pos: index,
-            next: cursor,
-        },
+        b'S' => {
+            let literal = read_line_bytes(payload, &mut cursor, limit)?;
+            let bytes = parse_pickle_string_literal_bytes(&literal);
+            ParsedOpcode {
+                name: "STRING",
+                arg: ArgValue::DecodedString {
+                    text: String::from_utf8_lossy(&bytes).to_string(),
+                    bytes,
+                },
+                pos: index,
+                next: cursor,
+            }
+        }
         b'T' => {
             let len = read_u32_le(payload, &mut cursor, limit)? as usize;
             let (start, end) = read_variable_span(payload, &mut cursor, limit, len, "string4")?;
@@ -585,6 +607,10 @@ fn read_line_raw_unicode(
 }
 
 pub(crate) fn parse_pickle_string_literal(value: &[u8]) -> String {
+    String::from_utf8_lossy(&parse_pickle_string_literal_bytes(value)).to_string()
+}
+
+pub(crate) fn parse_pickle_string_literal_bytes(value: &[u8]) -> Vec<u8> {
     let mut start = 0usize;
     let mut end = value.len();
     while start < end && value[start].is_ascii_whitespace() {
@@ -599,7 +625,7 @@ pub(crate) fn parse_pickle_string_literal(value: &[u8]) -> String {
             return decode_python_string_escape(&value[start + 1..end - 1]);
         }
     }
-    String::from_utf8_lossy(&value[start..end]).to_string()
+    value[start..end].to_vec()
 }
 
 pub(crate) fn decode_raw_unicode_escape(value: &[u8]) -> String {
@@ -631,7 +657,7 @@ pub(crate) fn decode_raw_unicode_escape(value: &[u8]) -> String {
     decoded
 }
 
-fn decode_python_string_escape(value: &[u8]) -> String {
+fn decode_python_string_escape(value: &[u8]) -> Vec<u8> {
     let mut decoded = Vec::with_capacity(value.len());
     let mut index = 0usize;
     while index < value.len() {
@@ -711,7 +737,7 @@ fn decode_python_string_escape(value: &[u8]) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&decoded).to_string()
+    decoded
 }
 
 fn decode_hex_codepoint(value: &[u8]) -> Option<char> {
