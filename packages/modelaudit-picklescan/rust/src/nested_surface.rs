@@ -106,7 +106,38 @@ pub(crate) fn is_allowlisted_nested_constructor_ref(reference: &str) -> bool {
             | "pathlib.PureWindowsPath"
             | "pathlib.PosixPath"
             | "pathlib.WindowsPath"
+            | "pathlib._local.PurePath"
+            | "pathlib._local.PurePosixPath"
+            | "pathlib._local.PureWindowsPath"
+            | "pathlib._local.PosixPath"
+            | "pathlib._local.WindowsPath"
             | "re._compile"
             | "uuid.UUID"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowlisted_nested_constructor_refs_include_python313_pathlib_local_aliases() {
+        for reference in [
+            "pathlib.PurePath",
+            "pathlib.PurePosixPath",
+            "pathlib.PureWindowsPath",
+            "pathlib.PosixPath",
+            "pathlib.WindowsPath",
+            "pathlib._local.PurePath",
+            "pathlib._local.PurePosixPath",
+            "pathlib._local.PureWindowsPath",
+            "pathlib._local.PosixPath",
+            "pathlib._local.WindowsPath",
+        ] {
+            assert!(
+                is_allowlisted_nested_constructor_ref(reference),
+                "{reference} should be treated as a benign pathlib constructor"
+            );
+        }
+    }
 }
