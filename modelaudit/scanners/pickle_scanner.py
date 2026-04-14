@@ -396,7 +396,7 @@ def _looks_like_pickle(data: bytes) -> bool:
 
     first = data[0]
     if first == 0x80:
-        return data[1] in {2, 3, 4, 5}
+        return data[1] in {1, 2, 3, 4, 5}
 
     # Protocol 0 pickles often start directly with GLOBAL/INST/list/dict/tuple
     # structural opcodes. This is intentionally a sniff, not validation.
@@ -1457,13 +1457,16 @@ class PickleScanner(BaseScanner):
 
     def _read_stream_payload_for_root(self, file_obj: BinaryIO, file_size: int | None) -> _RootStreamPayloadRead:
         if file_size is not None:
-            limit = self.max_file_read_size if self.max_file_read_size and self.max_file_read_size > 0 else file_size
+            limit = self._standalone_pickle_scanner.options.max_known_stream_read_bytes
+            if self.max_file_read_size and self.max_file_read_size > 0:
+                limit = min(limit, self.max_file_read_size)
         else:
-            limit = (
-                self.max_file_read_size
-                if self.max_file_read_size and self.max_file_read_size > 0
-                else self._root_raw_scan_limit()
+            limit = min(
+                self._root_raw_scan_limit(),
+                self._standalone_pickle_scanner.options.max_unbounded_stream_read_bytes,
             )
+            if self.max_file_read_size and self.max_file_read_size > 0:
+                limit = min(limit, self.max_file_read_size)
         if limit <= 0:
             return _RootStreamPayloadRead(payload=b"", truncated=False, read_limit=0)
 
@@ -1667,16 +1670,18 @@ class PickleScanner(BaseScanner):
         tail_start = self._binary_tail_start(result)
         if tail_start is None:
             return
-        if file_size is not None and tail_start >= file_size:
+        local_tail_start = tail_start - start_position if tail_start >= start_position else tail_start
+        if file_size is not None and local_tail_start >= file_size:
             return
         remaining = (
-            _BINARY_TAIL_SCAN_BYTES if file_size is None else min(_BINARY_TAIL_SCAN_BYTES, file_size - tail_start)
+            _BINARY_TAIL_SCAN_BYTES if file_size is None else min(_BINARY_TAIL_SCAN_BYTES, file_size - local_tail_start)
         )
         if remaining <= 0:
             return
+        absolute_tail_start = start_position + local_tail_start
         chunks: list[bytes] = []
         try:
-            file_obj.seek(start_position + tail_start)
+            file_obj.seek(absolute_tail_start)
             while remaining > 0:
                 self.check_interrupted()
                 if self._check_timeout(allow_partial=True):
@@ -1691,7 +1696,7 @@ class PickleScanner(BaseScanner):
         finally:
             with suppress(AttributeError, OSError, ValueError):
                 file_obj.seek(start_position)
-        self._scan_binary_tail_window(b"".join(chunks), result, source, tail_start)
+        self._scan_binary_tail_window(b"".join(chunks), result, source, absolute_tail_start)
 
     @staticmethod
     def _binary_tail_start(result: ScanResult) -> int | None:

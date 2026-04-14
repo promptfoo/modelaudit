@@ -1400,6 +1400,43 @@ def test_scan_bytes_post_budget_tail_detects_prememoized_stack_global() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "tail",
+    [
+        b"h\x00" + _short_binunicode(b"run") + b"\x93)R.",
+        _short_binunicode(b"subprocess") + b"h\x01\x93)R.",
+        b"h\x00U\x03run\x93)R.",
+        b"h\x00S'run'\n\x93)R.",
+        b"S'subprocess'\nh\x01\x93)R.",
+    ],
+    ids=[
+        "memo-module-inline-name",
+        "inline-module-memo-name",
+        "memo-module-short-binstring-name",
+        "memo-module-protocol0-name",
+        "protocol0-module-memo-name",
+    ],
+)
+def test_scan_bytes_post_budget_tail_detects_mixed_prememoized_stack_global(tail: bytes) -> None:
+    payload = _make_pre_memoized_post_budget_stack_global_payload(tail)
+
+    report = scan_bytes(
+        payload,
+        source="budget-prememo-mixed-stack-global.pkl",
+        options=ScanOptions(max_opcodes=7, post_budget_scan_bytes=4096),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "POST_BUDGET_GLOBAL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "subprocess"
+        and finding.details.get("name") == "run"
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_handles_multiple_pickle_streams() -> None:
     payload = pickle.dumps({"a": 1}, protocol=4) + pickle.dumps(MaliciousPayload(), protocol=4)
 

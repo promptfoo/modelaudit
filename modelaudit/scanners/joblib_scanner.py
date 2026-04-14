@@ -26,6 +26,7 @@ _JOBLIB_NUMPY_ARRAY_MODULE_PREFIXES = ("joblib.numpy_pickle", "numpy")
 _MAX_JOBLIB_ARRAY_ALIGNMENT_PADDING = 64
 _JOBLIB_TAIL_DANGER_SCAN_BYTES = 4096
 _JOBLIB_TAIL_DANGEROUS_SEEDS = (
+    b"\x80\x01",
     b"\x80\x02",
     b"\x80\x03",
     b"\x80\x04",

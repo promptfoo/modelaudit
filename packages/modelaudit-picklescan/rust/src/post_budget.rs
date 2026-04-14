@@ -52,8 +52,7 @@ pub(crate) fn post_budget_global_matches(
                 &mut matches,
             );
         }
-        record_post_budget_stack_global_pattern(tail, index, &mut seen, &mut matches);
-        record_post_budget_memo_stack_global_pattern(
+        record_post_budget_stack_global_pattern(
             tail,
             index,
             &resolve_memo_string,
@@ -122,49 +121,19 @@ fn record_post_budget_module_name_pair(
 fn record_post_budget_stack_global_pattern(
     tail: &[u8],
     index: usize,
-    seen: &mut HashSet<(usize, String, String)>,
-    matches: &mut Vec<PostBudgetGlobalMatch>,
-) {
-    let Some((module, after_module)) = read_post_budget_text_operand(tail, index) else {
-        return;
-    };
-    let name_start = skip_post_budget_memoize(tail, after_module);
-    let Some((name, after_name)) = read_post_budget_text_operand(tail, name_start) else {
-        return;
-    };
-    let stack_global_position = skip_post_budget_memoize(tail, after_name);
-    if tail.get(stack_global_position) != Some(&0x93) {
-        return;
-    }
-    record_post_budget_global(
-        module.as_ref(),
-        name.as_ref(),
-        index,
-        stack_global_position.saturating_add(1),
-        tail,
-        seen,
-        matches,
-    );
-}
-
-fn record_post_budget_memo_stack_global_pattern(
-    tail: &[u8],
-    index: usize,
     resolve_memo_string: &impl Fn(i64) -> Option<String>,
     seen: &mut HashSet<(usize, String, String)>,
     matches: &mut Vec<PostBudgetGlobalMatch>,
 ) {
-    let Some((module_index, after_module)) = read_post_budget_memo_read(tail, index) else {
-        return;
-    };
-    let Some(module) = resolve_memo_string(module_index) else {
+    let Some((module, after_module)) =
+        read_post_budget_stack_global_operand(tail, index, resolve_memo_string)
+    else {
         return;
     };
     let name_start = skip_post_budget_memoize(tail, after_module);
-    let Some((name_index, after_name)) = read_post_budget_memo_read(tail, name_start) else {
-        return;
-    };
-    let Some(name) = resolve_memo_string(name_index) else {
+    let Some((name, after_name)) =
+        read_post_budget_stack_global_operand(tail, name_start, resolve_memo_string)
+    else {
         return;
     };
     let stack_global_position = skip_post_budget_memoize(tail, after_name);
@@ -180,6 +149,19 @@ fn record_post_budget_memo_stack_global_pattern(
         seen,
         matches,
     );
+}
+
+fn read_post_budget_stack_global_operand<'a>(
+    tail: &'a [u8],
+    index: usize,
+    resolve_memo_string: &impl Fn(i64) -> Option<String>,
+) -> Option<(Cow<'a, str>, usize)> {
+    if let Some((text, next)) = read_post_budget_text_operand(tail, index) {
+        return Some((text, next));
+    }
+
+    let (memo_index, next) = read_post_budget_memo_read(tail, index)?;
+    resolve_memo_string(memo_index).map(|value| (Cow::Owned(value), next))
 }
 
 fn read_post_budget_memo_read(tail: &[u8], index: usize) -> Option<(i64, usize)> {

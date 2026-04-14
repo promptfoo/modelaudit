@@ -104,6 +104,18 @@ def test_scan_trusts_numpy_wrapper_zero_padding_after_pickle_boundary(tmp_path: 
     assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
 
 
+def test_scan_fails_closed_on_protocol1_pickle_in_numpy_wrapper_tail(tmp_path: Path) -> None:
+    prefix = b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\ncnumpy\nndarray\ncnumpy\ndtype\n"
+    payload = prefix + b"\x00\x80\x01K\x01."
+
+    result = _scan_payload(tmp_path, payload, "numpy_array_protocol1_tail.joblib")
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["analysis_incomplete"] is True
+    assert "trusted_incomplete_tail" not in result.metadata
+
+
 def test_scan_detects_gzip_compressed_pickle_joblib(tmp_path: Path) -> None:
     path = tmp_path / "gzip_protocol4.joblib"
     path.write_bytes(gzip.compress(pickle.dumps(_Payload(), protocol=4)))

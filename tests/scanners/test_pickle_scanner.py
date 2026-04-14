@@ -101,6 +101,7 @@ def test_pickle_scanner_star_import_exports_scanner_class() -> None:
 
 def test_looks_like_pickle_sniffs_binary_and_protocol_zero_payloads() -> None:
     assert _looks_like_pickle(pickle.dumps({"safe": True}, protocol=4)) is True
+    assert _looks_like_pickle(b"\x80\x01K\x01.") is True
     assert _looks_like_pickle(b"cos\nsystem\n.") is True
     assert _looks_like_pickle(b"not a pickle") is False
 
@@ -680,6 +681,30 @@ def test_post_budget_scan_detects_prememoized_stack_global_tail(tmp_path: Path) 
     assert result.success is False
 
 
+@pytest.mark.parametrize(
+    "tail",
+    [
+        b"h\x00" + _short_binunicode(b"run") + b"\x93)R.",
+        _short_binunicode(b"subprocess") + b"h\x01\x93)R.",
+    ],
+    ids=["memo-module-inline-name", "inline-module-memo-name"],
+)
+def test_post_budget_scan_detects_mixed_prememoized_stack_global_tail(tmp_path: Path, tail: bytes) -> None:
+    path = tmp_path / "post-budget-prememo-mixed-stack-global.pkl"
+    path.write_bytes(_make_pre_memoized_post_budget_stack_global_payload(tail))
+
+    result = PickleScanner({"max_opcodes": 7, "post_budget_global_scan_limit_bytes": 4096}).scan(str(path))
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("pickle_rule_code") == "POST_BUDGET_GLOBAL"
+        and issue.details.get("module") == "subprocess"
+        and issue.details.get("name") == "run"
+        for issue in result.issues
+    ), result.issues
+    assert result.success is False
+
+
 def test_scan_bounds_follow_on_probe_recursion_for_pickle_like_binary_tail(tmp_path: Path) -> None:
     path = tmp_path / "binary-tail.pkl"
     path.write_bytes(pickle.dumps({"safe": True}, protocol=2) + (b"XYZNmore-binary-data" * 20))
@@ -892,18 +917,20 @@ def test_scan_stream_unknown_size_non_seekable_payload_above_root_cap_returns_tr
     assert any(check.name == "Pickle Stream Read Limit" for check in result.checks)
 
 
-def test_scan_stream_non_seekable_known_size_buffers_full_payload_past_raw_cap() -> None:
+def test_scan_stream_non_seekable_known_size_caps_root_payload_buffer() -> None:
     payload = pickle.dumps({"pad": b"A" * 4096}, protocol=4)
 
-    result = PickleScanner(config={"pickle_root_raw_scan_limit_bytes": 64}).scan_stream(
+    result = PickleScanner(config={"max_known_stream_read_bytes": 64}).scan_stream(
         NonSeekableBytesIO(payload),
         len(payload),
         source="known-large-nonseek.pkl",
     )
 
-    assert result.success is True
-    assert result.metadata["pickle_stream_bytes_buffered"] == len(payload)
-    assert "pickle_stream_truncated_for_root_scan" not in result.metadata
+    assert result.success is False
+    assert result.metadata["pickle_stream_truncated_for_root_scan"] is True
+    assert result.metadata["pickle_stream_bytes_buffered"] == 64
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert any(check.name == "Pickle Stream Read Limit" for check in result.checks)
 
 
 def test_scan_stream_detects_binary_tail_past_raw_window() -> None:
@@ -919,6 +946,19 @@ def test_scan_stream_detects_binary_tail_past_raw_window() -> None:
     assert any(
         issue.rule_code == "S502" and issue.details.get("offset") == len(pickle_payload) for issue in result.issues
     )
+
+
+def test_scan_stream_detects_seekable_binary_tail_from_current_position() -> None:
+    prefix = b"WRAPPED:"
+    pickle_payload = pickle.dumps({"safe": True}, protocol=4)
+    payload = pickle_payload + b"\x7fELF/bin/sh\x00"
+    stream = io.BytesIO(prefix + payload)
+    stream.seek(len(prefix))
+
+    result = PickleScanner().scan_stream(stream, len(payload), source="embedded-tail.bin")
+
+    expected_offset = len(prefix) + len(pickle_payload)
+    assert any(issue.rule_code == "S502" and issue.details.get("offset") == expected_offset for issue in result.issues)
 
 
 def test_extract_metadata_uses_pickle_opcodes_not_raw_bytes(tmp_path: Path) -> None:

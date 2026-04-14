@@ -3554,6 +3554,62 @@ mod tests {
     }
 
     #[test]
+    fn post_budget_tail_detects_mixed_memo_and_inline_stack_global_operands() {
+        let options = post_budget_prememo_options();
+        let variants = [
+            ("memo-module-inline-name", {
+                let mut tail = b"h\x00".to_vec();
+                tail.extend_from_slice(&short_binunicode(b"run"));
+                tail.extend_from_slice(b"\x93)R.");
+                tail
+            }),
+            ("inline-module-memo-name", {
+                let mut tail = short_binunicode(b"subprocess");
+                tail.extend_from_slice(b"h\x01\x93)R.");
+                tail
+            }),
+            (
+                "memo-module-inline-short-binstring-name",
+                b"h\x00U\x03run\x93)R.".to_vec(),
+            ),
+            (
+                "memo-module-inline-protocol0-string-name",
+                b"h\x00S'run'\n\x93)R.".to_vec(),
+            ),
+            (
+                "inline-protocol0-module-memo-name",
+                b"S'subprocess'\nh\x01\x93)R.".to_vec(),
+            ),
+        ];
+
+        for (label, tail) in variants {
+            let payload = pre_memoized_post_budget_stack_global_payload(&tail);
+            let mut scan = ScanState::new(
+                format!("post-budget-prememo-mixed-{label}.pkl"),
+                &payload,
+                &options,
+                Some(payload.len()),
+                0,
+                0,
+                None,
+            );
+
+            scan.run();
+
+            let finding = scan
+                .findings
+                .iter()
+                .find(|finding| finding.rule_code == Some("POST_BUDGET_GLOBAL"))
+                .unwrap_or_else(|| panic!("missing mixed post-budget global finding for {label}"));
+            assert_eq!(finding.severity, "critical");
+            assert_eq!(
+                detail_string(&finding.details, "pattern").as_deref(),
+                Some("subprocess\nrun")
+            );
+        }
+    }
+
+    #[test]
     fn post_budget_tail_promotes_memoized_stack_global_reduce_class_opcodes() {
         let options = post_budget_prememo_options();
         let variants = [
