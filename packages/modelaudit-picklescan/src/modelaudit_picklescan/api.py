@@ -18,6 +18,14 @@ _PICKLE_MEMBER_SUFFIXES = (".pkl", ".pickle")
 _MAX_PYTORCH_ZIP_ENTRIES = 10_000
 _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES = 512 * 1024 * 1024
 _RUST_EXTENSION_MODULE = "modelaudit_picklescan._rust"
+_ZIP_EOCD_SIGNATURE = b"PK\x05\x06"
+_ZIP_EOCD_MIN_SIZE = 22
+_ZIP_MAX_COMMENT_SIZE = 0xFFFF
+_ZIP64_EOCD_LOCATOR_SIGNATURE = b"PK\x06\x07"
+_ZIP64_EOCD_LOCATOR_SIZE = 20
+_ZIP64_EOCD_SIGNATURE = b"PK\x06\x06"
+_ZIP64_EOCD_MIN_SIZE = 56
+_ZIP64_SENTINEL_ENTRY_COUNT = 0xFFFF
 
 
 class _StreamShortReadError(ValueError):
@@ -153,25 +161,20 @@ class PickleScanner:
             )
 
     def _scan_pytorch_zip_file(self, path: Path, *, source: str, size: int) -> PickleReport | None:
+        preflight_entry_count = _read_zip_entry_count(path, size)
+        if preflight_entry_count is not None and preflight_entry_count > _MAX_PYTORCH_ZIP_ENTRIES:
+            return _pytorch_zip_entry_limit_report(
+                source=source,
+                size=size,
+                entry_count=preflight_entry_count,
+            )
+
         with zipfile.ZipFile(path, "r") as archive:
-            entries = archive.infolist()
+            entries = _bounded_zip_entries(archive, source=source, size=size)
+            if isinstance(entries, PickleReport):
+                return entries
             if not _is_pytorch_zip_archive(entries):
                 return None
-            if len(entries) > _MAX_PYTORCH_ZIP_ENTRIES:
-                return _pytorch_zip_notice_report(
-                    source=source,
-                    size=size,
-                    message=(
-                        "PyTorch ZIP analysis stopped because the archive contains too many entries "
-                        f"({len(entries)} > {_MAX_PYTORCH_ZIP_ENTRIES})"
-                    ),
-                    code="pytorch_zip_entry_limit",
-                    details={
-                        "entry_count": len(entries),
-                        "max_entries": _MAX_PYTORCH_ZIP_ENTRIES,
-                        "analysis_incomplete": True,
-                    },
-                )
 
             pickle_entries = _discover_pytorch_zip_pickle_entries(entries)
             if not pickle_entries:
@@ -263,6 +266,73 @@ def scan_file(path: str | Path, *, options: ScanOptions | None = None) -> Pickle
     return PickleScanner(options=options).scan_file(path)
 
 
+def _read_zip_entry_count(path: Path, file_size: int) -> int | None:
+    if file_size < _ZIP_EOCD_MIN_SIZE:
+        return None
+
+    tail_size = min(file_size, _ZIP_EOCD_MIN_SIZE + _ZIP_MAX_COMMENT_SIZE)
+    try:
+        with path.open("rb") as handle:
+            handle.seek(file_size - tail_size)
+            tail = handle.read(tail_size)
+            eocd_index = _find_zip_eocd_index(tail)
+            if eocd_index is None:
+                return None
+
+            entry_count = int.from_bytes(tail[eocd_index + 10 : eocd_index + 12], "little")
+            if entry_count != _ZIP64_SENTINEL_ENTRY_COUNT:
+                return entry_count
+
+            eocd_offset = file_size - tail_size + eocd_index
+            locator_offset = eocd_offset - _ZIP64_EOCD_LOCATOR_SIZE
+            if locator_offset < 0:
+                return None
+            handle.seek(locator_offset)
+            locator = handle.read(_ZIP64_EOCD_LOCATOR_SIZE)
+            if not locator.startswith(_ZIP64_EOCD_LOCATOR_SIGNATURE):
+                return None
+            zip64_eocd_offset = int.from_bytes(locator[8:16], "little")
+            handle.seek(zip64_eocd_offset)
+            zip64_eocd = handle.read(_ZIP64_EOCD_MIN_SIZE)
+            if len(zip64_eocd) < _ZIP64_EOCD_MIN_SIZE or not zip64_eocd.startswith(_ZIP64_EOCD_SIGNATURE):
+                return None
+            return int.from_bytes(zip64_eocd[32:40], "little")
+    except OSError:
+        return None
+
+
+def _find_zip_eocd_index(tail: bytes) -> int | None:
+    search_end = len(tail)
+    while True:
+        eocd_index = tail.rfind(_ZIP_EOCD_SIGNATURE, 0, search_end)
+        if eocd_index < 0 or eocd_index + _ZIP_EOCD_MIN_SIZE > len(tail):
+            return None
+        comment_length = int.from_bytes(tail[eocd_index + 20 : eocd_index + 22], "little")
+        if eocd_index + _ZIP_EOCD_MIN_SIZE + comment_length == len(tail):
+            return eocd_index
+        search_end = eocd_index
+
+
+def _bounded_zip_entries(
+    archive: zipfile.ZipFile,
+    *,
+    source: str,
+    size: int,
+) -> list[zipfile.ZipInfo] | PickleReport:
+    filelist = getattr(archive, "filelist", None)
+    if isinstance(filelist, list):
+        entry_count = len(filelist)
+        if entry_count > _MAX_PYTORCH_ZIP_ENTRIES:
+            return _pytorch_zip_entry_limit_report(source=source, size=size, entry_count=entry_count)
+        return cast(list[zipfile.ZipInfo], filelist)
+
+    entries = archive.infolist()
+    entry_count = len(entries)
+    if entry_count > _MAX_PYTORCH_ZIP_ENTRIES:
+        return _pytorch_zip_entry_limit_report(source=source, size=size, entry_count=entry_count)
+    return entries
+
+
 def _is_pytorch_zip_archive(entries: list[zipfile.ZipInfo]) -> bool:
     names = [entry.filename for entry in entries if not entry.is_dir()]
     has_data_pickle = any(_is_data_pickle_member(name) for name in names)
@@ -320,6 +390,23 @@ def _pytorch_zip_notice_report(
             opcode_scan_complete=False,
         ),
         metadata={"container_type": "pytorch_zip", "archive_size_bytes": size},
+    )
+
+
+def _pytorch_zip_entry_limit_report(*, source: str, size: int, entry_count: int) -> PickleReport:
+    return _pytorch_zip_notice_report(
+        source=source,
+        size=size,
+        message=(
+            "PyTorch ZIP analysis stopped because the archive contains too many entries "
+            f"({entry_count} > {_MAX_PYTORCH_ZIP_ENTRIES})"
+        ),
+        code="pytorch_zip_entry_limit",
+        details={
+            "entry_count": entry_count,
+            "max_entries": _MAX_PYTORCH_ZIP_ENTRIES,
+            "analysis_incomplete": True,
+        },
     )
 
 

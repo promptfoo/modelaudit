@@ -845,6 +845,40 @@ def test_scan_file_marks_oversized_pytorch_zip_member_inconclusive(
     assert any(notice.code == "pytorch_zip_member_size_limit" for notice in report.notices)
 
 
+def test_scan_file_enforces_pytorch_zip_entry_cap_before_opening_archive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(package_api, "_MAX_PYTORCH_ZIP_ENTRIES", 2)
+    archive_path = tmp_path / "entry-limit.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("version", "3\n")
+        archive.writestr("byteorder", "little")
+
+    class UnexpectedZipFile:
+        def __init__(self, path: Path, mode: str) -> None:
+            del path, mode
+            raise AssertionError("entry limit should be enforced before ZipFile opens the archive")
+
+    monkeypatch.setattr(package_api.zipfile, "ZipFile", UnexpectedZipFile)
+
+    report = PickleScanner()._scan_pytorch_zip_file(
+        archive_path,
+        source=str(archive_path),
+        size=archive_path.stat().st_size,
+    )
+
+    assert report is not None
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    notices = [notice for notice in report.notices if notice.code == "pytorch_zip_entry_limit"]
+    assert len(notices) == 1
+    assert notices[0].details["analysis_incomplete"] is True
+    assert notices[0].details["entry_count"] == 3
+    assert notices[0].details["max_entries"] == 2
+
+
 def test_scan_file_scans_pytorch_zip_member_partial_bytes_on_short_read(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
