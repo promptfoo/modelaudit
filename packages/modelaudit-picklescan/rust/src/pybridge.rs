@@ -3,7 +3,8 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::PyDict;
 use std::time::Instant;
 
-use crate::state::{ScanOptions, ScanState};
+use crate::options::ScanOptions;
+use crate::state::ScanState;
 
 #[pyfunction]
 #[pyo3(signature = (payload, source, options, bytes_total=None, position_offset=0, nested_depth=0))]

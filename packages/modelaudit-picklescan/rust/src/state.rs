@@ -1,36 +1,39 @@
-use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
+use crate::expansion::{
+    detect_expansion_findings_in_tail, expansion_finding_to_detail, expansion_trigger_label,
+    flush_expansion_state, record_expansion_state_opcode, ExpansionHeuristicFinding,
+    ExpansionHeuristicState,
+};
 use crate::nested::{
     decode_possible_encoded_pickle, detect_oversized_encoded_pickle_prefixes,
     encoded_nested_literal_probe_windows, encoded_nested_window_char_limit, has_execution_opcode,
     has_pickle_prefix, looks_like_pickle_payload, nested_pickle_probe_offsets,
     pickle_payload_extent, truncated_pickle_prefix_requires_fail_closed,
 };
-use crate::opcode::{
-    decode_raw_unicode_escape, parse_opcode, parse_pickle_string_literal, ArgValue, ParseError,
-    ParsedOpcode,
+use crate::nested_surface::{
+    encoded_nested_payload_finding, is_allowlisted_nested_constructor_ref,
+    nested_rule_code_for_encoding, raw_nested_payload_finding, NestedPayloadFinding,
+    NestedSurfaceOutcome,
 };
+use crate::opcode::{parse_opcode, ArgValue, ParseError, ParsedOpcode};
+use crate::options::{deadline_from_timeout, ScanOptions};
 use crate::policy::global_severity;
+use crate::post_budget::{post_budget_absolute_position, post_budget_global_matches};
 use crate::report::{
     detail_string, detail_usize, notice_to_detail_value, scan_error_to_detail_value, DetailValue,
-    Finding, Notice, ScanError,
+    Finding, FindingDedupeKey, Notice, NoticeDedupeKey, ScanError,
+};
+use crate::stack::{
+    collapse_tuple_values, operand_preview, pytorch_storage_key, resolve_global_operand,
+    stack_value_from_integer_arg, stack_value_from_text_arg, stack_value_preview,
+    stack_value_string, GlobalRef, StackValue,
 };
 use crate::strings::suspicious_string_matches;
 
-const DEFAULT_TIMEOUT_S: f64 = 3600.0;
-const MAX_TIMEOUT_S: f64 = 86_400.0;
-const DEFAULT_MAX_OPCODES: usize = 1_000_000;
-const DEFAULT_POST_BUDGET_SCAN_BYTES: usize = 100 * 1024 * 1024;
-const DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS: usize = 8 * 1024 * 1024;
-const DEFAULT_MAX_NESTED_PICKLE_BYTES: usize = 2 * 1024 * 1024;
-const DEFAULT_MAX_NESTED_DEPTH: usize = 2;
-const MAX_TRACKED_TUPLE_ITEMS: usize = 16;
-const MAX_STACK_BYTES_PREVIEW: usize = 4096;
 const MIN_SUSPICIOUS_LITERAL_SCAN_WINDOW_CHARS: usize = 8192;
 const SUSPICIOUS_LITERAL_SCAN_OVERLAP_CHARS: usize = 4096;
 const TIME_CHECK_INTERVAL_OPCODES: usize = 4096;
@@ -46,180 +49,61 @@ const STACK_GLOBAL_STRING_OPCODES: &[&str] = &[
     "UNICODE",
 ];
 const REDUCE_OPCODES: &[&str] = &["REDUCE", "NEWOBJ", "NEWOBJ_EX", "OBJ", "INST", "BUILD"];
-const EXPANSION_EVENT_WINDOW: usize = 6;
-const EXPANSION_GROWTH_BUILDERS: &[&str] = &[
-    "APPEND", "APPENDS", "LIST", "TUPLE", "TUPLE1", "TUPLE2", "TUPLE3",
-];
-const EXPANSION_DUP_COUNT_THRESHOLD: usize = 128;
-const EXPANSION_DUP_DENSITY_THRESHOLD: f64 = 0.10;
-const EXPANSION_GET_PUT_RATIO_THRESHOLD: f64 = 32.0;
-const EXPANSION_GET_PUT_MIN_READS: usize = 128;
-const EXPANSION_MEMO_GROWTH_MIN_WRITES: usize = 64;
-const EXPANSION_MEMO_GROWTH_STEPS_THRESHOLD: usize = 32;
-const EXPANSION_RATIO_SUPPORTING_DUP_THRESHOLD: usize = 64;
-const EXPANSION_RATIO_SUPPORTING_GROWTH_THRESHOLD: usize = 16;
-const POST_BUDGET_REDUCE_PROXIMITY_BYTES: usize = 64;
-const POST_BUDGET_REDUCE_BYTES: &[u8] = b"Rob\x81\x92";
-
-#[derive(Clone)]
-struct GlobalRef {
-    module: String,
-    name: String,
-    position: usize,
-    malformed: bool,
-}
-
-impl GlobalRef {
-    fn symbol(&self) -> String {
-        format!("{}.{}", self.module, self.name)
-    }
-}
-
-#[derive(Clone)]
-enum StackValue {
-    Mark,
-    Text(String),
-    TextSpan {
-        start: usize,
-        end: usize,
-    },
-    Bytes {
-        start: usize,
-        end: usize,
-    },
-    Global(GlobalRef),
-    Constructed(GlobalRef),
-    Tuple(Vec<StackValue>),
-    Primitive {
-        type_name: &'static str,
-        repr: String,
-    },
-    Other,
-}
 
 enum LimitError {
     OpcodeBudgetExceeded(Vec<u8>),
     Timeout,
 }
 
-#[derive(Clone)]
-enum ExpansionEvent {
-    Op(&'static str),
-    Read(i64),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanStatus {
+    Complete,
+    Inconclusive,
+    Error,
 }
 
-#[derive(Clone, Default)]
-struct ExpansionHeuristicState {
-    stream_id: usize,
-    opcode_count: usize,
-    memo_reads: usize,
-    memo_writes: usize,
-    dup_count: usize,
-    memo_growth_steps: usize,
-    max_memo_index: i64,
-    next_memo_index: i64,
-    last_written_index: Option<i64>,
-    last_position: usize,
-    event_window: Vec<ExpansionEvent>,
-}
-
-#[derive(Clone)]
-struct ExpansionHeuristicFinding {
-    stream_id: usize,
-    position: usize,
-    opcode_count: usize,
-    memo_reads: usize,
-    memo_writes: usize,
-    get_put_ratio: f64,
-    dup_count: usize,
-    dup_density: f64,
-    memo_growth_steps: usize,
-    memo_slots_used: usize,
-    triggers: Vec<&'static str>,
-}
-
-struct NestedPayloadFinding {
-    encoding: &'static str,
-    payload_size: usize,
-    position: usize,
-    analysis_incomplete: bool,
-    nested_has_execution_opcode: bool,
-    rule_code: &'static str,
-    complete_message: &'static str,
-    incomplete_message: &'static str,
-    why: &'static str,
-    include_limit_when_complete: bool,
-}
-
-#[derive(Default)]
-struct NestedSurfaceOutcome {
-    has_critical_finding: bool,
-    has_unclassified_execution: bool,
-    incomplete: bool,
-    depth_limited: bool,
-}
-
-impl NestedSurfaceOutcome {
-    fn promote_complete_payload(&self, nested_has_execution_opcode: bool) -> bool {
-        self.has_critical_finding
-            || self.incomplete
-            || (self.has_unclassified_execution && nested_has_execution_opcode)
-            || (self.depth_limited && nested_has_execution_opcode)
+impl ScanStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Inconclusive => "inconclusive",
+            Self::Error => "error",
+        }
     }
 
-    fn should_stop_raw_probe_scan(&self, nested_has_execution_opcode: bool) -> bool {
-        self.has_critical_finding
-            || self.incomplete
-            || (self.depth_limited && nested_has_execution_opcode)
+    fn is_complete(self) -> bool {
+        self == Self::Complete
     }
 }
 
-fn raw_nested_payload_finding(
-    payload_size: usize,
-    position: usize,
-    analysis_incomplete: bool,
-    nested_has_execution_opcode: bool,
-) -> NestedPayloadFinding {
-    NestedPayloadFinding {
-        encoding: "raw",
-        payload_size,
-        position,
-        analysis_incomplete,
-        nested_has_execution_opcode,
-        rule_code: "S213",
-        complete_message: "Nested pickle payload detected",
-        incomplete_message: "Nested pickle payload exceeds deep-scan byte limit",
-        why: "This pickle contains another serialized pickle payload inside a byte field. Nested payloads can hide code execution paths from shallow scanners.",
-        include_limit_when_complete: true,
+impl PartialEq<&str> for ScanStatus {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
     }
 }
 
-fn encoded_nested_payload_finding(
-    encoding: &'static str,
-    payload_size: usize,
-    position: usize,
-    analysis_incomplete: bool,
-    nested_has_execution_opcode: bool,
-) -> NestedPayloadFinding {
-    NestedPayloadFinding {
-        encoding,
-        payload_size,
-        position,
-        analysis_incomplete,
-        nested_has_execution_opcode,
-        rule_code: if encoding == "base64" { "S601" } else { "S602" },
-        complete_message: "Encoded pickle payload detected",
-        incomplete_message: "Encoded pickle payload exceeds deep-scan byte limit",
-        why: "Encoded nested pickle payloads can hide deserialization gadgets inside apparently inert metadata strings.",
-        include_limit_when_complete: false,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanVerdict {
+    Clean,
+    Suspicious,
+    Malicious,
+    Unknown,
+}
+
+impl ScanVerdict {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Suspicious => "suspicious",
+            Self::Malicious => "malicious",
+            Self::Unknown => "unknown",
+        }
     }
 }
 
-fn nested_rule_code_for_encoding(encoding: &'static str) -> &'static str {
-    match encoding {
-        "raw" => "S213",
-        "base64" => "S601",
-        _ => "S602",
+impl PartialEq<&str> for ScanVerdict {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
     }
 }
 
@@ -252,94 +136,7 @@ fn global_ref_details(
     ]
 }
 
-impl ExpansionHeuristicState {
-    fn new(stream_id: usize) -> Self {
-        Self {
-            stream_id,
-            max_memo_index: -1,
-            ..Self::default()
-        }
-    }
-}
-
 type GlobalReferenceDedupeKey = (String, String, usize, &'static str, bool);
-type NoticeDedupeKey = (Option<&'static str>, Option<String>, String);
-
-pub(crate) struct ScanOptions {
-    timeout_s: f64,
-    max_opcodes: usize,
-    post_budget_scan_bytes: usize,
-    max_string_literal_scan_chars: usize,
-    max_nested_pickle_bytes: usize,
-    max_nested_depth: usize,
-}
-
-impl ScanOptions {
-    pub(crate) fn from_py(options: &Bound<'_, PyDict>) -> PyResult<Self> {
-        Ok(Self {
-            timeout_s: clamp_timeout_s(option_f64(options, "timeout_s", DEFAULT_TIMEOUT_S)?),
-            max_opcodes: option_usize(options, "max_opcodes", DEFAULT_MAX_OPCODES)?,
-            post_budget_scan_bytes: option_usize(
-                options,
-                "post_budget_scan_bytes",
-                DEFAULT_POST_BUDGET_SCAN_BYTES,
-            )?,
-            max_string_literal_scan_chars: option_usize(
-                options,
-                "max_string_literal_scan_chars",
-                DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            )?,
-            max_nested_pickle_bytes: option_usize(
-                options,
-                "max_nested_pickle_bytes",
-                DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            )?,
-            max_nested_depth: option_usize(options, "max_nested_depth", DEFAULT_MAX_NESTED_DEPTH)?,
-        })
-    }
-}
-
-fn clamp_timeout_s(timeout_s: f64) -> f64 {
-    timeout_s.min(MAX_TIMEOUT_S)
-}
-
-fn timeout_duration(timeout_s: f64) -> Duration {
-    if timeout_s.is_finite() && timeout_s > 0.0 {
-        Duration::from_secs_f64(clamp_timeout_s(timeout_s))
-    } else {
-        Duration::from_secs_f64(DEFAULT_TIMEOUT_S)
-    }
-}
-
-fn deadline_from_timeout(timeout_s: f64) -> Instant {
-    let now = Instant::now();
-    let duration = timeout_duration(timeout_s);
-    now.checked_add(duration).unwrap_or_else(|| {
-        now.checked_add(Duration::from_secs_f64(DEFAULT_TIMEOUT_S))
-            .unwrap_or_else(|| now + Duration::from_secs(1))
-    })
-}
-
-fn option_usize(options: &Bound<'_, PyDict>, key: &str, default: usize) -> PyResult<usize> {
-    match options.get_item(key)? {
-        Some(value) => value.extract::<usize>(),
-        None => Ok(default),
-    }
-}
-
-fn option_f64(options: &Bound<'_, PyDict>, key: &str, default: f64) -> PyResult<f64> {
-    let value = match options.get_item(key)? {
-        Some(value) => value.extract::<f64>(),
-        None => Ok(default),
-    }?;
-    if value.is_finite() && value > 0.0 {
-        Ok(value)
-    } else {
-        Err(PyValueError::new_err(format!(
-            "{key} must be greater than 0 and finite, got {value:?}"
-        )))
-    }
-}
 
 pub(crate) struct ScanState<'a> {
     source: String,
@@ -372,9 +169,9 @@ pub(crate) struct ScanState<'a> {
     first_buffer_opcode_position: Option<usize>,
     persistent_id_count: usize,
     first_persistent_id_position: Option<usize>,
-    status: &'static str,
-    verdict: &'static str,
-    seen_finding_keys: HashSet<(String, Option<String>, Option<&'static str>)>,
+    status: ScanStatus,
+    verdict: ScanVerdict,
+    seen_finding_keys: HashSet<FindingDedupeKey>,
     seen_notice_keys: HashSet<NoticeDedupeKey>,
     seen_global_reference_keys: HashSet<GlobalReferenceDedupeKey>,
     import_references_truncated: bool,
@@ -422,8 +219,8 @@ impl<'a> ScanState<'a> {
             first_buffer_opcode_position: None,
             persistent_id_count: 0,
             first_persistent_id_position: None,
-            status: "complete",
-            verdict: "clean",
+            status: ScanStatus::Complete,
+            verdict: ScanVerdict::Clean,
             seen_finding_keys: HashSet::new(),
             seen_notice_keys: HashSet::new(),
             seen_global_reference_keys: HashSet::new(),
@@ -467,7 +264,7 @@ impl<'a> ScanState<'a> {
                 };
 
                 if let Err(limit_error) = self.check_limits(&parsed) {
-                    self.status = "inconclusive";
+                    self.status = ScanStatus::Inconclusive;
                     match limit_error {
                         LimitError::OpcodeBudgetExceeded(tail_prefix) => {
                             self.add_notice(Notice {
@@ -564,7 +361,7 @@ impl<'a> ScanState<'a> {
             }
         }
 
-        if self.status == "complete"
+        if self.status.is_complete()
             && matches!(self.bytes_total, Some(bytes_total) if self.payload.len() < bytes_total)
         {
             self.record_short_read();
@@ -597,7 +394,7 @@ impl<'a> ScanState<'a> {
     fn handle_parse_error(&mut self, error: ParseError, index: usize) {
         let report_index = error.report_index.unwrap_or(index);
         if self.opcode_count == 0 && self.findings.is_empty() {
-            self.status = "error";
+            self.status = ScanStatus::Error;
             self.errors.push(ScanError {
                 message: format!("Could not parse pickle stream: {}", error.message),
                 category: "parse_error",
@@ -613,7 +410,7 @@ impl<'a> ScanState<'a> {
                 )],
             });
         } else {
-            self.status = "inconclusive";
+            self.status = ScanStatus::Inconclusive;
             self.add_notice(Notice {
                 message: format!(
                     "Pickle parsing stopped before the stream was fully consumed: {}",
@@ -643,8 +440,8 @@ impl<'a> ScanState<'a> {
     }
 
     fn record_empty_input_error(&mut self) {
-        self.status = "error";
-        self.verdict = "unknown";
+        self.status = ScanStatus::Error;
+        self.verdict = ScanVerdict::Unknown;
         self.errors.push(ScanError {
             message: "Input is empty and does not contain a pickle stream".to_string(),
             category: "empty_input",
@@ -658,7 +455,7 @@ impl<'a> ScanState<'a> {
         let Some(expected_size) = self.bytes_total else {
             return;
         };
-        self.status = "error";
+        self.status = ScanStatus::Error;
         self.bytes_scanned = self.bytes_scanned.max(self.payload.len());
         self.errors.push(ScanError {
             message: format!(
@@ -1429,8 +1226,8 @@ impl<'a> ScanState<'a> {
     }
 
     fn record_raw_nested_payload_truncated(&mut self, payload_size: usize, position: usize) {
-        if self.status == "complete" {
-            self.status = "inconclusive";
+        if self.status.is_complete() {
+            self.status = ScanStatus::Inconclusive;
         }
         self.add_notice(Notice {
             message: "Nested pickle payload exceeds configured deep-scan byte limit".to_string(),
@@ -1521,8 +1318,8 @@ impl<'a> ScanState<'a> {
         payload_size: usize,
         position: usize,
     ) {
-        if self.status == "complete" {
-            self.status = "inconclusive";
+        if self.status.is_complete() {
+            self.status = ScanStatus::Inconclusive;
         }
         self.add_notice(Notice {
             message: "Encoded pickle payload exceeds configured deep-scan byte limit".to_string(),
@@ -1684,19 +1481,13 @@ impl<'a> ScanState<'a> {
     }
 
     fn add_finding(&mut self, finding: Finding) {
-        let key = (
-            finding.message.clone(),
-            finding.location.clone(),
-            finding.rule_code,
-        );
-        if self.seen_finding_keys.insert(key) {
+        if self.seen_finding_keys.insert(finding.dedupe_key()) {
             self.findings.push(finding);
         }
     }
 
     fn add_notice(&mut self, notice: Notice) {
-        let key = notice_dedupe_key(&notice);
-        if self.seen_notice_keys.insert(key) {
+        if self.seen_notice_keys.insert(notice.dedupe_key()) {
             self.notices.push(notice);
         }
     }
@@ -1726,7 +1517,7 @@ impl<'a> ScanState<'a> {
     }
 
     fn rebuild_seen_notice_keys(&mut self) {
-        self.seen_notice_keys = self.notices.iter().map(notice_dedupe_key).collect();
+        self.seen_notice_keys = self.notices.iter().map(Notice::dedupe_key).collect();
     }
 
     fn record_structural_opcode(&mut self, opcode: &ParsedOpcode, position: usize) {
@@ -1942,8 +1733,8 @@ impl<'a> ScanState<'a> {
         op_name: &'static str,
         position: usize,
     ) {
-        if self.status == "complete" {
-            self.status = "inconclusive";
+        if self.status.is_complete() {
+            self.status = ScanStatus::Inconclusive;
         }
         self.add_notice(Notice {
             message: format!(
@@ -2005,7 +1796,7 @@ impl<'a> ScanState<'a> {
 
         let nested_had_findings = !nested_scan.findings.is_empty();
         let mut outcome = NestedSurfaceOutcome {
-            incomplete: nested_scan.status != "complete",
+            incomplete: !nested_scan.status.is_complete(),
             ..NestedSurfaceOutcome::default()
         };
         if !outcome.incomplete
@@ -2014,7 +1805,7 @@ impl<'a> ScanState<'a> {
         {
             outcome.has_unclassified_execution = true;
         }
-        let nested_incomplete = nested_scan.status != "complete";
+        let nested_incomplete = !nested_scan.status.is_complete();
 
         for nested_finding in nested_scan.findings {
             if nested_finding.severity == "critical" {
@@ -2062,8 +1853,8 @@ impl<'a> ScanState<'a> {
         }
 
         if nested_incomplete {
-            if self.status == "complete" {
-                self.status = "inconclusive";
+            if self.status.is_complete() {
+                self.status = ScanStatus::Inconclusive;
             }
             self.add_finding(Finding {
                 message: "Nested pickle analysis did not complete".to_string(),
@@ -2077,7 +1868,7 @@ impl<'a> ScanState<'a> {
                     ),
                     (
                         "nested_status".to_string(),
-                        DetailValue::String(nested_scan.status.to_string()),
+                        DetailValue::String(nested_scan.status.as_str().to_string()),
                     ),
                     ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
                 ],
@@ -2107,7 +1898,7 @@ impl<'a> ScanState<'a> {
                     ),
                     (
                         "nested_status".to_string(),
-                        DetailValue::String(nested_scan.status.to_string()),
+                        DetailValue::String(nested_scan.status.as_str().to_string()),
                     ),
                     (
                         "nested_errors".to_string(),
@@ -2146,9 +1937,9 @@ impl<'a> ScanState<'a> {
             .bytes_scanned
             .max(stream_offset.saturating_add(tail.len()));
 
-        for global_match in
-            post_budget_global_matches(&tail, tail_prefix_len, &self.memo, self.payload)
-        {
+        for global_match in post_budget_global_matches(&tail, tail_prefix_len, |memo_index| {
+            resolve_global_operand(self.memo.get(&memo_index), self.payload)
+        }) {
             let absolute_position = post_budget_absolute_position(
                 stream_offset,
                 read_offset,
@@ -2327,25 +2118,25 @@ impl<'a> ScanState<'a> {
             .iter()
             .any(|finding| finding.severity == "critical")
         {
-            self.verdict = "malicious";
+            self.verdict = ScanVerdict::Malicious;
         } else if self
             .findings
             .iter()
             .any(|finding| finding.severity == "warning")
         {
-            self.verdict = "suspicious";
-        } else if self.status == "complete" {
-            self.verdict = "clean";
+            self.verdict = ScanVerdict::Suspicious;
+        } else if self.status.is_complete() {
+            self.verdict = ScanVerdict::Clean;
         } else {
-            self.verdict = "unknown";
+            self.verdict = ScanVerdict::Unknown;
         }
     }
 
     pub(crate) fn to_py_report(&self, py: Python<'_>, duration_s: f64) -> PyResult<Py<PyDict>> {
         let report = PyDict::new(py);
         report.set_item("source", &self.source)?;
-        report.set_item("status", self.status)?;
-        report.set_item("verdict", self.verdict)?;
+        report.set_item("status", self.status.as_str())?;
+        report.set_item("verdict", self.verdict.as_str())?;
 
         let findings = PyList::empty(py);
         for finding in &self.findings {
@@ -2365,7 +2156,7 @@ impl<'a> ScanState<'a> {
         }
         report.set_item("errors", errors)?;
 
-        let raw_scan_complete = self.status == "complete"
+        let raw_scan_complete = self.status.is_complete()
             && self
                 .bytes_total
                 .map(|bytes_total| self.bytes_scanned >= bytes_total)
@@ -2375,7 +2166,7 @@ impl<'a> ScanState<'a> {
         coverage.set_item("bytes_total", self.bytes_total)?;
         coverage.set_item("opcode_count", self.opcode_count)?;
         coverage.set_item("raw_scan_complete", raw_scan_complete)?;
-        coverage.set_item("opcode_scan_complete", self.status == "complete")?;
+        coverage.set_item("opcode_scan_complete", self.status.is_complete())?;
         report.set_item("coverage", coverage)?;
 
         let metadata = PyDict::new(py);
@@ -2403,117 +2194,6 @@ impl<'a> ScanState<'a> {
     }
 }
 
-fn resolve_global_operand(value: Option<&StackValue>, payload: &[u8]) -> Option<String> {
-    match value {
-        Some(StackValue::Text(value)) => Some(value.clone()),
-        Some(StackValue::TextSpan { start, end }) if start <= end && *end <= payload.len() => {
-            Some(String::from_utf8_lossy(&payload[*start..*end]).to_string())
-        }
-        _ => None,
-    }
-}
-
-fn operand_preview(value: Option<&StackValue>) -> String {
-    match value {
-        Some(StackValue::Global(reference)) => format!("_GlobalRef({})", reference.symbol()),
-        Some(StackValue::Constructed(reference)) => format!("constructed:{}", reference.symbol()),
-        Some(StackValue::TextSpan { start, end }) => {
-            format!("str_span(len={})", end.saturating_sub(*start))
-        }
-        Some(StackValue::Bytes { start, end }) => {
-            format!("bytes(len={})", end.saturating_sub(*start))
-        }
-        Some(StackValue::Mark) => "MARK".to_string(),
-        Some(StackValue::Text(value)) => format!("str:{:?}", value),
-        Some(StackValue::Tuple(values)) => format!("tuple(len={})", values.len()),
-        Some(StackValue::Primitive { type_name, repr }) => format!("{type_name}:{repr}"),
-        Some(StackValue::Other) => "object".to_string(),
-        None => "NoneType:None".to_string(),
-    }
-}
-
-fn collapse_tuple_values(values: Vec<StackValue>) -> StackValue {
-    if values.len() > MAX_TRACKED_TUPLE_ITEMS
-        || values
-            .iter()
-            .any(|value| matches!(value, StackValue::Tuple(_)))
-    {
-        StackValue::Other
-    } else {
-        StackValue::Tuple(values)
-    }
-}
-
-fn stack_value_preview(value: &StackValue, depth: usize) -> String {
-    if depth >= 3 {
-        return "...".to_string();
-    }
-
-    match value {
-        StackValue::Mark => "MARK".to_string(),
-        StackValue::Text(value) => format!("str:{:?}", value),
-        StackValue::TextSpan { start, end } => {
-            format!("str_span(len={})", end.saturating_sub(*start))
-        }
-        StackValue::Bytes { start, end } => format!("bytes(len={})", end.saturating_sub(*start)),
-        StackValue::Global(reference) => format!("global:{}", reference.symbol()),
-        StackValue::Constructed(reference) => format!("constructed:{}", reference.symbol()),
-        StackValue::Tuple(values) => {
-            let mut parts: Vec<String> = values
-                .iter()
-                .take(6)
-                .map(|item| stack_value_preview(item, depth + 1))
-                .collect();
-            if values.len() > 6 {
-                parts.push("...".to_string());
-            }
-            format!("tuple({})", parts.join(", "))
-        }
-        StackValue::Primitive { type_name, repr } => format!("{type_name}:{repr}"),
-        StackValue::Other => "object".to_string(),
-    }
-}
-
-fn stack_value_text<'payload>(
-    value: &'payload StackValue,
-    payload: &'payload [u8],
-) -> Option<Cow<'payload, str>> {
-    match value {
-        StackValue::Text(text) => Some(Cow::Borrowed(text)),
-        StackValue::TextSpan { start, end } if start <= end && *end <= payload.len() => {
-            Some(String::from_utf8_lossy(&payload[*start..*end]))
-        }
-        StackValue::Primitive { repr, .. } => Some(Cow::Borrowed(repr)),
-        StackValue::Bytes { start, end }
-            if start <= end
-                && *end <= payload.len()
-                && end.saturating_sub(*start) <= MAX_STACK_BYTES_PREVIEW =>
-        {
-            std::str::from_utf8(&payload[*start..*end])
-                .ok()
-                .map(Cow::Borrowed)
-        }
-        _ => None,
-    }
-}
-
-fn stack_value_string(value: &StackValue, payload: &[u8]) -> Option<String> {
-    stack_value_text(value, payload).map(Cow::into_owned)
-}
-
-fn pytorch_storage_key(value: &StackValue, payload: &[u8]) -> Option<String> {
-    let StackValue::Tuple(items) = value else {
-        return None;
-    };
-    if items.len() < 4 || stack_value_text(&items[0], payload).as_deref() != Some("storage") {
-        return None;
-    }
-    if !is_pytorch_storage_descriptor(&items[1], payload) {
-        return None;
-    }
-    stack_value_string(&items[2], payload)
-}
-
 fn nested_scan_has_only_allowlisted_constructor_refs(scan: &ScanState<'_>) -> bool {
     let mut saw_import_reference = false;
     for details in &scan.import_references {
@@ -2526,116 +2206,6 @@ fn nested_scan_has_only_allowlisted_constructor_refs(scan: &ScanState<'_>) -> bo
         }
     }
     saw_import_reference
-}
-
-fn is_allowlisted_nested_constructor_ref(reference: &str) -> bool {
-    matches!(
-        reference,
-        "builtins.range"
-            | "builtins.slice"
-            | "__builtin__.range"
-            | "__builtin__.slice"
-            | "__builtins__.range"
-            | "__builtins__.slice"
-            | "collections.Counter"
-            | "collections.OrderedDict"
-            | "collections.defaultdict"
-            | "datetime.date"
-            | "datetime.datetime"
-            | "datetime.time"
-            | "datetime.timedelta"
-            | "decimal.Decimal"
-            | "pathlib.PurePath"
-            | "pathlib.PurePosixPath"
-            | "pathlib.PureWindowsPath"
-            | "pathlib.PosixPath"
-            | "pathlib.WindowsPath"
-            | "re._compile"
-            | "uuid.UUID"
-    )
-}
-
-fn is_pytorch_storage_descriptor(value: &StackValue, payload: &[u8]) -> bool {
-    match value {
-        StackValue::Global(reference) => {
-            reference.module == "torch" && reference.name.ends_with("Storage")
-        }
-        StackValue::Text(text) => text.starts_with("torch.") && text.ends_with("Storage"),
-        StackValue::TextSpan { start, end } if start <= end && *end <= payload.len() => {
-            let text = String::from_utf8_lossy(&payload[*start..*end]);
-            text.starts_with("torch.") && text.ends_with("Storage")
-        }
-        _ => false,
-    }
-}
-
-fn stack_value_from_integer_arg(arg: &ArgValue, payload: &[u8]) -> StackValue {
-    match arg {
-        ArgValue::Int(value) => StackValue::Primitive {
-            type_name: "int",
-            repr: value.to_string(),
-        },
-        ArgValue::UInt(value) => StackValue::Primitive {
-            type_name: "int",
-            repr: value.to_string(),
-        },
-        ArgValue::Text(value) | ArgValue::DecodedString { text: value, .. } => {
-            integer_text_repr(value).map_or(StackValue::Other, |repr| StackValue::Primitive {
-                type_name: "int",
-                repr,
-            })
-        }
-        ArgValue::Bytes { start, end } if start <= end && *end <= payload.len() => {
-            little_endian_signed_integer_repr(&payload[*start..*end]).map_or(
-                StackValue::Other,
-                |repr| StackValue::Primitive {
-                    type_name: "int",
-                    repr,
-                },
-            )
-        }
-        _ => StackValue::Other,
-    }
-}
-
-fn integer_text_repr(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    let trimmed = trimmed.strip_suffix('L').unwrap_or(trimmed);
-    if trimmed.parse::<i64>().is_ok() {
-        return Some(trimmed.to_string());
-    }
-    None
-}
-
-fn little_endian_signed_integer_repr(value: &[u8]) -> Option<String> {
-    if value.len() > 16 {
-        return None;
-    }
-    if value.is_empty() {
-        return Some("0".to_string());
-    }
-
-    let sign_extend = value.last().is_some_and(|byte| byte & 0x80 != 0);
-    let mut buffer = if sign_extend { [0xffu8; 16] } else { [0u8; 16] };
-    buffer[..value.len()].copy_from_slice(value);
-    Some(i128::from_le_bytes(buffer).to_string())
-}
-
-fn stack_value_from_text_arg(arg: &ArgValue, payload: &[u8]) -> StackValue {
-    match arg {
-        ArgValue::Text(value) | ArgValue::DecodedString { text: value, .. } => {
-            StackValue::Text(value.clone())
-        }
-        ArgValue::TextSpan { start, end } | ArgValue::Bytes { start, end }
-            if start <= end && *end <= payload.len() =>
-        {
-            StackValue::TextSpan {
-                start: *start,
-                end: *end,
-            }
-        }
-        _ => StackValue::Text(arg.coerce_text(payload)),
-    }
 }
 
 fn post_budget_opcode_prefix(
@@ -2673,252 +2243,6 @@ fn post_budget_opcode_prefix(
     prefix
 }
 
-fn record_expansion_state_opcode(
-    state: &mut ExpansionHeuristicState,
-    opcode: &ParsedOpcode,
-    position: usize,
-) -> bool {
-    state.opcode_count += 1;
-    state.last_position = position;
-
-    if opcode.name == "DUP" {
-        state.dup_count += 1;
-    }
-
-    let is_memo_read = is_memo_read_opcode(opcode.name);
-    if is_memo_read {
-        state.memo_reads += 1;
-    } else if is_memo_write_opcode(opcode.name) {
-        state.memo_writes += 1;
-        let memo_index = if opcode.name == "MEMOIZE" {
-            let index = state.next_memo_index;
-            state.next_memo_index += 1;
-            Some(index)
-        } else {
-            let index = opcode.arg.as_i64();
-            if let Some(index) = index {
-                state.next_memo_index = state.next_memo_index.max(index.saturating_add(1));
-            }
-            index
-        };
-
-        let previous_memo_index = state.last_written_index;
-        let repeated_previous_read = previous_memo_index.is_some_and(|index| {
-            state
-                .event_window
-                .iter()
-                .filter(|event| matches!(event, ExpansionEvent::Read(read_index) if *read_index == index))
-                .count()
-                >= 2
-        });
-        let has_growth_builder = state.event_window.iter().any(|event| {
-            matches!(event, ExpansionEvent::Op(op_name) if EXPANSION_GROWTH_BUILDERS.contains(op_name))
-        });
-        let is_sequential_growth = previous_memo_index
-            .zip(memo_index)
-            .is_some_and(|(previous, current)| current == previous.saturating_add(1));
-        if is_sequential_growth && repeated_previous_read && has_growth_builder {
-            state.memo_growth_steps += 1;
-        }
-
-        if let Some(index) = memo_index {
-            state.max_memo_index = state.max_memo_index.max(index);
-            state.last_written_index = Some(index);
-        }
-    }
-
-    if is_memo_read {
-        state
-            .event_window
-            .push(ExpansionEvent::Read(opcode.arg.as_i64().unwrap_or(-1)));
-    } else {
-        state.event_window.push(ExpansionEvent::Op(opcode.name));
-    }
-    if state.event_window.len() > EXPANSION_EVENT_WINDOW {
-        state.event_window.remove(0);
-    }
-
-    opcode.name == "STOP"
-}
-
-fn flush_expansion_state(
-    state: &mut ExpansionHeuristicState,
-    findings: &mut Vec<ExpansionHeuristicFinding>,
-) {
-    let next_stream_id = state.stream_id.saturating_add(1);
-    if let Some(finding) = build_expansion_heuristic_finding(state) {
-        findings.push(finding);
-    }
-    *state = ExpansionHeuristicState::new(next_stream_id);
-}
-
-fn build_expansion_heuristic_finding(
-    state: &ExpansionHeuristicState,
-) -> Option<ExpansionHeuristicFinding> {
-    if state.opcode_count == 0 {
-        return None;
-    }
-
-    let get_put_ratio = if state.memo_writes == 0 {
-        0.0
-    } else {
-        state.memo_reads as f64 / state.memo_writes as f64
-    };
-    let dup_density = state.dup_count as f64 / state.opcode_count as f64;
-
-    let mut triggers = Vec::new();
-    if state.memo_writes >= EXPANSION_MEMO_GROWTH_MIN_WRITES
-        && state.memo_growth_steps >= EXPANSION_MEMO_GROWTH_STEPS_THRESHOLD
-    {
-        triggers.push("memo_growth_chain");
-    }
-    if state.dup_count >= EXPANSION_DUP_COUNT_THRESHOLD
-        && dup_density >= EXPANSION_DUP_DENSITY_THRESHOLD
-    {
-        triggers.push("excessive_dup_usage");
-    }
-    if state.memo_reads >= EXPANSION_GET_PUT_MIN_READS
-        && get_put_ratio >= EXPANSION_GET_PUT_RATIO_THRESHOLD
-        && (state.dup_count >= EXPANSION_RATIO_SUPPORTING_DUP_THRESHOLD
-            || state.memo_growth_steps >= EXPANSION_RATIO_SUPPORTING_GROWTH_THRESHOLD)
-    {
-        triggers.push("suspicious_get_put_ratio");
-    }
-    if triggers.is_empty() {
-        return None;
-    }
-
-    let memo_slots_used = if state.max_memo_index >= 0 {
-        usize::try_from(state.max_memo_index.saturating_add(1)).unwrap_or(usize::MAX)
-    } else {
-        0
-    };
-
-    Some(ExpansionHeuristicFinding {
-        stream_id: state.stream_id,
-        position: state.last_position,
-        opcode_count: state.opcode_count,
-        memo_reads: state.memo_reads,
-        memo_writes: state.memo_writes,
-        get_put_ratio: round_float(get_put_ratio, 100.0),
-        dup_count: state.dup_count,
-        dup_density: round_float(dup_density, 10_000.0),
-        memo_growth_steps: state.memo_growth_steps,
-        memo_slots_used,
-        triggers,
-    })
-}
-
-fn detect_expansion_findings_in_tail(
-    tail: &[u8],
-    stream_offset: usize,
-    read_offset: usize,
-    tail_prefix_len: usize,
-    position_offset: usize,
-) -> Vec<ExpansionHeuristicFinding> {
-    let mut findings = Vec::new();
-    let mut state = ExpansionHeuristicState::new(0);
-    let mut index = 0usize;
-    while index < tail.len() {
-        let parsed = match parse_opcode(tail, index, tail.len()) {
-            Ok(opcode) => opcode,
-            Err(_) => break,
-        };
-        let local_position = if parsed.pos < tail_prefix_len {
-            stream_offset.saturating_add(parsed.pos)
-        } else {
-            read_offset.saturating_add(parsed.pos - tail_prefix_len)
-        };
-        let should_finish_stream = record_expansion_state_opcode(
-            &mut state,
-            &parsed,
-            position_offset.saturating_add(local_position),
-        );
-        index = parsed.next;
-        if should_finish_stream {
-            flush_expansion_state(&mut state, &mut findings);
-        }
-    }
-    flush_expansion_state(&mut state, &mut findings);
-    findings
-}
-
-fn expansion_finding_to_detail(finding: &ExpansionHeuristicFinding) -> DetailValue {
-    DetailValue::Dict(vec![
-        (
-            "stream_id".to_string(),
-            DetailValue::UInt(finding.stream_id as u64),
-        ),
-        (
-            "position".to_string(),
-            DetailValue::UInt(finding.position as u64),
-        ),
-        (
-            "opcode_count".to_string(),
-            DetailValue::UInt(finding.opcode_count as u64),
-        ),
-        (
-            "memo_reads".to_string(),
-            DetailValue::UInt(finding.memo_reads as u64),
-        ),
-        (
-            "memo_writes".to_string(),
-            DetailValue::UInt(finding.memo_writes as u64),
-        ),
-        (
-            "get_put_ratio".to_string(),
-            DetailValue::Float(finding.get_put_ratio),
-        ),
-        (
-            "dup_count".to_string(),
-            DetailValue::UInt(finding.dup_count as u64),
-        ),
-        (
-            "dup_density".to_string(),
-            DetailValue::Float(finding.dup_density),
-        ),
-        (
-            "memo_growth_steps".to_string(),
-            DetailValue::UInt(finding.memo_growth_steps as u64),
-        ),
-        (
-            "memo_slots_used".to_string(),
-            DetailValue::UInt(finding.memo_slots_used as u64),
-        ),
-        (
-            "triggers".to_string(),
-            DetailValue::List(
-                finding
-                    .triggers
-                    .iter()
-                    .map(|trigger| DetailValue::String((*trigger).to_string()))
-                    .collect(),
-            ),
-        ),
-    ])
-}
-
-fn is_memo_read_opcode(name: &str) -> bool {
-    matches!(name, "GET" | "BINGET" | "LONG_BINGET")
-}
-
-fn is_memo_write_opcode(name: &str) -> bool {
-    matches!(name, "PUT" | "BINPUT" | "LONG_BINPUT" | "MEMOIZE")
-}
-
-fn expansion_trigger_label(trigger: &str) -> &str {
-    match trigger {
-        "suspicious_get_put_ratio" => "high memo GET/PUT ratio",
-        "excessive_dup_usage" => "dense DUP usage",
-        "memo_growth_chain" => "iterative memo growth chain",
-        _ => trigger,
-    }
-}
-
-fn round_float(value: f64, factor: f64) -> f64 {
-    (value * factor).round() / factor
-}
-
 fn advance_chars_from(value: &str, start: usize, count: usize) -> usize {
     if count == 0 || start >= value.len() {
         return start;
@@ -2950,404 +2274,15 @@ fn capitalize(value: &str) -> String {
     }
 }
 
-struct PostBudgetGlobalMatch {
-    module: String,
-    name: String,
-    pattern_start: usize,
-    reduce_proximate: bool,
-    severity: &'static str,
-}
-
-impl PostBudgetGlobalMatch {
-    fn pattern(&self) -> String {
-        format!("{}\n{}", self.module, self.name)
-    }
-}
-
-struct PostBudgetGlobalCandidate<'a> {
-    module: &'a str,
-    name: &'a str,
-    pattern_start: usize,
-    proximity_start: usize,
-    severity: &'static str,
-}
-
-fn post_budget_global_matches(
-    tail: &[u8],
-    tail_prefix_len: usize,
-    memo: &HashMap<i64, StackValue>,
-    payload: &[u8],
-) -> Vec<PostBudgetGlobalMatch> {
-    let mut matches = Vec::new();
-    let mut seen = HashSet::new();
-
-    if tail_prefix_len > 0 {
-        record_post_budget_module_name_pair(tail, 0, 0, &mut seen, &mut matches);
-    }
-
-    let mut index = 0;
-    while index < tail.len() {
-        if matches!(tail[index], b'c' | b'i') {
-            record_post_budget_module_name_pair(
-                tail,
-                index + 1,
-                index + 1,
-                &mut seen,
-                &mut matches,
-            );
-        }
-        record_post_budget_stack_global_pattern(tail, index, &mut seen, &mut matches);
-        record_post_budget_memo_stack_global_pattern(
-            tail,
-            index,
-            memo,
-            payload,
-            &mut seen,
-            &mut matches,
-        );
-        record_post_budget_extension_ref(tail, index, &mut seen, &mut matches);
-        index += 1;
-    }
-
-    matches
-}
-
-fn record_post_budget_module_name_pair(
-    tail: &[u8],
-    module_start: usize,
-    pattern_start: usize,
-    seen: &mut HashSet<(usize, String, String)>,
-    matches: &mut Vec<PostBudgetGlobalMatch>,
-) {
-    let Some(module_end) = find_byte_from(tail, module_start, b'\n') else {
-        return;
-    };
-    let name_start = module_end.saturating_add(1);
-    let Some(name_end) = find_byte_from(tail, name_start, b'\n') else {
-        return;
-    };
-    if module_start == module_end || name_start == name_end {
-        return;
-    }
-    let Ok(module) = std::str::from_utf8(&tail[module_start..module_end]) else {
-        return;
-    };
-    let Ok(name) = std::str::from_utf8(&tail[name_start..name_end]) else {
-        return;
-    };
-    let Some(severity) = post_budget_global_severity(module, name) else {
-        return;
-    };
-    if !seen.insert((pattern_start, module.to_string(), name.to_string())) {
-        return;
-    }
-    let reduce_proximate = has_reduce_class_byte_nearby(tail, name_end.saturating_add(1));
-    matches.push(PostBudgetGlobalMatch {
-        module: module.to_string(),
-        name: name.to_string(),
-        pattern_start,
-        reduce_proximate,
-        severity,
-    });
-}
-
-fn record_post_budget_stack_global_pattern(
-    tail: &[u8],
-    index: usize,
-    seen: &mut HashSet<(usize, String, String)>,
-    matches: &mut Vec<PostBudgetGlobalMatch>,
-) {
-    let Some((module, after_module)) = read_post_budget_text_operand(tail, index) else {
-        return;
-    };
-    let name_start = skip_post_budget_memoize(tail, after_module);
-    let Some((name, after_name)) = read_post_budget_text_operand(tail, name_start) else {
-        return;
-    };
-    let stack_global_position = skip_post_budget_memoize(tail, after_name);
-    if tail.get(stack_global_position) != Some(&0x93) {
-        return;
-    }
-    record_post_budget_global(
-        module.as_ref(),
-        name.as_ref(),
-        index,
-        stack_global_position.saturating_add(1),
-        tail,
-        seen,
-        matches,
-    );
-}
-
-fn record_post_budget_memo_stack_global_pattern(
-    tail: &[u8],
-    index: usize,
-    memo: &HashMap<i64, StackValue>,
-    payload: &[u8],
-    seen: &mut HashSet<(usize, String, String)>,
-    matches: &mut Vec<PostBudgetGlobalMatch>,
-) {
-    let Some((module_index, after_module)) = read_post_budget_memo_read(tail, index) else {
-        return;
-    };
-    let Some(module) = resolve_global_operand(memo.get(&module_index), payload) else {
-        return;
-    };
-    let name_start = skip_post_budget_memoize(tail, after_module);
-    let Some((name_index, after_name)) = read_post_budget_memo_read(tail, name_start) else {
-        return;
-    };
-    let Some(name) = resolve_global_operand(memo.get(&name_index), payload) else {
-        return;
-    };
-    let stack_global_position = skip_post_budget_memoize(tail, after_name);
-    if tail.get(stack_global_position) != Some(&0x93) {
-        return;
-    }
-    record_post_budget_global(
-        &module,
-        &name,
-        index,
-        stack_global_position.saturating_add(1),
-        tail,
-        seen,
-        matches,
-    );
-}
-
-fn read_post_budget_memo_read(tail: &[u8], index: usize) -> Option<(i64, usize)> {
-    match *tail.get(index)? {
-        b'g' => {
-            let digits_start = index.saturating_add(1);
-            let digits_end = find_byte_from(tail, digits_start, b'\n')?;
-            let digits = std::str::from_utf8(tail.get(digits_start..digits_end)?).ok()?;
-            let memo_index = digits.parse::<i64>().ok()?;
-            Some((memo_index, digits_end.saturating_add(1)))
-        }
-        b'h' => Some((
-            i64::from(*tail.get(index.saturating_add(1))?),
-            index.saturating_add(2),
-        )),
-        b'j' => {
-            let start = index.saturating_add(1);
-            let end = start.checked_add(4)?;
-            let memo_index = u32::from_le_bytes(tail.get(start..end)?.try_into().ok()?);
-            Some((i64::from(memo_index), end))
-        }
-        _ => None,
-    }
-}
-
-fn read_post_budget_text_operand(tail: &[u8], index: usize) -> Option<(Cow<'_, str>, usize)> {
-    let opcode = *tail.get(index)?;
-    let (start, end) = match opcode {
-        b'S' => {
-            let start = index.saturating_add(1);
-            let end = find_byte_from(tail, start, b'\n')?;
-            return Some((
-                Cow::Owned(parse_pickle_string_literal(tail.get(start..end)?)),
-                end.saturating_add(1),
-            ));
-        }
-        b'U' | 0x8c => {
-            let len = *tail.get(index.saturating_add(1))? as usize;
-            let start = index.saturating_add(2);
-            (start, start.checked_add(len)?)
-        }
-        b'T' | b'X' => {
-            let len_start = index.saturating_add(1);
-            let len_end = len_start.checked_add(4)?;
-            let len = usize::try_from(u32::from_le_bytes(
-                tail.get(len_start..len_end)?.try_into().ok()?,
-            ))
-            .ok()?;
-            let start = len_end;
-            (start, start.checked_add(len)?)
-        }
-        0x8d => {
-            let len_start = index.saturating_add(1);
-            let len_end = len_start.checked_add(8)?;
-            let len = usize::try_from(u64::from_le_bytes(
-                tail.get(len_start..len_end)?.try_into().ok()?,
-            ))
-            .ok()?;
-            let start = len_end;
-            (start, start.checked_add(len)?)
-        }
-        b'V' => {
-            let start = index.saturating_add(1);
-            let end = find_byte_from(tail, start, b'\n')?;
-            return Some((
-                Cow::Owned(decode_raw_unicode_escape(tail.get(start..end)?)),
-                end.saturating_add(1),
-            ));
-        }
-        _ => return None,
-    };
-    let value = std::str::from_utf8(tail.get(start..end)?).ok()?;
-    Some((Cow::Borrowed(value), end))
-}
-
-fn skip_post_budget_memoize(tail: &[u8], mut index: usize) -> usize {
-    while tail.get(index) == Some(&0x94) {
-        index = index.saturating_add(1);
-    }
-    index
-}
-
-fn record_post_budget_extension_ref(
-    tail: &[u8],
-    index: usize,
-    seen: &mut HashSet<(usize, String, String)>,
-    matches: &mut Vec<PostBudgetGlobalMatch>,
-) {
-    let Some((extension_code, next)) = read_post_budget_extension_code(tail, index) else {
-        return;
-    };
-    record_post_budget_global_with_severity(
-        PostBudgetGlobalCandidate {
-            module: "copyreg.extension",
-            name: &format!("code_{extension_code}"),
-            pattern_start: index,
-            proximity_start: next,
-            severity: "warning",
-        },
-        tail,
-        seen,
-        matches,
-    );
-}
-
-fn read_post_budget_extension_code(tail: &[u8], index: usize) -> Option<(u64, usize)> {
-    match *tail.get(index)? {
-        0x82 => Some((
-            *tail.get(index.saturating_add(1))? as u64,
-            index.saturating_add(2),
-        )),
-        0x83 => {
-            let start = index.saturating_add(1);
-            let end = start.checked_add(2)?;
-            Some((
-                u16::from_le_bytes(tail.get(start..end)?.try_into().ok()?) as u64,
-                end,
-            ))
-        }
-        0x84 => {
-            let start = index.saturating_add(1);
-            let end = start.checked_add(4)?;
-            Some((
-                u32::from_le_bytes(tail.get(start..end)?.try_into().ok()?) as u64,
-                end,
-            ))
-        }
-        _ => None,
-    }
-}
-
-fn record_post_budget_global(
-    module: &str,
-    name: &str,
-    pattern_start: usize,
-    proximity_start: usize,
-    tail: &[u8],
-    seen: &mut HashSet<(usize, String, String)>,
-    matches: &mut Vec<PostBudgetGlobalMatch>,
-) {
-    let Some(severity) = post_budget_global_severity(module, name) else {
-        return;
-    };
-    record_post_budget_global_with_severity(
-        PostBudgetGlobalCandidate {
-            module,
-            name,
-            pattern_start,
-            proximity_start,
-            severity,
-        },
-        tail,
-        seen,
-        matches,
-    );
-}
-
-fn record_post_budget_global_with_severity(
-    candidate: PostBudgetGlobalCandidate<'_>,
-    tail: &[u8],
-    seen: &mut HashSet<(usize, String, String)>,
-    matches: &mut Vec<PostBudgetGlobalMatch>,
-) {
-    if candidate.module.is_empty() || candidate.name.is_empty() {
-        return;
-    }
-    if !seen.insert((
-        candidate.pattern_start,
-        candidate.module.to_string(),
-        candidate.name.to_string(),
-    )) {
-        return;
-    }
-    let reduce_proximate = has_reduce_class_byte_nearby(tail, candidate.proximity_start);
-    matches.push(PostBudgetGlobalMatch {
-        module: candidate.module.to_string(),
-        name: candidate.name.to_string(),
-        pattern_start: candidate.pattern_start,
-        reduce_proximate,
-        severity: candidate.severity,
-    });
-}
-
-fn post_budget_global_severity(module: &str, name: &str) -> Option<&'static str> {
-    if module == "__main__" {
-        return Some("warning");
-    }
-    global_severity(module, name)
-}
-
-fn has_reduce_class_byte_nearby(tail: &[u8], start: usize) -> bool {
-    let end = start
-        .saturating_add(POST_BUDGET_REDUCE_PROXIMITY_BYTES)
-        .min(tail.len());
-    tail[start..end]
-        .iter()
-        .any(|byte| POST_BUDGET_REDUCE_BYTES.contains(byte))
-}
-
-fn find_byte_from(haystack: &[u8], start: usize, needle: u8) -> Option<usize> {
-    haystack
-        .get(start..)?
-        .iter()
-        .position(|byte| *byte == needle)
-        .map(|offset| start + offset)
-}
-
-fn post_budget_absolute_position(
-    stream_offset: usize,
-    read_offset: usize,
-    tail_prefix_len: usize,
-    tail_offset: usize,
-) -> usize {
-    if tail_offset < tail_prefix_len {
-        stream_offset.saturating_add(tail_offset)
-    } else {
-        read_offset.saturating_add(tail_offset - tail_prefix_len)
-    }
-}
-
-fn notice_dedupe_key(notice: &Notice) -> NoticeDedupeKey {
-    (notice.code, notice.location.clone(), notice.message.clone())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::options::{
+        DEFAULT_MAX_NESTED_DEPTH, DEFAULT_MAX_NESTED_PICKLE_BYTES, DEFAULT_MAX_OPCODES,
+        DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS, DEFAULT_POST_BUDGET_SCAN_BYTES, DEFAULT_TIMEOUT_S,
+    };
     use crate::report::{detail_string, detail_usize};
-
-    #[test]
-    fn timeout_duration_clamps_excessive_values() {
-        assert_eq!(clamp_timeout_s(1.0e18), MAX_TIMEOUT_S);
-        assert_eq!(timeout_duration(1.0e18), Duration::from_secs(86_400));
-        assert_eq!(timeout_duration(f64::NAN), Duration::from_secs(3600));
-    }
+    use std::time::Duration;
 
     #[test]
     fn integer_stack_values_preserve_text_and_long_byte_operands() {

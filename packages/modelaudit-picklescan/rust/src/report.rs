@@ -51,7 +51,13 @@ pub(crate) struct Finding {
     pub(crate) why: Option<&'static str>,
 }
 
+pub(crate) type FindingDedupeKey = (String, Option<String>, Option<&'static str>);
+
 impl Finding {
+    pub(crate) fn dedupe_key(&self) -> FindingDedupeKey {
+        (self.message.clone(), self.location.clone(), self.rule_code)
+    }
+
     pub(crate) fn to_py_object(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
         dict.set_item("message", &self.message)?;
@@ -73,7 +79,13 @@ pub(crate) struct Notice {
     pub(crate) details: Vec<(String, DetailValue)>,
 }
 
+pub(crate) type NoticeDedupeKey = (Option<&'static str>, Option<String>, String);
+
 impl Notice {
+    pub(crate) fn dedupe_key(&self) -> NoticeDedupeKey {
+        (self.code, self.location.clone(), self.message.clone())
+    }
+
     pub(crate) fn to_py_object(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let dict = PyDict::new(py);
         dict.set_item("message", &self.message)?;
