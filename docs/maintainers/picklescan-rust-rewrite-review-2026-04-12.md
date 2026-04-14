@@ -1,12 +1,14 @@
 # PR #990 Comprehensive Review — `feat: replace picklescan with Rust-native engine`
 
 **Branch:** `mdangelo/codex/rust-picklescan-rewrite`
-**Latest audited:** `f5985768` (rev 9: 8 commits on top of rev 8's `77af4fae`)
+**Latest audited:** `e30344cf` (rev 10: 2 commits on top of rev 9's `8331c361`)
 **Scope:** Rust rewrite of pickle scanner, Python engine removed.
 
-This review combines five specialized agents (Rust core, Python integration, test coverage, CI/packaging, simplification), three Momus/Oracle critical re-reviews, and hands-on QA on 31 synthetic fixtures + 21 committed exploits. At rev 9, **validation gates fully green**: `pytest` **461 passed** (was 453 at rev 8), `cargo test` **73 passed** (was 72 at rev 8), `ruff`/`mypy`/`clippy` clean.
+This review combines five specialized agents (Rust core, Python integration, test coverage, CI/packaging, simplification), three Momus/Oracle critical re-reviews, and hands-on QA on 31 synthetic fixtures + 21 committed exploits. At rev 10, **validation gates fully green**: `pytest` **801 passed** (was 461 at rev 9 — jumped ~340 tests via the new adversarial oracle corpus), `cargo test` **76 passed** (was 73 at rev 9), `ruff`/`mypy`/`clippy` clean.
 
 On the repo's own 21 exploit fixtures and 2 safe samples the scanner is **0 FN / 0 FP** across every revision.
+
+> **Rev 10 release-readiness verdict: MERGE-READY from a security standpoint.** After 10 revisions and 9 confirmed-then-fixed RCE bypass paths, I cannot find a new bypass. Rev 10 fixes both N9 P0 bypasses and adds `packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py` — a **326-case adversarial corpus** that cross-references Python's actual `pickle.loads()` execution semantics against the scanner. Every payload in the corpus that reaches `subprocess.run` in CPython is asserted to produce a CRITICAL `subprocess.run` finding. All 326 pass. My independent 50-case sweep (10 dangerous globals × 5 attack patterns: all-inline / all-memo / memo+inline / inline+memo / tail-only PUT+GET) returns **50/50 detected**. My attempts at `BINGET+BINGET+DUP+POP+SG`, `BINGET+MARK+POP_MARK+BINGET+SG`, `BINGET+NONE+POP+BINGET+SG`, multi-REDUCE chains, FRAME-wrapped tails, dict-wrapped REDUCE, 500-level MARK nesting, pre-built callables cached in memo — **all detected**. The only probes that escape are ones CPython itself doesn't execute (TUPLE2 between operands, newline-in-module, BINBYTES-keyed STACK_GLOBAL), which are non-exploitable by design.
 
 > **Rev 9 release-readiness verdict: STILL NOT READY.** Rev 8 N8-CRITICAL-MIXED-MEMO-INLINE-BYPASS is **FIXED** — `post_budget.rs` `record_post_budget_stack_global_pattern` now uses a combined operand reader that accepts either inline strings or memo reads independently. All 14 mixed-pattern variants from rev 8 now correctly flagged as `verdict=malicious` with CRITICAL `POST_BUDGET_GLOBAL`. **But two new P0 RCE bypass paths surfaced**: **N9-CRITICAL-INTERLEAVED-OPCODE-BYPASS** (any non-MEMOIZE opcode between operands and STACK_GLOBAL — DUP/POP/MARK/NONE — breaks the pattern match) and **N9-CRITICAL-PUT-GET-IN-TAIL-BYPASS** (an attacker can fully memoize the dangerous strings within the post-budget tail itself via PUT/BINPUT, then GET them back, with no pre-memo). Both validated end-to-end: `pickle.loads(mal)` actually executes `subprocess.run(['id'])` and prints `uid=501(mdangelo)...`; scanner reports `verdict=unknown, findings=0`.
 
@@ -100,6 +102,92 @@ On the repo's own 21 exploit fixtures and 2 safe samples the scanner is **0 FN /
 | `S211` stderr noise                      | warning per process            | **gone** (S211 registered) |
 | Mid-string proto-0 encoded nested        | not probed                     | **detected (S601)**        |
 | `{"outer": b"JUNK" + nested}` small-blob | not probed                     | **detected (S213)**        |
+
+---
+
+## Rev 10 — new findings
+
+After re-pulling at `e30344cf`, the test suite jumped from 461 → **801 pytest** (adding the `test_adversarial_pickle_oracle.py` corpus with 326 parametrized cases) and `cargo test` 73 → **76**. Both rev 9 P0 bypasses are **fixed**, and the architectural recommendation from rev 9 (re-parse the post-budget tail with `parse_opcode` rather than byte-pattern matching) has been substantially implemented in `packages/modelaudit-picklescan/rust/src/post_budget.rs` (+522/-125 lines in `d37bb5a7`).
+
+### Rev 9 P0 items FIXED in rev 10 (verified)
+
+- **N9-CRITICAL-INTERLEAVED-OPCODE-BYPASS**: FIXED. `BINGET+BINGET+DUP+POP+STACK_GLOBAL`, `BINGET+MARK+POP_MARK+BINGET+STACK_GLOBAL`, `BINGET+NONE+POP+BINGET+STACK_GLOBAL` — all detected as `verdict=malicious` with CRITICAL `POST_BUDGET_GLOBAL`. The false positive in my rev 9 probe (`BINGET+BINGET+TUPLE2+STACK_GLOBAL`) is now correctly classified as non-exploitable (CPython raises `UnpicklingError: STACK_GLOBAL requires str` when TUPLE2 wraps the operands into a tuple before STACK_GLOBAL pops them), so it's not a real bypass.
+- **N9-CRITICAL-PUT-GET-IN-TAIL-BYPASS**: FIXED. `SHORT_BINUNICODE + BINPUT + SHORT_BINUNICODE + BINPUT + BINGET + BINGET + STACK_GLOBAL` fully in the tail (no pre-memo) is detected. `LONG_BINPUT+LONG_BINGET` and proto-0 text `PUT/GET` variants also detected.
+
+### New adversarial oracle corpus (`d37bb5a7` + `e30344cf`)
+
+**326 parametrized tests** in `packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py` generated via `_build_adversarial_cases()`. Each case builds a pickle via programmatic opcode construction, runs it through CPython's actual `pickle.loads()` with `subprocess.run` monkey-patched to a call-counter sentinel, and asserts that if CPython reaches `subprocess.run` via the payload, the scanner MUST produce a CRITICAL finding with `details.module == "subprocess" and details.name == "run"`.
+
+**Generator dimensions (multiplicative):**
+- `TEXT_OPERANDS` (`_short_binunicode` / `_binunicode` / `_binunicode8` / `_unicode` / `_string` / `_short_binstring` / `_binstring`) for each operand independently
+- `STACK_NEUTRAL_GAPS` between operands (DUP+POP, MARK+POP_MARK, NONE+POP, empty)
+- `MEMO_WRITES × MEMO_READS` (MEMOIZE / BINPUT / LONG_BINPUT / PUT × BINGET / LONG_BINGET / GET)
+- Pre-budget vs post-budget scenarios via `ScanOptions(max_opcodes=2)` to force the tail walker
+- Plus hand-crafted edge cases: `global-reduce`, `inst`, `obj-stack-global`, `invalid-mark-between-operands`, `invalid-popped-name`
+
+This is the right defense architecture. Future attack shapes will extend the generator rather than add ad-hoc byte-pattern scanners.
+
+### Hands-on probe (50 cases, independent of the repo corpus)
+
+```
+Attack matrix (5 patterns × 10 dangerous globals):
+    1. All-inline   (sbu module + sbu name + STACK_GLOBAL)
+    2. All-memo     (pre-memo + BINGET + BINGET + STACK_GLOBAL)
+    3. memo+inline  (pre-memo module + inline name + STACK_GLOBAL)
+    4. inline+memo  (pre-memo name + inline module + STACK_GLOBAL)
+    5. Tail-only    (SHORT_BINUNICODE + BINPUT + ... + BINGET + STACK_GLOBAL) past budget
+
+Dangerous globals: subprocess.run, subprocess.Popen, os.system, os.popen,
+                   builtins.eval, builtins.exec, importlib.reload,
+                   marshal.loads, ctypes.CDLL, _ctypes.dlopen
+
+Result: 50/50 detected
+```
+
+### Creative bypass probes (all detected)
+
+- 2-REDUCE chain (first REDUCE's result as callable for second): DETECTED
+- Pre-built callable cached in memo: DETECTED
+- Pre-built + NEWOBJ: DETECTED
+- 14M opcode filler: DETECTED
+- GET/POP filler loop: DETECTED
+- NONE/POP filler: DETECTED
+- 200-opcode pad between operands and STACK_GLOBAL: DETECTED
+- 100-opcode pad between each BINGET: DETECTED
+- FRAME-wrapped tail with memo operands: DETECTED
+- REDUCE wrapped inside dict value: DETECTED
+- 500-level MARK nesting around REDUCE: DETECTED
+- Memoized constructor + BUILD in tail: DETECTED
+
+### Non-exploitable spurious probes (not real bypasses — CPython rejects)
+
+- `BINGET+BINGET+TUPLE2+STACK_GLOBAL`: CPython raises `UnpicklingError: STACK_GLOBAL requires str`.
+- `newline-in-module-name`: CPython raises `ModuleNotFoundError: No module named 'subpr\noces'`.
+- `BINBYTES/BINBYTES8/BYTEARRAY8` memos for STACK_GLOBAL operands: CPython raises `UnpicklingError: STACK_GLOBAL requires str`.
+
+### Rev 10 release-readiness
+
+| Status | Severity | Item |
+|---|---|---|
+| ✅ | — | N9-CRITICAL-INTERLEAVED-OPCODE-BYPASS closed |
+| ✅ | — | N9-CRITICAL-PUT-GET-IN-TAIL-BYPASS closed |
+| ✅ | — | 326 adversarial oracle tests all passing |
+| ✅ | — | 50-case independent sweep: 50/50 detected |
+| ✅ | — | 12 creative bypass shapes: 12/12 detected |
+| ✅ | — | All test gates green: 801 pytest + 76 cargo test, ruff/mypy/clippy clean |
+| ✅ | — | Hot-path skip works on realistic PyTorch pickles (0.21s on 1.8 MB state dict) |
+| ✅ | — | 0 FN / 0 FP on repo corpus |
+| ⚠️ | P2 | (Architectural) `post_budget.rs` is ~1000 LOC of custom byte-pattern matching that partially re-implements what `parse_opcode` already does. The rev 10 refactor added memo lookup + stack-neutral gap handling + combined operand reader, but it's still not a proper opcode walker. If a future Rust change adds a new opcode (e.g., Python adds a protocol 6), the post-budget walker needs to be updated separately from the main walker. Consider delegating to `parse_opcode` in a follow-up PR. |
+
+**Verdict: MERGE-READY from a security standpoint.** After 10 revisions tracking 9 distinct RCE bypass paths across N5/N6/N7/N8/N9, rev 10 is the first revision I cannot find a new end-to-end bypass in. The adversarial oracle corpus gives future maintainers a clean way to add regression coverage for any newly-discovered attack shape — just extend the generator. Residual P2 items (wheel matrix for macOS x86_64 / Linux aarch64, the architectural recommendation to delegate to `parse_opcode`, per-detector skip metadata consistency, documentation callouts) are follow-up PRs and do not block merge.
+
+Remaining non-blocking P2 items I have not re-verified at rev 10 (unchanged from earlier revs but worth a quick follow-up PR):
+- SARIF backwards compat for new rule codes beyond the rev 6 fix (S214, S601, S602).
+- `CHANGELOG.md` consolidation of the 10-revision review cycle into a single user-facing entry.
+- `packages/modelaudit-picklescan/CHANGELOG.md` listing the public API contract for notice codes.
+- Docker multi-stage image size measurement (rev 6 split into builder + runtime; compare final image vs rev 5).
+
+**If I had to block on one thing**: the architectural recommendation in the P2 row above. The `post_budget.rs` byte-pattern scanner now handles all known attack shapes, but every future Python pickle protocol change (or attacker-discovered opcode interaction) will require updating the post-budget walker separately. The in-budget walker is the source of truth for opcode semantics; the post-budget walker should re-use it rather than re-implement. This is not a merge blocker, but it's worth a follow-up PR within the next sprint to consolidate.
 
 ---
 
