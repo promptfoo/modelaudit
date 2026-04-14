@@ -39,12 +39,12 @@ class TestFileTypeValidationIntegration:
     LICENSE_SCENARIOS_PATH = "assets/scenarios/license_scenarios"
 
     @pytest.fixture
-    def test_data_dir(self):
+    def test_data_dir(self) -> Path:
         """Return path to integration test data."""
         return Path(__file__).parent / self.LICENSE_SCENARIOS_PATH
 
     @pytest.fixture
-    def temp_test_dir(self, tmp_path):
+    def temp_test_dir(self, tmp_path: Path) -> Path:
         """Create a temporary directory with copies of test data for modification."""
         test_data_dir = Path(__file__).parent / self.LICENSE_SCENARIOS_PATH
         temp_dir = tmp_path / "file_type_tests"
@@ -64,7 +64,7 @@ class TestFileTypeValidationIntegration:
 
         return temp_dir
 
-    def test_existing_files_pass_validation(self, test_data_dir):
+    def test_existing_files_pass_validation(self, test_data_dir: Path) -> None:
         """Test that all existing integration test files pass file type validation."""
         validation_failures = []
 
@@ -274,8 +274,11 @@ class TestFileTypeValidationIntegration:
         malicious_model.write_bytes(malicious_content)
 
         malicious_result = scan_file(str(malicious_model))
-        executable_issues = [i for i in malicious_result.issues if "executable" in i.message.lower()]
-        assert len(executable_issues) > 0, "Executable disguised as pickle not detected"
+        malicious_validation_issues = [
+            i for i in malicious_result.issues if "file type validation failed" in i.message.lower()
+        ]
+        assert malicious_result.success is False
+        assert len(malicious_validation_issues) > 0, "PE-like bytes disguised as pickle were not rejected"
 
         # Scenario 2: Model with suspicious file size vs content mismatch
         tiny_model = temp_test_dir / "suspicious_model.h5"
