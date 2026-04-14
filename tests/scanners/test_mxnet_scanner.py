@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-import modelaudit.scanners.mxnet_scanner as mxnet_scanner
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners import get_scanner_for_file
@@ -328,7 +327,7 @@ def test_mxnet_truncated_symbol_scan_is_inconclusive(
 ) -> None:
     symbol_path = tmp_path / "truncated-symbol.json"
     _write_symbol_file(symbol_path)
-    monkeypatch.setattr(mxnet_scanner, "MAX_SYMBOL_READ_BYTES", 8)
+    monkeypatch.setattr("modelaudit.scanners.mxnet_scanner.MAX_SYMBOL_READ_BYTES", 8)
 
     result = MXNetScanner().scan(str(symbol_path))
 

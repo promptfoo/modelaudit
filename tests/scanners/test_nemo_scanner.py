@@ -110,10 +110,8 @@ class TestNemoScannerBasic:
 
     def test_missing_yaml_dependency_is_reported_as_warning(self, tmp_path, monkeypatch):
         """Missing PyYAML should be a non-passing warning, not a pass."""
-        import modelaudit.scanners.nemo_scanner as nemo_scanner_mod
-
         path = _create_nemo_file(tmp_path, {"model": "test"})
-        monkeypatch.setattr(nemo_scanner_mod, "HAS_YAML", False)
+        monkeypatch.setattr("modelaudit.scanners.nemo_scanner.HAS_YAML", False)
         scanner = NemoScanner()
         result = scanner.scan(str(path))
 
@@ -251,11 +249,8 @@ class TestNemoArchiveVulnerabilityCoverage:
             def scan(self, _path: str) -> None:
                 raise RuntimeError("nested boom")
 
-        import modelaudit.scanners as scanner_registry
-
         monkeypatch.setattr(
-            scanner_registry,
-            "get_scanner_for_file",
+            "modelaudit.scanners.nemo_scanner._get_nested_scanner_for_file",
             lambda _path, config=None: RaisingScanner(),
         )
 
@@ -282,11 +277,8 @@ class TestNemoArchiveVulnerabilityCoverage:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        import modelaudit.scanners as scanner_registry
-
         monkeypatch.setattr(
-            scanner_registry,
-            "get_scanner_for_file",
+            "modelaudit.scanners.nemo_scanner._get_nested_scanner_for_file",
             lambda _path, config=None: None,
         )
 
