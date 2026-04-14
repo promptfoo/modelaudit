@@ -4,10 +4,9 @@ from pathlib import Path
 
 import pytest
 
-import modelaudit.scanners.manifest_scanner as manifest_scanner_module
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.manifest_scanner import ManifestScanner, _is_trusted_url_domain
+from modelaudit.scanners.manifest_scanner import _PARSE_FAILED, ManifestScanner, _is_trusted_url_domain
 
 
 def _https_url(host: str, path: str = "/model.bin") -> str:
@@ -176,7 +175,7 @@ def test_parse_file_logs_warning(caplog, capsys):
         result = ScanResult(scanner.name)
         content = scanner._parse_file("nonexistent.json", ".json", result)
 
-    assert content is manifest_scanner_module._PARSE_FAILED
+    assert content is _PARSE_FAILED
     assert any("Error parsing file nonexistent.json" in record.getMessage() for record in caplog.records)
     assert capsys.readouterr().out == ""
     assert any(issue.severity == IssueSeverity.DEBUG for issue in result.issues)
@@ -860,7 +859,7 @@ def test_manifest_scanner_parse_timeout_reports_only_timeout(
     def raise_timeout(_content: str) -> dict:
         raise TimeoutError("parse helper timed out")
 
-    monkeypatch.setattr(manifest_scanner_module.json, "loads", raise_timeout)
+    monkeypatch.setattr(json, "loads", raise_timeout)
 
     result = scanner.scan(str(test_file))
 

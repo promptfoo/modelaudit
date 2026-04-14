@@ -45,9 +45,7 @@ def test_numpy_format_module_unavailable_is_operational_not_critical(
     path = tmp_path / "array.npy"
     np.save(path, arr)
 
-    import modelaudit.scanners.numpy_scanner as numpy_scanner_module
-
-    monkeypatch.setattr(numpy_scanner_module, "NUMPY_FORMAT_AVAILABLE", False)
+    monkeypatch.setattr("modelaudit.scanners.numpy_scanner.NUMPY_FORMAT_AVAILABLE", False)
 
     result = NumPyScanner().scan(str(path))
 

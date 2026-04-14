@@ -6,8 +6,6 @@ from typing import ClassVar
 
 import pytest
 
-import modelaudit.scanners.base as base_module
-import modelaudit.whitelists as whitelist_module
 from modelaudit.analysis.unified_context import UnifiedMLContext
 from modelaudit.scanners.base import (
     BaseScanner,
@@ -519,8 +517,11 @@ def test_whitelist_staleness_recent_no_warning(
     """Recent whitelist snapshots should not emit a staleness warning."""
     from modelaudit.whitelists import POPULAR_MODELS
 
-    monkeypatch.setattr(base_module, "_has_logged_stale_whitelist_warning", False)
-    monkeypatch.setattr(whitelist_module, "WHITELIST_GENERATED_AT", datetime.now(timezone.utc).date().isoformat())
+    monkeypatch.setattr("modelaudit.scanners.base._has_logged_stale_whitelist_warning", False)
+    monkeypatch.setattr(
+        "modelaudit.whitelists.WHITELIST_GENERATED_AT",
+        datetime.now(timezone.utc).date().isoformat(),
+    )
 
     scanner = MockScanner()
     scanner.context = UnifiedMLContext(
@@ -546,8 +547,8 @@ def test_whitelist_staleness_warning_logged_for_stale_snapshot(
     from modelaudit.whitelists import POPULAR_MODELS
 
     stale_date = (datetime.now(timezone.utc).date() - timedelta(days=180)).isoformat()
-    monkeypatch.setattr(base_module, "_has_logged_stale_whitelist_warning", False)
-    monkeypatch.setattr(whitelist_module, "WHITELIST_GENERATED_AT", stale_date)
+    monkeypatch.setattr("modelaudit.scanners.base._has_logged_stale_whitelist_warning", False)
+    monkeypatch.setattr("modelaudit.whitelists.WHITELIST_GENERATED_AT", stale_date)
 
     scanner = MockScanner()
     scanner.context = UnifiedMLContext(
@@ -573,8 +574,8 @@ def test_whitelist_staleness_warning_only_logs_once(
     from modelaudit.whitelists import POPULAR_MODELS
 
     stale_date = (datetime.now(timezone.utc).date() - timedelta(days=180)).isoformat()
-    monkeypatch.setattr(base_module, "_has_logged_stale_whitelist_warning", False)
-    monkeypatch.setattr(whitelist_module, "WHITELIST_GENERATED_AT", stale_date)
+    monkeypatch.setattr("modelaudit.scanners.base._has_logged_stale_whitelist_warning", False)
+    monkeypatch.setattr("modelaudit.whitelists.WHITELIST_GENERATED_AT", stale_date)
 
     scanner_one = MockScanner()
     scanner_one.context = UnifiedMLContext(
@@ -611,8 +612,8 @@ def test_whitelist_staleness_unknown_model_no_warning(
 ) -> None:
     """Unknown models should not emit a stale whitelist warning."""
     stale_date = (datetime.now(timezone.utc).date() - timedelta(days=180)).isoformat()
-    monkeypatch.setattr(base_module, "_has_logged_stale_whitelist_warning", False)
-    monkeypatch.setattr(whitelist_module, "WHITELIST_GENERATED_AT", stale_date)
+    monkeypatch.setattr("modelaudit.scanners.base._has_logged_stale_whitelist_warning", False)
+    monkeypatch.setattr("modelaudit.whitelists.WHITELIST_GENERATED_AT", stale_date)
 
     scanner = MockScanner()
     scanner.context = UnifiedMLContext(

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- preserve `S999` unknown-opcode mapping in generic rule fallback
+
 ## [0.2.37](https://github.com/promptfoo/modelaudit/compare/v0.2.36...v0.2.37) (2026-04-12)
 
 ### Bug Fixes

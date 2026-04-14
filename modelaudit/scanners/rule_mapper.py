@@ -323,12 +323,6 @@ def get_generic_rule_code(message: str) -> str | None:
     """
     msg_lower = message.lower()
 
-    # Try each specialized mapper
-    for mapper in _GENERIC_RULE_MAPPERS:
-        code = mapper(msg_lower)
-        if code:
-            return code
-
     # Check for specific patterns
     if "protocol" in msg_lower and "version" in msg_lower:
         # Informational protocol/version context; intentionally not a security rule.
@@ -337,10 +331,16 @@ def get_generic_rule_code(message: str) -> str | None:
         ("stack" in msg_lower and "depth" in msg_lower)
         or "timeout" in msg_lower
         or "timed out" in msg_lower
-        or ("opcode" in msg_lower and "count" in msg_lower)
+        or "opcode count" in msg_lower
     ):
         return None  # Internal check, no rule
     elif "unknown" in msg_lower and ("opcode" in msg_lower or "operation" in msg_lower):
         return _rule("S999")  # Unknown opcode/operation
+
+    # Try each specialized mapper
+    for mapper in _GENERIC_RULE_MAPPERS:
+        code = mapper(msg_lower)
+        if code:
+            return code
 
     return None
