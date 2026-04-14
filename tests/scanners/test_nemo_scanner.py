@@ -18,7 +18,7 @@ except ImportError:
 
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.nemo_scanner import NemoScanner
+from modelaudit.scanners.nemo_scanner import NemoScanner, _get_nested_scanner_for_file
 
 
 def _create_nemo_file_from_bytes(
@@ -119,6 +119,26 @@ class TestNemoScannerBasic:
         assert len(checks) == 1
         assert checks[0].status != CheckStatus.PASSED
         assert checks[0].severity == IssueSeverity.WARNING
+
+    def test_get_nested_scanner_for_file_delegates_to_registry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured: dict[str, object] = {}
+        sentinel = object()
+
+        def fake_get_scanner_for_file(path: str, *, config: dict[str, Any]) -> object:
+            captured["path"] = path
+            captured["config"] = config
+            return sentinel
+
+        monkeypatch.setattr("modelaudit.scanners.get_scanner_for_file", fake_get_scanner_for_file)
+
+        config = {"max_nemo_checkpoint_scan_bytes": 1024}
+
+        assert _get_nested_scanner_for_file("/tmp/model_weights.ckpt", config=config) is sentinel
+        assert captured["path"] == "/tmp/model_weights.ckpt"
+        assert captured["config"] is config
 
 
 @pytest.mark.skipif(not HAS_YAML, reason="PyYAML not installed")
