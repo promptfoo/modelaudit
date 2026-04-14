@@ -119,6 +119,7 @@ After re-pulling at `e30344cf`, the test suite jumped from 461 → **801 pytest*
 **326 parametrized tests** in `packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py` generated via `_build_adversarial_cases()`. Each case builds a pickle via programmatic opcode construction, runs it through CPython's actual `pickle.loads()` with `subprocess.run` monkey-patched to a call-counter sentinel, and asserts that if CPython reaches `subprocess.run` via the payload, the scanner MUST produce a CRITICAL finding with `details.module == "subprocess" and details.name == "run"`.
 
 **Generator dimensions (multiplicative):**
+
 - `TEXT_OPERANDS` (`_short_binunicode` / `_binunicode` / `_binunicode8` / `_unicode` / `_string` / `_short_binstring` / `_binstring`) for each operand independently
 - `STACK_NEUTRAL_GAPS` between operands (DUP+POP, MARK+POP_MARK, NONE+POP, empty)
 - `MEMO_WRITES × MEMO_READS` (MEMOIZE / BINPUT / LONG_BINPUT / PUT × BINGET / LONG_BINGET / GET)
@@ -167,21 +168,22 @@ Result: 50/50 detected
 
 ### Rev 10 release-readiness
 
-| Status | Severity | Item |
-|---|---|---|
-| ✅ | — | N9-CRITICAL-INTERLEAVED-OPCODE-BYPASS closed |
-| ✅ | — | N9-CRITICAL-PUT-GET-IN-TAIL-BYPASS closed |
-| ✅ | — | 326 adversarial oracle tests all passing |
-| ✅ | — | 50-case independent sweep: 50/50 detected |
-| ✅ | — | 12 creative bypass shapes: 12/12 detected |
-| ✅ | — | All test gates green: 801 pytest + 76 cargo test, ruff/mypy/clippy clean |
-| ✅ | — | Hot-path skip works on realistic PyTorch pickles (0.21s on 1.8 MB state dict) |
-| ✅ | — | 0 FN / 0 FP on repo corpus |
-| ⚠️ | P2 | (Architectural) `post_budget.rs` is ~1000 LOC of custom byte-pattern matching that partially re-implements what `parse_opcode` already does. The rev 10 refactor added memo lookup + stack-neutral gap handling + combined operand reader, but it's still not a proper opcode walker. If a future Rust change adds a new opcode (e.g., Python adds a protocol 6), the post-budget walker needs to be updated separately from the main walker. Consider delegating to `parse_opcode` in a follow-up PR. |
+| Status | Severity | Item                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| ✅     | —        | N9-CRITICAL-INTERLEAVED-OPCODE-BYPASS closed                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ✅     | —        | N9-CRITICAL-PUT-GET-IN-TAIL-BYPASS closed                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ✅     | —        | 326 adversarial oracle tests all passing                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ✅     | —        | 50-case independent sweep: 50/50 detected                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ✅     | —        | 12 creative bypass shapes: 12/12 detected                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ✅     | —        | All test gates green: 801 pytest + 76 cargo test, ruff/mypy/clippy clean                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| ✅     | —        | Hot-path skip works on realistic PyTorch pickles (0.21s on 1.8 MB state dict)                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ✅     | —        | 0 FN / 0 FP on repo corpus                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ⚠️     | P2       | (Architectural) `post_budget.rs` is ~1000 LOC of custom byte-pattern matching that partially re-implements what `parse_opcode` already does. The rev 10 refactor added memo lookup + stack-neutral gap handling + combined operand reader, but it's still not a proper opcode walker. If a future Rust change adds a new opcode (e.g., Python adds a protocol 6), the post-budget walker needs to be updated separately from the main walker. Consider delegating to `parse_opcode` in a follow-up PR. |
 
 **Verdict: MERGE-READY from a security standpoint.** After 10 revisions tracking 9 distinct RCE bypass paths across N5/N6/N7/N8/N9, rev 10 is the first revision I cannot find a new end-to-end bypass in. The adversarial oracle corpus gives future maintainers a clean way to add regression coverage for any newly-discovered attack shape — just extend the generator. Residual P2 items (wheel matrix for macOS x86_64 / Linux aarch64, the architectural recommendation to delegate to `parse_opcode`, per-detector skip metadata consistency, documentation callouts) are follow-up PRs and do not block merge.
 
 Remaining non-blocking P2 items I have not re-verified at rev 10 (unchanged from earlier revs but worth a quick follow-up PR):
+
 - SARIF backwards compat for new rule codes beyond the rev 6 fix (S214, S601, S602).
 - `CHANGELOG.md` consolidation of the 10-revision review cycle into a single user-facing entry.
 - `packages/modelaudit-picklescan/CHANGELOG.md` listing the public API contract for notice codes.
@@ -229,6 +231,7 @@ This section tracks what I did **not** exhaustively verify at rev 10 and what fu
 **Gap:** `packages/modelaudit-picklescan/rust/src/post_budget.rs` is ~1000 LOC of byte-pattern matching that partially re-implements `parse_opcode` from `opcode.rs`. Every N5–N9 bypass was a specific hole in this byte-pattern matcher that the in-budget opcode walker would have caught automatically. The in-budget walker is the source of truth for opcode semantics; the post-budget walker should re-use it rather than re-implement.
 
 **QA recipe:**
+
 1. Build a branch that replaces `post_budget_global_matches()` with a call to the same opcode walker used for in-budget scanning, seeded with the `self.memo` snapshot at budget exhaustion and a synthesized stack prefix from `post_budget_opcode_prefix()`.
 2. Run the full 326-case adversarial oracle corpus against the new branch. All cases must still pass.
 3. Run the N5–N9 historical bypass reproducers against the new branch. All must be detected.
@@ -244,6 +247,7 @@ This section tracks what I did **not** exhaustively verify at rev 10 and what fu
 **Hypothesis:** An attacker crafts a pickle where opcode parsing takes longer than `options.timeout_s` but the dangerous REDUCE is reached after the timeout fires. Scanner may flip verdict from `complete`/`malicious` to `inconclusive`/`unknown` with the tail scan unable to see the REDUCE.
 
 **QA recipe:**
+
 ```python
 # Slow-parsing pickle: deeply nested FRAME with long BINUNICODE payloads
 import pickle, struct
@@ -273,6 +277,7 @@ r = scan_bytes(payload, options=ScanOptions(timeout_s=0.01))
 **Hypothesis:** Rev 10 has `DEFAULT_MAX_NESTED_DEPTH = 2`. A 3-deep base64/hex encoding chain may silently truncate without surfacing the inner payload.
 
 **QA recipe:**
+
 ```python
 import pickle, base64
 class Evil:
@@ -297,6 +302,7 @@ for i, p in enumerate([layer1, layer2, layer3, layer4]):
 **Hypothesis:** A `.pt` file with a malicious pickle in a non-`data.pkl` archive member may bypass the PyTorchZipScanner member allowlist.
 
 **QA recipe:**
+
 ```python
 import pickle, zipfile, tempfile
 class Evil:
@@ -318,6 +324,7 @@ from modelaudit import scan_file  # or appropriate API
 ```
 
 **Also test:**
+
 - Non-`archive/` directory prefix (`foo/data.pkl`)
 - `.ckpt` instead of `.pt`
 - Archive with directory traversal in member name (`../../../etc/passwd.pkl`)
@@ -331,6 +338,7 @@ from modelaudit import scan_file  # or appropriate API
 **Hypothesis:** Shared state in `ScanState` or the Rust extension under concurrent scans could produce deadlocks, missed findings, or memory corruption.
 
 **QA recipe:**
+
 ```python
 import threading, pickle
 from modelaudit.scanners.pickle_scanner import PickleScanner
@@ -378,6 +386,7 @@ assert ben_correct == len(results), f"benign FP: {len(results) - ben_correct}/{l
 **Hypothesis:** A 1 GB+ pickle or a pickle with an extremely large single BINUNICODE8 / BINBYTES8 could OOM or panic in the Rust extension.
 
 **QA recipe:**
+
 ```python
 import pickle, struct
 from modelaudit_picklescan import scan_bytes, ScanOptions
