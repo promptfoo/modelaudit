@@ -5,7 +5,6 @@ Rule system for ModelAudit - Simple, centralized rule definitions and management
 import re
 from dataclasses import dataclass
 from enum import Enum
-from re import Pattern
 from typing import ClassVar
 
 from .rule_catalog import RULE_CATALOG
@@ -29,7 +28,7 @@ class Rule:
     name: str
     default_severity: Severity
     description: str
-    message_patterns: list[Pattern[str]]
+    message_patterns: list[re.Pattern[str]]
 
     def matches_message(self, message: str) -> bool:
         """Check if this rule matches a given message."""

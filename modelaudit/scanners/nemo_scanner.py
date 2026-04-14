@@ -130,6 +130,13 @@ def _scan_result_has_security_findings(result: ScanResult) -> bool:
     return any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
+def _get_nested_scanner_for_file(path: str, *, config: dict[str, Any]) -> BaseScanner | None:
+    """Resolve nested scanners lazily to avoid scanner registry import cycles."""
+    from modelaudit.scanners import get_scanner_for_file
+
+    return get_scanner_for_file(path, config=config)
+
+
 class NemoScanner(BaseScanner):
     """Scanner for NVIDIA NeMo model files.
 
@@ -526,9 +533,7 @@ class NemoScanner(BaseScanner):
             return
 
         try:
-            from modelaudit.scanners import get_scanner_for_file
-
-            scanner = get_scanner_for_file(extracted_path, config=dict(self.config))
+            scanner = _get_nested_scanner_for_file(extracted_path, config=dict(self.config))
             if scanner is None:
                 self._mark_inconclusive_scan_result(
                     result,

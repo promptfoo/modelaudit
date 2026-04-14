@@ -218,6 +218,18 @@ class TestLazyListInterface:
 class TestBackwardsCompatibility:
     """Test backwards compatibility of the lazy loading system."""
 
+    def test_analysis_all_exports_resolve(self) -> None:
+        """Analysis package __all__ entries should resolve through lazy imports."""
+        import modelaudit.analysis as analysis
+
+        namespace: dict[str, object] = {}
+
+        exec("from modelaudit.analysis import *", {}, namespace)
+
+        for name in analysis.__all__:
+            assert name in namespace
+            assert getattr(analysis, name) is namespace[name]
+
     def test_direct_scanner_import(self):
         """Test that scanners can still be imported directly."""
         from modelaudit.scanners import PickleScanner

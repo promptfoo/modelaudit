@@ -43,7 +43,7 @@ def test_run_coroutine_sync_without_running_loop() -> None:
 
 
 class TestCloudURLDetection:
-    def test_valid_cloud_urls(self):
+    def test_detects_valid_cloud_url_patterns(self):
         valid = [
             "s3://bucket/key",
             "gs://my-bucket/model.pt",
@@ -55,7 +55,7 @@ class TestCloudURLDetection:
         for url in valid:
             assert is_cloud_url(url), f"Failed to detect {url}"
 
-    def test_invalid_cloud_urls(self):
+    def test_rejects_invalid_cloud_url_patterns(self):
         invalid = [
             "https://huggingface.co/model",
             "ftp://example.com/file",
@@ -100,7 +100,9 @@ class TestCloudURLRedaction:
 
 @patch("modelaudit.utils.helpers.retry.time.sleep")
 @patch("fsspec.filesystem")
-def test_analyze_cloud_target_redacts_signed_url_retry_logs(mock_fs, mock_sleep, caplog):
+def test_analyze_cloud_target_redacts_signed_url_retry_logs(
+    mock_fs: MagicMock, mock_sleep: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
     url = "s3://bucket/model.bin?X-Amz-Signature=secret"
     fs = make_fs_mock()
     fs.info.side_effect = OSError(f"Forbidden while opening {url}")
@@ -224,7 +226,9 @@ def test_build_safe_local_path_preserves_signed_directory_relative_paths(tmp_pat
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
 @patch("modelaudit.utils.sources.cloud_storage.check_disk_space")
 @patch("fsspec.filesystem")
-def test_download_from_cloud_redacts_sensitive_url_in_errors(mock_fs, mock_disk_space, mock_analyze, tmp_path):
+def test_download_from_cloud_redacts_sensitive_url_in_errors(
+    mock_fs: MagicMock, mock_disk_space: MagicMock, mock_analyze: AsyncMock, tmp_path: Path
+) -> None:
     fs = make_fs_mock()
     fs.info.return_value = {"type": "file", "size": 1024}
     mock_fs.return_value = fs
@@ -251,8 +255,13 @@ def test_download_from_cloud_redacts_sensitive_url_in_errors(mock_fs, mock_disk_
 @patch("modelaudit.utils.sources.cloud_storage.check_disk_space")
 @patch("fsspec.filesystem")
 def test_download_from_cloud_redacts_signed_url_retry_logs(
-    mock_fs, mock_disk_space, mock_analyze, mock_sleep, tmp_path, caplog
-):
+    mock_fs: MagicMock,
+    mock_disk_space: MagicMock,
+    mock_analyze: MagicMock,
+    mock_sleep: MagicMock,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     url = "s3://bucket/model.bin?X-Amz-Signature=secret"
     fs = make_fs_mock()
     fs.info.return_value = {"type": "file", "size": 1024}
