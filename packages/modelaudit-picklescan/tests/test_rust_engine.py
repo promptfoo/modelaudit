@@ -19,7 +19,7 @@ from parity_corpus import (
 from modelaudit_picklescan import SafetyVerdict, ScanOptions, ScanStatus, scan_bytes, scan_file
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
 
-_SUSPICIOUS_STRING_LITERAL_INDICES = {*range(8, 20), *range(22, 31)}
+_SUSPICIOUS_STRING_LITERAL_INDICES = {*range(8, 20), 22, 23, 24}
 _GENERATED_EXPECTED_VERDICTS: dict[str, SafetyVerdict] = {
     **{
         f"string-{index}-protocol-{protocol}": SafetyVerdict.SUSPICIOUS
@@ -32,8 +32,6 @@ _GENERATED_EXPECTED_VERDICTS: dict[str, SafetyVerdict] = {
     "base64-3": SafetyVerdict.MALICIOUS,
     "hex-3": SafetyVerdict.MALICIOUS,
     "bytes-small-limit-4": SafetyVerdict.MALICIOUS,
-    "raw-0": SafetyVerdict.SUSPICIOUS,
-    "raw-1": SafetyVerdict.SUSPICIOUS,
     "raw-4": SafetyVerdict.MALICIOUS,
     "raw-5": SafetyVerdict.MALICIOUS,
     "raw-6": SafetyVerdict.MALICIOUS,

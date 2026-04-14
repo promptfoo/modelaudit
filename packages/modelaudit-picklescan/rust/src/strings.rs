@@ -136,7 +136,7 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
     }
 
     for (needle, label) in SIMPLE_SUBSTRING_PATTERNS {
-        if lower.contains(needle) {
+        if contains_qualified_call_like(&lower, needle) {
             matches.push((*label).to_string());
         }
     }
@@ -150,24 +150,24 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
             matches.push(pattern.label.to_string());
         }
     }
-    if any_lower_contains(&lower, SUBPROCESS_CALL_NEEDLES) {
+    if any_qualified_call_like(&lower, SUBPROCESS_CALL_NEEDLES) {
         matches.push("subprocess call".to_string());
     }
-    if any_lower_contains(&lower, COMMANDS_CALL_NEEDLES) {
+    if any_qualified_call_like(&lower, COMMANDS_CALL_NEEDLES) {
         matches.push("commands call".to_string());
     }
-    if any_lower_contains(&lower, PICKLE_LOADER_NEEDLES) {
+    if any_qualified_call_like(&lower, PICKLE_LOADER_NEEDLES) {
         matches.push("pickle loader call".to_string());
     }
-    if any_lower_contains(&lower, COPYREG_EXTENSION_NEEDLES) {
+    if any_qualified_call_like(&lower, COPYREG_EXTENSION_NEEDLES) {
         matches.push("copyreg extension".to_string());
     }
     if lower.contains("import") && contains_import_statement(&lower) {
         matches.push("import statement".to_string());
     }
     if lower.contains("importlib")
-        && (lower.contains("importlib.import_module")
-            || lower.contains("importlib.reload")
+        && (contains_qualified_call_like(&lower, "importlib.import_module")
+            || contains_qualified_call_like(&lower, "importlib.reload")
             || contains_import_statement(&lower))
     {
         matches.push("importlib".to_string());
@@ -195,8 +195,14 @@ pub(crate) fn suspicious_string_matches(value: &str) -> Vec<String> {
     matches
 }
 
-fn any_lower_contains(lower: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| lower.contains(needle))
+fn any_qualified_call_like(lower: &str, needles: &[&str]) -> bool {
+    needles
+        .iter()
+        .any(|needle| contains_qualified_call_like(lower, needle))
+}
+
+fn contains_qualified_call_like(lower: &str, qualified_name: &str) -> bool {
+    contains_call_like(lower, qualified_name)
 }
 
 fn has_base64_dangerous_seed(value: &str) -> bool {
@@ -546,7 +552,8 @@ fn call_like_has_prose_suffix(rest_after_name: &str) -> bool {
                     return suffix
                         .chars()
                         .next()
-                        .is_some_and(|next| next.is_ascii_alphabetic());
+                        .is_some_and(|next| next.is_ascii_alphabetic())
+                        && !has_literal_padding_boundary_after(suffix);
                 }
             }
             _ => {}
@@ -586,18 +593,25 @@ fn find_module_attr(lower: &str, module: &str, attr: &str, prefix: bool) -> bool
         if chars[cursor..cursor + attr_chars.len()] != attr_chars[..] {
             continue;
         }
+        let mut after = cursor + attr_chars.len();
         if prefix {
-            return true;
+            while chars.get(after).is_some_and(|ch| is_python_word_char(*ch)) {
+                after += 1;
+            }
+        } else if chars.get(after).is_some_and(|ch| is_python_word_char(*ch)) {
+            continue;
         }
-        let after = cursor + attr_chars.len();
-        if chars
-            .get(after)
-            .map_or(true, |ch| !is_python_word_char(*ch))
-        {
+        if suffix_starts_non_prose_call(&chars[after..]) {
             return true;
         }
     }
     false
+}
+
+fn suffix_starts_non_prose_call(chars: &[char]) -> bool {
+    let rest = chars.iter().collect::<String>();
+    let trimmed = rest.trim_start();
+    trimmed.starts_with('(') && !call_like_has_prose_suffix(trimmed)
 }
 
 fn has_literal_padding_boundary_before(chars: &[char], start: usize) -> bool {
@@ -611,6 +625,18 @@ fn has_literal_padding_boundary_before(chars: &[char], start: usize) -> bool {
     chars[start - MIN_LITERAL_PADDING_BOUNDARY_CHARS..start]
         .iter()
         .all(|ch| *ch == padding)
+}
+
+fn has_literal_padding_boundary_after(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(padding) = chars.next().filter(|ch| ch.is_ascii_alphanumeric()) else {
+        return false;
+    };
+    chars
+        .take(MIN_LITERAL_PADDING_BOUNDARY_CHARS.saturating_sub(1))
+        .filter(|ch| *ch == padding)
+        .count()
+        == MIN_LITERAL_PADDING_BOUNDARY_CHARS.saturating_sub(1)
 }
 
 fn contains_magic_method(value: &str) -> bool {
@@ -647,6 +673,7 @@ fn contains_magic_method(value: &str) -> bool {
                 if previous.is_ascii_alphabetic()
                     && !next_is_word
                     && is_suspicious_magic_method(&token)
+                    && !magic_method_looks_like_prose(&chars, start, end + 2)
                 {
                     return true;
                 }
@@ -658,6 +685,20 @@ fn contains_magic_method(value: &str) -> bool {
         }
     }
     false
+}
+
+fn magic_method_looks_like_prose(chars: &[char], start: usize, token_end: usize) -> bool {
+    let before_is_prose_gap = start == 0 || chars[start - 1].is_whitespace();
+    if !before_is_prose_gap {
+        return false;
+    }
+    let mut cursor = token_end;
+    let mut saw_whitespace = false;
+    while chars.get(cursor).is_some_and(|ch| ch.is_whitespace()) {
+        saw_whitespace = true;
+        cursor += 1;
+    }
+    saw_whitespace && chars.get(cursor).is_some_and(|ch| ch.is_ascii_alphabetic())
 }
 
 fn find_getattr_matches(value: &str) -> GetattrMatches {
@@ -802,24 +843,36 @@ fn is_python_word_char(ch: char) -> bool {
 }
 
 fn contains_import_statement(lower: &str) -> bool {
-    let mut previous_was_import = false;
-    for token in lower.split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '.') {
-        if token.is_empty() {
-            continue;
-        }
-        if previous_was_import {
-            return true;
-        }
-        previous_was_import = token == "import";
-    }
-    false
+    lower
+        .split([';', '\n', '\r'])
+        .map(str::trim_start)
+        .any(|statement| {
+            statement
+                .strip_prefix("import")
+                .is_some_and(starts_with_whitespace)
+                || statement.strip_prefix("from").is_some_and(|suffix| {
+                    starts_with_whitespace(suffix) && suffix.contains(" import ")
+                })
+        })
+}
+
+fn starts_with_whitespace(value: &str) -> bool {
+    value.chars().next().is_some_and(char::is_whitespace)
 }
 
 fn contains_hex_escape(value: &str) -> bool {
     let bytes = value.as_bytes();
-    bytes.windows(4).any(|window| {
-        window[0] == b'\\' && window[1] == b'x' && is_hex_byte(window[2]) && is_hex_byte(window[3])
-    })
+    bytes
+        .windows(4)
+        .filter(|window| {
+            window[0] == b'\\'
+                && window[1].eq_ignore_ascii_case(&b'x')
+                && is_hex_byte(window[2])
+                && is_hex_byte(window[3])
+        })
+        .take(2)
+        .count()
+        >= 2
 }
 
 fn is_hex_byte(byte: u8) -> bool {
@@ -877,6 +930,10 @@ mod tests {
             suspicious_string_matches(&format!("{}os.system('id')", "A".repeat(32)))
                 .contains(&"os.system".to_string())
         );
+        assert!(
+            suspicious_string_matches(&format!("os.system('id'){}", "B".repeat(32)))
+                .contains(&"os.system".to_string())
+        );
         assert!(suspicious_string_matches("Import OS").contains(&"import statement".to_string()));
     }
 
@@ -894,6 +951,16 @@ mod tests {
         assert!(suspicious_string_matches("Use eval() function to compute results").is_empty());
         assert!(suspicious_string_matches("eval(x + 2) where x is input").is_empty());
         assert!(suspicious_string_matches("eval(x); exec(y)").contains(&"eval(".to_string()));
+        assert!(
+            suspicious_string_matches("Do not call os.system(command) from loaders").is_empty()
+        );
+        assert!(suspicious_string_matches("subprocess.run(args) is documented here").is_empty());
+        assert!(suspicious_string_matches("base64.b64decode(data) decodes text").is_empty());
+        assert!(suspicious_string_matches("importlib.import_module(name) is an API").is_empty());
+        assert!(suspicious_string_matches("An import statement loads a module").is_empty());
+        assert!(suspicious_string_matches(r"The bytes are written as \x80 in docs").is_empty());
+        assert!(suspicious_string_matches("https://example.invalid/os.system").is_empty());
+        assert!(suspicious_string_matches("__reduce__ is a pickle protocol hook").is_empty());
     }
 
     #[test]

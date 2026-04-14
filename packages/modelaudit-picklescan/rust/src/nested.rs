@@ -158,11 +158,12 @@ pub(crate) fn has_execution_opcode(value: &[u8]) -> bool {
             Ok(parsed) => parsed,
             Err(_) => return false,
         };
-        if matches!(
-            parsed.name,
-            "REDUCE" | "NEWOBJ" | "NEWOBJ_EX" | "OBJ" | "INST" | "BUILD" | "PERSID" | "BINPERSID"
-        ) {
-            return true;
+        match parsed.name {
+            "INST" if protocol0_opcode_operands_are_plausible(&parsed, value) => return true,
+            "REDUCE" | "NEWOBJ" | "NEWOBJ_EX" | "OBJ" | "BUILD" | "PERSID" | "BINPERSID" => {
+                return true;
+            }
+            _ => {}
         }
         index = parsed.next;
         if parsed.name == "STOP" {
@@ -331,16 +332,109 @@ pub(crate) fn has_binary_pickle_prefix(value: &[u8]) -> bool {
 }
 
 pub(crate) fn truncated_pickle_prefix_requires_fail_closed(value: &[u8]) -> bool {
-    has_binary_pickle_prefix(value)
+    (has_binary_pickle_prefix(value) && binary_pickle_prefix_has_structured_opcodes(value))
         || protocol0_global_or_inst_prefix_has_lines(value)
         || has_execution_opcode(value)
+}
+
+fn binary_pickle_prefix_has_structured_opcodes(value: &[u8]) -> bool {
+    let mut index = 0usize;
+    let mut stack_depth = 0usize;
+    let mut mark_depths = Vec::new();
+    let mut parsed_count = 0usize;
+    while index < value.len() && parsed_count < 4 {
+        let parsed = match parse_opcode(value, index, value.len()) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                return parsed_count > 0 && value.get(index).is_some_and(is_pickle_opcode_byte)
+            }
+        };
+        if !validate_pickle_stack_effect(&parsed, &mut stack_depth, &mut mark_depths) {
+            return false;
+        }
+        parsed_count += 1;
+        index = parsed.next;
+        if parsed.name == "STOP" {
+            return false;
+        }
+    }
+    parsed_count >= 3
+}
+
+fn is_pickle_opcode_byte(byte: &u8) -> bool {
+    matches!(
+        *byte,
+        b'(' | b')'
+            | b'.'
+            | b'0'
+            | b'1'
+            | b'2'
+            | b'B'
+            | b'C'
+            | b'F'
+            | b'G'
+            | b'I'
+            | b'J'
+            | b'K'
+            | b'L'
+            | b'M'
+            | b'N'
+            | b'P'
+            | b'Q'
+            | b'R'
+            | b'S'
+            | b'T'
+            | b'U'
+            | b'V'
+            | b'X'
+            | b']'
+            | b'a'
+            | b'b'
+            | b'c'
+            | b'd'
+            | b'e'
+            | b'g'
+            | b'h'
+            | b'i'
+            | b'j'
+            | b'l'
+            | b'o'
+            | b'p'
+            | b'q'
+            | b'r'
+            | b's'
+            | b't'
+            | b'u'
+            | b'}'
+            | 0x80..=0x98
+    )
 }
 
 fn protocol0_global_or_inst_prefix_has_lines(value: &[u8]) -> bool {
     if !matches!(value.first().copied(), Some(b'c' | b'i')) {
         return false;
     }
-    value[1..].contains(&b'\n')
+    let mut fields = value[1..].splitn(3, |byte| *byte == b'\n');
+    let Some(module) = fields.next() else {
+        return false;
+    };
+    let Some(name) = fields.next() else {
+        return false;
+    };
+    is_protocol0_global_operand(module) && (name.is_empty() || is_protocol0_global_operand(name))
+}
+
+fn protocol0_opcode_operands_are_plausible(opcode: &ParsedOpcode, value: &[u8]) -> bool {
+    let (module, name) = opcode.arg.global_parts(value);
+    is_protocol0_global_operand(module.as_bytes()) && is_protocol0_global_operand(name.as_bytes())
+}
+
+fn is_protocol0_global_operand(value: &[u8]) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .iter()
+            .all(|byte| matches!(*byte, b'\t' | b' '..=b'~'))
 }
 
 pub(crate) fn nested_pickle_probe_offsets(value: &[u8]) -> Vec<usize> {
@@ -905,18 +999,33 @@ mod tests {
             b"\x80\x04cos\nsystem\nPfake_id\n.",
             TEST_MAX_NESTED_PICKLE_BYTES
         ));
+        assert!(!has_execution_opcode(
+            b"i\x69\xb2\x09\x48\xbe\x7d\x02\x6b\x23\x5f\xe0\xf7\x0a\x8a\x5c\x77"
+        ));
     }
 
     #[test]
     fn truncated_prefix_fail_closed_ignores_structural_protocol0_near_matches() {
         assert!(truncated_pickle_prefix_requires_fail_closed(
+            b"\x80\x04]K\x01aK\x02aK\x03a"
+        ));
+        assert!(truncated_pickle_prefix_requires_fail_closed(
+            b"\x80\x04\x95\x1f\x00\x00\x00\x00"
+        ));
+        assert!(!truncated_pickle_prefix_requires_fail_closed(
             b"\x80\x04AAAAAAAA"
+        ));
+        assert!(!truncated_pickle_prefix_requires_fail_closed(
+            b"\x80\x04\xff\xff\xff\xff"
         ));
         assert!(truncated_pickle_prefix_requires_fail_closed(
             b"cos\nsystem\nAAAAAAAA"
         ));
         assert!(truncated_pickle_prefix_requires_fail_closed(
             b"ios\nsystem\nAAAAAAAA"
+        ));
+        assert!(!truncated_pickle_prefix_requires_fail_closed(
+            b"i\x69\xb2\x09\x48\xbe\x7d\x02\x6b\x23\x5f\xe0\xf7\x0a\x8a\x5c\x77"
         ));
         assert!(!truncated_pickle_prefix_requires_fail_closed(
             b"inner\x94\x8c\x04data\x94s.BBBBB"

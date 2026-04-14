@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import collections
+import datetime
+import decimal
 import functools
 import io
 import os
@@ -10,7 +13,7 @@ import re
 import tarfile
 import uuid
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -1440,6 +1443,31 @@ def test_scan_bytes_allows_common_dunder_metadata_literals() -> None:
     assert not any(finding.rule_code == "SUSPICIOUS_STRING" for finding in report.findings)
 
 
+def test_scan_bytes_allows_benign_security_documentation_strings() -> None:
+    report = scan_bytes(
+        pickle.dumps(
+            {
+                "doc": [
+                    "Do not call os.system(command) from model loading code.",
+                    "subprocess.run(args) is documented here as a blocked API.",
+                    "An import statement loads a module.",
+                    "importlib.import_module(name) is referenced in Python docs.",
+                    "base64.b64decode(data) decodes text but is not executed here.",
+                    r"The bytes are written as \x80 in the file format reference.",
+                    "https://example.invalid/docs/os.system is a URL path, not code.",
+                    "__reduce__ is a pickle protocol hook.",
+                ]
+            },
+            protocol=4,
+        ),
+        source="security-docs.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
 @pytest.mark.parametrize("literal", ["__a__", "__x_y__"])
 def test_scan_bytes_allows_user_defined_dunder_metadata_literals(literal: str) -> None:
     report = scan_bytes(pickle.dumps({"metadata": literal}, protocol=4), source="user-dunder.pkl")
@@ -1834,6 +1862,108 @@ def test_scan_bytes_records_data_only_raw_nested_pickle_payloads_as_notices() ->
     )
 
 
+@pytest.mark.parametrize(
+    "inner_obj",
+    [
+        datetime.datetime(2024, 1, 2, 3, 4, 5),
+        datetime.timedelta(days=2, seconds=3),
+        decimal.Decimal("12.34"),
+        uuid.UUID("12345678-1234-5678-1234-567812345678"),
+        collections.OrderedDict([("a", 1), ("b", 2)]),
+        collections.Counter("abcaba"),
+        PurePosixPath("/tmp/model.bin"),
+        re.compile(r"a+b?"),
+        slice(1, 10, 2),
+        range(10),
+    ],
+)
+@pytest.mark.parametrize("encoding", ["raw", "base64", "hex"])
+def test_scan_bytes_treats_benign_nested_constructor_pickles_as_notices(
+    inner_obj: object,
+    encoding: str,
+) -> None:
+    nested_payload = pickle.dumps(inner_obj, protocol=4)
+    if encoding == "raw":
+        outer_value: bytes | str = nested_payload
+        expected_notice = "nested_payload_detected"
+    elif encoding == "base64":
+        outer_value = base64.b64encode(nested_payload).decode("ascii")
+        expected_notice = "encoded_nested_payload_detected"
+    else:
+        outer_value = binascii.hexlify(nested_payload).decode("ascii")
+        expected_notice = "encoded_nested_payload_detected"
+
+    report = scan_bytes(
+        pickle.dumps({"outer": outer_value}, protocol=4),
+        source=f"benign-nested-{encoding}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert any(
+        notice.code == expected_notice
+        and notice.details.get("encoding") == encoding
+        and notice.details.get("nested_has_execution_opcode") is True
+        for notice in report.notices
+    )
+
+
+@pytest.mark.parametrize("encoding", ["raw", "base64", "hex"])
+def test_scan_bytes_does_not_escalate_warning_only_nested_payloads_to_critical(
+    encoding: str,
+) -> None:
+    nested_payload = pickle.dumps(functools.partial(int, base=10), protocol=4)
+    if encoding == "raw":
+        outer_value: bytes | str = nested_payload
+    elif encoding == "base64":
+        outer_value = base64.b64encode(nested_payload).decode("ascii")
+    else:
+        outer_value = binascii.hexlify(nested_payload).decode("ascii")
+
+    report = scan_bytes(
+        pickle.dumps({"outer": outer_value}, protocol=4),
+        source=f"warning-only-nested-{encoding}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert not any(finding.severity == Severity.CRITICAL for finding in report.findings)
+    assert not any(finding.rule_code in {"S213", "S601", "S602"} for finding in report.findings)
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.WARNING
+        and finding.details.get("import_reference") == "functools.partial"
+        for finding in report.findings
+    )
+
+
+@pytest.mark.parametrize("encoding", ["raw", "base64", "hex"])
+def test_scan_bytes_flags_unclassified_nested_execution_callables(encoding: str) -> None:
+    nested_payload = b"\x80\x04cbuiltins\nprint\n\x8c\x0bnested ping\x85R."
+    if encoding == "raw":
+        outer_value: bytes | str = nested_payload
+        expected_rule_code = "S213"
+    elif encoding == "base64":
+        outer_value = base64.b64encode(nested_payload).decode("ascii")
+        expected_rule_code = "S601"
+    else:
+        outer_value = binascii.hexlify(nested_payload).decode("ascii")
+        expected_rule_code = "S602"
+
+    report = scan_bytes(
+        pickle.dumps({"outer": outer_value}, protocol=4),
+        source=f"unclassified-nested-execution-{encoding}.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == expected_rule_code and finding.details.get("nested_has_execution_opcode") is True
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_records_data_only_raw_nested_pickle_hidden_inside_large_literal_as_notice() -> None:
     nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
     hidden_payload = b"A" * 64 + nested_payload + b"B" * 64
@@ -1954,7 +2084,7 @@ def test_scan_bytes_marks_parent_inconclusive_when_nested_analysis_is_incomplete
 
 
 def test_scan_bytes_flags_oversized_nested_pickle_prefix_without_deep_parse() -> None:
-    nested_payload = b"\x80\x04" + (b"A" * 64)
+    nested_payload = b"\x80\x04]K\x01aK\x02aK\x03aK\x04a"
 
     report = scan_bytes(
         pickle.dumps({"outer": nested_payload}, protocol=4),
@@ -1978,6 +2108,25 @@ def test_scan_bytes_flags_oversized_nested_pickle_prefix_without_deep_parse() ->
         and notice.details.get("analysis_incomplete") is True
         for notice in report.notices
     )
+
+
+@pytest.mark.parametrize(
+    "opaque_blob",
+    [
+        b"A" * 64 + b"\x80\x04" + (b"\xff" * 64),
+        b"A" * 64 + b"i\x69\xb2\x09\x48\xbe\x7d\x02\x6b\x23\x5f\xe0\xf7\x0a\x8a\x5c\x77",
+    ],
+)
+def test_scan_bytes_ignores_invalid_pickle_prefix_inside_opaque_bytes(opaque_blob: bytes) -> None:
+    report = scan_bytes(
+        pickle.dumps({"outer": opaque_blob}, protocol=4),
+        source="opaque-random-bytes.pkl",
+        options=ScanOptions(max_nested_pickle_bytes=8),
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
 
 
 @pytest.mark.parametrize("fragment", [b"q\x00.", b"t.", b"cfoo\nbar\n0."])

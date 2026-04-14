@@ -151,6 +151,29 @@ struct NestedPayloadFinding {
     include_limit_when_complete: bool,
 }
 
+#[derive(Default)]
+struct NestedSurfaceOutcome {
+    has_critical_finding: bool,
+    has_unclassified_execution: bool,
+    incomplete: bool,
+    depth_limited: bool,
+}
+
+impl NestedSurfaceOutcome {
+    fn promote_complete_payload(&self, nested_has_execution_opcode: bool) -> bool {
+        self.has_critical_finding
+            || self.incomplete
+            || (self.has_unclassified_execution && nested_has_execution_opcode)
+            || (self.depth_limited && nested_has_execution_opcode)
+    }
+
+    fn should_stop_raw_probe_scan(&self, nested_has_execution_opcode: bool) -> bool {
+        self.has_critical_finding
+            || self.incomplete
+            || (self.depth_limited && nested_has_execution_opcode)
+    }
+}
+
 fn raw_nested_payload_finding(
     payload_size: usize,
     position: usize,
@@ -1257,7 +1280,11 @@ impl<'a> ScanState<'a> {
     }
 
     fn scan_raw_nested_pickle_bytes(&mut self, value: &[u8], position: usize) {
+        let mut skip_offsets_before = 0usize;
         for offset in nested_pickle_probe_offsets(value) {
+            if offset < skip_offsets_before {
+                continue;
+            }
             let remaining_len = value.len().saturating_sub(offset);
             let end = value
                 .len()
@@ -1268,27 +1295,33 @@ impl<'a> ScanState<'a> {
             {
                 let candidate = &probe[..payload_len];
                 let nested_has_execution_opcode = has_execution_opcode(candidate);
-                self.add_nested_payload_finding(raw_nested_payload_finding(
-                    candidate.len(),
-                    position + offset,
-                    false,
-                    nested_has_execution_opcode,
-                ));
-                let surfaced_unsafe =
+                let surface_outcome =
                     self.surface_nested_pickle_findings(candidate, "raw", position + offset);
-                if nested_has_execution_opcode || surfaced_unsafe {
+                self.add_nested_payload_finding(
+                    raw_nested_payload_finding(
+                        candidate.len(),
+                        position + offset,
+                        false,
+                        nested_has_execution_opcode,
+                    ),
+                    surface_outcome.promote_complete_payload(nested_has_execution_opcode),
+                );
+                if surface_outcome.should_stop_raw_probe_scan(nested_has_execution_opcode) {
                     return;
                 }
+                skip_offsets_before = offset.saturating_add(payload_len);
                 continue;
             }
             if has_pickle_prefix(probe) && has_execution_opcode(probe) {
-                self.add_nested_payload_finding(raw_nested_payload_finding(
-                    probe.len(),
-                    position + offset,
+                let surface_outcome =
+                    self.surface_nested_pickle_findings(probe, "raw", position + offset);
+                self.add_nested_payload_finding(
+                    raw_nested_payload_finding(probe.len(), position + offset, true, true),
                     true,
-                    true,
-                ));
-                self.surface_nested_pickle_findings(probe, "raw", position + offset);
+                );
+                if surface_outcome.should_stop_raw_probe_scan(true) {
+                    return;
+                }
                 return;
             }
             let candidate_truncated = remaining_len > self.options.max_nested_pickle_bytes;
@@ -1296,12 +1329,10 @@ impl<'a> ScanState<'a> {
                 && has_pickle_prefix(probe)
                 && truncated_pickle_prefix_requires_fail_closed(probe)
             {
-                self.add_nested_payload_finding(raw_nested_payload_finding(
-                    remaining_len,
-                    position + offset,
+                self.add_nested_payload_finding(
+                    raw_nested_payload_finding(remaining_len, position + offset, true, false),
                     true,
-                    false,
-                ));
+                );
                 self.record_raw_nested_payload_truncated(remaining_len, position + offset);
                 return;
             }
@@ -1366,14 +1397,18 @@ impl<'a> ScanState<'a> {
             decode_possible_encoded_pickle(value, self.options.max_nested_pickle_bytes)
         {
             decoded_payload_found = true;
-            self.add_nested_payload_finding(encoded_nested_payload_finding(
-                encoding,
-                decoded.len(),
-                position,
-                false,
-                has_execution_opcode(&decoded),
-            ));
-            self.surface_nested_pickle_findings(&decoded, encoding, position);
+            let nested_has_execution_opcode = has_execution_opcode(&decoded);
+            let surface_outcome = self.surface_nested_pickle_findings(&decoded, encoding, position);
+            self.add_nested_payload_finding(
+                encoded_nested_payload_finding(
+                    encoding,
+                    decoded.len(),
+                    position,
+                    false,
+                    nested_has_execution_opcode,
+                ),
+                surface_outcome.promote_complete_payload(nested_has_execution_opcode),
+            );
         }
         if decoded_payload_found {
             return true;
@@ -1384,13 +1419,10 @@ impl<'a> ScanState<'a> {
             detect_oversized_encoded_pickle_prefixes(value, self.options.max_nested_pickle_bytes)
         {
             oversized_prefix_found = true;
-            self.add_nested_payload_finding(encoded_nested_payload_finding(
-                encoding,
-                payload_size,
-                position,
+            self.add_nested_payload_finding(
+                encoded_nested_payload_finding(encoding, payload_size, position, true, false),
                 true,
-                false,
-            ));
+            );
             self.record_encoded_nested_payload_truncated(encoding, payload_size, position);
         }
         oversized_prefix_found
@@ -1423,7 +1455,11 @@ impl<'a> ScanState<'a> {
         });
     }
 
-    fn add_nested_payload_finding(&mut self, finding: NestedPayloadFinding) {
+    fn add_nested_payload_finding(
+        &mut self,
+        finding: NestedPayloadFinding,
+        promote_complete_payload: bool,
+    ) {
         let mut details = vec![
             (
                 "encoding".to_string(),
@@ -1450,7 +1486,7 @@ impl<'a> ScanState<'a> {
         ));
 
         let location = Some(format!("{} (pos {})", self.source, finding.position));
-        if !finding.analysis_incomplete && !finding.nested_has_execution_opcode {
+        if !finding.analysis_incomplete && !promote_complete_payload {
             self.add_notice(Notice {
                 message: finding.complete_message.to_string(),
                 severity: "info",
@@ -1944,9 +1980,12 @@ impl<'a> ScanState<'a> {
         payload: &[u8],
         encoding: &'static str,
         position: usize,
-    ) -> bool {
+    ) -> NestedSurfaceOutcome {
         if self.nested_depth >= self.options.max_nested_depth {
-            return false;
+            return NestedSurfaceOutcome {
+                depth_limited: true,
+                ..NestedSurfaceOutcome::default()
+            };
         }
 
         let nested_source = format!(
@@ -1965,9 +2004,22 @@ impl<'a> ScanState<'a> {
         nested_scan.run();
 
         let nested_had_findings = !nested_scan.findings.is_empty();
+        let mut outcome = NestedSurfaceOutcome {
+            incomplete: nested_scan.status != "complete",
+            ..NestedSurfaceOutcome::default()
+        };
+        if !outcome.incomplete
+            && !nested_had_findings
+            && !nested_scan_has_only_allowlisted_constructor_refs(&nested_scan)
+        {
+            outcome.has_unclassified_execution = true;
+        }
         let nested_incomplete = nested_scan.status != "complete";
 
         for nested_finding in nested_scan.findings {
+            if nested_finding.severity == "critical" {
+                outcome.has_critical_finding = true;
+            }
             let nested_details = nested_finding
                 .details
                 .iter()
@@ -2069,7 +2121,7 @@ impl<'a> ScanState<'a> {
                 ],
             });
         }
-        nested_had_findings || nested_incomplete
+        outcome
     }
 
     fn scan_post_budget_tail(
@@ -2460,6 +2512,47 @@ fn pytorch_storage_key(value: &StackValue, payload: &[u8]) -> Option<String> {
         return None;
     }
     stack_value_string(&items[2], payload)
+}
+
+fn nested_scan_has_only_allowlisted_constructor_refs(scan: &ScanState<'_>) -> bool {
+    let mut saw_import_reference = false;
+    for details in &scan.import_references {
+        let Some(reference) = detail_string(details, "import_reference") else {
+            continue;
+        };
+        saw_import_reference = true;
+        if !is_allowlisted_nested_constructor_ref(&reference) {
+            return false;
+        }
+    }
+    saw_import_reference
+}
+
+fn is_allowlisted_nested_constructor_ref(reference: &str) -> bool {
+    matches!(
+        reference,
+        "builtins.range"
+            | "builtins.slice"
+            | "__builtin__.range"
+            | "__builtin__.slice"
+            | "__builtins__.range"
+            | "__builtins__.slice"
+            | "collections.Counter"
+            | "collections.OrderedDict"
+            | "collections.defaultdict"
+            | "datetime.date"
+            | "datetime.datetime"
+            | "datetime.time"
+            | "datetime.timedelta"
+            | "decimal.Decimal"
+            | "pathlib.PurePath"
+            | "pathlib.PurePosixPath"
+            | "pathlib.PureWindowsPath"
+            | "pathlib.PosixPath"
+            | "pathlib.WindowsPath"
+            | "re._compile"
+            | "uuid.UUID"
+    )
 }
 
 fn is_pytorch_storage_descriptor(value: &StackValue, payload: &[u8]) -> bool {
@@ -4121,6 +4214,51 @@ mod tests {
             detail_string(&notice.details, "encoding").as_deref(),
             Some("raw")
         );
+    }
+
+    #[test]
+    fn benign_nested_constructor_payloads_emit_notice_not_finding() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let nested_payload = b"ccollections\nOrderedDict\n)R.";
+        let mut payload = b"\x80\x04C".to_vec();
+        payload.push(nested_payload.len() as u8);
+        payload.extend_from_slice(nested_payload);
+        payload.extend_from_slice(b"\x94.");
+        let mut scan = ScanState::new(
+            "benign-constructor-nested.pkl".to_string(),
+            &payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert_eq!(scan.verdict, "clean");
+        assert!(scan.findings.is_empty());
+        let notice = scan
+            .notices
+            .iter()
+            .find(|notice| notice.code == Some("nested_payload_detected"))
+            .expect("benign constructor nested payload notice");
+        assert_eq!(
+            detail_string(&notice.details, "encoding").as_deref(),
+            Some("raw")
+        );
+        assert!(notice
+            .details
+            .iter()
+            .any(|(key, value)| key == "nested_has_execution_opcode"
+                && matches!(value, DetailValue::Bool(true))));
     }
 
     #[test]
