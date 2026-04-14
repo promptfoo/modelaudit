@@ -1309,6 +1309,8 @@ This section is the active implementation log for follow-up commits after revisi
 
 ### Active todo
 
+- [x] PR-990-REV8-01 — Confirm the unresolved memoized post-budget global review thread is already closed by the current Rust memo-read tail scanner and regressions.
+- [x] PR-990-REV8-02 — Tighten Joblib trusted-tail classification so a benign `NumpyArrayWrapper` import prefix alone cannot mark an unknown malformed tail as trusted.
 - [x] N-P0-1 — Fix uncaught `ValueError` for non-seekable streams above the raw-read cap.
 - [x] N-P0-2 / N-P1-16 — Pass buffered payload size to Rust for non-seekable streams to avoid spurious `short_read`.
 - [x] N-P0-3 — Scope documentation/comment gating to the relevant literal or evidence window, not the entire raw detector pass.
@@ -1447,6 +1449,13 @@ This section is the active implementation log for follow-up commits after revisi
 
 ### Completed item QA log
 
+- PR-990-REV8-01 — The open PR review thread on memoized post-budget globals is addressed by the existing rev 7 follow-up commit. `scan_post_budget_tail` now routes `GET`/`BINGET`/`LONG_BINGET` through memo state before `STACK_GLOBAL`, and the fix is pinned by Rust, standalone API, and root `PickleScanner` regressions. Targeted QA:
+  - `rg -n "record_post_budget_memo_stack_global_pattern|post_budget_tail_resolves_memoized_stack_global_gets|test_scan_bytes_post_budget_tail_detects_prememoized_stack_global" packages/modelaudit-picklescan/rust/src/state.rs packages/modelaudit-picklescan/tests/test_api.py tests/scanners/test_pickle_scanner.py` — passed, confirmed implementation and coverage are present on the current branch.
+- PR-990-REV8-02 — Same-item commit replaces the Joblib scanner broad post-merge `NumpyArrayWrapper` trust marker with a constrained trust predicate: either the Rust adapter already proved a completed pickle boundary, or the tail must match Joblib ndarray framing with benign `NumpyArrayWrapper`/`numpy.ndarray`/`numpy.dtype` references, small alignment padding, and no pickle/dangerous raw seeds. A malformed unknown tail after the same benign imports now fails closed, while real Joblib numpy-array payloads and zero padding after a trusted pickle boundary remain INFO-only compatibility behavior. Targeted QA:
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_joblib_scanner_codecs.py::test_scan_fails_closed_when_numpy_wrapper_prefix_has_unknown_tail tests/scanners/test_joblib_scanner_codecs.py::test_scan_trusts_numpy_wrapper_zero_padding_after_pickle_boundary -q` — passed, 2 tests.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/scanners/test_joblib_scanner_codecs.py tests/scanners/test_joblib_scanner.py tests/scanners/test_picklescan_adapter.py -q` — passed, 84 tests.
+  - `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest tests/test_dill_joblib_enhanced.py tests/test_real_world_dill_joblib.py -q` — passed, 16 tests.
+  - Full local gate after the PR review pass: ruff format/check, mypy, Prettier review-doc check, cargo fmt/check/clippy/test, and `PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest -n auto -m "not slow and not integration" --maxfail=1` — passed, 3820 tests; 13 skipped.
 - V5-P0-01 — Same-item commit replaces the hardcoded post-budget dangerous-global needle list with a byte-level GLOBAL parser that consults the shared Rust policy, including wildcard modules like `subprocess`, explicit policy entries like `ctypes.CDLL`, and `__main__` references. REDUCE/OBJ/BUILD/NEWOBJ/NEWOBJ_EX proximity now promotes the post-budget finding to CRITICAL, and timeout exhaustion invokes the same tail scan. Targeted QA:
   - `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check` — passed.
   - `cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml` — passed.
@@ -2159,4 +2168,4 @@ This section is the active implementation log for follow-up commits after revisi
 - `size=-1` stream bug fix is real and verified (`api.py:535-538`, `pickle_scanner.py:749`).
 - `MODELAUDIT_PICKLESCAN_ENGINE` env var + `use_standalone_pickle_primary` flag removal is clean (zero lingering refs).
 - Rust `cargo test`, `cargo clippy`, `cargo fmt`, ruff, mypy, pytest all green locally.
-- Legacy rule-code alias mapping is mostly correct modulo the three regressions above.
+- Legacy rule-code alias mapping has targeted regression coverage for the previously reported duplicate and primary-rule cases.

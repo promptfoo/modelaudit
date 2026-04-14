@@ -73,6 +73,37 @@ def test_scan_accepts_raw_protocol0_int_pickle_joblib(tmp_path: Path) -> None:
     assert not _has_system_reduce_failure(result)
 
 
+def test_scan_fails_closed_when_numpy_wrapper_prefix_has_unknown_tail(tmp_path: Path) -> None:
+    payload = b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\ncnumpy\nndarray\ncnumpy\ndtype\n\xff"
+
+    result = _scan_payload(tmp_path, payload, "crafted_unknown_tail.joblib")
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["failure_reason"] == "unknown_opcode_or_format_error"
+    assert "first_pickle_end_pos" not in result.metadata
+    assert "trusted_incomplete_tail" not in result.metadata
+    assert any(
+        issue.rule_code == "S901"
+        and issue.severity == IssueSeverity.INFO
+        and issue.message == "Pickle parsing failed before full scan completion"
+        for issue in result.issues
+    )
+
+
+def test_scan_trusts_numpy_wrapper_zero_padding_after_pickle_boundary(tmp_path: Path) -> None:
+    payload = b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00." + (b"\x00" * 16)
+
+    result = _scan_payload(tmp_path, payload, "numpy_array_tail.joblib")
+
+    assert result.success is True
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["trusted_incomplete_tail"] is True
+    assert result.metadata["first_pickle_end_pos"] == len(payload) - 16
+    assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
+
+
 def test_scan_detects_gzip_compressed_pickle_joblib(tmp_path: Path) -> None:
     path = tmp_path / "gzip_protocol4.joblib"
     path.write_bytes(gzip.compress(pickle.dumps(_Payload(), protocol=4)))
