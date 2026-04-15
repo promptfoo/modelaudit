@@ -50,6 +50,7 @@ dependencies = [
     "posthog>=7.0.0",
     "protobuf>=5.29.0",
     "msgpack>=1.0.0,<2.0",
+    "modelaudit-picklescan>=0.1.0,<0.2.0",
 ]
 
 [project.optional-dependencies]
@@ -171,15 +172,15 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = [
-    "modelaudit",
-    "packages/modelaudit-picklescan/src/modelaudit_picklescan",
-]
+packages = ["modelaudit"]
 
 [tool.uv]
 # Exclude platform-specific extras from universal lock file resolution
 # tensorrt only supports Linux and Windows
 default-groups = ["dev"]
+
+[tool.uv.sources]
+modelaudit-picklescan = { path = "packages/modelaudit-picklescan", editable = true }
 
 [tool.ruff]
 line-length = 120

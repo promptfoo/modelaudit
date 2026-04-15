@@ -121,7 +121,9 @@ def test_executorch_scanner_preserves_legacy_pickle_rule_codes_for_embedded_memb
 
     result = ExecuTorchScanner().scan(str(model_path))
 
-    assert any(issue.rule_code == "S104" for issue in result.issues)
+    assert any(
+        issue.rule_code == "S604" and "S104" in issue.details.get("legacy_rule_aliases", []) for issue in result.issues
+    )
 
 
 def test_executorch_scanner_streams_pickle_members_without_zip_read(

@@ -31,9 +31,18 @@ jobs:
         run: |
           uv python pin ${{ matrix.python-version }}
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Sync dependencies
         run: |
           uv sync --extra all-ci
+
+      - name: Run standalone picklescan Rust tests
+        run: |
+          cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
 
       - name: Run all tests (fast + slow + integration + performance)
         run: |
@@ -54,9 +63,18 @@ jobs:
         run: |
           uv python pin 3.11
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Sync dependencies
         run: |
           uv sync --extra all-ci-windows
+
+      - name: Run standalone picklescan Rust tests
+        run: |
+          cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
 
       - name: Run all tests
         run: |

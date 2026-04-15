@@ -236,7 +236,9 @@ def test_object_dtype_numpy_recurses_into_pickle_exec(tmp_path: Path) -> None:
     failed = _failed_checks(result)
     assert any("CVE-2019-6446" in (c.name + c.message) for c in failed)
     assert any("exec" in (c.message.lower()) for c in failed)
-    assert any(issue.rule_code == "S115" for issue in result.issues)
+    assert any(
+        issue.rule_code == "S104" and "S115" in issue.details.get("legacy_rule_aliases", []) for issue in result.issues
+    )
 
 
 def test_object_dtype_numpy_recurses_into_pickle_ssl(tmp_path: Path) -> None:
@@ -369,7 +371,7 @@ def test_truncated_npy_fails_safely(tmp_path: Path) -> None:
     scanner = NumPyScanner()
     result = scanner.scan(str(path))
 
-    assert result.success is True
+    assert result.success is False
     assert result.has_errors is True
     assert any("exec" in i.message.lower() and i.severity == IssueSeverity.CRITICAL for i in result.issues)
     assert any(

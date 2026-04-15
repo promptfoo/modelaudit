@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling>=1.27.0"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
 
 [project]
 name = "modelaudit-picklescan"
-version = "0.1.0"
+version = "0.1.0" # x-release-please-version
 description = "Standalone pickle security scanner extracted from ModelAudit"
 authors = [
     { name = "Ian Webster", email = "ian@promptfoo.dev" },
@@ -29,19 +29,18 @@ classifiers = [
 requires-python = ">=3.10"
 dependencies = []
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/modelaudit_picklescan"]
+[project.urls]
+Homepage = "https://github.com/promptfoo/modelaudit"
+Documentation = "https://github.com/promptfoo/modelaudit/tree/main/packages/modelaudit-picklescan"
+Repository = "https://github.com/promptfoo/modelaudit"
+Issues = "https://github.com/promptfoo/modelaudit/issues"
+Changelog = "https://github.com/promptfoo/modelaudit/blob/main/packages/modelaudit-picklescan/CHANGELOG.md"
+Security = "https://github.com/promptfoo/modelaudit/security/policy"
 
-[tool.hatch.build.targets.wheel.force-include]
-"src/modelaudit_picklescan/py.typed" = "modelaudit_picklescan/py.typed"
-
-[tool.hatch.build.targets.sdist]
-include = [
-    "pyproject.toml",
-    "README.md",
-    "src/modelaudit_picklescan",
-    "src/modelaudit_picklescan/py.typed",
-]
+[tool.maturin]
+python-source = "src"
+module-name = "modelaudit_picklescan._rust"
+features = ["extension-module", "abi3"]
 
 [tool.ruff]
 line-length = 120

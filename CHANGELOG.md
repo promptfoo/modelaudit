@@ -7,9 +7,214 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Bug Fixes
+### Added
+
+- **pickle:** replace the standalone pickle scanner's package-engine selector with the Rust-only runtime and explicit native-extension errors
+- **pickle:** scan PyTorch ZIP checkpoint pickle members directly in the standalone pickle scanner
+- **pickle:** bundle the standalone `modelaudit_picklescan` API in the root `modelaudit` wheel and add source-tree coverage for the package boundary
+- **pickle:** add the scoped Rust rewrite plan, parity gates, large-corpus QA plan, and execution notes for the standalone pickle scanner
+- **tests:** enable existing PaddlePaddle scanner tests in CI by adding `test_paddle_scanner.py` to the allowed test files list (Python 3.10/3.12/3.13)
+- **security:** detect CVE-2026-1669 Keras HDF5 external weight references in standalone `.h5` and embedded `.keras` weights
+- **security:** detect CVE-2026-24747 PyTorch weights_only=True bypass via SETITEM/SETITEMS abuse and tensor metadata mismatch detection
+- **security:** detect CVE-2022-45907 PyTorch torch.jit.annotations.parse_type_line unsafe eval() injection (CVSS 9.8)
+- **keras:** detect CVE-2025-12058 StringLookup external vocabulary path loading in `.keras` configs (local file read / SSRF)
+
+### Changed
+
+- **pickle:** increase Rust stream read chunks to reduce scan overhead on large file and archive-member inputs
+- **pickle:** store Rust byte stack operands as source spans instead of copied previews to reduce large-pickle scan overhead
+- **pickle:** skip no-seed raw-text and CVE fallback passes on clean Rust-complete pickle scans, tightening benign state-dict CLI performance while preserving targeted raw-detector positives
+- **pickle:** document and pin parse-incomplete tail suppression to trusted pickle boundaries without dangerous import references; parse failures with security findings or dangerous imports still fail closed
+- **security:** temporarily bump the optional ONNX dependency to `1.21.0rc3`, which removes the vulnerable `onnx.hub` module flagged by CVE-2026-28500.
+
+### Rule Codes
+
+- **pickle:** preserve and document Rust pickle scanner mappings for SETITEM abuse (`S209`), copyreg extensions (`S211`), persistent IDs (`S212`), nested or encoded pickle payloads (`S213`), base64/hex/obfuscated encoded payloads (`S601`/`S602`/`S604`), structural tamper and incomplete analysis (`S902`), and the new pickle expansion denial-of-service rule (`S214`).
+- **pickle:** keep internal Rust finding codes such as `STRUCTURAL_TAMPER` and `PICKLE_EXPANSION` in `pickle_rule_code` details while exposing stable ModelAudit rule codes for dashboards, SARIF, suppression, and severity configuration.
+
+### Fixed
 
 - preserve `S999` unknown-opcode mapping in generic rule fallback
+- **security:** route renamed TFLite FlatBuffers by magic bytes, enforce scanner file-size limits before model reads, and fail closed instead of propagating malformed structure traversal exceptions
+- **onnx:** fail closed on CRITICAL findings, detect `PyFunc` operators and Windows absolute external-data paths, validate external tensor slices with the current ONNX dtype API, and avoid Python-op substring false positives
+- **tensorrt:** route `.trt` engines, detect case-variant and UTF-16 suspicious strings, and avoid substring false positives in benign engine metadata
+- **coreml:** detect Python 3 command metadata, Windows and bundle-macro linked-model escapes, malformed custom-code protobuf blocks, and custom layers nested under pipeline wrappers while preserving safe-key metadata URL inspection
+- **pmml:** enforce max-file-size limits, inspect namespaced Extension/script tags, ignore DOCTYPE/ENTITY text inside XML comments/CDATA, avoid recursive text-walk crashes on deeply nested Extension trees, and fail closed when CRITICAL PMML findings are present
+- **gguf:** fall back to the GGUF spec default tensor-data alignment after rejecting invalid `general.alignment` metadata values
+- **security:** detect protocol 0/1 pickle streams hidden behind long separator gaps after an initial safe pickle stream
+- **security:** preserve failed status for malicious Skops CVE detections and avoid CVE-2025-54886 false positives on benign README/model-card text such as "download"
+- **security:** enforce Flax msgpack scanner file-size limits before full reads, scan trailing msgpack stream objects with a bounded object-count cap, downgrade benign container-like trailing-object findings to INFO, and preserve failed status when CRITICAL findings are reported
+- **security:** route `.joblib` files through the Joblib scanner, scan raw protocol-0/1 payloads directly, support gzip/bzip2/lzma/zlib wrappers with bounded output and trailing-data checks, preserve embedded Pickle finding locations, and fail closed on undecodable/trailing-wrapper errors
+- **security:** detect direct `getattr(module, "dangerous")` handler calls in TorchServe MAR archives, parse conflicting duplicate manifests without silently downgrading hidden handlers, and suppress collision warnings for byte-identical duplicate manifests
+- **security:** reduce NeMo Hydra `_target_` false positives by matching suspicious identifiers on token boundaries, preserve CVE-2025-23304 details on suspicious-target findings, and reject oversized YAML members before parsing
+- **security:** detect protocol 0/1 pickle streams with trivial opcode prefixes even when `STOP` is followed by trailing junk, while preserving plain-text near-match rejection
+- **security:** detect protocol 0/1 pickle streams whose dangerous opcode appears after large trivial padding or after a non-trivial probe-boundary prelude, reject all-trivial no-`STOP` probe prefixes, and preserve rule codes across cached scan-result round trips
+- **pickle:** propagate standalone fallback parse and stream-read failures into merged scan success, preserve truncated `.bin` fail-closed behavior, reuse non-seekable stream spools for the legacy parity pass, clamp negative stream sizes, and reset post-budget scan state between reused scanner runs
+- **pickle:** align Rust pickle suspicious-string matching, protocol-0 text decoding, EOF-before-`STOP` handling, malformed argument diagnostics, parse-incomplete reports, warning dangerous-call adaptation, negative stream sizes, and compatibility finding promotion with Python parity
+- **pickle:** harden Rust opcode parity for protocol 5 buffers, copyreg extensions, follow-on streams, protocol-0 encoded nested payloads, and `__main__` call escalation while bounding Python raw-detector hot paths
+- **pickle:** preserve root raw-detector coverage for Slack tokens, `mongodb+srv://` secrets, bare IPs, domains, and network-library/function indicators behind large-file compatibility prefilters
+- **pickle:** detect modern `STACK_GLOBAL`, `INST`, and copyreg extension references in post-budget pickle tails, avoid a second Rust-boundary copy of Python byte payloads, and skip expensive raw detectors for realistic benign PyTorch state-dict key streams
+- **pickle:** route crafted protocol-1 binary pickle headers and nested protocol-1 payload prefixes through the same scanner paths as newer binary protocols
+- **pickle:** enforce PyTorch ZIP entry limits with a bounded EOCD preflight before opening over-cap archives
+- **pickle:** resolve memoized `GET`/`BINGET`/`LONG_BINGET` operands in post-budget `STACK_GLOBAL` tails so pre-memoized dangerous globals cannot bypass the Rust scanner
+- **numpy:** propagate incomplete embedded-pickle scan status from object-dtype `.npy` payloads so partial recursive pickle coverage fails closed
+- **license:** bound binary header scans and reuse compiled patterns to avoid full-file regex passes on large model archives
+- **security:** stop iterating malformed TFLite models after excessive subgraph counts are detected
+- **openvino:** route forbidden-DOCTYPE IR XML into the OpenVINO scanner, fail closed on XML parse errors, and suppress warning-level format-validation noise for benign `.xml` models with no distinctive magic bytes
+- **security:** fail closed on conflicting duplicate or alias Keras root members so benign trailing `config.json` entries cannot hide malicious earlier configs, while accepting byte-identical duplicates without warning noise
+- **security:** detect PyTorch binary code and blacklist patterns that straddle chunk boundaries, avoid duplicate overlap reports, and return `success=False` when CRITICAL findings are present
+- **security:** scan every duplicate PyTorch ZIP member by physical archive entry and report conflicting duplicate names at INFO severity so benign trailing `data.pkl` entries cannot shadow malicious earlier payloads without making benign-but-conflicting duplicates warning-fail by themselves
+- **security:** route misnamed Skops ZIPs by bounded schema sniffing, treat encrypted Skops-like schema members as non-matches instead of crashing routing, recurse into embedded members while preserving Skops-specific CVE checks, avoid tiny nested `.bin` false positives on clean archive members, preserve nested-member byte accounting, and preserve CLI `scanner_names` in aggregated JSON output
+- **pickle:** bound post-budget global fallback state, retained findings, and deadline checks to prevent crafted pickle tails from exhausting scanner memory or flooding logs
+- **pickle:** mark timeout-, budget-, recursion-, and resource-limited pickle scans as inconclusive so clean-looking partial analysis returns exit code 2 unless real security findings were reported
+- route misnamed ZIP, HDF5, and 7z files through content-aware scanner selection
+- **security:** recursively scan all members of content-routed `.keras` ZIP archives with bounded per-member extraction, prefer canonical root members over normalized aliases, and fail closed on ambiguous duplicate aliases so embedded payloads and `./config.json` entries are not skipped
+- **security:** scan duplicate ZIP entries by physical archive member instead of resolving repeated names to the final entry, preventing shadowed payloads from being skipped during recursive archive analysis
+- bound Keras `config.json` and `metadata.json` member reads before JSON parsing
+- **openvino:** parse XML roots for long-prolog routing, enforce size limits before parsing, scan nested layer attributes for external library references, and avoid importlib substring false positives
+- **zip:** propagate nested critical findings and incomplete archive traversal to `success=False`, and bound symlink-target reads before path validation
+- **tar:** propagate nested critical findings and partial archive traversal to `success=False`, continue after per-entry extraction errors, and normalize malformed archive-limit configs to safe defaults
+- route oversized config-only Keras ZIP archives by bounded config-prefix sniffing instead of falling back to the generic ZIP scanner
+- preserve disguised model files during directory prefiltering without promoting document ZIPs
+- fail closed on duplicate 7z entries, nested critical findings, probe-limit truncation, and malformed 7z safety-limit configs
+- **oci:** fail closed on nested findings and partial layer traversal, content-sniff misnamed layer members, normalize cosmetic layer-ref suffix changes, and reject oversized members before temp extraction
+- **oci:** ignore non-layer metadata strings ending in `.tar.gz` when collecting manifest layer refs so benign URLs do not become false missing-layer failures
+- recurse into nested 7z members even when their filenames use misleading extensions
+- fail closed on extreme-size files when a scanner lacks bounded large-file analysis
+- harden scan-cache invalidation and skip caching operational scan failures
+- propagate CLI cache settings into MLflow and JFrog downloads
+- avoid materializing streaming directory iterators in memory
+- fail closed when JFrog folder downloads return only partial results
+- **keras:** anchor safe Lambda normalization regexes in H5 scanning so appended statements (for example `; __import__(...)`) cannot bypass dangerous-code analysis
+- **keras:** harden Keras H5 scanning by propagating CRITICAL findings to `success=False`, scanning wrapper-owned nested layers, parsing prerelease fix-boundary versions correctly, and matching suspicious module/config tokens without benign substring false positives
+- complete primary header-format routing in `core.py` so all registered model formats map to scanner IDs (including OpenVINO/PMML/CNTK/LightGBM/Torch7/CatBoost/RKNN/MXNet/NeMo/Llamafile/TFLite/CoreML/Paddle/TensorRT/Flax/R/ExecuTorch/7z/compressed/skops/joblib/xgboost/jax_checkpoint), add `.skops` extension detection coverage without spurious ZIP mismatch noise, and route ZIP-backed PyTorch `.ckpt`/`.pkl` containers through the PyTorch ZIP path
+- **security:** track pickle `BUILD`-driven `__setstate__` mutation on non-safe globals and block tree-model opcode-threshold escalation when dangerous globals are present in-stream
+- **safetensors:** include BOOL, BF16, F8_E4M3, and F8_E5M2 dtypes in tensor-size validation so malformed offsets are no longer skipped
+- harden pickle symbolic stack simulation by ignoring stack-neutral opcodes and using unknown sentinels for unhandled stack pushes
+- **security:** scan TensorFlow SavedModel `assets/` and `assets.extra/` directories for executable-like content (shebang scripts, ELF/Mach-O binaries, pickle magic, and embedded Python source patterns)
+- **security:** make TensorFlow SavedModel scans fail closed on CRITICAL findings, avoid substring false positives in PyFunc function references, and treat `blacklist_patterns=None` as disabled instead of emitting DEBUG read errors
+- **security:** enforce SafeTensors `MAX_HEADER_BYTES` during `scan()` and skip regex-heavy metadata-content analysis when headers exceed the configured limit to reduce header-based DoS risk
+- emit a one-time warning when the HuggingFace whitelist snapshot is older than 90 days while preserving existing whitelist severity downgrades
+- treat pickle scan timeouts as unsuccessful while preserving post-budget tail scans after opcode truncation
+- harden pickle CVE-2026-24747 SETITEM detection against stack-neutral padding
+- **keras:** harden CVE-2025-9906 detection against documentation-padding bypasses in `.keras` `config.json`
+- count successful `stream://` scans in `files_scanned` so clean streaming scans return exit code 0 instead of 2
+- harden 7z nested archive scanning and pre-extraction size checks
+- scan follow-on pickle streams after large padding blocks
+- **security:** add a budget-independent post-truncation GLOBAL/INST/STACK_GLOBAL byte scan (100 MB capped) so dangerous imports hidden past opcode limits are still detected
+- **security:** detect nested pickle payloads in BINBYTES8 and BYTEARRAY8 opcodes
+- **security:** scan bounded sliding windows for padded nested pickles hidden beyond the first 1 KB in raw, legacy `BINSTRING`, and base64/hex-encoded payloads
+- **onnx:** treat official `ai.onnx.ml` and `ai.onnx.preview.training` domains as standard so only truly custom domains are flagged
+- reject local streaming symlink traversal outside the scan root
+- require explicit remote Hugging Face provenance for whitelist downgrades
+- preserve scannable archives, hidden model files, hidden DVC pointers, and local `.metadata` files in directory scans
+- tighten Hugging Face cache-root matching so only real `.cache/huggingface/hub` layouts get cache-specific filtering and provenance handling
+- preserve validated PE detections in pickle binary ML-context filtering
+- **security:** fail closed on pickle opcode parse errors for `.pkl` / `.pickle` / `.joblib` / `.dill` files instead of returning a successful INFO-only scan
+- **security:** surface an explicit INFO limitation when large pickle raw byte-pattern heuristics cover only the first 10 MB of the file
+- **security:** preserve full scanner execution for large files when scanners do not implement chunk analyzers
+- harden manifest URL trust checks and enforce metadata/manifest scan limits
+- harden metadata scanner URL handling so shorteners/tunnels hidden in userinfo are flagged without treating ordinary authenticated URLs as suspicious
+- trust legitimate AWS S3 virtual-hosted regional and legacy manifest URLs without broadening other `amazonaws.com` hosts
+- treat all-uppercase pickle module segments as plausible imports
+- recurse into extensionless nested ZIP members by content
+- preserve mixed ZIP/TAR/MAR archive depth limits
+- **security:** keep Hugging Face model downloads fail-closed when repo listing errors/timeouts prevent exact file allowlists, and run disk-space preflight against the default HF cache even without an explicit `cache_dir`
+- **security:** bound embedded `.keras` weight extraction before temporary-file inspection to reduce zip-bomb denial-of-service risk
+- **security:** prevent ExecuTorch binary ZIP polyglots from bypassing archive scanning
+- **security:** keep spoofed built-in Keras `registered_name` values from hiding non-allowlisted custom modules in `.keras` ZIP scans
+- **keras:** suppress duplicate custom-object warnings for allowlisted registered objects when module metadata is absent
+- **security:** analyze TorchServe MAR `requirements.txt` files for supply-chain attack indicators such as non-PyPI indexes, editable/git installs, direct remote URL installs, external requirement includes, insecure HTTP URLs, remote find-links, and typosquatting package names while ignoring inline comments
+- **security:** stop auto-applying local `.modelaudit.toml` and `pyproject.toml` rule config during scans unless a human explicitly trusts that config in an interactive scan; remembered trust is stored securely under the local ModelAudit cache and invalidated when the config changes
+- **telemetry:** preserve secret-scrubbed model references in telemetry payloads while omitting raw credentials, query strings, and local directory paths
+- **cli:** preserve original local files during `--stream` directory scans instead of unlinking them after analysis
+- **security:** reduce benign pickle scanner noise by suppressing placeholder `__reduce__` findings, narrowing generic base64-like string heuristics, and applying default suppression for the JWT.io example token
+- **security:** recurse into object-dtype `.npy` payloads and `.npz` object members with the pickle scanner while preserving CVE-2019-6446 attribution and archive-member context
+- eliminate false positives for valid ExecuTorch FlatBuffers binaries and file-type validation on public `.pte` models
+- eliminate Keras ZIP false positives for safe built-in and allowlisted serialized objects such as `Add` and `NotEqual`
+- **security:** remove `dill.load` / `dill.loads` from the pickle safe-global allowlist so recursive dill deserializers stay flagged as dangerous loader entry points
+- **security:** add exact dangerous helper coverage for validated torch and NumPy refs such as `numpy.f2py.crackfortran.getlincoef`, `torch._dynamo.guards.GuardBuilder.get`, and `torch.utils.collect_env.run`
+- **security:** add exact dangerous-global coverage for `numpy.load`, `site.main`, `_io.FileIO`, `test.support.script_helper.assert_python_ok`, `_osx_support._read_output`, `_aix_support._read_cmd_output`, `_pyrepl.pager.pipe_pager`, `torch.serialization.load`, and `torch._inductor.codecache.compile_file` (9 PickleScan-only loader and execution primitives)
+- **security:** treat legacy `httplib` pickle globals the same as `http.client`, including import-only and `REDUCE` findings in standalone and archived payloads
+- **security:** detect import-only pickle `GLOBAL`/`STACK_GLOBAL` references while preserving safe constructor imports and avoiding mislabeling executed call chains as import-only
+- **security:** fail closed on malformed `STACK_GLOBAL` operands when memo lookups are missing or operand types are non-string, while keeping simple truncation-only context informational
+- **security:** remove `builtins.hasattr` / `__builtin__.hasattr` from the pickle safe-global allowlist so attribute-access primitives stay flagged as dangerous builtins
+- **security:** harden pickle blocklist enforcement by removing `_pickle.Unpickler`/`_pickle.Pickler` from safe globals, adding `copyreg.add_extension`/`copyreg.remove_extension` to suspicious globals, and limiting functools warning downgrades to `partial`/`partialmethod` so `functools.reduce` findings stay CRITICAL
+- **security:** harden TensorFlow weight extraction limits to bound actual tensor payload materialization, including malformed `tensor_content` and string-backed tensors, and continue scanning past oversized `Const` nodes
+- **security:** stream TAR members to temp files under size limits instead of buffering whole entries in memory during scan
+- **security:** inspect TensorFlow SavedModel function definitions when scanning for dangerous ops and protobuf string abuse, with function-aware finding locations
+- **security:** route oversized TensorFlow MetaGraph files to fail-closed parse-budget scans, inspect `AttrValue.func.name` references in executable ops, and restore oversized-attribute anomaly detection after bounded string decoding
+- **cli:** include streamed artifacts as SBOM components when `scan --stream --sbom` is used
+- **cli:** exclude HuggingFace download cache bookkeeping files from remote SBOMs and asset lists
+- **cli:** add `--no-whitelist` and `--strict` whitelist/caching hardening so CI scans can disable HF severity downgrades and force uncached analysis
+- **security:** require official or explicitly allowlisted JFrog hosts before treating `/artifactory/` URLs as authenticated JFrog endpoints
+- **security:** detect CVE-2024-5480 PyTorch torch.distributed.rpc arbitrary function execution via PythonUDF (CVSS 10.0)
+- **security:** detect CVE-2024-48063 PyTorch torch.distributed.rpc.RemoteModule deserialization RCE via pickle (CVSS 9.8)
+- **security:** detect CVE-2019-6446 in NumPy scanner when object-dtype arrays are found, with informational attribution (CVSS 9.8) due to potential pickle deserialization via `allow_pickle=True`
+- **security:** new NeMo scanner detecting CVE-2025-23304 Hydra `_target_` injection in `.nemo` model files (CVSS 7.6), with recursive config inspection and dangerous callable blocklist
+- **security:** detect CVE-2025-51480 ONNX `save_external_data` arbitrary file overwrite via external_data path traversal (CVSS 8.8)
+- **security:** detect CVE-2025-49655 TorchModuleWrapper deserialization RCE (CVSS 9.8).
+- **security:** add CatBoost `.cbm` scanner with strict `CBM1` format validation, bounded parsing, and suspicious command/network/script indicator checks
+- **security:** add dedicated scanner support for R serialized artifacts (`.rds`, `.rda`, `.rdata`) with bounded decompression and static detection of executable symbol/payload indicators
+- **security:** add CNTK `.dnn`/`.cmf` scanner with strict signature validation, bounded reads, and multi-signal suspicious content correlation
+- **feat:** add standalone compressed-wrapper scanner support for `.gz`, `.bz2`, `.xz`, `.lz4`, and `.zlib` with strict signature validation, decompression size/ratio safeguards, and inner-payload scanner routing
+- **security:** add RKNN `.rknn` scanner with strict `RKNN` signature detection, bounded metadata parsing, and contextual command/network/obfuscation checks
+- **security:** add Torch7 (`.t7`, `.th`, `.net`) scanner with strict signature heuristics plus Lua execution primitive and dynamic module-loading detection
+- **security:** add native LightGBM scanner for `.lgb`/`.lightgbm` and signature-validated `.model` artifacts with strict XGBoost collision disambiguation and static command/network/path indicator checks
+- **feat:** add Llamafile executable scanner with bounded runtime-string analysis and embedded GGUF payload carving/forwarding
+- **feat:** add CoreML `.mlmodel` scanner with strict protobuf structure validation, custom layer/custom model detection, metadata abuse checks, and linked-model path safety checks
+- **feat:** add MXNet scanner support for paired `*-symbol.json` and `*-NNNN.params` artifacts with strict contract validation, companion-file checks, and suspicious reference/payload detection
+- **security:** add TensorFlow MetaGraph (`.meta`) scanner support with strict protobuf `can_handle()`, bounded MetaGraph parsing, unsafe op detection (`PyFunc`/`PyCall`/`LoadLibrary`), executable-context string checks, and payload-stuffing anomaly controls
+- **security:** add dedicated TorchServe `.mar` scanner with strict archive validation, bounded manifest/member reads, manifest policy checks, and recursive embedded payload scanning
+- **security:** detect CVE-2025-1716 pickle bypass via `pip.main()` as dangerous callable (CVSS 9.8)
+- **keras:** detect CVE-2025-9906 `enable_unsafe_deserialization` config bypass in `.keras` archives (CVSS 8.6, safe_mode bypass)
+- **security:** detect CVE-2025-8747 Keras get_file gadget safe_mode bypass
+- **keras:** detect CVE-2025-9905 H5 safe_mode bypass for Lambda layers (CVSS 7.3)
+- **keras:** add CVE-2024-3660 attribution to Lambda layer detection in .keras and .h5 scanners (CVSS 9.8)
+- **keras:** recursively inspect H5 `training_config` and `.keras` `compile_config` for custom losses and metrics, while allowlisting standard aliases and built-in preprocessing layers to reduce false positives
+- **security:** detect CVE-2025-10155 pickle protocol 0/1 payloads disguised as `.bin` files by extending `detect_file_format()` to recognize GLOBAL opcode patterns and adding `posix`/`nt` internal module names to binary code pattern blocklist
+- **security:** detect CVE-2022-25882 ONNX external_data path traversal with CVE attribution, CVSS score, and CWE classification in scan results
+- **security:** detect CVE-2024-27318 ONNX nested external_data path traversal bypass via path segment sanitization evasion
+- **security:** restore ZIP scanner fallback for invalid `.mar` archives so malicious ZIP payloads renamed to `.mar` cannot bypass archive checks
+- **security:** flag risky import-only pickle references for `torch.jit`, `torch._dynamo`, `torch._inductor`, `torch.compile`, `torch.storage._load_from_bytes`, `numpy.f2py`, and `numpy.distutils` while preserving safe state-dict reconstruction paths
+- **security:** add low-severity pickle structural tamper findings for duplicate or misplaced `PROTO` opcodes while avoiding benign binary-tail false positives
+- **security:** stop treating mixed-case valid pickle module names as implausible, so import and reduce checks no longer bypass on names like `PIL` or attacker-chosen `EvilPkg`
+- **security:** scan OCI layer members based on registered file extensions so embedded ONNX, Keras H5, and other real-path scanners are no longer skipped inside tar layers
+- **security:** resolve bare-module TorchServe handler references like `custom_handler` to concrete archive members so malicious handler source is no longer skipped by static analysis
+- **security:** compare archive entry paths against the intended extraction root without following base-directory symlinks
+- **security:** stop loading `.env` files implicitly during JFrog helper import so untrusted working directories cannot rewrite proxy or auth-related environment variables
+- **rules:** preserve `rule_code` metadata through direct result aggregation and ensure dangerous advanced pickle globals emit explicit rule codes (with regression coverage)
+- **rules:** ignore unknown rule IDs in config files with warning logs, normalize rule-code casing in config parsing, and prevent invalid severity entries from being applied
+- **security:** harden shared auth config storage and archive path sanitization to avoid insecure temp fallbacks, symlink overwrite abuse, and temp-root symlink traversal bypasses
+- **security:** stop archive path sanitization from resolving attacker-controlled extraction-root symlinks, preventing symlinked temp directories from weakening traversal checks
+- **telemetry:** refresh the cached telemetry client when runtime context changes and lazily initialize PostHog when telemetry is re-enabled in-process
+- **tests:** add scanner literal `rule_code` registry-consistency coverage to catch unknown rule identifiers early
+- **cloud:** harden cache path handling to prevent sibling-prefix bypasses from escaping cache boundaries, avoid deleting out-of-cache metadata paths during cleanup, and clean temporary cloud download directories on failure
+- **tests:** unskip and restore cloud disk-space failure coverage; add regressions for cache boundary enforcement and temp-directory cleanup on download errors
+- **security**: harden pickle scanner stack resolution to correctly track `STACK_GLOBAL` and memoized `REDUCE` call targets, preventing decoy-string and `BINGET` bypasses
+- **security**: flag pickle `EXT1`/`EXT2`/`EXT4` extension-registry call targets in `REDUCE` analysis to close EXT opcode bypasses
+- **security**: detect protocol 0/1 ASCII pickle signatures in generic file-format detection to prevent ZIP entry extension bypasses (e.g., malicious `payload.txt`)
+- **security**: harden protocol 0/1 pickle format detection with bounded opcode parsing to catch prefixed payloads (e.g., `MARK/LIST` before `GLOBAL`) while reducing plain-text false positives in ZIP entry scanning
+- **security**: keep opcode-level pickle analysis active when malformed streams trigger unicode/text parse errors after partial opcode extraction
+- **security**: tighten safetensors magic-byte detection to require valid framed headers, preventing JSON and protocol 0 pickle misrouting
+- **security:** analyze all Python files in TorchServe `.mar` archives (including non-handler modules and `__init__.py`) for risky calls, import-time execution, and handler-to-utility import relationships
+
+### Security
+
+- **keras:** detect CVE-2025-1550 arbitrary module references in `.keras` config.json (CVSS 9.8, safe_mode bypass)
+- **security**: treat `joblib.load` as always dangerous and remove it from pickle ML allowlist to block loader trampoline bypasses
+- **security**: tighten manifest trusted-domain matching to validate URL hostnames instead of substring matches
+- **security**: make `.keras` suspicious file extension checks case-insensitive to catch uppercase executable/script payloads
+- **security**: block unsafe in-process `torch.load` in `WeightDistributionScanner` by default unless explicitly opted in
+- **fix**: tighten metadata scanner suspicious URL matching to use exact hostname/subdomain checks and add focused regression coverage
+- **fix**: treat `.nemo` files as tar-compatible during file-type validation to avoid false extension/magic mismatch alerts
+- **fix**: pass XGBoost load-test file paths via subprocess argv instead of interpolating shell-quoted paths into `python -c`, preventing backslash escape corruption on Windows-style paths
+- **security**: reject absolute OCI layer references so `.manifest` files cannot scan host tarballs outside the OCI layout
+
+### Documentation
+
+- update README and user docs for the `modelaudit metadata` command, metadata safety guidance (`--trust-loaders`), and new NeMo format coverage
+- align maintainer/agent docs with current architecture and release workflow (metadata extractor component, dependency extras, and release-please + changelog guidance)
 
 ## [0.2.37](https://github.com/promptfoo/modelaudit/compare/v0.2.36...v0.2.37) (2026-04-12)
 
@@ -273,196 +478,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **agents:** tighten validation and routing guidance ([335b656](https://github.com/promptfoo/modelaudit/commit/335b65679de6c98d4040d3ea9e6a4fd025ac3f45))
 - normalize unreleased changelog section ([#741](https://github.com/promptfoo/modelaudit/issues/741)) ([5e66490](https://github.com/promptfoo/modelaudit/commit/5e664901d4448871715685833a91cfb339d632d7))
-
-## [Unreleased]
-
-### Added
-
-- **pickle:** bundle the standalone `modelaudit_picklescan` API in the root `modelaudit` wheel and add source-tree coverage for the package boundary
-- **tests:** enable existing PaddlePaddle scanner tests in CI by adding `test_paddle_scanner.py` to the allowed test files list (Python 3.10/3.12/3.13)
-- **security:** detect CVE-2026-1669 Keras HDF5 external weight references in standalone `.h5` and embedded `.keras` weights
-- **security:** detect CVE-2026-24747 PyTorch weights_only=True bypass via SETITEM/SETITEMS abuse and tensor metadata mismatch detection
-- **security:** detect CVE-2022-45907 PyTorch torch.jit.annotations.parse_type_line unsafe eval() injection (CVSS 9.8)
-- **keras:** detect CVE-2025-12058 StringLookup external vocabulary path loading in `.keras` configs (local file read / SSRF)
-
-### Changed
-
-- **security:** temporarily bump the optional ONNX dependency to `1.21.0rc3`, which removes the vulnerable `onnx.hub` module flagged by CVE-2026-28500.
-
-### Fixed
-
-- **security:** route renamed TFLite FlatBuffers by magic bytes, enforce scanner file-size limits before model reads, and fail closed instead of propagating malformed structure traversal exceptions
-- **onnx:** fail closed on CRITICAL findings, detect `PyFunc` operators and Windows absolute external-data paths, validate external tensor slices with the current ONNX dtype API, and avoid Python-op substring false positives
-- **tensorrt:** route `.trt` engines, detect case-variant and UTF-16 suspicious strings, and avoid substring false positives in benign engine metadata
-- **coreml:** detect Python 3 command metadata, Windows and bundle-macro linked-model escapes, malformed custom-code protobuf blocks, and custom layers nested under pipeline wrappers while preserving safe-key metadata URL inspection
-- **pmml:** enforce max-file-size limits, inspect namespaced Extension/script tags, ignore DOCTYPE/ENTITY text inside XML comments/CDATA, avoid recursive text-walk crashes on deeply nested Extension trees, and fail closed when CRITICAL PMML findings are present
-- **gguf:** fall back to the GGUF spec default tensor-data alignment after rejecting invalid `general.alignment` metadata values
-- **security:** detect protocol 0/1 pickle streams hidden behind long separator gaps after an initial safe pickle stream
-- **security:** preserve failed status for malicious Skops CVE detections and avoid CVE-2025-54886 false positives on benign README/model-card text such as "download"
-- **security:** enforce Flax msgpack scanner file-size limits before full reads, scan trailing msgpack stream objects with a bounded object-count cap, downgrade benign container-like trailing-object findings to INFO, and preserve failed status when CRITICAL findings are reported
-- **security:** route `.joblib` files through the Joblib scanner, scan raw protocol-0/1 payloads directly, support gzip/bzip2/lzma/zlib wrappers with bounded output and trailing-data checks, preserve embedded Pickle finding locations, and fail closed on undecodable/trailing-wrapper errors
-- **security:** detect direct `getattr(module, "dangerous")` handler calls in TorchServe MAR archives, parse conflicting duplicate manifests without silently downgrading hidden handlers, and suppress collision warnings for byte-identical duplicate manifests
-- **security:** reduce NeMo Hydra `_target_` false positives by matching suspicious identifiers on token boundaries, preserve CVE-2025-23304 details on suspicious-target findings, and reject oversized YAML members before parsing
-- **security:** detect protocol 0/1 pickle streams with trivial opcode prefixes even when `STOP` is followed by trailing junk, while preserving plain-text near-match rejection
-- **security:** detect protocol 0/1 pickle streams whose dangerous opcode appears after large trivial padding or after a non-trivial probe-boundary prelude, reject all-trivial no-`STOP` probe prefixes, and preserve rule codes across cached scan-result round trips
-- **pickle:** propagate standalone fallback parse and stream-read failures into merged scan success, preserve truncated `.bin` fail-closed behavior, reuse non-seekable stream spools for the legacy parity pass, clamp negative stream sizes, and reset post-budget scan state between reused scanner runs
-- **license:** bound binary header scans and reuse compiled patterns to avoid full-file regex passes on large model archives
-- **security:** stop iterating malformed TFLite models after excessive subgraph counts are detected
-- **openvino:** route forbidden-DOCTYPE IR XML into the OpenVINO scanner, fail closed on XML parse errors, and suppress warning-level format-validation noise for benign `.xml` models with no distinctive magic bytes
-- **security:** fail closed on conflicting duplicate or alias Keras root members so benign trailing `config.json` entries cannot hide malicious earlier configs, while accepting byte-identical duplicates without warning noise
-- **security:** detect PyTorch binary code and blacklist patterns that straddle chunk boundaries, avoid duplicate overlap reports, and return `success=False` when CRITICAL findings are present
-- **security:** scan every duplicate PyTorch ZIP member by physical archive entry and report conflicting duplicate names at INFO severity so benign trailing `data.pkl` entries cannot shadow malicious earlier payloads without making benign-but-conflicting duplicates warning-fail by themselves
-- **security:** route misnamed Skops ZIPs by bounded schema sniffing, treat encrypted Skops-like schema members as non-matches instead of crashing routing, recurse into embedded members while preserving Skops-specific CVE checks, avoid tiny nested `.bin` false positives on clean archive members, preserve nested-member byte accounting, and preserve CLI `scanner_names` in aggregated JSON output
-- **pickle:** bound post-budget global fallback state, retained findings, and deadline checks to prevent crafted pickle tails from exhausting scanner memory or flooding logs
-- **pickle:** mark timeout-, budget-, recursion-, and resource-limited pickle scans as inconclusive so clean-looking partial analysis returns exit code 2 unless real security findings were reported
-- route misnamed ZIP, HDF5, and 7z files through content-aware scanner selection
-- **security:** recursively scan all members of content-routed `.keras` ZIP archives with bounded per-member extraction, prefer canonical root members over normalized aliases, and fail closed on ambiguous duplicate aliases so embedded payloads and `./config.json` entries are not skipped
-- **security:** scan duplicate ZIP entries by physical archive member instead of resolving repeated names to the final entry, preventing shadowed payloads from being skipped during recursive archive analysis
-- bound Keras `config.json` and `metadata.json` member reads before JSON parsing
-- **openvino:** parse XML roots for long-prolog routing, enforce size limits before parsing, scan nested layer attributes for external library references, and avoid importlib substring false positives
-- **zip:** propagate nested critical findings and incomplete archive traversal to `success=False`, and bound symlink-target reads before path validation
-- **tar:** propagate nested critical findings and partial archive traversal to `success=False`, continue after per-entry extraction errors, and normalize malformed archive-limit configs to safe defaults
-- route oversized config-only Keras ZIP archives by bounded config-prefix sniffing instead of falling back to the generic ZIP scanner
-- preserve disguised model files during directory prefiltering without promoting document ZIPs
-- fail closed on duplicate 7z entries, nested critical findings, probe-limit truncation, and malformed 7z safety-limit configs
-- **oci:** fail closed on nested findings and partial layer traversal, content-sniff misnamed layer members, normalize cosmetic layer-ref suffix changes, and reject oversized members before temp extraction
-- **oci:** ignore non-layer metadata strings ending in `.tar.gz` when collecting manifest layer refs so benign URLs do not become false missing-layer failures
-- recurse into nested 7z members even when their filenames use misleading extensions
-- fail closed on extreme-size files when a scanner lacks bounded large-file analysis
-- harden scan-cache invalidation and skip caching operational scan failures
-- propagate CLI cache settings into MLflow and JFrog downloads
-- avoid materializing streaming directory iterators in memory
-- fail closed when JFrog folder downloads return only partial results
-- **keras:** anchor safe Lambda normalization regexes in H5 scanning so appended statements (for example `; __import__(...)`) cannot bypass dangerous-code analysis
-- **keras:** harden Keras H5 scanning by propagating CRITICAL findings to `success=False`, scanning wrapper-owned nested layers, parsing prerelease fix-boundary versions correctly, and matching suspicious module/config tokens without benign substring false positives
-- complete primary header-format routing in `core.py` so all registered model formats map to scanner IDs (including OpenVINO/PMML/CNTK/LightGBM/Torch7/CatBoost/RKNN/MXNet/NeMo/Llamafile/TFLite/CoreML/Paddle/TensorRT/Flax/R/ExecuTorch/7z/compressed/skops/joblib/xgboost/jax_checkpoint), add `.skops` extension detection coverage without spurious ZIP mismatch noise, and route ZIP-backed PyTorch `.ckpt`/`.pkl` containers through the PyTorch ZIP path
-- **security:** track pickle `BUILD`-driven `__setstate__` mutation on non-safe globals and block tree-model opcode-threshold escalation when dangerous globals are present in-stream
-- **safetensors:** include BOOL, BF16, F8_E4M3, and F8_E5M2 dtypes in tensor-size validation so malformed offsets are no longer skipped
-- harden pickle symbolic stack simulation by ignoring stack-neutral opcodes and using unknown sentinels for unhandled stack pushes
-- **security:** scan TensorFlow SavedModel `assets/` and `assets.extra/` directories for executable-like content (shebang scripts, ELF/Mach-O binaries, pickle magic, and embedded Python source patterns)
-- **security:** make TensorFlow SavedModel scans fail closed on CRITICAL findings, avoid substring false positives in PyFunc function references, and treat `blacklist_patterns=None` as disabled instead of emitting DEBUG read errors
-- **security:** enforce SafeTensors `MAX_HEADER_BYTES` during `scan()` and skip regex-heavy metadata-content analysis when headers exceed the configured limit to reduce header-based DoS risk
-- emit a one-time warning when the HuggingFace whitelist snapshot is older than 90 days while preserving existing whitelist severity downgrades
-- treat pickle scan timeouts as unsuccessful while preserving post-budget tail scans after opcode truncation
-- harden pickle CVE-2026-24747 SETITEM detection against stack-neutral padding
-- **keras:** harden CVE-2025-9906 detection against documentation-padding bypasses in `.keras` `config.json`
-- count successful `stream://` scans in `files_scanned` so clean streaming scans return exit code 0 instead of 2
-- harden 7z nested archive scanning and pre-extraction size checks
-- scan follow-on pickle streams after large padding blocks
-- **security:** add a budget-independent post-truncation GLOBAL/INST/STACK_GLOBAL byte scan (100 MB capped) so dangerous imports hidden past opcode limits are still detected
-- **security:** detect nested pickle payloads in BINBYTES8 and BYTEARRAY8 opcodes
-- **security:** scan bounded sliding windows for padded nested pickles hidden beyond the first 1 KB in raw, legacy `BINSTRING`, and base64/hex-encoded payloads
-- **onnx:** treat official `ai.onnx.ml` and `ai.onnx.preview.training` domains as standard so only truly custom domains are flagged
-- reject local streaming symlink traversal outside the scan root
-- require explicit remote Hugging Face provenance for whitelist downgrades
-- preserve scannable archives, hidden model files, hidden DVC pointers, and local `.metadata` files in directory scans
-- tighten Hugging Face cache-root matching so only real `.cache/huggingface/hub` layouts get cache-specific filtering and provenance handling
-- preserve validated PE detections in pickle binary ML-context filtering
-- **security:** fail closed on pickle opcode parse errors for `.pkl` / `.pickle` / `.joblib` / `.dill` files instead of returning a successful INFO-only scan
-- **security:** surface an explicit INFO limitation when large pickle raw byte-pattern heuristics cover only the first 10 MB of the file
-- **security:** preserve full scanner execution for large files when scanners do not implement chunk analyzers
-- harden manifest URL trust checks and enforce metadata/manifest scan limits
-- harden metadata scanner URL handling so shorteners/tunnels hidden in userinfo are flagged without treating ordinary authenticated URLs as suspicious
-- trust legitimate AWS S3 virtual-hosted regional and legacy manifest URLs without broadening other `amazonaws.com` hosts
-- treat all-uppercase pickle module segments as plausible imports
-- recurse into extensionless nested ZIP members by content
-- preserve mixed ZIP/TAR/MAR archive depth limits
-- **security:** keep Hugging Face model downloads fail-closed when repo listing errors/timeouts prevent exact file allowlists, and run disk-space preflight against the default HF cache even without an explicit `cache_dir`
-- **security:** bound embedded `.keras` weight extraction before temporary-file inspection to reduce zip-bomb denial-of-service risk
-- **security:** prevent ExecuTorch binary ZIP polyglots from bypassing archive scanning
-- **security:** keep spoofed built-in Keras `registered_name` values from hiding non-allowlisted custom modules in `.keras` ZIP scans
-- **keras:** suppress duplicate custom-object warnings for allowlisted registered objects when module metadata is absent
-- **security:** analyze TorchServe MAR `requirements.txt` files for supply-chain attack indicators such as non-PyPI indexes, editable/git installs, direct remote URL installs, external requirement includes, insecure HTTP URLs, remote find-links, and typosquatting package names while ignoring inline comments
-- **security:** stop auto-applying local `.modelaudit.toml` and `pyproject.toml` rule config during scans unless a human explicitly trusts that config in an interactive scan; remembered trust is stored securely under the local ModelAudit cache and invalidated when the config changes
-- **telemetry:** preserve secret-scrubbed model references in telemetry payloads while omitting raw credentials, query strings, and local directory paths
-- **cli:** preserve original local files during `--stream` directory scans instead of unlinking them after analysis
-- **security:** reduce benign pickle scanner noise by suppressing placeholder `__reduce__` findings, narrowing generic base64-like string heuristics, and applying default suppression for the JWT.io example token
-- **security:** recurse into object-dtype `.npy` payloads and `.npz` object members with the pickle scanner while preserving CVE-2019-6446 attribution and archive-member context
-- eliminate false positives for valid ExecuTorch FlatBuffers binaries and file-type validation on public `.pte` models
-- eliminate Keras ZIP false positives for safe built-in and allowlisted serialized objects such as `Add` and `NotEqual`
-- **security:** remove `dill.load` / `dill.loads` from the pickle safe-global allowlist so recursive dill deserializers stay flagged as dangerous loader entry points
-- **security:** add exact dangerous helper coverage for validated torch and NumPy refs such as `numpy.f2py.crackfortran.getlincoef`, `torch._dynamo.guards.GuardBuilder.get`, and `torch.utils.collect_env.run`
-- **security:** add exact dangerous-global coverage for `numpy.load`, `site.main`, `_io.FileIO`, `test.support.script_helper.assert_python_ok`, `_osx_support._read_output`, `_aix_support._read_cmd_output`, `_pyrepl.pager.pipe_pager`, `torch.serialization.load`, and `torch._inductor.codecache.compile_file` (9 PickleScan-only loader and execution primitives)
-- **security:** treat legacy `httplib` pickle globals the same as `http.client`, including import-only and `REDUCE` findings in standalone and archived payloads
-- **security:** detect import-only pickle `GLOBAL`/`STACK_GLOBAL` references while preserving safe constructor imports and avoiding mislabeling executed call chains as import-only
-- **security:** fail closed on malformed `STACK_GLOBAL` operands when memo lookups are missing or operand types are non-string, while keeping simple truncation-only context informational
-- **security:** remove `builtins.hasattr` / `__builtin__.hasattr` from the pickle safe-global allowlist so attribute-access primitives stay flagged as dangerous builtins
-- **security:** harden pickle blocklist enforcement by removing `_pickle.Unpickler`/`_pickle.Pickler` from safe globals, adding `copyreg.add_extension`/`copyreg.remove_extension` to suspicious globals, and limiting functools warning downgrades to `partial`/`partialmethod` so `functools.reduce` findings stay CRITICAL
-- **security:** harden TensorFlow weight extraction limits to bound actual tensor payload materialization, including malformed `tensor_content` and string-backed tensors, and continue scanning past oversized `Const` nodes
-- **security:** stream TAR members to temp files under size limits instead of buffering whole entries in memory during scan
-- **security:** inspect TensorFlow SavedModel function definitions when scanning for dangerous ops and protobuf string abuse, with function-aware finding locations
-- **security:** route oversized TensorFlow MetaGraph files to fail-closed parse-budget scans, inspect `AttrValue.func.name` references in executable ops, and restore oversized-attribute anomaly detection after bounded string decoding
-- **cli:** include streamed artifacts as SBOM components when `scan --stream --sbom` is used
-- **cli:** exclude HuggingFace download cache bookkeeping files from remote SBOMs and asset lists
-- **cli:** add `--no-whitelist` and `--strict` whitelist/caching hardening so CI scans can disable HF severity downgrades and force uncached analysis
-- **security:** require official or explicitly allowlisted JFrog hosts before treating `/artifactory/` URLs as authenticated JFrog endpoints
-- **security:** detect CVE-2024-5480 PyTorch torch.distributed.rpc arbitrary function execution via PythonUDF (CVSS 10.0)
-- **security:** detect CVE-2024-48063 PyTorch torch.distributed.rpc.RemoteModule deserialization RCE via pickle (CVSS 9.8)
-- **security:** detect CVE-2019-6446 in NumPy scanner when object-dtype arrays are found, with informational attribution (CVSS 9.8) due to potential pickle deserialization via `allow_pickle=True`
-- **security:** new NeMo scanner detecting CVE-2025-23304 Hydra `_target_` injection in `.nemo` model files (CVSS 7.6), with recursive config inspection and dangerous callable blocklist
-- **security:** detect CVE-2025-51480 ONNX `save_external_data` arbitrary file overwrite via external_data path traversal (CVSS 8.8)
-- **security:** detect CVE-2025-49655 TorchModuleWrapper deserialization RCE (CVSS 9.8).
-- **security:** add CatBoost `.cbm` scanner with strict `CBM1` format validation, bounded parsing, and suspicious command/network/script indicator checks
-- **security:** add dedicated scanner support for R serialized artifacts (`.rds`, `.rda`, `.rdata`) with bounded decompression and static detection of executable symbol/payload indicators
-- **security:** add CNTK `.dnn`/`.cmf` scanner with strict signature validation, bounded reads, and multi-signal suspicious content correlation
-- **feat:** add standalone compressed-wrapper scanner support for `.gz`, `.bz2`, `.xz`, `.lz4`, and `.zlib` with strict signature validation, decompression size/ratio safeguards, and inner-payload scanner routing
-- **security:** add RKNN `.rknn` scanner with strict `RKNN` signature detection, bounded metadata parsing, and contextual command/network/obfuscation checks
-- **security:** add Torch7 (`.t7`, `.th`, `.net`) scanner with strict signature heuristics plus Lua execution primitive and dynamic module-loading detection
-- **security:** add native LightGBM scanner for `.lgb`/`.lightgbm` and signature-validated `.model` artifacts with strict XGBoost collision disambiguation and static command/network/path indicator checks
-- **feat:** add Llamafile executable scanner with bounded runtime-string analysis and embedded GGUF payload carving/forwarding
-- **feat:** add CoreML `.mlmodel` scanner with strict protobuf structure validation, custom layer/custom model detection, metadata abuse checks, and linked-model path safety checks
-- **feat:** add MXNet scanner support for paired `*-symbol.json` and `*-NNNN.params` artifacts with strict contract validation, companion-file checks, and suspicious reference/payload detection
-- **security:** add TensorFlow MetaGraph (`.meta`) scanner support with strict protobuf `can_handle()`, bounded MetaGraph parsing, unsafe op detection (`PyFunc`/`PyCall`/`LoadLibrary`), executable-context string checks, and payload-stuffing anomaly controls
-- **security:** add dedicated TorchServe `.mar` scanner with strict archive validation, bounded manifest/member reads, manifest policy checks, and recursive embedded payload scanning
-- **security:** detect CVE-2025-1716 pickle bypass via `pip.main()` as dangerous callable (CVSS 9.8)
-- **keras:** detect CVE-2025-9906 `enable_unsafe_deserialization` config bypass in `.keras` archives (CVSS 8.6, safe_mode bypass)
-- **security:** detect CVE-2025-8747 Keras get_file gadget safe_mode bypass
-- **keras:** detect CVE-2025-9905 H5 safe_mode bypass for Lambda layers (CVSS 7.3)
-- **keras:** add CVE-2024-3660 attribution to Lambda layer detection in .keras and .h5 scanners (CVSS 9.8)
-- **keras:** recursively inspect H5 `training_config` and `.keras` `compile_config` for custom losses and metrics, while allowlisting standard aliases and built-in preprocessing layers to reduce false positives
-- **security:** detect CVE-2025-10155 pickle protocol 0/1 payloads disguised as `.bin` files by extending `detect_file_format()` to recognize GLOBAL opcode patterns and adding `posix`/`nt` internal module names to binary code pattern blocklist
-- **security:** detect CVE-2022-25882 ONNX external_data path traversal with CVE attribution, CVSS score, and CWE classification in scan results
-- **security:** detect CVE-2024-27318 ONNX nested external_data path traversal bypass via path segment sanitization evasion
-- **security:** restore ZIP scanner fallback for invalid `.mar` archives so malicious ZIP payloads renamed to `.mar` cannot bypass archive checks
-- **security:** flag risky import-only pickle references for `torch.jit`, `torch._dynamo`, `torch._inductor`, `torch.compile`, `torch.storage._load_from_bytes`, `numpy.f2py`, and `numpy.distutils` while preserving safe state-dict reconstruction paths
-- **security:** add low-severity pickle structural tamper findings for duplicate or misplaced `PROTO` opcodes while avoiding benign binary-tail false positives
-- **security:** stop treating mixed-case valid pickle module names as implausible, so import and reduce checks no longer bypass on names like `PIL` or attacker-chosen `EvilPkg`
-- **security:** scan OCI layer members based on registered file extensions so embedded ONNX, Keras H5, and other real-path scanners are no longer skipped inside tar layers
-- **security:** resolve bare-module TorchServe handler references like `custom_handler` to concrete archive members so malicious handler source is no longer skipped by static analysis
-- **security:** compare archive entry paths against the intended extraction root without following base-directory symlinks
-- **security:** stop loading `.env` files implicitly during JFrog helper import so untrusted working directories cannot rewrite proxy or auth-related environment variables
-- **rules:** preserve `rule_code` metadata through direct result aggregation and ensure dangerous advanced pickle globals emit explicit rule codes (with regression coverage)
-- **rules:** ignore unknown rule IDs in config files with warning logs, normalize rule-code casing in config parsing, and prevent invalid severity entries from being applied
-- **security:** harden shared auth config storage and archive path sanitization to avoid insecure temp fallbacks, symlink overwrite abuse, and temp-root symlink traversal bypasses
-- **security:** stop archive path sanitization from resolving attacker-controlled extraction-root symlinks, preventing symlinked temp directories from weakening traversal checks
-- **telemetry:** refresh the cached telemetry client when runtime context changes and lazily initialize PostHog when telemetry is re-enabled in-process
-- **tests:** add scanner literal `rule_code` registry-consistency coverage to catch unknown rule identifiers early
-- **cloud:** harden cache path handling to prevent sibling-prefix bypasses from escaping cache boundaries, avoid deleting out-of-cache metadata paths during cleanup, and clean temporary cloud download directories on failure
-- **tests:** unskip and restore cloud disk-space failure coverage; add regressions for cache boundary enforcement and temp-directory cleanup on download errors
-- **security**: harden pickle scanner stack resolution to correctly track `STACK_GLOBAL` and memoized `REDUCE` call targets, preventing decoy-string and `BINGET` bypasses
-- **security**: flag pickle `EXT1`/`EXT2`/`EXT4` extension-registry call targets in `REDUCE` analysis to close EXT opcode bypasses
-- **security**: detect protocol 0/1 ASCII pickle signatures in generic file-format detection to prevent ZIP entry extension bypasses (e.g., malicious `payload.txt`)
-- **security**: harden protocol 0/1 pickle format detection with bounded opcode parsing to catch prefixed payloads (e.g., `MARK/LIST` before `GLOBAL`) while reducing plain-text false positives in ZIP entry scanning
-- **security**: keep opcode-level pickle analysis active when malformed streams trigger unicode/text parse errors after partial opcode extraction
-- **security**: tighten safetensors magic-byte detection to require valid framed headers, preventing JSON and protocol 0 pickle misrouting
-- **security:** analyze all Python files in TorchServe `.mar` archives (including non-handler modules and `__init__.py`) for risky calls, import-time execution, and handler-to-utility import relationships
-
-### Security
-
-- **keras:** detect CVE-2025-1550 arbitrary module references in `.keras` config.json (CVSS 9.8, safe_mode bypass)
-- **security**: treat `joblib.load` as always dangerous and remove it from pickle ML allowlist to block loader trampoline bypasses
-- **security**: tighten manifest trusted-domain matching to validate URL hostnames instead of substring matches
-- **security**: make `.keras` suspicious file extension checks case-insensitive to catch uppercase executable/script payloads
-- **security**: block unsafe in-process `torch.load` in `WeightDistributionScanner` by default unless explicitly opted in
-- **fix**: tighten metadata scanner suspicious URL matching to use exact hostname/subdomain checks and add focused regression coverage
-- **fix**: treat `.nemo` files as tar-compatible during file-type validation to avoid false extension/magic mismatch alerts
-- **fix**: pass XGBoost load-test file paths via subprocess argv instead of interpolating shell-quoted paths into `python -c`, preventing backslash escape corruption on Windows-style paths
-- **security**: reject absolute OCI layer references so `.manifest` files cannot scan host tarballs outside the OCI layout
-
-### Documentation
-
-- update README and user docs for the `modelaudit metadata` command, metadata safety guidance (`--trust-loaders`), and new NeMo format coverage
-- align maintainer/agent docs with current architecture and release workflow (metadata extractor component, dependency extras, and release-please + changelog guidance)
 
 ## [0.2.28](https://github.com/promptfoo/modelaudit/compare/v0.2.27...v0.2.28) (2026-03-20)
 
@@ -1263,7 +1278,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.28...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.37...HEAD
 [0.2.25]: https://github.com/promptfoo/modelaudit/compare/v0.2.24...v0.2.25
 [0.2.24]: https://github.com/promptfoo/modelaudit/compare/v0.2.23...v0.2.24
 [0.2.23]: https://github.com/promptfoo/modelaudit/compare/v0.2.22...v0.2.23

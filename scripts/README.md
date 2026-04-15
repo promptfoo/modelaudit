@@ -20,16 +20,6 @@ Utilities for fetching model metadata from HuggingFace for testing and validatio
 
 Demonstrates JAX/Flax model scanning capabilities including Msgpack-based checkpoints, Orbax format, and JAX-specific threat detection.
 
-### `compare_pickle_scanners.py`
-
-Differential harness for comparing the legacy in-repo `PickleScanner` against the
-standalone `modelaudit-picklescan` package on committed pickle fixtures. The
-harness uses a pure legacy baseline (without package-result merging) and prints
-label-aware drift summaries so safe-fixture false-positive regressions are easy
-to spot. Use `--json` for a machine-readable report. Add `--include-root` to
-compare the actual root scanner result, or `--root-standalone-primary` to audit
-the opt-in standalone-primary migration mode.
-
 ## Development Use Only
 
 These scripts are intended for development, testing, and research purposes. They should not be used in production environments.

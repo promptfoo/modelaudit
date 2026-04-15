@@ -1,343 +1,67 @@
-"""Comprehensive tests for enhanced dill/joblib support."""
+"""Rust-backed dill/joblib pickle scanner regressions."""
 
+from __future__ import annotations
+
+import os
 import pickle
-import struct
-import time
 from pathlib import Path
-from unittest.mock import patch
-
-import pytest
+from typing import Any
 
 from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.pickle_scanner import (
-    ML_SAFE_GLOBALS,
-    PickleScanner,
-    _is_legitimate_serialization_file,
-)
+from modelaudit.scanners.pickle_scanner import ML_SAFE_GLOBALS, PickleScanner, _is_legitimate_serialization_file
+
+
+class MaliciousPayload:
+    def __reduce__(self) -> tuple[Any, tuple[str]]:
+        return (os.system, ("id",))
 
 
 def _write_joblib_like_pickle(path: Path, *, padding: int = 0) -> None:
-    """Write a minimal pickle stream with opcode-level joblib evidence."""
     path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00." + b"\x00" * padding)
 
 
-class TestDillJoblibSecurity:
-    """Security-focused tests for dill/joblib support."""
+def test_malicious_joblib_extension_cannot_bypass_rust_scan(tmp_path: Path) -> None:
+    malicious_file = tmp_path / "evil.joblib"
+    malicious_file.write_bytes(pickle.dumps(MaliciousPayload(), protocol=4))
 
-    def test_security_bypass_prevention_malicious_joblib_extension(self, tmp_path):
-        """Ensure malicious pickle files can't bypass security via .joblib extension."""
-        # Create a malicious pickle with dangerous imports
-        malicious_file = tmp_path / "evil.joblib"
+    result = PickleScanner().scan(str(malicious_file))
 
-        # Create a pickle file that contains os.system reference but no joblib markers
-        with open(malicious_file, "wb") as f:
-            f.write(b"\x80\x03")  # Pickle protocol 3
-            # Create a pickle that references os.system directly
-            f.write(b"cos\nsystem\n")  # os.system global reference
-            f.write(
-                b"q\x00X\x04\x00\x00\x00testq\x01\x85q\x02Rq\x03.",
-            )  # Call with "test" arg
+    assert result.success is True
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert _is_legitimate_serialization_file(str(malicious_file)) is False
 
-        scanner = PickleScanner()
-        result = scanner.scan(str(malicious_file))
 
-        # Should detect as suspicious since it's not a real joblib file
-        # and contains dangerous references
-        assert len(result.issues) > 0
+def test_malicious_dill_extension_cannot_bypass_rust_scan(tmp_path: Path) -> None:
+    malicious_file = tmp_path / "evil.dill"
+    malicious_file.write_bytes(pickle.dumps(MaliciousPayload(), protocol=4))
 
-        # Should find the os.system reference
-        os_issues = [i for i in result.issues if "os" in str(i.message).lower()]
-        assert len(os_issues) > 0
+    result = PickleScanner().scan(str(malicious_file))
 
-    def test_security_bypass_prevention_malicious_dill_extension(self, tmp_path):
-        """Ensure malicious pickle files can't bypass security via .dill extension."""
-        malicious_file = tmp_path / "evil.dill"
+    assert result.success is True
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
-        # Create a suspicious pickle that would normally trigger alerts
-        with open(malicious_file, "wb") as f:
-            f.write(b"\x80\x03")  # Pickle protocol 3
-            f.write(b"cos\nsystem\n")  # os.system reference
-            f.write(b"q\x00.")  # STOP
 
-        # Validation should fail since this doesn't look like real dill
-        is_valid = _is_legitimate_serialization_file(str(malicious_file))
-        assert is_valid is False
+def test_joblib_policy_export_remains_narrow() -> None:
+    assert "joblib" not in ML_SAFE_GLOBALS
+    assert "dill" not in ML_SAFE_GLOBALS
 
-        # But scanner should still detect the suspicious content
-        scanner = PickleScanner()
-        result = scanner.scan(str(malicious_file))
 
-        # Should find security issues regardless of extension
-        assert len(result.issues) > 0
+def test_legitimate_joblib_like_pickle_is_accepted(tmp_path: Path) -> None:
+    joblib_file = tmp_path / "numpy_arrays.joblib"
+    _write_joblib_like_pickle(joblib_file, padding=16)
 
-    def test_specific_function_allowlists_not_wildcards(self):
-        """Ensure dill and joblib don't have dangerous wildcard permissions."""
-        joblib_perms = ML_SAFE_GLOBALS.get("joblib", [])
-        dill_perms = ML_SAFE_GLOBALS.get("dill", [])
+    result = PickleScanner().scan(str(joblib_file))
 
-        # Should not have wildcard permissions
-        assert joblib_perms != ["*"]
-        assert dill_perms != ["*"]
+    assert _is_legitimate_serialization_file(str(joblib_file)) is True
+    assert not [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}]
 
-        # Should have specific safe functions
-        assert "dump" in joblib_perms
-        # joblib.load is explicitly treated as dangerous (loader trampoline bypass)
-        assert "load" not in joblib_perms
-        assert "dump" in dill_perms
-        # dill.load/dill.loads recursively deserialize and are intentionally blocked
-        assert "load" not in dill_perms
-        assert "loads" not in dill_perms
 
-        # Should not have dangerous functions if they exist
-        dangerous_funcs = ["eval", "exec", "compile", "__import__"]
-        for func in dangerous_funcs:
-            assert func not in joblib_perms
-            assert func not in dill_perms
+def test_legitimate_serialization_file_rejects_empty_text_and_missing_paths(tmp_path: Path) -> None:
+    empty_file = tmp_path / "empty.joblib"
+    empty_file.write_bytes(b"")
+    text_file = tmp_path / "text.joblib"
+    text_file.write_text("not a pickle", encoding="utf-8")
 
-
-class TestFileValidation:
-    """Tests for the file format validation logic."""
-
-    def test_legitimate_joblib_file_validation(self, tmp_path):
-        """Test validation of legitimate joblib files."""
-        joblib_file = tmp_path / "model.joblib"
-        _write_joblib_like_pickle(joblib_file)
-
-        is_valid = _is_legitimate_serialization_file(str(joblib_file))
-        assert is_valid is True
-
-    def test_legitimate_dill_file_validation(self, tmp_path):
-        """Test validation of legitimate dill files."""
-        dill_file = tmp_path / "object.dill"
-
-        # Create basic pickle file (dill uses pickle format)
-        with open(dill_file, "wb") as f:
-            f.write(b"\x80\x03")  # Pickle protocol 3
-            pickle.dump({"complex": "object"}, f)
-
-        is_valid = _is_legitimate_serialization_file(str(dill_file))
-        assert is_valid is True
-
-    def test_invalid_file_validation(self, tmp_path):
-        """Test validation rejects invalid files."""
-        # Empty file
-        empty_file = tmp_path / "empty.joblib"
-        empty_file.touch()
-        assert _is_legitimate_serialization_file(str(empty_file)) is False
-
-        # Non-pickle file
-        text_file = tmp_path / "text.joblib"
-        text_file.write_text("this is not pickle")
-        assert _is_legitimate_serialization_file(str(text_file)) is False
-
-        # File that doesn't exist
-        assert _is_legitimate_serialization_file("nonexistent.joblib") is False
-
-    def test_joblib_file_without_markers(self, tmp_path):
-        """Test joblib file without proper markers fails validation."""
-        fake_joblib = tmp_path / "fake.joblib"
-
-        # Valid pickle but no joblib markers
-        with open(fake_joblib, "wb") as f:
-            pickle.dump({"data": "no markers"}, f)
-
-        is_valid = _is_legitimate_serialization_file(str(fake_joblib))
-        assert is_valid is False
-
-
-class TestErrorHandling:
-    """Tests for improved error handling."""
-
-    def test_non_benign_errors_still_reported(self, tmp_path):
-        """Test that non-benign errors are still reported as warnings."""
-        suspicious_file = tmp_path / "suspicious.pkl"  # Note: .pkl extension
-
-        with open(suspicious_file, "wb") as f:
-            f.write(b"invalid pickle data")
-
-        scanner = PickleScanner()
-
-        # Mock to raise a different type of error
-        with patch(
-            "modelaudit.scanners.pickle_scanner.pickletools.genops",
-        ) as mock_genops:
-            mock_genops.side_effect = RuntimeError("unexpected error")
-
-            result = scanner.scan(str(suspicious_file))
-
-            # Should be treated as warning (not benign, but not necessarily critical)
-            warning_issues = [i for i in result.issues if i.severity == IssueSeverity.WARNING]
-            assert len(warning_issues) > 0
-            assert not result.metadata.get("truncated", False)
-
-            # Find the issue related to the runtime error
-            runtime_issue = next(
-                (i for i in warning_issues if "RuntimeError" in i.details.get("exception_type", "")),
-                None,
-            )
-            assert runtime_issue is not None
-
-    def test_logging_for_truncated_scans(self, tmp_path, caplog):
-        """Test that error scans are properly handled and logged."""
-        import logging
-
-        caplog.set_level(logging.WARNING)
-
-        joblib_file = tmp_path / "logged.joblib"
-        _write_joblib_like_pickle(joblib_file)
-
-        scanner = PickleScanner()
-
-        with patch(
-            "modelaudit.scanners.pickle_scanner.pickletools.genops",
-        ) as mock_genops:
-            mock_genops.side_effect = struct.error("unpack requires more data")
-
-            result = scanner.scan(str(joblib_file))
-
-            # Should have handled the error gracefully - either through:
-            # 1. Benign error handling with truncation metadata/logging, OR
-            # 2. Critical error handling with issues reported
-
-            # Check for any form of error handling
-            has_issues = len(result.issues) > 0
-            has_truncation_metadata = result.metadata.get("truncated") is True
-            has_logged_messages = len(caplog.records) > 0
-
-            # Should have at least one form of error handling
-            assert has_issues or has_truncation_metadata or has_logged_messages, (
-                "Should have some form of error handling (issues, truncation, or logging)"
-            )
-
-
-class TestPerformanceAndEdgeCases:
-    """Performance and edge case tests."""
-
-    def test_large_file_validation_performance(self, tmp_path):
-        """Test that file validation is performant on large files."""
-        large_file = tmp_path / "large.joblib"
-        _write_joblib_like_pickle(large_file, padding=10000)
-
-        start_time = time.perf_counter()
-        is_valid = _is_legitimate_serialization_file(str(large_file))
-        duration = time.perf_counter() - start_time
-
-        # Should complete quickly on a bounded prefix scan.
-        assert duration < 0.01
-        assert is_valid is True
-
-    def test_concurrent_scanning_safety(self, tmp_path):
-        """Test that scanner is safe for concurrent use."""
-        files = []
-        for i in range(5):
-            file_path = tmp_path / f"test_{i}.joblib"
-            with open(file_path, "wb") as f:
-                f.write(b"joblib")
-                pickle.dump({"id": i}, f)
-            files.append(str(file_path))
-
-        # Create multiple scanner instances (simulating concurrent use)
-        scanners = [PickleScanner() for _ in range(5)]
-
-        # Scan files concurrently (simulated)
-        results = []
-        for scanner, file_path in zip(scanners, files, strict=False):
-            result = scanner.scan(file_path)
-            results.append(result)
-
-        # All should succeed
-        assert all(result.success for result in results)
-
-    def test_edge_case_empty_file(self, tmp_path):
-        """Test handling of empty files."""
-        empty_file = tmp_path / "empty.joblib"
-        empty_file.touch()
-
-        scanner = PickleScanner()
-        result = scanner.scan(str(empty_file))
-
-        # Should handle gracefully - empty files will fail pickle parsing
-        # but success depends on how the scanner handles the error
-        assert len(result.issues) > 0  # Should report issues with empty file
-        # Check that it reported a pickle parsing error
-        assert any("pickle" in str(issue.message).lower() for issue in result.issues)
-
-    def test_edge_case_very_small_file(self, tmp_path):
-        """Test handling of very small files."""
-        tiny_file = tmp_path / "tiny.joblib"
-        tiny_file.write_bytes(b"hi")
-
-        scanner = PickleScanner()
-        result = scanner.scan(str(tiny_file))
-
-        # Should handle gracefully without crashing
-        assert isinstance(result.success, bool)
-
-
-class TestIntegration:
-    """Integration tests with real-world scenarios."""
-
-    def test_backward_compatibility(self, tmp_path):
-        """Test that regular pickle scanning still works unchanged."""
-        regular_pickle = tmp_path / "regular.pkl"
-
-        with open(regular_pickle, "wb") as f:
-            pickle.dump({"normal": "data"}, f)
-
-        scanner = PickleScanner()
-        result = scanner.scan(str(regular_pickle))
-
-        # Should work normally
-        assert result.success is True
-        assert len([i for i in result.issues if i.severity == IssueSeverity.CRITICAL]) == 0
-
-    def test_existing_dill_fixture_still_scans_without_crash(self) -> None:
-        """Real-world dill fixture should still scan and produce stable findings."""
-        fixture = Path(__file__).parent / "assets" / "samples" / "pickles" / "dill_func.pkl"
-
-        result = PickleScanner().scan(str(fixture))
-
-        assert result.success is True
-        assert any("dill._dill" in issue.message for issue in result.issues)
-
-    def test_multiple_exception_types_handling(self, tmp_path):
-        """Test handling of different exception types."""
-        test_file = tmp_path / "multi.joblib"
-        _write_joblib_like_pickle(test_file)
-
-        scanner = PickleScanner()
-
-        # Test ValueError with keywords that should trigger benign handling
-        with patch(
-            "modelaudit.scanners.pickle_scanner.pickletools.genops",
-        ) as mock_genops:
-            mock_genops.side_effect = ValueError("unknown opcode at position 10")
-            result = scanner.scan(str(test_file))
-            # Should trigger benign error handling if file validates as legitimate
-            # Check that we got some result (behavior may vary based on validation)
-            assert isinstance(result.success, bool)
-
-        # Test struct.error
-        with patch(
-            "modelaudit.scanners.pickle_scanner.pickletools.genops",
-        ) as mock_genops:
-            mock_genops.side_effect = struct.error("unpack requires at least 4 bytes")
-            result = scanner.scan(str(test_file))
-            # Similar check
-            assert isinstance(result.success, bool)
-
-        # Test non-benign error
-        with patch(
-            "modelaudit.scanners.pickle_scanner.pickletools.genops",
-        ) as mock_genops:
-            mock_genops.side_effect = KeyError("unexpected error type")
-            result = scanner.scan(str(test_file))
-            # Non-benign errors should definitely create issues
-            assert len(result.issues) > 0
-            # Should be warning error since KeyError is not in benign list but also not necessarily critical
-            warning_issues = [i for i in result.issues if i.severity == IssueSeverity.WARNING]
-            assert len(warning_issues) > 0
-
-
-if __name__ == "__main__":
-    pytest.main([__file__])
+    assert _is_legitimate_serialization_file(str(empty_file)) is False
+    assert _is_legitimate_serialization_file(str(text_file)) is False
+    assert _is_legitimate_serialization_file(str(tmp_path / "missing.joblib")) is False

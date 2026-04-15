@@ -1201,7 +1201,9 @@ def test_pytorch_zip_scanner_preserves_legacy_pickle_rule_codes_for_embedded_mem
 
     result = PyTorchZipScanner().scan(str(model_path))
 
-    assert any(issue.rule_code == "S104" for issue in result.issues)
+    assert any(
+        issue.rule_code == "S604" and "S104" in issue.details.get("legacy_rule_aliases", []) for issue in result.issues
+    )
 
 
 def test_pytorch_zip_scanner_trusts_storage_persistent_ids_in_data_pkl(tmp_path: Path) -> None:

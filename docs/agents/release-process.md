@@ -70,6 +70,9 @@ Before merging a release PR:
    - exactly one wheel + one sdist, both matching the release version
    - clean-room install smoke tests from wheel and sdist
    - project URL metadata checks (`Bug Tracker`, `Changelog`)
+   - standalone `modelaudit-picklescan` Rust gates pass: `cargo fmt`,
+     `cargo check`, `cargo clippy -D warnings`, `cargo test`, wheel build, and
+     clean-room wheel smoke test
 4. Confirm no unreviewed high-severity security findings are outstanding.
 5. Merge release PR, then verify GitHub Release and PyPI publish completed.
 

@@ -52,6 +52,12 @@ jobs:
         if: steps.check-pr.outputs.has_pr == 'true'
         uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
 
+      - name: Install Rust toolchain for standalone lock refresh
+        if: steps.check-pr.outputs.has_pr == 'true'
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Sync uv.lock with pyproject.toml
         if: steps.check-pr.outputs.has_pr == 'true'
         run: |
@@ -129,6 +135,11 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Sync dependencies
         run: uv sync --extra all-ci
 
@@ -147,6 +158,9 @@ jobs:
 
       - name: Build package
         run: uv build
+
+      - name: Build standalone pickle package for smoke installs
+        run: uv build packages/modelaudit-picklescan --out-dir /tmp/modelaudit-picklescan-dist
 
       - name: Verify distribution artifacts and version consistency
         run: |
@@ -250,7 +264,10 @@ jobs:
 
           uv venv /tmp/modelaudit-wheel-smoke
 
-          uv pip install --python /tmp/modelaudit-wheel-smoke/bin/python "${WHEEL_ARTIFACT}"
+          uv pip install \
+            --python /tmp/modelaudit-wheel-smoke/bin/python \
+            --find-links /tmp/modelaudit-picklescan-dist \
+            "${WHEEL_ARTIFACT}"
 
           INSTALLED_VERSION="$(
             /tmp/modelaudit-wheel-smoke/bin/python -c "import importlib.metadata as m; print(m.version('modelaudit'))"
@@ -336,7 +353,10 @@ jobs:
 
           uv venv /tmp/modelaudit-sdist-smoke
 
-          uv pip install --python /tmp/modelaudit-sdist-smoke/bin/python "${SDIST_ARTIFACT}"
+          uv pip install \
+            --python /tmp/modelaudit-sdist-smoke/bin/python \
+            --find-links /tmp/modelaudit-picklescan-dist \
+            "${SDIST_ARTIFACT}"
 
           INSTALLED_VERSION="$(
             /tmp/modelaudit-sdist-smoke/bin/python -c "import importlib.metadata as m; print(m.version('modelaudit'))"
@@ -389,12 +409,33 @@ jobs:
 
   build-picklescan-package:
     if: needs.release-please.outputs.release_created == 'true'
-    runs-on: ubuntu-latest
+    name: Build standalone pickle package (${{ matrix.artifact-suffix }})
+    runs-on: ${{ matrix.os }}
     needs: release-please
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact-suffix: linux
+            build-sdist: "true"
+          - os: macos-14
+            artifact-suffix: macos-arm64
+            build-sdist: "false"
+          - os: macos-15-intel
+            artifact-suffix: macos-x86_64
+            build-sdist: "false"
+          - os: ubuntu-24.04-arm
+            artifact-suffix: linux-aarch64
+            build-sdist: "false"
+          - os: windows-latest
+            artifact-suffix: windows
+            build-sdist: "false"
     defaults:
       run:
+        shell: bash
         working-directory: packages/modelaudit-picklescan
     steps:
       - uses: actions/checkout@v6
@@ -408,9 +449,38 @@ jobs:
         run: |
           uv python pin 3.12
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/modelaudit-picklescan/target
+          key: ${{ runner.os }}-cargo-picklescan-${{ hashFiles('packages/modelaudit-picklescan/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-picklescan-
+
       - name: Check standalone package lock is in sync
         run: |
           uv lock --check
+
+      - name: Check Rust scanner formatting
+        run: cargo fmt --manifest-path Cargo.toml -- --check
+
+      - name: Check Rust scanner crate
+        run: cargo check --manifest-path Cargo.toml
+
+      - name: Lint Rust scanner crate
+        run: cargo clippy --manifest-path Cargo.toml --all-targets -- -D warnings
+
+      - name: Test Rust scanner crate
+        run: |
+          cargo test --manifest-path Cargo.toml
 
       - name: Lint standalone package with Ruff
         run: uv run --with ruff ruff check src tests
@@ -424,8 +494,24 @@ jobs:
       - name: Run standalone package tests
         run: uv run --with pytest --with pytest-xdist pytest -n auto tests --tb=short
 
-      - name: Build standalone package
-        run: uv build --out-dir /tmp/modelaudit-picklescan-dist
+      - name: Build standalone package sdist
+        if: matrix.build-sdist == 'true'
+        run: |
+          uv build --sdist --out-dir /tmp/modelaudit-picklescan-dist
+
+      - name: Build standalone package manylinux wheel
+        if: runner.os == 'Linux'
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --wheel --out /tmp/modelaudit-picklescan-dist --compatibility manylinux_2_28
+          manylinux: "2_28"
+          working-directory: packages/modelaudit-picklescan
+
+      - name: Build standalone package wheel
+        if: runner.os != 'Linux'
+        run: |
+          uv build --wheel --out-dir /tmp/modelaudit-picklescan-dist
 
       - name: Validate standalone package metadata
         run: uvx twine check /tmp/modelaudit-picklescan-dist/*
@@ -454,12 +540,20 @@ jobs:
           import modelaudit_picklescan
 
           assert importlib.util.find_spec("modelaudit") is None
+          assert importlib.util.find_spec("modelaudit_picklescan._rust") is not None
           report = modelaudit_picklescan.scan_bytes(b"\x80\x04}q\x00.")
           assert report.status.value == "complete", report
           assert report.verdict.value == "clean", report
+          assert not any(notice.code == "engine_fallback" for notice in report.notices)
           print("standalone modelaudit_picklescan wheel loaded without modelaudit")
           PY
           )
+
+      - name: Upload standalone package artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: modelaudit-picklescan-dist-${{ matrix.artifact-suffix }}
+          path: /tmp/modelaudit-picklescan-dist/
 
   publish-pypi:
     if: needs.release-please.outputs.release_created == 'true'
@@ -477,6 +571,13 @@ jobs:
         with:
           name: dist
           path: dist/
+
+      - name: Download standalone pickle package artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: modelaudit-picklescan-dist-*
+          path: dist/
+          merge-multiple: true
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
@@ -509,6 +610,13 @@ jobs:
         with:
           name: dist
           path: dist/
+
+      - name: Download standalone pickle package artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: modelaudit-picklescan-dist-*
+          path: dist/
+          merge-multiple: true
 
       - name: Generate artifact attestations
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4

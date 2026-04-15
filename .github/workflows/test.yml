@@ -52,6 +52,8 @@ jobs:
             dependencies:
               - 'pyproject.toml'
               - 'uv.lock'
+              - 'packages/modelaudit-picklescan/pyproject.toml'
+              - 'packages/modelaudit-picklescan/uv.lock'
 
   lint:
     name: Lint and Format
@@ -72,6 +74,11 @@ jobs:
       - name: Pin Python version
         run: |
           uv python pin 3.12
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Cache Python dependencies
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
@@ -120,6 +127,11 @@ jobs:
         run: |
           uv python pin 3.12
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Sync dependencies
         run: |
           uv sync --extra all-ci
@@ -127,7 +139,19 @@ jobs:
       - name: Audit dependencies for vulnerabilities
         run: |
           # CVE-2026-4539 currently has no upstream Pygments fix release.
-          uvx pip-audit --strict --desc --ignore-vuln CVE-2026-4539 -r <(uv export --no-hashes --no-emit-project)
+          # pip-audit cannot audit unpublished editable path requirements, so
+          # the standalone Rust-backed pickle package is audited separately.
+          uv export --no-hashes --no-emit-project \
+            | sed -e '/^-e \.\/packages\/modelaudit-picklescan$/d' -e '/^modelaudit-picklescan==/d' \
+            > /tmp/modelaudit-audit-requirements.txt
+          uvx pip-audit --strict --desc --ignore-vuln CVE-2026-4539 -r /tmp/modelaudit-audit-requirements.txt
+          uv export --project packages/modelaudit-picklescan --no-hashes --no-emit-project \
+            > /tmp/modelaudit-picklescan-audit-requirements.txt
+          if grep -Eq '^[A-Za-z0-9_.-]' /tmp/modelaudit-picklescan-audit-requirements.txt; then
+            uvx pip-audit --strict --desc -r /tmp/modelaudit-picklescan-audit-requirements.txt
+          else
+            echo "Standalone picklescan package has no Python dependencies to audit."
+          fi
 
   license-check:
     name: License Compliance
@@ -147,6 +171,11 @@ jobs:
       - name: Pin Python version
         run: |
           uv python pin 3.12
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Sync dependencies
         run: |
@@ -289,6 +318,11 @@ jobs:
         run: |
           uv lock --check
 
+      - name: Check standalone picklescan uv.lock is in sync
+        working-directory: packages/modelaudit-picklescan
+        run: |
+          uv lock --check
+
   type-check:
     name: Type Check
     needs: changes
@@ -308,6 +342,11 @@ jobs:
       - name: Pin Python version
         run: |
           uv python pin 3.12
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Cache Python dependencies
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
@@ -355,6 +394,11 @@ jobs:
         run: |
           uv python pin 3.12
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Cache Python dependencies
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
@@ -392,6 +436,11 @@ jobs:
         run: |
           uv python pin 3.11
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Sync dependencies
         run: |
           uv sync --extra all-ci-windows
@@ -426,6 +475,11 @@ jobs:
       - name: Pin Python version
         run: |
           uv python pin ${{ matrix.python-version }}
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Cache Python dependencies
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
@@ -517,6 +571,11 @@ jobs:
         run: |
           uv python pin ${{ matrix.python-version }}
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Cache Python dependencies
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
         with:
@@ -577,6 +636,11 @@ jobs:
       - name: Pin Python version
         run: |
           uv python pin 3.12
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Install WITHOUT TensorFlow
         run: |
@@ -697,6 +761,11 @@ jobs:
         run: |
           uv python pin 3.12
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
       - name: Install with ${{ matrix.extra }} extra
         run: |
           uv sync --extra ${{ matrix.extra }}
@@ -719,7 +788,7 @@ jobs:
     # Always build on main, otherwise only if Python/dependency/workflow files changed
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.python == 'true' || needs.changes.outputs.dependencies == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Checkout repo
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -732,6 +801,11 @@ jobs:
       - name: Pin Python version
         run: |
           uv python pin 3.12
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Cache Python dependencies
         uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
@@ -749,6 +823,10 @@ jobs:
         run: |
           uv sync --extra all-ci
 
+      - name: Build standalone pickle package
+        run: |
+          uv build packages/modelaudit-picklescan --out-dir /tmp/modelaudit-picklescan-dist
+
       - name: Build package
         run: |
           uv build
@@ -762,15 +840,21 @@ jobs:
           set -euo pipefail
           uv venv /tmp/modelaudit-wheel-smoke
 
-          uv pip install --python /tmp/modelaudit-wheel-smoke/bin/python dist/modelaudit-*.whl
+          uv pip install \
+            --python /tmp/modelaudit-wheel-smoke/bin/python \
+            --find-links /tmp/modelaudit-picklescan-dist \
+            dist/modelaudit-*.whl
 
           smoke_dir="$(mktemp -d)"
           (
             cd "$smoke_dir"
             PYTHONPATH= /tmp/modelaudit-wheel-smoke/bin/python -I - <<'PY'
+          import importlib.util
+
           import modelaudit
           import modelaudit_picklescan
 
+          assert importlib.util.find_spec("modelaudit_picklescan._rust") is not None
           report = modelaudit_picklescan.scan_bytes(b"\x80\x04}q\x00.")
           assert report.status.value == "complete", report
           print(f"modelaudit {modelaudit.__version__} and modelaudit_picklescan loaded")
@@ -784,11 +868,15 @@ jobs:
           path: dist/
 
   picklescan-package:
-    name: Standalone Pickle Package
+    name: Standalone Pickle Package (${{ matrix.python-version }})
     needs: changes
     if: github.ref == 'refs/heads/main' || needs.changes.outputs.picklescan == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     defaults:
       run:
         working-directory: packages/modelaudit-picklescan
@@ -803,11 +891,49 @@ jobs:
 
       - name: Pin Python version
         run: |
-          uv python pin 3.12
+          uv python pin ${{ matrix.python-version }}
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.74.0 --profile minimal
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/modelaudit-picklescan/target
+          key: ${{ runner.os }}-cargo-picklescan-${{ hashFiles('packages/modelaudit-picklescan/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-picklescan-
 
       - name: Check standalone package lock is in sync
         run: |
           uv lock --check
+
+      - name: Check Rust scanner formatting
+        run: |
+          cargo fmt --manifest-path Cargo.toml -- --check
+
+      - name: Check Rust scanner crate
+        run: |
+          cargo check --manifest-path Cargo.toml
+
+      - name: Check Rust scanner MSRV
+        run: |
+          rustup toolchain install 1.74.0 --profile minimal
+          cargo +1.74.0 check --manifest-path Cargo.toml --locked
+
+      - name: Lint Rust scanner crate
+        run: |
+          cargo clippy --manifest-path Cargo.toml --all-targets -- -D warnings
+
+      - name: Test Rust scanner crate
+        run: |
+          cargo test --manifest-path Cargo.toml
 
       - name: Lint standalone package with Ruff
         run: |
@@ -861,9 +987,11 @@ jobs:
           import modelaudit_picklescan
 
           assert importlib.util.find_spec("modelaudit") is None
+          assert importlib.util.find_spec("modelaudit_picklescan._rust") is not None
           report = modelaudit_picklescan.scan_bytes(b"\x80\x04}q\x00.")
           assert report.status.value == "complete", report
           assert report.verdict.value == "clean", report
+          assert not any(notice.code == "engine_fallback" for notice in report.notices)
           print("standalone modelaudit_picklescan wheel loaded without modelaudit")
           PY
           )

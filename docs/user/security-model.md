@@ -40,6 +40,14 @@ ModelAudit is a static security scanner for model artifacts. It analyzes files a
 - `WARNING`: Potential risk. Require manual review.
 - `INFO`: Context signal. Useful for triage and audit trails.
 
+For dashboards and aggregate corpus scans, filter security-alert views to
+`WARNING` and `CRITICAL` findings by default. INFO rows may include benign
+explainability notices, budget notes, or structural context; group them by code
+or keep them in an audit/detail view rather than counting each row as a blocker.
+Some compatibility findings intentionally include a secondary rule-code row for
+legacy dashboards; these rows carry `supporting_rule_code=true` in details and
+should be excluded from primary issue counts when de-duplicating.
+
 Exit codes:
 
 - `0`: No issues found

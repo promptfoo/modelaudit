@@ -6,6 +6,7 @@ on:
       - "Dockerfile*"
       - ".dockerignore"
       - "modelaudit/**"
+      - "packages/modelaudit-picklescan/**"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/docker-image-test.yml"
@@ -36,10 +37,12 @@ jobs:
               - 'Dockerfile*'
               - '.dockerignore'
               - 'modelaudit/**'
+              - 'packages/modelaudit-picklescan/**'
               - 'pyproject.toml'
               - 'uv.lock'
             full-image:
               - 'Dockerfile.full'
+              - 'packages/modelaudit-picklescan/**'
 
   build-test-lightweight:
     name: Build and Test Lightweight Docker Image

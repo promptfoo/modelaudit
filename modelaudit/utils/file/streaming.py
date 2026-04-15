@@ -125,7 +125,6 @@ def stream_analyze_file(
                 ("scan_stream", True),
                 ("scan_bytes", False),
                 ("scan_fileobj", False),
-                ("_scan_pickle_bytes", True),
             ]
             for method_name, needs_size in partial_methods:
                 if hasattr(scanner, method_name):
