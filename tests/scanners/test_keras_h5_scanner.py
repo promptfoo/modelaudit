@@ -1484,6 +1484,30 @@ class TestCVE20259905H5SafeMode:
         assert len(cve_issues) >= 1, "Lambda in H5 should trigger CVE-2025-9905"
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
 
+    def test_fully_qualified_lambda_layer_triggers_cve_2025_9905(self, tmp_path: Path) -> None:
+        """Serialized fully-qualified Lambda class names should not bypass H5 Lambda checks."""
+        h5_path = tmp_path / "qualified_lambda.h5"
+        with h5py.File(h5_path, "w") as f:
+            model_config = {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "test",
+                    "layers": [
+                        {
+                            "class_name": "keras.layers.Lambda",
+                            "config": {"function": "lambda x: x * 2"},
+                        }
+                    ],
+                },
+            }
+            f.attrs["model_config"] = json.dumps(model_config)
+            f.attrs["keras_version"] = "3.11.2"
+
+        result = KerasH5Scanner().scan(str(h5_path))
+
+        cve_issues = [i for i in result.issues if "CVE-2025-9905" in i.message]
+        assert len(cve_issues) >= 1
+
     def test_cve_attribution_details(self, tmp_path: Path) -> None:
         """CVE details should be present in issue details."""
         h5_path = tmp_path / "model.h5"

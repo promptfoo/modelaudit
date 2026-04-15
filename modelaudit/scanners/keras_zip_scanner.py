@@ -1418,6 +1418,7 @@ class KerasZipScanner(BaseScanner):
 
         if weights_info.file_size > self.max_embedded_weights_bytes:
             weights_entry = weights_info.filename
+            self._mark_inconclusive_scan_result(result, "keras_zip_embedded_weights_too_large")
             result.add_check(
                 name="Embedded Weights Size Limit",
                 passed=False,
@@ -1464,6 +1465,7 @@ class KerasZipScanner(BaseScanner):
                 findings = self._collect_hdf5_external_references(h5_file)
         except _EmbeddedWeightsLimitExceeded as exc:
             weights_entry = weights_info.filename
+            self._mark_inconclusive_scan_result(result, "keras_zip_embedded_weights_too_large")
             result.add_check(
                 name="Embedded Weights Size Limit",
                 passed=False,
@@ -1607,12 +1609,12 @@ class KerasZipScanner(BaseScanner):
         """Heuristically detect documentation-only nodes to reduce false positives."""
         context_lower = context.lower()
         doc_markers = (".description", ".doc", ".docs", ".comment", ".comments", ".notes", ".help", ".readme")
-        if any(marker in context_lower for marker in doc_markers):
-            return True
-
         lowered_keys = {str(key).lower() for key in node}
         doc_keys = {"description", "doc", "docs", "comment", "comments", "notes", "help", "readme", "citation"}
         execution_keys = {"fn", "function", "module", "url", "args", "kwargs", "class_name", "callable"}
+        if any(marker in context_lower for marker in doc_markers):
+            return lowered_keys.isdisjoint(execution_keys)
+
         return bool(lowered_keys) and lowered_keys.issubset(doc_keys) and lowered_keys.isdisjoint(execution_keys)
 
     @staticmethod
