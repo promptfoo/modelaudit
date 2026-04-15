@@ -3,6 +3,7 @@ Tests to ensure telemetry is properly decoupled from core functionality.
 """
 # ruff: noqa: SIM117
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -11,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from modelaudit.telemetry import (
+    TelemetryClient,
     TelemetryEvent,
     disable_telemetry,
     enable_telemetry,
@@ -250,6 +252,75 @@ class TestTelemetryFunctionalityWhenWorking:
             result = "executed successfully"
 
         assert result == "executed successfully"
+
+    def test_record_issue_found_uses_stable_redacted_issue_type(self, tmp_path: Path) -> None:
+        """Issue telemetry should not copy free-form scanner messages into analytics fields."""
+        client = TelemetryClient()
+        captured: dict[str, object] = {}
+
+        def capture_event(event: TelemetryEvent, properties: dict[str, object] | None = None) -> None:
+            captured["event"] = event
+            captured["properties"] = properties or {}
+
+        client.record_event = capture_event  # type: ignore[method-assign]
+        sensitive_path = tmp_path / "private-model.pkl"
+        client.record_issue_found(
+            f"Unsafe pickle found in {sensitive_path} from https://example.com/model?token=secret",
+            "critical",
+            "pickle",
+            file_path=str(sensitive_path),
+        )
+
+        assert captured["event"] == TelemetryEvent.ISSUE_FOUND
+        properties = captured["properties"]
+        assert isinstance(properties, dict)
+        assert properties["issue_type"] == "unknown_issue"
+        assert "issue_message" not in properties
+        serialized = json.dumps(properties)
+        assert str(sensitive_path) not in serialized
+        assert "token=secret" not in serialized
+
+    def test_scan_completed_uses_rule_identifiers_not_issue_messages(self, tmp_path: Path) -> None:
+        """Completed-scan telemetry should count stable rule IDs and omit raw issue text."""
+        client = TelemetryClient()
+        captured: dict[str, object] = {}
+
+        def capture_event(event: TelemetryEvent, properties: dict[str, object] | None = None) -> None:
+            captured["event"] = event
+            captured["properties"] = properties or {}
+
+        client.record_event = capture_event  # type: ignore[method-assign]
+        sensitive_path = tmp_path / "secret-model.nemo"
+        raw_message = f"CVE-2025-23304: dangerous target in {sensitive_path} https://example.com/?token=secret"
+
+        client.record_scan_completed(
+            0.1,
+            {
+                "files_scanned": 1,
+                "scanner_names": ["nemo"],
+                "issues": [
+                    {
+                        "message": raw_message,
+                        "severity": "critical",
+                        "location": str(sensitive_path),
+                        "type": "nemo_check",
+                        "rule_code": "S1101",
+                        "details": {"cve_id": "CVE-2025-23304"},
+                    }
+                ],
+                "assets": [],
+            },
+        )
+
+        assert captured["event"] == TelemetryEvent.SCAN_COMPLETED
+        properties = captured["properties"]
+        assert isinstance(properties, dict)
+        assert properties["issue_types"] == {"rule:S1101": 1}
+        assert properties["issue_details"][0]["type"] == "rule:S1101"
+        serialized = json.dumps(properties)
+        assert raw_message not in serialized
+        assert str(sensitive_path) not in serialized
+        assert "token=secret" not in serialized
 
 
 if __name__ == "__main__":

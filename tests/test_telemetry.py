@@ -322,10 +322,11 @@ class TestTelemetryClient:
 
             assert properties["total_files"] == 2
             assert properties["total_issues"] == 4
-            assert properties["issue_types"]["Issue A"] == 1
-            assert properties["issue_types"]["Issue B"] == 1
+            assert properties["issue_types"]["unknown_issue"] == 3
             assert properties["issue_types"]["pickle_dangerous_global"] == 1
-            assert properties["issue_types"]["Issue with no location"] == 1
+            assert "Issue A" not in properties["issue_types"]
+            assert "Issue B" not in properties["issue_types"]
+            assert "Issue with no location" not in properties["issue_types"]
             assert "Legacy message should not be used when type exists" not in properties["issue_types"]
             assert properties["issue_severities"]["critical"] == 1
             assert properties["issue_severities"]["warning"] == 2
@@ -342,7 +343,9 @@ class TestTelemetryClient:
             assert canonical_issue["model_name"] == "a.pkl"
             assert canonical_issue["model_reference"] == "a.pkl"
             missing_location_issue = next(
-                detail for detail in properties["issue_details"] if detail["type"] == "Issue with no location"
+                detail
+                for detail in properties["issue_details"]
+                if detail["type"] == "unknown_issue" and detail["location_type"] == "unknown"
             )
             assert missing_location_issue["location_type"] == "unknown"
             assert missing_location_issue["model_name"] is None

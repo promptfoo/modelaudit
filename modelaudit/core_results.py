@@ -158,11 +158,15 @@ def add_scan_result_to_model(
     for issue in file_result.issues:
         issue_dict = issue.to_dict() if hasattr(issue, "to_dict") else issue
         if isinstance(issue_dict, dict):
+            issue_details = issue_dict.get("details")
+            issue_details = issue_details if isinstance(issue_details, dict) else {}
             record_issue_found(
-                issue_type=str(issue_dict.get("message", "unknown_issue")),
+                issue_type=str(issue_dict.get("type") or "unknown_issue"),
                 severity=to_telemetry_severity(issue_dict.get("severity", "unknown")),
                 scanner=file_result.scanner_name,
                 file_path=file_path,
+                rule_code=issue_dict.get("rule_code") if isinstance(issue_dict.get("rule_code"), str) else None,
+                cve_id=issue_details.get("cve_id") if isinstance(issue_details.get("cve_id"), str) else None,
             )
             results.issues.append(Issue(**issue_dict))
 
@@ -489,20 +493,27 @@ def merge_scan_result(
     if isinstance(scan_result, ScanResult):
         file_path = scan_result.file_path if hasattr(scan_result, "file_path") else None
         for issue in scan_result.issues:
+            issue_details = issue.details if isinstance(issue.details, dict) else {}
             record_issue_found(
-                issue.message,
+                issue.type or "unknown_issue",
                 issue.severity.name if hasattr(issue.severity, "name") else str(issue.severity),
                 scan_result.scanner_name,
                 file_path=file_path,
+                rule_code=issue.rule_code,
+                cve_id=issue_details.get("cve_id") if isinstance(issue_details.get("cve_id"), str) else None,
             )
         results.aggregate_scan_result_direct(scan_result)
     else:
         file_path = scan_result.get("file_path")
         for issue in scan_result.get("issues", []):
+            raw_issue_details = issue.get("details") if isinstance(issue, dict) else None
+            issue_details = raw_issue_details if isinstance(raw_issue_details, dict) else {}
             record_issue_found(
-                issue.get("message", "unknown_issue"),
+                issue.get("type") or "unknown_issue",
                 issue.get("severity", "unknown"),
                 scan_result.get("scanner_name", "unknown"),
                 file_path=file_path,
+                rule_code=issue.get("rule_code") if isinstance(issue.get("rule_code"), str) else None,
+                cve_id=issue_details.get("cve_id") if isinstance(issue_details.get("cve_id"), str) else None,
             )
         results.aggregate_scan_result(scan_result)

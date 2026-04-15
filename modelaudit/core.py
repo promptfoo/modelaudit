@@ -542,11 +542,23 @@ def scan_model_directory_or_file(
                         for issue in file_result.issues:
                             issue_dict = issue.to_dict() if hasattr(issue, "to_dict") else issue
                             if isinstance(issue_dict, dict):
+                                issue_details = issue_dict.get("details")
+                                issue_details = issue_details if isinstance(issue_details, dict) else {}
                                 record_issue_found(
-                                    issue_type=str(issue_dict.get("message", "unknown_issue")),
+                                    issue_type=str(issue_dict.get("type") or "unknown_issue"),
                                     severity=_to_telemetry_severity(issue_dict.get("severity", "unknown")),
                                     scanner=file_result.scanner_name,
                                     file_path=representative_file,
+                                    rule_code=(
+                                        issue_dict.get("rule_code")
+                                        if isinstance(issue_dict.get("rule_code"), str)
+                                        else None
+                                    ),
+                                    cve_id=(
+                                        issue_details.get("cve_id")
+                                        if isinstance(issue_details.get("cve_id"), str)
+                                        else None
+                                    ),
                                 )
                                 if not issue_dict.get("location"):
                                     issue_dict["location"] = representative_file

@@ -118,6 +118,9 @@ class TelemetryEvent(str, Enum):
 _DEFAULT_POSTHOG_KEY = "phc_E5n5uHnDo2eREJL1uqX1cIlbkoRby4yFWt3V94HqRRg"
 POSTHOG_PROJECT_KEY = os.getenv("PROMPTFOO_POSTHOG_KEY", os.getenv("MODELAUDIT_POSTHOG_KEY", _DEFAULT_POSTHOG_KEY))
 POSTHOG_HOST = os.getenv("PROMPTFOO_POSTHOG_HOST", "https://a.promptfoo.app")
+_TELEMETRY_RULE_CODE_RE = re.compile(r"\bS\d{3,4}\b", re.IGNORECASE)
+_TELEMETRY_CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
+_TELEMETRY_STABLE_ISSUE_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,79}$")
 
 
 def _is_development_install() -> bool:
@@ -409,6 +412,53 @@ class TelemetryClient:
             counts[value] = counts.get(value, 0) + 1
         return counts
 
+    @staticmethod
+    def _sanitize_issue_identifier(value: Any) -> str | None:
+        """Return a stable telemetry issue identifier without preserving free-form text."""
+        if not isinstance(value, str):
+            return None
+
+        stripped = value.strip()
+        if not stripped:
+            return None
+
+        rule_match = _TELEMETRY_RULE_CODE_RE.search(stripped)
+        if rule_match:
+            return f"rule:{rule_match.group(0).upper()}"
+
+        cve_match = _TELEMETRY_CVE_RE.search(stripped)
+        if cve_match:
+            return f"cve:{cve_match.group(0).upper()}"
+
+        if _TELEMETRY_STABLE_ISSUE_ID_RE.fullmatch(stripped):
+            return stripped
+
+        return None
+
+    def _stable_issue_type(
+        self,
+        *,
+        issue_type: Any = None,
+        rule_code: Any = None,
+        cve_id: Any = None,
+    ) -> str:
+        """Build the stable issue identifier used in telemetry payloads."""
+        for candidate in (rule_code, cve_id, issue_type):
+            sanitized = self._sanitize_issue_identifier(candidate)
+            if sanitized:
+                return sanitized
+        return "unknown_issue"
+
+    def _issue_type_from_record(self, issue: dict[str, Any]) -> str:
+        """Extract a stable issue identifier from a serialized issue record."""
+        raw_details = issue.get("details")
+        details = raw_details if isinstance(raw_details, dict) else {}
+        return self._stable_issue_type(
+            issue_type=issue.get("type") or issue.get("message"),
+            rule_code=issue.get("rule_code") or details.get("rule_code"),
+            cve_id=issue.get("cve_id") or details.get("cve_id"),
+        )
+
     def _send_event_internal(self, event: TelemetryEvent, properties: dict[str, Any]) -> None:
         """Internal method to send events without checking disabled state."""
         event_properties = {
@@ -551,8 +601,7 @@ class TelemetryClient:
         issue_details: list[dict[str, Any]] = []
 
         for issue in issues:
-            # Prefer structured issue type when available, fall back to message for legacy payloads.
-            issue_type = str(issue.get("type") or issue.get("message") or "unknown")
+            issue_type = self._issue_type_from_record(issue)
             severity = str(issue.get("severity", "unknown"))
             issue_types[issue_type] = issue_types.get(issue_type, 0) + 1
             # Capture first 50 issues in detail without including raw paths or identifiers.
@@ -633,13 +682,16 @@ class TelemetryClient:
         severity: str,
         scanner: str,
         file_path: str | None = None,
+        *,
+        rule_code: str | None = None,
+        cve_id: str | None = None,
     ) -> None:
         """Record that a security issue was found."""
+        stable_issue_type = self._stable_issue_type(issue_type=issue_type, rule_code=rule_code, cve_id=cve_id)
         properties: dict[str, Any] = {
             "severity": severity,
             "scanner": scanner,
-            "issue_type": issue_type,
-            "issue_message": issue_type,  # Full message for analytics
+            "issue_type": stable_issue_type,
         }
 
         if file_path:
@@ -863,11 +915,19 @@ def record_file_type_detected(file_path: str, detected_type: str, confidence: fl
 
 
 @safe_telemetry
-def record_issue_found(issue_type: str, severity: str, scanner: str, file_path: str | None = None) -> None:
+def record_issue_found(
+    issue_type: str,
+    severity: str,
+    scanner: str,
+    file_path: str | None = None,
+    *,
+    rule_code: str | None = None,
+    cve_id: str | None = None,
+) -> None:
     """Record that a security issue was found."""
     client = get_telemetry_client()
     if client is not None:
-        client.record_issue_found(issue_type, severity, scanner, file_path)
+        client.record_issue_found(issue_type, severity, scanner, file_path, rule_code=rule_code, cve_id=cve_id)
 
 
 @safe_telemetry
