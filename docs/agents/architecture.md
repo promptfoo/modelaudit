@@ -21,6 +21,7 @@
 - Source discovery filters should consume the registry-backed scannable extension set instead of carrying local allowlists.
 - For routing, prefiltering, or archive-recursion changes, add one malicious positive regression and one benign near-match negative regression.
 - If a scanner aborts to avoid partial coverage, make the result operationally explicit (`success=False` with a clear error message) and preserve consistent exit-code and cache behavior.
+- For repo-wide proof obligations and audit backlog, see `docs/agents/repo-correctness-audit.md`.
 
 ## Scanner System
 

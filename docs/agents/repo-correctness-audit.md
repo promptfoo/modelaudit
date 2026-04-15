@@ -135,25 +135,22 @@ E4 is the target. Most components start below E4.
 | `llamafile`           | `.llamafile`, `.exe`, extensionless                        | E1               | executable header routing and model payload boundaries          |
 | `weight_distribution` | optional secondary analysis                                | E0               | optional dependency isolation and non-security failure behavior |
 
-## Current Findings and PR Ledger
+## Recent Audit Evidence
 
-Recent concrete fixes from this audit stream:
+Recent merged fixes from this audit stream:
 
-| PR   | Component         | Finding                                                                                                                            | Status               |
-| ---- | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
-| #917 | Keras H5          | Malformed config/training config could be treated as clean or wrong security failure instead of inconclusive coverage              | Open, review pending |
-| #918 | Keras ZIP         | Malformed `config.json` structures could scan clean or crash as the wrong failure type                                             | Open, review pending |
-| #919 | NeMo              | Top-level YAML lists were not traversed for Hydra `_target_`; malformed/scalar configs looked like missing config                  | Open, review pending |
-| #920 | Jinja2 template   | Malformed tokenizer/YAML configs swallowed parse failures and returned "No templates found"; raw visible SSTI payloads were missed | Open, review pending |
-| #922 | Manifest          | `.config` INI manifests with section headers could skip structured parsing and lose URL/hash checks                                | Open, review pending |
-| #923 | MXNet             | Malformed symbol artifacts needed routing into fail-closed scanner outcomes instead of aggregate clean/unknown results             | Open, review pending |
-| #924 | CatBoost          | Corrupt declared-section scans fail closed as inconclusive instead of returning incomplete coverage as clean                       | Open, review pending |
-| #925 | Paddle            | Suspicious Paddle code indicators are warnings, preserving signal without escalating review-only findings to errors                | Open, review pending |
-| #926 | Native code tests | Expanded native-code detection regression coverage and benign executable-suffix near-match negatives                               | Open, review pending |
-
-Earlier open PRs from the same boundary-hardening campaign include #901 and
-#907 through #916. All open PR entries remain provisional until CI and review
-complete; treat them as evidence of audited findings, not landed behavior.
+| PR              | Component       | Evidence added                                                                                                                     |
+| --------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| #917            | Keras H5        | Malformed config/training config scans fail closed instead of returning clean or the wrong security failure                        |
+| #918            | Keras ZIP       | Malformed `config.json` structures scan inconclusive instead of clean or crash-only                                                |
+| #919            | NeMo            | Top-level YAML lists are traversed for Hydra `_target_`; malformed/scalar configs are explicit coverage failures                   |
+| #920            | Jinja2 template | Malformed tokenizer/YAML configs preserve parse failures, and visible SSTI payloads are still detected                             |
+| #922            | Manifest        | `.config` INI manifests with section headers preserve structured URL/hash checks                                                   |
+| #923            | MXNet           | Malformed symbol artifacts route into fail-closed scanner outcomes instead of aggregate clean/unknown results                      |
+| #924            | CatBoost        | Corrupt declared-section scans fail closed as inconclusive instead of returning incomplete coverage as clean                       |
+| #925            | Paddle          | Suspicious Paddle code indicators stay warning-level without escalating review-only findings to scan errors                        |
+| #926            | Native code     | Native-code detection has expanded regression coverage and benign executable-suffix near-match negatives                           |
+| #901, #907-#916 | Mixed scanners  | Earlier routing, parser-boundary, and archive-hardening fixes are in main; consult git history for exact component-specific claims |
 
 ## Audit Workflow
 
