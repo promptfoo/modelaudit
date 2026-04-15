@@ -10,6 +10,7 @@ from modelaudit.utils.file.filtering import (
     _ZIP_MEMBER_SNIFF_LIMIT,
     should_skip_file,
 )
+from tests.helpers.file_creators import create_v7_tar_archive
 
 
 class TestFileFilter:
@@ -152,12 +153,15 @@ class TestFileFilter:
         with zipfile.ZipFile(disguised_zip, "w") as archive:
             archive.writestr("payload.pkl", pickle.dumps({"safe": True}))
 
+        disguised_legacy_tar = create_v7_tar_archive(tmp_path / "legacy-tar.jpg")
+
         real_image = tmp_path / "cover.jpg"
         real_image.write_bytes(b"\xff\xd8\xff\xe0" + b"jpeg")
 
         assert not should_skip_file(str(disguised_pickle))
         assert not should_skip_file(str(disguised_protocol0_pickle))
         assert not should_skip_file(str(disguised_zip))
+        assert not should_skip_file(str(disguised_legacy_tar))
         assert should_skip_file(str(real_image))
 
     def test_executorch_payloads_bypass_extension_skip(self, tmp_path: Path) -> None:

@@ -58,9 +58,19 @@ _BZIP2_MAGIC = b"BZh"
 _XZ_MAGIC = b"\xfd7zXZ\x00"
 _SEVENZIP_MAGIC = b"7z\xbc\xaf\x27\x1c"
 _LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
+_TAR_BLOCK_SIZE = 512
 _TAR_USTAR_OFFSET = 257
 _TAR_USTAR_MAGIC_SIZE = 5
 _TAR_USTAR_MIN_BYTES = _TAR_USTAR_OFFSET + _TAR_USTAR_MAGIC_SIZE
+_TAR_CHECKSUM_OFFSET = 148
+_TAR_CHECKSUM_SIZE = 8
+_TAR_NUMERIC_FIELD_SLICES = (
+    (100, 108),  # mode
+    (108, 116),  # uid
+    (116, 124),  # gid
+    (124, 136),  # size
+    (136, 148),  # mtime
+)
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_SIZE = 4
 _TFLITE_MIN_HEADER_SIZE = _TFLITE_MAGIC_OFFSET + _TFLITE_MAGIC_SIZE
@@ -626,18 +636,53 @@ def _is_tar_archive(path: str) -> bool:
         return False
 
 
-def _has_tar_ustar_signature(file_path: Path, size: int | None = None) -> bool:
-    """Return whether an uncompressed TAR ustar signature is present."""
+def _tar_octal_value(field: bytes) -> int | None:
+    stripped = field.split(b"\0", 1)[0].strip()
+    if not stripped or any(byte < ord("0") or byte > ord("7") for byte in stripped):
+        return None
     try:
-        if size is None:
-            size = file_path.stat().st_size
-        if size < _TAR_USTAR_MIN_BYTES:
-            return False
-        with file_path.open("rb") as f:
-            f.seek(_TAR_USTAR_OFFSET)
-            return f.read(_TAR_USTAR_MAGIC_SIZE).startswith(b"ustar")
-    except OSError:
+        return int(stripped, 8)
+    except ValueError:
+        return None
+
+
+def _tar_name_looks_plausible(name_field: bytes) -> bool:
+    name = name_field.split(b"\0", 1)[0]
+    return bool(name) and all(byte >= 0x20 and byte != 0x7F for byte in name)
+
+
+def _has_tar_ustar_signature(header: bytes) -> bool:
+    return len(header) >= _TAR_USTAR_MIN_BYTES and header[
+        _TAR_USTAR_OFFSET : _TAR_USTAR_OFFSET + _TAR_USTAR_MAGIC_SIZE
+    ].startswith(b"ustar")
+
+
+def _has_valid_tar_checksum_header(header: bytes) -> bool:
+    """Return whether a 512-byte TAR header block has a valid v7/POSIX checksum."""
+    if len(header) < _TAR_BLOCK_SIZE:
         return False
+
+    block = header[:_TAR_BLOCK_SIZE]
+    if block == b"\0" * _TAR_BLOCK_SIZE or not _tar_name_looks_plausible(block[:100]):
+        return False
+
+    if any(_tar_octal_value(block[start:end]) is None for start, end in _TAR_NUMERIC_FIELD_SLICES):
+        return False
+
+    expected_checksum = _tar_octal_value(block[_TAR_CHECKSUM_OFFSET : _TAR_CHECKSUM_OFFSET + _TAR_CHECKSUM_SIZE])
+    if expected_checksum is None:
+        return False
+
+    checksum = (
+        sum(block[:_TAR_CHECKSUM_OFFSET])
+        + (_TAR_CHECKSUM_SIZE * ord(" "))
+        + sum(block[_TAR_CHECKSUM_OFFSET + _TAR_CHECKSUM_SIZE :])
+    )
+    return checksum == expected_checksum
+
+
+def _looks_like_uncompressed_tar_header(header: bytes) -> bool:
+    return _has_tar_ustar_signature(header) or _has_valid_tar_checksum_header(header)
 
 
 def is_zipfile(path: str) -> bool:
@@ -867,15 +912,10 @@ def detect_file_format_from_magic(path: str) -> str:
             return "tf_metagraph" if _is_tensorflow_metagraph_file(path) else "unknown"
 
         with file_path.open("rb") as f:
-            header = f.read(16)
+            header = f.read(min(size, _TAR_BLOCK_SIZE))
 
-            # Check for TAR format by looking for the "ustar" signature
-            if size >= _TAR_USTAR_MIN_BYTES:
-                f.seek(_TAR_USTAR_OFFSET)
-                if f.read(_TAR_USTAR_MAGIC_SIZE).startswith(b"ustar"):
-                    return "tar"
-            # Reset to read from header for further checks
-            f.seek(0)
+            if _looks_like_uncompressed_tar_header(header):
+                return "tar"
 
             magic4 = header[:4]
             magic8 = header[:8]
@@ -976,7 +1016,7 @@ def detect_file_format_for_skip_filter(path: str) -> str:
     if size < 4:
         return "unknown"
 
-    initial_read_size = min(size, max(64, _TAR_USTAR_MIN_BYTES))
+    initial_read_size = min(size, max(64, _TAR_BLOCK_SIZE))
     with file_path.open("rb") as f:
         prefix = f.read(initial_read_size)
 
@@ -985,11 +1025,8 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         magic8 = header[:8]
         magic16 = header[:16]
 
-        if size >= _TAR_USTAR_MIN_BYTES and len(prefix) >= _TAR_USTAR_MIN_BYTES:
-            tar_magic_start = _TAR_USTAR_OFFSET
-            tar_magic_end = tar_magic_start + _TAR_USTAR_MAGIC_SIZE
-            if prefix[tar_magic_start:tar_magic_end].startswith(b"ustar"):
-                return "tar"
+        if _looks_like_uncompressed_tar_header(prefix):
+            return "tar"
 
         if _looks_like_tflite_header(magic8):
             return "tflite"
@@ -1052,7 +1089,7 @@ def detect_file_format(path: str) -> str:
 
     # Read first bytes for format detection using a single file handle
     with file_path.open("rb") as f:
-        header = f.read(16)
+        header = f.read(min(size, _TAR_BLOCK_SIZE))
 
     magic4 = header[:4]
     magic8 = header[:8]
@@ -1093,7 +1130,7 @@ def detect_file_format(path: str) -> str:
         return "unknown"
     if magic8.startswith(_SEVENZIP_MAGIC):
         return "sevenzip"
-    if _has_tar_ustar_signature(file_path, size):
+    if _looks_like_uncompressed_tar_header(header):
         return "tar"
     if compression_format:
         if _is_tar_archive(path):
