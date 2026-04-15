@@ -325,6 +325,9 @@ pub(crate) fn has_pickle_prefix(value: &[u8]) -> bool {
     if value.len() < 2 {
         return false;
     }
+    if !is_pickle_prefix_start_byte(value[0]) {
+        return false;
+    }
     has_binary_pickle_prefix(value)
         || protocol0_global_or_inst_prefix_has_complete_lines(value)
         || matches!(value[0], b'(' | b'd' | b'l' | b'I' | b'S' | b'V')
@@ -416,6 +419,36 @@ fn is_pickle_opcode_byte(byte: &u8) -> bool {
     )
 }
 
+fn is_pickle_prefix_start_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'(' | b')'
+            | b'B'
+            | b'C'
+            | b'F'
+            | b'G'
+            | b'I'
+            | b'J'
+            | b'K'
+            | b'L'
+            | b'M'
+            | b'N'
+            | b'P'
+            | b'S'
+            | b'T'
+            | b'U'
+            | b'V'
+            | b'X'
+            | b']'
+            | b'c'
+            | b'd'
+            | b'i'
+            | b'l'
+            | b'}'
+            | 0x80..=0x98
+    )
+}
+
 fn protocol0_global_or_inst_prefix_has_lines(value: &[u8]) -> bool {
     if !matches!(value.first().copied(), Some(b'c' | b'i')) {
         return false;
@@ -492,8 +525,13 @@ pub(crate) fn encoded_nested_literal_probe_windows(
     max_window_chars: usize,
 ) -> Vec<String> {
     let mut windows = Vec::new();
-    if encoded_prefix_has_pickle_prefix(value) {
+    let prefix_has_base64_pickle = base64_prefix_has_pickle_prefix(value);
+    let prefix_has_hex_pickle = !prefix_has_base64_pickle && hex_prefix_has_pickle_prefix(value);
+    if prefix_has_base64_pickle || prefix_has_hex_pickle {
         push_unique_window(&mut windows, take_chars(value, max_window_chars));
+        if encoded_prefix_consumes_literal(value, prefix_has_base64_pickle, prefix_has_hex_pickle) {
+            return windows;
+        }
     }
     let suffix_probe = take_last_chars(value, ENCODED_LITERAL_PROBE_CHARS);
     if encoded_prefix_has_pickle_prefix(&suffix_probe) {
@@ -547,21 +585,36 @@ pub(crate) fn encoded_literal_may_contain_pickle(value: &str) -> bool {
 
 fn starts_encoded_pickle_at(bytes: &[u8], index: usize) -> bool {
     let suffix = &bytes[index..];
+    let starts_base64_pickle =
+        encoded_base64_first_byte(suffix).is_some_and(is_pickle_prefix_start_byte);
+    let starts_hex_pickle = encoded_hex_first_byte(suffix).is_some_and(is_pickle_prefix_start_byte);
+    if !starts_base64_pickle && !starts_hex_pickle {
+        return false;
+    }
+
     let probe_len = suffix.len().min(ENCODED_LITERAL_PROBE_CHARS * 4);
     let Ok(probe) = std::str::from_utf8(&suffix[..probe_len]) else {
         return false;
     };
-    if encoded_base64_first_byte(suffix).is_some_and(|byte| is_pickle_opcode_byte(&byte))
-        && base64_prefix_has_pickle_prefix(probe)
-    {
+    if starts_base64_pickle && base64_prefix_has_pickle_prefix(probe) {
         return true;
     }
-    encoded_hex_first_byte(suffix).is_some_and(|byte| is_pickle_opcode_byte(&byte))
-        && hex_prefix_has_pickle_prefix(probe)
+    starts_hex_pickle && hex_prefix_has_pickle_prefix(probe)
 }
 
 fn encoded_prefix_has_pickle_prefix(value: &str) -> bool {
     base64_prefix_has_pickle_prefix(value) || hex_prefix_has_pickle_prefix(value)
+}
+
+fn encoded_prefix_consumes_literal(
+    value: &str,
+    prefix_has_base64_pickle: bool,
+    prefix_has_hex_pickle: bool,
+) -> bool {
+    (prefix_has_base64_pickle
+        && take_base64_literal_prefix(value).len() == value.len()
+        && is_base64_candidate(value))
+        || (prefix_has_hex_pickle && take_hex_literal_prefix(value).len() == value.len())
 }
 
 fn encoded_literal_candidates(stripped: &str) -> Vec<String> {
@@ -973,6 +1026,15 @@ mod tests {
 
         assert!(encoded_literal_may_contain_pickle(&value));
         assert!(windows.iter().any(|window| window.starts_with("gAR9Lg==")));
+    }
+
+    #[test]
+    fn encoded_probe_windows_skip_mid_scan_for_whole_encoded_literals() {
+        for value in ["gAR9Lg==", "80047d2e", r"\x80\x04\x7d\x2e"] {
+            let windows = encoded_nested_literal_probe_windows(value, 64);
+
+            assert_eq!(windows, vec![value.to_string()]);
+        }
     }
 
     #[test]

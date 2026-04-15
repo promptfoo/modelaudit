@@ -1179,6 +1179,9 @@ impl<'a> ScanState<'a> {
         }
 
         for candidate in encoded_nested_literal_probe_windows(value, max_window_chars) {
+            if found_candidate && candidate == value {
+                continue;
+            }
             found_candidate |= self.scan_encoded_nested_pickle_candidate(&candidate, position);
         }
 
