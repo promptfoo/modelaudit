@@ -2,7 +2,7 @@
 name = "modelaudit-picklescan-rust"
 version = "0.1.0" # x-release-please-version
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.83"
 description = "Native pickle security scanner engine for modelaudit-picklescan"
 license = "MIT"
 repository = "https://github.com/promptfoo/modelaudit"
