@@ -413,6 +413,73 @@ class TestKerasZipScanner:
         assert "keras_zip_embedded_weights_too_large" in result.metadata["scan_outcome_reasons"]
         assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
 
+    def test_embedded_weights_size_limit_runs_without_h5py(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The size-limit fail-closed reason does not require optional HDF5 parsing."""
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+
+        scanner = KerasZipScanner({"max_embedded_weights_bytes": 1024})
+        keras_path = tmp_path / "oversized_weights_without_h5py.keras"
+        with zipfile.ZipFile(keras_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.12.0"}))
+            zf.writestr("model.weights.h5", b"0" * 4096)
+
+        result = scanner.scan(str(keras_path))
+
+        limit_checks = [check for check in result.checks if check.name == "Embedded Weights Size Limit"]
+        assert len(limit_checks) == 1
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_embedded_weights_too_large" in result.metadata["scan_outcome_reasons"]
+
+    def test_embedded_weights_size_limit_returns_exit2_and_skips_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Oversized embedded weights must fail closed at the aggregate/cache boundary."""
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", True)
+
+        keras_path = tmp_path / "cached_oversized_weights.keras"
+        with zipfile.ZipFile(keras_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.12.0"}))
+            zf.writestr("model.weights.h5", b"0" * 4096)
+        cache_dir = tmp_path / "cache"
+
+        reset_cache_manager()
+        first_result = scan_model_directory_or_file(
+            str(keras_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            max_embedded_weights_bytes=1024,
+        )
+        second_result = scan_model_directory_or_file(
+            str(keras_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            max_embedded_weights_bytes=1024,
+        )
+        metadata = second_result.file_metadata[str(keras_path)]
+
+        assert determine_exit_code(first_result) == 2
+        assert determine_exit_code(second_result) == 2
+        assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_embedded_weights_too_large" in metadata.get("scan_outcome_reasons")
+        assert any(
+            issue.message.startswith("Skipping embedded model.weights.h5 inspection") for issue in second_result.issues
+        )
+        assert not any(
+            issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in second_result.issues
+        )
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
     @pytest.mark.parametrize(
         "scanner_config",
         [
@@ -2175,7 +2242,7 @@ class TestCVE20258747GetFileGadget:
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
 
     def test_description_scoped_get_file_with_url_is_not_treated_as_documentation(self, tmp_path: Path) -> None:
-        """Doc-like paths should still be scanned when the node contains executable get_file fields."""
+        """Doc-like paths should still scan callable get_file plus URL fields."""
         scanner = KerasZipScanner()
         config = {
             "class_name": "Sequential",
@@ -2190,6 +2257,41 @@ class TestCVE20258747GetFileGadget:
 
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
         assert len(cve_issues) >= 1
+
+    def test_description_class_name_get_file_docs_not_flagged(self, tmp_path: Path) -> None:
+        """Doc tables that name get_file class fields should stay documentation-only."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "description": {
+                    "class_name": "keras.utils.get_file",
+                    "url": "https://docs.example/keras-get-file-guide",
+                    "notes": "Documentation table describing the get_file function signature.",
+                }
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
+        assert cve_issues == []
+
+    def test_description_url_with_get_file_prose_not_flagged(self, tmp_path: Path) -> None:
+        """Doc URLs plus prose mentions should not be treated as executable get_file calls."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "description": {
+                    "summary": "Documentation example: keras.utils.get_file can download files in user code.",
+                    "url": "https://docs.example/keras-get-file-guide",
+                }
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
+        assert cve_issues == []
 
     def test_get_file_with_url_in_args_list_detected(self, tmp_path: Path) -> None:
         """Config with URL inside args list should also be detected."""
@@ -2903,6 +3005,68 @@ class TestCVE20243660LambdaAttribution:
         assert cve_issues[0].details["description"]
         assert cve_issues[0].details["remediation"]
         assert cve_issues[0].details["layer_name"] == "my_lambda"
+
+    @pytest.mark.parametrize(
+        "layer_class",
+        [
+            "keras.layers.Lambda",
+            "tf_keras.src.layers.core.lambda_layer.Lambda",
+        ],
+    )
+    def test_fully_qualified_lambda_layer_has_cve_2024_3660_attribution(self, tmp_path: Path, layer_class: str) -> None:
+        """Keras-qualified Lambda class names should use Lambda-specific ZIP checks."""
+        scanner = KerasZipScanner()
+        encoded = base64.b64encode(b"exec('print(1)')").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": layer_class,
+                        "name": "qualified_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2024-3660"]
+        dangerous_lambda = [check for check in result.checks if check.name == "Dangerous Lambda Layer"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert len(dangerous_lambda) == 1
+        assert dangerous_lambda[0].details["layer_name"] == "qualified_lambda"
+
+    def test_custom_namespace_lambda_layer_not_attributed_to_keras_zip_cve(self, tmp_path: Path) -> None:
+        """Custom classes ending in Lambda should not be treated as Keras Lambda."""
+        scanner = KerasZipScanner()
+        encoded = base64.b64encode(b"exec('print(1)')").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "myproject.layers.Lambda",
+                        "name": "custom_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2024-3660"]
+        dangerous_lambda = [check for check in result.checks if check.name == "Dangerous Lambda Layer"]
+        custom_layer_checks = [
+            check
+            for check in result.checks
+            if check.name == "Custom Layer Class Detection"
+            and check.details.get("layer_class") == "myproject.layers.Lambda"
+        ]
+        assert cve_issues == []
+        assert dangerous_lambda == []
+        assert len(custom_layer_checks) == 1
 
     def test_no_cve_without_lambda(self, tmp_path: Path) -> None:
         """Non-Lambda model should NOT have CVE-2024-3660 attribution."""

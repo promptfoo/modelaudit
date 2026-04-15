@@ -906,7 +906,21 @@ class KerasH5Scanner(BaseScanner):
             return False
 
         normalized = layer_class.strip()
-        return bool(normalized) and normalized.rsplit(".", 1)[-1] == "Lambda"
+        if normalized == "Lambda":
+            return True
+
+        module_path, _, class_name = normalized.rpartition(".")
+        if class_name != "Lambda":
+            return False
+
+        framework_prefixes = (
+            "keras.",
+            "tensorflow.keras.",
+            "tensorflow.python.keras.",
+            "tf.keras.",
+            "tf_keras.",
+        )
+        return any(f"{module_path.lower()}.".startswith(prefix) for prefix in framework_prefixes)
 
     @staticmethod
     def _is_vulnerable_to_cve_2024_3660(version: str) -> bool | None:

@@ -1484,7 +1484,14 @@ class TestCVE20259905H5SafeMode:
         assert len(cve_issues) >= 1, "Lambda in H5 should trigger CVE-2025-9905"
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
 
-    def test_fully_qualified_lambda_layer_triggers_cve_2025_9905(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "layer_class",
+        [
+            "keras.layers.Lambda",
+            "tf_keras.src.layers.core.lambda_layer.Lambda",
+        ],
+    )
+    def test_fully_qualified_lambda_layer_triggers_cve_2025_9905(self, tmp_path: Path, layer_class: str) -> None:
         """Serialized fully-qualified Lambda class names should not bypass H5 Lambda checks."""
         h5_path = tmp_path / "qualified_lambda.h5"
         with h5py.File(h5_path, "w") as f:
@@ -1494,7 +1501,7 @@ class TestCVE20259905H5SafeMode:
                     "name": "test",
                     "layers": [
                         {
-                            "class_name": "keras.layers.Lambda",
+                            "class_name": layer_class,
                             "config": {"function": "lambda x: x * 2"},
                         }
                     ],
@@ -1505,8 +1512,42 @@ class TestCVE20259905H5SafeMode:
 
         result = KerasH5Scanner().scan(str(h5_path))
 
-        cve_issues = [i for i in result.issues if "CVE-2025-9905" in i.message]
-        assert len(cve_issues) >= 1
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9905"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert cve_issues[0].details["layer_class"] == "Lambda"
+        assert cve_issues[0].details["keras_version"] == "3.11.2"
+
+    def test_custom_namespace_lambda_layer_not_attributed_to_keras_cve(self, tmp_path: Path) -> None:
+        """Custom classes ending in Lambda should stay in the custom-layer review path."""
+        h5_path = tmp_path / "custom_lambda.h5"
+        with h5py.File(h5_path, "w") as f:
+            model_config = {
+                "class_name": "Sequential",
+                "config": {
+                    "name": "test",
+                    "layers": [
+                        {
+                            "class_name": "myproject.layers.Lambda",
+                            "config": {"function": "lambda x: x * 2"},
+                        }
+                    ],
+                },
+            }
+            f.attrs["model_config"] = json.dumps(model_config)
+            f.attrs["keras_version"] = "3.11.2"
+
+        result = KerasH5Scanner().scan(str(h5_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-9905"]
+        custom_layer_checks = [
+            check
+            for check in result.checks
+            if check.name == "Custom Layer Class Detection"
+            and check.details.get("layer_class") == "myproject.layers.Lambda"
+        ]
+        assert cve_issues == []
+        assert len(custom_layer_checks) == 1
 
     def test_cve_attribution_details(self, tmp_path: Path) -> None:
         """CVE details should be present in issue details."""

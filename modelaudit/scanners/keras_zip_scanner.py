@@ -314,7 +314,7 @@ class KerasZipScanner(BaseScanner):
             return self.max_embedded_weights_bytes
         return _KERAS_CONFIG_MAX_BYTES
 
-    def _get_recursive_archive_scan_config(self) -> dict[str, Any]:
+    def _get_recursive_archive_scan_config(self, *, skip_weights_entry: bool = False) -> dict[str, Any]:
         """Return a ZIP scanner config with an explicit bounded per-member extraction limit."""
         recursive_config = dict(self.config)
         member_size_limits = [self.max_embedded_weights_bytes]
@@ -332,17 +332,31 @@ class KerasZipScanner(BaseScanner):
             recursive_config["max_file_size"] = recursive_member_size_limit
         else:
             recursive_config.pop("max_file_size", None)
+        if skip_weights_entry:
+            skip_entries = recursive_config.get("skip_archive_entries", ())
+            if isinstance(skip_entries, str):
+                skip_entry_values: list[str] = [skip_entries]
+            elif isinstance(skip_entries, (list, tuple, set, frozenset)):
+                skip_entry_values = [entry for entry in skip_entries if isinstance(entry, str)]
+            else:
+                skip_entry_values = []
+            if _KERAS_WEIGHTS_ENTRY not in skip_entry_values:
+                skip_entry_values.append(_KERAS_WEIGHTS_ENTRY)
+            recursive_config["skip_archive_entries"] = skip_entry_values
         return recursive_config
 
     def _merge_recursive_archive_scan(self, path: str, result: ScanResult) -> None:
         """Recursively scan every ZIP member through the generic archive scanner."""
         from .zip_scanner import ZipScanner
 
-        zip_scanner = ZipScanner(self._get_recursive_archive_scan_config())
+        has_embedded_weights_limit = self._has_embedded_weights_limit_reason(result)
+        zip_scanner = ZipScanner(self._get_recursive_archive_scan_config(skip_weights_entry=has_embedded_weights_limit))
         nested_result = zip_scanner._scan_zip_file(
             path,
             depth=max(zip_scanner._get_archive_depth(), zip_scanner._get_zip_depth()),
         )
+        if has_embedded_weights_limit:
+            self._suppress_expected_embedded_weights_limit_noise(nested_result)
         preserved_metadata = dict(result.metadata)
         nested_contents = nested_result.metadata.get("contents")
         result.merge(nested_result)
@@ -554,6 +568,27 @@ class KerasZipScanner(BaseScanner):
         result.metadata["analysis_incomplete"] = True
 
     @staticmethod
+    def _has_embedded_weights_limit_reason(result: ScanResult) -> bool:
+        reasons = result.metadata.get("scan_outcome_reasons")
+        return isinstance(reasons, list) and "keras_zip_embedded_weights_too_large" in reasons
+
+    @staticmethod
+    def _is_expected_recursive_weights_limit_noise(entry: Any) -> bool:
+        details = getattr(entry, "details", None)
+        message = getattr(entry, "message", "")
+        return (
+            isinstance(details, dict)
+            and details.get("entry") == _KERAS_WEIGHTS_ENTRY
+            and isinstance(message, str)
+            and "exceeds maximum size" in message
+        )
+
+    @classmethod
+    def _suppress_expected_embedded_weights_limit_noise(cls, result: ScanResult) -> None:
+        result.issues = [issue for issue in result.issues if not cls._is_expected_recursive_weights_limit_noise(issue)]
+        result.checks = [check for check in result.checks if not cls._is_expected_recursive_weights_limit_noise(check)]
+
+    @staticmethod
     def _scan_result_has_security_findings(result: ScanResult) -> bool:
         """Return True when the scan found warning or critical security risk."""
         return any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
@@ -692,8 +727,10 @@ class KerasZipScanner(BaseScanner):
             if layer_class == "StringLookup":
                 self._check_stringlookup_vocabulary_path(layer, result, layer_name)
 
+            is_lambda_layer = self._is_lambda_layer_class(layer_class)
+
             # Check for Lambda layers
-            if layer_class == "Lambda":
+            if is_lambda_layer:
                 self._check_lambda_layer(layer, result, layer_name)
                 keras_version = result.metadata.get("keras_version")
                 if isinstance(keras_version, str) and self._is_vulnerable_to_cve_2024_3660(keras_version):
@@ -1016,7 +1053,7 @@ class KerasZipScanner(BaseScanner):
                     },
                     why=get_cve_2025_1550_explanation("dangerous_module"),
                 )
-            elif is_outside_allowlist and (key == "fn_module" or layer_class == "Lambda"):
+            elif is_outside_allowlist and (key == "fn_module" or self._is_lambda_layer_class(layer_class)):
                 result.add_check(
                     name="CVE-2025-1550: Untrusted Module in Config",
                     passed=False,
@@ -1409,9 +1446,6 @@ class KerasZipScanner(BaseScanner):
 
     def _check_embedded_hdf5_weights_external_references(self, archive: zipfile.ZipFile, result: ScanResult) -> None:
         """Detect CVE-2026-1669 external HDF5 references inside embedded .keras weights."""
-        if not HAS_H5PY:
-            return
-
         weights_info = self._get_archive_member_info(archive, _KERAS_WEIGHTS_ENTRY)
         if weights_info is None:
             return
@@ -1439,6 +1473,9 @@ class KerasZipScanner(BaseScanner):
                     "extracted for inspection."
                 ),
             )
+            return
+
+        if not HAS_H5PY:
             return
 
         temp_path = None
@@ -1610,12 +1647,63 @@ class KerasZipScanner(BaseScanner):
         context_lower = context.lower()
         doc_markers = (".description", ".doc", ".docs", ".comment", ".comments", ".notes", ".help", ".readme")
         lowered_keys = {str(key).lower() for key in node}
-        doc_keys = {"description", "doc", "docs", "comment", "comments", "notes", "help", "readme", "citation"}
-        execution_keys = {"fn", "function", "module", "url", "args", "kwargs", "class_name", "callable"}
+        doc_keys = {
+            "description",
+            "doc",
+            "docs",
+            "comment",
+            "comments",
+            "notes",
+            "help",
+            "readme",
+            "citation",
+            "url",
+            "homepage",
+            "link",
+            "reference",
+        }
         if any(marker in context_lower for marker in doc_markers):
-            return lowered_keys.isdisjoint(execution_keys)
+            return not KerasZipScanner._has_serialized_callable_context(node, lowered_keys)
 
-        return bool(lowered_keys) and lowered_keys.issubset(doc_keys) and lowered_keys.isdisjoint(execution_keys)
+        return (
+            bool(lowered_keys)
+            and lowered_keys.issubset(doc_keys)
+            and not KerasZipScanner._has_serialized_callable_context(node, lowered_keys)
+        )
+
+    @staticmethod
+    def _has_serialized_callable_context(node: dict[str, Any], lowered_keys: set[str]) -> bool:
+        """Return True when a doc-like node still resembles Keras callable config."""
+        callable_keys = {"fn", "function", "callable"}
+        callable_context_keys = {"module", "fn_module", "args", "kwargs", "config", "origin", "url"}
+        if lowered_keys & callable_keys:
+            return bool(lowered_keys & callable_context_keys)
+
+        class_context_keys = {"module", "fn_module", "args", "kwargs", "config"}
+        return bool(lowered_keys & {"class_name", "registered_name"}) and bool(lowered_keys & class_context_keys)
+
+    @staticmethod
+    def _is_lambda_layer_class(layer_class: Any) -> bool:
+        """Return True for Keras/TensorFlow Lambda serialization names."""
+        if not isinstance(layer_class, str):
+            return False
+
+        normalized = layer_class.strip()
+        if normalized == "Lambda":
+            return True
+
+        module_path, _, class_name = normalized.rpartition(".")
+        if class_name != "Lambda":
+            return False
+
+        framework_prefixes = (
+            "keras.",
+            "tensorflow.keras.",
+            "tensorflow.python.keras.",
+            "tf.keras.",
+            "tf_keras.",
+        )
+        return any(f"{module_path.lower()}.".startswith(prefix) for prefix in framework_prefixes)
 
     @staticmethod
     def _is_primarily_documentation_text(text: str) -> bool:

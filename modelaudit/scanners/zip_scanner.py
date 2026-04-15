@@ -57,6 +57,14 @@ class ZipScanner(BaseScanner):
             self.config.get("zip_min_compression_bomb_uncompressed_size"),
             self.MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE,
         )
+        raw_skip_entries = self.config.get("skip_archive_entries", ())
+        if isinstance(raw_skip_entries, str):
+            raw_skip_entries = (raw_skip_entries,)
+        if not isinstance(raw_skip_entries, (list, tuple, set, frozenset)):
+            raw_skip_entries = ()
+        self.skip_archive_entries = {
+            self._normalize_skip_entry_name(entry) for entry in raw_skip_entries if isinstance(entry, str)
+        }
 
     def _get_zip_depth(self) -> int:
         """Return the current nested ZIP depth from config."""
@@ -108,6 +116,16 @@ class ZipScanner(BaseScanner):
             )
 
         return min(positive_limits) if positive_limits else self.UNLIMITED_ARCHIVE_SIZE
+
+    @staticmethod
+    def _normalize_skip_entry_name(name: str) -> str:
+        normalized = name.replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        return normalized.lstrip("/")
+
+    def _should_skip_archive_entry(self, name: str) -> bool:
+        return self._normalize_skip_entry_name(name) in self.skip_archive_entries
 
     def _read_symlink_target(self, archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> str:
         """Read a symlink target with a hard cap to avoid materializing large archive members."""
