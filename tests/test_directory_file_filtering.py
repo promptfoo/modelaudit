@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from modelaudit.core import _is_huggingface_cache_file, scan_model_directory_or_file
+from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_model_directory_or_file
 
 
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
@@ -258,6 +258,18 @@ class TestDirectoryFileFiltering:
         assert "sevenzip" in results.scanner_names
         assert "unknown" not in results.scanner_names
         assert not any("Unknown or unhandled format" in issue.message for issue in results.issues)
+
+    def test_rar_archive_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
+        """RAR archives should be recognized and fail closed instead of being skipped."""
+        rar_path = tmp_path / "archive.rar"
+        rar_path.write_bytes(b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32)
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "rar" in results.scanner_names
+        assert results.file_metadata[str(rar_path)]["scan_outcome"] == "inconclusive"
+        assert determine_exit_code(results) == 2
 
     def test_docx_like_zip_remains_skipped(self, tmp_path: Path) -> None:
         """Common document containers should not be treated as model archives."""

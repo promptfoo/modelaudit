@@ -71,6 +71,7 @@ _GZIP_MAGIC = b"\x1f\x8b"
 _BZIP2_MAGIC = b"BZh"
 _XZ_MAGIC = b"\xfd7zXZ\x00"
 _SEVENZIP_MAGIC = b"7z\xbc\xaf\x27\x1c"
+_RAR_MAGIC = b"Rar!\x1a\x07"
 _LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
 _TAR_BLOCK_SIZE = 512
 _TAR_USTAR_OFFSET = 257
@@ -1085,6 +1086,8 @@ def detect_format_from_magic_bytes(
     match magic8:
         case magic if magic.startswith(_SEVENZIP_MAGIC):
             return "sevenzip"
+        case magic if magic.startswith(_RAR_MAGIC):
+            return "rar"
         case magic if magic == _CNTK_LEGACY_MAGIC:
             return "cntk"
         case b"\x89HDF\r\n\x1a\n":  # HDF5 magic
@@ -1354,6 +1357,8 @@ def detect_file_format(path: str) -> str:
         return "unknown"
     if magic8.startswith(_SEVENZIP_MAGIC):
         return "sevenzip"
+    if magic8.startswith(_RAR_MAGIC):
+        return "rar"
     if _looks_like_uncompressed_tar_header(header):
         return "tar"
     if compression_format:
@@ -1495,6 +1500,8 @@ def detect_file_format(path: str) -> str:
         return "pickle"
     if ext in (".rds", ".rda", ".rdata"):
         return "r_serialized"
+    if ext == ".rar":
+        return "rar"
     if ext in (
         ".tar",
         ".tar.gz",

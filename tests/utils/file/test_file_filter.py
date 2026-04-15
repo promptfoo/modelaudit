@@ -228,6 +228,13 @@ class TestFileFilter:
 
         assert not should_skip_file(str(disguised_zip))
 
+    def test_rar_archives_bypass_extension_skip(self, tmp_path: Path) -> None:
+        """RAR archives should be routed to the fail-closed unsupported scanner."""
+        rar_path = tmp_path / "archive.rar"
+        rar_path.write_bytes(b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32)
+
+        assert not should_skip_file(str(rar_path))
+
     def test_docx_like_zip_remains_skipped(self, tmp_path: Path) -> None:
         """Common document ZIP containers should not be promoted into the scan set."""
         docx_path = tmp_path / "spec.docx"

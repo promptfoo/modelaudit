@@ -783,6 +783,19 @@ def test_scan_file_routes_misnamed_sevenzip_by_header(tmp_path: Path) -> None:
     assert any("payload.pkl" in (issue.location or "") for issue in result.issues)
 
 
+def test_scan_file_fails_closed_on_rar_archive(tmp_path: Path) -> None:
+    rar_path = tmp_path / "archive.rar"
+    rar_path.write_bytes(b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32)
+
+    result = scan_file(str(rar_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "rar"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "rar_archive_unsupported" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "RAR Archive Support" and check.severity == IssueSeverity.INFO for check in result.checks)
+
+
 def test_scan_file_routes_readme_documentation_to_metadata_scanner(tmp_path: Path) -> None:
     readme_path = tmp_path / "README.md"
     readme_path.write_text("# Model Card\n\nThis README is benign.\n")

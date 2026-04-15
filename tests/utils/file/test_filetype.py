@@ -143,6 +143,7 @@ def test_detect_file_format_by_extension(tmp_path):
         ".rds": "r_serialized",
         ".rda": "r_serialized",
         ".rdata": "r_serialized",
+        ".rar": "rar",
         ".unknown": "unknown",
     }
 
@@ -248,6 +249,15 @@ def test_detect_file_format_rejects_benign_onnx_token_near_match(tmp_path: Path)
     assert detect_file_format(str(model_path)) == "unknown"
     assert detect_file_format_from_magic(str(model_path)) == "unknown"
     assert validate_file_type(str(model_path)) is True
+
+
+def test_detect_file_format_rar_magic(tmp_path: Path) -> None:
+    """RAR archives should be recognized for fail-closed scanner routing."""
+    rar_path = tmp_path / "archive.payload"
+    rar_path.write_bytes(b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32)
+
+    assert detect_file_format(str(rar_path)) == "rar"
+    assert detect_file_format_from_magic(str(rar_path)) == "rar"
 
 
 def test_detect_format_from_extension_mxnet_symbol(tmp_path: Path) -> None:
