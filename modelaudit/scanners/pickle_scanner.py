@@ -1385,8 +1385,6 @@ class PickleScanner(BaseScanner):
         )
 
     def _should_skip_expensive_raw_detectors(self, result: ScanResult, raw_data: bytes) -> bool:
-        if result.has_errors:
-            return True
         if not self._rust_scan_completed_cleanly(result):
             return False
 
@@ -1607,9 +1605,14 @@ class PickleScanner(BaseScanner):
             self._scan_binary_tail_if_needed(data, result, source)
         if skip_expensive_detectors:
             result.metadata["pickle_expensive_raw_detectors_skipped"] = True
-            result.metadata["pickle_expensive_raw_detector_skip_reason"] = (
-                "prior_critical_findings" if result.has_errors else "rust_complete_clean_no_expensive_raw_seeds"
-            )
+            result.metadata["pickle_expensive_raw_detector_skip_reason"] = "rust_complete_clean_no_expensive_raw_seeds"
+            if self.config.get("check_network_comm", True):
+                result.add_check(
+                    name="Network Communication Detection",
+                    passed=True,
+                    message="No network communication patterns detected",
+                    location=source,
+                )
             return
 
         expensive_limit = self._root_expensive_raw_scan_limit()

