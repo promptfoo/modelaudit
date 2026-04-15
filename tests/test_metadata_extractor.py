@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+import modelaudit.metadata_extractor as metadata_extractor_module
 from modelaudit.metadata_extractor import ModelMetadataExtractor
 from modelaudit.utils import tensorflow_compat
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
@@ -33,6 +34,39 @@ def test_has_tensorflow_protobuf_stubs_fails_closed_on_probe_error(monkeypatch: 
 
 class TestModelMetadataExtractor:
     """Test the ModelMetadataExtractor class."""
+
+    def test_extract_metadata_uses_scanner_helper_with_deserialization_config(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Metadata extraction should route through the helper-based scanner lookup."""
+        extractor = ModelMetadataExtractor()
+        target = tmp_path / "helper-routed.model"
+        target.write_bytes(b"placeholder")
+        helper_calls: list[tuple[str, dict[str, Any] | None]] = []
+
+        class HelperSelectedScanner:
+            def __init__(self) -> None:
+                self.name = "helper_selected"
+
+            def extract_metadata(self, file_path: str) -> dict[str, Any]:
+                assert file_path == str(target)
+                return {"file_size": 123}
+
+        def fake_get_scanner_for_file(path: str, config: dict[str, Any] | None = None) -> HelperSelectedScanner:
+            helper_calls.append((path, config))
+            return HelperSelectedScanner()
+
+        monkeypatch.setattr(metadata_extractor_module, "get_scanner_for_file", fake_get_scanner_for_file)
+
+        metadata = extractor.extract(str(target), allow_deserialization=True)
+
+        assert helper_calls == [(str(target), {"allow_metadata_deserialization": True})]
+        assert metadata["format"] == "helper_selected"
+        assert metadata["file"] == target.name
+        assert metadata["path"] == str(target)
+        assert metadata["file_size"] == 123
 
     def test_extract_metadata_unknown_format(self) -> None:
         """Test metadata extraction with unknown file format."""
@@ -449,6 +483,37 @@ class TestModelMetadataExtractor:
         assert "Simulated extraction failure" in metadata["extraction_error"]
         assert metadata["file"] == "broken.safetensors"
         assert metadata["format"] == "safetensors"
+
+    def test_extract_metadata_uses_instance_name_when_helper_scanner_extraction_fails(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Helper-selected scanners should still populate format from the instance on failure."""
+        extractor = ModelMetadataExtractor()
+        target = tmp_path / "instance-name-only.model"
+        target.write_bytes(b"placeholder")
+
+        class InstanceNamedScanner:
+            def __init__(self) -> None:
+                self.name = "instance_only_format"
+
+            def extract_metadata(self, file_path: str) -> dict[str, Any]:
+                raise RuntimeError(f"failed to read {Path(file_path).name}")
+
+        def fake_get_scanner_for_file(path: str, config: dict[str, Any] | None = None) -> InstanceNamedScanner | None:
+            assert path == str(target)
+            assert config == {"allow_metadata_deserialization": False}
+            return InstanceNamedScanner()
+
+        monkeypatch.setattr(metadata_extractor_module, "get_scanner_for_file", fake_get_scanner_for_file)
+
+        metadata = extractor.extract(str(target))
+
+        assert metadata["format"] == "instance_only_format"
+        assert metadata["file"] == target.name
+        assert metadata["path"] == str(target)
+        assert metadata["extraction_error"] == f"failed to read {target.name}"
 
 
 class TestPickleDangerousOpcodes:
