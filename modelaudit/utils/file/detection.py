@@ -1103,7 +1103,7 @@ def detect_file_format(path: str) -> str:
 
     if magic8.startswith(b"\x93NUMPY"):
         return "numpy"
-    if magic4 == b"\x08\x01\x12\x00":
+    if magic4 == b"\x08\x01\x12\x00" or b"onnx" in magic16:
         return "onnx"
 
     # Check first 8 bytes for HDF5 magic
@@ -1363,7 +1363,7 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
             return True
 
         # TensorFlow protobuf files (.pb extension)
-        if ext_format == "protobuf" and header_format in {"protobuf", "unknown"}:
+        if ext_format == "protobuf" and header_format in {"protobuf", "unknown", "onnx"}:
             return True
 
         # TensorFlow MetaGraph files (.meta extension) require strict protobuf validation.

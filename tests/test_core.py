@@ -708,6 +708,16 @@ def test_scan_file_routes_misnamed_onnx_by_header(tmp_path: Path) -> None:
     assert result.scanner_name == "onnx"
 
 
+def test_scan_file_routes_onnx_pb_by_content(tmp_path: Path) -> None:
+    onnx_pb = tmp_path / "model.pb"
+    onnx_pb.write_bytes(b"\x00\x00\x00\x00onnx.proto" + b"\x00" * 32)
+
+    result = scan_file(str(onnx_pb))
+
+    assert result.scanner_name == "onnx"
+    assert not any(check.name == "Format Validation" for check in result.checks)
+
+
 def test_scan_file_routes_misnamed_numpy_by_header(tmp_path: Path) -> None:
     np = pytest.importorskip("numpy")
 

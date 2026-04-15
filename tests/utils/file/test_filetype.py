@@ -218,6 +218,15 @@ def test_detect_file_format_coreml_validation_passthrough(tmp_path: Path) -> Non
     assert validate_file_type(str(model_path)) is True
 
 
+def test_detect_file_format_onnx_pb_content_hint_preempts_protobuf_extension(tmp_path: Path) -> None:
+    """ONNX protobuf payloads renamed to .pb should route to ONNX, not TensorFlow protobuf."""
+    model_path = tmp_path / "model.pb"
+    model_path.write_bytes(b"\x00\x00\x00\x00onnx.proto" + b"\x00" * 32)
+
+    assert detect_file_format(str(model_path)) == "onnx"
+    assert validate_file_type(str(model_path)) is True
+
+
 def test_detect_format_from_extension_mxnet_symbol(tmp_path: Path) -> None:
     """MXNet symbol files should be detected by filename pattern."""
     symbol_path = tmp_path / "resnet-symbol.json"
