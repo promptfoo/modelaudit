@@ -1,4 +1,5 @@
 import struct
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -791,3 +792,69 @@ class TestExternalDataSizeValidation:
         assert len(size_checks) > 0
         assert size_checks[0].severity == IssueSeverity.CRITICAL
         assert "non-negative" in size_checks[0].message.lower()
+
+
+class TestWeightDistributionCoverage:
+    """Tests for ONNX weight-distribution analysis coverage gaps."""
+
+    @staticmethod
+    def _coverage_checks(result: Any) -> list[Any]:
+        return [c for c in result.checks if c.name == "Weight Distribution Analysis Coverage"]
+
+    def test_missing_weight_distribution_dependency_is_inconclusive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = create_onnx_model(tmp_path, tensor_shape=(2, 2))
+        monkeypatch.setitem(sys.modules, "scipy", None)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage_checks = self._coverage_checks(result)
+        assert result.success is False
+        assert result.has_errors is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "onnx_weight_distribution_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert len(coverage_checks) == 1
+        assert coverage_checks[0].status == CheckStatus.FAILED
+        assert coverage_checks[0].severity == IssueSeverity.INFO
+        assert coverage_checks[0].details["coverage_gap"] == "missing_dependency"
+
+    def test_external_weight_distribution_tensors_are_inconclusive(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="weights.bin",
+            external_file_bytes=struct.pack("ffff", 1.0, 2.0, 3.0, 4.0),
+            tensor_shape=(2, 2),
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage_checks = self._coverage_checks(result)
+        assert result.success is False
+        assert result.has_errors is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "onnx_weight_distribution_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert len(coverage_checks) == 1
+        assert coverage_checks[0].details["coverage_gap"] == "partial_initializer_coverage"
+        assert coverage_checks[0].details["eligible_initializers"] == 1
+        assert coverage_checks[0].details["external_initializers_skipped"] == 1
+        assert coverage_checks[0].details["analyzed_initializers"] == 0
+
+    def test_oversized_weight_distribution_tensors_are_inconclusive(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, tensor_shape=(2, 2))
+
+        result = OnnxScanner({"max_array_size": 1}).scan(str(model_path))
+
+        coverage_checks = self._coverage_checks(result)
+        assert result.success is False
+        assert result.has_errors is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "onnx_weight_distribution_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert len(coverage_checks) == 1
+        assert coverage_checks[0].details["coverage_gap"] == "partial_initializer_coverage"
+        assert coverage_checks[0].details["eligible_initializers"] == 1
+        assert coverage_checks[0].details["oversized_initializers_skipped"] == 1
+        assert coverage_checks[0].details["analyzed_initializers"] == 0

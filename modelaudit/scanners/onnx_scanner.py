@@ -58,6 +58,7 @@ STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset(
     }
 )
 ONNX_STRUCTURE_INCONCLUSIVE_REASON = "onnx_structure_validation_failed"
+ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON = "onnx_weight_distribution_analysis_incomplete"
 _PYTHON_OPERATOR_TYPES: frozenset[str] = frozenset(
     {
         "pyfunc",
@@ -770,32 +771,43 @@ class OnnxScanner(BaseScanner):
         analysis; 1-D tensors (biases, batch-norm params) are excluded.
         """
         try:
+            import numpy as np
             import onnx
+            from scipy import stats as _stats  # noqa: F401
 
             # Lazy-import the weight distribution scanner to avoid circular deps
             # and heavy library loads when the scanner is not needed.
             from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
-        except ImportError:
-            # numpy / scipy / onnx not available — silently skip
+        except ImportError as e:
+            self._mark_weight_distribution_incomplete(
+                result,
+                path,
+                reason="missing_dependency",
+                message=f"Weight distribution analysis dependency unavailable: {e!s}",
+                details={"exception": str(e), "exception_type": type(e).__name__},
+            )
             return
 
         # Max in-memory array size (default 100 MB)
         max_array_size = self.config.get("max_array_size", 100 * 1024 * 1024)
 
-        import numpy as np
-
+        eligible_initializers = 0
+        external_initializers_skipped = 0
+        oversized_initializers_skipped = 0
         extraction_failures = 0
         weights_info: dict[str, Any] = {}
         for initializer in model.graph.initializer:
             try:
                 self.check_interrupted()
 
-                # Skip external-data tensors — their bytes were not loaded.
-                if initializer.data_location == onnx.TensorProto.EXTERNAL:
-                    continue
-
                 # Only 2-D+ tensors are interesting for distribution analysis.
                 if len(initializer.dims) < 2:
+                    continue
+                eligible_initializers += 1
+
+                # Skip external-data tensors — their bytes were not loaded.
+                if initializer.data_location == onnx.TensorProto.EXTERNAL:
+                    external_initializers_skipped += 1
                     continue
 
                 # Pre-check estimated size before materializing the array.
@@ -805,6 +817,7 @@ class OnnxScanner(BaseScanner):
                 itemsize = int(np.dtype(onnx.helper.tensor_dtype_to_np_dtype(initializer.data_type)).itemsize)
                 estimated_bytes = numel * itemsize
                 if max_array_size and max_array_size > 0 and estimated_bytes > max_array_size:
+                    oversized_initializers_skipped += 1
                     continue
 
                 array = onnx.numpy_helper.to_array(initializer)
@@ -818,6 +831,22 @@ class OnnxScanner(BaseScanner):
                     e,
                 )
                 continue
+
+        if external_initializers_skipped or oversized_initializers_skipped or extraction_failures:
+            self._mark_weight_distribution_incomplete(
+                result,
+                path,
+                reason="partial_initializer_coverage",
+                message="Weight distribution analysis skipped one or more eligible ONNX initializers",
+                details={
+                    "eligible_initializers": eligible_initializers,
+                    "analyzed_initializers": len(weights_info),
+                    "external_initializers_skipped": external_initializers_skipped,
+                    "oversized_initializers_skipped": oversized_initializers_skipped,
+                    "extraction_failures": extraction_failures,
+                    "max_array_size": max_array_size,
+                },
+            )
 
         if not weights_info:
             # Nothing to analyse (external-only model, or all tensors too small / too large).
@@ -853,6 +882,37 @@ class OnnxScanner(BaseScanner):
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
+            self._mark_weight_distribution_incomplete(
+                result,
+                path,
+                reason="analysis_failed",
+                message=f"Weight distribution analysis failed: {e!s}",
+                details={"exception": str(e), "exception_type": type(e).__name__},
+            )
+
+    def _mark_weight_distribution_incomplete(
+        self,
+        result: ScanResult,
+        path: str,
+        *,
+        reason: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        _mark_inconclusive_scan_result(result, ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON)
+        result.add_check(
+            name="Weight Distribution Analysis Coverage",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=path,
+            rule_code="S902",
+            details={
+                "scan_outcome_reason": ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON,
+                "coverage_gap": reason,
+                **(details or {}),
+            },
+        )
 
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         """Extract ONNX model metadata."""
