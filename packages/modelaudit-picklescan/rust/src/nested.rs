@@ -64,8 +64,18 @@ pub(crate) fn decode_possible_encoded_pickle(
 
 fn decoded_pickle_payloads(decoded: &[u8], max_nested_pickle_bytes: usize) -> Vec<Vec<u8>> {
     let mut payloads = Vec::new();
+    let mut search_start = 0usize;
+    if let Some(payload_len) = pickle_payload_extent(decoded, max_nested_pickle_bytes) {
+        payloads.push(decoded[..payload_len].to_vec());
+        search_start = payload_len;
+        if search_start >= decoded.len() {
+            return payloads;
+        }
+    }
+
     let mut seen_spans = Vec::new();
-    for offset in nested_pickle_probe_offsets_unbounded(decoded) {
+    for offset in nested_pickle_probe_offsets_unbounded(&decoded[search_start..]) {
+        let offset = search_start.saturating_add(offset);
         let end = decoded
             .len()
             .min(offset.saturating_add(max_nested_pickle_bytes));
@@ -562,7 +572,7 @@ pub(crate) fn encoded_nested_literal_probe_windows(
 
 pub(crate) fn encoded_literal_may_contain_pickle(value: &str) -> bool {
     let stripped = value.trim();
-    if stripped.is_empty() {
+    if stripped.len() < 16 {
         return false;
     }
     if encoded_prefix_has_pickle_prefix(stripped) {
