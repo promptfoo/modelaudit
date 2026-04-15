@@ -1376,6 +1376,59 @@ class TestSevenZipScannerHardening:
             assert len(limit_checks) == 1
             assert limit_checks[0].status == CheckStatus.FAILED
 
+    def test_disguised_nested_zip_member_is_routed_for_scan(
+        self,
+        temp_7z_file: str,
+    ) -> None:
+        """Disguised nested archives should become scannable via bounded header probes."""
+        scanner = SevenZipScanner()
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_probe_extensionless_members", return_value={"payload.jpg": "zip"}) as mock_probe,
+            patch.object(scanner, "_extract_and_scan_files", return_value=True) as mock_extract,
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["payload.jpg"]
+            mock_archive.getinfo.return_value = MagicMock(is_directory=False, uncompressed=16)
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+            assert result.success
+            assert mock_probe.call_args.args[1] == ["payload.jpg"]
+            assert mock_extract.call_args.args[1] == ["payload.jpg"]
+            assert result.metadata["scannable_files"] == 1
+
+    def test_oversized_disguised_nested_zip_marks_scan_incomplete(
+        self,
+        temp_7z_file: str,
+    ) -> None:
+        """Oversized disguised nested archives must fail closed once header probes classify them as scannable."""
+        scanner = SevenZipScanner(config={"max_7z_extract_size": 8})
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_probe_extensionless_members", return_value={"payload.jpg": "zip"}),
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["payload.jpg"]
+            mock_archive.getinfo.return_value = MagicMock(is_directory=False, uncompressed=32)
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(temp_7z_file)
+
+            oversized_checks = [c for c in result.checks if c.name == "Extracted File Size"]
+            assert len(oversized_checks) == 1
+            assert oversized_checks[0].details["size_limit"] == 8
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert "sevenzip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+
     # -- cumulative entry count -----------------------------------------------
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
@@ -1496,6 +1549,18 @@ class TestSevenZipScannerHardening:
             buf.write(b"\xbc\xaf\x27\x1c\x00\x00")  # 8 bytes, only 4 more captured
         buf.seek(0)
         assert buf.read(6) == b"\x37\x7a\xbc\xaf\x27\x1c"
+
+    def test_probe_detected_format_recognizes_tar_headers(self) -> None:
+        """Header probes should classify nested TAR members without relying on suffixes."""
+        from modelaudit.scanners.sevenzip_scanner import _HeaderProbeBuffer
+
+        scanner = SevenZipScanner()
+        buf = _HeaderProbeBuffer(limit=scanner._NESTED_MEMBER_PROBE_BYTES, raise_on_limit=False)
+        tar_header = bytearray(scanner._NESTED_MEMBER_PROBE_BYTES)
+        tar_header[257:262] = b"ustar"
+        buf.write(bytes(tar_header))
+
+        assert scanner._probe_detected_format(buf) == "tar"
 
     # -- default config includes new limits -----------------------------------
 
