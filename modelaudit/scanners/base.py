@@ -52,6 +52,8 @@ __all__ = [
 TRUSTED_HUGGINGFACE_SOURCES = frozenset({"huggingface"})
 _TRUSTED_SOURCE_PROVENANCE_TOKEN: Final[object] = object()
 _WHITELIST_STALE_WARNING_THRESHOLD_DAYS: Final[int] = 90
+DEFAULT_MAX_FILE_READ_SIZE: Final[int] = 512 * 1024 * 1024
+DEFAULT_READ_CHUNK_SIZE: Final[int] = 8 * 1024 * 1024
 _has_logged_stale_whitelist_warning = False
 
 
@@ -79,6 +81,7 @@ class BaseScanner(ABC):
     name: ClassVar[str] = "base"
     description: ClassVar[str] = "Base scanner class"
     supported_extensions: ClassVar[list[str]] = []
+    default_max_file_read_size: ClassVar[int] = DEFAULT_MAX_FILE_READ_SIZE
 
     def __init__(self, config: dict[str, Any] | None = None):
         """Initialize the scanner with configuration"""
@@ -87,12 +90,9 @@ class BaseScanner(ABC):
         self.current_file_path = ""  # Track the current file being scanned
         self.chunk_size = self.config.get(
             "chunk_size",
-            10 * 1024 * 1024 * 1024,
-        )  # Default: 10GB chunks
-        self.max_file_read_size = self._normalize_positive_int_config(
-            self.config.get("max_file_read_size", 0),
-            0,
-        )  # Default unlimited
+            DEFAULT_READ_CHUNK_SIZE,
+        )
+        self.max_file_read_size = self._resolve_max_file_read_size()
         self._path_validation_result: ScanResult | None = None
         self.context: UnifiedMLContext | None = None  # Will be initialized when scanning a file
         self.scan_start_time: float | None = None  # Track scan start time for timeout
@@ -107,6 +107,16 @@ class BaseScanner(ABC):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             return default
         return value
+
+    def _resolve_max_file_read_size(self) -> int:
+        """Resolve the scanner read cap, using a bounded class default when unset."""
+        if "max_file_read_size" in self.config:
+            value = self.config["max_file_read_size"]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return self.default_max_file_read_size
+            return value
+
+        return self.default_max_file_read_size
 
     def _get_bool_config(self, key: str, default: bool = True) -> bool:
         """
@@ -1060,6 +1070,9 @@ class BaseScanner(ABC):
         if self.max_file_read_size and self.max_file_read_size > 0 and file_size > self.max_file_read_size:
             result = self._create_result()
             result.metadata["file_size"] = file_size
+            result.metadata["analysis_incomplete"] = True
+            result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+            result.metadata["scan_outcome_reasons"] = ["max_file_read_size_exceeded"]
             result.add_check(
                 name="File Size Limit",
                 passed=False,
@@ -1069,6 +1082,8 @@ class BaseScanner(ABC):
                 details={
                     "file_size": file_size,
                     "max_file_read_size": self.max_file_read_size,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "max_file_read_size_exceeded",
                 },
                 why=(
                     "Large files may consume excessive memory or processing time. "

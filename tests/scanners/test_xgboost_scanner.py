@@ -13,11 +13,12 @@ import json
 import pickle
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.xgboost_scanner import XGBoostScanner
 
 
@@ -201,6 +202,40 @@ class TestXGBoostJSONScanning:
 
         # Should be rejected by can_handle() - scanner won't even try to scan it
         assert not XGBoostScanner.can_handle(str(json_file))
+
+    def test_can_handle_json_uses_bounded_structural_sniff(
+        self,
+        temp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Routing should not fully parse arbitrary JSON before scanner limits apply."""
+        json_file = temp_dir / "large_non_xgboost.json"
+        json_file.write_text('{"padding": "' + ("A" * 200_000) + '"}', encoding="utf-8")
+
+        def fail_json_load(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("can_handle() must not call json.load()")
+
+        monkeypatch.setattr("modelaudit.scanners.xgboost_scanner.json.load", fail_json_load)
+
+        assert XGBoostScanner.can_handle(str(json_file)) is False
+
+    def test_scan_default_read_limit_fails_closed(
+        self,
+        temp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        valid_xgboost_json: dict[str, Any],
+    ) -> None:
+        """JSON scans should fail closed before full parsing when the read cap is exceeded."""
+        monkeypatch.setattr(XGBoostScanner, "default_max_file_read_size", 32)
+        json_file = temp_dir / "oversized_model.json"
+        json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
+
+        result = XGBoostScanner().scan(str(json_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["analysis_incomplete"] is True
+        assert "max_file_read_size_exceeded" in result.metadata["scan_outcome_reasons"]
 
     def test_malicious_json_content_detected(self, temp_dir, xgboost_scanner):
         """Test detection of malicious patterns in JSON."""

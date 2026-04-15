@@ -11,6 +11,46 @@ HUGGINGFACE_URL_IN_TEXT_PATTERN = re.compile(
     r"(?i)\b(?:https?://(?:[^\s\"'<>/@]+(?::[^\s\"'<>/@]*)?@)?(?:huggingface\.co|hf\.co)|hf://)"
     r"[^\s\"'<>]*"
 )
+_HF_REPO_COMPONENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+
+
+def _validate_huggingface_repo_component(component: str, field_name: str) -> str:
+    """Validate one HuggingFace repo-id component before using it in paths."""
+    if (
+        not component
+        or component in {".", ".."}
+        or "/" in component
+        or "\\" in component
+        or component.endswith(".git")
+        or component[0] in {".", "-"}
+        or component[-1] in {".", "-"}
+        or ".." in component
+        or "--" in component
+        or not _HF_REPO_COMPONENT_PATTERN.fullmatch(component)
+    ):
+        raise ValueError(f"Invalid HuggingFace {field_name}: {component!r}")
+    return component
+
+
+def _decode_huggingface_repo_component(raw_component: str, field_name: str) -> str:
+    decoded = unquote(raw_component)
+    return _validate_huggingface_repo_component(decoded, field_name)
+
+
+def _split_huggingface_repo_path(raw_path: str) -> tuple[str, str, list[str]]:
+    stripped = raw_path.strip("/")
+    if not stripped:
+        raise ValueError("Invalid HuggingFace URL format")
+
+    raw_parts = stripped.split("/")
+    if any(not part for part in raw_parts):
+        raise ValueError("Invalid HuggingFace URL format")
+
+    namespace = _decode_huggingface_repo_component(raw_parts[0], "namespace")
+    repo_name = ""
+    if len(raw_parts) >= 2:
+        repo_name = _decode_huggingface_repo_component(raw_parts[1], "repository")
+    return namespace, repo_name, raw_parts
 
 
 def is_huggingface_url(url: str) -> bool:
@@ -20,7 +60,13 @@ def is_huggingface_url(url: str) -> bool:
         r"^https?://(?:[^\s\"'<>/@?#]+(?::[^\s\"'<>/@?#]*)?@)?hf\.co/[^/?#]+(/[^/?#]+)?/?([?#].*)?$",
         r"^hf://[^/?#]+(/[^/?#]+)?/?([?#].*)?$",
     ]
-    return any(re.match(pattern, url) for pattern in patterns)
+    if not any(re.match(pattern, url) for pattern in patterns):
+        return False
+    try:
+        parse_huggingface_url(url)
+    except ValueError:
+        return False
+    return True
 
 
 def redact_huggingface_url_for_display(url: str) -> str:
@@ -66,7 +112,9 @@ def parse_huggingface_file_url(url: str) -> tuple[str, str, str]:
     if len(path_parts) < 5 or path_parts[2] != "resolve":
         raise ValueError(f"Invalid HuggingFace file URL format: {redact_huggingface_url_for_display(url)}")
 
-    repo_id = f"{path_parts[0]}/{path_parts[1]}"
+    namespace = _decode_huggingface_repo_component(path_parts[0], "namespace")
+    repo_name = _decode_huggingface_repo_component(path_parts[1], "repository")
+    repo_id = f"{namespace}/{repo_name}"
     branch = unquote(path_parts[3])
     filename = "/".join(unquote(part) for part in path_parts[4:])
 
@@ -76,25 +124,27 @@ def parse_huggingface_file_url(url: str) -> tuple[str, str, str]:
 def parse_huggingface_url(url: str) -> tuple[str, str]:
     """Parse a HuggingFace model URL into namespace and repository name."""
     if url.startswith("hf://"):
-        path = unquote(url[5:])
-        parts = path.strip("/").split("/")
-        if len(parts) == 1 and parts[0]:
-            return parts[0], ""
-        if len(parts) == 2:
-            return parts[0], parts[1]
+        try:
+            namespace, repo_name, raw_parts = _split_huggingface_repo_path(url[5:])
+        except ValueError as exc:
+            raise ValueError(f"Invalid HuggingFace URL format: {redact_huggingface_url_for_display(url)}") from exc
+        if len(raw_parts) == 1:
+            return namespace, ""
+        if len(raw_parts) == 2:
+            return namespace, repo_name
         raise ValueError(f"Invalid HuggingFace URL format: {redact_huggingface_url_for_display(url)}")
 
     parsed = urlparse(url)
     if parsed.hostname not in ["huggingface.co", "hf.co"]:
         raise ValueError(f"Not a HuggingFace URL: {redact_huggingface_url_for_display(url)}")
 
-    path = unquote(parsed.path)
-    path_parts = path.strip("/").split("/")
-    if len(path_parts) == 1 and path_parts[0]:
-        return path_parts[0], ""
-    if len(path_parts) >= 2:
-        return path_parts[0], path_parts[1]
-    raise ValueError(f"Invalid HuggingFace URL format: {redact_huggingface_url_for_display(url)}")
+    try:
+        namespace, repo_name, raw_parts = _split_huggingface_repo_path(parsed.path)
+    except ValueError as exc:
+        raise ValueError(f"Invalid HuggingFace URL format: {redact_huggingface_url_for_display(url)}") from exc
+    if len(raw_parts) == 1:
+        return namespace, ""
+    return namespace, repo_name
 
 
 def is_huggingface_cache_path(path: str | Path) -> bool:

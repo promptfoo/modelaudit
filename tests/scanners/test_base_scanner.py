@@ -8,6 +8,7 @@ import pytest
 
 from modelaudit.analysis.unified_context import UnifiedMLContext
 from modelaudit.scanners.base import (
+    INCONCLUSIVE_SCAN_OUTCOME,
     BaseScanner,
     CheckStatus,
     Issue,
@@ -46,6 +47,12 @@ class MockScanner(BaseScanner):
         # Finish the scan
         result.finish(success=True)
         return result
+
+
+class TinyReadLimitScanner(MockScanner):
+    """Mock scanner with a tiny default read cap for size-limit regression tests."""
+
+    default_max_file_read_size: ClassVar[int] = 8
 
 
 def _create_hf_cache_model_path(tmp_path: Path, model_id: str, *, cache_root: Path | None = None) -> Path:
@@ -353,7 +360,7 @@ def test_base_scanner_size_limit_pass(tmp_path):
     assert checks["File Size Limit"].status == CheckStatus.PASSED
 
 
-def test_base_scanner_size_limit_fail(tmp_path):
+def test_base_scanner_size_limit_fail(tmp_path: Path) -> None:
     """_check_size_limit should return a result when file is too large."""
     scanner = MockScanner(config={"max_file_read_size": 5})
     file_path = tmp_path / "large.test"
@@ -365,6 +372,41 @@ def test_base_scanner_size_limit_fail(tmp_path):
     checks = {check.name: check for check in result.checks}
     assert checks["File Size Limit"].status == CheckStatus.FAILED
     assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
+    assert "max_file_read_size_exceeded" in result.metadata["scan_outcome_reasons"]
+
+
+def test_base_scanner_uses_bounded_default_read_limit() -> None:
+    """Scanners should default to a bounded full-file read cap."""
+    scanner = MockScanner()
+
+    assert scanner.max_file_read_size == MockScanner.default_max_file_read_size
+
+
+def test_base_scanner_default_read_limit_fails_closed(tmp_path: Path) -> None:
+    """Default read caps should stop oversized files with an inconclusive result."""
+    scanner = TinyReadLimitScanner()
+    file_path = tmp_path / "large.test"
+    file_path.write_bytes(b"this is too long")
+
+    result = scanner._check_size_limit(str(file_path))
+
+    assert isinstance(result, ScanResult)
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
+
+
+def test_base_scanner_explicit_zero_read_limit_keeps_opt_out(tmp_path: Path) -> None:
+    """Direct scanner config can still opt out of the read cap explicitly."""
+    scanner = TinyReadLimitScanner(config={"max_file_read_size": 0})
+    file_path = tmp_path / "large.test"
+    file_path.write_bytes(b"this is too long")
+
+    result = scanner._check_size_limit(str(file_path))
+
+    assert result is None
 
 
 def test_base_scanner_create_scan_result_after_preflight_merges_checks(tmp_path: Path) -> None:

@@ -40,6 +40,8 @@ SUSPICIOUS_JSON_PATTERNS = [
     (re.compile(r"__import__", re.IGNORECASE), "Dynamic import in JSON"),
     (re.compile(r"\\x[0-9a-fA-F]{2}", re.IGNORECASE), "Hex-encoded data (potential shellcode)"),
 ]
+XGBOOST_JSON_ROUTING_SNIFF_BYTES = 64 * 1024
+XGBOOST_DEFAULT_MAX_FILE_READ_SIZE = 256 * 1024 * 1024
 
 
 def _check_xgboost_available() -> bool:
@@ -57,12 +59,122 @@ def _check_ubjson_available() -> bool:
         return False
 
 
+def _skip_json_whitespace(text: str, index: int) -> int:
+    while index < len(text) and text[index] in " \t\r\n":
+        index += 1
+    return index
+
+
+def _json_string_end(text: str, start: int) -> int | None:
+    if start >= len(text) or text[start] != '"':
+        return None
+    index = start + 1
+    while index < len(text):
+        char = text[index]
+        if char == "\\":
+            index += 2
+            continue
+        if char == '"':
+            return index + 1
+        index += 1
+    return None
+
+
+def _skip_json_value_prefix(text: str, start: int) -> int | None:
+    index = start
+    stack: list[str] = []
+    in_string = False
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            if char == "\\":
+                index += 2
+                continue
+            if char == '"':
+                in_string = False
+            index += 1
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char in "[{":
+            stack.append("]" if char == "[" else "}")
+        elif char in "]}":
+            if not stack or stack[-1] != char:
+                return None
+            stack.pop()
+        elif char == "," and not stack:
+            return index + 1
+        elif char == "}" and not stack:
+            return index
+        index += 1
+    return None
+
+
+def _prefix_has_xgboost_json_markers(prefix: bytes) -> bool:
+    """Return True if a bounded JSON prefix has top-level XGBoost markers."""
+    try:
+        text = prefix.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return False
+
+    index = _skip_json_whitespace(text, 0)
+    if index >= len(text) or text[index] != "{":
+        return False
+    index += 1
+
+    found_version = False
+    found_learner = False
+    decoder = json.JSONDecoder()
+
+    while index < len(text):
+        index = _skip_json_whitespace(text, index)
+        if index >= len(text):
+            return False
+        if text[index] == "}":
+            return found_version and found_learner
+        if text[index] == ",":
+            index += 1
+            continue
+
+        key_start = index
+        key_end = _json_string_end(text, key_start)
+        if key_end is None:
+            return False
+        try:
+            key = decoder.decode(text[key_start:key_end])
+        except json.JSONDecodeError:
+            return False
+
+        index = _skip_json_whitespace(text, key_end)
+        if index >= len(text) or text[index] != ":":
+            return False
+        index = _skip_json_whitespace(text, index + 1)
+        if index >= len(text):
+            return False
+
+        if key == "version" and text[index] == "[":
+            found_version = True
+        elif key == "learner" and text[index] == "{":
+            found_learner = True
+        if found_version and found_learner:
+            return True
+
+        next_index = _skip_json_value_prefix(text, index)
+        if next_index is None:
+            return False
+        index = next_index
+
+    return False
+
+
 class XGBoostScanner(BaseScanner):
     """Scanner for XGBoost model files with comprehensive security analysis."""
 
     name: ClassVar[str] = "xgboost"
     description: ClassVar[str] = "Scans XGBoost models for security vulnerabilities"
     supported_extensions: ClassVar[list[str]] = [".bst", ".model", ".json", ".ubj"]
+    default_max_file_read_size: ClassVar[int] = XGBOOST_DEFAULT_MAX_FILE_READ_SIZE
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -106,7 +218,7 @@ class XGBoostScanner(BaseScanner):
     @classmethod
     def _is_xgboost_json(cls, path: str) -> bool:
         """
-        Deterministic check for XGBoost JSON format.
+        Bounded structural check for XGBoost JSON format.
 
         XGBoost JSON models have this structure (any version):
         {
@@ -119,29 +231,12 @@ class XGBoostScanner(BaseScanner):
         This matches what _validate_xgboost_json_schema() checks.
         """
         try:
-            with open(path, encoding="utf-8") as f:
-                data = json.load(f)
-
-            # Must be a dict at top level
-            if not isinstance(data, dict):
-                return False
-
-            # Required: both "version" AND "learner" keys (line 379)
-            if "version" not in data or "learner" not in data:
-                return False
-
-            # Validate version is array-like with at least 2 elements
-            version = data.get("version")
-            if not isinstance(version, list | tuple) or len(version) < 2:
-                return False
-
-            # Validate learner is a dict
-            learner = data.get("learner")
-            return isinstance(learner, dict)
-
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError):
-            # Any parsing/validation error = not XGBoost JSON
+            with open(path, "rb") as f:
+                prefix = f.read(XGBOOST_JSON_ROUTING_SNIFF_BYTES + 1)
+        except OSError:
             return False
+
+        return _prefix_has_xgboost_json_markers(prefix[:XGBOOST_JSON_ROUTING_SNIFF_BYTES])
 
     def scan(self, path: str) -> ScanResult:
         """Scan XGBoost model file for security vulnerabilities."""

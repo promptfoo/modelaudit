@@ -1,5 +1,8 @@
 import asyncio
+import json
 import logging
+import os
+import stat
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -773,6 +776,31 @@ class TestCloudCacheSafety:
         assert outside_file.exists()
         assert poisoned_key not in cache.metadata
         assert "outside cache dir" in caplog.text
+
+    def test_cache_metadata_redacts_signed_urls_and_uses_private_permissions(self, tmp_path: Path) -> None:
+        """Cache metadata should not persist raw signed URL credentials."""
+        cache = GCSCache(cache_dir=tmp_path / "cache")
+        source_file = tmp_path / "artifact.bin"
+        source_file.write_bytes(b"artifact")
+        signed_url = (
+            "https://user:pass@bucket.s3.amazonaws.com/path/model.bin"
+            "?X-Amz-Credential=secret&X-Amz-Signature=sig#fragment"
+        )
+
+        cache.cache_file(signed_url, source_file, etag="etag-value")
+
+        raw_metadata = cache.metadata_file.read_text(encoding="utf-8")
+        metadata = json.loads(raw_metadata)
+        entry = metadata[cache.get_cache_key(signed_url)]
+        assert "url" not in entry
+        assert entry["url_sha256"] == cache.get_cache_key(signed_url)
+        assert entry["url_display"] == "https://bucket.s3.amazonaws.com/path/model.bin"
+        assert "X-Amz-Credential" not in raw_metadata
+        assert "X-Amz-Signature" not in raw_metadata
+        assert "user:pass" not in raw_metadata
+        assert "fragment" not in raw_metadata
+        if os.name != "nt":
+            assert stat.S_IMODE(cache.metadata_file.stat().st_mode) == 0o600
 
 
 class TestCloudDownloadCleanup:
