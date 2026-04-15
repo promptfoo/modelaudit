@@ -4,7 +4,7 @@ This page shows which model formats work in base install and which require optio
 
 ## Installation profiles
 
-- Broadest coverage: `pip install modelaudit[all]`
+- Broad portable coverage: `pip install "modelaudit[all]"` (add `tensorflow` only for TensorFlow-dependent checkpoint/weight analysis)
 - Minimal base install: `pip install modelaudit`
 - Targeted extras: install only the extras you need (examples below)
 
@@ -29,11 +29,12 @@ This page shows which model formats work in base install and which require optio
 | Llamafile binaries              | `.llamafile`, extensionless, `.exe`                               | Yes (executable + embedded GGUF checks)                   | None required                                                                |
 | TorchServe archives             | `.mar`                                                            | Yes                                                       | None                                                                         |
 | SafeTensors                     | `.safetensors`                                                    | Yes                                                       | None required                                                                |
-| Flax/JAX msgpack                | `.msgpack`, `.flax`, `.orbax`, `.jax`                             | No                                                        | `modelaudit[flax]` (required)                                                |
+| GGUF/GGML                       | `.gguf`, `.ggml`, `.ggmf`, `.ggjt`, `.ggla`, `.ggsa`              | Yes                                                       | None required                                                                |
+| Flax/JAX msgpack                | `.msgpack`, `.flax`, `.orbax`, `.jax`                             | Yes                                                       | None (`modelaudit[flax]` is a compatibility alias)                           |
 | JAX checkpoints                 | `.ckpt`, `.checkpoint`, `.orbax-checkpoint`                       | Yes                                                       | None                                                                         |
 | TFLite                          | `.tflite`                                                         | No                                                        | `modelaudit[tflite]` (required)                                              |
 | XGBoost                         | `.bst`, `.model`, `.json`, `.ubj`                                 | Yes for static checks on common formats                   | `modelaudit[xgboost]` recommended for UBJ/full validation paths              |
-| TensorRT                        | `.engine`, `.plan`                                                | Yes                                                       | None required                                                                |
+| TensorRT                        | `.engine`, `.plan`, `.trt`                                        | Yes                                                       | None required                                                                |
 | PaddlePaddle                    | `.pdmodel`, `.pdiparams`                                          | Yes (static byte-pattern checks)                          | None required                                                                |
 | MXNet                           | `*-symbol.json`, `*-NNNN.params`                                  | Yes (static graph + params checks)                        | None required                                                                |
 | Standalone compressed wrappers  | `.gz`, `.bz2`, `.xz`, `.lz4`, `.zlib`                             | Yes (safe bounded decompression + inner scan routing)     | `lz4` package optional only for `.lz4` payload decompression                 |
@@ -48,4 +49,4 @@ This page shows which model formats work in base install and which require optio
 - CNTK scanner scope in v1 is `.dnn`/`.cmf`; `.model` remains owned by XGBoost overlap handling.
 - Llamafile wrappers are executable by design: executable presence is reported at `INFO`, and severity escalates only when suspicious runtime indicators or malformed embedded payloads are found.
 - `modelaudit doctor --show-failed` shows unavailable scanners and missing dependencies in your environment.
-- If you need predictable CI behavior across many formats, prefer `modelaudit[all]`.
+- If you need predictable CI behavior across many formats, prefer `modelaudit[all]`; add `modelaudit[tensorflow]` only for TensorFlow runtime-dependent paths.

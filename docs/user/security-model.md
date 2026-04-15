@@ -58,7 +58,7 @@ Exit codes:
 
 1. Scan artifacts before loading or serving them.
 2. Treat `CRITICAL` findings as release blockers.
-3. Keep scanner dependencies current (`modelaudit[all]` for broadest coverage).
+3. Keep scanner dependencies current (`modelaudit[all]` for broad portable coverage; add `modelaudit[tensorflow]` only for TensorFlow runtime-dependent paths).
 4. Pair scanning with provenance and runtime controls.
 
 ## Reporting gaps or misses

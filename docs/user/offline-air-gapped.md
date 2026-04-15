@@ -24,7 +24,7 @@ Transfer `wheelhouse/` to the air-gapped environment, then install:
 pip install --no-index --find-links wheelhouse "modelaudit[all]"
 ```
 
-If you only need specific scanners, replace `[all]` with targeted extras.
+If you only need specific scanners, replace `[all]` with targeted extras. Add `tensorflow` only when TensorFlow-dependent checkpoint or weight analysis is required.
 
 ## 2. Disable telemetry
 

@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **docs:** align public README and compatibility guidance with supported Python 3.10-3.13, TensorFlow extra requirements, supported formats, and telemetry sanitization behavior
 - **pickle:** increase Rust stream read chunks to reduce scan overhead on large file and archive-member inputs
 - **pickle:** store Rust byte stack operands as source spans instead of copied previews to reduce large-pickle scan overhead
 - **pickle:** skip no-seed raw-text and CVE fallback passes on clean Rust-complete pickle scans, tightening benign state-dict CLI performance while preserving targeted raw-detector positives
