@@ -120,7 +120,15 @@ POSTHOG_PROJECT_KEY = os.getenv("PROMPTFOO_POSTHOG_KEY", os.getenv("MODELAUDIT_P
 POSTHOG_HOST = os.getenv("PROMPTFOO_POSTHOG_HOST", "https://a.promptfoo.app")
 _TELEMETRY_RULE_CODE_RE = re.compile(r"\bS\d{3,4}\b", re.IGNORECASE)
 _TELEMETRY_CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
-_TELEMETRY_STABLE_ISSUE_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,79}$")
+_TELEMETRY_STABLE_ISSUE_ID_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+){1,15}$")
+_TELEMETRY_SECRETLIKE_ISSUE_ID_RE = re.compile(
+    r"^(?:sk|pk|rk|ghp|github_pat|xox[baprs]?|glpat|hf|akia|asia)[_-]",
+    re.IGNORECASE,
+)
+_TELEMETRY_FILELIKE_ISSUE_ID_RE = re.compile(
+    r"\.(?:bin|ckpt|gguf|gz|h5|hdf5|json|keras|nemo|onnx|pb|pickle|pkl|pt|pth|safetensors|tar|yaml|yml|zip)$",
+    re.IGNORECASE,
+)
 
 
 def _is_development_install() -> bool:
@@ -413,8 +421,8 @@ class TelemetryClient:
         return counts
 
     @staticmethod
-    def _sanitize_issue_identifier(value: Any) -> str | None:
-        """Return a stable telemetry issue identifier without preserving free-form text."""
+    def _issue_text_rule_or_cve(value: Any) -> str | None:
+        """Extract a stable rule/CVE token from untrusted issue text."""
         if not isinstance(value, str):
             return None
 
@@ -430,6 +438,25 @@ class TelemetryClient:
         if cve_match:
             return f"cve:{cve_match.group(0).upper()}"
 
+        return None
+
+    @classmethod
+    def _sanitize_issue_identifier(cls, value: Any) -> str | None:
+        """Return a stable telemetry issue identifier without preserving free-form text."""
+        token_identifier = cls._issue_text_rule_or_cve(value)
+        if token_identifier:
+            return token_identifier
+
+        if not isinstance(value, str):
+            return None
+
+        stripped = value.strip()
+        if not stripped:
+            return None
+
+        if _TELEMETRY_SECRETLIKE_ISSUE_ID_RE.search(stripped) or _TELEMETRY_FILELIKE_ISSUE_ID_RE.search(stripped):
+            return None
+
         if _TELEMETRY_STABLE_ISSUE_ID_RE.fullmatch(stripped):
             return stripped
 
@@ -441,12 +468,19 @@ class TelemetryClient:
         issue_type: Any = None,
         rule_code: Any = None,
         cve_id: Any = None,
+        issue_message: Any = None,
     ) -> str:
         """Build the stable issue identifier used in telemetry payloads."""
-        for candidate in (rule_code, cve_id, issue_type):
+        for candidate in (rule_code, cve_id):
             sanitized = self._sanitize_issue_identifier(candidate)
             if sanitized:
                 return sanitized
+        message_identifier = self._issue_text_rule_or_cve(issue_message)
+        if message_identifier:
+            return message_identifier
+        sanitized_type = self._sanitize_issue_identifier(issue_type)
+        if sanitized_type:
+            return sanitized_type
         return "unknown_issue"
 
     def _issue_type_from_record(self, issue: dict[str, Any]) -> str:
@@ -454,9 +488,10 @@ class TelemetryClient:
         raw_details = issue.get("details")
         details = raw_details if isinstance(raw_details, dict) else {}
         return self._stable_issue_type(
-            issue_type=issue.get("type") or issue.get("message"),
+            issue_type=issue.get("type"),
             rule_code=issue.get("rule_code") or details.get("rule_code"),
             cve_id=issue.get("cve_id") or details.get("cve_id"),
+            issue_message=issue.get("message"),
         )
 
     def _send_event_internal(self, event: TelemetryEvent, properties: dict[str, Any]) -> None:
@@ -685,9 +720,15 @@ class TelemetryClient:
         *,
         rule_code: str | None = None,
         cve_id: str | None = None,
+        issue_message: str | None = None,
     ) -> None:
         """Record that a security issue was found."""
-        stable_issue_type = self._stable_issue_type(issue_type=issue_type, rule_code=rule_code, cve_id=cve_id)
+        stable_issue_type = self._stable_issue_type(
+            issue_type=issue_type,
+            rule_code=rule_code,
+            cve_id=cve_id,
+            issue_message=issue_message,
+        )
         properties: dict[str, Any] = {
             "severity": severity,
             "scanner": scanner,
@@ -923,11 +964,20 @@ def record_issue_found(
     *,
     rule_code: str | None = None,
     cve_id: str | None = None,
+    issue_message: str | None = None,
 ) -> None:
     """Record that a security issue was found."""
     client = get_telemetry_client()
     if client is not None:
-        client.record_issue_found(issue_type, severity, scanner, file_path, rule_code=rule_code, cve_id=cve_id)
+        client.record_issue_found(
+            issue_type,
+            severity,
+            scanner,
+            file_path,
+            rule_code=rule_code,
+            cve_id=cve_id,
+            issue_message=issue_message,
+        )
 
 
 @safe_telemetry

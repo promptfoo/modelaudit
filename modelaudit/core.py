@@ -559,6 +559,11 @@ def scan_model_directory_or_file(
                                         if isinstance(issue_details.get("cve_id"), str)
                                         else None
                                     ),
+                                    issue_message=(
+                                        issue_dict.get("message")
+                                        if isinstance(issue_dict.get("message"), str)
+                                        else None
+                                    ),
                                 )
                                 if not issue_dict.get("location"):
                                     issue_dict["location"] = representative_file

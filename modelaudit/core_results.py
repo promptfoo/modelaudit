@@ -167,6 +167,7 @@ def add_scan_result_to_model(
                 file_path=file_path,
                 rule_code=issue_dict.get("rule_code") if isinstance(issue_dict.get("rule_code"), str) else None,
                 cve_id=issue_details.get("cve_id") if isinstance(issue_details.get("cve_id"), str) else None,
+                issue_message=issue_dict.get("message") if isinstance(issue_dict.get("message"), str) else None,
             )
             results.issues.append(Issue(**issue_dict))
 
@@ -501,6 +502,7 @@ def merge_scan_result(
                 file_path=file_path,
                 rule_code=issue.rule_code,
                 cve_id=issue_details.get("cve_id") if isinstance(issue_details.get("cve_id"), str) else None,
+                issue_message=issue.message,
             )
         results.aggregate_scan_result_direct(scan_result)
     else:
@@ -515,5 +517,6 @@ def merge_scan_result(
                 file_path=file_path,
                 rule_code=issue.get("rule_code") if isinstance(issue.get("rule_code"), str) else None,
                 cve_id=issue_details.get("cve_id") if isinstance(issue_details.get("cve_id"), str) else None,
+                issue_message=issue.get("message") if isinstance(issue.get("message"), str) else None,
             )
         results.aggregate_scan_result(scan_result)
