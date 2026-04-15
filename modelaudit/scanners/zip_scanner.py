@@ -74,20 +74,40 @@ class ZipScanner(BaseScanner):
     def _get_max_entry_size(self) -> int:
         """Return the configured per-entry extraction limit with a safe unlimited fallback."""
         default_limit = self.DEFAULT_MAX_ENTRY_SIZE
-        max_entry_size = self.config.get("max_file_size", self.config.get("max_entry_size", default_limit))
-        if max_entry_size == 0:
-            return self.UNLIMITED_ARCHIVE_SIZE
-        return self._normalize_positive_int_config(max_entry_size, default_limit)
+        configured_file_limit = self.config.get("max_file_size")
+        configured_entry_limit = self.config.get("max_entry_size")
+
+        if configured_file_limit is not None and configured_file_limit != 0:
+            return self._normalize_positive_int_config(configured_file_limit, default_limit)
+
+        if configured_entry_limit is not None:
+            if configured_entry_limit == 0:
+                return self.UNLIMITED_ARCHIVE_SIZE
+            return self._normalize_positive_int_config(configured_entry_limit, default_limit)
+
+        return default_limit
 
     def _get_max_total_uncompressed_size(self) -> int:
         """Return the configured aggregate uncompressed ZIP budget."""
+        positive_limits: list[int] = []
         configured_limit = self.config.get("max_zip_total_uncompressed_size")
         if configured_limit is not None:
-            if configured_limit == 0:
-                return self.UNLIMITED_ARCHIVE_SIZE
-            return self._normalize_positive_int_config(configured_limit, self.DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE)
+            if configured_limit != 0:
+                positive_limits.append(
+                    self._normalize_positive_int_config(configured_limit, self.DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE)
+                )
+        else:
+            positive_limits.append(self.DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE)
 
-        return self.DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE
+        for config_key in ("max_total_size", "max_file_size"):
+            configured_public_limit = self.config.get(config_key)
+            if configured_public_limit is None or configured_public_limit == 0:
+                continue
+            positive_limits.append(
+                self._normalize_positive_int_config(configured_public_limit, self.DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE)
+            )
+
+        return min(positive_limits) if positive_limits else self.UNLIMITED_ARCHIVE_SIZE
 
     def _read_symlink_target(self, archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> str:
         """Read a symlink target with a hard cap to avoid materializing large archive members."""
@@ -222,6 +242,98 @@ class ZipScanner(BaseScanner):
             return nested_scan_callback(path, nested_config)
         return scan_nested_file(path, nested_config)
 
+    def _validate_entry_metadata(
+        self,
+        archive: zipfile.ZipFile,
+        info: zipfile.ZipInfo,
+        archive_path: str,
+        temp_base: str,
+        result: ScanResult,
+    ) -> tuple[bool, bool]:
+        """Validate ZIP entry metadata that does not require full extraction."""
+        name = info.filename
+        if not name:
+            return False, True
+
+        resolved_name, is_safe = sanitize_archive_path(name, temp_base)
+        if not is_safe:
+            result.add_check(
+                name="Path Traversal Protection",
+                passed=False,
+                message=f"Archive entry {name} attempted path traversal outside the archive",
+                severity=IssueSeverity.CRITICAL,
+                rule_code="S405",  # Path traversal
+                location=f"{archive_path}:{name}",
+                details={"entry": name},
+            )
+            return False, True
+
+        is_symlink = (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK
+        if is_symlink:
+            try:
+                target = self._read_symlink_target(archive, info)
+            except Exception as exc:
+                result.add_check(
+                    name="Symlink Safety Validation",
+                    passed=False,
+                    message=f"Unable to read symlink target for {name}: {exc!s}",
+                    severity=IssueSeverity.WARNING,
+                    rule_code="S902",
+                    location=f"{archive_path}:{name}",
+                    details={
+                        "entry": name,
+                        "exception": str(exc),
+                        "exception_type": type(exc).__name__,
+                    },
+                )
+                return False, False
+
+            target_base = os.path.dirname(resolved_name)
+            _target_resolved, target_safe = sanitize_archive_path(
+                target,
+                target_base,
+            )
+            if not target_safe:
+                # Check if it's specifically a critical system path
+                if is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
+                    message = f"Symlink {name} points to critical system path: {target}"
+                else:
+                    message = f"Symlink {name} resolves outside extraction directory"
+                result.add_check(
+                    name="Symlink Safety Validation",
+                    passed=False,
+                    message=message,
+                    severity=IssueSeverity.CRITICAL,
+                    rule_code="S406",  # Symlink external
+                    location=f"{archive_path}:{name}",
+                    details={"target": target, "entry": name},
+                )
+            elif is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
+                result.add_check(
+                    name="Symlink Safety Validation",
+                    passed=False,
+                    message=f"Symlink {name} points to critical system path: {target}",
+                    severity=IssueSeverity.CRITICAL,
+                    rule_code="S408",  # System file access
+                    location=f"{archive_path}:{name}",
+                    details={"target": target, "entry": name},
+                )
+            else:
+                result.add_check(
+                    name="Symlink Safety Validation",
+                    passed=True,
+                    message=f"Symlink {name} is safe",
+                    location=f"{archive_path}:{name}",
+                    rule_code=None,  # Passing check
+                    details={"target": target, "entry": name},
+                )
+            return False, True
+
+        if info.is_dir():
+            return False, True
+
+        return True, True
+
     def _scan_zip_file(self, path: str, depth: int = 0) -> ScanResult:
         """Recursively scan a ZIP file and its contents"""
         result = ScanResult(scanner_name=self.name)
@@ -255,9 +367,10 @@ class ZipScanner(BaseScanner):
 
         with zipfile.ZipFile(path, "r") as z:
             max_total_uncompressed_size = self._get_max_total_uncompressed_size()
+            entries = z.infolist()
 
             # Check number of entries
-            entry_count = len(z.infolist())
+            entry_count = len(entries)
             if entry_count > self.max_entries:
                 result.add_check(
                     name="Entry Count Limit Check",
@@ -287,7 +400,20 @@ class ZipScanner(BaseScanner):
                     rule_code=None,  # Passing check
                 )
 
-            archive_uncompressed_size = sum(info.file_size for info in z.infolist() if not info.is_dir())
+            temp_base = os.path.join(tempfile.gettempdir(), "extract")
+            extractable_entries: list[zipfile.ZipInfo] = []
+            for info in entries:
+                should_extract, entry_metadata_complete = self._validate_entry_metadata(
+                    z, info, path, temp_base, result
+                )
+                if not entry_metadata_complete:
+                    scan_complete = False
+                if should_extract:
+                    extractable_entries.append(info)
+
+            archive_declared_uncompressed_size = sum(info.file_size for info in entries if not info.is_dir())
+            archive_uncompressed_size = sum(info.file_size for info in extractable_entries)
+            result.metadata["archive_declared_uncompressed_size"] = archive_declared_uncompressed_size
             result.metadata["archive_uncompressed_size"] = archive_uncompressed_size
             result.metadata["max_zip_total_uncompressed_size"] = max_total_uncompressed_size
             if archive_uncompressed_size > max_total_uncompressed_size:
@@ -303,6 +429,7 @@ class ZipScanner(BaseScanner):
                     location=path,
                     details={
                         "archive_uncompressed_size": archive_uncompressed_size,
+                        "archive_declared_uncompressed_size": archive_declared_uncompressed_size,
                         "max_zip_total_uncompressed_size": max_total_uncompressed_size,
                     },
                 )
@@ -320,6 +447,7 @@ class ZipScanner(BaseScanner):
                 location=path,
                 details={
                     "archive_uncompressed_size": archive_uncompressed_size,
+                    "archive_declared_uncompressed_size": archive_declared_uncompressed_size,
                     "max_zip_total_uncompressed_size": max_total_uncompressed_size,
                 },
                 rule_code=None,
@@ -327,91 +455,8 @@ class ZipScanner(BaseScanner):
 
             # Scan each file in the archive
             extracted_uncompressed_size = 0
-            for info in z.infolist():
+            for info in extractable_entries:
                 name = info.filename
-                if not name:
-                    continue
-
-                temp_base = os.path.join(tempfile.gettempdir(), "extract")
-                resolved_name, is_safe = sanitize_archive_path(name, temp_base)
-                if not is_safe:
-                    result.add_check(
-                        name="Path Traversal Protection",
-                        passed=False,
-                        message=f"Archive entry {name} attempted path traversal outside the archive",
-                        severity=IssueSeverity.CRITICAL,
-                        rule_code="S405",  # Path traversal
-                        location=f"{path}:{name}",
-                        details={"entry": name},
-                    )
-                    continue
-
-                is_symlink = (info.external_attr >> 16) & 0o170000 == stat.S_IFLNK
-                if is_symlink:
-                    try:
-                        target = self._read_symlink_target(z, info)
-                    except Exception as exc:
-                        scan_complete = False
-                        result.add_check(
-                            name="Symlink Safety Validation",
-                            passed=False,
-                            message=f"Unable to read symlink target for {name}: {exc!s}",
-                            severity=IssueSeverity.WARNING,
-                            rule_code="S902",
-                            location=f"{path}:{name}",
-                            details={
-                                "entry": name,
-                                "exception": str(exc),
-                                "exception_type": type(exc).__name__,
-                            },
-                        )
-                        continue
-
-                    target_base = os.path.dirname(resolved_name)
-                    _target_resolved, target_safe = sanitize_archive_path(
-                        target,
-                        target_base,
-                    )
-                    if not target_safe:
-                        # Check if it's specifically a critical system path
-                        if is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
-                            message = f"Symlink {name} points to critical system path: {target}"
-                        else:
-                            message = f"Symlink {name} resolves outside extraction directory"
-                        result.add_check(
-                            name="Symlink Safety Validation",
-                            passed=False,
-                            message=message,
-                            severity=IssueSeverity.CRITICAL,
-                            rule_code="S406",  # Symlink external
-                            location=f"{path}:{name}",
-                            details={"target": target, "entry": name},
-                        )
-                    elif is_absolute_archive_path(target) and is_critical_system_path(target, CRITICAL_SYSTEM_PATHS):
-                        result.add_check(
-                            name="Symlink Safety Validation",
-                            passed=False,
-                            message=f"Symlink {name} points to critical system path: {target}",
-                            severity=IssueSeverity.CRITICAL,
-                            rule_code="S408",  # System file access
-                            location=f"{path}:{name}",
-                            details={"target": target, "entry": name},
-                        )
-                    else:
-                        result.add_check(
-                            name="Symlink Safety Validation",
-                            passed=True,
-                            message=f"Symlink {name} is safe",
-                            location=f"{path}:{name}",
-                            rule_code=None,  # Passing check
-                            details={"target": target, "entry": name},
-                        )
-                    # Do not scan symlink contents
-                    continue
-
-                # Skip directories
-                if info.is_dir():
-                    continue
 
                 # Check compression ratio for zip bomb detection
                 if info.compress_size > 0:
