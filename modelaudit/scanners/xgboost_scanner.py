@@ -27,7 +27,7 @@ import sys
 import tempfile
 from typing import Any, ClassVar
 
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 # Precompiled regex patterns for performance
 SUSPICIOUS_JSON_PATTERNS = [
@@ -211,12 +211,36 @@ class XGBoostScanner(BaseScanner):
     description: ClassVar[str] = "Scans XGBoost models for security vulnerabilities"
     supported_extensions: ClassVar[list[str]] = [".bst", ".model", ".json", ".ubj"]
     default_max_file_read_size: ClassVar[int] = XGBOOST_DEFAULT_MAX_FILE_READ_SIZE
+    _INCONCLUSIVE_REASONS: ClassVar[dict[str, str]] = {
+        "json_parse_failed": "xgboost_json_parse_failed",
+        "json_analysis_failed": "xgboost_json_analysis_failed",
+        "ubj_dependency_missing": "xgboost_ubj_dependency_missing",
+        "ubj_analysis_failed": "xgboost_ubj_analysis_failed",
+        "binary_pickle_spoof": "xgboost_binary_pickle_spoof",
+    }
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
         self.enable_xgb_loading = self._get_bool_config("enable_xgb_loading", False)
         self.max_num_trees = self.config.get("max_num_trees", 10000)
         self.max_tree_depth = self.config.get("max_tree_depth", 1000)
+
+    def _mark_inconclusive_scan_result(self, result: ScanResult, reason: str) -> None:
+        """Mark XGBoost analysis as incomplete so callers fail closed."""
+        existing_reasons = result.metadata.get("scan_outcome_reasons")
+        reasons = existing_reasons if isinstance(existing_reasons, list) else []
+        if reason not in reasons:
+            reasons.append(reason)
+
+        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        result.metadata["scan_outcome_reasons"] = reasons
+        result.metadata["analysis_incomplete"] = True
+
+    def _finish_scan_result(self, result: ScanResult) -> None:
+        """Fail closed on inconclusive scans while preserving clean valid models."""
+        result.finish(
+            success=not result.has_errors and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        )
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -317,8 +341,9 @@ class XGBoostScanner(BaseScanner):
                 details={"exception": str(e), "exception_type": type(e).__name__},
                 why="Scanning failures may indicate file corruption or malicious content",
             )
+            self._mark_inconclusive_scan_result(result, "xgboost_scan_execution_failed")
 
-        result.finish(success=True)
+        self._finish_scan_result(result)
         return result
 
     def _scan_json_model(self, path: str, result: ScanResult) -> None:
@@ -353,6 +378,7 @@ class XGBoostScanner(BaseScanner):
                 details={"json_error": str(e)},
                 why="Malformed JSON may indicate file corruption or crafted exploit",
             )
+            self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["json_parse_failed"])
         except Exception as e:
             result.add_check(
                 name="JSON Analysis",
@@ -362,6 +388,7 @@ class XGBoostScanner(BaseScanner):
                 location=path,
                 details={"exception": str(e)},
             )
+            self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["json_analysis_failed"])
 
     def _scan_ubj_model(self, path: str, result: ScanResult) -> None:
         """Scan XGBoost UBJ (Universal Binary JSON) model for security issues."""
@@ -378,6 +405,7 @@ class XGBoostScanner(BaseScanner):
                 details={"required_package": "ubjson", "install_command": "pip install ubjson"},
                 why="UBJ file scanning requires the ubjson package to decode Universal Binary JSON format",
             )
+            self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["ubj_dependency_missing"])
             return
 
         try:
@@ -407,6 +435,7 @@ class XGBoostScanner(BaseScanner):
                 details={"exception": str(e)},
                 why="UBJ decoding failures may indicate file corruption or malicious content",
             )
+            self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["ubj_analysis_failed"])
 
     def _scan_binary_model(self, path: str, result: ScanResult) -> None:
         """Scan XGBoost binary (.bst) model for security issues."""
@@ -427,19 +456,20 @@ class XGBoostScanner(BaseScanner):
         try:
             # Check if it's actually a pickle file masquerading as .bst
             if self._is_pickle_file(path):
+                claimed_format = os.path.splitext(path)[1].lower().lstrip(".") or "binary"
                 result.add_check(
                     name="File Format Validation",
                     passed=False,
-                    message="File appears to be a pickle file with .bst/.model extension",
-                    severity=IssueSeverity.INFO,
+                    message=f"File appears to be a pickle file with .{claimed_format} extension",
+                    severity=IssueSeverity.WARNING,
                     location=path,
-                    details={"detected_format": "pickle", "claimed_format": "bst"},
+                    details={"detected_format": "pickle", "claimed_format": claimed_format},
                     why=(
                         "File extension spoofing is a security evasion technique "
                         "used to bypass security scanners. This may indicate malicious intent."
                     ),
                 )
-                # Let pickle scanner handle this file
+                self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["binary_pickle_spoof"])
                 return
 
             # Basic binary structure validation

@@ -192,6 +192,9 @@ class TestXGBoostJSONScanning:
 
         # Should detect JSON parsing error
         assert any("Invalid JSON format" in str(issue.message) for issue in result.issues)
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_json_parse_failed" in result.metadata["scan_outcome_reasons"]
 
     def test_missing_required_keys_detected(self, temp_dir):
         """Test that scanner rejects JSON files missing required XGBoost keys in can_handle()."""
@@ -306,6 +309,9 @@ class TestXGBoostUBJScanning:
 
         # Message changed to "Cannot scan UBJ file"
         assert any("cannot scan ubj file" in str(issue.message).lower() for issue in result.issues)
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_ubj_dependency_missing" in result.metadata["scan_outcome_reasons"]
 
     def test_invalid_ubj_detected(self, temp_dir, xgboost_scanner):
         """Test detection of invalid UBJ content."""
@@ -337,17 +343,21 @@ class TestXGBoostBinaryScanning:
 
         assert any("empty" in str(issue.message).lower() for issue in result.issues)
 
-    def test_pickle_masquerading_as_bst_detected(self, temp_dir, xgboost_scanner):
-        """Test detection of pickle files with .bst extension."""
+    @pytest.mark.parametrize("suffix", [".bst", ".model"])
+    def test_pickle_masquerading_as_binary_model_is_inconclusive(self, temp_dir, xgboost_scanner, suffix):
+        """Pickle files masquerading as XGBoost binaries should fail closed."""
         # Create a pickle file
         pickle_data = pickle.dumps({"fake": "model"})
 
-        fake_bst = temp_dir / "fake.bst"
+        fake_bst = temp_dir / f"fake{suffix}"
         fake_bst.write_bytes(pickle_data)
 
         result = xgboost_scanner.scan(str(fake_bst))
 
         assert any("pickle file" in str(issue.message) for issue in result.issues)
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_binary_pickle_spoof" in result.metadata["scan_outcome_reasons"]
 
     def test_binary_structure_validation(self, temp_dir, xgboost_scanner):
         """Test binary structure validation."""
@@ -523,6 +533,7 @@ class TestXGBoostPickleIntegration:
 
         # Should detect file format spoofing
         assert any("pickle file" in str(issue.message) for issue in result.issues)
+        assert result.success is False
 
 
 # Integration tests (require actual dependencies)
