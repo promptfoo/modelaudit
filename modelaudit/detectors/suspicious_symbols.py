@@ -103,6 +103,7 @@ SUSPICIOUS_GLOBALS = {
     "builtins": [
         "eval",
         "exec",
+        "exit",
         "compile",
         "open",
         "input",
@@ -115,27 +116,32 @@ SUSPICIOUS_GLOBALS = {
         "delattr",  # Can delete attributes
         "vars",  # Access to object's namespace
         "dir",  # Can enumerate available attributes
+        "quit",  # Terminates the interpreter when invoked
     ],  # Dynamic code evaluation and file access
     # Python 2 style builtins - CRITICAL RISK
     "__builtin__": [
         "eval",
         "exec",
         "execfile",
+        "exit",
         "compile",
         "open",
         "input",
         "raw_input",
         "__import__",
+        "quit",
         "reload",
     ],  # Python 2 style builtin functions (still exploitable in many contexts)
     # Alternative builtin references - CRITICAL RISK
     "__builtins__": [
         "eval",
         "exec",
+        "exit",
         "compile",
         "open",
         "input",
         "__import__",
+        "quit",
     ],  # Sometimes used as dict or module reference
     "operator": ["attrgetter"],  # Attribute access bypass
     "importlib.machinery": "*",  # Module machinery manipulation
@@ -213,6 +219,17 @@ SUSPICIOUS_GLOBALS = {
     "py_compile": "*",
     # FFI / native code
     "_ctypes": "*",
+    "_posixsubprocess": ["fork_exec"],
+    # Crash and process-resource primitives
+    "faulthandler": [
+        "_fatal_error_c_thread",
+        "_read_null",
+        "_sigabrt",
+        "_sigfpe",
+        "_sigsegv",
+        "_stack_overflow",
+    ],
+    "resource": ["setrlimit"],
     # Profiling / debugging (can execute code)
     "cProfile": "*",
     "profile": "*",
@@ -278,10 +295,12 @@ SUSPICIOUS_GLOBALS.update({alias: data["functions"] for alias, data in OS_MODULE
 DANGEROUS_BUILTINS = [
     "eval",
     "exec",
+    "exit",
     "compile",
     "open",
     "input",
     "__import__",
+    "quit",
     "globals",  # Access to global namespace
     "locals",  # Access to local namespace
     "setattr",  # Can set arbitrary attributes

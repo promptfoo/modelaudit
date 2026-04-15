@@ -13,7 +13,7 @@ use crate::nested::{
     encoded_literal_may_contain_pickle, encoded_nested_literal_probe_windows,
     encoded_nested_window_char_limit, has_execution_opcode, has_pickle_prefix,
     looks_like_pickle_payload, nested_pickle_probe_offsets, pickle_payload_extent,
-    truncated_pickle_prefix_requires_fail_closed,
+    truncated_pickle_prefix_requires_fail_closed, MAX_NESTED_PAYLOAD_PROBES,
 };
 use crate::nested_surface::{
     encoded_nested_payload_finding, is_allowlisted_nested_constructor_ref,
@@ -1076,7 +1076,9 @@ impl<'a> ScanState<'a> {
 
     fn scan_raw_nested_pickle_bytes(&mut self, value: &[u8], position: usize) {
         let mut skip_offsets_before = 0usize;
-        for offset in nested_pickle_probe_offsets(value) {
+        let probe_offsets = nested_pickle_probe_offsets(value);
+        let limit_exceeded = probe_offsets.limit_exceeded;
+        for offset in probe_offsets.offsets {
             if offset < skip_offsets_before {
                 continue;
             }
@@ -1120,10 +1122,7 @@ impl<'a> ScanState<'a> {
                 return;
             }
             let candidate_truncated = remaining_len > self.options.max_nested_pickle_bytes;
-            if candidate_truncated
-                && has_pickle_prefix(probe)
-                && truncated_pickle_prefix_requires_fail_closed(probe)
-            {
+            if candidate_truncated && truncated_pickle_prefix_requires_fail_closed(probe) {
                 self.add_nested_payload_finding(
                     raw_nested_payload_finding(remaining_len, position + offset, true, false),
                     true,
@@ -1131,6 +1130,9 @@ impl<'a> ScanState<'a> {
                 self.record_raw_nested_payload_truncated(remaining_len, position + offset);
                 return;
             }
+        }
+        if limit_exceeded {
+            self.record_nested_probe_limit_exceeded("raw", value.len(), position);
         }
     }
 
@@ -1257,6 +1259,50 @@ impl<'a> ScanState<'a> {
                 ),
                 ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
             ],
+        });
+    }
+
+    fn record_nested_probe_limit_exceeded(
+        &mut self,
+        encoding: &'static str,
+        payload_size: usize,
+        position: usize,
+    ) {
+        if self.status.is_complete() {
+            self.status = ScanStatus::Inconclusive;
+        }
+        let details = vec![
+            (
+                "encoding".to_string(),
+                DetailValue::String(encoding.to_string()),
+            ),
+            (
+                "payload_size".to_string(),
+                DetailValue::UInt(payload_size as u64),
+            ),
+            (
+                "max_nested_payload_probes".to_string(),
+                DetailValue::UInt(MAX_NESTED_PAYLOAD_PROBES as u64),
+            ),
+            ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
+        ];
+        let location = Some(format!("{} (pos {})", self.source, position));
+        self.add_finding(Finding {
+            message: "Nested pickle probe candidate limit exceeded".to_string(),
+            severity: "critical",
+            location: location.clone(),
+            rule_code: Some(nested_rule_code_for_encoding(encoding)),
+            details: details.clone(),
+            why: Some(
+                "Too many plausible nested pickle starts were found to analyze exhaustively; the payload is treated as unsafe because later nested gadgets may be hidden past the probe budget.",
+            ),
+        });
+        self.add_notice(Notice {
+            message: "Nested pickle probe candidate limit exceeded".to_string(),
+            severity: "info",
+            location,
+            code: Some("nested_probe_limit"),
+            details,
         });
     }
 
@@ -2021,7 +2067,8 @@ impl<'a> ScanState<'a> {
             .len()
             .min(start_index.saturating_add(self.options.post_budget_scan_bytes));
         let tail = &self.payload[start_index..scan_end];
-        for relative_offset in nested_pickle_probe_offsets(tail) {
+        let probe_offsets = nested_pickle_probe_offsets(tail);
+        for relative_offset in probe_offsets.offsets {
             let absolute_offset = start_index.saturating_add(relative_offset);
             if absolute_offset <= start_index {
                 continue;
