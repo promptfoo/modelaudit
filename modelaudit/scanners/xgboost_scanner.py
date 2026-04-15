@@ -211,12 +211,32 @@ class XGBoostScanner(BaseScanner):
     description: ClassVar[str] = "Scans XGBoost models for security vulnerabilities"
     supported_extensions: ClassVar[list[str]] = [".bst", ".model", ".json", ".ubj"]
     default_max_file_read_size: ClassVar[int] = XGBOOST_DEFAULT_MAX_FILE_READ_SIZE
+    _JSON_PROBE_READ_BYTES: ClassVar[int] = 256 * 1024
+    _JSON_REQUIRED_MARKERS: ClassVar[tuple[bytes, ...]] = (b'"learner"', b'"version"')
+    _JSON_STRONG_MARKERS: ClassVar[tuple[bytes, ...]] = (
+        b'"gradient_booster"',
+        b'"learner_model_param"',
+        b'"gbtree_model_param"',
+        b'"tree_info"',
+        b'"gbtree"',
+        b'"gblinear"',
+        b'"dart"',
+    )
+    _BINARY_MIN_STRUCTURE_BYTES: ClassVar[int] = 32
     _INCONCLUSIVE_REASONS: ClassVar[dict[str, str]] = {
         "json_parse_failed": "xgboost_json_parse_failed",
         "json_analysis_failed": "xgboost_json_analysis_failed",
         "ubj_dependency_missing": "xgboost_ubj_dependency_missing",
         "ubj_analysis_failed": "xgboost_ubj_analysis_failed",
+        "binary_empty": "xgboost_binary_empty",
+        "binary_structure_too_small": "xgboost_binary_structure_too_small",
+        "binary_structure_unrecognized": "xgboost_binary_structure_unrecognized",
+        "binary_analysis_failed": "xgboost_binary_analysis_failed",
         "binary_pickle_spoof": "xgboost_binary_pickle_spoof",
+        "binary_load_dependency_missing": "xgboost_binary_load_dependency_missing",
+        "binary_load_failed": "xgboost_binary_load_failed",
+        "binary_load_timeout": "xgboost_binary_load_timeout",
+        "binary_load_exception": "xgboost_binary_load_exception",
     }
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -256,7 +276,7 @@ class XGBoostScanner(BaseScanner):
 
         # For .json files, validate it's actually an XGBoost model
         if file_ext == ".json":
-            return cls._is_xgboost_json(path)
+            return cls._is_xgboost_json(path) or cls._is_probable_xgboost_json_candidate(path)
 
         # For .model files, accept (generic extension)
         if file_ext == ".model":
@@ -274,6 +294,21 @@ class XGBoostScanner(BaseScanner):
                 pass
 
         return False
+
+    @classmethod
+    def _is_probable_xgboost_json_candidate(cls, path: str) -> bool:
+        """Sniff malformed-but-XGBoost-like JSON so parse failures fail closed."""
+        try:
+            with open(path, "rb") as f:
+                probe = f.read(cls._JSON_PROBE_READ_BYTES).lower()
+        except OSError:
+            return False
+
+        has_required_markers = all(marker in probe for marker in cls._JSON_REQUIRED_MARKERS)
+        if not has_required_markers:
+            return False
+
+        return any(marker in probe for marker in cls._JSON_STRONG_MARKERS)
 
     @classmethod
     def _is_xgboost_json(cls, path: str) -> bool:
@@ -451,6 +486,7 @@ class XGBoostScanner(BaseScanner):
                 details={"file_size": 0},
                 why="Empty model files are invalid and may indicate corruption or attack",
             )
+            self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["binary_empty"])
             return
 
         try:
@@ -476,7 +512,7 @@ class XGBoostScanner(BaseScanner):
             self._validate_binary_structure(path, result)
 
             # Attempt safe XGBoost loading if enabled
-            if self.enable_xgb_loading and _check_xgboost_available():
+            if self.enable_xgb_loading:
                 self._safe_xgboost_load(path, result)
             else:
                 result.add_check(
@@ -496,6 +532,7 @@ class XGBoostScanner(BaseScanner):
                 location=path,
                 details={"exception": str(e)},
             )
+            self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["binary_analysis_failed"])
 
     def _validate_xgboost_json_schema(self, data: dict[str, Any], result: ScanResult, path: str) -> None:
         """Validate XGBoost JSON model schema and structure."""
@@ -656,15 +693,11 @@ class XGBoostScanner(BaseScanner):
     def _is_pickle_file(self, path: str) -> bool:
         """Check if file is actually a Python pickle file."""
         try:
-            with open(path, "rb") as f:
-                header = f.read(8)
-                # Check for pickle protocol headers
-                if len(header) >= 2:
-                    # Pickle protocols 0-5
-                    return header.startswith(b"\x80") or header[0:1] in [b"c", b"(", b"]", b"}"]
-        except OSError:
-            pass
-        return False
+            from modelaudit.utils.file.detection import detect_file_format
+
+            return detect_file_format(path) == "pickle"
+        except Exception:
+            return False
 
     def _validate_binary_structure(self, path: str, result: ScanResult) -> None:
         """Validate XGBoost binary file structure."""
@@ -673,21 +706,24 @@ class XGBoostScanner(BaseScanner):
                 # Read first few bytes to check for basic structure
                 header = f.read(64)
 
-                if len(header) < 4:
+                if len(header) < self._BINARY_MIN_STRUCTURE_BYTES:
                     result.add_check(
                         name="Binary Structure Validation",
                         passed=False,
                         message="XGBoost binary file too small to contain valid model",
                         severity=IssueSeverity.INFO,
                         location=path,
-                        details={"header_length": len(header)},
+                        details={"header_length": len(header), "min_header_length": self._BINARY_MIN_STRUCTURE_BYTES},
                         why="Truncated files may indicate corruption or attack",
+                    )
+                    self._mark_inconclusive_scan_result(
+                        result, self._INCONCLUSIVE_REASONS["binary_structure_too_small"]
                     )
                     return
 
                 # Check for readable strings that typically appear in XGBoost models
                 header_str = header.decode("utf-8", errors="ignore")
-                expected_patterns = ["gbtree", "gblinear", "dart", "reg:", "binary:", "multi:"]
+                expected_patterns = ["binf", "gbtree", "gblinear", "dart", "reg:", "binary:", "multi:"]
 
                 has_expected_pattern = any(pattern in header_str.lower() for pattern in expected_patterns)
 
@@ -708,10 +744,17 @@ class XGBoostScanner(BaseScanner):
                         )
                     else:
                         result.add_check(
-                            name="XGBoost Binary Pattern Check",
-                            passed=True,
-                            message="File appears to contain valid binary model structure",
+                            name="Binary Structure Validation",
+                            passed=False,
+                            message="File does not contain expected XGBoost binary model markers",
+                            severity=IssueSeverity.INFO,
                             location=path,
+                            details={"expected_patterns": expected_patterns},
+                            why="Missing XGBoost markers may indicate a truncated, corrupted, or mislabeled model file",
+                        )
+                    if not self.enable_xgb_loading:
+                        self._mark_inconclusive_scan_result(
+                            result, self._INCONCLUSIVE_REASONS["binary_structure_unrecognized"]
                         )
                 else:
                     result.add_check(
@@ -731,6 +774,7 @@ class XGBoostScanner(BaseScanner):
                 location=path,
                 details={"exception": str(e)},
             )
+            self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["binary_analysis_failed"])
 
     def _safe_xgboost_load(self, path: str, result: ScanResult) -> None:
         """Attempt to safely load XGBoost model with timeout and error handling."""
@@ -739,10 +783,11 @@ class XGBoostScanner(BaseScanner):
                 name="XGBoost Library Check",
                 passed=False,
                 message="XGBoost library not available for model validation",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"required_package": "xgboost"},
             )
+            self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["binary_load_dependency_missing"])
             return
 
         try:
@@ -801,6 +846,7 @@ except Exception as e:
                         "This is a compatibility test run in an isolated subprocess for safety."
                     ),
                 )
+                self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["binary_load_failed"])
 
         except subprocess.TimeoutExpired:
             result.add_check(
@@ -812,6 +858,7 @@ except Exception as e:
                 details={"timeout": timeout},
                 why="Loading timeout may indicate an extremely large model. The subprocess was safely terminated.",
             )
+            self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["binary_load_timeout"])
         except Exception as e:
             result.add_check(
                 name="XGBoost Model Loading",
@@ -821,6 +868,7 @@ except Exception as e:
                 location=path,
                 details={"exception": str(e)},
             )
+            self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["binary_load_exception"])
 
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         """Extract XGBoost model metadata."""

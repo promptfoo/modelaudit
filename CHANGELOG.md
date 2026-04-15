@@ -55,6 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** detect direct `getattr(module, "dangerous")` handler calls in TorchServe MAR archives, parse conflicting duplicate manifests without silently downgrading hidden handlers, and suppress collision warnings for byte-identical duplicate manifests
 - **security:** recognize RAR archives and fail closed as unsupported coverage instead of skipping `.rar` files during directory scans
 - **skops:** fail closed when Skops archive limits, malformed archives, or bounded metadata reads leave CVE coverage incomplete, while preserving benign numeric-array payload scans
+- **xgboost:** fail closed on incomplete JSON, UBJ, binary-structure, pickle-spoof, and enabled-loader analyses while preserving core exit-code and cache semantics
 - **security:** reduce NeMo Hydra `_target_` false positives by matching suspicious identifiers on token boundaries, preserve CVE-2025-23304 details on suspicious-target findings, and reject oversized YAML members before parsing
 - **security:** preserve skipped-suffix ZIP containers when Keras config-only structure or embedded model-like `.bin` members indicate scannable content
 - **security:** fail closed when oversized NeMo YAML prevents Hydra target analysis and scan malformed Jinja2 config fallbacks beyond the initial prefix window
