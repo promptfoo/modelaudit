@@ -9,7 +9,15 @@ from collections import defaultdict
 from typing import Any
 
 from modelaudit.models import ModelAuditResultModel
-from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Check, Issue, IssueSeverity, ScanResult
+from modelaudit.scanner_results import (
+    INCONCLUSIVE_SCAN_OUTCOME,
+    Check,
+    Issue,
+    IssueSeverity,
+    ScanResult,
+    mark_inconclusive_scan_result,
+    normalize_unclassified_scan_failure,
+)
 from modelaudit.telemetry import record_issue_found
 from modelaudit.utils.helpers.assets import asset_from_scan_result
 
@@ -28,18 +36,7 @@ def mark_operational_scan_error(scan_result: ScanResult, reason: str) -> None:
 
 def mark_inconclusive_scan_outcome(scan_result: ScanResult, reason: str) -> None:
     """Mark a scan result as explicitly inconclusive for exit-code aggregation."""
-    scan_result.metadata["analysis_incomplete"] = True
-    scan_result.metadata[SCAN_OUTCOME_METADATA_KEY] = INCONCLUSIVE_SCAN_OUTCOME
-    scan_result.metadata.setdefault(
-        "scan_outcome_message",
-        "Scan analysis incomplete; failed closed because full coverage was not available.",
-    )
-
-    existing_reasons = scan_result.metadata.get("scan_outcome_reasons")
-    reasons = existing_reasons if isinstance(existing_reasons, list) else []
-    if reason not in reasons:
-        reasons.append(reason)
-    scan_result.metadata["scan_outcome_reasons"] = reasons
+    mark_inconclusive_scan_result(scan_result, reason)
 
 
 def scan_result_has_operational_error(scan_result: ScanResult) -> bool:
@@ -145,6 +142,7 @@ def add_scan_result_to_model(
     from .models import FileMetadataModel
 
     results.bytes_scanned += file_result.bytes_scanned
+    normalize_unclassified_scan_failure(file_result)
 
     if file_result.scanner_name and file_result.scanner_name not in scan_metadata.get("scanners", []):
         scan_metadata.setdefault("scanners", []).append(file_result.scanner_name)

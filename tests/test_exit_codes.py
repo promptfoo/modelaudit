@@ -412,8 +412,8 @@ def test_scan_result_operational_flag_keeps_exit_code_2(tmp_path: Path) -> None:
     assert determine_exit_code(results) == 2
 
 
-def test_scan_result_info_only_failed_scan_without_operational_flag_keeps_exit_code_0(tmp_path: Path) -> None:
-    """Informational failed scans should stay clean without explicit operational metadata."""
+def test_scan_result_info_only_failed_scan_without_outcome_fails_closed(tmp_path: Path) -> None:
+    """Bare success=False results should become inconclusive instead of exiting clean."""
     test_file = tmp_path / "trailing.npy"
     test_file.write_bytes(b"payload")
 
@@ -428,9 +428,12 @@ def test_scan_result_info_only_failed_scan_without_operational_flag_keeps_exit_c
     with patch("modelaudit.core.scan_file", return_value=scan_result):
         results = scan_model_directory_or_file(str(test_file))
 
+    metadata = results.file_metadata[str(test_file)]
+    assert metadata["scan_outcome"] == "inconclusive"
+    assert "scanner_reported_unsuccessful_without_outcome" in metadata["scan_outcome_reasons"]
     assert results.has_errors is False
-    assert results.success is True
-    assert determine_exit_code(results) == 0
+    assert results.success is False
+    assert determine_exit_code(results) == 2
 
 
 def test_scan_result_inconclusive_with_security_finding_keeps_exit_code_1(tmp_path: Path) -> None:

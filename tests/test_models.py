@@ -565,8 +565,8 @@ class TestModelAuditResultModel:
         assert result.issues[0].rule_code == "S101"
         assert result.checks[0].rule_code == "S101"
 
-    def test_aggregate_scan_result_direct_info_only_failure_keeps_success(self) -> None:
-        """Direct aggregation should not treat info-only failed scans as operational errors."""
+    def test_aggregate_scan_result_direct_info_only_failure_fails_closed(self) -> None:
+        """Direct aggregation should mark bare failed scans inconclusive."""
         result = create_initial_audit_result()
         scan_result = ScanResult(scanner_name="numpy")
         scan_result.add_issue(
@@ -579,7 +579,9 @@ class TestModelAuditResultModel:
         result.aggregate_scan_result_direct(scan_result)
 
         assert result.has_errors is False
-        assert result.success is True
+        assert result.success is False
+        assert scan_result.metadata["scan_outcome"] == "inconclusive"
+        assert "scanner_reported_unsuccessful_without_outcome" in scan_result.metadata["scan_outcome_reasons"]
 
     def test_aggregate_scan_result_direct_operational_flag_sets_error_state(self) -> None:
         """Direct aggregation should honor explicit operational-error metadata."""

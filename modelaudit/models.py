@@ -9,7 +9,15 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
-from .scanner_results import Check, CheckStatus, Issue, IssueSeverity, ScanResult
+from .scanner_results import (
+    INCONCLUSIVE_SCAN_OUTCOME,
+    Check,
+    CheckStatus,
+    Issue,
+    IssueSeverity,
+    ScanResult,
+    normalize_unclassified_scan_failure,
+)
 
 # We'll use forward references and rebuild models after imports
 
@@ -467,6 +475,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         """
         if not isinstance(scan_result, ScanResult):
             raise TypeError(f"Expected ScanResult, got {type(scan_result)}")
+        normalize_unclassified_scan_failure(scan_result)
 
         # Update scalar fields directly from ScanResult properties
         self.bytes_scanned += scan_result.bytes_scanned
@@ -478,6 +487,8 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
 
         # Update success status - only set to False for operational errors
         if bool(metadata.get("operational_error")):
+            self.success = False
+        elif metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
             self.success = False
 
         # Convert and extend issues directly from ScanResult objects

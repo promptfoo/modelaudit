@@ -11,6 +11,43 @@ from pydantic import BaseModel, ConfigDict, Field, field_serializer
 logger = logging.getLogger("modelaudit.scanners")
 
 INCONCLUSIVE_SCAN_OUTCOME: Final[str] = "inconclusive"
+SCAN_OUTCOME_METADATA_KEY: Final[str] = "scan_outcome"
+SCAN_OUTCOME_REASONS_METADATA_KEY: Final[str] = "scan_outcome_reasons"
+SCAN_OUTCOME_MESSAGE_METADATA_KEY: Final[str] = "scan_outcome_message"
+OPERATIONAL_ERROR_METADATA_KEY: Final[str] = "operational_error"
+UNCLASSIFIED_SCAN_FAILURE_REASON: Final[str] = "scanner_reported_unsuccessful_without_outcome"
+
+
+def scan_result_has_inconclusive_outcome(scan_result: "ScanResult") -> bool:
+    """Return True when the scanner explicitly marked coverage as inconclusive."""
+    return scan_result.metadata.get(SCAN_OUTCOME_METADATA_KEY) == INCONCLUSIVE_SCAN_OUTCOME
+
+
+def mark_inconclusive_scan_result(scan_result: "ScanResult", reason: str) -> None:
+    """Mark a scan result as inconclusive while preserving existing reasons."""
+    scan_result.metadata["analysis_incomplete"] = True
+    scan_result.metadata[SCAN_OUTCOME_METADATA_KEY] = INCONCLUSIVE_SCAN_OUTCOME
+    scan_result.metadata.setdefault(
+        SCAN_OUTCOME_MESSAGE_METADATA_KEY,
+        "Scan analysis incomplete; failed closed because full coverage was not available.",
+    )
+
+    existing_reasons = scan_result.metadata.get(SCAN_OUTCOME_REASONS_METADATA_KEY)
+    reasons = existing_reasons if isinstance(existing_reasons, list) else []
+    if reason not in reasons:
+        reasons.append(reason)
+    scan_result.metadata[SCAN_OUTCOME_REASONS_METADATA_KEY] = reasons
+
+
+def normalize_unclassified_scan_failure(scan_result: "ScanResult") -> None:
+    """Fail closed when a scanner reports success=False without explicit outcome metadata."""
+    if scan_result.success:
+        return
+    if bool(scan_result.metadata.get(OPERATIONAL_ERROR_METADATA_KEY)):
+        return
+    if scan_result_has_inconclusive_outcome(scan_result):
+        return
+    mark_inconclusive_scan_result(scan_result, UNCLASSIFIED_SCAN_FAILURE_REASON)
 
 
 class IssueSeverity(Enum):

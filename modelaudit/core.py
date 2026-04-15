@@ -64,6 +64,7 @@ _results_should_be_unsuccessful = core_results.results_should_be_unsuccessful
 _scan_result_has_operational_error = core_results.scan_result_has_operational_error
 _serialize_streamed_records = core_results.serialize_streamed_records
 _to_telemetry_severity = core_results.to_telemetry_severity
+_normalize_unclassified_scan_failure = core_results.normalize_unclassified_scan_failure
 determine_exit_code = core_results.determine_exit_code
 merge_scan_result = core_results.merge_scan_result
 
@@ -491,6 +492,7 @@ def scan_model_directory_or_file(
                         check_interrupted()
 
                         file_result = scan_file(representative_file, config)
+                        _normalize_unclassified_scan_failure(file_result)
                         if _scan_result_has_operational_error(file_result):
                             scan_metadata["has_operational_errors"] = True
                         results.bytes_scanned += file_result.bytes_scanned
@@ -1208,6 +1210,7 @@ def scan_model_streaming(
 
                 # Merge results
                 if scan_result:
+                    _normalize_unclassified_scan_failure(scan_result)
                     resolved_report_path = str(scan_path)
                     metadata_dict = dict(scan_result.metadata or {})
                     metadata_dict.setdefault("file_size", scan_path.stat().st_size)
@@ -1226,9 +1229,8 @@ def scan_model_streaming(
                     scan_result_dict = {
                         "bytes_scanned": scan_result.bytes_scanned,
                         "files_scanned": 1,  # Each scan_result represents one file
-                        # Preserve the main scan semantics: success=False does not
-                        # imply an operational error when the scanner completed
-                        # and only reported informational integrity findings.
+                        # Bare success=False results were normalized above so
+                        # they fail closed as inconclusive instead of exiting 0.
                         "has_errors": operational_scan_failure,
                         "success": scan_result.success,
                         "issues": _serialize_streamed_records(
