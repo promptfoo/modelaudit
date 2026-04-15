@@ -562,11 +562,26 @@ class TestCVE202523304HydraTarget:
     @pytest.mark.parametrize(
         "target",
         [
+            "cloudpickle.load",
+            "cloudpickle.loads",
+            "dill.load",
+            "dill.loads",
             "torch.load",
             "torch.jit.load",
+            "torch.hub.load",
+            "torch.hub.load_state_dict_from_url",
+            "torch.package.PackageImporter",
+            "torch.package.PackageImporter.load_pickle",
+            "torch.serialization.load",
+            "torch.utils.model_zoo.load_url",
             "joblib.load",
+            "sklearn.externals.joblib.load",
             "keras.models.load_model",
-            "numpy.load",
+            "tensorflow.keras.models.load_model",
+            "tensorflow.saved_model.load",
+            "tf.keras.models.load_model",
+            "mlflow.pyfunc.load_model",
+            "pandas.read_pickle",
         ],
     )
     def test_ml_deserialization_targets_detected_as_dangerous(self, tmp_path: Path, target: str) -> None:
@@ -581,6 +596,73 @@ class TestCVE202523304HydraTarget:
         assert cve_checks[0].status == CheckStatus.FAILED
         assert cve_checks[0].severity == IssueSeverity.CRITICAL
         assert cve_checks[0].details["target"] == target
+
+    def test_numpy_load_without_pickle_is_safe_target(self, tmp_path: Path) -> None:
+        """Default numpy.load calls should not be treated as pickle deserialization."""
+        config = {"model": {"_target_": "numpy.load", "file": "weights.npy"}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert not [
+            check
+            for check in result.checks
+            if check.name == "CVE-2025-23304: Dangerous Hydra _target_" and check.details.get("target") == "numpy.load"
+        ]
+        assert any(
+            check.name == "Hydra _target_ Safety Check"
+            and check.status == CheckStatus.PASSED
+            and check.details.get("target") == "numpy.load"
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "model_config",
+        [
+            {"_target_": "numpy.load", "file": "weights.npy", "allow_pickle": True},
+            {"_target_": "numpy.load", "_args_": ["weights.npy", None, True]},
+        ],
+        ids=["kwarg_allow_pickle", "positional_allow_pickle"],
+    )
+    def test_numpy_load_with_pickle_enabled_is_dangerous(
+        self,
+        tmp_path: Path,
+        model_config: dict[str, Any],
+    ) -> None:
+        """numpy.load becomes a pickle sink only when allow_pickle is enabled."""
+        path = _create_nemo_file(tmp_path, {"model": model_config})
+
+        result = NemoScanner().scan(str(path))
+
+        cve_checks = [
+            check
+            for check in result.checks
+            if check.name == "CVE-2025-23304: Dangerous Hydra _target_" and check.details.get("target") == "numpy.load"
+        ]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+
+    def test_skops_load_target_is_review_only(self, tmp_path: Path) -> None:
+        """skops.io.load should not be CVE-critical without vulnerable content context."""
+        config = {"model": {"_target_": "skops.io.load", "file": "model.skops"}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert not [
+            check
+            for check in result.checks
+            if check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.details.get("target") == "skops.io.load"
+        ]
+        review_checks = [
+            check
+            for check in result.checks
+            if check.name == "Hydra _target_ Review" and check.details.get("target") == "skops.io.load"
+        ]
+        assert len(review_checks) == 1
+        assert review_checks[0].severity == IssueSeverity.INFO
 
     def test_torch_load_target_fails_aggregate_scan(self, tmp_path: Path) -> None:
         """A NeMo config using torch.load should produce a security failure, not exit 0."""
