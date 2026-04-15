@@ -40,8 +40,10 @@ SUSPICIOUS_JSON_PATTERNS = [
     (re.compile(r"__import__", re.IGNORECASE), "Dynamic import in JSON"),
     (re.compile(r"\\x[0-9a-fA-F]{2}", re.IGNORECASE), "Hex-encoded data (potential shellcode)"),
 ]
-XGBOOST_JSON_ROUTING_SNIFF_BYTES = 64 * 1024
 XGBOOST_DEFAULT_MAX_FILE_READ_SIZE = 256 * 1024 * 1024
+XGBOOST_JSON_ROUTING_CHUNK_BYTES = 64 * 1024
+_JSON_KEY_MAX_BYTES = 256
+_JSON_WHITESPACE_BYTES = frozenset(b" \t\r\n")
 
 
 def _check_xgboost_available() -> bool:
@@ -59,111 +61,145 @@ def _check_ubjson_available() -> bool:
         return False
 
 
-def _skip_json_whitespace(text: str, index: int) -> int:
-    while index < len(text) and text[index] in " \t\r\n":
-        index += 1
-    return index
-
-
-def _json_string_end(text: str, start: int) -> int | None:
-    if start >= len(text) or text[start] != '"':
+def _decode_json_key(raw_key: bytes, key_overflow: bool) -> str | None:
+    """Decode a bounded JSON object key captured with surrounding quotes."""
+    if key_overflow:
         return None
-    index = start + 1
-    while index < len(text):
-        char = text[index]
-        if char == "\\":
-            index += 2
-            continue
-        if char == '"':
-            return index + 1
-        index += 1
-    return None
-
-
-def _skip_json_value_prefix(text: str, start: int) -> int | None:
-    index = start
-    stack: list[str] = []
-    in_string = False
-    while index < len(text):
-        char = text[index]
-        if in_string:
-            if char == "\\":
-                index += 2
-                continue
-            if char == '"':
-                in_string = False
-            index += 1
-            continue
-
-        if char == '"':
-            in_string = True
-        elif char in "[{":
-            stack.append("]" if char == "[" else "}")
-        elif char in "]}":
-            if not stack or stack[-1] != char:
-                return None
-            stack.pop()
-        elif char == "," and not stack:
-            return index + 1
-        elif char == "}" and not stack:
-            return index
-        index += 1
-    return None
-
-
-def _prefix_has_xgboost_json_markers(prefix: bytes) -> bool:
-    """Return True if a bounded JSON prefix has top-level XGBoost markers."""
     try:
-        text = prefix.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return False
+        value = json.JSONDecoder().decode(raw_key.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, str) else None
 
-    index = _skip_json_whitespace(text, 0)
-    if index >= len(text) or text[index] != "{":
-        return False
-    index += 1
 
+def _json_file_has_xgboost_markers(path: str, max_bytes: int) -> bool:
+    """Return True if a bounded stream finds top-level XGBoost JSON markers."""
     found_version = False
     found_learner = False
-    decoder = json.JSONDecoder()
+    bytes_read = 0
+    started = False
+    stack: list[int] = []
+    in_string = False
+    escaped = False
+    collecting_key = False
+    key_overflow = False
+    raw_key = bytearray()
+    expecting_key = False
+    awaiting_colon = False
+    pending_key: str | None = None
+    awaiting_value_for: str | None = None
+    version_array_depth: int | None = None
+    version_array_items = 0
+    version_array_expects_value = False
 
-    while index < len(text):
-        index = _skip_json_whitespace(text, index)
-        if index >= len(text):
-            return False
-        if text[index] == "}":
-            return found_version and found_learner
-        if text[index] == ",":
-            index += 1
-            continue
-
-        key_start = index
-        key_end = _json_string_end(text, key_start)
-        if key_end is None:
-            return False
-        try:
-            key = decoder.decode(text[key_start:key_end])
-        except json.JSONDecodeError:
-            return False
-
-        index = _skip_json_whitespace(text, key_end)
-        if index >= len(text) or text[index] != ":":
-            return False
-        index = _skip_json_whitespace(text, index + 1)
-        if index >= len(text):
-            return False
-
-        if key == "version" and text[index] == "[":
-            found_version = True
-        elif key == "learner" and text[index] == "{":
-            found_learner = True
-        if found_version and found_learner:
+    def record_value_marker(byte: int, key: str) -> bool:
+        nonlocal found_learner, version_array_depth, version_array_items, version_array_expects_value
+        if key == "version" and byte == ord("["):
+            version_array_depth = len(stack) + 1
+            version_array_items = 0
+            version_array_expects_value = True
             return True
+        if key == "learner" and byte == ord("{"):
+            found_learner = True
+        return False
 
-        next_index = _skip_json_value_prefix(text, index)
-        if next_index is None:
-            return False
-        index = next_index
+    with open(path, "rb") as f:
+        initial = f.read(3)
+        if initial != b"\xef\xbb\xbf":
+            f.seek(0)
+
+        while bytes_read < max_bytes:
+            chunk = f.read(min(XGBOOST_JSON_ROUTING_CHUNK_BYTES, max_bytes - bytes_read))
+            if not chunk:
+                break
+            bytes_read += len(chunk)
+
+            for byte in chunk:
+                if in_string:
+                    if collecting_key:
+                        if len(raw_key) < _JSON_KEY_MAX_BYTES:
+                            raw_key.append(byte)
+                        else:
+                            key_overflow = True
+
+                    if escaped:
+                        escaped = False
+                    elif byte == ord("\\"):
+                        escaped = True
+                    elif byte == ord('"'):
+                        in_string = False
+                        if collecting_key:
+                            pending_key = _decode_json_key(bytes(raw_key), key_overflow)
+                            awaiting_colon = True
+                            collecting_key = False
+                            key_overflow = False
+                            expecting_key = False
+                    continue
+
+                if not started:
+                    if byte in _JSON_WHITESPACE_BYTES:
+                        continue
+                    if byte != ord("{"):
+                        return False
+                    started = True
+                    stack.append(ord("}"))
+                    expecting_key = True
+                    continue
+
+                if awaiting_colon:
+                    if byte in _JSON_WHITESPACE_BYTES:
+                        continue
+                    if byte != ord(":"):
+                        return False
+                    awaiting_value_for = pending_key
+                    pending_key = None
+                    awaiting_colon = False
+                    expecting_key = False
+                    continue
+
+                if awaiting_value_for is not None:
+                    if byte in _JSON_WHITESPACE_BYTES:
+                        continue
+                    started_version_array = record_value_marker(byte, awaiting_value_for)
+                    awaiting_value_for = None
+                else:
+                    started_version_array = False
+
+                if version_array_depth is not None and not started_version_array and len(stack) == version_array_depth:
+                    if byte in _JSON_WHITESPACE_BYTES:
+                        continue
+                    if byte == ord("]"):
+                        if version_array_items >= 2:
+                            found_version = True
+                        version_array_depth = None
+                    elif byte == ord(","):
+                        version_array_expects_value = True
+                    elif version_array_expects_value:
+                        version_array_items += 1
+                        version_array_expects_value = False
+                    if found_version and found_learner:
+                        return True
+
+                if byte == ord('"'):
+                    if len(stack) == 1 and expecting_key:
+                        collecting_key = True
+                        raw_key = bytearray(b'"')
+                    in_string = True
+                    escaped = False
+                    continue
+
+                if byte == ord("{"):
+                    stack.append(ord("}"))
+                elif byte == ord("["):
+                    stack.append(ord("]"))
+                elif byte in {ord("}"), ord("]")}:
+                    if not stack or stack[-1] != byte:
+                        return False
+                    if len(stack) == 1:
+                        return found_version and found_learner
+                    stack.pop()
+                elif byte == ord(",") and len(stack) == 1:
+                    expecting_key = True
 
     return False
 
@@ -231,12 +267,9 @@ class XGBoostScanner(BaseScanner):
         This matches what _validate_xgboost_json_schema() checks.
         """
         try:
-            with open(path, "rb") as f:
-                prefix = f.read(XGBOOST_JSON_ROUTING_SNIFF_BYTES + 1)
+            return _json_file_has_xgboost_markers(path, cls.default_max_file_read_size)
         except OSError:
             return False
-
-        return _prefix_has_xgboost_json_markers(prefix[:XGBOOST_JSON_ROUTING_SNIFF_BYTES])
 
     def scan(self, path: str) -> ScanResult:
         """Scan XGBoost model file for security vulnerabilities."""
