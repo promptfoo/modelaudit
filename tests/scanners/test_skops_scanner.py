@@ -3,13 +3,58 @@
 import os
 import zipfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.skops_scanner import SkopsScanner
 
 SAMPLES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "samples")
+
+
+def _make_numeric_npy(element_count: int = 64) -> bytes:
+    header = f"{{'descr': '<f8', 'fortran_order': False, 'shape': ({element_count},), }}"
+    header_bytes = header.encode("latin1")
+    header_len = len(header_bytes) + 1
+    padding_len = (16 - ((10 + header_len) % 16)) % 16
+    padded_header = header_bytes + (b" " * padding_len) + b"\n"
+    return (
+        b"\x93NUMPY\x01\x00" + len(padded_header).to_bytes(2, "little") + padded_header + (b"\x00" * element_count * 8)
+    )
+
+
+def _scan_twice_with_cache(
+    path: Path,
+    cache_dir: Path,
+    *,
+    max_files_in_archive: int | None = None,
+    max_skops_file_size: int | None = None,
+    max_zip_entry_read_size: int | None = None,
+) -> tuple[ModelAuditResultModel, ModelAuditResultModel]:
+    scan_kwargs: dict[str, Any] = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+    if max_files_in_archive is not None:
+        scan_kwargs["max_files_in_archive"] = max_files_in_archive
+    if max_skops_file_size is not None:
+        scan_kwargs["max_skops_file_size"] = max_skops_file_size
+    if max_zip_entry_read_size is not None:
+        scan_kwargs["max_zip_entry_read_size"] = max_zip_entry_read_size
+
+    first = scan_model_directory_or_file(str(path), **scan_kwargs)
+    second = scan_model_directory_or_file(str(path), **scan_kwargs)
+    return first, second
+
+
+def _assert_inconclusive_reason(metadata: Any, reason: str) -> None:
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert reason in metadata.get("scan_outcome_reasons", [])
 
 
 class TestSkopsScannerCanHandle:
@@ -314,8 +359,10 @@ class TestSkopsScannerEdgeCases:
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
 
-        # Should have at least one check about the file
-        assert len(result.checks) > 0
+        assert result.success is False
+        _assert_inconclusive_reason(result.metadata, "skops_not_zip_archive")
+        format_checks = [c for c in result.checks if c.name == "Skops File Format Check"]
+        assert len(format_checks) > 0
 
     def test_handles_deeply_nested_files(self, tmp_path: Path) -> None:
         """Test handling of deeply nested file paths."""
@@ -356,6 +403,7 @@ class TestSkopsScannerEdgeCases:
         result = scanner.scan(str(skops_file))
 
         assert result.success is False
+        _assert_inconclusive_reason(result.metadata, "skops_archive_file_count_limited")
         bomb_checks = [c for c in result.checks if "Archive Bomb" in c.name]
         assert len(bomb_checks) > 0
         assert bomb_checks[0].status == CheckStatus.FAILED
@@ -371,6 +419,7 @@ class TestSkopsScannerEdgeCases:
         result = scanner.scan(str(skops_file))
 
         assert result.success is False
+        _assert_inconclusive_reason(result.metadata, "skops_archive_uncompressed_size_limited")
         size_checks = [c for c in result.checks if "Archive Uncompressed Size Limit" in c.name]
         assert len(size_checks) > 0
         assert size_checks[0].status == CheckStatus.FAILED
@@ -386,13 +435,27 @@ class TestSkopsScannerEdgeCases:
         result = scanner.scan(str(skops_file))
 
         assert result.success is False
-        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "skops_zip_entry_size_limited" in result.metadata["scan_outcome_reasons"]
+        _assert_inconclusive_reason(result.metadata, "skops_zip_entry_size_limited")
         oversized_checks = [c for c in result.checks if c.name == "Skops Oversized ZIP Entry"]
         assert len(oversized_checks) == 1
         assert oversized_checks[0].details["entry"] == "README.md"
         cve_checks = [c for c in result.checks if "CVE-2025-54886" in c.name and c.status == CheckStatus.FAILED]
         assert len(cve_checks) == 0
+
+    def test_oversized_numpy_payload_does_not_mark_skops_incomplete(self, tmp_path: Path) -> None:
+        """Large Skops numeric arrays are covered by nested scanners, not Skops CVE text matching."""
+        skops_file = tmp_path / "oversized_array.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("step/0/content/0.npy", _make_numeric_npy())
+
+        scanner = SkopsScanner(config={"max_zip_entry_read_size": 128, "max_skops_file_size": 10 * 1024 * 1024})
+        result = scanner.scan(str(skops_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        oversized_checks = [c for c in result.checks if c.name == "Skops Oversized ZIP Entry"]
+        assert len(oversized_checks) == 0
 
     def test_oversized_entry_warning_is_emitted_once(self, tmp_path: Path) -> None:
         """Repeated detector passes over one oversized member should emit one incomplete warning."""
@@ -409,6 +472,193 @@ class TestSkopsScannerEdgeCases:
         assert oversized_checks[0].details["entry"] == "payload.bin"
         assert result.success is False
         assert result.metadata["oversized_zip_entries"] == ["payload.bin"]
+
+    def test_oversized_entry_core_exits_one_and_avoids_cache_reuse(self, tmp_path: Path) -> None:
+        """Aggregate scans should preserve fail-closed exit and avoid reusing incomplete outer results."""
+        skops_file = tmp_path / "oversized_readme.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("README.md", "get_model via joblib.load" * 512)
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            first, second = _scan_twice_with_cache(
+                skops_file,
+                cache_dir,
+                max_zip_entry_read_size=128,
+                max_skops_file_size=10 * 1024 * 1024,
+            )
+
+            for result in (first, second):
+                assert result.success is True
+                assert determine_exit_code(result) == 1
+                assert "skops" in result.scanner_names
+                metadata = result.file_metadata[str(skops_file)]
+                _assert_inconclusive_reason(metadata, "skops_zip_entry_size_limited")
+                assert any("Skipped oversized ZIP entry README.md" in str(issue.message) for issue in result.issues)
+
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["cache_hits"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_archive_file_count_limit_core_exits_two_and_avoids_cache_reuse(self, tmp_path: Path) -> None:
+        """Core scans should fail closed and avoid caching when Skops file-count limits stop analysis."""
+        skops_file = tmp_path / "too_many_files.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for index in range(6):
+                zf.writestr(f"file_{index}.bin", b"data")
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            first, second = _scan_twice_with_cache(
+                skops_file,
+                cache_dir,
+                max_files_in_archive=5,
+                max_skops_file_size=10 * 1024 * 1024,
+            )
+
+            for result in (first, second):
+                assert result.success is False
+                assert determine_exit_code(result) == 2
+                metadata = result.file_metadata[str(skops_file)]
+                _assert_inconclusive_reason(metadata, "skops_archive_file_count_limited")
+                assert any("Archive contains 6 files" in str(issue.message) for issue in result.issues)
+
+            stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+            assert stats["cache_hits"] == 0
+            assert stats["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_archive_uncompressed_size_limit_core_exits_two_and_avoids_cache_reuse(self, tmp_path: Path) -> None:
+        """Core scans should fail closed and avoid caching when Skops aggregate size limits stop analysis."""
+        skops_file = tmp_path / "too_large.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("README.md", "A" * 4096)
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            first, second = _scan_twice_with_cache(
+                skops_file,
+                cache_dir,
+                max_skops_file_size=2048,
+            )
+
+            for result in (first, second):
+                assert result.success is False
+                assert determine_exit_code(result) == 2
+                metadata = result.file_metadata[str(skops_file)]
+                _assert_inconclusive_reason(metadata, "skops_archive_uncompressed_size_limited")
+                assert any("uncompressed content exceeds" in str(issue.message) for issue in result.issues)
+
+            stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+            assert stats["cache_hits"] == 0
+            assert stats["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_not_zip_core_exits_one_and_avoids_cache_reuse(self, tmp_path: Path) -> None:
+        """A non-ZIP .skops path is incomplete Skops coverage, not a cacheable clean result."""
+        skops_file = tmp_path / "not_zip.skops"
+        skops_file.write_bytes(b"not a zip archive")
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            first, second = _scan_twice_with_cache(skops_file, cache_dir)
+
+            for result in (first, second):
+                assert result.success is True
+                assert determine_exit_code(result) == 1
+                metadata = result.file_metadata[str(skops_file)]
+                _assert_inconclusive_reason(metadata, "skops_not_zip_archive")
+                assert any("not a ZIP archive" in str(issue.message) for issue in result.issues)
+
+            stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+            assert stats["cache_hits"] == 0
+            assert stats["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_bad_zip_core_exits_two_and_avoids_cache_reuse(self, tmp_path: Path) -> None:
+        """A corrupt ZIP-like .skops path should also fail closed and stay uncached."""
+        skops_file = tmp_path / "bad_zip.skops"
+        skops_file.write_bytes(b"PK\x03\x04not a complete zip")
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            first, second = _scan_twice_with_cache(skops_file, cache_dir)
+
+            for result in (first, second):
+                assert result.success is False
+                assert determine_exit_code(result) == 2
+                metadata = result.file_metadata[str(skops_file)]
+                _assert_inconclusive_reason(metadata, "skops_bad_zip_file")
+                assert any("Invalid ZIP file" in str(issue.message) for issue in result.issues)
+
+            stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+            assert stats["cache_hits"] == 0
+            assert stats["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_oversized_numpy_payload_core_exits_zero_and_still_caches(self, tmp_path: Path) -> None:
+        """Oversized numeric arrays should not become Skops CVE false positives in aggregate scans."""
+        skops_file = tmp_path / "large_array.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("step/0/content/0.npy", _make_numeric_npy())
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            first, second = _scan_twice_with_cache(
+                skops_file,
+                cache_dir,
+                max_zip_entry_read_size=128,
+                max_skops_file_size=10 * 1024 * 1024,
+            )
+
+            for result in (first, second):
+                assert result.success is True
+                assert determine_exit_code(result) == 0
+                metadata = result.file_metadata[str(skops_file)]
+                assert "scan_outcome" not in metadata
+                assert not any("Skipped oversized ZIP entry" in str(issue.message) for issue in result.issues)
+
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["cache_hits"] >= 1
+        finally:
+            reset_cache_manager()
+
+    def test_small_benign_core_scan_still_caches(self, tmp_path: Path) -> None:
+        """Clean Skops scans should still be cacheable."""
+        skops_file = tmp_path / "small_benign.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("README.md", "normal safe model card")
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            first, second = _scan_twice_with_cache(
+                skops_file,
+                cache_dir,
+                max_zip_entry_read_size=128,
+                max_skops_file_size=10 * 1024 * 1024,
+            )
+
+            assert first.success is True
+            assert second.success is True
+            assert determine_exit_code(first) == 0
+            assert determine_exit_code(second) == 0
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["cache_hits"] >= 1
+        finally:
+            reset_cache_manager()
 
     def test_counts_embedded_member_bytes(self, tmp_path: Path) -> None:
         """Embedded member scans should contribute to total bytes_scanned."""

@@ -24,6 +24,10 @@ class SkopsScanner(BaseScanner):
     supported_extensions: ClassVar[list[str]] = [".skops"]
     _OVERSIZED_ENTRY_REASON: ClassVar[str] = "skops_zip_entry_size_limited"
     _OVERSIZED_ENTRY_METADATA_KEY: ClassVar[str] = "oversized_zip_entries"
+    _NOT_ZIP_REASON: ClassVar[str] = "skops_not_zip_archive"
+    _BAD_ZIP_REASON: ClassVar[str] = "skops_bad_zip_file"
+    _FILE_COUNT_LIMIT_REASON: ClassVar[str] = "skops_archive_file_count_limited"
+    _UNCOMPRESSED_SIZE_LIMIT_REASON: ClassVar[str] = "skops_archive_uncompressed_size_limited"
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -31,6 +35,11 @@ class SkopsScanner(BaseScanner):
         self.max_file_size = self.config.get("max_skops_file_size", 500 * 1024 * 1024)  # 500MB
         self.max_files_in_archive = self.config.get("max_files_in_archive", 10000)
         self.max_zip_entry_read_size = self.config.get("max_zip_entry_read_size", 10 * 1024 * 1024)
+
+    @staticmethod
+    def _is_nested_array_payload(filename: str) -> bool:
+        """Return True for Skops numeric payloads covered by nested archive scans."""
+        return os.path.splitext(filename.lower())[1] in {".npy", ".npz"}
 
     def _record_oversized_zip_entry(
         self,
@@ -61,6 +70,10 @@ class SkopsScanner(BaseScanner):
                 "entry_size": file_info.file_size,
                 "max_zip_entry_read_size": self.max_zip_entry_read_size,
             },
+            why=(
+                "The scanner did not inspect this archive member because reading it would exceed the configured "
+                "per-entry limit, so Skops CVE coverage for the archive is incomplete."
+            ),
         )
         mark_archive_scan_incomplete(result, self._OVERSIZED_ENTRY_REASON)
 
@@ -74,7 +87,7 @@ class SkopsScanner(BaseScanner):
     ) -> bytes | None:
         """Read a ZIP entry with a bounded memory limit."""
         if file_info.file_size > self.max_zip_entry_read_size:
-            if result is not None and zip_path is not None:
+            if result is not None and zip_path is not None and not self._is_nested_array_payload(file_info.filename):
                 self._record_oversized_zip_entry(result, zip_path, file_info)
             return None
 
@@ -82,7 +95,7 @@ class SkopsScanner(BaseScanner):
             content = entry.read(self.max_zip_entry_read_size + 1)
 
         if len(content) > self.max_zip_entry_read_size:
-            if result is not None and zip_path is not None:
+            if result is not None and zip_path is not None and not self._is_nested_array_payload(file_info.filename):
                 self._record_oversized_zip_entry(result, zip_path, file_info)
             return None
 
@@ -450,6 +463,7 @@ class SkopsScanner(BaseScanner):
                     location=path,
                     details={"magic_bytes": magic.hex()},
                 )
+                mark_archive_scan_incomplete(result, self._NOT_ZIP_REASON)
                 result.finish(success=False)
                 return result
 
@@ -474,6 +488,7 @@ class SkopsScanner(BaseScanner):
                         },
                         why="Excessive number of files may indicate a decompression bomb attack",
                     )
+                    mark_archive_scan_incomplete(result, self._FILE_COUNT_LIMIT_REASON)
                     result.finish(success=False)
                     return result
 
@@ -502,6 +517,7 @@ class SkopsScanner(BaseScanner):
                             "exhaust memory during scanning."
                         ),
                     )
+                    mark_archive_scan_incomplete(result, self._UNCOMPRESSED_SIZE_LIMIT_REASON)
                     result.finish(success=False)
                     return result
 
@@ -532,6 +548,7 @@ class SkopsScanner(BaseScanner):
                 severity=IssueSeverity.INFO,
                 location=path,
             )
+            mark_archive_scan_incomplete(result, self._BAD_ZIP_REASON)
             result.finish(success=False)
             return result
         except Exception as e:
