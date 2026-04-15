@@ -38,6 +38,20 @@ _TF_METAGRAPH_MIN_BYTES = 8
 _TF_METAGRAPH_MAX_VALIDATE_BYTES = 20 * 1024 * 1024
 _TORCH7_SIGNATURE_READ_BYTES = 4096
 _LIGHTGBM_SIGNATURE_READ_BYTES = 8192
+_ONNX_PROTO_SIGNATURE_READ_BYTES = 1024 * 1024
+_ONNX_MODEL_TOP_LEVEL_TAG_START_BYTES = frozenset(
+    {
+        0x08,  # ir_version
+        0x12,  # producer_name
+        0x1A,  # producer_version
+        0x22,  # domain
+        0x28,  # model_version
+        0x32,  # doc_string
+        0x3A,  # graph
+        0x42,  # opset_import
+        0x72,  # metadata_props
+    }
+)
 _LIGHTGBM_HEADER_MARKERS = (
     "version=",
     "num_class=",
@@ -151,6 +165,212 @@ PROTO0_1_TRIVIAL_LEADING_OPCODES: frozenset[str] = frozenset(
         "SHORT_BINUNICODE",
     },
 )
+
+
+def _read_proto_varint(data: bytes, offset: int, end: int | None = None) -> tuple[int, int] | None:
+    """Read a protobuf varint from bounded data."""
+    limit = len(data) if end is None else min(end, len(data))
+    value = 0
+    shift = 0
+    cursor = offset
+    while cursor < limit and cursor - offset < 10:
+        byte = data[cursor]
+        cursor += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, cursor
+        shift += 7
+    return None
+
+
+def _has_onnx_model_tag_start(data: bytes) -> bool:
+    """Return True when data starts with a plausible ONNX ModelProto field tag."""
+    return bool(data) and data[0] in _ONNX_MODEL_TOP_LEVEL_TAG_START_BYTES
+
+
+def _read_length_delimited_proto_value(
+    data: bytes,
+    offset: int,
+    end: int | None = None,
+) -> tuple[int, int, int, int] | None:
+    """Return protobuf length-delimited value bounds within the sampled prefix."""
+    limit = len(data) if end is None else min(end, len(data))
+    length_result = _read_proto_varint(data, offset, limit)
+    if length_result is None:
+        return None
+    length, value_start = length_result
+    value_end = value_start + length
+    if value_start > limit:
+        return None
+    return length, value_start, min(value_end, limit), value_end
+
+
+def _skip_proto_value(data: bytes, offset: int, wire_type: int, end: int | None = None) -> int | None:
+    """Skip one protobuf value, returning the next offset when the sample contains it."""
+    limit = len(data) if end is None else min(end, len(data))
+    if wire_type == 0:
+        value_result = _read_proto_varint(data, offset, limit)
+        return None if value_result is None else value_result[1]
+    if wire_type == 1:
+        next_offset = offset + 8
+        return next_offset if next_offset <= limit else None
+    if wire_type == 2:
+        bounds = _read_length_delimited_proto_value(data, offset, limit)
+        if bounds is None:
+            return None
+        _length, _value_start, _sampled_value_end, value_end = bounds
+        return value_end if value_end <= limit else None
+    if wire_type == 5:
+        next_offset = offset + 4
+        return next_offset if next_offset <= limit else None
+    return None
+
+
+def _looks_like_onnx_node_proto_prefix(data: bytes) -> bool:
+    """Return True when a bounded prefix resembles an ONNX NodeProto."""
+    offset = 0
+    fields_seen = 0
+    has_input_or_output = False
+    has_op_type = False
+    while offset < len(data) and fields_seen < 128:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            break
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+
+        if wire_type == 2 and field_number in {1, 2, 4}:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                break
+            length, value_start, value_end, actual_value_end = bounds
+            if field_number in {1, 2} and 0 < length <= 1024:
+                has_input_or_output = True
+            elif field_number == 4 and 0 < length <= 1024:
+                op_type = data[value_start:value_end]
+                has_op_type = bool(op_type) and all(32 <= byte < 127 for byte in op_type)
+            offset = actual_value_end
+        else:
+            next_offset = _skip_proto_value(data, value_offset, wire_type)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        fields_seen += 1
+        if has_input_or_output and has_op_type:
+            return True
+
+    return False
+
+
+def _looks_like_onnx_graph_proto_prefix(data: bytes) -> bool:
+    """Return True when a bounded prefix resembles an ONNX GraphProto."""
+    offset = 0
+    fields_seen = 0
+    has_node = False
+    has_initializer = False
+    value_info_fields: set[int] = set()
+
+    while offset < len(data) and fields_seen < 512:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            break
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+
+        if wire_type == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                break
+            _length, value_start, value_end, actual_value_end = bounds
+            if field_number == 1 and _looks_like_onnx_node_proto_prefix(data[value_start:value_end]):
+                has_node = True
+            elif field_number == 5:
+                has_initializer = True
+            elif field_number in {11, 12, 13}:
+                value_info_fields.add(field_number)
+            offset = actual_value_end
+        else:
+            next_offset = _skip_proto_value(data, value_offset, wire_type)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        fields_seen += 1
+        if (has_node and value_info_fields) or len(value_info_fields) >= 2:
+            return True
+
+    return has_initializer and bool(value_info_fields)
+
+
+def _looks_like_onnx_model_proto_prefix(data: bytes) -> bool:
+    """Return True when a bounded prefix resembles an ONNX ModelProto."""
+    if not _has_onnx_model_tag_start(data):
+        return False
+
+    offset = 0
+    fields_seen = 0
+    has_plausible_ir_version = False
+    has_graph = False
+
+    while offset < len(data) and fields_seen < 512:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            break
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+
+        if field_number == 1 and wire_type == 0:
+            value_result = _read_proto_varint(data, value_offset)
+            if value_result is None:
+                break
+            ir_version, offset = value_result
+            has_plausible_ir_version = 0 < ir_version <= 1000
+        elif field_number == 7 and wire_type == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                break
+            length, value_start, value_end, actual_value_end = bounds
+            if length > 0 and _looks_like_onnx_graph_proto_prefix(data[value_start:value_end]):
+                has_graph = True
+            offset = actual_value_end
+        else:
+            next_offset = _skip_proto_value(data, value_offset, wire_type)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        fields_seen += 1
+        if has_plausible_ir_version and has_graph:
+            return True
+
+    return False
+
+
+def _looks_like_onnx_model_file(path: Path, size: int) -> bool:
+    """Detect real ONNX ModelProto structure with a bounded prefix read."""
+    if size < 4:
+        return False
+    try:
+        with path.open("rb") as handle:
+            prefix = handle.read(min(size, _ONNX_PROTO_SIGNATURE_READ_BYTES))
+    except OSError:
+        return False
+    return _looks_like_onnx_model_proto_prefix(prefix)
+
+
+def _looks_like_onnx_model_candidate_file(path: Path, size: int, header: bytes) -> bool:
+    """Run the bounded ONNX parser only for plausible protobuf tag starts."""
+    return _has_onnx_model_tag_start(header) and _looks_like_onnx_model_file(path, size)
 
 
 def _looks_like_binary_pickle_protocol(header: bytes) -> bool:
@@ -855,10 +1075,11 @@ def detect_format_from_magic_bytes(
             return "ggml"
         case magic if magic.startswith(b"PK"):
             return "zip"
-        case b"\x08\x01\x12\x00":  # ONNX protobuf magic
-            return "onnx"
         case _:
             pass
+
+    if file_path is not None and _looks_like_onnx_model_candidate_file(file_path, file_size, magic4):
+        return "onnx"
 
     # Check longer magic sequences
     match magic8:
@@ -883,9 +1104,6 @@ def detect_format_from_magic_bytes(
     if _looks_like_safetensors_structure(file_path, magic8, file_size):
         return "safetensors"
 
-    # Check for patterns in first 16 bytes
-    if b"onnx" in magic16:
-        return "onnx"
     if b'"__metadata__"' in magic16 and _looks_like_safetensors_structure(file_path, magic8, file_size):
         return "safetensors"
 
@@ -983,7 +1201,7 @@ def detect_file_format_from_magic(path: str) -> str:
     if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
 
-    if magic4 == b"\x08\x01\x12\x00" or b"onnx" in magic16:
+    if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
         return "onnx"
 
     return "unknown"
@@ -1103,7 +1321,7 @@ def detect_file_format(path: str) -> str:
 
     if magic8.startswith(b"\x93NUMPY"):
         return "numpy"
-    if magic4 == b"\x08\x01\x12\x00" or b"onnx" in magic16:
+    if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
         return "onnx"
 
     # Check first 8 bytes for HDF5 magic
@@ -1183,7 +1401,7 @@ def detect_file_format(path: str) -> str:
             return "safetensors"
 
         # Check for ONNX format (protobuf)
-        if magic4 == b"\x08\x01\x12\x00" or b"onnx" in magic16:
+        if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
             return "onnx"
 
         # Otherwise, assume raw binary format (PyTorch weights)

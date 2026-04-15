@@ -15,7 +15,7 @@ import pytest
 from modelaudit import core as core_module
 from modelaudit.core import scan_file
 from modelaudit.scanners.base import IssueSeverity, ScanResult
-from tests.helpers import create_mock_gguf, create_mock_pytorch_zip
+from tests.helpers import create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
 
@@ -700,8 +700,9 @@ def test_scan_file_does_not_route_gguf_magic_near_match_to_gguf(tmp_path: Path) 
 
 
 def test_scan_file_routes_misnamed_onnx_by_header(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
     disguised_onnx = tmp_path / "model.payload"
-    disguised_onnx.write_bytes(b"\x08\x01\x12\x00onnx.proto" + b"\x00" * 32)
+    create_mock_onnx(disguised_onnx)
 
     result = scan_file(str(disguised_onnx))
 
@@ -709,13 +710,49 @@ def test_scan_file_routes_misnamed_onnx_by_header(tmp_path: Path) -> None:
 
 
 def test_scan_file_routes_onnx_pb_by_content(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
     onnx_pb = tmp_path / "model.pb"
-    onnx_pb.write_bytes(b"\x00\x00\x00\x00onnx.proto" + b"\x00" * 32)
+    create_mock_onnx(onnx_pb)
 
     result = scan_file(str(onnx_pb))
 
     assert result.scanner_name == "onnx"
     assert not any(check.name == "Format Validation" for check in result.checks)
+
+
+def test_scan_file_detects_malicious_onnx_pb_by_content(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    onnx_pb = tmp_path / "malicious.pb"
+    create_mock_onnx(onnx_pb, op_type="PythonOp")
+
+    result = scan_file(str(onnx_pb))
+
+    assert result.scanner_name == "onnx"
+    assert not any(check.name == "Format Validation" for check in result.checks)
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
+
+
+def test_scan_file_does_not_route_incidental_onnx_pb_string(tmp_path: Path) -> None:
+    near_match = tmp_path / "metadata.pb"
+    near_match.write_bytes(bytes([0x0A, 0x04]) + b"onnx" + b"\x00" * 16)
+
+    result = scan_file(str(near_match))
+
+    assert result.scanner_name != "onnx"
+    assert not any(check.name == "Python Operator Detection" for check in result.checks)
+
+
+def test_scan_file_ignores_benign_onnx_token_near_match(tmp_path: Path) -> None:
+    near_match = tmp_path / "note.payload"
+    near_match.write_bytes(b"this documentation mentions onnx but is not a model")
+
+    result = scan_file(str(near_match))
+
+    assert result.scanner_name == "unknown"
+    assert result.issues == []
 
 
 def test_scan_file_routes_misnamed_numpy_by_header(tmp_path: Path) -> None:

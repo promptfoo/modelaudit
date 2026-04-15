@@ -153,6 +153,27 @@ def create_mock_gguf(path: Path, *, version: int = 3) -> Path:
     return path
 
 
+def create_mock_onnx(
+    path: Path,
+    *,
+    op_type: str = "Relu",
+    domain: str = "",
+    tensor_shape: tuple[int, ...] = (1,),
+) -> Path:
+    """Create a small ONNX model for routing and scanner tests."""
+    import onnx
+    from onnx import TensorProto, helper
+
+    shape = list(tensor_shape) or [1]
+    x_value = helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)
+    y_value = helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)
+    node = helper.make_node(op_type, ["input"], ["output"], domain=domain, name="node")
+    graph = helper.make_graph([node], "graph", [x_value], [y_value])
+    model = helper.make_model(graph)
+    onnx.save(model, str(path))
+    return path
+
+
 def create_mock_manifest(path: Path, content: dict[str, Any] | None = None) -> Path:
     """Create a mock model manifest JSON file.
 

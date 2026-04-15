@@ -23,6 +23,7 @@ from modelaudit.scanners.archive_dispatch import (
 )
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.zip_scanner import ZipScanner
+from tests.helpers import create_mock_onnx
 
 
 def test_rewrite_extracted_member_location_preserves_scanner_specific_suffix_policy() -> None:
@@ -796,9 +797,11 @@ class TestZipScanner:
 
     def test_nested_member_routes_misnamed_onnx_by_header(self, tmp_path: Path) -> None:
         """A model header should route nested members even when their suffix is generic."""
+        pytest.importorskip("onnx")
         archive_path = tmp_path / "outer.zip"
+        onnx_path = create_mock_onnx(tmp_path / "model.onnx")
         with zipfile.ZipFile(archive_path, "w") as archive:
-            archive.writestr("model.payload", b"\x08\x01\x12\x00onnx.proto" + b"\x00" * 32)
+            archive.writestr("model.payload", onnx_path.read_bytes())
 
         result = self.scanner.scan(str(archive_path))
 

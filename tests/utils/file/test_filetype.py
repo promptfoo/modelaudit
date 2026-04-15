@@ -24,6 +24,7 @@ from modelaudit.utils.file.detection import (
     validate_file_type,
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
+from tests.helpers import create_mock_onnx
 from tests.helpers.file_creators import create_v7_tar_archive
 
 
@@ -220,10 +221,32 @@ def test_detect_file_format_coreml_validation_passthrough(tmp_path: Path) -> Non
 
 def test_detect_file_format_onnx_pb_content_hint_preempts_protobuf_extension(tmp_path: Path) -> None:
     """ONNX protobuf payloads renamed to .pb should route to ONNX, not TensorFlow protobuf."""
+    pytest.importorskip("onnx")
     model_path = tmp_path / "model.pb"
-    model_path.write_bytes(b"\x00\x00\x00\x00onnx.proto" + b"\x00" * 32)
+    create_mock_onnx(model_path)
 
     assert detect_file_format(str(model_path)) == "onnx"
+    assert detect_file_format_from_magic(str(model_path)) == "onnx"
+    assert validate_file_type(str(model_path)) is True
+
+
+def test_detect_file_format_rejects_incidental_onnx_pb_string(tmp_path: Path) -> None:
+    """A generic protobuf string value mentioning ONNX must not route as ONNX."""
+    model_path = tmp_path / "metadata.pb"
+    model_path.write_bytes(bytes([0x0A, 0x04]) + b"onnx" + b"\x00" * 16)
+
+    assert detect_file_format(str(model_path)) == "protobuf"
+    assert detect_file_format_from_magic(str(model_path)) == "unknown"
+    assert validate_file_type(str(model_path)) is True
+
+
+def test_detect_file_format_rejects_benign_onnx_token_near_match(tmp_path: Path) -> None:
+    """Plain text mentioning ONNX must not route to the ONNX scanner."""
+    model_path = tmp_path / "note.payload"
+    model_path.write_bytes(b"this documentation mentions onnx but is not a model")
+
+    assert detect_file_format(str(model_path)) == "unknown"
+    assert detect_file_format_from_magic(str(model_path)) == "unknown"
     assert validate_file_type(str(model_path)) is True
 
 
