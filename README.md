@@ -132,13 +132,13 @@ pip install "modelaudit[all]"
 # Core only (pickle, numpy, archives)
 pip install modelaudit
 
-# Specific frameworks
+# Specific frameworks (TensorFlow runtime extra installs on Python 3.11-3.12)
 pip install "modelaudit[tensorflow,pytorch,h5,onnx,safetensors]"
 
 # CI/CD environments
 pip install "modelaudit[all-ci]"
 
-# Add TensorFlow only when you need TensorFlow-dependent checkpoint or weight analysis
+# On Python 3.11-3.12, add TensorFlow only when you need runtime-dependent checkpoint or weight analysis
 pip install "modelaudit[all,tensorflow]"
 
 # Docker

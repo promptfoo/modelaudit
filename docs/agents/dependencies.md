@@ -21,7 +21,7 @@ ModelAudit uses optional dependencies to keep the base installation lightweight:
 | `joblib`      | `joblib`, `scikit-learn`               | Joblib/sklearn ecosystem compatibility                                           |
 | `flax`        | no extra package (uses base `msgpack`) | Flax/JAX msgpack checkpoint support                                              |
 | `tflite`      | `tflite`                               | TensorFlow Lite parsing                                                          |
-| `tensorflow`  | `tensorflow`                           | Optional TF runtime-dependent paths (for example checkpoint inspection)          |
+| `tensorflow`  | `tensorflow`                           | Optional TF runtime-dependent paths on Python 3.11-3.12                          |
 | `xgboost`     | `xgboost`, `py-ubjson`                 | XGBoost UBJ/full validation paths                                                |
 | `mlflow`      | `mlflow`                               | MLflow registry source support                                                   |
 | `sevenzip`    | `py7zr`                                | 7z archive scanner                                                               |
@@ -52,21 +52,22 @@ protobuf stubs compiled from TensorFlow's `.proto` files.
 - Checkpoint reading (`tf.train.list_variables`, `tf.train.load_variable`)
 - Weight distribution analysis on checkpoints
 
-Most users don't need to install TensorFlow at all.
+Most users don't need to install TensorFlow at all. When they do, the packaged
+TensorFlow runtime extra is available on Python 3.11-3.12.
 
 ## Installation
 
 ```bash
-# With pip
+# With pip (TensorFlow runtime extra installs on Python 3.11-3.12)
 pip install "modelaudit[tensorflow,pytorch,h5]"
 
-# With uv (development)
+# With uv (development; TensorFlow runtime extra installs on Python 3.11-3.12)
 uv sync --extra tensorflow --extra pytorch --extra h5
 
 # Broad portable dependencies
 uv sync --extra all
 
-# Add TensorFlow runtime-dependent paths when needed
+# Add TensorFlow runtime-dependent paths when needed on Python 3.11-3.12
 uv sync --extra all --extra tensorflow
 ```
 
