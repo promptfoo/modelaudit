@@ -359,25 +359,28 @@ fn pickle_prefix_has_structured_opcodes(value: &[u8], allow_truncated: bool) -> 
     let mut stack_depth = 0usize;
     let mut mark_depths = Vec::new();
     let mut parsed_count = 0usize;
+    let mut saw_probe_anchor = false;
     while index < value.len() && parsed_count < 4 {
         let parsed = match parse_opcode(value, index, value.len()) {
             Ok(parsed) => parsed,
             Err(_) => {
-                return allow_truncated
-                    && parsed_count > 0
-                    && value.get(index).is_some_and(is_pickle_opcode_byte)
+                if allow_truncated {
+                    return parsed_count > 0 && value.get(index).is_some_and(is_pickle_opcode_byte);
+                }
+                return saw_probe_anchor && parsed_count >= 2;
             }
         };
         if !validate_pickle_stack_effect(&parsed, &mut stack_depth, &mut mark_depths) {
             return false;
         }
+        saw_probe_anchor |= is_structured_nested_probe_anchor(parsed.name);
         parsed_count += 1;
         index = parsed.next;
         if parsed.name == "STOP" {
-            return stack_depth > 0;
+            return stack_depth > 0 && (allow_truncated || saw_probe_anchor);
         }
     }
-    parsed_count >= 2 && stack_depth > 0
+    parsed_count >= 2 && stack_depth > 0 && (allow_truncated || saw_probe_anchor)
 }
 
 fn is_pickle_opcode_byte(byte: &u8) -> bool {
@@ -426,6 +429,24 @@ fn is_pickle_opcode_byte(byte: &u8) -> bool {
             | b'u'
             | b'}'
             | 0x80..=0x98
+    )
+}
+
+fn is_structured_nested_probe_anchor(name: &str) -> bool {
+    matches!(
+        name,
+        "GLOBAL"
+            | "STACK_GLOBAL"
+            | "EXT1"
+            | "EXT2"
+            | "EXT4"
+            | "REDUCE"
+            | "NEWOBJ"
+            | "NEWOBJ_EX"
+            | "OBJ"
+            | "BUILD"
+            | "PERSID"
+            | "BINPERSID"
     )
 }
 

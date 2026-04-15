@@ -702,6 +702,55 @@ def test_pickle_report_to_scan_result_fails_closed_for_raw_nested_truncation_not
     assert notice_check.message == "Nested pickle payload exceeds configured deep-scan byte limit"
 
 
+def test_pickle_report_to_scan_result_fails_closed_for_nested_probe_limit_notice() -> None:
+    report = PickleReport(
+        source="probe-limit.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="Nested pickle probe candidate limit exceeded",
+                severity=Severity.CRITICAL,
+                location="probe-limit.pkl (pos 16)",
+                rule_code="S213",
+                details={"analysis_incomplete": True, "max_nested_payload_probes": 64},
+            ),
+        ),
+        notices=(
+            Notice(
+                message="Nested pickle probe candidate limit exceeded",
+                severity=Severity.INFO,
+                location="probe-limit.pkl (pos 16)",
+                code="nested_probe_limit",
+                details={"analysis_incomplete": True, "max_nested_payload_probes": 64},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["nested_probe_limit"]
+    assert result.metadata["analysis_incomplete"] is True
+    finding_issue = next(
+        issue
+        for issue in result.issues
+        if issue.message == "Nested pickle probe candidate limit exceeded" and issue.rule_code == "S213"
+    )
+    assert finding_issue.severity == IssueSeverity.CRITICAL
+    assert finding_issue.details["analysis_incomplete"] is True
+    notice_check = next(
+        check
+        for check in result.checks
+        if check.name == "Standalone Pickle Notice"
+        and check.status.value == "failed"
+        and check.rule_code == "S902"
+        and check.details["pickle_notice_code"] == "nested_probe_limit"
+    )
+    assert notice_check.message == "Nested pickle probe candidate limit exceeded"
+
+
 def test_pickle_report_to_scan_result_fails_closed_for_nested_incomplete_notice() -> None:
     report = PickleReport(
         source="nested-incomplete.pkl",

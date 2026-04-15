@@ -84,6 +84,10 @@ def _binary_opcode_os_system_reduce_payload() -> bytes:
     return _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93" + _short_binunicode(b"true") + b"\x85R."
 
 
+def _binary_opcode_stack_global_probe_decoy() -> bytes:
+    return _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93Z"
+
+
 @pytest.fixture
 def parity_payloads() -> dict[str, tuple[bytes, ScanOptions | None]]:
     nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
@@ -213,6 +217,40 @@ def test_rust_engine_detects_binary_opcode_nested_payload_without_proto(payload:
     )
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param(
+            pickle.dumps({"blob": b"K\x00." * 80}, protocol=4),
+            id="raw-scalar-pickle-fragments",
+        ),
+        pytest.param(
+            pickle.dumps({"blob": base64.b64encode(b"K\x00." * 80).decode("ascii")}, protocol=4),
+            id="base64-scalar-pickle-fragments",
+        ),
+        pytest.param(
+            pickle.dumps({"blob": "prefix:" + base64.b64encode(b"K\x00." * 80).decode("ascii")}, protocol=4),
+            id="prefixed-base64-scalar-pickle-fragments",
+        ),
+        pytest.param(
+            pickle.dumps({"blob": binascii.hexlify(b"K\x00." * 80).decode("ascii")}, protocol=4),
+            id="hex-scalar-pickle-fragments",
+        ),
+        pytest.param(
+            pickle.dumps({"blob": "prefix:" + binascii.hexlify(b"K\x00." * 80).decode("ascii")}, protocol=4),
+            id="prefixed-hex-scalar-pickle-fragments",
+        ),
+    ],
+)
+def test_rust_engine_ignores_data_only_scalar_pickle_near_matches(payload: bytes) -> None:
+    report = scan_bytes(payload, source="scalar-fragment-near-match.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(notice.code == "nested_probe_limit" for notice in report.notices)
+    assert not any(finding.rule_code in {"S213", "S601", "S602"} for finding in report.findings)
+
+
 def test_rust_engine_scans_past_invalid_nested_prefix_decoys() -> None:
     payload = pickle.dumps({"blob": (b"c" * 64) + b"\x80\x04" + _binary_opcode_os_system_reduce_payload()}, protocol=4)
 
@@ -228,15 +266,20 @@ def test_rust_engine_scans_past_invalid_nested_prefix_decoys() -> None:
 
 def test_rust_engine_fails_closed_when_nested_probe_limit_is_exceeded() -> None:
     payload = pickle.dumps(
-        {"blob": (b"K\x00." * 64) + b"\x80\x04" + _binary_opcode_os_system_reduce_payload()}, protocol=4
+        {"blob": (_binary_opcode_stack_global_probe_decoy() * 64) + _binary_opcode_os_system_reduce_payload()},
+        protocol=4,
     )
 
     report = scan_bytes(payload, source="nested-probe-limit.pkl")
 
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert any(finding.rule_code == "S213" for finding in report.findings)
-    assert any(notice.code == "nested_probe_limit" for notice in report.notices)
+    probe_limit_finding = next(finding for finding in report.findings if finding.rule_code == "S213")
+    probe_limit_notice = next(notice for notice in report.notices if notice.code == "nested_probe_limit")
+    assert probe_limit_finding.message == "Nested pickle probe candidate limit exceeded"
+    assert probe_limit_notice.message == "Nested pickle probe candidate limit exceeded"
+    assert probe_limit_finding.details["analysis_incomplete"] is True
+    assert probe_limit_notice.details["analysis_incomplete"] is True
 
 
 def test_rust_engine_scans_parity_payloads(parity_payloads: dict[str, tuple[bytes, ScanOptions | None]]) -> None:
