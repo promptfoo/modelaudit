@@ -143,6 +143,7 @@ _OFFICE_ARCHIVE_MARKER_FILES: frozenset[str] = frozenset(
         "ppt/presentation.xml",
     }
 )
+_ZIP_LOCAL_FILE_SIGNATURES: tuple[bytes, ...] = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 _MODEL_ARCHIVE_SIGNAL_BASENAMES: frozenset[str] = frozenset(
     {
         "pytorch_model.bin",
@@ -179,8 +180,8 @@ def _get_candidate_extensions(filename: str) -> list[str]:
     return candidates
 
 
-def _zip_member_has_scannable_binary_signal(archive: zipfile.ZipFile, member: zipfile.ZipInfo) -> bool:
-    """Return whether a normally low-signal binary member has model-like content."""
+def _zip_member_has_scannable_binary_signal(archive: zipfile.ZipFile, member: zipfile.ZipInfo) -> bool | None:
+    """Return whether a low-signal binary member is model-like, or None if unknown."""
     member_ext = Path(member.filename).suffix.lower()
     if member_ext not in _MODEL_ARCHIVE_BINARY_SIGNAL_EXTENSIONS or member.file_size <= 0:
         return False
@@ -196,9 +197,9 @@ def _zip_member_has_scannable_binary_signal(archive: zipfile.ZipFile, member: zi
             sample = member_file.read(min(member.file_size, PROTO0_1_MAX_PROBE_BYTES))
     except Exception as exc:
         logger.debug("Binary member sniffing failed for %s: %s", member.filename, exc)
-        return False
+        return None
 
-    if len(sample) >= 4 and sample[:4].startswith(b"PK"):
+    if sample.startswith(_ZIP_LOCAL_FILE_SIGNATURES):
         return True
     if _looks_like_binary_pickle_protocol(sample[:4]):
         return True
@@ -211,8 +212,7 @@ def _has_scannable_content(path: str) -> bool:
         return False
 
     try:
-        from .detection import detect_file_format_for_skip_filter
-        from .detection import is_keras_zip_archive
+        from .detection import detect_file_format_for_skip_filter, is_keras_zip_archive
 
         detected_format = detect_file_format_for_skip_filter(path)
         if detected_format == "unknown":
@@ -289,7 +289,10 @@ def _has_scannable_content(path: str) -> bool:
                 if member_basename in _MODEL_ARCHIVE_SIGNAL_BASENAMES:
                     return True
 
-                if _zip_member_has_scannable_binary_signal(archive, member):
+                binary_signal = _zip_member_has_scannable_binary_signal(archive, member)
+                if binary_signal is None:
+                    return True
+                if binary_signal:
                     return True
 
             if has_keras_config and has_keras_marker:

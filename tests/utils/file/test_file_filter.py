@@ -32,6 +32,35 @@ def _build_lightgbm_text() -> str:
     )
 
 
+def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
+    """Patch a ZIP member CRC so reading the member raises BadZipFile."""
+    with zipfile.ZipFile(path) as archive:
+        info = archive.getinfo(member_name)
+        bad_crc = ((info.CRC + 1) & 0xFFFFFFFF).to_bytes(4, "little")
+        local_offset = info.header_offset
+
+    data = bytearray(path.read_bytes())
+    assert data[local_offset : local_offset + 4] == b"PK\x03\x04"
+    data[local_offset + 14 : local_offset + 18] = bad_crc
+
+    member_name_bytes = member_name.encode("utf-8")
+    central_offset = 0
+    while True:
+        central_offset = data.find(b"PK\x01\x02", central_offset)
+        assert central_offset >= 0
+        name_length = int.from_bytes(data[central_offset + 28 : central_offset + 30], "little")
+        extra_length = int.from_bytes(data[central_offset + 30 : central_offset + 32], "little")
+        comment_length = int.from_bytes(data[central_offset + 32 : central_offset + 34], "little")
+        name_start = central_offset + 46
+        name_end = name_start + name_length
+        if data[name_start:name_end] == member_name_bytes:
+            data[central_offset + 16 : central_offset + 20] = bad_crc
+            break
+        central_offset = name_end + extra_length + comment_length
+
+    path.write_bytes(data)
+
+
 class TestFileFilter:
     """Test file filtering functionality."""
 
@@ -218,6 +247,28 @@ class TestFileFilter:
 
         assert should_skip_file(str(docx_path))
 
+    def test_docx_with_embedded_pk_near_match_bin_remains_skipped(self, tmp_path: Path) -> None:
+        """PK-prefixed non-ZIP OLE binaries must not promote Office documents."""
+        docx_path = tmp_path / "embedded-pk-near-match.docx"
+        with zipfile.ZipFile(docx_path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types></Types>")
+            archive.writestr("word/document.xml", "<w:document></w:document>")
+            archive.writestr("word/embeddings/oleObject1.bin", b"PKNOPE embedded-ole")
+
+        assert should_skip_file(str(docx_path))
+
+    def test_docx_with_unreadable_embedded_pickle_bin_is_preserved(self, tmp_path: Path) -> None:
+        """Unreadable model-like .bin members must preserve Office ZIPs for full scanning."""
+        docx_path = tmp_path / "embedded-corrupt.docx"
+        member_name = "word/embeddings/oleObject1.bin"
+        with zipfile.ZipFile(docx_path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types></Types>")
+            archive.writestr("word/document.xml", "<w:document></w:document>")
+            archive.writestr(member_name, pickle.dumps({"safe": True}, protocol=4))
+        _corrupt_zip_member_crc(docx_path, member_name)
+
+        assert not should_skip_file(str(docx_path))
+
     def test_docx_with_embedded_pickle_bin_bypasses_extension_skip(self, tmp_path: Path) -> None:
         """Office ZIPs with model-like .bin payloads should survive prefiltering."""
         docx_path = tmp_path / "embedded-model.docx"
@@ -236,6 +287,15 @@ class TestFileFilter:
             archive.writestr("config.json", json.dumps(config))
 
         assert not should_skip_file(str(keras_zip))
+
+    def test_generic_config_zip_with_skipped_extension_remains_skipped(self, tmp_path: Path) -> None:
+        """Generic config.json members must not promote arbitrary skipped-suffix ZIPs."""
+        config_zip = tmp_path / "settings.jpg"
+        config = {"name": "not-a-keras-model", "config": {"theme": "light"}}
+        with zipfile.ZipFile(config_zip, "w") as archive:
+            archive.writestr("config.json", json.dumps(config))
+
+        assert should_skip_file(str(config_zip))
 
     def test_docx_like_zip_remains_skipped_when_office_markers_appear_late(self, tmp_path: Path) -> None:
         """Office ZIP detection should not depend on member order within the sniff budget."""

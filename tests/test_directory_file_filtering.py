@@ -15,6 +15,35 @@ import pytest
 from modelaudit.core import _is_huggingface_cache_file, scan_model_directory_or_file
 
 
+def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
+    """Patch a ZIP member CRC so full scanning sees a malformed entry."""
+    with zipfile.ZipFile(path) as archive:
+        info = archive.getinfo(member_name)
+        bad_crc = ((info.CRC + 1) & 0xFFFFFFFF).to_bytes(4, "little")
+        local_offset = info.header_offset
+
+    data = bytearray(path.read_bytes())
+    assert data[local_offset : local_offset + 4] == b"PK\x03\x04"
+    data[local_offset + 14 : local_offset + 18] = bad_crc
+
+    member_name_bytes = member_name.encode("utf-8")
+    central_offset = 0
+    while True:
+        central_offset = data.find(b"PK\x01\x02", central_offset)
+        assert central_offset >= 0
+        name_length = int.from_bytes(data[central_offset + 28 : central_offset + 30], "little")
+        extra_length = int.from_bytes(data[central_offset + 30 : central_offset + 32], "little")
+        comment_length = int.from_bytes(data[central_offset + 32 : central_offset + 34], "little")
+        name_start = central_offset + 46
+        name_end = name_start + name_length
+        if data[name_start:name_end] == member_name_bytes:
+            data[central_offset + 16 : central_offset + 20] = bad_crc
+            break
+        central_offset = name_end + extra_length + comment_length
+
+    path.write_bytes(data)
+
+
 class TestDirectoryFileFiltering:
     """Test directory scanning with file filtering."""
 
@@ -253,6 +282,35 @@ class TestDirectoryFileFiltering:
 
         assert results["files_scanned"] == 0
 
+    def test_docx_with_embedded_pk_near_match_bin_remains_skipped(self, tmp_path: Path) -> None:
+        """PK-prefixed non-ZIP OLE binaries should not survive directory prefiltering."""
+        docx_path = tmp_path / "report.docx"
+        with zipfile.ZipFile(docx_path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types></Types>")
+            archive.writestr("word/document.xml", "<w:document></w:document>")
+            archive.writestr("word/embeddings/oleObject1.bin", b"PKNOPE embedded-ole")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
+        assert "zip" not in results.scanner_names
+
+    def test_docx_with_unreadable_embedded_pickle_bin_is_scanned(self, tmp_path: Path) -> None:
+        """Unreadable embedded .bin members should fail open into the ZIP scanner."""
+        docx_path = tmp_path / "report.docx"
+        member_name = "word/embeddings/oleObject1.bin"
+        with zipfile.ZipFile(docx_path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types></Types>")
+            archive.writestr("word/document.xml", "<w:document></w:document>")
+            archive.writestr(member_name, pickle.dumps({"safe": True}, protocol=4))
+        _corrupt_zip_member_crc(docx_path, member_name)
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "zip" in results.scanner_names
+        assert any(member_name in (issue.location or "") for issue in results.issues)
+
     def test_docx_with_embedded_pickle_bin_is_scanned(self, tmp_path: Path) -> None:
         """Model-like .bin payloads in Office ZIP containers should not be hidden by the outer suffix."""
         docx_path = tmp_path / "report.docx"
@@ -285,6 +343,18 @@ class TestDirectoryFileFiltering:
 
         assert results["files_scanned"] == 1
         assert "keras_zip" in results.scanner_names
+
+    def test_generic_config_zip_with_skipped_extension_remains_skipped(self, tmp_path: Path) -> None:
+        """Directory prefilter should not preserve arbitrary config.json ZIPs."""
+        config_zip = tmp_path / "settings.jpg"
+        config = {"name": "not-a-keras-model", "config": {"theme": "light"}}
+        with zipfile.ZipFile(config_zip, "w") as archive:
+            archive.writestr("config.json", json.dumps(config))
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
+        assert "keras_zip" not in results.scanner_names
 
     def test_only_huggingface_bookkeeping_metadata_is_skipped(
         self,
