@@ -533,6 +533,30 @@ def test_scan_file_routes_misnamed_pytorch_zip_by_content(tmp_path: Path) -> Non
     assert any("data.pkl" in (issue.location or "") for issue in result.issues)
 
 
+@pytest.mark.parametrize(
+    ("pickle_member", "storage_member"),
+    [("data.pkl", "data/0"), ("archive/data.pkl", "archive/data/0")],
+)
+def test_scan_file_routes_misnamed_pytorch_zip_with_storage_but_no_metadata(
+    tmp_path: Path,
+    pickle_member: str,
+    storage_member: str,
+) -> None:
+    disguised_torch = tmp_path / f"metadata-stripped-{pickle_member.replace('/', '-')}.jpg"
+    _create_misnamed_zip(
+        disguised_torch,
+        {
+            pickle_member: _build_malicious_pickle(),
+            storage_member: b"tensor-storage",
+        },
+    )
+
+    result = scan_file(str(disguised_torch))
+
+    assert result.scanner_name == "pytorch_zip"
+    assert any(pickle_member in (issue.location or "") for issue in result.issues)
+
+
 @pytest.mark.parametrize("suffix", [".pt", ".pth", ".ckpt", ".bin", ".pkl"])
 def test_scan_file_routes_zip_backed_torch_suffix_collisions_to_pytorch_zip(
     tmp_path: Path,
