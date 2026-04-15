@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **pickle:** restore ModelAudit nested-pickle findings from Rust standalone notices and keep network raw-detector coverage after native pickle findings
 - preserve `S999` unknown-opcode mapping in generic rule fallback
 - **security:** route renamed TFLite FlatBuffers by magic bytes, enforce scanner file-size limits before model reads, and fail closed instead of propagating malformed structure traversal exceptions
 - **onnx:** fail closed on CRITICAL findings, detect `PyFunc` operators and Windows absolute external-data paths, validate external tensor slices with the current ONNX dtype API, and avoid Python-op substring false positives

@@ -28,12 +28,16 @@ _INCONCLUSIVE_NOTICE_CODES = frozenset(
         "unbounded_stream_truncated",
     }
 )
+_NESTED_PAYLOAD_NOTICE_CODES = frozenset({"nested_payload_detected", "encoded_nested_payload_detected"})
 _DEFAULT_SCAN_OPTIONS = ScanOptions()
 _IMPORT_MODULE_ALIASES = {
     "nt": "os",
     "posix": "os",
 }
-_LEGACY_NOTICE_RULE_CODES = dict.fromkeys(_INCONCLUSIVE_NOTICE_CODES, "S902")
+_LEGACY_NOTICE_RULE_CODES = {
+    **dict.fromkeys(_INCONCLUSIVE_NOTICE_CODES, "S902"),
+    "nested_payload_detected": "S213",
+}
 _LEGACY_SCAN_OUTCOME_REASONS = {
     "encoded_nested_payload_truncated": "encoded_nested_payload_truncated",
     "literal_scan_truncated": "literal_scan_truncated",
@@ -220,14 +224,16 @@ def pickle_report_to_scan_result(
             **notice.to_dict()["details"],
         }
         details.setdefault("pickle_notice_code", notice.code)
+        notice_is_nested_payload = notice.code in _NESTED_PAYLOAD_NOTICE_CODES
         result.add_check(
             name="Standalone Pickle Notice",
-            passed=notice.code not in _INCONCLUSIVE_NOTICE_CODES,
+            passed=notice.code not in _INCONCLUSIVE_NOTICE_CODES and not notice_is_nested_payload,
             message=notice.message,
-            severity=_to_issue_severity(notice.severity),
+            severity=IssueSeverity.CRITICAL if notice_is_nested_payload else _to_issue_severity(notice.severity),
             location=notice.location,
             details=details,
-            rule_code=_legacy_rule_code_for_notice(notice.code),
+            why=_legacy_why_for_notice(notice.code),
+            rule_code=_legacy_rule_code_for_notice(notice.code, details),
         )
         if notice.code == "parse_incomplete" and not suppress_parse_failure_escalation:
             parse_failure_details = {
@@ -476,10 +482,21 @@ def _apply_member_context_to_record(
     record.location = f"{member_location} {record.location}"
 
 
-def _legacy_rule_code_for_notice(notice_code: str | None) -> str | None:
+def _legacy_rule_code_for_notice(notice_code: str | None, details: Mapping[str, Any] | None = None) -> str | None:
     if notice_code is None:
         return None
+    if notice_code == "encoded_nested_payload_detected":
+        encoding = details.get("encoding") if details is not None else None
+        return "S601" if encoding == "base64" else "S602"
     return _LEGACY_NOTICE_RULE_CODES.get(notice_code)
+
+
+def _legacy_why_for_notice(notice_code: str | None) -> str | None:
+    if notice_code == "nested_payload_detected":
+        return "Nested pickle payloads can hide code execution paths from shallow scanners."
+    if notice_code == "encoded_nested_payload_detected":
+        return "Encoded nested pickle payloads can hide deserialization gadgets inside metadata strings."
+    return None
 
 
 def _legacy_scan_outcome_reason(notice_code: str | None) -> str:
