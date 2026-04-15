@@ -559,6 +559,44 @@ class TestCVE202523304HydraTarget:
         assert len(cve_checks) > 0, "Should detect subprocess.Popen"
         assert cve_checks[0].details.get("target") == "subprocess.Popen"
 
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "torch.load",
+            "torch.jit.load",
+            "joblib.load",
+            "keras.models.load_model",
+            "numpy.load",
+        ],
+    )
+    def test_ml_deserialization_targets_detected_as_dangerous(self, tmp_path: Path, target: str) -> None:
+        """Hydra targets that deserialize model artifacts should not fall through to INFO review."""
+        config = {"model": {"_target_": target, "f": "weights.bin"}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        cve_checks = [c for c in result.checks if c.name == "CVE-2025-23304: Dangerous Hydra _target_"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["target"] == target
+
+    def test_torch_load_target_fails_aggregate_scan(self, tmp_path: Path) -> None:
+        """A NeMo config using torch.load should produce a security failure, not exit 0."""
+        config = {"model": {"_target_": "torch.load", "f": "payload.pt"}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = scan_model_directory_or_file(
+            str(path),
+            config={"cache_scan_results": False},
+        )
+
+        assert determine_exit_code(result) == 1
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL and "torch.load" in issue.message for issue in result.issues
+        )
+
     def test_top_level_list_target_detected(self, tmp_path: Path) -> None:
         """Top-level YAML lists must be traversed, not mistaken for absent config."""
         path = _create_nemo_file_from_bytes(
