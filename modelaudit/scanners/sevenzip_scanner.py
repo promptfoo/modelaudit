@@ -587,19 +587,8 @@ class SevenZipScanner(BaseScanner):
         return priority
 
     def _probe_extensionless_members(self, archive: Any, file_names: list[str]) -> dict[str, str | None]:
-        """Batch probe disguised members in one pass to avoid repeated archive resets."""
-        probe_factory = _HeaderProbeFactory(
-            limit=self._NESTED_MEMBER_PROBE_BYTES,
-            raise_on_limit=False,
-        )
-
-        try:
-            archive.extract(targets=file_names, factory=probe_factory)
-        finally:
-            with suppress(Exception):
-                archive.reset()
-
-        return {file_name: self._probe_detected_format(probe_factory.get(file_name)) for file_name in file_names}
+        """Probe disguised members while stopping each extraction at the header budget."""
+        return {file_name: self._member_probe_detected_format(archive, file_name) for file_name in file_names}
 
     @classmethod
     def _probe_has_7z_magic(cls, probe: _HeaderProbeBuffer | None) -> bool:
