@@ -58,6 +58,9 @@ _BZIP2_MAGIC = b"BZh"
 _XZ_MAGIC = b"\xfd7zXZ\x00"
 _SEVENZIP_MAGIC = b"7z\xbc\xaf\x27\x1c"
 _LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
+_TAR_USTAR_OFFSET = 257
+_TAR_USTAR_MAGIC_SIZE = 5
+_TAR_USTAR_MIN_BYTES = _TAR_USTAR_OFFSET + _TAR_USTAR_MAGIC_SIZE
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_SIZE = 4
 _TFLITE_MIN_HEADER_SIZE = _TFLITE_MAGIC_OFFSET + _TFLITE_MAGIC_SIZE
@@ -623,6 +626,20 @@ def _is_tar_archive(path: str) -> bool:
         return False
 
 
+def _has_tar_ustar_signature(file_path: Path, size: int | None = None) -> bool:
+    """Return whether an uncompressed TAR ustar signature is present."""
+    try:
+        if size is None:
+            size = file_path.stat().st_size
+        if size < _TAR_USTAR_MIN_BYTES:
+            return False
+        with file_path.open("rb") as f:
+            f.seek(_TAR_USTAR_OFFSET)
+            return f.read(_TAR_USTAR_MAGIC_SIZE).startswith(b"ustar")
+    except OSError:
+        return False
+
+
 def is_zipfile(path: str) -> bool:
     """Check if file is a ZIP by reading the signature."""
     file_path = Path(path)
@@ -853,9 +870,9 @@ def detect_file_format_from_magic(path: str) -> str:
             header = f.read(16)
 
             # Check for TAR format by looking for the "ustar" signature
-            if size >= 262:
-                f.seek(257)
-                if f.read(5).startswith(b"ustar"):
+            if size >= _TAR_USTAR_MIN_BYTES:
+                f.seek(_TAR_USTAR_OFFSET)
+                if f.read(_TAR_USTAR_MAGIC_SIZE).startswith(b"ustar"):
                     return "tar"
             # Reset to read from header for further checks
             f.seek(0)
@@ -932,6 +949,83 @@ def detect_file_format_from_magic(path: str) -> str:
     return "unknown"
 
 
+def _could_start_proto0_or_1_pickle(sample: bytes) -> bool:
+    if not sample:
+        return False
+    if sample[0] in PROTO0_1_START_BYTES:
+        return True
+    return len(sample) >= 2 and sample[0] == ord("#") and sample[1] in PROTO0_1_START_BYTES
+
+
+def detect_file_format_for_skip_filter(path: str) -> str:
+    """Cheap content detection for skipped-extension preservation.
+
+    This intentionally recognizes only content-derived format signals. It avoids
+    extension-based routing and uses one bounded prefix read for common skipped
+    files, while still preserving disguised model/archive payloads for full scans.
+    """
+    file_path = Path(path)
+    if file_path.is_dir():
+        if (file_path / "saved_model.pb").exists():
+            return "tensorflow_directory"
+        return "directory"
+    if not file_path.is_file():
+        return "unknown"
+
+    size = file_path.stat().st_size
+    if size < 4:
+        return "unknown"
+
+    initial_read_size = min(size, max(64, _TAR_USTAR_MIN_BYTES))
+    with file_path.open("rb") as f:
+        prefix = f.read(initial_read_size)
+
+        header = prefix[:16]
+        magic4 = header[:4]
+        magic8 = header[:8]
+        magic16 = header[:16]
+
+        if size >= _TAR_USTAR_MIN_BYTES and len(prefix) >= _TAR_USTAR_MIN_BYTES:
+            tar_magic_start = _TAR_USTAR_OFFSET
+            tar_magic_end = tar_magic_start + _TAR_USTAR_MAGIC_SIZE
+            if prefix[tar_magic_start:tar_magic_end].startswith(b"ustar"):
+                return "tar"
+
+        if _looks_like_tflite_header(magic8):
+            return "tflite"
+        if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
+            return "executorch"
+
+        format_result = detect_format_from_magic_bytes(magic4, magic8, magic16, size, file_path)
+        if format_result == "zip":
+            return "zip"
+        if format_result in {"gzip", "bzip2", "xz", "lz4", "zlib"}:
+            if _is_tar_archive(path):
+                return "tar"
+            return format_result
+        if format_result != "unknown":
+            return format_result
+
+        if _could_start_proto0_or_1_pickle(prefix):
+            max_probe_size = min(size, PROTO0_1_MAX_PROBE_BYTES)
+            if len(prefix) < max_probe_size:
+                prefix += f.read(max_probe_size - len(prefix))
+            if _looks_like_proto0_or_1_pickle(
+                prefix[:PROTO0_1_MAX_PROBE_BYTES],
+                sample_is_prefix=size > min(size, PROTO0_1_MAX_PROBE_BYTES),
+            ):
+                return "pickle"
+
+        if magic16.startswith(b"<?xml"):
+            xml_header = prefix[:64]
+            if b"<net" in xml_header:
+                return "openvino"
+            if b"<PMML" in xml_header:
+                return "pmml"
+
+    return "unknown"
+
+
 def detect_file_format(path: str) -> str:
     """
     Attempt to identify the format:
@@ -999,9 +1093,11 @@ def detect_file_format(path: str) -> str:
         return "unknown"
     if magic8.startswith(_SEVENZIP_MAGIC):
         return "sevenzip"
-    if _is_tar_archive(path):
+    if _has_tar_ustar_signature(file_path, size):
         return "tar"
     if compression_format:
+        if _is_tar_archive(path):
+            return "tar"
         return compression_format
     # Check ZIP magic first (for .pt/.pth files that are actually zips)
     if magic4.startswith(b"PK"):
@@ -1194,12 +1290,9 @@ def detect_format_from_extension(path: FilePath) -> FileFormat:
     return detect_format_from_extension_pattern_matching(file_path.suffix)
 
 
-def validate_file_type(path: str) -> bool:
-    """Validate that a file's magic bytes match its extension-based format."""
+def validate_file_type_with_formats(path: str, header_format: str, ext_format: str) -> bool:
+    """Validate file type using precomputed magic/header and extension formats."""
     try:
-        header_format = detect_file_format_from_magic(path)
-        ext_format = detect_format_from_extension(path)
-
         # If extension format is unknown, we can't validate - assume valid
         if ext_format == "unknown":
             return True
@@ -1395,3 +1488,10 @@ def validate_file_type(path: str) -> bool:
     except Exception:
         # If validation fails due to error, assume valid to avoid breaking scans
         return True
+
+
+def validate_file_type(path: str) -> bool:
+    """Validate that a file's magic bytes match its extension-based format."""
+    header_format = detect_file_format_from_magic(path)
+    ext_format = detect_format_from_extension(path)
+    return validate_file_type_with_formats(path, header_format, ext_format)

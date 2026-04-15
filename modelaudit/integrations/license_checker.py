@@ -2,6 +2,7 @@ import itertools
 import json
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -126,6 +127,28 @@ _COMPILED_LICENSE_PATTERNS = tuple(
 _COMPILED_COPYRIGHT_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE | re.MULTILINE) for pattern in COPYRIGHT_PATTERNS
 )
+_LICENSE_PREFILTER_TERMS = (
+    "license",
+    "spdx",
+    "mit",
+    "apache",
+    "bsd",
+    "gnu",
+    "gpl",
+    "agpl",
+    "lgpl",
+    "creative commons",
+    "cc by",
+    "cc-by",
+    "open data commons",
+    "odbl",
+    "pddl",
+    "bigscience",
+    "responsible ai",
+    "rail",
+    "openrail",
+)
+_COPYRIGHT_PREFILTER_TERMS = ("copyright", "(c)", "©")
 
 
 def _looks_like_binary_header_sample(sample: bytes) -> bool:
@@ -165,6 +188,11 @@ def _read_header_text(file_path: str, max_lines: int) -> str | None:
             return "".join(itertools.islice(f, max_lines))
     except OSError:
         return None
+
+
+def _content_has_prefilter_term(content: str, terms: tuple[str, ...]) -> bool:
+    lowered = content.lower()
+    return any(term in lowered for term in terms)
 
 
 def load_spdx_license_data(download: bool = False) -> dict[str, Any]:
@@ -227,21 +255,9 @@ DATASET_EXTENSIONS = {
 MODEL_EXTENSIONS = COMMON_MODEL_EXTENSIONS
 
 
-def scan_for_license_headers(file_path: str, max_lines: int = 50) -> list[LicenseInfo]:
-    """
-    Scan a file's header for license information.
-
-    Args:
-        file_path: Path to the file to scan
-        max_lines: Maximum number of lines to scan from the beginning
-
-    Returns:
-        List of detected license information
-    """
+def _scan_license_headers_from_content(content: str) -> list[LicenseInfo]:
     licenses: list[LicenseInfo] = []
-
-    content = _read_header_text(file_path, max_lines)
-    if content is None:
+    if not _content_has_prefilter_term(content, _LICENSE_PREFILTER_TERMS):
         return licenses
 
     # Search for license patterns
@@ -261,24 +277,27 @@ def scan_for_license_headers(file_path: str, max_lines: int = 50) -> list[Licens
     return licenses
 
 
-def extract_copyright_notices(
-    file_path: str,
-    max_lines: int = 50,
-) -> list[CopyrightInfo]:
+def scan_for_license_headers(file_path: str, max_lines: int = 50) -> list[LicenseInfo]:
     """
-    Extract copyright notices from a file.
+    Scan a file's header for license information.
 
     Args:
         file_path: Path to the file to scan
-        max_lines: Maximum number of lines to scan
+        max_lines: Maximum number of lines to scan from the beginning
 
     Returns:
-        List of copyright information found
+        List of detected license information
     """
-    copyrights: list[CopyrightInfo] = []
-
     content = _read_header_text(file_path, max_lines)
     if content is None:
+        return []
+
+    return _scan_license_headers_from_content(content)
+
+
+def _extract_copyright_notices_from_content(content: str) -> list[CopyrightInfo]:
+    copyrights: list[CopyrightInfo] = []
+    if not _content_has_prefilter_term(content, _COPYRIGHT_PREFILTER_TERMS):
         return copyrights
 
     # Search for copyright patterns
@@ -297,6 +316,27 @@ def extract_copyright_notices(
                 copyrights.append(copyright_info)
 
     return copyrights
+
+
+def extract_copyright_notices(
+    file_path: str,
+    max_lines: int = 50,
+) -> list[CopyrightInfo]:
+    """
+    Extract copyright notices from a file.
+
+    Args:
+        file_path: Path to the file to scan
+        max_lines: Maximum number of lines to scan
+
+    Returns:
+        List of copyright information found
+    """
+    content = _read_header_text(file_path, max_lines)
+    if content is None:
+        return []
+
+    return _extract_copyright_notices_from_content(content)
 
 
 def find_license_files(directory: str) -> list[str]:
@@ -326,7 +366,11 @@ def find_license_files(directory: str) -> list[str]:
     return license_files
 
 
-def detect_unlicensed_datasets(file_paths: list[str]) -> list[str]:
+def detect_unlicensed_datasets(
+    file_paths: list[str],
+    *,
+    license_info_by_path: Mapping[str, object] | None = None,
+) -> list[str]:
     """
     Detect dataset files that may lack proper licensing.
 
@@ -363,12 +407,29 @@ def detect_unlicensed_datasets(file_paths: list[str]) -> list[str]:
                 has_license = False
 
             if not has_license:
-                # Check if the file itself contains license info
+                # Reuse metadata gathered during the scan when available.
+                if license_info_by_path is not None and file_path in license_info_by_path:
+                    if not license_info_by_path[file_path]:
+                        unlicensed.append(file_path)
+                    continue
+
                 licenses = scan_for_license_headers(file_path, max_lines=10)
                 if not licenses:
                     unlicensed.append(file_path)
 
     return unlicensed
+
+
+def _get_license_info_from_metadata(metadata: Any) -> object | None:
+    if isinstance(metadata, dict):
+        return metadata.get("license_info")
+    if hasattr(metadata, "license_info"):
+        license_info: object | None = metadata.license_info
+        return license_info
+    if hasattr(metadata, "get"):
+        license_info = metadata.get("license_info")
+        return license_info
+    return None
 
 
 def _is_ml_config_file(filename: str) -> bool:
@@ -572,8 +633,14 @@ def check_commercial_use_warnings(scan_results: dict[str, Any] | Any, *, strict:
 
     # Check for datasets with unspecified licenses
     # Only warn if we have multiple files or files that are clearly datasets
-    all_files = list(scan_results.get("file_metadata", {}).keys())
-    unlicensed_datasets = detect_unlicensed_datasets(all_files)
+    file_metadata = scan_results.get("file_metadata", {})
+    all_files = list(file_metadata.keys())
+    license_info_by_path = {}
+    for file_path, metadata in file_metadata.items():
+        license_info = _get_license_info_from_metadata(metadata)
+        if license_info is not None:
+            license_info_by_path[file_path] = license_info
+    unlicensed_datasets = detect_unlicensed_datasets(all_files, license_info_by_path=license_info_by_path)
 
     # Filter out single files that might be tests or simple examples
     significant_unlicensed_datasets = []
@@ -607,7 +674,6 @@ def check_commercial_use_warnings(scan_results: dict[str, Any] | Any, *, strict:
 
     # Check for non-commercial licenses
     nc_files = []
-    file_metadata = scan_results.get("file_metadata", {})
     for file_path, metadata in file_metadata.items():
         licenses = metadata.get("license_info", [])
         for license_info in licenses:
@@ -695,8 +761,10 @@ def collect_license_metadata(file_path: str) -> dict[str, Any]:
     metadata["is_dataset"] = ext in DATASET_EXTENSIONS
     metadata["is_model"] = ext in MODEL_EXTENSIONS
 
+    content = _read_header_text(file_path, max_lines=50)
+
     # Scan for license headers
-    licenses = scan_for_license_headers(file_path)
+    licenses = _scan_license_headers_from_content(content) if content is not None else []
     metadata["license_info"] = [
         {
             "spdx_id": lic.spdx_id,
@@ -709,7 +777,7 @@ def collect_license_metadata(file_path: str) -> dict[str, Any]:
     ]
 
     # Extract copyright notices
-    copyrights = extract_copyright_notices(file_path)
+    copyrights = _extract_copyright_notices_from_content(content) if content is not None else []
     metadata["copyright_notices"] = [
         {
             "holder": cr.holder,

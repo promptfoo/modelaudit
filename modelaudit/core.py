@@ -19,7 +19,7 @@ from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_ini
 from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
 from modelaudit.scanners import _registry
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
-from modelaudit.scanners.base import BaseScanner
+from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.file.detection import (
@@ -31,7 +31,7 @@ from modelaudit.utils.file.detection import (
     is_pytorch_zip_archive,
     is_skops_archive,
     is_torchserve_mar_archive,
-    validate_file_type,
+    validate_file_type_with_formats,
 )
 from modelaudit.utils.file.handlers import (
     scan_advanced_large_file,
@@ -142,6 +142,20 @@ def _calculate_file_hash(file_path: str) -> str:
         for chunk in iter(lambda: f.read(8192), b""):
             hash_sha256.update(chunk)
     return hash_sha256.hexdigest()
+
+
+def _extract_sha256_hash_from_scan_result(file_result: ScanResult) -> str | None:
+    """Return a scanner-computed SHA-256 hash when the scan result includes one."""
+    metadata = getattr(file_result, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+
+    file_hashes = metadata.get("file_hashes")
+    if isinstance(file_hashes, dict):
+        sha256_hash = file_hashes.get("sha256")
+        return sha256_hash if isinstance(sha256_hash, str) and sha256_hash else None
+    sha256_hash = getattr(file_hashes, "sha256", None)
+    return sha256_hash if isinstance(sha256_hash, str) and sha256_hash else None
 
 
 def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
@@ -637,15 +651,17 @@ def scan_model_directory_or_file(
 
                 results.files_scanned += 1
 
-                # Compute hash for single file to enable aggregate hash
-                try:
-                    file_hash = _calculate_file_hash(target)
-                    file_hashes.append(file_hash)
-                except Exception as e:
-                    logger.debug(f"Failed to hash file {target}: {e}")
-                    # Continue without hash - not a critical error
-
                 file_result = scan_file(target, config)
+                file_hash = _extract_sha256_hash_from_scan_result(file_result)
+                if file_hash is None:
+                    # Fall back for scanner paths that do not emit file integrity metadata.
+                    try:
+                        file_hash = _calculate_file_hash(target)
+                    except Exception as e:
+                        logger.debug(f"Failed to hash file {target}: {e}")
+                        file_hash = None
+                if file_hash is not None:
+                    file_hashes.append(file_hash)
 
                 # Use helper function to add scan result to Pydantic model
                 _add_scan_result_to_model(results, scan_metadata, file_result, target)
@@ -930,14 +946,12 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     record_file_type_detected(path, detected_format)
 
     # Validate file type consistency as a security check
-    file_type_valid = validate_file_type(path)
+    magic_format = detect_file_format_from_magic(path)
+    file_type_valid = validate_file_type_with_formats(path, magic_format, ext_format)
     discrepancy_msg = None
-    magic_format = None
 
     if not file_type_valid:
         # File type validation failed - this is a security concern
-        # Get the actual magic bytes format for accurate error message
-        magic_format = detect_file_format_from_magic(path)
         discrepancy_msg = (
             f"File type validation failed: extension indicates {ext_format} but magic bytes "
             f"indicate {magic_format}. This could indicate file spoofing or corruption."
@@ -967,6 +981,12 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     use_large_handler = should_use_large_file_handler(path) and not use_extreme_handler
     progress_callback = config.get("progress_callback")
     timeout = config.get("timeout", 3600)
+    config[FORMAT_VALIDATION_CONFIG_KEY] = {
+        "path": os.path.abspath(path),
+        "header_format": magic_format,
+        "extension_format": ext_format,
+        "file_type_valid": file_type_valid,
+    }
 
     if (
         preferred_scanner

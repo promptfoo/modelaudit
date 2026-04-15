@@ -33,6 +33,7 @@ CRITICAL_SYSTEM_PATHS = [
 DEFAULT_MAX_TAR_ENTRY_SIZE = 1024 * 1024 * 1024
 DEFAULT_MAX_DECOMPRESSED_BYTES = 512 * 1024 * 1024
 DEFAULT_MAX_DECOMPRESSION_RATIO = 250.0
+ARCHIVE_MEMBER_COPY_CHUNK_BYTES = 64 * 1024
 
 _GZIP_MAGIC = b"\x1f\x8b"
 _BZIP2_MAGIC = b"BZh"
@@ -235,7 +236,7 @@ class TarScanner(BaseScanner):
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
                 tmp_path = tmp.name
                 while True:
-                    chunk = fileobj.read(4096)
+                    chunk = fileobj.read(ARCHIVE_MEMBER_COPY_CHUNK_BYTES)
                     if not chunk:
                         break
                     total_size += len(chunk)

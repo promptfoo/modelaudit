@@ -50,6 +50,7 @@ __all__ = [
 ]
 
 TRUSTED_HUGGINGFACE_SOURCES = frozenset({"huggingface"})
+FORMAT_VALIDATION_CONFIG_KEY: Final[str] = "_modelaudit_format_validation"
 _TRUSTED_SOURCE_PROVENANCE_TOKEN: Final[object] = object()
 _WHITELIST_STALE_WARNING_THRESHOLD_DAYS: Final[int] = 90
 _has_logged_stale_whitelist_warning = False
@@ -962,9 +963,20 @@ class BaseScanner(ABC):
                     validate_file_type,
                 )
 
-                if not validate_file_type(path):
-                    header_format = detect_file_format_from_magic(path)
-                    ext_format = detect_format_from_extension(path)
+                format_validation = self.config.get(FORMAT_VALIDATION_CONFIG_KEY)
+                if isinstance(format_validation, dict) and format_validation.get("path") == os.path.abspath(path):
+                    file_type_valid = bool(format_validation.get("file_type_valid", True))
+                    header_format = str(format_validation.get("header_format", "unknown"))
+                    ext_format = str(format_validation.get("extension_format", "unknown"))
+                else:
+                    file_type_valid = validate_file_type(path)
+                    header_format = "unknown"
+                    ext_format = "unknown"
+
+                if not file_type_valid:
+                    if header_format == "unknown" and ext_format == "unknown":
+                        header_format = detect_file_format_from_magic(path)
+                        ext_format = detect_format_from_extension(path)
                     result.add_check(
                         name="File Type Validation",
                         passed=False,

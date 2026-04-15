@@ -145,6 +145,9 @@ class TestFileFilter:
         disguised_pickle = tmp_path / "payload.jpg"
         disguised_pickle.write_bytes(pickle.dumps({"safe": True}))
 
+        disguised_protocol0_pickle = tmp_path / "payload-protocol0.jpg"
+        disguised_protocol0_pickle.write_bytes(pickle.dumps({"safe": True}, protocol=0))
+
         disguised_zip = tmp_path / "archive.jpg"
         with zipfile.ZipFile(disguised_zip, "w") as archive:
             archive.writestr("payload.pkl", pickle.dumps({"safe": True}))
@@ -153,6 +156,7 @@ class TestFileFilter:
         real_image.write_bytes(b"\xff\xd8\xff\xe0" + b"jpeg")
 
         assert not should_skip_file(str(disguised_pickle))
+        assert not should_skip_file(str(disguised_protocol0_pickle))
         assert not should_skip_file(str(disguised_zip))
         assert should_skip_file(str(real_image))
 
@@ -219,6 +223,6 @@ class TestFileFilter:
         def raise_os_error(_path: str) -> str:
             raise OSError("synthetic sniff failure")
 
-        monkeypatch.setattr("modelaudit.utils.file.detection.detect_file_format", raise_os_error)
+        monkeypatch.setattr("modelaudit.utils.file.detection.detect_file_format_for_skip_filter", raise_os_error)
 
         assert not should_skip_file(str(disguised_payload))
