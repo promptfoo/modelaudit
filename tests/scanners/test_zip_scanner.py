@@ -862,6 +862,72 @@ class TestZipScanner:
         assert result.metadata["analysis_incomplete"] is True
         assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
 
+    def test_aggregate_uncompressed_size_limit_fails_before_extraction(self, tmp_path: Path) -> None:
+        """Small entries split across a ZIP should still be bounded by an aggregate budget."""
+        archive_path = tmp_path / "split_budget.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("one.bin", b"A" * 8)
+            archive.writestr("two.bin", b"B" * 8)
+
+        def nested_scan(_path: str, _config: dict[str, Any]) -> ScanResult:
+            raise AssertionError("aggregate size preflight should stop before extracting members")
+
+        result = ZipScanner(
+            config={
+                NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan,
+                "max_entry_size": 8,
+                "max_zip_total_uncompressed_size": 12,
+            },
+        ).scan(str(archive_path))
+
+        assert result.success is False
+        assert result.metadata["archive_uncompressed_size"] == 16
+        assert result.metadata["max_zip_total_uncompressed_size"] == 12
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "ZIP Aggregate Size Limit Check"
+            and check.status == CheckStatus.FAILED
+            and check.details["archive_uncompressed_size"] == 16
+            and check.details["max_zip_total_uncompressed_size"] == 12
+            for check in result.checks
+        )
+
+    def test_aggregate_uncompressed_size_limit_allows_near_match(self, tmp_path: Path) -> None:
+        """Archives at the aggregate budget should continue through normal member scanning."""
+        archive_path = tmp_path / "within_budget.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("one.bin", b"A" * 6)
+            archive.writestr("two.bin", b"B" * 6)
+
+        scanned_entries = 0
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            nonlocal scanned_entries
+            scanned_entries += 1
+            nested_result = ScanResult(scanner_name="test_nested")
+            nested_result.bytes_scanned = Path(path).stat().st_size
+            nested_result.finish(success=True)
+            return nested_result
+
+        result = ZipScanner(
+            config={
+                NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan,
+                "max_entry_size": 8,
+                "max_zip_total_uncompressed_size": 12,
+            },
+        ).scan(str(archive_path))
+
+        assert result.success is True
+        assert scanned_entries == 2
+        assert result.metadata["archive_uncompressed_size"] == 12
+        assert any(
+            check.name == "ZIP Aggregate Size Limit Check"
+            and check.status == CheckStatus.PASSED
+            and check.details["archive_uncompressed_size"] == 12
+            for check in result.checks
+        )
+
     def test_core_zip_partial_nested_scan_without_findings_returns_exit_code_2(self, tmp_path: Path) -> None:
         """A failed nested ZIP member scan with no finding should stay inconclusive in aggregate output."""
         archive_path = tmp_path / "nested_failure.zip"

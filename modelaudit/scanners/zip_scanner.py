@@ -41,6 +41,9 @@ class ZipScanner(BaseScanner):
     MAX_SYMLINK_TARGET_BYTES: ClassVar[int] = 64 * 1024
     MAX_COMPRESSION_RATIO: ClassVar[int] = 100
     MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE: ClassVar[int] = 1024 * 1024
+    DEFAULT_MAX_ENTRY_SIZE: ClassVar[int] = 10 * 1024 * 1024 * 1024
+    DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE: ClassVar[int] = 10 * 1024 * 1024 * 1024
+    UNLIMITED_ARCHIVE_SIZE: ClassVar[int] = 1024 * 1024 * 1024 * 1024
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -70,11 +73,21 @@ class ZipScanner(BaseScanner):
 
     def _get_max_entry_size(self) -> int:
         """Return the configured per-entry extraction limit with a safe unlimited fallback."""
-        default_limit = 10 * 1024 * 1024 * 1024
+        default_limit = self.DEFAULT_MAX_ENTRY_SIZE
         max_entry_size = self.config.get("max_file_size", self.config.get("max_entry_size", default_limit))
         if max_entry_size == 0:
-            return 1024 * 1024 * 1024 * 1024
+            return self.UNLIMITED_ARCHIVE_SIZE
         return self._normalize_positive_int_config(max_entry_size, default_limit)
+
+    def _get_max_total_uncompressed_size(self) -> int:
+        """Return the configured aggregate uncompressed ZIP budget."""
+        configured_limit = self.config.get("max_zip_total_uncompressed_size")
+        if configured_limit is not None:
+            if configured_limit == 0:
+                return self.UNLIMITED_ARCHIVE_SIZE
+            return self._normalize_positive_int_config(configured_limit, self.DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE)
+
+        return self.DEFAULT_MAX_TOTAL_UNCOMPRESSED_SIZE
 
     def _read_symlink_target(self, archive: zipfile.ZipFile, info: zipfile.ZipInfo) -> str:
         """Read a symlink target with a hard cap to avoid materializing large archive members."""
@@ -241,6 +254,8 @@ class ZipScanner(BaseScanner):
             )
 
         with zipfile.ZipFile(path, "r") as z:
+            max_total_uncompressed_size = self._get_max_total_uncompressed_size()
+
             # Check number of entries
             entry_count = len(z.infolist())
             if entry_count > self.max_entries:
@@ -271,7 +286,47 @@ class ZipScanner(BaseScanner):
                     },
                     rule_code=None,  # Passing check
                 )
+
+            archive_uncompressed_size = sum(info.file_size for info in z.infolist() if not info.is_dir())
+            result.metadata["archive_uncompressed_size"] = archive_uncompressed_size
+            result.metadata["max_zip_total_uncompressed_size"] = max_total_uncompressed_size
+            if archive_uncompressed_size > max_total_uncompressed_size:
+                result.add_check(
+                    name="ZIP Aggregate Size Limit Check",
+                    passed=False,
+                    message=(
+                        f"ZIP total uncompressed size exceeds limit "
+                        f"({archive_uncompressed_size} > {max_total_uncompressed_size} bytes); skipping extraction"
+                    ),
+                    severity=IssueSeverity.WARNING,
+                    rule_code="S410",  # Archive bomb
+                    location=path,
+                    details={
+                        "archive_uncompressed_size": archive_uncompressed_size,
+                        "max_zip_total_uncompressed_size": max_total_uncompressed_size,
+                    },
+                )
+                mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
+                result.finish(success=False)
+                return result
+
+            result.add_check(
+                name="ZIP Aggregate Size Limit Check",
+                passed=True,
+                message=(
+                    f"ZIP total uncompressed size ({archive_uncompressed_size}) is within "
+                    f"limit ({max_total_uncompressed_size})"
+                ),
+                location=path,
+                details={
+                    "archive_uncompressed_size": archive_uncompressed_size,
+                    "max_zip_total_uncompressed_size": max_total_uncompressed_size,
+                },
+                rule_code=None,
+            )
+
             # Scan each file in the archive
+            extracted_uncompressed_size = 0
             for info in z.infolist():
                 name = info.filename
                 if not name:
@@ -439,7 +494,13 @@ class ZipScanner(BaseScanner):
                                         raise ValueError(
                                             f"ZIP entry {name} exceeds maximum size of {max_entry_size} bytes",
                                         )
+                                    if extracted_uncompressed_size + total_size > max_total_uncompressed_size:
+                                        raise ValueError(
+                                            "ZIP archive exceeds maximum total uncompressed size of "
+                                            f"{max_total_uncompressed_size} bytes",
+                                        )
                                     tmp.write(chunk)
+                            extracted_uncompressed_size += total_size
 
                         if archive_ext == ".mar" and name.lower().endswith(".py"):
                             mar_python_result = self._scan_mar_python_entry(path, name, tmp_path, total_size)
