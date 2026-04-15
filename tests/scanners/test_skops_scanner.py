@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.skops_scanner import SkopsScanner
 
 SAMPLES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "samples")
@@ -375,8 +375,8 @@ class TestSkopsScannerEdgeCases:
         assert len(size_checks) > 0
         assert size_checks[0].status == CheckStatus.FAILED
 
-    def test_skips_oversized_readme_entry_without_crashing(self, tmp_path: Path) -> None:
-        """Oversized archive entries should be skipped by bounded reads."""
+    def test_oversized_readme_entry_marks_scan_incomplete(self, tmp_path: Path) -> None:
+        """Oversized archive entries should fail closed when bounded reads skip them."""
         skops_file = tmp_path / "oversized_readme.skops"
         with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("README.md", "get_model via joblib.load" * 512)
@@ -385,9 +385,30 @@ class TestSkopsScannerEdgeCases:
         scanner = SkopsScanner(config={"max_zip_entry_read_size": 128, "max_skops_file_size": 10 * 1024 * 1024})
         result = scanner.scan(str(skops_file))
 
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "skops_zip_entry_size_limited" in result.metadata["scan_outcome_reasons"]
+        oversized_checks = [c for c in result.checks if c.name == "Skops Oversized ZIP Entry"]
+        assert len(oversized_checks) == 1
+        assert oversized_checks[0].details["entry"] == "README.md"
         cve_checks = [c for c in result.checks if "CVE-2025-54886" in c.name and c.status == CheckStatus.FAILED]
         assert len(cve_checks) == 0
+
+    def test_oversized_entry_warning_is_emitted_once(self, tmp_path: Path) -> None:
+        """Repeated detector passes over one oversized member should emit one incomplete warning."""
+        skops_file = tmp_path / "oversized_methodnode.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("payload.bin", "MethodNode __getattr__" * 512)
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        scanner = SkopsScanner(config={"max_zip_entry_read_size": 128, "max_skops_file_size": 10 * 1024 * 1024})
+        result = scanner.scan(str(skops_file))
+
+        oversized_checks = [c for c in result.checks if c.name == "Skops Oversized ZIP Entry"]
+        assert len(oversized_checks) == 1
+        assert oversized_checks[0].details["entry"] == "payload.bin"
+        assert result.success is False
+        assert result.metadata["oversized_zip_entries"] == ["payload.bin"]
 
     def test_counts_embedded_member_bytes(self, tmp_path: Path) -> None:
         """Embedded member scans should contribute to total bytes_scanned."""

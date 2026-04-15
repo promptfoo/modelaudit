@@ -12,7 +12,8 @@ import zipfile
 from typing import Any, ClassVar
 
 from ..utils.file.detection import is_skops_archive, read_magic_bytes
-from .base import BaseScanner, IssueSeverity, ScanResult
+from ._archive_outcomes import mark_archive_scan_incomplete
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 
 class SkopsScanner(BaseScanner):
@@ -21,6 +22,8 @@ class SkopsScanner(BaseScanner):
     name = "skops"
     description = "Scans skops files for CVE-2025-54412, CVE-2025-54413, CVE-2025-54886 vulnerabilities"
     supported_extensions: ClassVar[list[str]] = [".skops"]
+    _OVERSIZED_ENTRY_REASON: ClassVar[str] = "skops_zip_entry_size_limited"
+    _OVERSIZED_ENTRY_METADATA_KEY: ClassVar[str] = "oversized_zip_entries"
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -29,15 +32,58 @@ class SkopsScanner(BaseScanner):
         self.max_files_in_archive = self.config.get("max_files_in_archive", 10000)
         self.max_zip_entry_read_size = self.config.get("max_zip_entry_read_size", 10 * 1024 * 1024)
 
-    def _read_zip_entry_safely(self, zip_file: zipfile.ZipFile, file_info: zipfile.ZipInfo) -> bytes | None:
+    def _record_oversized_zip_entry(
+        self,
+        result: ScanResult,
+        zip_path: str,
+        file_info: zipfile.ZipInfo,
+    ) -> None:
+        oversized_entries = result.metadata.setdefault(self._OVERSIZED_ENTRY_METADATA_KEY, [])
+        if not isinstance(oversized_entries, list):
+            oversized_entries = []
+            result.metadata[self._OVERSIZED_ENTRY_METADATA_KEY] = oversized_entries
+
+        if file_info.filename in oversized_entries:
+            return
+
+        oversized_entries.append(file_info.filename)
+        result.add_check(
+            name="Skops Oversized ZIP Entry",
+            passed=False,
+            message=(
+                f"Skipped oversized ZIP entry {file_info.filename} "
+                f"({file_info.file_size} bytes > {self.max_zip_entry_read_size} byte read limit)"
+            ),
+            severity=IssueSeverity.WARNING,
+            location=f"{zip_path}:{file_info.filename}",
+            details={
+                "entry": file_info.filename,
+                "entry_size": file_info.file_size,
+                "max_zip_entry_read_size": self.max_zip_entry_read_size,
+            },
+        )
+        mark_archive_scan_incomplete(result, self._OVERSIZED_ENTRY_REASON)
+
+    def _read_zip_entry_safely(
+        self,
+        zip_file: zipfile.ZipFile,
+        file_info: zipfile.ZipInfo,
+        *,
+        result: ScanResult | None = None,
+        zip_path: str | None = None,
+    ) -> bytes | None:
         """Read a ZIP entry with a bounded memory limit."""
         if file_info.file_size > self.max_zip_entry_read_size:
+            if result is not None and zip_path is not None:
+                self._record_oversized_zip_entry(result, zip_path, file_info)
             return None
 
         with zip_file.open(file_info, "r") as entry:
             content = entry.read(self.max_zip_entry_read_size + 1)
 
         if len(content) > self.max_zip_entry_read_size:
+            if result is not None and zip_path is not None:
+                self._record_oversized_zip_entry(result, zip_path, file_info)
             return None
 
         return content
@@ -90,7 +136,7 @@ class SkopsScanner(BaseScanner):
         # Scan file contents for suspicious patterns
         for file_info in zip_file.filelist:
             try:
-                content = self._read_zip_entry_safely(zip_file, file_info)
+                content = self._read_zip_entry_safely(zip_file, file_info, result=result, zip_path=zip_path)
                 if content is None:
                     continue
                 for binary_pattern in suspicious_binary_patterns:
@@ -157,7 +203,7 @@ class SkopsScanner(BaseScanner):
         # Scan file contents for suspicious patterns
         for file_info in zip_file.filelist:
             try:
-                content = self._read_zip_entry_safely(zip_file, file_info)
+                content = self._read_zip_entry_safely(zip_file, file_info, result=result, zip_path=zip_path)
                 if content is None:
                     continue
                 for binary_pattern in suspicious_binary_patterns:
@@ -204,7 +250,7 @@ class SkopsScanner(BaseScanner):
             # Check for Card/model card files
             if "card" in file_name or "model_card" in file_name or "readme" in file_name:
                 try:
-                    raw_content = self._read_zip_entry_safely(zip_file, file_info)
+                    raw_content = self._read_zip_entry_safely(zip_file, file_info, result=result, zip_path=zip_path)
                     if raw_content is None:
                         continue
 
@@ -247,7 +293,7 @@ class SkopsScanner(BaseScanner):
             for file_name in zip_file.namelist():
                 if "schema" in file_name.lower() or "version" in file_name.lower() or "protocol" in file_name.lower():
                     file_info = zip_file.getinfo(file_name)
-                    raw_content = self._read_zip_entry_safely(zip_file, file_info)
+                    raw_content = self._read_zip_entry_safely(zip_file, file_info, result=result, zip_path=zip_path)
                     if raw_content is None:
                         continue
 
@@ -330,7 +376,7 @@ class SkopsScanner(BaseScanner):
             is_metadata = self._is_skops_metadata(file_info.filename)
 
             try:
-                content = self._read_zip_entry_safely(zip_file, file_info)
+                content = self._read_zip_entry_safely(zip_file, file_info, result=result, zip_path=zip_path)
                 if content is None:
                     continue
                 for pattern in joblib_patterns:
@@ -500,5 +546,7 @@ class SkopsScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=not result.has_errors)
+        result.finish(
+            success=not result.has_errors and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        )
         return result
