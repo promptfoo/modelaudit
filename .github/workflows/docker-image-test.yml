@@ -40,9 +40,11 @@ jobs:
               - 'packages/modelaudit-picklescan/**'
               - 'pyproject.toml'
               - 'uv.lock'
+              - '.github/workflows/docker-image-test.yml'
             full-image:
               - 'Dockerfile.full'
               - 'packages/modelaudit-picklescan/**'
+              - '.github/workflows/docker-image-test.yml'
 
   build-test-lightweight:
     name: Build and Test Lightweight Docker Image
@@ -148,6 +150,10 @@ jobs:
           # Test that the package is properly installed
           docker run --rm modelaudit:full --version
 
+      - name: Test full container runs as non-root
+        run: |
+          docker run --rm modelaudit:full python -c "import os; uid = os.getuid(); print(f'Container UID: {uid}'); assert uid == 10001"
+
       - name: Scan image for vulnerabilities
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
@@ -166,9 +172,9 @@ jobs:
 
       - name: Test full container with ML model scan
         run: |
-          # Create test models for different frameworks
-          docker run --rm -v $(pwd):/data modelaudit:full python -c "import pickle; import numpy as np; pickle.dump({'weights': np.random.rand(10, 10)}, open('/data/test_numpy.pkl', 'wb')); print('Created test model')"
-          # Scan the model
+          # Create the fixture with a root Python image because the full image intentionally runs as UID 10001.
+          docker run --rm -v $(pwd):/data python:3.11-slim@sha256:543d6cace00ffc96bc95d332493bb28a4332c6dd614aab5fcbd649ae8a7953d9 sh -c "python -c \"import pickle; pickle.dump({'test': 'data', 'numbers': [1, 2, 3]}, open('/data/test_numpy.pkl', 'wb')); print('Created test model')\""
+          # Scan the bind-mounted model as the non-root full image.
           docker run --rm -v $(pwd):/data modelaudit:full /data/test_numpy.pkl
 
   docker-ci-success:
