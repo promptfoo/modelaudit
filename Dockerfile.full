@@ -45,5 +45,19 @@ RUN pip install --no-cache-dir \
 
 RUN pip install --no-cache-dir "setuptools>=78.1.1,<82"
 
+ARG UID=10001
+RUN adduser \
+    --disabled-password \
+    --gecos "" \
+    --home "/nonexistent" \
+    --shell "/sbin/nologin" \
+    --no-create-home \
+    --uid "${UID}" \
+    appuser \
+    && mkdir -p /data \
+    && chown appuser:appuser /data
+
+USER appuser
+
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["--help"]
