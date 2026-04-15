@@ -269,6 +269,7 @@ class TestDirectoryFileFiltering:
         assert results["files_scanned"] == 1
         assert "rar" in results.scanner_names
         assert results.file_metadata[str(rar_path)]["scan_outcome"] == "inconclusive"
+        assert any("RAR archive contents were not scanned" in issue.message for issue in results.issues)
         assert determine_exit_code(results) == 2
 
     def test_docx_like_zip_remains_skipped(self, tmp_path: Path) -> None:

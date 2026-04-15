@@ -143,7 +143,7 @@ def test_detect_file_format_by_extension(tmp_path):
         ".rds": "r_serialized",
         ".rda": "r_serialized",
         ".rdata": "r_serialized",
-        ".rar": "rar",
+        ".rar": "unknown",
         ".unknown": "unknown",
     }
 
@@ -253,11 +253,24 @@ def test_detect_file_format_rejects_benign_onnx_token_near_match(tmp_path: Path)
 
 def test_detect_file_format_rar_magic(tmp_path: Path) -> None:
     """RAR archives should be recognized for fail-closed scanner routing."""
-    rar_path = tmp_path / "archive.payload"
-    rar_path.write_bytes(b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32)
+    rar4_path = tmp_path / "archive-rar4.payload"
+    rar4_path.write_bytes(b"Rar!\x1a\x07\x00" + b"\x00" * 32)
+    rar5_path = tmp_path / "archive-rar5.payload"
+    rar5_path.write_bytes(b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32)
 
-    assert detect_file_format(str(rar_path)) == "rar"
-    assert detect_file_format_from_magic(str(rar_path)) == "rar"
+    assert detect_file_format(str(rar4_path)) == "rar"
+    assert detect_file_format_from_magic(str(rar4_path)) == "rar"
+    assert detect_file_format(str(rar5_path)) == "rar"
+    assert detect_file_format_from_magic(str(rar5_path)) == "rar"
+
+
+def test_detect_file_format_rejects_rar_magic_near_match(tmp_path: Path) -> None:
+    """RAR routing should require a complete RAR4/RAR5 signature."""
+    near_match = tmp_path / "archive.payload"
+    near_match.write_bytes(b"Rar!\x1a\x07ZZ" + b"\x00" * 32)
+
+    assert detect_file_format(str(near_match)) == "unknown"
+    assert detect_file_format_from_magic(str(near_match)) == "unknown"
 
 
 def test_detect_format_from_extension_mxnet_symbol(tmp_path: Path) -> None:

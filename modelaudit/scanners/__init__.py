@@ -265,6 +265,20 @@ class ScannerRegistry:
             if scanner_class and scanner_class.can_handle(path):
                 return scanner_class
 
+        try:
+            from modelaudit.utils.file.detection import detect_file_format
+
+            header_format = detect_file_format(path)
+        except Exception:
+            header_format = "unknown"
+
+        header_scanner_id = self.get_scanner_id_for_header_format(header_format)
+        header_scanner_info = self._scanners.get(header_scanner_id or "")
+        if header_scanner_id and header_scanner_info and header_format == header_scanner_id:
+            scanner_class = self._load_scanner(header_scanner_id)
+            if scanner_class and (scanner_class.can_handle(path) or os.path.exists(path)):
+                return scanner_class
+
         # Manifest-like config files sometimes intentionally use generic or
         # missing extensions, so keep the descriptor-owned filename fallback.
         for scanner_id, scanner_info in sorted_scanners:

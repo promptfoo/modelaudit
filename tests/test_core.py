@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from modelaudit import core as core_module
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import scan_file
 from modelaudit.scanners.base import IssueSeverity, ScanResult
 from tests.helpers import create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
@@ -793,7 +794,44 @@ def test_scan_file_fails_closed_on_rar_archive(tmp_path: Path) -> None:
     assert result.success is False
     assert result.metadata["scan_outcome"] == "inconclusive"
     assert "rar_archive_unsupported" in result.metadata["scan_outcome_reasons"]
-    assert any(check.name == "RAR Archive Support" and check.severity == IssueSeverity.INFO for check in result.checks)
+    rar_check = next(check for check in result.checks if check.name == "RAR Archive Support")
+    assert rar_check.severity == IssueSeverity.INFO
+    assert "RAR archive contents were not scanned" in rar_check.message
+
+
+def test_scan_file_does_not_fail_closed_on_rar_suffix_near_match(tmp_path: Path) -> None:
+    rar_path = tmp_path / "not_really.rar"
+    rar_path.write_text("plain text, not a RAR archive\n", encoding="utf-8")
+
+    result = scan_file(str(rar_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name != "rar"
+    assert result.metadata.get("scan_outcome") != "inconclusive"
+    assert not any(check.name == "RAR Archive Support" for check in result.checks)
+
+
+def test_scan_file_rar_inconclusive_result_is_not_cached(tmp_path: Path) -> None:
+    rar_path = tmp_path / "archive.rar"
+    rar_path.write_bytes(b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32)
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(rar_path), config=config)
+        second = scan_file(str(rar_path), config=config)
+
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert second.metadata["scan_outcome"] == "inconclusive"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_scan_file_routes_readme_documentation_to_metadata_scanner(tmp_path: Path) -> None:

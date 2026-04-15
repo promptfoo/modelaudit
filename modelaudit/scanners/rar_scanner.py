@@ -11,6 +11,17 @@ from typing import ClassVar
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 RAR_UNSUPPORTED_REASON = "rar_archive_unsupported"
+RAR4_MAGIC = b"Rar!\x1a\x07\x00"
+RAR5_MAGIC = b"Rar!\x1a\x07\x01\x00"
+
+
+def _has_rar_magic(path: str) -> bool:
+    try:
+        with open(path, "rb") as handle:
+            header = handle.read(len(RAR5_MAGIC))
+    except OSError:
+        return False
+    return header.startswith(RAR4_MAGIC) or header.startswith(RAR5_MAGIC)
 
 
 class RarScanner(BaseScanner):
@@ -24,7 +35,7 @@ class RarScanner(BaseScanner):
     def can_handle(cls, path: str) -> bool:
         if not os.path.isfile(path):
             return False
-        return os.path.splitext(path)[1].lower() in cls.supported_extensions
+        return _has_rar_magic(path)
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
