@@ -771,14 +771,8 @@ class OnnxScanner(BaseScanner):
         analysis; 1-D tensors (biases, batch-norm params) are excluded.
         """
         try:
-            import numpy as np
             import onnx
-            from scipy import stats as _stats  # noqa: F401
-
-            # Lazy-import the weight distribution scanner to avoid circular deps
-            # and heavy library loads when the scanner is not needed.
-            from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
-        except ImportError as e:
+        except Exception as e:
             self._mark_weight_distribution_incomplete(
                 result,
                 path,
@@ -814,7 +808,7 @@ class OnnxScanner(BaseScanner):
                 # Use math.prod for arbitrary-precision arithmetic (np.prod
                 # can silently overflow for very large dimension products).
                 numel = math.prod(int(dim) for dim in initializer.dims)
-                itemsize = int(np.dtype(onnx.helper.tensor_dtype_to_np_dtype(initializer.data_type)).itemsize)
+                itemsize = int(_tensor_data_type_to_np_dtype(initializer.data_type).itemsize)
                 estimated_bytes = numel * itemsize
                 if max_array_size and max_array_size > 0 and estimated_bytes > max_array_size:
                     oversized_initializers_skipped += 1
@@ -850,6 +844,22 @@ class OnnxScanner(BaseScanner):
 
         if not weights_info:
             # Nothing to analyse (external-only model, or all tensors too small / too large).
+            return
+
+        try:
+            from scipy import stats as _stats  # noqa: F401
+
+            # Lazy-import the weight distribution scanner to avoid circular deps
+            # and heavy library loads when the scanner is not needed.
+            from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
+        except Exception as e:
+            self._mark_weight_distribution_incomplete(
+                result,
+                path,
+                reason="missing_dependency",
+                message=f"Weight distribution analysis dependency unavailable: {e!s}",
+                details={"exception": str(e), "exception_type": type(e).__name__},
+            )
             return
 
         # Delegate the actual statistical analysis to WeightDistributionScanner.
