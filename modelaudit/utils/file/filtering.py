@@ -151,6 +151,7 @@ _MODEL_ARCHIVE_SIGNAL_BASENAMES: frozenset[str] = frozenset(
         "flax_model.msgpack",
     }
 )
+_MODEL_ARCHIVE_BINARY_SIGNAL_EXTENSIONS: frozenset[str] = frozenset({".bin"})
 
 
 def _get_scannable_extensions() -> set[str]:
@@ -178,6 +179,32 @@ def _get_candidate_extensions(filename: str) -> list[str]:
     return candidates
 
 
+def _zip_member_has_scannable_binary_signal(archive: zipfile.ZipFile, member: zipfile.ZipInfo) -> bool:
+    """Return whether a normally low-signal binary member has model-like content."""
+    member_ext = Path(member.filename).suffix.lower()
+    if member_ext not in _MODEL_ARCHIVE_BINARY_SIGNAL_EXTENSIONS or member.file_size <= 0:
+        return False
+
+    try:
+        from .detection import (
+            PROTO0_1_MAX_PROBE_BYTES,
+            _looks_like_binary_pickle_protocol,
+            _looks_like_proto0_or_1_pickle,
+        )
+
+        with archive.open(member) as member_file:
+            sample = member_file.read(min(member.file_size, PROTO0_1_MAX_PROBE_BYTES))
+    except Exception as exc:
+        logger.debug("Binary member sniffing failed for %s: %s", member.filename, exc)
+        return False
+
+    if len(sample) >= 4 and sample[:4].startswith(b"PK"):
+        return True
+    if _looks_like_binary_pickle_protocol(sample[:4]):
+        return True
+    return _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=member.file_size > len(sample))
+
+
 def _has_scannable_content(path: str) -> bool:
     """Return whether on-disk file contents map to a supported format."""
     if not os.path.isfile(path):
@@ -185,6 +212,7 @@ def _has_scannable_content(path: str) -> bool:
 
     try:
         from .detection import detect_file_format_for_skip_filter
+        from .detection import is_keras_zip_archive
 
         detected_format = detect_file_format_for_skip_filter(path)
         if detected_format == "unknown":
@@ -194,6 +222,9 @@ def _has_scannable_content(path: str) -> bool:
             return True
 
         with zipfile.ZipFile(path, "r") as archive:
+            if is_keras_zip_archive(path):
+                return True
+
             model_archive_signal_extensions = _get_model_archive_signal_extensions()
             has_keras_config = False
             has_keras_marker = False
@@ -256,6 +287,9 @@ def _has_scannable_content(path: str) -> bool:
                     return True
 
                 if member_basename in _MODEL_ARCHIVE_SIGNAL_BASENAMES:
+                    return True
+
+                if _zip_member_has_scannable_binary_signal(archive, member):
                     return True
 
             if has_keras_config and has_keras_marker:

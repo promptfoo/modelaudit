@@ -1,5 +1,6 @@
 """Tests for file filtering functionality."""
 
+import json
 import pickle
 import zipfile
 from pathlib import Path
@@ -216,6 +217,25 @@ class TestFileFilter:
             archive.writestr("word/embeddings/oleObject1.bin", b"embedded-ole")
 
         assert should_skip_file(str(docx_path))
+
+    def test_docx_with_embedded_pickle_bin_bypasses_extension_skip(self, tmp_path: Path) -> None:
+        """Office ZIPs with model-like .bin payloads should survive prefiltering."""
+        docx_path = tmp_path / "embedded-model.docx"
+        with zipfile.ZipFile(docx_path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types></Types>")
+            archive.writestr("word/document.xml", "<w:document></w:document>")
+            archive.writestr("word/embeddings/oleObject1.bin", pickle.dumps({"safe": True}, protocol=4))
+
+        assert not should_skip_file(str(docx_path))
+
+    def test_config_only_keras_zip_bypasses_extension_skip(self, tmp_path: Path) -> None:
+        """Config-only Keras ZIPs should not depend on a .keras outer suffix."""
+        keras_zip = tmp_path / "model.jpg"
+        config = {"class_name": "Sequential", "config": {"layers": []}}
+        with zipfile.ZipFile(keras_zip, "w") as archive:
+            archive.writestr("config.json", json.dumps(config))
+
+        assert not should_skip_file(str(keras_zip))
 
     def test_docx_like_zip_remains_skipped_when_office_markers_appear_late(self, tmp_path: Path) -> None:
         """Office ZIP detection should not depend on member order within the sniff budget."""
