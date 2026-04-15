@@ -524,11 +524,11 @@ class Jinja2TemplateScanner(BaseScanner):
         if file_size <= 0:
             return []
 
-        marker_offsets = self._template_marker_offsets_from_file(path)
+        window_size = self._raw_template_fallback_window_size(file_size)
+        marker_offsets = self._template_marker_offsets_from_file(path, file_size, window_size)
         if not marker_offsets:
             return []
 
-        window_size = self._raw_template_fallback_window_size(file_size)
         windows: list[tuple[int, int]] = []
         for marker_offset in marker_offsets:
             if any(start <= marker_offset < end for start, end in windows):
@@ -580,10 +580,7 @@ class Jinja2TemplateScanner(BaseScanner):
         return [text[start:end] for start, end in windows]
 
     def _raw_template_fallback_window_size(self, content_size: int) -> int:
-        configured_window_size = self.max_template_size
-        if not isinstance(configured_window_size, int) or configured_window_size <= 0:
-            configured_window_size = _RAW_PARSE_FALLBACK_READ_BYTES
-        return min(configured_window_size, _RAW_PARSE_FALLBACK_READ_BYTES, content_size)
+        return self._raw_template_fallback_window_size_for_config(content_size, self.max_template_size)
 
     @staticmethod
     def _template_marker_offsets(text: str) -> list[int]:
@@ -597,8 +594,9 @@ class Jinja2TemplateScanner(BaseScanner):
         return sorted(offsets)
 
     @staticmethod
-    def _template_marker_offsets_from_file(path: str) -> list[int]:
+    def _template_marker_offsets_from_file(path: str, file_size: int, window_size: int) -> list[int]:
         offsets: set[int] = set()
+        windows: list[tuple[int, int]] = []
         max_indicator_size = max(len(indicator) for indicator in _JINJA_TEMPLATE_INDICATOR_BYTES)
         overlap_size = max_indicator_size - 1
         overlap = b""
@@ -606,7 +604,7 @@ class Jinja2TemplateScanner(BaseScanner):
 
         try:
             with open(path, "rb") as f:
-                while len(offsets) < _RAW_PARSE_FALLBACK_MAX_WINDOWS:
+                while len(windows) < _RAW_PARSE_FALLBACK_MAX_WINDOWS:
                     chunk = f.read(_RAW_PARSE_FALLBACK_READ_BYTES)
                     if not chunk:
                         break
@@ -623,9 +621,15 @@ class Jinja2TemplateScanner(BaseScanner):
                             marker_offset = data.find(indicator, marker_offset + len(indicator))
 
                     for absolute_offset in sorted(chunk_offsets):
-                        offsets.add(absolute_offset)
-                        if len(offsets) >= _RAW_PARSE_FALLBACK_MAX_WINDOWS:
-                            break
+                        if Jinja2TemplateScanner._add_fallback_window_for_marker(
+                            windows,
+                            absolute_offset,
+                            file_size,
+                            window_size,
+                        ):
+                            offsets.add(absolute_offset)
+                            if len(windows) >= _RAW_PARSE_FALLBACK_MAX_WINDOWS:
+                                break
 
                     overlap = data[-overlap_size:] if overlap_size else b""
                     chunk_start += len(chunk)
@@ -634,6 +638,31 @@ class Jinja2TemplateScanner(BaseScanner):
             return []
 
         return sorted(offsets)
+
+    @staticmethod
+    def _raw_template_fallback_window_size_for_config(content_size: int, configured_window_size: Any) -> int:
+        if not isinstance(configured_window_size, int) or configured_window_size <= 0:
+            configured_window_size = _RAW_PARSE_FALLBACK_READ_BYTES
+        return min(configured_window_size, _RAW_PARSE_FALLBACK_READ_BYTES, content_size)
+
+    @staticmethod
+    def _fallback_window_for_marker(marker_offset: int, content_size: int, window_size: int) -> tuple[int, int]:
+        start = max(0, marker_offset - _RAW_PARSE_FALLBACK_CONTEXT_BYTES)
+        end = min(content_size, start + window_size)
+        start = max(0, end - window_size)
+        return start, end
+
+    @staticmethod
+    def _add_fallback_window_for_marker(
+        windows: list[tuple[int, int]],
+        marker_offset: int,
+        content_size: int,
+        window_size: int,
+    ) -> bool:
+        if any(start <= marker_offset < end for start, end in windows):
+            return False
+        windows.append(Jinja2TemplateScanner._fallback_window_for_marker(marker_offset, content_size, window_size))
+        return True
 
     def _extract_template_file(self, path: str) -> dict[str, str]:
         """Extract content from standalone template files"""

@@ -409,6 +409,33 @@ class TestJinja2TemplateScannerEdgeCases:
         )
         assert determine_exit_code(aggregate_result) == 1
 
+    def test_malformed_large_json_raw_template_fallback_ignores_clustered_benign_markers(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Clustered early markers should not consume the full fallback window budget."""
+        tokenizer_file = tmp_path / "tokenizer_config.json"
+        benign_prefix = "".join("{{ content }}" for _ in range(8))
+        payload = "{{ lipsum.__globals__.os.popen('id').read() }}"
+        tokenizer_file.write_text(
+            '{"chat_template":"' + benign_prefix + ("a" * 400000) + payload + ("b" * 1000),
+            encoding="utf-8",
+        )
+
+        result = Jinja2TemplateScanner().scan(str(tokenizer_file))
+
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_json_parse_failed" in result.metadata["scan_outcome_reasons"]
+        failed_checks = [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
+        assert failed_checks
+        assert any(str(c.details.get("template_location")).startswith("raw_json_parse_fallback") for c in failed_checks)
+
+        aggregate_result = scan_model_directory_or_file(
+            str(tokenizer_file),
+            config={"cache_scan_results": False},
+        )
+        assert determine_exit_code(aggregate_result) == 1
+
     def test_malformed_large_json_benign_raw_template_stays_inconclusive_only(self, tmp_path: Path) -> None:
         """Benign raw-template recovery should not create security findings."""
         tokenizer_file = tmp_path / "tokenizer_config.json"
