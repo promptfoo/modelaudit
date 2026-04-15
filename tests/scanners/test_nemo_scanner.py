@@ -846,6 +846,10 @@ class TestCVE202523304HydraTarget:
         assert len(size_checks) == 1
         assert size_checks[0].status == CheckStatus.FAILED
         assert size_checks[0].severity == IssueSeverity.WARNING
+        assert size_checks[0].details["scan_outcome_reason"] == "nemo_config_size_limit"
+        assert size_checks[0].details["max_config_size"] == NemoScanner.MAX_CONFIG_SIZE
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_config_size_limit" in result.metadata["scan_outcome_reasons"]
 
     def test_safe_nemo_target_passes(self, tmp_path):
         """Known-safe NeMo/PyTorch targets should pass."""
