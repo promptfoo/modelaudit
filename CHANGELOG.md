@@ -63,6 +63,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **pickle:** route crafted protocol-1 binary pickle headers and nested protocol-1 payload prefixes through the same scanner paths as newer binary protocols
 - **pickle:** enforce PyTorch ZIP entry limits with a bounded EOCD preflight before opening over-cap archives
 - **pickle:** resolve memoized `GET`/`BINGET`/`LONG_BINGET` operands in post-budget `STACK_GLOBAL` tails so pre-memoized dangerous globals cannot bypass the Rust scanner
+- **pickle:** detect no-`PROTO` binary-opcode nested payloads in raw/base64/hex fields, fail closed when nested probe candidates exceed the bounded budget, and flag process-termination/resource primitives such as `builtins.exit`, `faulthandler._sigsegv`, and `resource.setrlimit`
 - **numpy:** propagate incomplete embedded-pickle scan status from object-dtype `.npy` payloads so partial recursive pickle coverage fails closed
 - **license:** bound binary header scans and reuse compiled patterns to avoid full-file regex passes on large model archives
 - **security:** stop iterating malformed TFLite models after excessive subgraph counts are detected

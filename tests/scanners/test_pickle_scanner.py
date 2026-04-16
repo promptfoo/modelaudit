@@ -9,7 +9,9 @@ from typing import Any
 
 import pytest
 
-from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
     ALWAYS_DANGEROUS_FUNCTIONS,
     ALWAYS_DANGEROUS_MODULES,
@@ -47,6 +49,14 @@ def _short_binunicode(data: bytes) -> bytes:
     if len(data) > 0xFF:
         raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
     return b"\x8c" + bytes([len(data)]) + data
+
+
+def _binary_opcode_os_system_reduce_payload() -> bytes:
+    return _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93" + _short_binunicode(b"true") + b"\x85R."
+
+
+def _binary_opcode_stack_global_probe_decoy() -> bytes:
+    return _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93Z"
 
 
 def _make_opcode_padding_stream(opcode_pairs: int) -> bytes:
@@ -392,6 +402,54 @@ def test_scan_malicious_pickle_reports_rust_finding(tmp_path: Path) -> None:
     assert result.metadata["pickle_primary_engine"] == "rust"
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
     assert any(issue.details.get("import_reference") == EXPECTED_SYSTEM_GLOBAL for issue in result.issues)
+
+
+def test_nested_probe_limit_operational_semantics_and_cache_policy(tmp_path: Path) -> None:
+    path = tmp_path / "probe-limit.pkl"
+    cache_dir = tmp_path / "cache"
+    path.write_bytes(
+        pickle.dumps(
+            {"blob": (_binary_opcode_stack_global_probe_decoy() * 64) + _binary_opcode_os_system_reduce_payload()},
+            protocol=4,
+        )
+    )
+
+    direct_result = PickleScanner().scan(str(path))
+
+    assert direct_result.success is False
+    assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct_result.metadata["scan_outcome_reasons"] == ["nested_probe_limit"]
+    assert direct_result.metadata["analysis_incomplete"] is True
+    assert any(
+        issue.message == "Nested pickle probe candidate limit exceeded"
+        and issue.severity == IssueSeverity.CRITICAL
+        and issue.rule_code == "S213"
+        for issue in direct_result.issues
+    )
+    assert any(
+        check.name == "Standalone Pickle Notice"
+        and check.message == "Nested pickle probe candidate limit exceeded"
+        and check.rule_code == "S902"
+        for check in direct_result.checks
+    )
+
+    reset_cache_manager()
+    try:
+        aggregate_result = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        metadata = aggregate_result.file_metadata[str(path)]
+
+        assert aggregate_result.success is True
+        assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert metadata["scan_outcome_reasons"] == ["nested_probe_limit"]
+        assert determine_exit_code(aggregate_result) == 1
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_scan_stream_treats_negative_size_as_unknown_size() -> None:
