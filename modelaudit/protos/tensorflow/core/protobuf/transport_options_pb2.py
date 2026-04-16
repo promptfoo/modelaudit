@@ -21,9 +21,8 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 
 _sym_db = _symbol_database.Default()
 
-
-
-
+# Keep generated dependency imports for descriptor registration side effects.
+del _sym_db
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n0tensorflow/core/protobuf/transport_options.proto\x12\ntensorflow\"*\n\x10RecvBufRespExtra\x12\x16\n\x0etensor_content\x18\x01 \x03(\x0c\x42WZUgithub.com/tensorflow/tensorflow/tensorflow/go/core/protobuf/for_core_protos_go_protob\x06proto3')
 
 _globals = globals()

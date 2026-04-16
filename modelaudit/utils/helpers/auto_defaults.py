@@ -73,7 +73,7 @@ def detect_file_size(path: str) -> int:
                         continue
             return total_size
     except OSError:
-        pass
+        return 0
     return 0
 
 

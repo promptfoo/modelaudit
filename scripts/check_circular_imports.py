@@ -99,7 +99,6 @@ def main():
     # Skip runtime import testing in favor of pure static analysis
     # This avoids dependency issues in CI environments with limited package installations
     print("Using static analysis only (more reliable in CI environments)")
-    import_check_passed = False
 
     # Detect circular import violations
     violations = detect_circular_imports()
@@ -109,12 +108,7 @@ def main():
         print(f"\n❌ Found {len(violations)} circular import violation(s)")
         sys.exit(1)
 
-    success_msg = "✅ No circular imports detected"
-    if import_check_passed:
-        success_msg += " (with runtime import verification)"
-    else:
-        success_msg += " (static analysis only)"
-    print(success_msg)
+    print("✅ No circular imports detected (static analysis only)")
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ import json
 import os
 import re
 from collections.abc import Mapping
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -649,13 +650,11 @@ def check_commercial_use_warnings(scan_results: dict[str, Any] | Any, *, strict:
     else:
         # Single file case - only warn if it's clearly a substantial dataset
         for file_path in unlicensed_datasets:
-            try:
+            with suppress(OSError):
                 file_size = os.path.getsize(file_path)
                 # Only warn about single files that are substantial (>100KB)
                 if file_size > 100 * 1024:
                     significant_unlicensed_datasets.append(file_path)
-            except OSError:
-                pass
 
     if significant_unlicensed_datasets:
         warnings.append(

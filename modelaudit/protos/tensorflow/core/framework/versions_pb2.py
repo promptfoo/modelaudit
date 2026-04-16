@@ -21,9 +21,8 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 
 _sym_db = _symbol_database.Default()
 
-
-
-
+# Keep generated dependency imports for descriptor registration side effects.
+del _sym_db
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n(tensorflow/core/framework/versions.proto\x12\ntensorflow\"K\n\nVersionDef\x12\x10\n\x08producer\x18\x01 \x01(\x05\x12\x14\n\x0cmin_consumer\x18\x02 \x01(\x05\x12\x15\n\rbad_consumers\x18\x03 \x03(\x05\x42\x80\x01\n\x18org.tensorflow.frameworkB\x0eVersionsProtosP\x01ZOgithub.com/tensorflow/tensorflow/tensorflow/go/core/framework/versions_go_proto\xf8\x01\x01\x62\x06proto3')
 
 _globals = globals()

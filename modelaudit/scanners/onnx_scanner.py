@@ -33,7 +33,7 @@ def _get_onnx_mapping() -> Any:
         if hasattr(onnx, "_mapping"):
             return onnx._mapping
     except (ImportError, AttributeError):
-        pass
+        logger.debug("ONNX mapping module is unavailable in the installed onnx package", exc_info=True)
 
     try:
         # Try older ONNX location
@@ -41,7 +41,7 @@ def _get_onnx_mapping() -> Any:
 
         return mapping_export
     except (ImportError, AttributeError):
-        pass
+        logger.debug("Legacy ONNX mapping export is unavailable", exc_info=True)
 
     return None
 
@@ -150,8 +150,8 @@ def _tensor_data_type_to_np_dtype(data_type: int) -> Any:
 
     try:
         return np.dtype(onnx.helper.tensor_dtype_to_np_dtype(data_type))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Unable to resolve ONNX dtype through helper API: %s", exc)
 
     if mapping is None:
         raise ValueError(f"ONNX tensor dtype mapping unavailable for data_type={data_type}")

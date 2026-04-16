@@ -205,15 +205,13 @@ def read_global_config() -> GlobalConfig:
         parent_path_is_safe = False
 
     if parent_path_is_safe and config_file_path.exists():
-        try:
+        with suppress(OSError, yaml.YAMLError):
             if config_file_path.is_symlink():
                 raise OSError("Refusing to read symlinked config file")
 
             with open(config_file_path) as f:
                 loaded_config = yaml.safe_load(f) or {}
                 global_config_data = loaded_config
-        except (OSError, yaml.YAMLError):
-            pass
 
         if not global_config_data.get("id"):
             global_config_data["id"] = str(uuid4())

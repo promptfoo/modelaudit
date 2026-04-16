@@ -311,8 +311,6 @@ def test_tensorflow_savedmodel_integration(tmp_path: Path) -> None:
     assert result.output is not None
 
     # Should be valid JSON
-    import json
-
     output_json = json.loads(result.output)
 
     # Check expected fields are present

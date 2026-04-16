@@ -9,6 +9,7 @@ import stat
 import tempfile
 import zipfile
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -917,8 +918,8 @@ class PyTorchZipScanner(BaseScanner):
                         sample_is_prefix=entry.file_size > len(data_start),
                     ):
                         pickle_files.append(entry)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Unable to inspect ZIP member %s as a pickle: %s", entry.filename, exc)
 
         result.metadata["pickle_files"] = self._get_zip_member_names(pickle_files)
         return pickle_files
@@ -1633,15 +1634,13 @@ class PyTorchZipScanner(BaseScanner):
                 ):
                     return arg
 
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Unable to infer PyTorch version from pickle metadata: %s", exc)
 
         return None
 
     def _looks_like_version(self, text: str) -> bool:
         """Check if a string looks like a version number"""
-        import re
-
         # Match patterns like 2.5.1, 2.10.0a0, 2.2.3rc1, 1.13.0+cu117, 2.0.0.dev20230101.
         version_pattern = (
             r"^\d+\.\d+\.\d+"
@@ -2087,8 +2086,8 @@ class PyTorchZipScanner(BaseScanner):
                                         "expected_range": f"{min_expected}-{max_expected} bytes",
                                     }
                                 )
-        except Exception:
-            pass  # Best-effort: don't fail the scan if pickle parsing encounters issues
+        except Exception as exc:
+            logger.debug("Unable to compare PyTorch storage blob sizes: %s", exc)
 
         return mismatches
 
@@ -2385,8 +2384,6 @@ class PyTorchZipScanner(BaseScanner):
         metadata = super().extract_metadata(file_path)
 
         try:
-            import zipfile
-
             with zipfile.ZipFile(file_path, "r") as zip_file:
                 file_list = zip_file.namelist()
 
@@ -2413,11 +2410,9 @@ class PyTorchZipScanner(BaseScanner):
 
                 # Try to read version if available
                 if "version" in file_list:
-                    try:
+                    with suppress(Exception):
                         version_data = zip_file.read("version")
                         metadata["pytorch_version"] = version_data.decode("utf-8").strip()
-                    except Exception:
-                        pass
 
                 # Estimate model complexity from file count and names
                 param_indicators = sum(

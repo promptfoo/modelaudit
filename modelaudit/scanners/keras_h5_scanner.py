@@ -3,6 +3,7 @@
 import json
 import os
 import re
+from contextlib import suppress
 from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import (
@@ -1093,9 +1094,7 @@ class KerasH5Scanner(BaseScanner):
 
                 # Try to extract model configuration
                 if "model_config" in h5_file.attrs:
-                    try:
-                        import json
-
+                    with suppress(Exception):
                         config_json = h5_file.attrs["model_config"]
                         if isinstance(config_json, bytes):
                             config_json = config_json.decode("utf-8")
@@ -1121,12 +1120,9 @@ class KerasH5Scanner(BaseScanner):
                                 }
                             )
 
-                    except Exception:
-                        pass
-
                 # Analyze model weights structure
                 if "model_weights" in h5_file:
-                    try:
+                    with suppress(Exception):
                         weights_group = h5_file["model_weights"]
 
                         # Count parameters
@@ -1156,9 +1152,6 @@ class KerasH5Scanner(BaseScanner):
                                 "parameter_details": weight_layers[:10],  # First 10 layers
                             }
                         )
-
-                    except Exception:
-                        pass
 
         except Exception as e:
             metadata["extraction_error"] = str(e)

@@ -154,14 +154,12 @@ def _is_development_install() -> bool:
         # Modern pip (21.3+) uses direct_url.json for editable installs
         direct_url_text = dist.read_text("direct_url.json")
         if direct_url_text:
-            import json
-
             direct_url = json.loads(direct_url_text)
             if direct_url.get("dir_info", {}).get("editable", False):
                 return True
-    except Exception:
-        # Package not installed or metadata not available - not editable
-        pass
+    except Exception as exc:
+        # Package not installed or metadata not available - not editable.
+        logger.debug("Unable to inspect editable install metadata: %s", exc)
 
     return False
 
@@ -234,8 +232,8 @@ class UserConfig:
                 if isinstance(config, dict) and "id" in config:
                     self._promptfoo_user_id = str(config["id"])
                     return self._promptfoo_user_id
-            except (OSError, yaml.YAMLError):
-                pass
+            except (OSError, yaml.YAMLError) as exc:
+                logger.debug("Unable to read promptfoo telemetry config: %s", exc)
         return None
 
     @property

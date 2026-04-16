@@ -147,11 +147,11 @@ class ScannerProtocol(Protocol):
 
     def can_handle(self, path: FilePath) -> bool:
         """Check if this scanner can handle the given file."""
-        ...
+        raise NotImplementedError
 
     def scan(self, path: FilePath) -> Any:  # Should return ScanResult
         """Scan the given file and return results."""
-        ...
+        raise NotImplementedError
 
 
 class ProgressTrackerProtocol(Protocol):
@@ -159,11 +159,11 @@ class ProgressTrackerProtocol(Protocol):
 
     def update_progress(self, message: str, progress: ProgressValue) -> None:
         """Update progress with a message and completion percentage."""
-        ...
+        raise NotImplementedError
 
     def set_total_steps(self, total: int) -> None:
         """Set the total number of steps for progress tracking."""
-        ...
+        raise NotImplementedError
 
 
 class FileHandlerProtocol(Protocol):
@@ -171,12 +171,12 @@ class FileHandlerProtocol(Protocol):
 
     def read_bytes(self, num_bytes: int) -> bytes:
         """Read specified number of bytes from file."""
-        ...
+        raise NotImplementedError
 
     def seek(self, position: int) -> None:
         """Seek to specific position in file."""
-        ...
+        raise NotImplementedError
 
     def close(self) -> None:
         """Close the file handler."""
-        ...
+        raise NotImplementedError

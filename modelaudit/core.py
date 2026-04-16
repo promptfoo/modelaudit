@@ -480,9 +480,6 @@ def scan_model_directory_or_file(
                 content_processed = 0
 
                 for content_hash, file_paths in content_groups.items():
-                    if limit_reached:
-                        break
-
                     # Collect valid content hashes for aggregate hash computation
                     # Skip "unhashable_" prefix entries (those are placeholder hashes for files that failed to hash)
                     if not content_hash.startswith("unhashable_"):

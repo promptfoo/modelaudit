@@ -24,7 +24,9 @@ _sym_db = _symbol_database.Default()
 
 from tensorflow.core.protobuf import struct_pb2 as tensorflow_dot_core_dot_protobuf_dot_struct__pb2
 
-
+# Keep generated dependency imports for descriptor registration side effects.
+del _sym_db
+del tensorflow_dot_core_dot_protobuf_dot_struct__pb2
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n7tensorflow/core/protobuf/composite_tensor_variant.proto\x12\ntensorflow\x1a%tensorflow/core/protobuf/struct.proto\"T\n\x1e\x43ompositeTensorVariantMetadata\x12\x32\n\x0ftype_spec_proto\x18\x01 \x01(\x0b\x32\x19.tensorflow.TypeSpecProtoBWZUgithub.com/tensorflow/tensorflow/tensorflow/go/core/protobuf/for_core_protos_go_protob\x06proto3')
 
 _globals = globals()

@@ -1,5 +1,6 @@
 """Scanner for TensorFlow SavedModel directories and files."""
 
+import base64
 import contextlib
 import logging
 import os
@@ -979,9 +980,6 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
     def _scan_keras_metadata(self, path: str, result: ScanResult) -> None:
         """Scan keras_metadata.pb for Lambda layers and unsafe patterns"""
-        import base64
-        import re
-
         try:
             with open(path, "rb") as f:
                 content = f.read()
@@ -1188,8 +1186,6 @@ class TensorFlowSavedModelScanner(BaseScanner):
             # "Adam/embedding/embeddings").
             (r"[A-Za-z0-9+/]{20,}={1,2}", "encoded_payload", "potential base64 payload"),
         ]
-
-        import re
 
         for node_context in self._iter_saved_model_node_contexts(saved_model):
             node = node_context.node
