@@ -19,7 +19,7 @@ from enum import Enum
 from functools import wraps
 from pathlib import Path
 from typing import Any, TypeVar, Union, cast
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 
 import yaml
 
@@ -377,11 +377,27 @@ class TelemetryClient:
             # Just mark that we've acknowledged telemetry is disabled - no actual recording
             self._telemetry_disabled_recorded = True
 
+    def _parse_url_reference(self, path: str) -> ParseResult | None:
+        """Parse URL-like model references without treating local paths as URLs."""
+        if "://" not in path:
+            return None
+        try:
+            parsed = urlparse(path)
+        except Exception:
+            return None
+        return parsed if parsed.scheme else None
+
+    def _extract_file_extension(self, path: str) -> str:
+        """Extract a file extension without URL query strings or fragments."""
+        parsed = self._parse_url_reference(path)
+        name_source = parsed.path if parsed else path
+        return Path(name_source).suffix.lower()
+
     def _build_path_properties(self, path: str) -> dict[str, Any]:
         """Build coarse telemetry properties for a file path."""
         return {
             "path_type": self._classify_path(path),
-            "file_extension": Path(path).suffix.lower(),
+            "file_extension": self._extract_file_extension(path),
             "model_name": self._extract_model_name(path),
             "model_reference": self._extract_model_reference(path),
         }
@@ -520,9 +536,10 @@ class TelemetryClient:
 
     def _extract_model_name(self, path: str) -> str | None:
         """Extract model name from path or URL."""
-        is_http_url = path.startswith(("http://", "https://"))
-        is_hf_shorthand = path.startswith("hf://")
-        parsed = urlparse(path) if (is_http_url or is_hf_shorthand) else None
+        parsed = self._parse_url_reference(path)
+        scheme = parsed.scheme.lower() if parsed else ""
+        is_http_url = scheme in {"http", "https"}
+        is_hf_shorthand = scheme == "hf"
         url_host = self._extract_url_host(path) if parsed else None
 
         # HuggingFace format: hf://org/model or https://huggingface.co/org/model
@@ -542,28 +559,28 @@ class TelemetryClient:
 
         # PyTorch Hub format: pytorch://org/repo/model
         if "pytorch" in path.lower() and "/" in path:
-            parts = (parsed.path if is_http_url and parsed else path).split("/")
+            parts = (parsed.path if parsed and parsed.path else path).split("/")
             return "/".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
 
-        # Local file: filename, or URL path leaf (query and fragments excluded for HTTP URLs).
-        name_source = parsed.path if is_http_url and parsed else path
+        # Local file: filename, or URL path leaf with query/fragment stripped.
+        name_source = parsed.path if parsed else path
         if "/" in name_source or "\\" in name_source:
             model_name = Path(name_source).name
             if model_name:
                 return model_name
 
-        if is_http_url and url_host and url_host != "unknown":
+        if parsed and url_host and url_host != "unknown":
             return url_host
 
         return name_source
 
     def _extract_model_reference(self, path: str) -> str | None:
         """Extract a secret-scrubbed model reference while preserving model identity."""
-        if "://" not in path:
+        parsed = self._parse_url_reference(path)
+        if not parsed:
             return self._extract_model_name(path)
 
         try:
-            parsed = urlparse(path)
             host = self._extract_url_host(path)
             if not parsed.scheme or host == "unknown":
                 return self._extract_model_name(path)

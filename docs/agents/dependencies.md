@@ -11,24 +11,24 @@ ModelAudit uses optional dependencies to keep the base installation lightweight:
 
 ## Optional Dependencies
 
-| Extra         | Key packages                              | Purpose                                                                 |
-| ------------- | ----------------------------------------- | ----------------------------------------------------------------------- |
-| `h5`          | `h5py`                                    | Keras H5 model scanning                                                 |
-| `pytorch`     | `torch`                                   | PyTorch ecosystem compatibility paths                                   |
-| `safetensors` | `safetensors`                             | SafeTensors runtime-backed validation paths                             |
-| `onnx`        | `onnx`                                    | ONNX parsing/validation                                                 |
-| `dill`        | `dill`                                    | Extended pickle-family compatibility                                    |
-| `joblib`      | `joblib`, `scikit-learn`                  | Joblib/sklearn ecosystem compatibility                                  |
-| `flax`        | no extra package (uses base `msgpack`)    | Flax/JAX msgpack checkpoint support                                     |
-| `tflite`      | `tflite`                                  | TensorFlow Lite parsing                                                 |
-| `tensorflow`  | `tensorflow`                              | Optional TF runtime-dependent paths (for example checkpoint inspection) |
-| `xgboost`     | `xgboost`, `py-ubjson`                    | XGBoost UBJ/full validation paths                                       |
-| `mlflow`      | `mlflow`                                  | MLflow registry source support                                          |
-| `sevenzip`    | `py7zr`                                   | 7z archive scanner                                                      |
-| `all-ci`      | most extras except platform-specific ones | CI profile                                                              |
-| `all`         | all optional extras                       | Broadest local scanner coverage                                         |
+| Extra         | Key packages                           | Purpose                                                                          |
+| ------------- | -------------------------------------- | -------------------------------------------------------------------------------- |
+| `h5`          | `h5py`                                 | Keras H5 model scanning                                                          |
+| `pytorch`     | `torch`                                | PyTorch ecosystem compatibility paths                                            |
+| `safetensors` | `safetensors`                          | SafeTensors runtime-backed validation paths                                      |
+| `onnx`        | `onnx` on Python <3.13                 | ONNX parsing/validation                                                          |
+| `dill`        | `dill`                                 | Extended pickle-family compatibility                                             |
+| `joblib`      | `joblib`, `scikit-learn`               | Joblib/sklearn ecosystem compatibility                                           |
+| `flax`        | no extra package (uses base `msgpack`) | Flax/JAX msgpack checkpoint support                                              |
+| `tflite`      | `tflite`                               | TensorFlow Lite parsing                                                          |
+| `tensorflow`  | `tensorflow`                           | Optional TF runtime-dependent paths on Python 3.11-3.12                          |
+| `xgboost`     | `xgboost`, `py-ubjson`                 | XGBoost UBJ/full validation paths                                                |
+| `mlflow`      | `mlflow`                               | MLflow registry source support                                                   |
+| `sevenzip`    | `py7zr`                                | 7z archive scanner                                                               |
+| `all-ci`      | most portable extras except TensorFlow | CI profile                                                                       |
+| `all`         | broad portable extras                  | Broad local scanner coverage; excludes TensorFlow and platform-specific TensorRT |
 
-`pyyaml`, `msgpack`, and cloud storage dependencies (`fsspec`, `s3fs`, `gcsfs`) are core dependencies in the base install.
+`pyyaml`, `msgpack`, and cloud storage dependencies (`fsspec`, `s3fs`, `gcsfs`) are core dependencies in the base install. Keep ONNX docs aligned with the `python_version < "3.13"` package marker until that gate is removed.
 
 ## TensorFlow SavedModel Scanning (No TensorFlow Required)
 
@@ -52,19 +52,23 @@ protobuf stubs compiled from TensorFlow's `.proto` files.
 - Checkpoint reading (`tf.train.list_variables`, `tf.train.load_variable`)
 - Weight distribution analysis on checkpoints
 
-Most users don't need to install TensorFlow at all.
+Most users don't need to install TensorFlow at all. When they do, the packaged
+TensorFlow runtime extra is available on Python 3.11-3.12.
 
 ## Installation
 
 ```bash
-# With pip
-pip install modelaudit[tensorflow,pytorch,h5]
+# With pip (TensorFlow runtime extra installs on Python 3.11-3.12)
+pip install "modelaudit[tensorflow,pytorch,h5]"
 
-# With uv (development)
+# With uv (development; TensorFlow runtime extra installs on Python 3.11-3.12)
 uv sync --extra tensorflow --extra pytorch --extra h5
 
-# All dependencies
+# Broad portable dependencies
 uv sync --extra all
+
+# Add TensorFlow runtime-dependent paths when needed on Python 3.11-3.12
+uv sync --extra all --extra tensorflow
 ```
 
 ## Development Setup
@@ -75,11 +79,11 @@ git clone https://github.com/promptfoo/modelaudit.git
 cd modelaudit
 
 # Install with uv (recommended)
-uv sync --extra all    # All optional dependencies
+uv sync --extra all    # Broad optional dependencies, excluding TensorFlow/TensorRT
 uv sync                # Basic dependencies only
 
 # Or with pip
-pip install -e .[all]      # Development mode with all extras
+pip install -e ".[all]"    # Development mode with broad optional extras
 pip install -e .           # Basic installation
 ```
 

@@ -469,6 +469,49 @@ class TestTelemetryClient:
             )
             assert client._extract_model_reference("https://user:pass@example.com") == "https://example.com"
 
+    def test_cloud_url_telemetry_fields_strip_query_and_fragment(self) -> None:
+        """Cloud URL telemetry should not retain presigned query material."""
+        mock_posthog = MagicMock()
+        cloud_url = "s3://access:secret@bucket/path/model.pt?X-Amz-Signature=SECRET#frag"
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            patch.dict(
+                os.environ,
+                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                clear=False,
+            ),
+        ):
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+            client._posthog_client = mock_posthog
+            client._user_config.telemetry_enabled = True
+
+            client.record_scan_started([cloud_url], {"format": "json"})
+            started_props = mock_posthog.capture.call_args.kwargs["properties"]
+            assert started_props["model_names"] == ["model.pt"]
+            assert started_props["model_references"] == ["s3://bucket/path/model.pt"]
+            assert "SECRET" not in json.dumps(started_props)
+            assert "access:secret@" not in json.dumps(started_props)
+
+            client.record_file_type_detected(cloud_url, "pytorch")
+            file_props = mock_posthog.capture.call_args.kwargs["properties"]
+            assert file_props["file_extension"] == ".pt"
+            assert file_props["model_name"] == "model.pt"
+            assert file_props["model_reference"] == "s3://bucket/path/model.pt"
+            assert "SECRET" not in json.dumps(file_props)
+            assert "access:secret@" not in json.dumps(file_props)
+
+            client.record_download_started("s3", cloud_url)
+            download_props = mock_posthog.capture.call_args.kwargs["properties"]
+            assert download_props["domain"] == "bucket"
+            assert download_props["model_name"] == "model.pt"
+            assert download_props["model_reference"] == "s3://bucket/path/model.pt"
+            assert "SECRET" not in json.dumps(download_props)
+            assert "access:secret@" not in json.dumps(download_props)
+
     def test_telemetry_available_false_when_posthog_unavailable(self):
         """Telemetry should be unavailable when transport client is missing."""
         with (

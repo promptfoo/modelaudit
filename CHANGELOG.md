@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **docs:** align public README and compatibility guidance with supported Python 3.10-3.13, TensorFlow extra requirements, supported formats, and telemetry sanitization behavior
 - **pickle:** increase Rust stream read chunks to reduce scan overhead on large file and archive-member inputs
 - **pickle:** store Rust byte stack operands as source spans instead of copied previews to reduce large-pickle scan overhead
 - **pickle:** skip no-seed raw-text and CVE fallback passes on clean Rust-complete pickle scans, tightening benign state-dict CLI performance while preserving targeted raw-detector positives
@@ -35,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **pickle:** restore ModelAudit nested-pickle findings from Rust standalone notices and keep network raw-detector coverage after native pickle findings
+- **telemetry:** strip query strings, fragments, and URL userinfo from cloud model names and file-extension metadata
 - preserve `S999` unknown-opcode mapping in generic rule fallback
 - **docker:** run the full parser image as a non-root `appuser`
 - **onnx:** mark weight-distribution analysis inconclusive when dependencies are missing or eligible tensors are external, oversized, or fail extraction

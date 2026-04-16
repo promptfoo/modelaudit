@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "modelaudit"
 version = "0.2.37"
-description = "Static scanning library for detecting malicious code, backdoors, and other security risks in ML model files"
+description = "Static scanning library for detecting malicious code, potential backdoor indicators, and other security risks in ML model files"
 authors = [
     { name = "Ian Webster", email = "ian@promptfoo.dev" },
     { name = "Michael D'Angelo", email = "michael@promptfoo.dev" },
@@ -26,7 +26,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 dependencies = [
     "click>=8.1.7",
     "yaspin>=2.5.0",
@@ -123,7 +123,7 @@ all-ci-windows = [
     "msgpack>=1.0.0,<2.0",
     "safetensors>=0.4.0",
 ]
-# All optional dependencies (TensorFlow removed - use vendored protos)
+# Broad portable optional dependencies (excludes TensorFlow and platform-specific TensorRT)
 all = [
     "h5py>=3.1,<4.0",
     "torch>=2.6.0,<3.0",
