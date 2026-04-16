@@ -69,6 +69,26 @@ _DANGEROUS_TARGETS = {
     "importlib.import_module",
     "pickle.loads",
     "pickle.load",
+    "cloudpickle.loads",
+    "cloudpickle.load",
+    "dill.loads",
+    "dill.load",
+    "joblib.load",
+    "sklearn.externals.joblib.load",
+    "keras.models.load_model",
+    "mlflow.pyfunc.load_model",
+    "pandas.read_pickle",
+    "tensorflow.keras.models.load_model",
+    "tensorflow.saved_model.load",
+    "tf.keras.models.load_model",
+    "torch.hub.load",
+    "torch.hub.load_state_dict_from_url",
+    "torch.jit.load",
+    "torch.load",
+    "torch.package.PackageImporter",
+    "torch.package.PackageImporter.load_pickle",
+    "torch.serialization.load",
+    "torch.utils.model_zoo.load_url",
     "shutil.rmtree",
     "pathlib.Path.unlink",
     "webbrowser.open",
@@ -124,6 +144,11 @@ def _find_suspicious_target_pattern(target: str) -> str | None:
                 if token_lower.startswith(pattern) and token_lower[len(pattern) :].isdigit():
                     return pattern
     return None
+
+
+def _is_runtime_truthy(value: Any) -> bool:
+    """Return whether a Hydra argument would be truthy when passed to Python."""
+    return bool(value)
 
 
 def _scan_result_has_security_findings(result: ScanResult) -> bool:
@@ -877,7 +902,7 @@ class NemoScanner(BaseScanner):
             current_path = f"{path_prefix}.{key}" if path_prefix else key
 
             if key == "_target_" and isinstance(value, str):
-                self._evaluate_target(value, current_path, config_name, archive_path, result)
+                self._evaluate_target(value, current_path, config_name, archive_path, result, config)
             elif isinstance(value, dict | list):
                 self._check_hydra_targets(value, config_name, archive_path, result, current_path)
 
@@ -888,10 +913,11 @@ class NemoScanner(BaseScanner):
         config_name: str,
         archive_path: str,
         result: ScanResult,
+        target_config: dict[str, Any] | None = None,
     ) -> None:
         """Evaluate a single _target_ value for dangerous patterns."""
         # Check against known dangerous targets (always flag, even if safe prefix)
-        if target in _DANGEROUS_TARGETS:
+        if target in _DANGEROUS_TARGETS or (target == "numpy.load" and self._numpy_load_allows_pickle(target_config)):
             result.add_check(
                 name=f"{CVE_2025_23304_ID}: Dangerous Hydra _target_",
                 passed=False,
@@ -970,3 +996,18 @@ class NemoScanner(BaseScanner):
                 "config_file": config_name,
             },
         )
+
+    @staticmethod
+    def _numpy_load_allows_pickle(target_config: dict[str, Any] | None) -> bool:
+        """Return whether a Hydra numpy.load target enables pickle loading."""
+        if not isinstance(target_config, dict):
+            return False
+
+        if "allow_pickle" in target_config:
+            return _is_runtime_truthy(target_config["allow_pickle"])
+
+        positional_args = target_config.get("_args_")
+        if isinstance(positional_args, list) and len(positional_args) >= 3:
+            return _is_runtime_truthy(positional_args[2])
+
+        return False
