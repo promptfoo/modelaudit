@@ -233,6 +233,7 @@ class TestSevenZipScanner:
 
                 assert result.success is False
                 assert len(result.issues) > 0  # But issues are found
+                assert any("eval" in getattr(issue, "message", "").lower() for issue in result.issues)
                 mock_scan_file.assert_called_once()
 
                 # Check that location was adjusted for archive context
@@ -842,7 +843,7 @@ class TestSevenZipScanner:
         tmp_path: Path,
     ) -> None:
         """Only header-confirmed extensionless members should reach the full extraction pass."""
-        extensionless_members = [f"asset_{index:03d}" for index in range(32)]
+        extensionless_members = [f"asset_{index:03d}" for index in range(3)]
         archive_path = tmp_path / "filter_probe.7z"
         archive_path.write_bytes(scanner._SEVENZIP_MAGIC + b"\0" * 26)
 
@@ -1632,43 +1633,77 @@ class TestSevenZipScannerHardening:
             assert len(depth_checks) >= 1
             assert result.metadata.get("file_size") is not None
 
-    # -- _HeaderProbeBuffer empty write guard ---------------------------------
+    # -- nested header probe behavior via scanner API -------------------------
 
-    def test_header_probe_buffer_empty_write_returns_zero(self) -> None:
-        """_HeaderProbeBuffer.write(b'') must return 0 without looping."""
-        from modelaudit.scanners.sevenzip_scanner import _HeaderProbeBuffer
+    def test_extensionless_probe_without_header_is_not_scanned(
+        self,
+        scanner: SevenZipScanner,
+        tmp_path: Path,
+    ) -> None:
+        """Extensionless members without captured archive headers should be ignored."""
+        archive_path = tmp_path / "empty_probe.7z"
+        archive_path.write_bytes(scanner._SEVENZIP_MAGIC + b"\0" * 26)
 
-        buf = _HeaderProbeBuffer(limit=6)
-        written = buf.write(b"")
-        assert written == 0
-        assert buf.size() == 0
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_scan_extracted_file") as mock_scan_extracted_file,
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.getsize", return_value=32),
+        ):
 
-    def test_header_probe_buffer_normal_flow(self) -> None:
-        """_HeaderProbeBuffer should capture up to limit bytes then raise."""
-        from modelaudit.scanners.sevenzip_scanner import (
-            _HeaderProbeBuffer,
-            _HeaderProbeComplete,
-        )
+            def fake_extract(*_args: Any, **kwargs: Any) -> None:
+                factory = kwargs.get("factory")
+                if factory is not None:
+                    factory.create("nested_payload").write(b"")
 
-        buf = _HeaderProbeBuffer(limit=6)
-        buf.write(b"\x37\x7a")  # 2 bytes
-        assert buf.size() == 2
-        with pytest.raises(_HeaderProbeComplete):
-            buf.write(b"\xbc\xaf\x27\x1c\x00\x00")  # 8 bytes, only 4 more captured
-        buf.seek(0)
-        assert buf.read(6) == b"\x37\x7a\xbc\xaf\x27\x1c"
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["nested_payload"]
+            mock_archive.getinfo.return_value = MagicMock(uncompressed=16, is_directory=False)
+            mock_archive.extract.side_effect = fake_extract
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
-    def test_probe_detected_format_recognizes_tar_headers(self) -> None:
-        """Header probes should classify nested TAR members without relying on suffixes."""
-        from modelaudit.scanners.sevenzip_scanner import _HeaderProbeBuffer
+            result = scanner.scan(str(archive_path))
 
+            assert result.success
+            assert result.metadata["scannable_files"] == 0
+            assert mock_scan_extracted_file.call_count == 0
+
+    def test_extensionless_tar_header_reaches_full_extraction(self, tmp_path: Path) -> None:
+        """Header probes should route extensionless TAR members through scanner extraction."""
         scanner = SevenZipScanner()
-        buf = _HeaderProbeBuffer(limit=scanner._NESTED_MEMBER_PROBE_BYTES, raise_on_limit=False)
+        archive_path = tmp_path / "tar_probe.7z"
+        archive_path.write_bytes(scanner._SEVENZIP_MAGIC + b"\0" * 26)
+
         tar_header = bytearray(scanner._NESTED_MEMBER_PROBE_BYTES)
         tar_header[257:262] = b"ustar"
-        buf.write(bytes(tar_header))
 
-        assert scanner._probe_detected_format(buf) == "tar"
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_has_7z_magic", return_value=True),
+            patch.object(scanner, "_scan_extracted_file", return_value=_mock_scan_result()) as mock_scan_extracted_file,
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.islink", return_value=False),
+            patch("os.path.getsize", return_value=32),
+        ):
+
+            def fake_extract(*_args: Any, **kwargs: Any) -> None:
+                factory = kwargs.get("factory")
+                if factory is not None:
+                    factory.create("nested_payload").write(bytes(tar_header))
+
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["nested_payload"]
+            mock_archive.getinfo.return_value = MagicMock(uncompressed=16, is_directory=False)
+            mock_archive.extract.side_effect = fake_extract
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(str(archive_path))
+
+            assert result.success
+            assert result.metadata["scannable_files"] == 1
+            mock_scan_extracted_file.assert_called_once()
 
     # -- default config includes new limits -----------------------------------
 

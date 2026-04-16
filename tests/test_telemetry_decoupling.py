@@ -253,7 +253,7 @@ class TestTelemetryFunctionalityWhenWorking:
 
         assert result == "executed successfully"
 
-    def test_record_issue_found_uses_stable_redacted_issue_type(self, tmp_path: Path) -> None:
+    def test_record_issue_found_redacts_sensitive_data(self, tmp_path: Path) -> None:
         """Issue telemetry should not copy free-form scanner messages into analytics fields."""
         captured: dict[str, object] = {}
 
@@ -282,7 +282,7 @@ class TestTelemetryFunctionalityWhenWorking:
         assert str(sensitive_path) not in serialized
         assert "token=secret" not in serialized
 
-    def test_record_issue_found_rejects_token_shaped_issue_text(self, tmp_path: Path) -> None:
+    def test_record_issue_found_filters_token_like_strings(self, tmp_path: Path) -> None:
         """Slug-like filenames and tokens must not be treated as stable issue IDs."""
         captured: dict[str, object] = {}
 

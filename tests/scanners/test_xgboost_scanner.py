@@ -195,7 +195,12 @@ class TestXGBoostScannerBasic:
 class TestXGBoostJSONScanning:
     """Test XGBoost JSON model scanning."""
 
-    def test_valid_json_model_passes(self, temp_dir, xgboost_scanner, valid_xgboost_json):
+    def test_valid_json_model_passes(
+        self,
+        temp_dir: Path,
+        xgboost_scanner: XGBoostScanner,
+        valid_xgboost_json: dict[str, Any],
+    ) -> None:
         """Test that valid XGBoost JSON model passes all checks."""
         json_file = temp_dir / "valid_model.json"
         json_file.write_text(json.dumps(valid_xgboost_json, indent=2))
@@ -208,7 +213,7 @@ class TestXGBoostJSONScanning:
         assert len(passing_checks) > 0
 
         # Should not have critical issues
-        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.INFO]
+        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
         assert len(critical_issues) == 0
 
     def test_invalid_json_fails(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:

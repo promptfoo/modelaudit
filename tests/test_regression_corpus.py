@@ -21,7 +21,10 @@ from tests.assets.generators.generate_safetensors_assets import generate_safeten
 ASSETS = Path(__file__).parent / "assets"
 EXPLOITS_DIR = ASSETS / "exploits"
 SAFE_PICKLES_DIR = ASSETS / "samples" / "pickles"
-MALICIOUS_PICKLES_DIR = ASSETS / "samples" / "pickles"
+_DEDICATED_MALICIOUS_PICKLES_DIR = ASSETS / "samples" / "malicious_pickles"
+MALICIOUS_PICKLES_DIR = (
+    _DEDICATED_MALICIOUS_PICKLES_DIR if _DEDICATED_MALICIOUS_PICKLES_DIR.exists() else SAFE_PICKLES_DIR
+)
 SAFE_SAFETENSORS_DIR = ASSETS / "samples" / "safetensors"
 SAFE_PYTORCH_DIR = ASSETS / "samples" / "pytorch"
 SAFE_ARCHIVES_DIR = ASSETS / "samples" / "archives"
