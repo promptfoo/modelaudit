@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import re
 import zipfile
+from contextlib import suppress
 from typing import Any, ClassVar
 
 from ..utils.file.detection import is_skops_archive, read_magic_bytes
@@ -148,7 +149,7 @@ class SkopsScanner(BaseScanner):
 
         # Scan file contents for suspicious patterns
         for file_info in zip_file.filelist:
-            try:
+            with suppress(Exception):
                 content = self._read_zip_entry_safely(zip_file, file_info, result=result, zip_path=zip_path)
                 if content is None:
                     continue
@@ -157,8 +158,6 @@ class SkopsScanner(BaseScanner):
                         found_patterns.append(
                             f"content: {binary_pattern.decode('utf-8', errors='ignore')} in {file_info.filename}"
                         )
-            except Exception:
-                pass
 
         if found_patterns:
             result.add_check(
@@ -215,7 +214,7 @@ class SkopsScanner(BaseScanner):
 
         # Scan file contents for suspicious patterns
         for file_info in zip_file.filelist:
-            try:
+            with suppress(Exception):
                 content = self._read_zip_entry_safely(zip_file, file_info, result=result, zip_path=zip_path)
                 if content is None:
                     continue
@@ -224,8 +223,6 @@ class SkopsScanner(BaseScanner):
                         found_patterns.append(
                             f"content: {binary_pattern.decode('utf-8', errors='ignore')} in {file_info.filename}"
                         )
-            except Exception:
-                pass
 
         if found_patterns:
             result.add_check(
@@ -262,7 +259,7 @@ class SkopsScanner(BaseScanner):
             file_name = file_info.filename.lower()
             # Check for Card/model card files
             if "card" in file_name or "model_card" in file_name or "readme" in file_name:
-                try:
+                with suppress(Exception):
                     raw_content = self._read_zip_entry_safely(zip_file, file_info, result=result, zip_path=zip_path)
                     if raw_content is None:
                         continue
@@ -272,8 +269,6 @@ class SkopsScanner(BaseScanner):
                     # substrings such as "download" in benign card/readme prose.
                     if self._contains_card_joblib_fallback_signal(content):
                         suspicious_files.append(file_info.filename)
-                except Exception:
-                    pass
 
         if suspicious_files:
             result.add_check(
@@ -301,7 +296,7 @@ class SkopsScanner(BaseScanner):
     def _check_protocol_version(self, zip_file: zipfile.ZipFile, result: ScanResult, zip_path: str) -> None:
         """Check skops protocol version and warn if using vulnerable version."""
         # Look for protocol version information
-        try:
+        with suppress(Exception):
             # Check for schema or version files
             for file_name in zip_file.namelist():
                 if "schema" in file_name.lower() or "version" in file_name.lower() or "protocol" in file_name.lower():
@@ -315,8 +310,6 @@ class SkopsScanner(BaseScanner):
                     # Check for protocol version indicators
                     if "PROTOCOL" in content or "version" in content.lower():
                         # Parse version if possible
-                        import re
-
                         version_pattern = r"(?:PROTOCOL|version)\s*=\s*['\"]?([0-9.]+)"
                         match = re.search(version_pattern, content, re.IGNORECASE)
 
@@ -333,8 +326,6 @@ class SkopsScanner(BaseScanner):
                                     "file": file_name,
                                 },
                             )
-        except Exception:
-            pass
 
     # Metadata files that are part of the skops format and should be excluded
     # from joblib fallback pattern matching. These files legitimately contain
@@ -388,7 +379,7 @@ class SkopsScanner(BaseScanner):
         for file_info in zip_file.filelist:
             is_metadata = self._is_skops_metadata(file_info.filename)
 
-            try:
+            with suppress(Exception):
                 content = self._read_zip_entry_safely(zip_file, file_info, result=result, zip_path=zip_path)
                 if content is None:
                     continue
@@ -406,8 +397,6 @@ class SkopsScanner(BaseScanner):
                             }
                         )
                         break
-            except Exception:
-                pass
 
         if files_with_joblib:
             result.add_check(

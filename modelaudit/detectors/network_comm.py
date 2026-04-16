@@ -7,6 +7,7 @@ that could be used for data exfiltration or command & control operations.
 import ipaddress
 import re
 from collections.abc import Iterator
+from contextlib import suppress
 from typing import Any, ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
@@ -555,7 +556,7 @@ class NetworkCommDetector:
                 continue
 
             # Validate it's a real IP
-            try:
+            with suppress(ipaddress.AddressValueError):
                 ip_obj = ipaddress.IPv4Address(ip)
 
                 # Check if it's private/reserved
@@ -578,13 +579,11 @@ class NetworkCommDetector:
                         "context": context,
                     }
                 )
-            except ipaddress.AddressValueError:
-                pass  # Not a valid IP
 
         # IPv6
         for match in self.IPV6_PATTERN.finditer(data):
             ip = match.group().decode("utf-8", errors="ignore")
-            try:
+            with suppress(ipaddress.AddressValueError):
                 ip6_obj = ipaddress.IPv6Address(ip)
 
                 self.findings.append(
@@ -600,8 +599,6 @@ class NetworkCommDetector:
                         "context": context,
                     }
                 )
-            except ipaddress.AddressValueError:
-                pass
 
     def _scan_domains(self, data: bytes, context: str) -> None:
         """Scan for domain name patterns."""
@@ -920,8 +917,6 @@ class NetworkCommDetector:
         ]
 
         for pattern, pattern_type in explicit_network_patterns:
-            import re
-
             regex = re.compile(pattern, re.IGNORECASE)
             matches = regex.finditer(data)
 

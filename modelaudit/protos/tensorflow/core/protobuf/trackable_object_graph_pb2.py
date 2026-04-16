@@ -24,7 +24,9 @@ _sym_db = _symbol_database.Default()
 
 from google.protobuf import wrappers_pb2 as google_dot_protobuf_dot_wrappers__pb2
 
-
+# Keep generated dependency imports for descriptor registration side effects.
+del _sym_db
+del google_dot_protobuf_dot_wrappers__pb2
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n5tensorflow/core/protobuf/trackable_object_graph.proto\x12\ntensorflow\x1a\x1egoogle/protobuf/wrappers.proto\"\xf3\x05\n\x14TrackableObjectGraph\x12?\n\x05nodes\x18\x01 \x03(\x0b\x32\x30.tensorflow.TrackableObjectGraph.TrackableObject\x1a\x99\x05\n\x0fTrackableObject\x12R\n\x08\x63hildren\x18\x01 \x03(\x0b\x32@.tensorflow.TrackableObjectGraph.TrackableObject.ObjectReference\x12U\n\nattributes\x18\x02 \x03(\x0b\x32\x41.tensorflow.TrackableObjectGraph.TrackableObject.SerializedTensor\x12^\n\x0eslot_variables\x18\x03 \x03(\x0b\x32\x46.tensorflow.TrackableObjectGraph.TrackableObject.SlotVariableReference\x12\x35\n\x10registered_saver\x18\x04 \x01(\x0b\x32\x1b.tensorflow.RegisteredSaver\x12\x39\n\x15has_checkpoint_values\x18\x05 \x01(\x0b\x32\x1a.google.protobuf.BoolValue\x1a\x36\n\x0fObjectReference\x12\x0f\n\x07node_id\x18\x01 \x01(\x05\x12\x12\n\nlocal_name\x18\x02 \x01(\t\x1a\x63\n\x10SerializedTensor\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x11\n\tfull_name\x18\x02 \x01(\t\x12\x16\n\x0e\x63heckpoint_key\x18\x03 \x01(\tJ\x04\x08\x04\x10\x05R\x10optional_restore\x1al\n\x15SlotVariableReference\x12!\n\x19original_variable_node_id\x18\x01 \x01(\x05\x12\x11\n\tslot_name\x18\x02 \x01(\t\x12\x1d\n\x15slot_variable_node_id\x18\x03 \x01(\x05\"4\n\x0fRegisteredSaver\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x13\n\x0bobject_name\x18\x02 \x01(\tBZZUgithub.com/tensorflow/tensorflow/tensorflow/go/core/protobuf/for_core_protos_go_proto\xf8\x01\x01\x62\x06proto3')
 
 _globals = globals()

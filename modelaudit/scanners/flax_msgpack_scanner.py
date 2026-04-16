@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from contextlib import suppress
 from typing import Any, ClassVar
 
 try:
@@ -203,33 +204,30 @@ class FlaxMsgpackScanner(BaseScanner):
 
         # For files without clear extensions, check if they might be msgpack
         if HAS_MSGPACK and ext in [".ckpt", ""]:  # Some JAX checkpoints have no extension
-            try:
-                with open(path, "rb") as f:
-                    # Read first few bytes to check for msgpack format
-                    header = f.read(32)
-                    if len(header) > 0 and header[0:1] in [
-                        b"\x80",
-                        b"\x81",
-                        b"\x82",
-                        b"\x83",
-                        b"\x84",
-                        b"\x85",
-                        b"\x86",
-                        b"\x87",
-                        b"\x88",
-                        b"\x89",
-                        b"\x8a",
-                        b"\x8b",
-                        b"\x8c",
-                        b"\x8d",
-                        b"\x8e",
-                        b"\x8f",
-                        b"\xde",
-                        b"\xdf",  # Common msgpack format markers
-                    ]:
-                        return True
-            except Exception:
-                pass
+            with suppress(Exception), open(path, "rb") as f:
+                # Read first few bytes to check for msgpack format
+                header = f.read(32)
+                if len(header) > 0 and header[0:1] in [
+                    b"\x80",
+                    b"\x81",
+                    b"\x82",
+                    b"\x83",
+                    b"\x84",
+                    b"\x85",
+                    b"\x86",
+                    b"\x87",
+                    b"\x88",
+                    b"\x89",
+                    b"\x8a",
+                    b"\x8b",
+                    b"\x8c",
+                    b"\x8d",
+                    b"\x8e",
+                    b"\x8f",
+                    b"\xde",
+                    b"\xdf",  # Common msgpack format markers
+                ]:
+                    return True
 
         return False
 

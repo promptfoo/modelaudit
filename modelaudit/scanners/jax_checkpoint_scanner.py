@@ -8,6 +8,7 @@ import pickletools
 import re
 from collections import OrderedDict
 from collections.abc import Iterator
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -478,14 +479,12 @@ class JaxCheckpointScanner(BaseScanner):
             # Check for pickle format with JAX indicators
             if header.startswith(b"\x80"):  # Pickle protocol
                 # Read more to check for JAX-specific content
-                try:
+                with suppress(Exception):
                     with open(path, "rb") as f:
                         data = f.read(8192)  # Read first 8KB
                         data_str = data.decode("utf-8", errors="ignore").lower()
 
                     return any(indicator in data_str for indicator in cls._JAX_INDICATORS)
-                except Exception:
-                    pass
 
             decoded_header = header.decode("utf-8", errors="ignore").lower()
 
@@ -501,7 +500,7 @@ class JaxCheckpointScanner(BaseScanner):
                 return True
 
         except Exception:
-            pass
+            return False
 
         return False
 

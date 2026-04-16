@@ -1217,7 +1217,6 @@ def detect_file_format_from_magic(path: str) -> str:
     # Fallback: use strict safetensors framing; plain JSON must not be routed as safetensors.
     magic4 = header[:4]
     magic8 = header[:8]
-    magic16 = header[:16]
 
     if _looks_like_tflite_header(magic8):
         return "tflite"

@@ -580,8 +580,6 @@ class SafeTensorsScanner(BaseScanner):
         """Analyze SafeTensors metadata content for injection attacks"""
 
         # Convert metadata to string for pattern analysis
-        import json
-
         metadata_str = json.dumps(metadata, indent=2, ensure_ascii=False)
 
         # XSS/HTML injection patterns

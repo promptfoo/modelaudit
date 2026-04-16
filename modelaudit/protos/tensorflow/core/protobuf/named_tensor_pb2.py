@@ -24,7 +24,9 @@ _sym_db = _symbol_database.Default()
 
 from tensorflow.core.framework import tensor_pb2 as tensorflow_dot_core_dot_framework_dot_tensor__pb2
 
-
+# Keep generated dependency imports for descriptor registration side effects.
+del _sym_db
+del tensorflow_dot_core_dot_framework_dot_tensor__pb2
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n+tensorflow/core/protobuf/named_tensor.proto\x12\ntensorflow\x1a&tensorflow/core/framework/tensor.proto\"I\n\x10NamedTensorProto\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\'\n\x06tensor\x18\x02 \x01(\x0b\x32\x17.tensorflow.TensorProtoB\x89\x01\n\x18org.tensorflow.frameworkB\x11NamedTensorProtosP\x01ZUgithub.com/tensorflow/tensorflow/tensorflow/go/core/protobuf/for_core_protos_go_proto\xf8\x01\x01\x62\x06proto3')
 
 _globals = globals()

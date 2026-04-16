@@ -4,6 +4,7 @@ import sys
 import tempfile
 import types
 import zipfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -166,37 +167,19 @@ HAS_NUMPY = has_numpy()  # numpy is lightweight
 
 
 # Defer heavy imports until actually needed in tests
+@lru_cache(maxsize=1)
 def _has_torch_cached():
-    global _TORCH_CHECKED, _HAS_TORCH
-    if not _TORCH_CHECKED:
-        _HAS_TORCH = has_torch()
-        _TORCH_CHECKED = True
-    return _HAS_TORCH
+    return has_torch()
 
 
+@lru_cache(maxsize=1)
 def _has_h5py_cached():
-    global _H5PY_CHECKED, _HAS_H5PY
-    if not _H5PY_CHECKED:
-        _HAS_H5PY = has_h5py()
-        _H5PY_CHECKED = True
-    return _HAS_H5PY
+    return has_h5py()
 
 
+@lru_cache(maxsize=1)
 def _has_tensorflow_cached():
-    global _TENSORFLOW_CHECKED, _HAS_TENSORFLOW
-    if not _TENSORFLOW_CHECKED:
-        _HAS_TENSORFLOW = has_tensorflow()
-        _TENSORFLOW_CHECKED = True
-    return _HAS_TENSORFLOW
-
-
-# Global caching variables
-_TORCH_CHECKED = False
-_HAS_TORCH = False
-_H5PY_CHECKED = False
-_HAS_H5PY = False
-_TENSORFLOW_CHECKED = False
-_HAS_TENSORFLOW = False
+    return has_tensorflow()
 
 
 @pytest.mark.skipif(not HAS_NUMPY, reason="numpy not available")

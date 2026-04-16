@@ -26,7 +26,11 @@ from tensorflow.core.framework import full_type_pb2 as tensorflow_dot_core_dot_f
 from tensorflow.core.framework import tensor_shape_pb2 as tensorflow_dot_core_dot_framework_dot_tensor__shape__pb2
 from tensorflow.core.framework import types_pb2 as tensorflow_dot_core_dot_framework_dot_types__pb2
 
-
+# Keep generated dependency imports for descriptor registration side effects.
+del _sym_db
+del tensorflow_dot_core_dot_framework_dot_full__type__pb2
+del tensorflow_dot_core_dot_framework_dot_tensor__shape__pb2
+del tensorflow_dot_core_dot_framework_dot_types__pb2
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n3tensorflow/core/framework/cpp_shape_inference.proto\x12\x0ftensorflow.core\x1a)tensorflow/core/framework/full_type.proto\x1a,tensorflow/core/framework/tensor_shape.proto\x1a%tensorflow/core/framework/types.proto\"\xa5\x03\n\x17\x43ppShapeInferenceResult\x12+\n\x05shape\x18\x01 \x01(\x0b\x32\x1c.tensorflow.TensorShapeProto\x12H\n\x0bhandle_data\x18\x04 \x01(\x0b\x32\x33.tensorflow.core.CppShapeInferenceResult.HandleData\x1a\x93\x01\n\x12HandleShapeAndType\x12+\n\x05shape\x18\x01 \x01(\x0b\x32\x1c.tensorflow.TensorShapeProto\x12#\n\x05\x64type\x18\x02 \x01(\x0e\x32\x14.tensorflow.DataType\x12%\n\x04type\x18\x04 \x01(\x0b\x32\x17.tensorflow.FullTypeDefJ\x04\x08\x03\x10\x04\x1aq\n\nHandleData\x12\x0e\n\x06is_set\x18\x01 \x01(\x08\x12S\n\x0eshape_and_type\x18\x02 \x03(\x0b\x32;.tensorflow.core.CppShapeInferenceResult.HandleShapeAndTypeJ\x04\x08\x02\x10\x03J\x04\x08\x03\x10\x04\"e\n\x1d\x43ppShapeInferenceInputsNeeded\x12\x1c\n\x14input_tensors_needed\x18\x01 \x03(\x05\x12&\n\x1einput_tensors_as_shapes_needed\x18\x02 \x03(\x05\x42\x61Z\\github.com/tensorflow/tensorflow/tensorflow/go/python/framework/cpp_shape_inference_go_proto\xf8\x01\x01\x62\x06proto3')
 
 _globals = globals()

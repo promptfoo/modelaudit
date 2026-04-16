@@ -714,11 +714,14 @@ class TestTelemetryIntegration:
         from modelaudit.core import scan_model_directory_or_file
 
         sample = Path(__file__).parent / "assets" / "samples" / "pickles" / "malicious_system_call.pkl"
-        with patch("modelaudit.core_results.record_issue_found") as mock_record_issue_found:
+        with (
+            patch("modelaudit.core.record_issue_found") as mock_core_record_issue_found,
+            patch("modelaudit.core_results.record_issue_found") as mock_results_record_issue_found,
+        ):
             result = scan_model_directory_or_file(str(sample))
 
         assert len(result.issues) > 0
-        assert mock_record_issue_found.call_count > 0
+        assert mock_core_record_issue_found.call_count + mock_results_record_issue_found.call_count > 0
 
 
 if __name__ == "__main__":

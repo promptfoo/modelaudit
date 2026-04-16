@@ -8,10 +8,7 @@ from modelaudit.detectors.suspicious_symbols import BINARY_CODE_PATTERNS, SUSPIC
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
-try:
-    HAS_PADDLE = True
-except Exception:  # pragma: no cover - optional dependency
-    HAS_PADDLE = False
+HAS_PADDLE = True
 
 # Patterns that are expected in raw binary weight files and should be skipped
 # for .pdiparams files to avoid false positives.  The hex-escape pattern

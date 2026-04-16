@@ -591,7 +591,7 @@ class SevenZipScanner(BaseScanner):
         return {file_name: self._member_probe_detected_format(archive, file_name) for file_name in file_names}
 
     @classmethod
-    def _probe_has_7z_magic(cls, probe: _HeaderProbeBuffer | None) -> bool:
+    def _probe_has_7z_magic(cls, probe: Any | None) -> bool:
         """Return True when a probe buffer captured the 7z magic header."""
         if probe is None:
             return False
@@ -600,7 +600,7 @@ class SevenZipScanner(BaseScanner):
         return probe.read(len(cls._SEVENZIP_MAGIC)) == cls._SEVENZIP_MAGIC
 
     @classmethod
-    def _probe_has_tar_magic(cls, probe: _HeaderProbeBuffer | None) -> bool:
+    def _probe_has_tar_magic(cls, probe: Any | None) -> bool:
         """Return True when a probe buffer captured a TAR header marker."""
         if probe is None:
             return False
@@ -609,7 +609,7 @@ class SevenZipScanner(BaseScanner):
         tar_header = probe.read(cls._NESTED_MEMBER_PROBE_BYTES)
         return len(tar_header) >= 262 and tar_header[257:262] == b"ustar"
 
-    def _probe_detected_format(self, probe: _HeaderProbeBuffer | None) -> str | None:
+    def _probe_detected_format(self, probe: Any | None) -> str | None:
         """Return a directly routable header format captured by a bounded member probe."""
         if probe is None:
             return None
@@ -639,9 +639,8 @@ class SevenZipScanner(BaseScanner):
         probe_factory = _HeaderProbeFactory(limit=self._NESTED_MEMBER_PROBE_BYTES)
 
         try:
-            archive.extract(targets=[file_name], factory=probe_factory)
-        except _HeaderProbeComplete:
-            pass
+            with suppress(_HeaderProbeComplete):
+                archive.extract(targets=[file_name], factory=probe_factory)
         finally:
             with suppress(Exception):
                 archive.reset()

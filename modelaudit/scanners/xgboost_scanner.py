@@ -20,14 +20,18 @@ Security Focus:
 
 import importlib.util
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
 import tempfile
+from contextlib import suppress
 from typing import Any, ClassVar
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
+
+logger = logging.getLogger(__name__)
 
 # Precompiled regex patterns for performance
 SUSPICIOUS_JSON_PATTERNS = [
@@ -284,14 +288,11 @@ class XGBoostScanner(BaseScanner):
 
         # Check for XGBoost files without extension
         if file_ext == "":
-            try:
-                with open(path, "rb") as f:
-                    header = f.read(16)
-                    # Check for XGBoost binary signature patterns
-                    if b"binf" in header or b"gblinear" in header[:100]:
-                        return True
-            except OSError:
-                pass
+            with suppress(OSError), open(path, "rb") as f:
+                header = f.read(16)
+                # Check for XGBoost binary signature patterns
+                if b"binf" in header or b"gblinear" in header[:100]:
+                    return True
 
         return False
 
@@ -909,8 +910,6 @@ except Exception as e:
                 # Model configuration
                 config = model.save_config()
                 if config:
-                    import json
-
                     try:
                         config_dict = json.loads(config)
 
@@ -938,8 +937,8 @@ except Exception as e:
                                         "colsample_bytree": gbtree_params.get("colsample_bytree", "unknown"),
                                     }
                                 )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Unable to parse XGBoost model configuration: %s", exc)
 
                 # Feature importance (if available)
                 try:

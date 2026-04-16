@@ -583,9 +583,10 @@ def test_whitelist_staleness_recent_no_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Recent whitelist snapshots should not emit a staleness warning."""
+    from modelaudit.scanners.base import _warn_if_whitelist_is_stale
     from modelaudit.whitelists import POPULAR_MODELS
 
-    monkeypatch.setattr("modelaudit.scanners.base._has_logged_stale_whitelist_warning", False)
+    _warn_if_whitelist_is_stale.cache_clear()
     monkeypatch.setattr(
         "modelaudit.whitelists.WHITELIST_GENERATED_AT",
         datetime.now(timezone.utc).date().isoformat(),
@@ -615,7 +616,9 @@ def test_whitelist_staleness_warning_logged_for_stale_snapshot(
     from modelaudit.whitelists import POPULAR_MODELS
 
     stale_date = (datetime.now(timezone.utc).date() - timedelta(days=180)).isoformat()
-    monkeypatch.setattr("modelaudit.scanners.base._has_logged_stale_whitelist_warning", False)
+    from modelaudit.scanners.base import _warn_if_whitelist_is_stale
+
+    _warn_if_whitelist_is_stale.cache_clear()
     monkeypatch.setattr("modelaudit.whitelists.WHITELIST_GENERATED_AT", stale_date)
 
     scanner = MockScanner()
@@ -642,7 +645,9 @@ def test_whitelist_staleness_warning_only_logs_once(
     from modelaudit.whitelists import POPULAR_MODELS
 
     stale_date = (datetime.now(timezone.utc).date() - timedelta(days=180)).isoformat()
-    monkeypatch.setattr("modelaudit.scanners.base._has_logged_stale_whitelist_warning", False)
+    from modelaudit.scanners.base import _warn_if_whitelist_is_stale
+
+    _warn_if_whitelist_is_stale.cache_clear()
     monkeypatch.setattr("modelaudit.whitelists.WHITELIST_GENERATED_AT", stale_date)
 
     scanner_one = MockScanner()
@@ -680,7 +685,9 @@ def test_whitelist_staleness_unknown_model_no_warning(
 ) -> None:
     """Unknown models should not emit a stale whitelist warning."""
     stale_date = (datetime.now(timezone.utc).date() - timedelta(days=180)).isoformat()
-    monkeypatch.setattr("modelaudit.scanners.base._has_logged_stale_whitelist_warning", False)
+    from modelaudit.scanners.base import _warn_if_whitelist_is_stale
+
+    _warn_if_whitelist_is_stale.cache_clear()
     monkeypatch.setattr("modelaudit.whitelists.WHITELIST_GENERATED_AT", stale_date)
 
     scanner = MockScanner()

@@ -104,8 +104,39 @@ echo "Compilation results: $COMPILED succeeded, $FAILED failed"
 # Only in tensorflow/ subdirectories - do NOT overwrite modelaudit/protos/__init__.py
 find "$OUTPUT_DIR/tensorflow" -type d -exec touch {}/__init__.py \;
 
-# DON'T patch imports - keep original tensorflow.* imports
-# We'll add modelaudit/protos to sys.path at runtime instead
+# Keep original tensorflow.* imports so descriptor dependencies load through
+# modelaudit/protos on sys.path at runtime.
+
+echo "Marking generated dependency imports as consumed..."
+python3 - "$OUTPUT_DIR" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+output_dir = Path(sys.argv[1]) / "tensorflow"
+cleanup_marker = "# Keep generated dependency imports for descriptor registration side effects."
+descriptor_marker = "\nDESCRIPTOR = _descriptor_pool.Default().AddSerializedFile"
+
+for path in sorted(output_dir.rglob("*_pb2.py")):
+    text = path.read_text()
+    if descriptor_marker not in text or "_sym_db = _symbol_database.Default()" not in text:
+        continue
+
+    prefix, rest = text.split(descriptor_marker, 1)
+    if cleanup_marker in prefix:
+        prefix = prefix.split("\n" + cleanup_marker, 1)[0].rstrip()
+
+    after_sym_db = prefix.split("_sym_db = _symbol_database.Default()", 1)[1]
+    aliases: list[str] = []
+    for line in after_sym_db.splitlines():
+        match = re.match(r"from\s+.+\s+import\s+.+\s+as\s+([A-Za-z_][A-Za-z0-9_]*)$", line.strip())
+        if match:
+            aliases.append(match.group(1))
+
+    cleanup_lines = ["", cleanup_marker, "del _sym_db"]
+    cleanup_lines.extend(f"del {alias}" for alias in aliases)
+    path.write_text(prefix.rstrip() + "\n" + "\n".join(cleanup_lines) + descriptor_marker + rest)
+PY
 
 echo ""
 echo "Creating type stubs..."

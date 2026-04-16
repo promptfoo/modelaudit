@@ -5,6 +5,7 @@ import logging
 import random
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from typing import Any, TypeVar
 
 import click
@@ -173,7 +174,7 @@ def retry_cloud_operation(
     )
 
     # Try to include HTTP errors if available
-    try:
+    with suppress(ImportError):
         import requests
 
         retry_exceptions = (
@@ -182,16 +183,12 @@ def retry_cloud_operation(
             requests.Timeout,
             requests.HTTPError,
         )
-    except ImportError:
-        pass
 
     # Try to include fsspec errors if available
-    try:
+    with suppress(ImportError, AttributeError):
         import fsspec
 
         retry_exceptions = (*retry_exceptions, fsspec.exceptions.FSTimeoutError)  # type: ignore[attr-defined]
-    except (ImportError, AttributeError):
-        pass
 
     wrapped_func = retry_with_backoff(
         max_retries=max_retries,

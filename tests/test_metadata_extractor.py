@@ -12,7 +12,6 @@ from typing import Any
 import pytest
 
 import modelaudit.metadata_extractor as metadata_extractor_module
-from modelaudit.metadata_extractor import ModelMetadataExtractor
 from modelaudit.utils import tensorflow_compat
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 
@@ -41,7 +40,7 @@ class TestModelMetadataExtractor:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Metadata extraction should route through the helper-based scanner lookup."""
-        extractor = ModelMetadataExtractor()
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
         target = tmp_path / "helper-routed.model"
         target.write_bytes(b"placeholder")
         helper_calls: list[tuple[str, dict[str, Any] | None]] = []
@@ -70,7 +69,7 @@ class TestModelMetadataExtractor:
 
     def test_extract_metadata_unknown_format(self) -> None:
         """Test metadata extraction with unknown file format."""
-        extractor = ModelMetadataExtractor()
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
 
         with tempfile.NamedTemporaryFile(suffix=".unknown") as tmp:
             tmp.write(b"some random data")
@@ -84,7 +83,7 @@ class TestModelMetadataExtractor:
 
     def test_extract_metadata_basic(self, tmp_path: Path) -> None:
         """Test basic metadata extraction functionality."""
-        extractor = ModelMetadataExtractor()
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
 
         # Create a simple safetensors file
         header = {"tensor1": {"dtype": "F32", "shape": [2, 2], "data_offsets": [0, 16]}}
@@ -107,7 +106,7 @@ class TestModelMetadataExtractor:
 
     def test_extract_directory_metadata(self) -> None:
         """Test directory metadata extraction."""
-        extractor = ModelMetadataExtractor()
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             # Create multiple test files
@@ -142,7 +141,7 @@ class TestModelMetadataExtractor:
         requires_symlinks: None,
     ) -> None:
         """Directory metadata extraction should not read symlinks outside the scan root."""
-        extractor = ModelMetadataExtractor()
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
         scan_dir = tmp_path / "scan"
         scan_dir.mkdir()
         outside_dir = tmp_path / "outside"
@@ -167,7 +166,7 @@ class TestModelMetadataExtractor:
 
     def test_security_only_filter(self, tmp_path: Path) -> None:
         """Test security-only metadata filtering."""
-        extractor = ModelMetadataExtractor()
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
 
         header = {
             "tensor1": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
@@ -237,7 +236,7 @@ class TestModelMetadataExtractor:
 
     def test_pickle_metadata_no_deserialization(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Ensure pickle metadata extraction does not deserialize by default."""
-        extractor = ModelMetadataExtractor()
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
 
         import pickle
 
@@ -260,7 +259,7 @@ class TestModelMetadataExtractor:
     def test_joblib_metadata_no_deserialization(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         """Ensure joblib metadata extraction does not deserialize by default."""
         joblib_mod = pytest.importorskip("joblib")
-        extractor = ModelMetadataExtractor()
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
 
         joblib_file = tmp_path / "model.joblib"
         joblib_mod.dump({"x": 1}, joblib_file)
@@ -280,7 +279,7 @@ class TestModelMetadataExtractor:
         if not _has_tf_protos():
             pytest.skip("TensorFlow protobuf stubs unavailable")
 
-        extractor = ModelMetadataExtractor()
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
 
         saved_model_dir = tmp_path / "saved_model"
         saved_model_dir.mkdir()
@@ -323,7 +322,7 @@ class TestModelMetadataExtractor:
         saved_model_pb = saved_model_dir / "saved_model.pb"
         saved_model_pb.write_bytes(saved_model.SerializeToString())
 
-        extractor = ModelMetadataExtractor()
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
         metadata = extractor.extract(str(saved_model_pb), allow_deserialization=True)
 
         assert metadata["format"] == "tf_savedmodel"
@@ -342,7 +341,7 @@ class TestModelMetadataExtractor:
     def test_numpy_metadata_no_deserialization(self, tmp_path: Path) -> None:
         """Ensure NumPy metadata extraction uses allow_pickle=False by default."""
         np = pytest.importorskip("numpy")
-        extractor = ModelMetadataExtractor()
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
 
         # Create a simple numeric .npy file
         arr = np.array([1.0, 2.0, 3.0], dtype=np.float32)
@@ -360,7 +359,7 @@ class TestModelMetadataExtractor:
     def test_numpy_object_array_blocked_without_deserialization(self, tmp_path: Path) -> None:
         """Ensure NumPy object arrays are blocked by default (require pickle)."""
         np = pytest.importorskip("numpy")
-        extractor = ModelMetadataExtractor()
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
 
         # Create an object-dtype .npy file that requires pickle to load
         obj_arr = np.array([{"a": 1}, {"b": 2}], dtype=object)
@@ -376,7 +375,7 @@ class TestModelMetadataExtractor:
     def test_numpy_object_array_allowed_with_deserialization(self, tmp_path: Path) -> None:
         """Ensure NumPy object arrays load when deserialization is explicitly allowed."""
         np = pytest.importorskip("numpy")
-        extractor = ModelMetadataExtractor()
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
 
         obj_arr = np.array([{"a": 1}, {"b": 2}], dtype=object)
         npy_file = tmp_path / "object_array.npy"
@@ -391,7 +390,7 @@ class TestModelMetadataExtractor:
 
     def test_xgboost_metadata_no_deserialization(self, tmp_path: Path) -> None:
         """Ensure XGBoost metadata extraction is blocked without deserialization flag."""
-        extractor = ModelMetadataExtractor()
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
 
         # Create a minimal XGBoost JSON model
         xgb_model = {
@@ -409,7 +408,7 @@ class TestModelMetadataExtractor:
 
     def test_metadata_extractor_setdefault_preserves_scanner_values(self, tmp_path: Path) -> None:
         """Ensure scanner metadata isn't overwritten by extractor's setdefault calls."""
-        extractor = ModelMetadataExtractor()
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
 
         # Create a safetensors file - the scanner sets format to "safetensors"
         header = {"t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
@@ -430,7 +429,7 @@ class TestModelMetadataExtractor:
 
     def test_security_only_includes_deserialization_keys(self) -> None:
         """Ensure security filter preserves deserialization-related keys."""
-        extractor = ModelMetadataExtractor()
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
 
         metadata = {
             "file": "test.pkl",
@@ -456,7 +455,7 @@ class TestModelMetadataExtractor:
 
     def test_extract_metadata_handles_scanner_exception(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Ensure metadata extraction gracefully handles scanner exceptions."""
-        extractor = ModelMetadataExtractor()
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
 
         # Create a safetensors file
         header = {"t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]}}
@@ -490,7 +489,7 @@ class TestModelMetadataExtractor:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Helper-selected scanners should still populate format from the instance on failure."""
-        extractor = ModelMetadataExtractor()
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
         target = tmp_path / "instance-name-only.model"
         target.write_bytes(b"placeholder")
 

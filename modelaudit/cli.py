@@ -1,5 +1,6 @@
 """Command-line interface for ModelAudit security scanner."""
 
+import contextlib
 import json
 import logging
 import os
@@ -498,8 +499,6 @@ def _resolve_scan_runtime_config(
 
     max_download_bytes = None
     if max_size is not None:
-        import contextlib
-
         with contextlib.suppress(ValueError):
             max_download_bytes = parse_size_string(max_size)
 
@@ -1091,8 +1090,8 @@ def _resolve_scan_source_for_path(
 
                 if runtime.scan_and_delete:
                     click.echo(style_text("   Mode: Streaming (scan and delete to save disk)", fg="cyan"))
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Unable to display HuggingFace model metadata for %s: %s", path, exc)
 
         temp_dir = None
         try:
@@ -3007,15 +3006,13 @@ def _get_install_info() -> dict[str, Any]:
         dist = distribution("modelaudit")
 
         # Get install location using public API (locate_file returns install root)
-        try:
+        with contextlib.suppress(Exception):
             install_root = dist.locate_file("")
             install_path = str(install_root)
             home = str(Path.home())
             if install_path.startswith(home):
                 install_path = "~" + install_path[len(home) :]
             info["location"] = install_path
-        except Exception:
-            pass  # location is optional
 
         # Check for editable install via direct_url.json
         direct_url_text = dist.read_text("direct_url.json")

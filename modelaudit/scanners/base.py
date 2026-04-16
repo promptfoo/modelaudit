@@ -7,6 +7,7 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any, ClassVar, Final, Literal
 
 from ..analysis.unified_context import UnifiedMLContext
@@ -24,7 +25,6 @@ from .rule_mapper import get_embedded_code_rule_code, get_network_rule_code, get
 # Progress tracking imports with circular dependency detection
 PROGRESS_AVAILABLE = False
 ProgressTracker = None
-ProgressPhase = None
 
 # Try to import progress tracking, handle circular import gracefully
 try:
@@ -55,7 +55,25 @@ _TRUSTED_SOURCE_PROVENANCE_TOKEN: Final[object] = object()
 _WHITELIST_STALE_WARNING_THRESHOLD_DAYS: Final[int] = 90
 DEFAULT_MAX_FILE_READ_SIZE: Final[int] = 512 * 1024 * 1024
 DEFAULT_READ_CHUNK_SIZE: Final[int] = 8 * 1024 * 1024
-_has_logged_stale_whitelist_warning = False
+
+
+@lru_cache(maxsize=16)
+def _warn_if_whitelist_is_stale(generated_at: str) -> None:
+    try:
+        whitelist_generated_at = datetime.fromisoformat(generated_at).date()
+    except ValueError:
+        logger.debug(
+            "Invalid WHITELIST_GENERATED_AT value %r; skipping whitelist staleness check.",
+            generated_at,
+        )
+        return
+
+    whitelist_age_days = (datetime.now(timezone.utc).date() - whitelist_generated_at).days
+    if whitelist_age_days > _WHITELIST_STALE_WARNING_THRESHOLD_DAYS:
+        logger.warning(
+            "HuggingFace whitelist is %d days old. Consider updating for best supply chain coverage.",
+            whitelist_age_days,
+        )
 
 
 @dataclass(frozen=True)
@@ -173,22 +191,7 @@ class BaseScanner(ABC):
             if not is_whitelisted:
                 return False
 
-            global _has_logged_stale_whitelist_warning
-            if not _has_logged_stale_whitelist_warning:
-                try:
-                    whitelist_generated_at = datetime.fromisoformat(WHITELIST_GENERATED_AT).date()
-                    whitelist_age_days = (datetime.now(timezone.utc).date() - whitelist_generated_at).days
-                    if whitelist_age_days > _WHITELIST_STALE_WARNING_THRESHOLD_DAYS:
-                        logger.warning(
-                            "HuggingFace whitelist is %d days old. Consider updating for best supply chain coverage.",
-                            whitelist_age_days,
-                        )
-                        _has_logged_stale_whitelist_warning = True
-                except ValueError:
-                    logger.debug(
-                        "Invalid WHITELIST_GENERATED_AT value %r; skipping whitelist staleness check.",
-                        WHITELIST_GENERATED_AT,
-                    )
+            _warn_if_whitelist_is_stale(WHITELIST_GENERATED_AT)
 
             return True
 

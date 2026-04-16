@@ -1,3 +1,4 @@
+import importlib.util
 import sys
 from pathlib import Path
 from typing import Any
@@ -11,13 +12,7 @@ from modelaudit.scanners import _registry
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.tflite_scanner import _MAX_COUNT, TFLiteScanner
 
-# Try to import tflite to check availability
-try:
-    import tflite  # noqa: F401
-
-    HAS_TFLITE = True
-except ImportError:
-    HAS_TFLITE = False
+HAS_TFLITE = importlib.util.find_spec("tflite") is not None
 
 
 def _single_file_metadata(aggregate: Any) -> Any:

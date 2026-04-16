@@ -24,7 +24,9 @@ _sym_db = _symbol_database.Default()
 
 from tensorflow.core.framework import versions_pb2 as tensorflow_dot_core_dot_framework_dot_versions__pb2
 
-
+# Keep generated dependency imports for descriptor registration side effects.
+del _sym_db
+del tensorflow_dot_core_dot_framework_dot_versions__pb2
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n*tensorflow/core/protobuf/fingerprint.proto\x12\ntensorflow\x1a(tensorflow/core/framework/versions.proto\"\xcd\x01\n\x0e\x46ingerprintDef\x12\x1c\n\x14saved_model_checksum\x18\x01 \x01(\x04\x12\x1e\n\x16graph_def_program_hash\x18\x02 \x01(\x04\x12\x1a\n\x12signature_def_hash\x18\x03 \x01(\x04\x12\x1f\n\x17saved_object_graph_hash\x18\x04 \x01(\x04\x12\x17\n\x0f\x63heckpoint_hash\x18\x05 \x01(\x04\x12\'\n\x07version\x18\x06 \x01(\x0b\x32\x16.tensorflow.VersionDefB\x89\x01\n\x18org.tensorflow.frameworkB\x11\x46ingerprintProtosP\x01ZUgithub.com/tensorflow/tensorflow/tensorflow/go/core/protobuf/for_core_protos_go_proto\xf8\x01\x01\x62\x06proto3')
 
 _globals = globals()

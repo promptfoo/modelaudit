@@ -9,6 +9,7 @@ Tests the 7-Zip archive scanning functionality including:
 - Large archive handling
 """
 
+import io
 import os
 import pickle
 import tarfile
@@ -1634,6 +1635,28 @@ class TestSevenZipScannerHardening:
             assert result.metadata.get("file_size") is not None
 
     # -- nested header probe behavior via scanner API -------------------------
+
+    def test_probe_detected_format_handles_missing_probe(self) -> None:
+        """Header probe should return None when no probe buffer is available."""
+        scanner = SevenZipScanner()
+
+        assert scanner._probe_detected_format(None) is None
+
+    def test_probe_detected_format_recognizes_7z_magic(self) -> None:
+        """Header probes should classify 7z members from signature bytes."""
+        scanner = SevenZipScanner()
+        probe = io.BytesIO(scanner._SEVENZIP_MAGIC + b"\x00" * 16)
+
+        assert scanner._probe_detected_format(probe) == "sevenzip"
+
+    def test_probe_detected_format_recognizes_tar_headers(self) -> None:
+        """Header probes should classify nested TAR members without relying on suffixes."""
+        scanner = SevenZipScanner()
+        tar_header = bytearray(scanner._NESTED_MEMBER_PROBE_BYTES)
+        tar_header[257:262] = b"ustar"
+        probe = io.BytesIO(bytes(tar_header))
+
+        assert scanner._probe_detected_format(probe) == "tar"
 
     def test_extensionless_probe_without_header_is_not_scanned(
         self,

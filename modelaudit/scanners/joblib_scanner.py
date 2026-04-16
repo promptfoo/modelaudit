@@ -9,6 +9,7 @@ import os
 import pickletools
 import zlib
 from collections.abc import Callable
+from contextlib import suppress
 from typing import Any, ClassVar
 
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
@@ -558,7 +559,7 @@ class JoblibScanner(BaseScanner):
                         }
                     )
                 except Exception:
-                    pass
+                    metadata["model_parameters_unavailable"] = True
 
             # Check for common sklearn model attributes
             if hasattr(obj, "n_features_in_"):
@@ -576,15 +577,13 @@ class JoblibScanner(BaseScanner):
 
             if hasattr(obj, "feature_importances_"):
                 metadata["has_feature_importances"] = True
-                try:
+                with suppress(Exception):
                     importances = obj.feature_importances_
                     metadata["feature_importance_stats"] = {
                         "min": float(min(importances)),
                         "max": float(max(importances)),
                         "mean": float(sum(importances) / len(importances)),
                     }
-                except Exception:
-                    pass
             else:
                 metadata["has_feature_importances"] = False
 
