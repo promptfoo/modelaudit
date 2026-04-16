@@ -41,19 +41,21 @@ class TestAdvancedSizeLimits:
                     mock_format.return_value = "unknown"
                     with patch("modelaudit.core.detect_format_from_extension") as mock_ext:
                         mock_ext.return_value = "unknown"
-                        with patch("modelaudit.core.validate_file_type") as mock_validate:
-                            mock_validate.return_value = True
+                        with patch("modelaudit.core.detect_file_format_from_magic") as mock_magic:
+                            mock_magic.return_value = "unknown"
+                            with patch("modelaudit.core.validate_file_type_with_formats") as mock_validate:
+                                mock_validate.return_value = True
 
-                            # Also need to mock the registry
-                            with patch("modelaudit.core._registry.get_scanner_for_path") as mock_registry:
-                                mock_registry.return_value = None  # No specific scanner
+                                # Also need to mock the registry
+                                with patch("modelaudit.core._registry.get_scanner_for_path") as mock_registry:
+                                    mock_registry.return_value = None  # No specific scanner
 
-                                # This should NOT be blocked by max_file_size
-                                result = scan_file(f.name, config)
+                                    # This should NOT be blocked by max_file_size
+                                    result = scan_file(f.name, config)
 
-                                # With new behavior, large files are still scanned
-                                # but using the normal large file handler
-                                assert result is not None
+                                    # With new behavior, large files are still scanned
+                                    # but using the normal large file handler
+                                    assert result is not None
 
     @patch("modelaudit.utils.file.handlers.os.path.getsize")
     def test_normal_files_respect_size_limit(self, mock_size):
@@ -122,17 +124,19 @@ class TestAdvancedSizeLimits:
                         mock_format.return_value = "unknown"
                         with patch("modelaudit.core.detect_format_from_extension") as mock_ext:
                             mock_ext.return_value = "unknown"
-                            with patch("modelaudit.core.validate_file_type") as mock_validate:
-                                mock_validate.return_value = True
+                            with patch("modelaudit.core.detect_file_format_from_magic") as mock_magic:
+                                mock_magic.return_value = "unknown"
+                                with patch("modelaudit.core.validate_file_type_with_formats") as mock_validate:
+                                    mock_validate.return_value = True
 
-                                # Also need to mock the registry
-                                with patch("modelaudit.core._registry.get_scanner_for_path") as mock_registry:
-                                    mock_registry.return_value = None  # No specific scanner
+                                    # Also need to mock the registry
+                                    with patch("modelaudit.core._registry.get_scanner_for_path") as mock_registry:
+                                        mock_registry.return_value = None  # No specific scanner
 
-                                    # Should not be blocked
-                                    result = scan_file(f.name, config)
-                                    # With new behavior, we scan all files
-                                    assert result is not None
+                                        # Should not be blocked
+                                        result = scan_file(f.name, config)
+                                        # With new behavior, we scan all files
+                                        assert result is not None
 
     def test_size_thresholds_are_sensible(self):
         """Verify that size thresholds make sense."""

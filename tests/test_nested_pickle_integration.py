@@ -360,17 +360,23 @@ class TestNestedPickleIntegration:
 
                 assert result.success, f"Scan should succeed for {description}"
 
-                nested_issues = [
+                nested_issue_messages = [
                     issue
                     for issue in result.issues
                     if "nested" in issue.message.lower() or "encoded" in issue.message.lower()
                 ]
+                nested_check_messages = [
+                    check
+                    for check in result.checks
+                    if "nested" in check.message.lower() or "encoded" in check.message.lower()
+                ]
+                nested_detection_count = len(nested_issue_messages) + len(nested_check_messages)
 
                 if should_detect:
-                    assert len(nested_issues) > 0, f"Should detect {description}"
+                    assert nested_detection_count > 0, f"Should detect {description}"
                     print("  ✅ Correctly detected nested pickle")
                 else:
-                    assert len(nested_issues) == 0, f"Should not detect {description} as nested pickle"
+                    assert nested_detection_count == 0, f"Should not detect {description} as nested pickle"
                     print("  ✅ Correctly ignored non-threat")
 
     def test_regression_existing_functionality(self, pickles_dir):

@@ -13,6 +13,33 @@ from pathlib import Path
 from typing import Any
 
 
+def _tar_octal_field(value: int, length: int) -> bytes:
+    return f"{value:0{length - 1}o}\0".encode("ascii")[-length:]
+
+
+def create_v7_tar_archive(path: Path, *, member_name: str = "payload.txt", payload: bytes = b"payload") -> Path:
+    """Create a legacy TAR archive without a ustar magic marker."""
+    header = bytearray(512)
+    encoded_name = member_name.encode("utf-8")
+    if not encoded_name or len(encoded_name) > 100:
+        raise ValueError("member_name must encode to 1-100 bytes")
+
+    header[: len(encoded_name)] = encoded_name
+    header[100:108] = _tar_octal_field(0o644, 8)
+    header[108:116] = _tar_octal_field(0, 8)
+    header[116:124] = _tar_octal_field(0, 8)
+    header[124:136] = _tar_octal_field(len(payload), 12)
+    header[136:148] = _tar_octal_field(0, 12)
+    header[148:156] = b"        "
+    header[156:157] = b"0"
+    checksum = sum(header)
+    header[148:156] = f"{checksum:06o}\0 ".encode("ascii")
+
+    padding = b"\0" * ((512 - (len(payload) % 512)) % 512)
+    path.write_bytes(bytes(header) + payload + padding + (b"\0" * 1024))
+    return path
+
+
 def create_safe_pickle(path: Path, data: dict[str, Any] | None = None) -> Path:
     """Create a safe pickle file for testing.
 

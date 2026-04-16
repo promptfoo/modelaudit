@@ -10,6 +10,7 @@ import pytest
 
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.utils.file.detection import detect_file_format, validate_file_type
+from modelaudit.utils.file.filtering import should_skip_file
 from tests.helpers.file_creators import create_mock_manifest, create_safe_pickle
 
 pytest.importorskip("pytest_benchmark")
@@ -18,6 +19,7 @@ pytestmark = pytest.mark.performance
 
 DETECTION_ROUNDS = 25
 SCAN_ROUNDS = 5
+SKIP_FILTER_ROUNDS = 10
 WARMUP_ROUNDS = 1
 
 
@@ -121,6 +123,16 @@ def _benchmark_context(path: Path) -> dict[str, int | str]:
     }
 
 
+def _create_skip_filter_corpus(root: Path) -> list[Path]:
+    root.mkdir()
+    files = []
+    for index in range(256):
+        path = root / f"note_{index}.txt"
+        path.write_text(f"benchmark note {index}\n", encoding="utf-8")
+        files.append(path)
+    return files
+
+
 @pytest.fixture(scope="session")
 def benchmark_inputs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
     root = tmp_path_factory.mktemp("scan-benchmarks")
@@ -138,10 +150,16 @@ def benchmark_inputs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path
     }
 
 
-def _benchmark_scan(benchmark: Any, path: Path, *, rounds: int = SCAN_ROUNDS) -> Any:
+@pytest.fixture(scope="session")
+def skip_filter_inputs(tmp_path_factory: pytest.TempPathFactory) -> list[Path]:
+    return _create_skip_filter_corpus(tmp_path_factory.mktemp("skip-filter-benchmark") / "plain-text")
+
+
+def _benchmark_scan(benchmark: Any, path: Path, *, rounds: int = SCAN_ROUNDS, cache_enabled: bool = False) -> Any:
     benchmark.extra_info.update(_benchmark_context(path))
+    benchmark.extra_info["cache_enabled"] = cache_enabled
     return benchmark.pedantic(
-        lambda: scan_model_directory_or_file(str(path)),
+        lambda: scan_model_directory_or_file(str(path), cache_enabled=cache_enabled),
         iterations=1,
         rounds=rounds,
         warmup_rounds=WARMUP_ROUNDS,
@@ -174,6 +192,24 @@ def test_validate_file_type_pytorch_zip(benchmark: Any, benchmark_inputs: dict[s
     )
 
     assert is_valid is True
+
+
+def test_skip_filter_plain_text_files(benchmark: Any, skip_filter_inputs: list[Path]) -> None:
+    benchmark.extra_info.update(
+        {
+            "files": len(skip_filter_inputs),
+            "bytes": sum(path.stat().st_size for path in skip_filter_inputs),
+        }
+    )
+
+    skipped_count = benchmark.pedantic(
+        lambda: sum(1 for path in skip_filter_inputs if should_skip_file(str(path))),
+        iterations=1,
+        rounds=SKIP_FILTER_ROUNDS,
+        warmup_rounds=WARMUP_ROUNDS,
+    )
+
+    assert skipped_count == len(skip_filter_inputs)
 
 
 def test_scan_safe_pickle(benchmark: Any, benchmark_inputs: dict[str, Path]) -> None:

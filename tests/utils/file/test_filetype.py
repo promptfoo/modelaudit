@@ -24,6 +24,7 @@ from modelaudit.utils.file.detection import (
     validate_file_type,
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
+from tests.helpers.file_creators import create_v7_tar_archive
 
 
 def _create_mar_archive(
@@ -543,6 +544,16 @@ def test_detect_file_format_tar(tmp_path):
         info = tarfile.TarInfo(name="test.txt")
         tar.addfile(info, io.BytesIO(b"content"))
 
+    assert detect_file_format_from_magic(str(tar_path)) == "tar"
+    assert detect_file_format(str(tar_path)) == "tar"
+
+
+def test_detect_file_format_extensionless_legacy_tar_without_ustar(tmp_path: Path) -> None:
+    """Legacy TAR headers without ustar magic should still route by checksum."""
+    tar_path = create_v7_tar_archive(tmp_path / "legacy-archive")
+
+    assert tar_path.read_bytes()[257:262] == b"\0" * 5
+    assert tarfile.is_tarfile(tar_path) is True
     assert detect_file_format_from_magic(str(tar_path)) == "tar"
     assert detect_file_format(str(tar_path)) == "tar"
 

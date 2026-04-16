@@ -1,6 +1,9 @@
 """Tests for content hash generation in regular scan mode."""
 
+import hashlib
 import pickle
+import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -27,6 +30,20 @@ class TestRegularScanContentHash:
         assert result.content_hash is not None
         assert isinstance(result.content_hash, str)
         assert len(result.content_hash) == 64  # SHA-256 hex digest length
+
+    def test_single_archive_hash_uses_outer_file_bytes(self, tmp_path: Path) -> None:
+        """Archive scans must hash the scanned archive, not merged nested metadata."""
+        archive_path = tmp_path / "model.zip"
+        nested_payload = pickle.dumps({"nested": "payload"})
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("model.pkl", nested_payload)
+
+        result = scan_model_directory_or_file(str(archive_path))
+
+        outer_hash = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+        nested_hash = hashlib.sha256(nested_payload).hexdigest()
+        assert result.content_hash == compute_aggregate_hash([outer_hash])
+        assert result.content_hash != compute_aggregate_hash([nested_hash])
 
     def test_directory_generates_hash(self, tmp_path):
         """Test that scanning a directory generates an aggregate content hash."""

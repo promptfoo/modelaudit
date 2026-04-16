@@ -184,9 +184,9 @@ def _has_scannable_content(path: str) -> bool:
         return False
 
     try:
-        from .detection import detect_file_format
+        from .detection import detect_file_format_for_skip_filter
 
-        detected_format = detect_file_format(path)
+        detected_format = detect_file_format_for_skip_filter(path)
         if detected_format == "unknown":
             return False
 

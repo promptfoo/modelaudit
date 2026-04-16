@@ -6,10 +6,29 @@ from pathlib import Path
 
 import pytest
 
+from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
 from modelaudit.utils.file.filtering import (
     _ZIP_MEMBER_SNIFF_LIMIT,
     should_skip_file,
 )
+from tests.helpers.file_creators import create_v7_tar_archive
+
+
+def _build_lightgbm_text() -> str:
+    return "\n".join(
+        [
+            "tree=0",
+            "version=v4",
+            "num_class=1",
+            "num_tree_per_iteration=1",
+            "max_feature_idx=2",
+            "feature_names=f0 f1 f2",
+            "tree_sizes=12",
+            "num_leaves=2",
+            "split_feature=0",
+            "leaf_value=0.1 0.2",
+        ]
+    )
 
 
 class TestFileFilter:
@@ -145,16 +164,31 @@ class TestFileFilter:
         disguised_pickle = tmp_path / "payload.jpg"
         disguised_pickle.write_bytes(pickle.dumps({"safe": True}))
 
+        disguised_protocol0_pickle = tmp_path / "payload-protocol0.jpg"
+        disguised_protocol0_pickle.write_bytes(pickle.dumps({"safe": True}, protocol=0))
+
         disguised_zip = tmp_path / "archive.jpg"
         with zipfile.ZipFile(disguised_zip, "w") as archive:
             archive.writestr("payload.pkl", pickle.dumps({"safe": True}))
+
+        disguised_legacy_tar = create_v7_tar_archive(tmp_path / "legacy-tar.jpg")
 
         real_image = tmp_path / "cover.jpg"
         real_image.write_bytes(b"\xff\xd8\xff\xe0" + b"jpeg")
 
         assert not should_skip_file(str(disguised_pickle))
+        assert not should_skip_file(str(disguised_protocol0_pickle))
         assert not should_skip_file(str(disguised_zip))
+        assert not should_skip_file(str(disguised_legacy_tar))
         assert should_skip_file(str(real_image))
+
+    def test_disguised_lightgbm_text_model_bypasses_default_skip(self, tmp_path: Path) -> None:
+        """Default skip filtering must preserve supported text models under skipped suffixes."""
+        disguised_lightgbm = tmp_path / "model.txt"
+        disguised_lightgbm.write_text(("# preface\n" * 64) + _build_lightgbm_text(), encoding="utf-8")
+
+        assert detect_file_format_for_skip_filter(str(disguised_lightgbm)) == "lightgbm"
+        assert not should_skip_file(str(disguised_lightgbm))
 
     def test_executorch_payloads_bypass_extension_skip(self, tmp_path: Path) -> None:
         """Disguised ZIPs carrying supported ExecuTorch payloads should survive prefiltering."""
@@ -219,6 +253,6 @@ class TestFileFilter:
         def raise_os_error(_path: str) -> str:
             raise OSError("synthetic sniff failure")
 
-        monkeypatch.setattr("modelaudit.utils.file.detection.detect_file_format", raise_os_error)
+        monkeypatch.setattr("modelaudit.utils.file.detection.detect_file_format_for_skip_filter", raise_os_error)
 
         assert not should_skip_file(str(disguised_payload))

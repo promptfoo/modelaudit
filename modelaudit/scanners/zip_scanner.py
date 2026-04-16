@@ -27,6 +27,7 @@ CRITICAL_SYSTEM_PATHS = [
     "/sbin",
     "C:\\Windows",
 ]
+ARCHIVE_MEMBER_COPY_CHUNK_BYTES = 64 * 1024
 
 
 class ZipScanner(BaseScanner):
@@ -430,7 +431,7 @@ class ZipScanner(BaseScanner):
                             total_size = 0
                             with z.open(info) as entry:
                                 while True:
-                                    chunk = entry.read(4096)
+                                    chunk = entry.read(ARCHIVE_MEMBER_COPY_CHUNK_BYTES)
                                     if not chunk:
                                         break
                                     total_size += len(chunk)

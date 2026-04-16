@@ -599,21 +599,39 @@ def _contains_any_seed(data: bytes, seeds: tuple[bytes, ...]) -> bool:
     return _contains_any_seed_lowered(data.lower(), seeds)
 
 
-def _contains_any_seed_lowered(lower_data: bytes, seeds: tuple[bytes, ...]) -> bool:
-    return any(seed in lower_data for seed in seeds)
+def _seed_possible_from_present_bytes(seed: bytes, present_bytes: frozenset[int] | None) -> bool:
+    return present_bytes is None or all(byte in present_bytes for byte in seed)
 
 
-def _has_raw_text_indicator_shape(data: bytes, lower_data: bytes, *, rust_clean: bool) -> bool:
-    if _contains_any_seed_lowered(lower_data, _RAW_TEXT_SCAN_SEEDS):
+def _contains_any_seed_lowered(
+    lower_data: bytes,
+    seeds: tuple[bytes, ...],
+    present_bytes: frozenset[int] | None = None,
+) -> bool:
+    return any(_seed_possible_from_present_bytes(seed, present_bytes) and seed in lower_data for seed in seeds)
+
+
+def _has_raw_text_indicator_shape(
+    data: bytes,
+    lower_data: bytes,
+    *,
+    rust_clean: bool,
+    present_bytes: frozenset[int] | None = None,
+) -> bool:
+    if _contains_any_seed_lowered(lower_data, _RAW_TEXT_SCAN_SEEDS, present_bytes):
         return True
     if rust_clean:
         return False
     return b"R" in data and any(opcode in data for opcode in _COPYREG_EXTENSION_OPCODES)
 
 
-def _has_alnum_secret_shape(data: bytes) -> bool:
-    lower = data.lower()
-    if not _contains_any_seed_lowered(lower, _SECRET_SHAPE_KEYWORDS):
+def _has_alnum_secret_shape(
+    data: bytes,
+    lower_data: bytes | None = None,
+    present_bytes: frozenset[int] | None = None,
+) -> bool:
+    lower = data.lower() if lower_data is None else lower_data
+    if not _contains_any_seed_lowered(lower, _SECRET_SHAPE_KEYWORDS, present_bytes):
         return False
     return _SECRET_ASSIGNMENT_SHAPE_RE.search(data) is not None
 
@@ -1598,9 +1616,12 @@ class PickleScanner(BaseScanner):
         if not data:
             return
 
-        self._scan_raw_text_indicators(data, result, source)
+        lower_data = data.lower()
+        present_bytes = frozenset(lower_data)
+
+        self._scan_raw_text_indicators(data, result, source, lower_data=lower_data, present_bytes=present_bytes)
         self._scan_encoded_text_indicators(data, result, source)
-        self._analyze_cve_patterns(data, result, source)
+        self._analyze_cve_patterns(data, result, source, lower_data=lower_data, present_bytes=present_bytes)
         if scan_binary_tail:
             self._scan_binary_tail_if_needed(data, result, source)
         if skip_expensive_detectors:
@@ -1621,22 +1642,33 @@ class PickleScanner(BaseScanner):
             result.metadata["pickle_expensive_raw_detector_skip_reason"] = "disabled"
             return
         expensive_data = data[:expensive_limit]
-        expensive_lower = expensive_data.lower()
+        if len(expensive_data) == len(data):
+            expensive_lower = lower_data
+            expensive_present_bytes = present_bytes
+        else:
+            expensive_lower = expensive_data.lower()
+            expensive_present_bytes = frozenset(expensive_lower)
         if len(expensive_data) < len(data):
             result.metadata["pickle_expensive_raw_detector_bytes_scanned"] = len(expensive_data)
             result.metadata["pickle_expensive_raw_detector_bytes_available"] = len(data)
 
-        if _contains_any_seed_lowered(expensive_lower, _SECRET_SCAN_SEEDS) or _has_alnum_secret_shape(expensive_data):
+        if _contains_any_seed_lowered(
+            expensive_lower,
+            _SECRET_SCAN_SEEDS,
+            expensive_present_bytes,
+        ) or _has_alnum_secret_shape(expensive_data, expensive_lower, expensive_present_bytes):
             self.check_for_embedded_secrets(expensive_data, result, source)
         else:
             result.metadata["pickle_secrets_raw_detector_skipped"] = True
 
-        if _contains_any_seed_lowered(expensive_lower, _JIT_SCAN_SEEDS):
+        if _contains_any_seed_lowered(expensive_lower, _JIT_SCAN_SEEDS, expensive_present_bytes):
             self.check_for_jit_script_code(expensive_data, result, model_type="pickle", context=source)
         else:
             result.metadata["pickle_jit_raw_detector_skipped"] = True
 
-        if _contains_any_seed_lowered(expensive_lower, _NETWORK_SCAN_SEEDS) or _has_domain_or_ip_shape(expensive_data):
+        if _contains_any_seed_lowered(expensive_lower, _NETWORK_SCAN_SEEDS, expensive_present_bytes) or (
+            _has_domain_or_ip_shape(expensive_data)
+        ):
             self.check_for_network_communication(expensive_data, result, context=source)
         else:
             result.metadata["pickle_network_raw_detector_skipped"] = True
@@ -1818,9 +1850,24 @@ class PickleScanner(BaseScanner):
                     rule_code="S207",
                 )
 
-    def _scan_raw_text_indicators(self, data: bytes, result: ScanResult, source: str) -> None:
-        lower = data.lower()
-        if not _has_raw_text_indicator_shape(data, lower, rust_clean=self._rust_scan_completed_cleanly(result)):
+    def _scan_raw_text_indicators(
+        self,
+        data: bytes,
+        result: ScanResult,
+        source: str,
+        *,
+        lower_data: bytes | None = None,
+        present_bytes: frozenset[int] | None = None,
+    ) -> None:
+        lower = data.lower() if lower_data is None else lower_data
+        if present_bytes is None:
+            present_bytes = frozenset(lower)
+        if not _has_raw_text_indicator_shape(
+            data,
+            lower,
+            rust_clean=self._rust_scan_completed_cleanly(result),
+            present_bytes=present_bytes,
+        ):
             result.metadata["pickle_raw_text_detector_skipped"] = True
             return
         documentation_spans = _documentation_literal_spans(data)
@@ -2042,7 +2089,15 @@ class PickleScanner(BaseScanner):
                 )
                 return
 
-    def _analyze_cve_patterns(self, data: bytes, result: ScanResult, source: str | None = None) -> None:
+    def _analyze_cve_patterns(
+        self,
+        data: bytes,
+        result: ScanResult,
+        source: str | None = None,
+        *,
+        lower_data: bytes | None = None,
+        present_bytes: frozenset[int] | None = None,
+    ) -> None:
         """Add CVE attribution checks from a bounded raw pickle scan window."""
         opcode_counts = _result_opcode_counts(result)
         has_setitem_opcode = opcode_counts.get("SETITEM", 0) > 0 or opcode_counts.get("SETITEMS", 0) > 0
@@ -2051,8 +2106,10 @@ class PickleScanner(BaseScanner):
             reference.get("import_reference") in {"os.system", "posix.system", "nt.system"}
             for reference in import_references
         )
-        lower = data.lower()
-        if not _contains_any_seed_lowered(lower, _CVE_RAW_SCAN_SEEDS) and not (
+        lower = data.lower() if lower_data is None else lower_data
+        if present_bytes is None:
+            present_bytes = frozenset(lower)
+        if not _contains_any_seed_lowered(lower, _CVE_RAW_SCAN_SEEDS, present_bytes) and not (
             has_setitem_opcode and has_dangerous_system_global
         ):
             result.metadata["pickle_cve_raw_detector_skipped"] = True

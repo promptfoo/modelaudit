@@ -11,6 +11,7 @@ from modelaudit import core
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.tar_scanner import (
+    ARCHIVE_MEMBER_COPY_CHUNK_BYTES,
     DEFAULT_MAX_DECOMPRESSED_BYTES,
     DEFAULT_MAX_DECOMPRESSION_RATIO,
     DEFAULT_MAX_TAR_ENTRY_SIZE,
@@ -423,7 +424,7 @@ class TestTarScanner:
             assert total_size == len(content)
             assert Path(extracted_path).read_bytes() == content
             assert len(read_sizes) > 1
-            assert set(read_sizes) == {4096}
+            assert set(read_sizes) == {ARCHIVE_MEMBER_COPY_CHUNK_BYTES}
         finally:
             os.unlink(extracted_path)
 
