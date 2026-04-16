@@ -510,18 +510,23 @@ class XGBoostScanner(BaseScanner):
                 return
 
             # Modern XGBoost (2.0+) saves .bst files in UBJSON format by default.
-            # Detect and route to the UBJ scanner for proper analysis.
-            if self._is_ubjson_file(path):
+            # Route to the UBJ scanner when the decoder is available; otherwise
+            # fall through to binary validation + optional XGBoost loading so the
+            # load path is still attempted when enable_xgb_loading=True.
+            is_ubjson = self._is_ubjson_file(path)
+            if is_ubjson and _check_ubjson_available():
                 self._scan_ubj_model(path, result)
                 return
 
-            # Basic binary structure validation
-            self._validate_binary_structure(path, result)
+            # Basic binary structure validation (skipped for detected UBJSON
+            # since the old binary-marker check would mis-flag it).
+            if not is_ubjson:
+                self._validate_binary_structure(path, result)
 
             # Attempt safe XGBoost loading if enabled
             if self.enable_xgb_loading:
                 self._safe_xgboost_load(path, result)
-            else:
+            elif not is_ubjson:
                 result.add_check(
                     name="XGBoost Loading",
                     passed=True,
@@ -529,6 +534,22 @@ class XGBoostScanner(BaseScanner):
                     location=path,
                     details={"safe_mode": True},
                 )
+            else:
+                # UBJSON detected but no decoder and loading disabled
+                result.add_check(
+                    name="UBJSON Library Check",
+                    passed=False,
+                    message=(
+                        "File appears to be UBJSON format (modern XGBoost default) "
+                        "but the ubjson package is not installed. "
+                        "Install with 'pip install ubjson' to enable scanning."
+                    ),
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={"required_package": "ubjson", "detected_format": "ubjson"},
+                    why="UBJSON file scanning requires the ubjson package to decode Universal Binary JSON format",
+                )
+                self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["ubj_dependency_missing"])
 
         except Exception as e:
             result.add_check(
