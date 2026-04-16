@@ -432,7 +432,13 @@ def _looks_like_pytorch_zip_metadata(archive: zipfile.ZipFile, prefix: str) -> b
 def _looks_like_pytorch_zip_storage_members(member_names: set[str], prefix: str) -> bool:
     """Detect PyTorch tensor storage members next to data.pkl."""
     storage_prefix = f"{prefix}/data/" if prefix else "data/"
-    return any(name.startswith(storage_prefix) and name != storage_prefix for name in member_names)
+    for name in member_names:
+        if not name.startswith(storage_prefix):
+            continue
+        storage_key = name[len(storage_prefix) :]
+        if "/" not in storage_key and storage_key.isascii() and storage_key.isdecimal():
+            return True
+    return False
 
 
 def is_torchserve_mar_archive(path: str) -> bool:
