@@ -327,8 +327,11 @@ class KerasZipScanner(BaseScanner):
                 member_size_limits.append(configured_limit)
 
         recursive_member_size_limit = min(member_size_limits)
-        recursive_config["max_file_size"] = recursive_member_size_limit
         recursive_config["max_entry_size"] = recursive_member_size_limit
+        if self.config.get("max_file_size") not in (None, 0):
+            recursive_config["max_file_size"] = recursive_member_size_limit
+        else:
+            recursive_config.pop("max_file_size", None)
         return recursive_config
 
     def _merge_recursive_archive_scan(self, path: str, result: ScanResult) -> None:

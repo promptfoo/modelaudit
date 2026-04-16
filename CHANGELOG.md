@@ -38,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve `S999` unknown-opcode mapping in generic rule fallback
 - **docker:** run the full parser image as a non-root `appuser`
 - **onnx:** mark weight-distribution analysis inconclusive when dependencies are missing or eligible tensors are external, oversized, or fail extraction
+- **zip:** enforce an aggregate uncompressed-size budget before extracting ZIP entries so split archive bombs cannot bypass per-entry limits
 - **security:** route renamed TFLite FlatBuffers by magic bytes, enforce scanner file-size limits before model reads, and fail closed instead of propagating malformed structure traversal exceptions
 - **onnx:** fail closed on CRITICAL findings, detect `PyFunc` operators and Windows absolute external-data paths, validate external tensor slices with the current ONNX dtype API, and avoid Python-op substring false positives
 - **tensorrt:** route `.trt` engines, detect case-variant and UTF-16 suspicious strings, and avoid substring false positives in benign engine metadata
