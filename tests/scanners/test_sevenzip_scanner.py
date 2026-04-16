@@ -11,7 +11,9 @@ Tests the 7-Zip archive scanning functionality including:
 
 import os
 import pickle
+import tarfile
 import tempfile
+import zipfile
 from collections.abc import Generator
 from pathlib import Path
 from typing import Any
@@ -837,10 +839,12 @@ class TestSevenZipScanner:
     def test_extensionless_non_7z_members_are_filtered_before_full_extraction(
         self,
         scanner: SevenZipScanner,
-        temp_7z_file: str,
+        tmp_path: Path,
     ) -> None:
         """Only header-confirmed extensionless members should reach the full extraction pass."""
         extensionless_members = [f"asset_{index:03d}" for index in range(32)]
+        archive_path = tmp_path / "filter_probe.7z"
+        archive_path.write_bytes(scanner._SEVENZIP_MAGIC + b"\0" * 26)
 
         with (
             patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
@@ -867,17 +871,15 @@ class TestSevenZipScanner:
             mock_archive.extract.side_effect = fake_extract
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 
-            result = scanner.scan(temp_7z_file)
+            result = scanner.scan(str(archive_path))
 
             assert result.success
-            assert mock_archive.reset.call_count == 1
-            assert mock_archive.extract.call_count == 2
-            assert mock_archive.extract.call_args_list[0].kwargs["targets"] == [
-                "nested_archive",
-                *extensionless_members,
-            ]
-            assert "factory" in mock_archive.extract.call_args_list[0].kwargs
-            assert mock_archive.extract.call_args_list[1].kwargs["targets"] == ["safe.pkl", "nested_archive"]
+            probe_calls = mock_archive.extract.call_args_list[:-1]
+            assert mock_archive.reset.call_count == len(probe_calls)
+            assert mock_archive.extract.call_count == len(extensionless_members) + 2
+            assert [call.kwargs["targets"][0] for call in probe_calls] == ["nested_archive", *extensionless_members]
+            assert all("factory" in call.kwargs for call in probe_calls)
+            assert mock_archive.extract.call_args_list[-1].kwargs["targets"] == ["safe.pkl", "nested_archive"]
             assert mock_scan_extracted_file.call_count == 2
 
     def test_max_entries_protection(self, scanner, temp_7z_file):
@@ -1376,6 +1378,165 @@ class TestSevenZipScannerHardening:
             assert len(limit_checks) == 1
             assert limit_checks[0].status == CheckStatus.FAILED
 
+    def test_disguised_nested_zip_member_is_routed_for_scan(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Disguised nested archives should become scannable via bounded header probes."""
+        scanner = SevenZipScanner()
+        archive_path = tmp_path / "mock.7z"
+        archive_path.write_bytes(scanner._SEVENZIP_MAGIC + b"\0" * 26)
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_probe_extensionless_members", return_value={"payload.jpg": "zip"}) as mock_probe,
+            patch.object(scanner, "_extract_and_scan_files", return_value=True) as mock_extract,
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["payload.jpg"]
+            mock_archive.getinfo.return_value = MagicMock(is_directory=False, uncompressed=16)
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(str(archive_path))
+
+            assert result.success
+            assert mock_probe.call_args.args[1] == ["payload.jpg"]
+            assert mock_extract.call_args.args[1] == ["payload.jpg"]
+            assert result.metadata["scannable_files"] == 1
+
+    def test_oversized_disguised_nested_zip_marks_scan_incomplete(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Oversized disguised nested archives must fail closed once header probes classify them as scannable."""
+        scanner = SevenZipScanner(config={"max_7z_extract_size": 8})
+        archive_path = tmp_path / "mock_oversized.7z"
+        archive_path.write_bytes(scanner._SEVENZIP_MAGIC + b"\0" * 26)
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_probe_extensionless_members", return_value={"payload.jpg": "zip"}),
+            patch("os.path.getsize", return_value=32),
+        ):
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["payload.jpg"]
+            mock_archive.getinfo.return_value = MagicMock(is_directory=False, uncompressed=32)
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(str(archive_path))
+
+            oversized_checks = [c for c in result.checks if c.name == "Extracted File Size"]
+            assert len(oversized_checks) == 1
+            assert oversized_checks[0].details["size_limit"] == 8
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert "sevenzip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+
+    def test_probe_extensionless_members_stops_each_member_at_header_limit(self) -> None:
+        """Header probes should stop each disguised member after the bounded prefix."""
+        scanner = SevenZipScanner()
+
+        class FakeArchive:
+            def __init__(self) -> None:
+                self.targets: list[list[str]] = []
+                self.reset_count = 0
+
+            def extract(self, *, targets: list[str], factory: Any) -> None:
+                self.targets.append(targets)
+                probe = factory.create(targets[0])
+                probe.write(b"PK\x03\x04" + (b"A" * scanner._NESTED_MEMBER_PROBE_BYTES * 2))
+                raise AssertionError("probe extraction did not stop at the configured header budget")
+
+            def reset(self) -> None:
+                self.reset_count += 1
+
+        fake_archive = FakeArchive()
+
+        assert scanner._probe_extensionless_members(fake_archive, ["payload_a.jpg", "payload_b.jpg"]) == {
+            "payload_a.jpg": "zip",
+            "payload_b.jpg": "zip",
+        }
+        assert fake_archive.targets == [["payload_a.jpg"], ["payload_b.jpg"]]
+        assert fake_archive.reset_count == 2
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_disguised_nested_zip_member_detects_malicious_payload_end_to_end(self, tmp_path: Path) -> None:
+        """A ZIP payload hidden behind an image suffix inside 7z must still be scanned."""
+        import py7zr  # type: ignore[import-untyped]
+
+        class MaliciousClass:
+            def __reduce__(self) -> tuple[Any, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo disguised_zip_in_7z",))
+
+        pickle_path = tmp_path / "payload.pkl"
+        nested_zip_path = tmp_path / "nested.zip"
+        archive_path = tmp_path / "outer.7z"
+        self._write_pickle(pickle_path, MaliciousClass())
+        with zipfile.ZipFile(nested_zip_path, "w") as archive:
+            archive.write(pickle_path, "payload.pkl")
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(str(nested_zip_path), "payload.jpg")
+
+        result = SevenZipScanner().scan(str(archive_path))
+
+        assert result.success is False
+        assert any(
+            issue.location
+            and f"{archive_path}:payload.jpg:payload.pkl" in issue.location
+            and "system" in issue.message.lower()
+            for issue in result.issues
+        )
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_disguised_nested_tar_member_detects_malicious_payload_end_to_end(self, tmp_path: Path) -> None:
+        """A TAR payload hidden behind an opaque suffix inside 7z must still be scanned."""
+        import py7zr  # type: ignore[import-untyped]
+
+        class MaliciousClass:
+            def __reduce__(self) -> tuple[Any, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo disguised_tar_in_7z",))
+
+        pickle_path = tmp_path / "payload.pkl"
+        nested_tar_path = tmp_path / "nested.tar"
+        archive_path = tmp_path / "outer_tar.7z"
+        self._write_pickle(pickle_path, MaliciousClass())
+        with tarfile.open(nested_tar_path, "w") as archive:
+            archive.add(pickle_path, arcname="payload.pkl")
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(str(nested_tar_path), "payload.bin")
+
+        result = SevenZipScanner().scan(str(archive_path))
+
+        assert result.success is False
+        assert any(
+            issue.location
+            and f"{archive_path}:payload.bin:payload.pkl" in issue.location
+            and "system" in issue.message.lower()
+            for issue in result.issues
+        )
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_benign_disguised_image_member_is_not_routed_as_nested_archive(self, tmp_path: Path) -> None:
+        """Image-like members with unsupported magic should not become noisy nested archive scans."""
+        import py7zr  # type: ignore[import-untyped]
+
+        archive_path = tmp_path / "benign_image.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.writestr(b"\x89PNG\r\n\x1a\n" + (b"\0" * 128), "payload.jpg")
+
+        result = SevenZipScanner().scan(str(archive_path))
+
+        assert result.success is True
+        assert result.metadata["scannable_files"] == 0
+        assert not result.issues
+
     # -- cumulative entry count -----------------------------------------------
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
@@ -1496,6 +1657,18 @@ class TestSevenZipScannerHardening:
             buf.write(b"\xbc\xaf\x27\x1c\x00\x00")  # 8 bytes, only 4 more captured
         buf.seek(0)
         assert buf.read(6) == b"\x37\x7a\xbc\xaf\x27\x1c"
+
+    def test_probe_detected_format_recognizes_tar_headers(self) -> None:
+        """Header probes should classify nested TAR members without relying on suffixes."""
+        from modelaudit.scanners.sevenzip_scanner import _HeaderProbeBuffer
+
+        scanner = SevenZipScanner()
+        buf = _HeaderProbeBuffer(limit=scanner._NESTED_MEMBER_PROBE_BYTES, raise_on_limit=False)
+        tar_header = bytearray(scanner._NESTED_MEMBER_PROBE_BYTES)
+        tar_header[257:262] = b"ustar"
+        buf.write(bytes(tar_header))
+
+        assert scanner._probe_detected_format(buf) == "tar"
 
     # -- default config includes new limits -----------------------------------
 
