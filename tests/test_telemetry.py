@@ -25,7 +25,7 @@ from modelaudit.telemetry import (
 class TestUserConfig:
     """Test user configuration management."""
 
-    def test_user_config_creates_user_id(self):
+    def test_user_config_creates_user_id(self) -> None:
         """Test that user config generates a UUID."""
         with tempfile.TemporaryDirectory() as temp_dir:
             config_file = Path(temp_dir) / ".modelaudit" / "user_config.json"
@@ -36,6 +36,7 @@ class TestUserConfig:
 
                 assert config.user_id
                 assert len(config.user_id) == 36  # UUID length
+                assert config_file.parent.exists()
                 assert config_file.exists()
 
     def test_user_config_defaults_to_enabled(self):
@@ -708,13 +709,13 @@ class TestTelemetryIntegration:
             # Should still work without PostHog
             assert client._posthog_client is None
 
-    @patch("modelaudit.core_results.record_issue_found")
-    def test_core_scan_emits_issue_found_telemetry(self, mock_record_issue_found):
+    def test_core_scan_emits_issue_found_telemetry(self) -> None:
         """Core scans should emit issue telemetry for detected findings."""
         from modelaudit.core import scan_model_directory_or_file
 
         sample = Path(__file__).parent / "assets" / "samples" / "pickles" / "malicious_system_call.pkl"
-        result = scan_model_directory_or_file(str(sample))
+        with patch("modelaudit.core_results.record_issue_found") as mock_record_issue_found:
+            result = scan_model_directory_or_file(str(sample))
 
         assert len(result.issues) > 0
         assert mock_record_issue_found.call_count > 0
