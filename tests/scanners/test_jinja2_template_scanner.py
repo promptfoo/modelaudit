@@ -9,6 +9,35 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.jinja2_template_scanner import Jinja2TemplateScanner
 
+JINJA2_ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets" / "samples" / "jinja2"
+MALICIOUS_JSON_FIXTURES = tuple(sorted((JINJA2_ASSETS_DIR / "malicious").glob("*.json"))) + tuple(
+    sorted((JINJA2_ASSETS_DIR / "obfuscated").glob("*.json"))
+)
+BENIGN_JSON_FIXTURES = tuple(sorted((JINJA2_ASSETS_DIR / "benign").glob("*.json")))
+MALICIOUS_STANDALONE_FIXTURES = (
+    JINJA2_ASSETS_DIR / "standalone" / "malicious_standalone.jinja",
+    JINJA2_ASSETS_DIR / "standalone" / "malicious_subprocess.template",
+)
+BENIGN_STANDALONE_FIXTURES = (
+    JINJA2_ASSETS_DIR / "standalone" / "benign_chat.j2",
+    JINJA2_ASSETS_DIR / "standalone" / "suspicious_benign.template",
+)
+MALICIOUS_YAML_FIXTURES = (JINJA2_ASSETS_DIR / "yaml" / "malicious_config.yaml",)
+BENIGN_YAML_FIXTURES = (JINJA2_ASSETS_DIR / "yaml" / "model_config.yaml",)
+
+
+def _fixture_id(path: Path) -> str:
+    return path.name
+
+
+def _copy_as_tokenizer_config(source: Path, tmp_path: Path) -> Path:
+    """Route committed JSON template fixtures through the production tokenizer-config path."""
+    target_dir = tmp_path / "huggingface" / source.parent.name / source.stem
+    target_dir.mkdir(parents=True)
+    target = target_dir / "tokenizer_config.json"
+    target.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    return target
+
 
 class TestJinja2TemplateScannerCanHandle:
     """Test the can_handle method."""
@@ -616,6 +645,98 @@ class TestJinja2TemplateScannerStandaloneFiles:
 
         failed_checks = [c for c in result.checks if c.status == CheckStatus.FAILED]
         assert len(failed_checks) > 0
+
+
+class TestJinja2TemplateCommittedCorpus:
+    """Regression coverage for committed Jinja2 template fixtures."""
+
+    def test_committed_corpus_inventory_is_not_empty(self) -> None:
+        all_fixtures = (
+            MALICIOUS_JSON_FIXTURES
+            + BENIGN_JSON_FIXTURES
+            + MALICIOUS_STANDALONE_FIXTURES
+            + BENIGN_STANDALONE_FIXTURES
+            + MALICIOUS_YAML_FIXTURES
+            + BENIGN_YAML_FIXTURES
+        )
+
+        assert MALICIOUS_JSON_FIXTURES
+        assert BENIGN_JSON_FIXTURES
+        assert any(path.suffix == ".template" for path in MALICIOUS_STANDALONE_FIXTURES)
+        assert any(path.suffix == ".template" for path in BENIGN_STANDALONE_FIXTURES)
+        assert all(path.is_file() for path in all_fixtures), [
+            str(path.relative_to(JINJA2_ASSETS_DIR)) for path in all_fixtures if not path.is_file()
+        ]
+
+    @pytest.mark.parametrize("fixture_path", MALICIOUS_JSON_FIXTURES, ids=_fixture_id)
+    def test_malicious_json_fixtures_detect_when_routed_as_tokenizer_config(
+        self,
+        fixture_path: Path,
+        tmp_path: Path,
+    ) -> None:
+        tokenizer_file = _copy_as_tokenizer_config(fixture_path, tmp_path)
+
+        result = Jinja2TemplateScanner().scan(str(tokenizer_file))
+
+        assert any(
+            check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            for check in result.checks
+        ), f"Expected committed malicious Jinja2 fixture to produce a security check: {fixture_path}"
+
+    @pytest.mark.parametrize("fixture_path", BENIGN_JSON_FIXTURES, ids=_fixture_id)
+    def test_benign_json_fixtures_remain_quiet_when_routed_as_tokenizer_config(
+        self,
+        fixture_path: Path,
+        tmp_path: Path,
+    ) -> None:
+        tokenizer_file = _copy_as_tokenizer_config(fixture_path, tmp_path)
+
+        result = Jinja2TemplateScanner().scan(str(tokenizer_file))
+
+        assert not any(
+            check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            for check in result.checks
+        ), f"Expected committed benign Jinja2 fixture to stay quiet: {fixture_path}"
+
+    @pytest.mark.parametrize("fixture_path", MALICIOUS_STANDALONE_FIXTURES, ids=_fixture_id)
+    def test_malicious_standalone_fixtures_detect(self, fixture_path: Path) -> None:
+        result = Jinja2TemplateScanner().scan(str(fixture_path))
+
+        assert any(
+            check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            for check in result.checks
+        ), f"Expected committed malicious Jinja2 fixture to produce a security check: {fixture_path}"
+
+    @pytest.mark.parametrize("fixture_path", BENIGN_STANDALONE_FIXTURES, ids=_fixture_id)
+    def test_benign_standalone_fixtures_remain_quiet(self, fixture_path: Path) -> None:
+        result = Jinja2TemplateScanner().scan(str(fixture_path))
+
+        assert not any(
+            check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            for check in result.checks
+        ), f"Expected committed benign Jinja2 fixture to stay quiet: {fixture_path}"
+
+    @pytest.mark.parametrize("fixture_path", MALICIOUS_YAML_FIXTURES, ids=_fixture_id)
+    def test_malicious_yaml_fixtures_detect(self, fixture_path: Path) -> None:
+        pytest.importorskip("yaml")
+
+        result = Jinja2TemplateScanner().scan(str(fixture_path))
+
+        assert any(
+            check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            for check in result.checks
+        ), f"Expected committed malicious Jinja2 fixture to produce a security check: {fixture_path}"
+
+    @pytest.mark.parametrize("fixture_path", BENIGN_YAML_FIXTURES, ids=_fixture_id)
+    def test_benign_yaml_fixtures_remain_quiet(self, fixture_path: Path) -> None:
+        pytest.importorskip("yaml")
+
+        result = Jinja2TemplateScanner().scan(str(fixture_path))
+
+        assert not any(
+            check.status == CheckStatus.FAILED and check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            for check in result.checks
+        ), f"Expected committed benign Jinja2 fixture to stay quiet: {fixture_path}"
 
 
 class TestJinja2TemplateScannerMetadata:

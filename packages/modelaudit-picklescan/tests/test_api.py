@@ -1834,6 +1834,54 @@ def test_scan_bytes_does_not_treat_benign_stdlib_module_references_as_dangerous(
             SafetyVerdict.MALICIOUS,
         ),
         (
+            b"cctypes\nCDLL\n(tR.",
+            "ctypes.CDLL",
+            Severity.CRITICAL,
+            SafetyVerdict.MALICIOUS,
+        ),
+        (
+            b"cctypes\ncast\n(tR.",
+            "ctypes.cast",
+            Severity.CRITICAL,
+            SafetyVerdict.MALICIOUS,
+        ),
+        (
+            b"ccProfile\nrun\n(tR.",
+            "cProfile.run",
+            Severity.CRITICAL,
+            SafetyVerdict.MALICIOUS,
+        ),
+        (
+            b"cpdb\nrun\n(tR.",
+            "pdb.run",
+            Severity.CRITICAL,
+            SafetyVerdict.MALICIOUS,
+        ),
+        (
+            b"ctimeit\ntimeit\n(tR.",
+            "timeit.timeit",
+            Severity.CRITICAL,
+            SafetyVerdict.MALICIOUS,
+        ),
+        (
+            b"cprofile\nrun\n(tR.",
+            "profile.run",
+            Severity.CRITICAL,
+            SafetyVerdict.MALICIOUS,
+        ),
+        (
+            b"c_thread\nallocate_lock\n(tR.",
+            "_thread.allocate_lock",
+            Severity.CRITICAL,
+            SafetyVerdict.MALICIOUS,
+        ),
+        (
+            b"clinecache\ngetline\n(tR.",
+            "linecache.getline",
+            Severity.WARNING,
+            SafetyVerdict.SUSPICIOUS,
+        ),
+        (
             b"clogging.config\nfileConfig\n(tR.",
             "logging.config.fileConfig",
             Severity.CRITICAL,
@@ -1848,6 +1896,12 @@ def test_scan_bytes_does_not_treat_benign_stdlib_module_references_as_dangerous(
         (
             b"clogging.config\nlisten\n(tR.",
             "logging.config.listen",
+            Severity.CRITICAL,
+            SafetyVerdict.MALICIOUS,
+        ),
+        (
+            b"czipimport\nzipimporter\n(tR.",
+            "zipimport.zipimporter",
             Severity.CRITICAL,
             SafetyVerdict.MALICIOUS,
         ),
