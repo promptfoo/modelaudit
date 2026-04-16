@@ -53,6 +53,7 @@ recursive or adversarial nesting stays bounded.
 Release wheels are published for Linux x86_64, Linux aarch64, macOS arm64,
 macOS x86_64, and Windows targets. Other platforms may install from the source
 distribution and need a local Rust toolchain available during install.
+Use Rust 1.83+ when building from source.
 
 ## Report Contract
 
