@@ -38,9 +38,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Replace the historical Python implementation with the Rust scanner as the
-  only runtime engine; `MODELAUDIT_PICKLESCAN_ENGINE=python` and Python-engine
-  fallback behavior are removed.
+- Use the Rust scanner as the only runtime engine; runtime engine selection and
+  Python-engine fallback behavior are not part of the public API.
 - Release the Python GIL during native scans and avoid hot-path byte-literal
   cloning by retaining borrowed payload spans for variable-length operands.
 - Stream declared-size inputs in bounded chunks, normalize negative sizes as

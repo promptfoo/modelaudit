@@ -6,7 +6,7 @@ ModelAudit uses optional dependencies to keep the base installation lightweight:
 
 - **Base install**: Supports many static scanners out-of-the-box; optional extras expand framework-specific validation paths
 - **Feature-specific installs**: Add only what you need
-- **Graceful degradation**: Missing dependencies disable specific scanners, don't break the tool
+- **Graceful degradation**: Missing dependencies disable or narrow specific scanner paths, not the whole tool
 - **Clear guidance**: Error messages tell you exactly what to install
 
 ## Optional Dependencies
@@ -92,7 +92,7 @@ pip install -e .           # Basic installation
 - `JFROG_API_TOKEN` / `JFROG_ACCESS_TOKEN` - JFrog authentication
 - `NO_COLOR` - Disable color output
 - `PROMPTFOO_DISABLE_TELEMETRY` / `NO_ANALYTICS` - Disable telemetry
-- `.env` file is automatically loaded if present
+- ModelAudit reads process environment variables directly; it does not implicitly load `.env` files from the working directory during scans.
 
 ## Vendored TensorFlow Protos (Maintainer Guide)
 

@@ -6,7 +6,7 @@ Thank you for your interest in contributing to ModelAudit! This guide will help 
 
 ### Prerequisites
 
-- Python 3.10 or higher
+- Python 3.10-3.13
 - uv (recommended) or pip
 - Git
 - Rust 1.83+ toolchain with `cargo`, `rustfmt`, and `clippy`; editable installs build the native pickle scanner extension

@@ -170,7 +170,7 @@ modelaudit/
 │   ├── integrations/     # SARIF, JFrog, license checking
 │   ├── progress/         # Progress tracking subsystem
 │   ├── protos/           # Vendored TensorFlow protobuf stubs
-│   ├── scanners/         # Scanner implementations (30+)
+│   ├── scanners/         # Scanner implementations (40+)
 │   ├── utils/            # File detection, helpers, streaming
 │   ├── whitelists/       # HuggingFace/model whitelists
 │   ├── cli.py            # CLI interface

@@ -30,7 +30,7 @@ ModelAudit is a static security scanner for model artifacts. It analyzes files a
 ## Local scan policy files
 
 - Local `.modelaudit.toml` or `pyproject.toml` policy files are not applied implicitly during scans.
-- Interactive text scans may offer to trust a detected local policy file for future runs on that same config directory.
+- Interactive text scans may offer to trust a detected local policy file for later scans on that same config directory.
 - Remembered trust is stored in the local ModelAudit cache and is invalidated automatically if the config file changes.
 - CI and other non-interactive scans should use explicit configuration rather than relying on remembered local trust.
 
@@ -45,7 +45,7 @@ For dashboards and aggregate corpus scans, filter security-alert views to
 explainability notices, budget notes, or structural context; group them by code
 or keep them in an audit/detail view rather than counting each row as a blocker.
 Some compatibility findings intentionally include a secondary rule-code row for
-legacy dashboards; these rows carry `supporting_rule_code=true` in details and
+dashboards that rely on older rule identifiers; these rows carry `supporting_rule_code=true` in details and
 should be excluded from primary issue counts when de-duplicating.
 
 Exit codes:

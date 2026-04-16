@@ -79,6 +79,6 @@ are excluded from this notice.
 
 ---
 
-_This file was last reviewed on 2026-03-26. Run
+Run
 `uv run python -c "import importlib.metadata as md; [print(f'{d.metadata[\"Name\"]} {d.metadata[\"Version\"]} {d.metadata.get(\"License\",\"\")}') for d in md.distributions()]"`
-to regenerate the installed package list._
+to regenerate the installed package list.
