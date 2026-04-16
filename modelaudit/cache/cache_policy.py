@@ -35,6 +35,9 @@ _OPERATIONAL_ERROR_INDICATORS = (
 
 def should_cache_scan_result(scan_result: dict[str, Any]) -> bool:
     """Return True when a scan result is stable enough to cache safely."""
+    if scan_result.get("success") is False:
+        return False
+
     metadata = scan_result.get("metadata")
     if isinstance(metadata, dict) and (
         bool(metadata.get("operational_error"))

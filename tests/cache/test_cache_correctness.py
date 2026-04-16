@@ -19,7 +19,7 @@ from modelaudit.cache.optimized_config import (
 )
 from modelaudit.cache.scan_results_cache import ScanResultsCache
 from modelaudit.config.rule_config import ModelAuditConfig, get_config, reset_config, set_config
-from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, ScanResult
 from modelaudit.utils.helpers.cache_decorator import cached_scan
 
 
@@ -210,6 +210,57 @@ def test_cached_scan_skips_persisting_incomplete_metadata(
 
     assert first["scan_count"] == 1
     assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+def test_cached_scan_skips_persisting_bare_unsuccessful_results(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [],
+            "issues": [],
+            "success": False,
+            "scan_count": calls["count"],
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+def test_cached_scan_normalizes_and_skips_persisting_bare_unsuccessful_scan_result(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        calls["count"] += 1
+        result = ScanResult(scanner_name="numpy")
+        result.finish(success=False)
+        return result
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert isinstance(first, ScanResult)
+    assert isinstance(second, ScanResult)
+    assert first.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert second.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert first.metadata["scan_outcome_reasons"] == ["scanner_reported_unsuccessful_without_outcome"]
+    assert second.metadata["scan_outcome_reasons"] == ["scanner_reported_unsuccessful_without_outcome"]
     assert calls["count"] == 2
     assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
 

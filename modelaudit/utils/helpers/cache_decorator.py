@@ -88,6 +88,10 @@ def cached_scan(cache_enabled_key: str = "cache_enabled", cache_dir_key: str = "
 
                     # Convert result to dictionary format for caching
                     if hasattr(result, "to_dict"):
+                        from ...scanner_results import ScanResult, normalize_unclassified_scan_failure
+
+                        if isinstance(result, ScanResult):
+                            normalize_unclassified_scan_failure(result)
                         return result.to_dict()  # type: ignore[no-any-return]
                     elif isinstance(result, dict):
                         return result

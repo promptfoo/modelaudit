@@ -9,9 +9,61 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
-from .scanner_results import Check, CheckStatus, Issue, IssueSeverity, ScanResult
+from .scanner_results import (
+    INCONCLUSIVE_SCAN_OUTCOME,
+    Check,
+    CheckStatus,
+    Issue,
+    IssueSeverity,
+    ScanResult,
+    normalize_unclassified_scan_failure,
+)
 
 # We'll use forward references and rebuild models after imports
+
+
+def _metadata_has_scan_outcome(metadata: Any, outcome: str) -> bool:
+    """Return True when dict/model metadata reports a scan outcome."""
+    if metadata is None:
+        return False
+    if isinstance(metadata, dict):
+        return metadata.get("scan_outcome") == outcome
+
+    getter = getattr(metadata, "get", None)
+    if callable(getter):
+        try:
+            return bool(getter("scan_outcome") == outcome)
+        except Exception:
+            return False
+
+    return getattr(metadata, "scan_outcome", None) == outcome
+
+
+def _file_metadata_has_scan_outcome(file_metadata: Any, outcome: str) -> bool:
+    """Return True when any file metadata entry reports a scan outcome."""
+    if not isinstance(file_metadata, dict):
+        return False
+    return any(_metadata_has_scan_outcome(metadata, outcome) for metadata in file_metadata.values())
+
+
+def _issues_have_security_findings(issues: list[Any]) -> bool:
+    """Return True when incoming issue records contain WARNING/CRITICAL findings."""
+    for issue in issues:
+        severity = issue.get("severity") if isinstance(issue, dict) else getattr(issue, "severity", None)
+        if isinstance(severity, IssueSeverity):
+            if severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL):
+                return True
+            continue
+        if isinstance(severity, str):
+            severity_name = severity.lower()
+            if severity_name.startswith("issueseverity."):
+                severity_name = severity_name.split(".", 1)[1]
+            if severity_name in {
+                IssueSeverity.WARNING.value,
+                IssueSeverity.CRITICAL.value,
+            }:
+                return True
+    return False
 
 
 class DetectorFinding(BaseModel):
@@ -405,10 +457,19 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         if results_dict.get("has_errors", False):
             self.has_errors = True
 
-        # Update success status - only set to False for operational errors, not security findings
-        # Only set success to False if there are actual operational errors (has_errors=True)
-        # Security findings should not affect the success status
-        if results_dict.get("success", True) is False and results_dict.get("has_errors", False):
+        incoming_issues = results_dict.get("issues", [])
+        incoming_has_security_findings = (
+            _issues_have_security_findings(incoming_issues) if isinstance(incoming_issues, list) else False
+        )
+        incoming_has_inconclusive_outcome = _metadata_has_scan_outcome(
+            results_dict.get("metadata"), INCONCLUSIVE_SCAN_OUTCOME
+        ) or _file_metadata_has_scan_outcome(results_dict.get("file_metadata"), INCONCLUSIVE_SCAN_OUTCOME)
+
+        # Update success status for operational/inconclusive scan failures.
+        # Security findings should drive exit code 1 without becoming an
+        # operationally unsuccessful scan by themselves.
+        incoming_unsuccessful = results_dict.get("success", True) is False or incoming_has_inconclusive_outcome
+        if results_dict.get("has_errors", False) or (incoming_unsuccessful and not incoming_has_security_findings):
             self.success = False
 
         # Convert and extend issues
@@ -467,6 +528,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         """
         if not isinstance(scan_result, ScanResult):
             raise TypeError(f"Expected ScanResult, got {type(scan_result)}")
+        normalize_unclassified_scan_failure(scan_result)
 
         # Update scalar fields directly from ScanResult properties
         self.bytes_scanned += scan_result.bytes_scanned
@@ -477,8 +539,20 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
             self.has_errors = True
 
         # Update success status - only set to False for operational errors
-        if bool(metadata.get("operational_error")):
+        if bool(metadata.get("operational_error")) or metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME:
             self.success = False
+
+        if metadata:
+            metadata_dict = metadata.copy()
+            if "ml_context" in metadata_dict and isinstance(metadata_dict["ml_context"], dict):
+                metadata_dict["ml_context"] = MLContextModel(**metadata_dict["ml_context"])
+            metadata_path = (
+                getattr(scan_result, "file_path", None)
+                or metadata_dict.get("file_path")
+                or metadata_dict.get("source_path")
+                or f"<{scan_result.scanner_name or 'unknown'}:{self.files_scanned}>"
+            )
+            self.file_metadata[str(metadata_path)] = FileMetadataModel(**metadata_dict)
 
         # Convert and extend issues directly from ScanResult objects
         for issue in scan_result.issues:
