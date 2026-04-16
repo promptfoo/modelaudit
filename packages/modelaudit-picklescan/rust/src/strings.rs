@@ -279,99 +279,50 @@ fn has_suspicious_ascii_seed(bytes: &[u8]) -> bool {
     let mut index = 0usize;
     while index < bytes.len() {
         match bytes[index].to_ascii_lowercase() {
-            b'_' => {
-                if bytes.get(index + 1) == Some(&b'_') {
-                    return true;
-                }
-            }
-            b'\\' => {
+            b'_' if bytes.get(index + 1) == Some(&b'_') => return true,
+            b'\\'
                 if bytes
                     .get(index + 1)
-                    .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'x'))
-                {
-                    return true;
-                }
+                    .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'x')) =>
+            {
+                return true;
             }
-            b'b' => {
-                if starts_with_ascii_case_insensitive(bytes, index, b"base64") {
-                    return true;
-                }
+            b'b' if starts_with_ascii_case_insensitive(bytes, index, b"base64") => return true,
+            b'c' if starts_with_ascii_case_insensitive(bytes, index, b"commands")
+                || starts_with_ascii_case_insensitive(bytes, index, b"cloudpickle")
+                || starts_with_ascii_case_insensitive(bytes, index, b"compile")
+                || starts_with_ascii_case_insensitive(bytes, index, b"copyreg")
+                || starts_with_ascii_case_insensitive(bytes, index, b"ctypes")
+                || starts_with_ascii_case_insensitive(bytes, index, b"codecs") =>
+            {
+                return true;
             }
-            b'c' => {
-                if starts_with_ascii_case_insensitive(bytes, index, b"commands")
-                    || starts_with_ascii_case_insensitive(bytes, index, b"cloudpickle")
-                    || starts_with_ascii_case_insensitive(bytes, index, b"compile")
-                    || starts_with_ascii_case_insensitive(bytes, index, b"copyreg")
-                    || starts_with_ascii_case_insensitive(bytes, index, b"ctypes")
-                    || starts_with_ascii_case_insensitive(bytes, index, b"codecs")
-                {
-                    return true;
-                }
+            b'e' if starts_with_ascii_case_insensitive(bytes, index, b"eval")
+                || starts_with_ascii_case_insensitive(bytes, index, b"exec") =>
+            {
+                return true;
             }
-            b'e' => {
-                if starts_with_ascii_case_insensitive(bytes, index, b"eval")
-                    || starts_with_ascii_case_insensitive(bytes, index, b"exec")
-                {
-                    return true;
-                }
+            b'g' if starts_with_ascii_case_insensitive(bytes, index, b"getattr") => return true,
+            b'i' if starts_with_ascii_case_insensitive(bytes, index, b"import") => return true,
+            b'j' if starts_with_ascii_case_insensitive(bytes, index, b"joblib") => return true,
+            b'o' if starts_with_ascii_case_insensitive(bytes, index, b"os.")
+                || starts_with_ascii_case_insensitive(bytes, index, b"os ")
+                || starts_with_ascii_case_insensitive(bytes, index, b"os\t")
+                || starts_with_ascii_case_insensitive(bytes, index, b"os\n")
+                || starts_with_ascii_case_insensitive(bytes, index, b"os\r") =>
+            {
+                return true;
             }
-            b'g' => {
-                if starts_with_ascii_case_insensitive(bytes, index, b"getattr") {
-                    return true;
-                }
+            b's' if starts_with_ascii_case_insensitive(bytes, index, b"subprocess") => return true,
+            b'w' if starts_with_ascii_case_insensitive(bytes, index, b"webbrowser") => return true,
+            b'p' if starts_with_ascii_case_insensitive(bytes, index, b"pickle")
+                || starts_with_ascii_case_insensitive(bytes, index, b"popen") =>
+            {
+                return true;
             }
-            b'i' => {
-                if starts_with_ascii_case_insensitive(bytes, index, b"import") {
-                    return true;
-                }
-            }
-            b'j' => {
-                if starts_with_ascii_case_insensitive(bytes, index, b"joblib") {
-                    return true;
-                }
-            }
-            b'o' => {
-                if starts_with_ascii_case_insensitive(bytes, index, b"os.")
-                    || starts_with_ascii_case_insensitive(bytes, index, b"os ")
-                    || starts_with_ascii_case_insensitive(bytes, index, b"os\t")
-                    || starts_with_ascii_case_insensitive(bytes, index, b"os\n")
-                    || starts_with_ascii_case_insensitive(bytes, index, b"os\r")
-                {
-                    return true;
-                }
-            }
-            b's' => {
-                if starts_with_ascii_case_insensitive(bytes, index, b"subprocess") {
-                    return true;
-                }
-            }
-            b'w' => {
-                if starts_with_ascii_case_insensitive(bytes, index, b"webbrowser") {
-                    return true;
-                }
-            }
-            b'p' => {
-                if starts_with_ascii_case_insensitive(bytes, index, b"pickle")
-                    || starts_with_ascii_case_insensitive(bytes, index, b"popen")
-                {
-                    return true;
-                }
-            }
-            b'r' => {
-                if starts_with_ascii_case_insensitive(bytes, index, b"runpy") {
-                    return true;
-                }
-            }
-            b'm' => {
-                if starts_with_ascii_case_insensitive(bytes, index, b"marshal") {
-                    return true;
-                }
-            }
-            b'd' => {
-                if starts_with_ascii_case_insensitive(bytes, index, b"dill") {
-                    return true;
-                }
-            }
+            b'r' if starts_with_ascii_case_insensitive(bytes, index, b"runpy") => return true,
+            b'm' if starts_with_ascii_case_insensitive(bytes, index, b"marshal") => return true,
+            b'd' if starts_with_ascii_case_insensitive(bytes, index, b"dill") => return true,
             _ => {}
         }
         index += 1;
