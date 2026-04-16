@@ -1,4 +1,5 @@
 import struct
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ import onnx
 from onnx import TensorProto, helper
 from onnx.onnx_ml_pb2 import StringStringEntryProto
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.onnx_scanner import OnnxScanner
@@ -28,6 +30,7 @@ def create_onnx_model(
     external_file_bytes: bytes | None = None,
     missing_external: bool = False,
     tensor_shape: tuple[int, ...] = (1,),
+    include_initializer: bool = True,
 ) -> Path:
     X = helper.make_tensor_value_info("input", TensorProto.FLOAT, list(tensor_shape) or [1])
     Y = helper.make_tensor_value_info("output", TensorProto.FLOAT, list(tensor_shape) or [1])
@@ -43,8 +46,8 @@ def create_onnx_model(
         else helper.make_node("Relu", ["input"], ["output"], name="relu")
     )
 
-    initializers = []
-    if external:
+    initializers: list[Any] = []
+    if include_initializer and external:
         value_count = 1
         for dim in tensor_shape:
             value_count *= dim
@@ -65,7 +68,7 @@ def create_onnx_model(
             external_file.parent.mkdir(parents=True, exist_ok=True)
             with open(external_file, "wb") as f:
                 f.write(external_file_bytes or struct.pack("f", 1.0))
-    else:
+    elif include_initializer:
         value_count = 1
         for dim in tensor_shape:
             value_count *= dim
@@ -791,3 +794,141 @@ class TestExternalDataSizeValidation:
         assert len(size_checks) > 0
         assert size_checks[0].severity == IssueSeverity.CRITICAL
         assert "non-negative" in size_checks[0].message.lower()
+
+
+class TestWeightDistributionCoverage:
+    """Tests for ONNX weight-distribution analysis coverage gaps."""
+
+    _INCONCLUSIVE_REASON = "onnx_weight_distribution_analysis_incomplete"
+
+    @staticmethod
+    def _coverage_checks(result: Any) -> list[Any]:
+        return [c for c in result.checks if c.name == "Weight Distribution Analysis Coverage"]
+
+    def _assert_uncached_inconclusive_exit2(self, model_path: Path, cache_dir: Path, **scan_kwargs: Any) -> None:
+        reset_cache_manager()
+        try:
+            first_result = scan_model_directory_or_file(
+                str(model_path),
+                recursive=False,
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                **scan_kwargs,
+            )
+            second_result = scan_model_directory_or_file(
+                str(model_path),
+                recursive=False,
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                **scan_kwargs,
+            )
+            metadata = second_result.file_metadata[str(model_path)]
+
+            assert first_result.success is False
+            assert second_result.success is False
+            assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            assert self._INCONCLUSIVE_REASON in metadata.get("scan_outcome_reasons", [])
+            assert determine_exit_code(first_result) == 2
+            assert determine_exit_code(second_result) == 2
+            assert not any(issue.severity == IssueSeverity.CRITICAL for issue in second_result.issues)
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_missing_weight_distribution_dependency_ignores_model_without_initializers(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = create_onnx_model(tmp_path, include_initializer=False)
+        monkeypatch.setitem(sys.modules, "scipy", None)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert self._coverage_checks(result) == []
+
+    def test_missing_weight_distribution_dependency_ignores_1d_only_initializers(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = create_onnx_model(tmp_path, tensor_shape=(4,))
+        monkeypatch.setitem(sys.modules, "scipy", None)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert self._coverage_checks(result) == []
+
+    def test_missing_weight_distribution_dependency_is_inconclusive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = create_onnx_model(tmp_path, tensor_shape=(2, 2))
+        monkeypatch.setitem(sys.modules, "scipy", None)
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage_checks = self._coverage_checks(result)
+        assert result.success is False
+        assert result.has_errors is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert self._INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+        assert len(coverage_checks) == 1
+        assert coverage_checks[0].status == CheckStatus.FAILED
+        assert coverage_checks[0].severity == IssueSeverity.INFO
+        assert "Weight distribution analysis dependency unavailable:" in coverage_checks[0].message
+        assert coverage_checks[0].details["coverage_gap"] == "missing_dependency"
+        self._assert_uncached_inconclusive_exit2(model_path, tmp_path / "cache")
+
+    def test_external_weight_distribution_tensors_are_inconclusive(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(
+            tmp_path,
+            external=True,
+            external_path="weights.bin",
+            external_file_bytes=struct.pack("ffff", 1.0, 2.0, 3.0, 4.0),
+            tensor_shape=(2, 2),
+        )
+
+        result = OnnxScanner().scan(str(model_path))
+
+        coverage_checks = self._coverage_checks(result)
+        assert result.success is False
+        assert result.has_errors is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert self._INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+        assert len(coverage_checks) == 1
+        assert (
+            coverage_checks[0].message == "Weight distribution analysis skipped one or more eligible ONNX initializers"
+        )
+        assert coverage_checks[0].details["coverage_gap"] == "partial_initializer_coverage"
+        assert coverage_checks[0].details["eligible_initializers"] == 1
+        assert coverage_checks[0].details["external_initializers_skipped"] == 1
+        assert coverage_checks[0].details["analyzed_initializers"] == 0
+        self._assert_uncached_inconclusive_exit2(model_path, tmp_path / "cache")
+
+    def test_oversized_weight_distribution_tensors_are_inconclusive(self, tmp_path: Path) -> None:
+        model_path = create_onnx_model(tmp_path, tensor_shape=(2, 2))
+
+        result = OnnxScanner({"max_array_size": 1}).scan(str(model_path))
+
+        coverage_checks = self._coverage_checks(result)
+        assert result.success is False
+        assert result.has_errors is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert self._INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+        assert len(coverage_checks) == 1
+        assert (
+            coverage_checks[0].message == "Weight distribution analysis skipped one or more eligible ONNX initializers"
+        )
+        assert coverage_checks[0].details["coverage_gap"] == "partial_initializer_coverage"
+        assert coverage_checks[0].details["eligible_initializers"] == 1
+        assert coverage_checks[0].details["oversized_initializers_skipped"] == 1
+        assert coverage_checks[0].details["analyzed_initializers"] == 0
+        self._assert_uncached_inconclusive_exit2(model_path, tmp_path / "cache", max_array_size=1)
