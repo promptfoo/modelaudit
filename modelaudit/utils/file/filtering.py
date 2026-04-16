@@ -106,6 +106,7 @@ DEFAULT_SCANNABLE_SKIP_OVERRIDES = {
     ".bz2",
     ".xz",
     ".7z",
+    ".rar",
 }
 
 _ARCHIVE_SIGNAL_EXTENSION_EXCLUSIONS: frozenset[str] = frozenset(

@@ -19,7 +19,7 @@ from modelaudit.scanner_registry_metadata import (
     get_extension_format_map,
     get_registered_scanner_extensions,
 )
-from modelaudit.scanners import SCANNER_REGISTRY, ScannerRegistry, _registry
+from modelaudit.scanners import SCANNER_REGISTRY, ScannerRegistry, _registry, get_scanner_for_file
 from modelaudit.scanners.archive_dispatch import _HEADER_FORMAT_TO_SCANNER_ID, _select_nested_scanner_id
 from modelaudit.scanners.base import BaseScanner, IssueSeverity
 from tests.helpers import create_mock_pytorch_zip
@@ -476,6 +476,26 @@ def test_get_scanner_for_path_routes_generic_zip_without_skops_markers_to_zip(tm
     )
 
     _assert_scanner_for_path(model_path, "zip")
+
+
+def test_get_scanner_for_file_routes_disguised_rar_by_header(tmp_path: Path) -> None:
+    """Public helper routing should honor RAR magic even without a .rar suffix."""
+    path = tmp_path / "archive.payload"
+    path.write_bytes(b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32)
+
+    scanner = get_scanner_for_file(str(path))
+
+    assert scanner is not None
+    assert scanner.name == "rar"
+
+
+def test_get_scanner_for_file_rejects_rar_suffix_without_magic(tmp_path: Path) -> None:
+    path = tmp_path / "not_really.rar"
+    path.write_text("plain text, not a RAR archive\n", encoding="utf-8")
+
+    scanner = get_scanner_for_file(str(path))
+
+    assert scanner is None
 
 
 def test_get_scanner_for_path_routes_valid_mar_archive_to_torchserve_mar(tmp_path: Path) -> None:

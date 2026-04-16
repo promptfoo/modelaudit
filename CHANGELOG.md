@@ -50,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** route `.joblib` files through the Joblib scanner, scan raw protocol-0/1 payloads directly, support gzip/bzip2/lzma/zlib wrappers with bounded output and trailing-data checks, preserve embedded Pickle finding locations, and fail closed on undecodable/trailing-wrapper errors
 - **security:** route ONNX protobuf payloads saved with a `.pb` suffix by content before TensorFlow protobuf extension fallback
 - **security:** detect direct `getattr(module, "dangerous")` handler calls in TorchServe MAR archives, parse conflicting duplicate manifests without silently downgrading hidden handlers, and suppress collision warnings for byte-identical duplicate manifests
+- **security:** recognize RAR archives and fail closed as unsupported coverage instead of skipping `.rar` files during directory scans
 - **security:** reduce NeMo Hydra `_target_` false positives by matching suspicious identifiers on token boundaries, preserve CVE-2025-23304 details on suspicious-target findings, and reject oversized YAML members before parsing
 - **security:** preserve skipped-suffix ZIP containers when Keras config-only structure or embedded model-like `.bin` members indicate scannable content
 - **security:** detect protocol 0/1 pickle streams with trivial opcode prefixes even when `STOP` is followed by trailing junk, while preserving plain-text near-match rejection
