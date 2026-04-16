@@ -71,6 +71,8 @@ merge_scan_result = core_results.merge_scan_result
 HEADER_FORMAT_TO_SCANNER_ID = _registry.get_header_format_to_scanner_ids()
 _COMPRESSED_HEADER_FORMATS = frozenset({"compressed", "gzip", "bzip2", "xz", "lz4", "zlib"})
 _R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
+_XGBOOST_BINARY_EXTENSIONS = frozenset({".bst"})
+_XGBOOST_PICKLE_SPOOF_REASON = "xgboost_binary_pickle_spoof"
 
 
 def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
@@ -129,6 +131,30 @@ def _preferred_scanner_can_handle(
         return True
 
     return False
+
+
+def _mark_xgboost_pickle_extension_spoof(result: ScanResult, path: str, ext: str) -> None:
+    """Preserve pickle analysis while flagging XGBoost extension spoofing."""
+    existing_reasons = result.metadata.get("scan_outcome_reasons")
+    if isinstance(existing_reasons, list) and _XGBOOST_PICKLE_SPOOF_REASON in existing_reasons:
+        result.success = False
+        return
+
+    claimed_format = ext.lower().lstrip(".") or "binary"
+    result.add_check(
+        name="File Format Validation",
+        passed=False,
+        message=f"File appears to be a pickle file with .{claimed_format} extension",
+        severity=IssueSeverity.WARNING,
+        location=path,
+        details={"detected_format": "pickle", "claimed_format": claimed_format},
+        why=(
+            "File extension spoofing is a security evasion technique used to bypass security scanners. "
+            "This may indicate malicious intent."
+        ),
+    )
+    _mark_inconclusive_scan_outcome(result, _XGBOOST_PICKLE_SPOOF_REASON)
+    result.success = False
 
 
 def _calculate_file_hash(file_path: str) -> str:
@@ -927,6 +953,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     header_format = detect_file_format(path)
     ext_format = detect_format_from_extension(path)
     ext = os.path.splitext(path)[1].lower()
+    is_xgboost_pickle_spoof = ext in _XGBOOST_BINARY_EXTENSIONS and header_format == "pickle"
 
     # Record telemetry for file type detection
     detected_format = header_format if header_format != "unknown" else ext_format
@@ -998,6 +1025,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             elif use_large_handler:
                 logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
                 result = scan_large_file(path, scanner, progress_callback, timeout)
+            elif is_xgboost_pickle_spoof:
+                result = scanner.scan(path)
             else:
                 result = scanner.scan_with_cache(path)
 
@@ -1036,6 +1065,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 elif use_large_handler:
                     logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
                     result = scan_large_file(path, scanner, progress_callback, timeout)
+                elif is_xgboost_pickle_spoof:
+                    result = scanner.scan(path)
                 else:
                     result = scanner.scan_with_cache(path)
 
@@ -1071,6 +1102,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     details={"format": format_, "path": path},
                 )
             result = sr
+
+    if is_xgboost_pickle_spoof:
+        _mark_xgboost_pickle_extension_spoof(result, path, ext)
 
     if discrepancy_msg:
         # Determine severity based on whether it's a validation failure or just a discrepancy

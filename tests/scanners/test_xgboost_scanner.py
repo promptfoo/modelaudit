@@ -11,13 +11,18 @@ Tests cover various XGBoost model formats and security vulnerabilities:
 
 import json
 import pickle
+import subprocess as real_subprocess
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.xgboost_scanner import XGBOOST_JSON_ROUTING_CHUNK_BYTES, XGBoostScanner
 
@@ -30,20 +35,20 @@ class FakeBooster:
 
 
 @pytest.fixture
-def temp_dir():
+def temp_dir() -> Iterator[Path]:
     """Create a temporary directory for test files."""
     with tempfile.TemporaryDirectory() as tmpdir:
         yield Path(tmpdir)
 
 
 @pytest.fixture
-def xgboost_scanner():
+def xgboost_scanner() -> XGBoostScanner:
     """Create an XGBoost scanner instance."""
     return XGBoostScanner()
 
 
 @pytest.fixture
-def valid_xgboost_json():
+def valid_xgboost_json() -> dict[str, Any]:
     """Valid XGBoost JSON model structure."""
     return {
         "version": [1, 7, 4],
@@ -125,6 +130,29 @@ def valid_xgboost_json():
     }
 
 
+def _scan_twice_with_cache(path: Path, cache_dir: Path) -> tuple[ModelAuditResultModel, ModelAuditResultModel]:
+    first = scan_model_directory_or_file(
+        str(path),
+        cache_enabled=True,
+        cache_dir=str(cache_dir),
+        min_cache_file_size=0,
+    )
+    second = scan_model_directory_or_file(
+        str(path),
+        cache_enabled=True,
+        cache_dir=str(cache_dir),
+        min_cache_file_size=0,
+    )
+    return first, second
+
+
+def _assert_inconclusive_metadata(result: ModelAuditResultModel, path: Path, reason: str) -> None:
+    metadata = result.file_metadata[str(path)]
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert metadata.get("analysis_incomplete") is True
+    assert reason in metadata.get("scan_outcome_reasons", [])
+
+
 class TestXGBoostScannerBasic:
     """Test basic XGBoost scanner functionality."""
 
@@ -183,7 +211,7 @@ class TestXGBoostJSONScanning:
         critical_issues = [i for i in result.issues if i.severity == IssueSeverity.INFO]
         assert len(critical_issues) == 0
 
-    def test_invalid_json_fails(self, temp_dir, xgboost_scanner):
+    def test_invalid_json_fails(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
         """Test that invalid JSON content is detected."""
         json_file = temp_dir / "invalid.json"
         json_file.write_text('{"invalid": json content}')  # Invalid JSON
@@ -192,8 +220,32 @@ class TestXGBoostJSONScanning:
 
         # Should detect JSON parsing error
         assert any("Invalid JSON format" in str(issue.message) for issue in result.issues)
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_json_parse_failed" in result.metadata["scan_outcome_reasons"]
 
-    def test_missing_required_keys_detected(self, temp_dir):
+    def test_malformed_xgboost_json_candidate_is_routed(self, temp_dir: Path) -> None:
+        """Malformed XGBoost-shaped JSON should reach the fail-closed parser path."""
+        json_file = temp_dir / "booster.json"
+        json_file.write_text('{"version":[1,7,4],"learner":{"gradient_booster":')
+
+        assert XGBoostScanner.can_handle(str(json_file))
+
+    @pytest.mark.parametrize(
+        ("filename", "payload"),
+        [
+            ("model.json", '{"version":"1","learner":'),
+            ("settings.json", '{"version":"1","learner":{"objective":'),
+        ],
+    )
+    def test_generic_malformed_json_candidate_is_not_routed(self, temp_dir: Path, filename: str, payload: str) -> None:
+        """Generic malformed JSON should not be misclassified from weak key names alone."""
+        json_file = temp_dir / filename
+        json_file.write_text(payload)
+
+        assert not XGBoostScanner.can_handle(str(json_file))
+
+    def test_missing_required_keys_detected(self, temp_dir: Path) -> None:
         """Test that scanner rejects JSON files missing required XGBoost keys in can_handle()."""
         incomplete_json = {"version": [1, 0, 0]}  # Missing learner
 
@@ -296,7 +348,7 @@ class TestXGBoostJSONScanning:
 class TestXGBoostUBJScanning:
     """Test XGBoost UBJ model scanning."""
 
-    def test_ubj_without_ubjson_library(self, temp_dir, xgboost_scanner):
+    def test_ubj_without_ubjson_library(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
         """Test UBJ scanning without ubjson library (INFO level)."""
         ubj_file = temp_dir / "model.ubj"
         ubj_file.write_bytes(b"\x7b\x55")  # UBJ object start
@@ -306,8 +358,11 @@ class TestXGBoostUBJScanning:
 
         # Message changed to "Cannot scan UBJ file"
         assert any("cannot scan ubj file" in str(issue.message).lower() for issue in result.issues)
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_ubj_dependency_missing" in result.metadata["scan_outcome_reasons"]
 
-    def test_invalid_ubj_detected(self, temp_dir, xgboost_scanner):
+    def test_invalid_ubj_detected(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
         """Test detection of invalid UBJ content."""
         pytest.importorskip("ubjson", reason="ubjson not installed")
         ubj_file = temp_dir / "invalid.ubj"
@@ -328,7 +383,7 @@ class TestXGBoostUBJScanning:
 class TestXGBoostBinaryScanning:
     """Test XGBoost binary model scanning."""
 
-    def test_empty_binary_file_detected(self, temp_dir, xgboost_scanner):
+    def test_empty_binary_file_detected(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
         """Test detection of empty binary files."""
         binary_file = temp_dir / "empty.bst"
         binary_file.write_bytes(b"")
@@ -336,23 +391,75 @@ class TestXGBoostBinaryScanning:
         result = xgboost_scanner.scan(str(binary_file))
 
         assert any("empty" in str(issue.message).lower() for issue in result.issues)
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_binary_empty" in result.metadata["scan_outcome_reasons"]
 
-    def test_pickle_masquerading_as_bst_detected(self, temp_dir, xgboost_scanner):
-        """Test detection of pickle files with .bst extension."""
+    @pytest.mark.parametrize("suffix", [".bst", ".model"])
+    def test_pickle_masquerading_as_binary_model_is_inconclusive(
+        self, temp_dir: Path, xgboost_scanner: XGBoostScanner, suffix: str
+    ) -> None:
+        """Pickle files masquerading as XGBoost binaries should fail closed."""
         # Create a pickle file
         pickle_data = pickle.dumps({"fake": "model"})
 
-        fake_bst = temp_dir / "fake.bst"
+        fake_bst = temp_dir / f"fake{suffix}"
         fake_bst.write_bytes(pickle_data)
 
         result = xgboost_scanner.scan(str(fake_bst))
 
         assert any("pickle file" in str(issue.message) for issue in result.issues)
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_binary_pickle_spoof" in result.metadata["scan_outcome_reasons"]
 
-    def test_binary_structure_validation(self, temp_dir, xgboost_scanner):
+    def test_non_pickle_binary_starting_with_proto0_like_byte_is_not_spoof(
+        self, temp_dir: Path, xgboost_scanner: XGBoostScanner
+    ) -> None:
+        """Custom XGBoost-like binaries starting with 'c' are not automatically pickle spoofs."""
+        binary_file = temp_dir / "custom.bst"
+        binary_file.write_bytes(b"custom xgboost binary gbtree reg:squarederror")
+
+        result = xgboost_scanner.scan(str(binary_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert not any("pickle file" in str(issue.message) for issue in result.issues)
+
+    def test_binary_structure_exception_is_inconclusive(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
+        """Binary analyzer exceptions should fail closed instead of returning success."""
+        binary_file = temp_dir / "broken.bst"
+        binary_file.write_bytes(b"gbtree reg:squarederror with enough bytes")
+
+        with patch.object(xgboost_scanner, "_validate_binary_structure", side_effect=RuntimeError("boom")):
+            result = xgboost_scanner.scan(str(binary_file))
+
+        assert any("Error analyzing XGBoost binary model: boom" in str(issue.message) for issue in result.issues)
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_binary_analysis_failed" in result.metadata["scan_outcome_reasons"]
+
+    def test_binary_structure_read_failure_is_inconclusive(
+        self, temp_dir: Path, xgboost_scanner: XGBoostScanner
+    ) -> None:
+        """Read failures caught inside structure validation should still fail closed."""
+        binary_file = temp_dir / "unreadable.bst"
+        binary_file.write_bytes(b"gbtree reg:squarederror with enough bytes")
+        result = xgboost_scanner._create_result()
+
+        with patch("builtins.open", side_effect=OSError("forced read failure")):
+            xgboost_scanner._validate_binary_structure(str(binary_file), result)
+        xgboost_scanner._finish_scan_result(result)
+
+        assert any("forced read failure" in str(issue.message) for issue in result.issues)
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_binary_analysis_failed" in result.metadata["scan_outcome_reasons"]
+
+    def test_binary_structure_validation(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
         """Test binary structure validation."""
         # Create a file with some XGBoost-like content
-        binary_content = b"gbtree\x00\x00\x01\x02reg:squarederror\x00\x00"
+        binary_content = b"gbtree\x00\x00\x01\x02reg:squarederror\x00\x00extra xgboost bytes"
 
         binary_file = temp_dir / "valid.bst"
         binary_file.write_bytes(binary_content)
@@ -363,7 +470,24 @@ class TestXGBoostBinaryScanning:
         pattern_checks = [c for c in result.checks if "Pattern Check" in c.name and c.status.value == "passed"]
         assert len(pattern_checks) > 0
 
-    def test_suspicious_binary_patterns_detected(self, temp_dir, xgboost_scanner):
+    def test_binf_binary_signature_passes_structure_validation(
+        self, temp_dir: Path, xgboost_scanner: XGBoostScanner
+    ) -> None:
+        """The binary binf signature should not be treated as markerless."""
+        binary_file = temp_dir / "signature.bst"
+        binary_file.write_bytes(b"binf" + (b"\0" * 60) + b"gbtree appears outside first read window")
+
+        result = xgboost_scanner.scan(str(binary_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert any(
+            "binf" in check.details.get("patterns_found", [])
+            for check in result.checks
+            if "Pattern Check" in check.name
+        )
+
+    def test_suspicious_binary_patterns_detected(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
         """Test detection of suspicious binary patterns."""
         # Create binary data with no recognizable XGBoost patterns
         suspicious_binary = bytes(range(256))  # All byte values 0-255
@@ -375,14 +499,33 @@ class TestXGBoostBinaryScanning:
 
         # Should detect unusual binary patterns
         assert any("unusual binary patterns" in str(issue.message) for issue in result.issues)
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_binary_structure_unrecognized" in result.metadata["scan_outcome_reasons"]
+
+    def test_printable_binary_without_xgboost_markers_is_inconclusive(
+        self, temp_dir: Path, xgboost_scanner: XGBoostScanner
+    ) -> None:
+        """Printable .bst content without XGBoost markers should not pass cleanly."""
+        binary_file = temp_dir / "printable.bst"
+        binary_file.write_bytes(b"abcdefghijklmnopqrstuvwxyzabcdef")
+
+        result = xgboost_scanner.scan(str(binary_file))
+
+        assert any("expected XGBoost binary model markers" in str(issue.message) for issue in result.issues)
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_binary_structure_unrecognized" in result.metadata["scan_outcome_reasons"]
 
     @patch("modelaudit.scanners.xgboost_scanner._check_xgboost_available")
-    def test_xgboost_loading_disabled_by_default(self, mock_check_xgb, temp_dir, xgboost_scanner):
+    def test_xgboost_loading_disabled_by_default(
+        self, mock_check_xgb: Mock, temp_dir: Path, xgboost_scanner: XGBoostScanner
+    ) -> None:
         """Test that XGBoost loading is disabled by default."""
         mock_check_xgb.return_value = True
 
         binary_file = temp_dir / "test.bst"
-        binary_file.write_bytes(b"some_binary_data")
+        binary_file.write_bytes(b"some_binary_data gbtree reg:squarederror")
 
         result = xgboost_scanner.scan(str(binary_file))
 
@@ -391,7 +534,7 @@ class TestXGBoostBinaryScanning:
 
     @patch("modelaudit.scanners.xgboost_scanner._check_xgboost_available")
     @patch("modelaudit.scanners.xgboost_scanner.subprocess")
-    def test_xgboost_loading_success(self, mock_subprocess, mock_check_xgb, temp_dir):
+    def test_xgboost_loading_success(self, mock_subprocess: Mock, mock_check_xgb: Mock, temp_dir: Path) -> None:
         """Test successful XGBoost model loading."""
         mock_check_xgb.return_value = True
         mock_proc = Mock()
@@ -404,7 +547,7 @@ class TestXGBoostBinaryScanning:
         loading_scanner = XGBoostScanner({"enable_xgb_loading": True})
 
         binary_file = temp_dir / "valid.bst"
-        binary_file.write_bytes(b"dummy_xgboost_data")
+        binary_file.write_bytes(b"dummy_xgboost_data gbtree reg:squarederror")
 
         result = loading_scanner.scan(str(binary_file))
 
@@ -412,7 +555,7 @@ class TestXGBoostBinaryScanning:
 
     @patch("modelaudit.scanners.xgboost_scanner._check_xgboost_available")
     @patch("modelaudit.scanners.xgboost_scanner.subprocess")
-    def test_xgboost_loading_failure(self, mock_subprocess, mock_check_xgb, temp_dir):
+    def test_xgboost_loading_failure(self, mock_subprocess: Mock, mock_check_xgb: Mock, temp_dir: Path) -> None:
         """Test XGBoost model loading failure detection."""
         mock_check_xgb.return_value = True
         mock_proc = Mock()
@@ -424,11 +567,14 @@ class TestXGBoostBinaryScanning:
         loading_scanner = XGBoostScanner({"enable_xgb_loading": True})
 
         binary_file = temp_dir / "invalid.bst"
-        binary_file.write_bytes(b"invalid_data")
+        binary_file.write_bytes(b"invalid_data gbtree reg:squarederror")
 
         result = loading_scanner.scan(str(binary_file))
 
         assert any("Failed to load XGBoost model" in str(issue.message) for issue in result.issues)
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_binary_load_failed" in result.metadata["scan_outcome_reasons"]
 
     @patch("modelaudit.scanners.xgboost_scanner._check_xgboost_available")
     @patch("modelaudit.scanners.xgboost_scanner.subprocess")
@@ -460,19 +606,165 @@ class TestXGBoostBinaryScanning:
 
     @patch("modelaudit.scanners.xgboost_scanner._check_xgboost_available")
     @patch("modelaudit.scanners.xgboost_scanner.subprocess")
-    def test_xgboost_loading_timeout(self, mock_subprocess, mock_check_xgb, temp_dir):
+    def test_xgboost_loading_timeout(self, mock_subprocess: Mock, mock_check_xgb: Mock, temp_dir: Path) -> None:
         """Test XGBoost model loading timeout handling."""
         mock_check_xgb.return_value = True
-        mock_subprocess.run.side_effect = mock_subprocess.TimeoutExpired(["python"], 30)
+        mock_subprocess.TimeoutExpired = real_subprocess.TimeoutExpired
+        mock_subprocess.run.side_effect = real_subprocess.TimeoutExpired(["python"], 30)
 
         loading_scanner = XGBoostScanner({"enable_xgb_loading": True})
 
         binary_file = temp_dir / "timeout.bst"
-        binary_file.write_bytes(b"data_that_causes_timeout")
+        binary_file.write_bytes(b"data_that_causes_timeout gbtree reg:squarederror")
 
         result = loading_scanner.scan(str(binary_file))
 
         assert any("timeout" in str(issue.message).lower() for issue in result.issues)
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_binary_load_timeout" in result.metadata["scan_outcome_reasons"]
+
+
+class TestXGBoostFailClosedEndToEnd:
+    """Test CLI/core-visible XGBoost fail-closed semantics."""
+
+    def test_malformed_xgboost_json_core_fails_closed_and_is_uncached(self, tmp_path: Path) -> None:
+        json_file = tmp_path / "booster.json"
+        json_file.write_text('{"version":[1,7,4],"learner":{"gradient_booster":')
+        cache_dir = tmp_path / "cache"
+
+        reset_cache_manager()
+        try:
+            first, second = _scan_twice_with_cache(json_file, cache_dir)
+
+            for result in (first, second):
+                assert result.success is False
+                assert determine_exit_code(result) == 2
+                assert "xgboost" in result.scanner_names
+                _assert_inconclusive_metadata(result, json_file, "xgboost_json_parse_failed")
+                assert any("Invalid JSON format" in str(issue.message) for issue in result.issues)
+
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_missing_ubjson_core_fails_closed_and_is_uncached(self, tmp_path: Path) -> None:
+        ubj_file = tmp_path / "model.ubj"
+        ubj_file.write_bytes(b"\x7b\x55")
+        cache_dir = tmp_path / "cache"
+
+        reset_cache_manager()
+        try:
+            with patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=False):
+                first, second = _scan_twice_with_cache(ubj_file, cache_dir)
+
+            for result in (first, second):
+                assert result.success is False
+                assert determine_exit_code(result) == 2
+                _assert_inconclusive_metadata(result, ubj_file, "xgboost_ubj_dependency_missing")
+                assert any("Cannot scan UBJ file" in str(issue.message) for issue in result.issues)
+
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_pickle_spoof_core_preserves_pickle_scan_and_is_uncached(self, tmp_path: Path) -> None:
+        spoof_file = tmp_path / "spoof.bst"
+        spoof_file.write_bytes(pickle.dumps({"safe": True}, protocol=4))
+        cache_dir = tmp_path / "cache"
+
+        direct = scan_file(str(spoof_file), config={"cache_enabled": False})
+        assert direct.success is False
+        assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_binary_pickle_spoof" in direct.metadata["scan_outcome_reasons"]
+
+        reset_cache_manager()
+        try:
+            first, second = _scan_twice_with_cache(spoof_file, cache_dir)
+
+            for result in (first, second):
+                assert determine_exit_code(result) == 1
+                assert "pickle" in result.scanner_names
+                _assert_inconclusive_metadata(result, spoof_file, "xgboost_binary_pickle_spoof")
+                assert any(
+                    issue.severity == IssueSeverity.WARNING and "pickle file with .bst extension" in str(issue.message)
+                    for issue in result.issues
+                )
+
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_generic_model_pickle_core_does_not_false_positive(self, tmp_path: Path) -> None:
+        model_file = tmp_path / "safe.model"
+        model_file.write_bytes(pickle.dumps({"safe": True}, protocol=4))
+
+        result = scan_model_directory_or_file(str(model_file), cache_enabled=False)
+
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+        assert "pickle" in result.scanner_names
+        assert not result.issues
+
+    def test_tiny_binary_core_fails_closed_and_is_uncached(self, tmp_path: Path) -> None:
+        binary_file = tmp_path / "tiny.bst"
+        binary_file.write_bytes(b"abcdefghijklmnopqrstuvwxyzabcde")
+        cache_dir = tmp_path / "cache"
+
+        reset_cache_manager()
+        try:
+            first, second = _scan_twice_with_cache(binary_file, cache_dir)
+
+            for result in (first, second):
+                assert result.success is False
+                assert determine_exit_code(result) == 2
+                _assert_inconclusive_metadata(result, binary_file, "xgboost_binary_structure_too_small")
+                assert any("too small" in str(issue.message).lower() for issue in result.issues)
+
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_non_pickle_xgboost_binary_core_does_not_false_positive(self, tmp_path: Path) -> None:
+        binary_file = tmp_path / "custom.bst"
+        binary_file.write_bytes(b"custom xgboost binary gbtree reg:squarederror")
+
+        result = scan_model_directory_or_file(str(binary_file), cache_enabled=False)
+
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+        assert "xgboost" in result.scanner_names
+        assert not result.issues
+
+    def test_binf_signature_core_does_not_false_positive(self, tmp_path: Path) -> None:
+        binary_file = tmp_path / "signature.bst"
+        binary_file.write_bytes(b"binf" + (b"\0" * 60) + b"gbtree appears outside first read window")
+
+        result = scan_model_directory_or_file(str(binary_file), cache_enabled=False)
+
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+        assert "xgboost" in result.scanner_names
+        assert not result.issues
+
+    def test_markerless_binary_core_fails_closed_and_is_uncached(self, tmp_path: Path) -> None:
+        binary_file = tmp_path / "markerless.bst"
+        binary_file.write_bytes(b"abcdefghijklmnopqrstuvwxyzabcdef")
+        cache_dir = tmp_path / "cache"
+
+        reset_cache_manager()
+        try:
+            first, second = _scan_twice_with_cache(binary_file, cache_dir)
+
+            for result in (first, second):
+                assert result.success is False
+                assert determine_exit_code(result) == 2
+                _assert_inconclusive_metadata(result, binary_file, "xgboost_binary_structure_unrecognized")
+                assert any("expected XGBoost binary model markers" in str(issue.message) for issue in result.issues)
+
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
 
 
 class TestXGBoostScannerConfiguration:
@@ -523,6 +815,7 @@ class TestXGBoostPickleIntegration:
 
         # Should detect file format spoofing
         assert any("pickle file" in str(issue.message) for issue in result.issues)
+        assert result.success is False
 
 
 # Integration tests (require actual dependencies)
