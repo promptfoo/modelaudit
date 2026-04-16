@@ -132,7 +132,7 @@ pip install "modelaudit[all]"
 # Core only (pickle, numpy, archives)
 pip install modelaudit
 
-# Specific frameworks (TensorFlow runtime extra installs on Python 3.11-3.12)
+# Specific frameworks (TensorFlow installs on Python 3.11-3.12; ONNX installs on Python 3.10-3.12)
 pip install "modelaudit[tensorflow,pytorch,h5,onnx,safetensors]"
 
 # CI/CD environments
@@ -144,6 +144,8 @@ pip install "modelaudit[all,tensorflow]"
 # Docker
 docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 ```
+
+The ONNX runtime extra, including the ONNX portion of `modelaudit[all]`, is packaged for Python 3.10-3.12 in this release.
 
 ## CLI Options
 

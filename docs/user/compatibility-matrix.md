@@ -4,7 +4,7 @@ This page shows which model formats work in base install and which require optio
 
 ## Installation profiles
 
-- Broad portable coverage: `pip install "modelaudit[all]"` (on Python 3.11-3.12, add `tensorflow` only for TensorFlow-dependent checkpoint/weight analysis)
+- Broad portable coverage: `pip install "modelaudit[all]"` (ONNX installs on Python 3.10-3.12; on Python 3.11-3.12, add `tensorflow` only for TensorFlow-dependent checkpoint/weight analysis)
 - Minimal base install: `pip install modelaudit`
 - Targeted extras: install only the extras you need (examples below)
 
@@ -18,7 +18,7 @@ This page shows which model formats work in base install and which require optio
 | R serialized                    | `.rds`, `.rda`, `.rdata`                                          | Yes (static analysis only)                                | None                                                                                             |
 | TensorFlow SavedModel/MetaGraph | `.pb`, `.meta`, SavedModel directories                            | Yes (vendored protos)                                     | `modelaudit[tensorflow]` on Python 3.11-3.12 for TensorFlow-dependent checkpoint/weight analysis |
 | Keras H5                        | `.h5`, `.hdf5`                                                    | No                                                        | `modelaudit[h5]` (required)                                                                      |
-| ONNX                            | `.onnx`                                                           | No                                                        | `modelaudit[onnx]` (required)                                                                    |
+| ONNX                            | `.onnx`                                                           | No                                                        | `modelaudit[onnx]` on Python 3.10-3.12 (required)                                                |
 | CoreML                          | `.mlmodel`                                                        | Yes (static protobuf/metadata checks)                     | None                                                                                             |
 | NeMo                            | `.nemo`                                                           | Yes (static tar/config analysis, Hydra `_target_` checks) | None                                                                                             |
 | CNTK native                     | `.dnn`, `.cmf`                                                    | Yes (static signature and string analysis)                | None                                                                                             |
@@ -49,4 +49,4 @@ This page shows which model formats work in base install and which require optio
 - CNTK scanner scope in v1 is `.dnn`/`.cmf`; `.model` remains owned by XGBoost overlap handling.
 - Llamafile wrappers are executable by design: executable presence is reported at `INFO`, and severity escalates only when suspicious runtime indicators or malformed embedded payloads are found.
 - `modelaudit doctor --show-failed` shows unavailable scanners and missing dependencies in your environment.
-- If you need predictable CI behavior across many formats, prefer `modelaudit[all]`; add `modelaudit[tensorflow]` on Python 3.11-3.12 only for TensorFlow runtime-dependent paths.
+- If you need predictable CI behavior across many formats, prefer `modelaudit[all]`; ONNX is included on Python 3.10-3.12, and TensorFlow runtime-dependent paths require adding `modelaudit[tensorflow]` on Python 3.11-3.12.

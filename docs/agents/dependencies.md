@@ -16,7 +16,7 @@ ModelAudit uses optional dependencies to keep the base installation lightweight:
 | `h5`          | `h5py`                                 | Keras H5 model scanning                                                          |
 | `pytorch`     | `torch`                                | PyTorch ecosystem compatibility paths                                            |
 | `safetensors` | `safetensors`                          | SafeTensors runtime-backed validation paths                                      |
-| `onnx`        | `onnx`                                 | ONNX parsing/validation                                                          |
+| `onnx`        | `onnx` on Python <3.13                 | ONNX parsing/validation                                                          |
 | `dill`        | `dill`                                 | Extended pickle-family compatibility                                             |
 | `joblib`      | `joblib`, `scikit-learn`               | Joblib/sklearn ecosystem compatibility                                           |
 | `flax`        | no extra package (uses base `msgpack`) | Flax/JAX msgpack checkpoint support                                              |
@@ -28,7 +28,7 @@ ModelAudit uses optional dependencies to keep the base installation lightweight:
 | `all-ci`      | most portable extras except TensorFlow | CI profile                                                                       |
 | `all`         | broad portable extras                  | Broad local scanner coverage; excludes TensorFlow and platform-specific TensorRT |
 
-`pyyaml`, `msgpack`, and cloud storage dependencies (`fsspec`, `s3fs`, `gcsfs`) are core dependencies in the base install.
+`pyyaml`, `msgpack`, and cloud storage dependencies (`fsspec`, `s3fs`, `gcsfs`) are core dependencies in the base install. Keep ONNX docs aligned with the `python_version < "3.13"` package marker until that gate is removed.
 
 ## TensorFlow SavedModel Scanning (No TensorFlow Required)
 

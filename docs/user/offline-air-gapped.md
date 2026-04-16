@@ -24,7 +24,7 @@ Transfer `wheelhouse/` to the air-gapped environment, then install:
 pip install --no-index --find-links wheelhouse "modelaudit[all]"
 ```
 
-If you only need specific scanners, replace `[all]` with targeted extras. Add `tensorflow` on Python 3.11-3.12 only when TensorFlow-dependent checkpoint or weight analysis is required.
+If you only need specific scanners, replace `[all]` with targeted extras. ONNX is included by `onnx`/`all` on Python 3.10-3.12; add `tensorflow` on Python 3.11-3.12 only when TensorFlow-dependent checkpoint or weight analysis is required.
 
 ## 2. Disable telemetry
 
