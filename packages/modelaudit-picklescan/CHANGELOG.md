@@ -24,8 +24,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add suspicious string-literal matching for execution helpers, loader helpers,
   `getattr` variants, `os.system`/`subprocess`/`runpy`/`webbrowser` patterns,
   encoded code strings, and pickle loader references.
-- Add post-budget tail scanning so dangerous globals and expansion patterns
-  hidden after opcode-budget exhaustion are still reported.
+- Improve detection so dangerous globals and expansion patterns remain
+  reportable even when opcode-budget limits are reached.
 - Add resource controls for timeout, opcode budget, post-budget byte scans,
   known-size and unknown-size stream reads, long string literal probing, nested
   pickle byte budgets, nested depth, and import-reference metadata volume.
@@ -57,9 +57,10 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Detect nested payloads that use PERSID/BINPERSID semantics, proto-0 payloads,
   uppercase escaped-hex prefixes, multiline/comment-wrapped encodings, and long
   literals with suspicious content outside prefix/suffix windows.
-- Preserve stack state on operand underflow, avoid wrapping MARK sentinels,
-  preserve `GLOBAL`/`INST` module/name operands without string roundtrips, and
-  keep follow-on pickle streams at sibling depth.
+- Preserve stack state on operand underflow.
+- Avoid wrapping MARK sentinels.
+- Preserve `GLOBAL`/`INST` module/name operands without string roundtrips.
+- Keep follow-on pickle streams at sibling depth.
 - Cap import-reference metadata with an explicit notice, summarize repeated
   persistent IDs, coalesce protocol-5 buffer notices, and surface structural
   tamper severity without adapter downgrades.

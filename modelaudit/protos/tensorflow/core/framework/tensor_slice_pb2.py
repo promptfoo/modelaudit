@@ -7,7 +7,6 @@
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import runtime_version as _runtime_version
-from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
 _runtime_version.ValidateProtobufRuntimeVersion(
     _runtime_version.Domain.PUBLIC,
@@ -18,11 +17,6 @@ _runtime_version.ValidateProtobufRuntimeVersion(
     'tensorflow/core/framework/tensor_slice.proto'
 )
 # @@protoc_insertion_point(imports)
-
-_sym_db = _symbol_database.Default()
-
-# Keep generated dependency imports for descriptor registration side effects.
-del _sym_db
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n,tensorflow/core/framework/tensor_slice.proto\x12\ntensorflow\"\x80\x01\n\x10TensorSliceProto\x12\x33\n\x06\x65xtent\x18\x01 \x03(\x0b\x32#.tensorflow.TensorSliceProto.Extent\x1a\x37\n\x06\x45xtent\x12\r\n\x05start\x18\x01 \x01(\x03\x12\x10\n\x06length\x18\x02 \x01(\x03H\x00\x42\x0c\n\nhas_lengthB\x87\x01\n\x18org.tensorflow.frameworkB\x11TensorSliceProtosP\x01ZSgithub.com/tensorflow/tensorflow/tensorflow/go/core/framework/tensor_slice_go_proto\xf8\x01\x01\x62\x06proto3')
 
 _globals = globals()

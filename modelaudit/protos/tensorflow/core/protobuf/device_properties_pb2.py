@@ -7,7 +7,6 @@
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import runtime_version as _runtime_version
-from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
 _runtime_version.ValidateProtobufRuntimeVersion(
     _runtime_version.Domain.PUBLIC,
@@ -18,11 +17,6 @@ _runtime_version.ValidateProtobufRuntimeVersion(
     'tensorflow/core/protobuf/device_properties.proto'
 )
 # @@protoc_insertion_point(imports)
-
-_sym_db = _symbol_database.Default()
-
-# Keep generated dependency imports for descriptor registration side effects.
-del _sym_db
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n0tensorflow/core/protobuf/device_properties.proto\x12\ntensorflow\"\x90\x03\n\x10\x44\x65viceProperties\x12\x0c\n\x04type\x18\x01 \x01(\t\x12\x0e\n\x06vendor\x18\x02 \x01(\t\x12\r\n\x05model\x18\x03 \x01(\t\x12\x11\n\tfrequency\x18\x04 \x01(\x03\x12\x11\n\tnum_cores\x18\x05 \x01(\x03\x12\x42\n\x0b\x65nvironment\x18\x06 \x03(\x0b\x32-.tensorflow.DeviceProperties.EnvironmentEntry\x12\x15\n\rnum_registers\x18\x07 \x01(\x03\x12\x15\n\rl1_cache_size\x18\x08 \x01(\x03\x12\x15\n\rl2_cache_size\x18\t \x01(\x03\x12\x15\n\rl3_cache_size\x18\n \x01(\x03\x12-\n%shared_memory_size_per_multiprocessor\x18\x0b \x01(\x03\x12\x13\n\x0bmemory_size\x18\x0c \x01(\x03\x12\x11\n\tbandwidth\x18\r \x01(\x03\x1a\x32\n\x10\x45nvironmentEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"M\n\x0bNamedDevice\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x30\n\nproperties\x18\x02 \x01(\x0b\x32\x1c.tensorflow.DevicePropertiesBrB\x16\x44\x65vicePropertiesProtosZUgithub.com/tensorflow/tensorflow/tensorflow/go/core/protobuf/for_core_protos_go_proto\xf8\x01\x01\x62\x06proto3')
 
 _globals = globals()

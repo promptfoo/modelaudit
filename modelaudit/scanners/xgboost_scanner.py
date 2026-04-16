@@ -429,19 +429,7 @@ class XGBoostScanner(BaseScanner):
     def _scan_ubj_model(self, path: str, result: ScanResult) -> None:
         """Scan XGBoost UBJ (Universal Binary JSON) model for security issues."""
         if not _check_ubjson_available():
-            result.add_check(
-                name="UBJSON Library Check",
-                passed=False,
-                message=(
-                    "Cannot scan UBJ file: ubjson package is not installed. "
-                    "Install with 'pip install ubjson' to enable scanning."
-                ),
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={"required_package": "ubjson", "install_command": "pip install ubjson"},
-                why="UBJ file scanning requires the ubjson package to decode Universal Binary JSON format",
-            )
-            self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["ubj_dependency_missing"])
+            self._record_missing_ubjson_dependency(path, result)
             return
 
         try:
@@ -510,9 +498,17 @@ class XGBoostScanner(BaseScanner):
                 return
 
             # Modern XGBoost (2.0+) saves .bst files in UBJSON format by default.
-            # Detect and route to the UBJ scanner for proper analysis.
-            if self._is_ubjson_file(path):
-                self._scan_ubj_model(path, result)
+            # Route to the UBJ scanner when the decoder is available; otherwise
+            # fail closed while still attempting the optional XGBoost load.
+            is_ubjson = self._is_ubjson_file(path)
+            if is_ubjson:
+                if _check_ubjson_available():
+                    self._scan_ubj_model(path, result)
+                    return
+
+                self._record_missing_ubjson_dependency(path, result)
+                if self.enable_xgb_loading:
+                    self._safe_xgboost_load(path, result)
                 return
 
             # Basic binary structure validation
@@ -540,6 +536,26 @@ class XGBoostScanner(BaseScanner):
                 details={"exception": str(e)},
             )
             self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["binary_analysis_failed"])
+
+    def _record_missing_ubjson_dependency(self, path: str, result: ScanResult) -> None:
+        """Record that UBJSON structural scanning could not run."""
+        result.add_check(
+            name="UBJSON Library Check",
+            passed=False,
+            message=(
+                "Cannot scan UBJ file: ubjson package is not installed. "
+                "Install with 'pip install ubjson' to enable scanning."
+            ),
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "required_package": "ubjson",
+                "install_command": "pip install ubjson",
+                "detected_format": "ubjson",
+            },
+            why="UBJ file scanning requires the ubjson package to decode Universal Binary JSON format",
+        )
+        self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["ubj_dependency_missing"])
 
     def _validate_xgboost_json_schema(self, data: dict[str, Any], result: ScanResult, path: str) -> None:
         """Validate XGBoost JSON model schema and structure."""
@@ -611,25 +627,56 @@ class XGBoostScanner(BaseScanner):
     def _validate_tree_structures(self, trees: list[dict[str, Any]], result: ScanResult, path: str) -> None:
         """Validate individual tree structures for anomalies."""
         for i, tree in enumerate(trees):
-            # Check tree depth
-            if "tree_param" in tree:
-                tree_param = tree["tree_param"]
-                if isinstance(tree_param, dict):
-                    try:
-                        depth = int(tree_param.get("size_leaf_vector", 0))
-                    except (ValueError, TypeError):
-                        # Skip validation if value can't be converted to int
-                        continue
-                    if depth > self.max_tree_depth:
-                        result.add_check(
-                            name="Tree Depth Validation",
-                            passed=False,
-                            message=f"Tree {i} has deep structure: depth {depth} (threshold: {self.max_tree_depth})",
-                            severity=IssueSeverity.INFO,
-                            location=path,
-                            details={"tree_index": i, "depth": depth, "max_depth": self.max_tree_depth},
-                            why="Deep trees may impact performance but can be legitimate in complex models",
-                        )
+            left_children = tree.get("left_children")
+            right_children = tree.get("right_children")
+            if not isinstance(left_children, list) or not isinstance(right_children, list):
+                continue
+            if len(left_children) != len(right_children) or len(left_children) == 0:
+                continue
+
+            try:
+                left = [int(child) for child in left_children]
+                right = [int(child) for child in right_children]
+            except (ValueError, TypeError):
+                continue
+
+            depth = self._compute_tree_depth(left, right)
+            if depth > self.max_tree_depth:
+                result.add_check(
+                    name="Tree Depth Validation",
+                    passed=False,
+                    message=f"Tree {i} has deep structure: depth {depth} (threshold: {self.max_tree_depth})",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={"tree_index": i, "depth": depth, "max_depth": self.max_tree_depth},
+                    why="Deep trees may impact performance but can be legitimate in complex models",
+                )
+
+    @staticmethod
+    def _compute_tree_depth(left_children: list[int], right_children: list[int]) -> int:
+        """Compute tree depth from XGBoost child-index arrays."""
+        max_depth = 0
+        stack = [(0, 0)]
+        visited: set[int] = set()
+
+        while stack:
+            node_idx, node_depth = stack.pop()
+            if node_idx in visited:
+                continue
+            if node_idx < 0 or node_idx >= len(left_children):
+                continue
+
+            visited.add(node_idx)
+            max_depth = max(max_depth, node_depth)
+
+            left_idx = left_children[node_idx]
+            right_idx = right_children[node_idx]
+            if left_idx != -1:
+                stack.append((left_idx, node_depth + 1))
+            if right_idx != -1:
+                stack.append((right_idx, node_depth + 1))
+
+        return max_depth
 
     def _validate_model_parameters(self, params: dict[str, Any], result: ScanResult, path: str) -> None:
         """Validate XGBoost model parameters for suspicious values."""
@@ -693,7 +740,7 @@ class XGBoostScanner(BaseScanner):
                     message=f"Suspicious pattern detected: {description}",
                     severity=IssueSeverity.CRITICAL,
                     location=path,
-                    details={"pattern": pattern, "description": description},
+                    details={"pattern": pattern.pattern, "description": description},
                     why="Suspicious patterns in model JSON may indicate embedded malicious code",
                 )
 
