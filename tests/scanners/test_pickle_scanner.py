@@ -25,6 +25,18 @@ from modelaudit.scanners.pickle_scanner import (
 from tests.helpers import create_mock_pytorch_zip
 
 EXPECTED_SYSTEM_GLOBAL = "nt.system" if os.name == "nt" else "posix.system"
+BYPASS_V4_REFERENCES: tuple[tuple[str, str, IssueSeverity], ...] = (
+    ("ctypes", "CDLL", IssueSeverity.CRITICAL),
+    ("ctypes", "cast", IssueSeverity.CRITICAL),
+    ("cProfile", "run", IssueSeverity.CRITICAL),
+    ("pdb", "run", IssueSeverity.CRITICAL),
+    ("timeit", "timeit", IssueSeverity.CRITICAL),
+    ("profile", "run", IssueSeverity.CRITICAL),
+    ("_thread", "allocate_lock", IssueSeverity.CRITICAL),
+    ("linecache", "getline", IssueSeverity.WARNING),
+    ("logging.config", "listen", IssueSeverity.CRITICAL),
+    ("zipimport", "zipimporter", IssueSeverity.CRITICAL),
+)
 
 
 class MaliciousPayload:
@@ -57,6 +69,10 @@ def _binary_opcode_os_system_reduce_payload() -> bytes:
 
 def _binary_opcode_stack_global_probe_decoy() -> bytes:
     return _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93Z"
+
+
+def _global_reduce_payload(module: str, func: str) -> bytes:
+    return b"\x80\x02c" + module.encode("utf-8") + b"\n" + func.encode("utf-8") + b"\n)R."
 
 
 def _make_opcode_padding_stream(opcode_pairs: int) -> bytes:
@@ -682,6 +698,30 @@ def test_comment_token_does_not_bypass_main_stack_global_detection(tmp_path: Pat
     ), (
         "Expected __main__ STACK_GLOBAL warning despite comment token, "
         f"got: {[issue.message for issue in result.issues]}"
+    )
+
+
+@pytest.mark.parametrize(("module", "func", "expected_severity"), BYPASS_V4_REFERENCES)
+def test_deleted_bypass_v4_generator_references_remain_covered(
+    module: str,
+    func: str,
+    expected_severity: IssueSeverity,
+) -> None:
+    full_ref = f"{module}.{func}"
+    payload = _global_reduce_payload(module, func)
+
+    result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="bypass-v4-regression.pkl")
+
+    matched = [
+        issue
+        for issue in result.issues
+        if issue.severity == expected_severity
+        and (issue.details.get("associated_global") == full_ref or full_ref in issue.message)
+    ]
+    assert result.success is True, f"Scan failed for {full_ref}: {result.metadata}"
+    assert matched, (
+        f"Expected {expected_severity.value} finding for {full_ref}, "
+        f"got: {[(issue.severity.value, issue.message, issue.details) for issue in result.issues]}"
     )
 
 

@@ -7,15 +7,50 @@ regression corpus. Scanner-specific metadata cases should usually live in
 typed pytest tests that build temporary fixtures.
 """
 
+import json
+import struct
 from pathlib import Path
 
 import numpy as np
-from safetensors.numpy import save_file
+
+_DTYPE_CODES = {
+    np.dtype("float32"): "F32",
+}
 
 
-def generate_safetensors_assets() -> None:
+def _write_safetensors(path: Path, tensors: dict[str, np.ndarray], metadata: dict[str, str]) -> None:
+    """Write a tiny deterministic SafeTensors file for committed fixtures."""
+    header: dict[str, object] = {"__metadata__": dict(sorted(metadata.items()))}
+    data_chunks: list[bytes] = []
+    offset = 0
+
+    for name, tensor in sorted(tensors.items()):
+        array = np.ascontiguousarray(tensor)
+        dtype_code = _DTYPE_CODES.get(array.dtype)
+        if dtype_code is None:
+            raise ValueError(f"Unsupported fixture tensor dtype for {name}: {array.dtype}")
+
+        tensor_data = array.tobytes(order="C")
+        next_offset = offset + len(tensor_data)
+        header[name] = {
+            "dtype": dtype_code,
+            "shape": list(array.shape),
+            "data_offsets": [offset, next_offset],
+        }
+        data_chunks.append(tensor_data)
+        offset = next_offset
+
+    header_bytes = json.dumps(header, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    header_padding = (8 - (len(header_bytes) % 8)) % 8
+    header_bytes += b" " * header_padding
+
+    path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + b"".join(data_chunks))
+
+
+def generate_safetensors_assets(assets_dir: Path | None = None) -> None:
     """Generate the committed SafeTensors regression assets."""
-    assets_dir = Path(__file__).parent.parent / "samples" / "safetensors"
+    if assets_dir is None:
+        assets_dir = Path(__file__).parent.parent / "samples" / "safetensors"
     assets_dir.mkdir(exist_ok=True)
 
     print("Generating SafeTensors regression assets...")
@@ -34,7 +69,7 @@ def generate_safetensors_assets() -> None:
     }
 
     safe_path = assets_dir / "safe_model.safetensors"
-    save_file(base_data, str(safe_path), metadata=safe_metadata)
+    _write_safetensors(safe_path, base_data, safe_metadata)
     print(f"Generated: {safe_path.name} (safe baseline)")
 
     malicious_path = assets_dir / "malicious_import.safetensors"
@@ -42,7 +77,7 @@ def generate_safetensors_assets() -> None:
         "model_info": "import os; os.system('echo pwned')",
         "description": "Legitimate looking model with malicious import statement",
     }
-    save_file(base_data, str(malicious_path), metadata=malicious_metadata)
+    _write_safetensors(malicious_path, base_data, malicious_metadata)
     print(f"Generated: {malicious_path.name} (malicious metadata baseline)")
 
     print(f"\nSafeTensors assets location: {assets_dir}")
