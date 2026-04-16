@@ -15,7 +15,7 @@ import subprocess as real_subprocess
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import Mock, patch
 
 import pytest
@@ -216,6 +216,27 @@ class TestXGBoostJSONScanning:
         critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
         assert len(critical_issues) == 0
 
+    def test_tree_depth_validation_uses_child_structure(
+        self,
+        temp_dir: Path,
+        valid_xgboost_json: dict[str, Any],
+    ) -> None:
+        """Tree depth validation should use child arrays, not size_leaf_vector metadata."""
+        tree = valid_xgboost_json["learner"]["gradient_booster"]["model"]["trees"][0]
+        tree["tree_param"]["size_leaf_vector"] = "1"
+        tree["left_children"] = [1, 2, 3, -1]
+        tree["right_children"] = [-1, -1, -1, -1]
+        tree["parents"] = [2147483647, 0, 1, 2]
+
+        json_file = temp_dir / "deep_tree.json"
+        json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
+
+        result = XGBoostScanner({"max_tree_depth": 2}).scan(str(json_file))
+
+        checks = {check.name: check for check in result.checks}
+        assert checks["Tree Depth Validation"].status == CheckStatus.FAILED
+        assert checks["Tree Depth Validation"].details["depth"] == 3
+
     def test_invalid_json_fails(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
         """Test that invalid JSON content is detected."""
         json_file = temp_dir / "invalid.json"
@@ -274,7 +295,45 @@ class TestXGBoostJSONScanning:
 
         monkeypatch.setattr("modelaudit.scanners.xgboost_scanner.json.load", fail_json_load)
 
-        assert XGBoostScanner.can_handle(str(json_file)) is False
+        read_sizes: list[int] = []
+        real_open = open
+
+        class TrackingBinaryReader:
+            def __init__(self, raw: Any) -> None:
+                self._raw = raw
+
+            def __enter__(self) -> "TrackingBinaryReader":
+                self._raw.__enter__()
+                return self
+
+            def __exit__(self, *args: Any) -> object:
+                return self._raw.__exit__(*args)
+
+            def read(self, size: int = -1) -> bytes:
+                read_sizes.append(size)
+                if size < 0:
+                    raise AssertionError("can_handle() must not perform unbounded full-file read()")
+                data = self._raw.read(size)
+                assert isinstance(data, bytes)
+                return data
+
+            def seek(self, offset: int, whence: int = 0) -> int:
+                return cast(int, self._raw.seek(offset, whence))
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._raw, name)
+
+        def instrumented_open(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            stream = real_open(file, mode, *args, **kwargs)
+            if isinstance(file, str) and Path(file) == json_file and "b" in mode:
+                return TrackingBinaryReader(stream)
+            return stream
+
+        with patch("builtins.open", side_effect=instrumented_open):
+            assert XGBoostScanner.can_handle(str(json_file)) is False
+
+        assert XGBOOST_JSON_ROUTING_CHUNK_BYTES in read_sizes
+        assert all(size <= XGBoostScanner._JSON_PROBE_READ_BYTES for size in read_sizes)
 
     def test_can_handle_json_detects_malicious_xgboost_after_large_prefix(self, tmp_path: Path) -> None:
         """Routing should find malicious XGBoost JSON markers beyond the first read chunk."""
@@ -557,6 +616,13 @@ class TestXGBoostBinaryScanning:
         result = loading_scanner.scan(str(binary_file))
 
         assert any("loaded successfully" in str(check.message) for check in result.checks)
+        mock_subprocess.run.assert_called_once()
+        _, run_kwargs = mock_subprocess.run.call_args
+        assert "cwd" in run_kwargs
+        assert run_kwargs["cwd"] is not None
+        assert "env" in run_kwargs
+        assert isinstance(run_kwargs["env"], dict)
+        assert "PYTHONPATH" not in run_kwargs["env"]
 
     @patch("modelaudit.scanners.xgboost_scanner._check_xgboost_available")
     @patch("modelaudit.scanners.xgboost_scanner.subprocess")

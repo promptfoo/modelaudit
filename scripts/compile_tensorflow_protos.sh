@@ -107,7 +107,7 @@ find "$OUTPUT_DIR/tensorflow" -type d -exec touch {}/__init__.py \;
 # Keep original tensorflow.* imports so descriptor dependencies load through
 # modelaudit/protos on sys.path at runtime.
 
-echo "Marking generated dependency imports as consumed..."
+echo "Cleaning generated proto import side effects..."
 python3 - "$OUTPUT_DIR" <<'PY'
 from pathlib import Path
 import re
@@ -116,26 +116,38 @@ import sys
 output_dir = Path(sys.argv[1]) / "tensorflow"
 cleanup_marker = "# Keep generated dependency imports for descriptor registration side effects."
 descriptor_marker = "\nDESCRIPTOR = _descriptor_pool.Default().AddSerializedFile"
+symbol_database_import = "from google.protobuf import symbol_database as _symbol_database\n"
+symbol_database_default = "_sym_db = _symbol_database.Default()"
 
 for path in sorted(output_dir.rglob("*_pb2.py")):
     text = path.read_text()
-    if descriptor_marker not in text or "_sym_db = _symbol_database.Default()" not in text:
+    if descriptor_marker not in text:
         continue
 
     prefix, rest = text.split(descriptor_marker, 1)
     if cleanup_marker in prefix:
         prefix = prefix.split("\n" + cleanup_marker, 1)[0].rstrip()
 
-    after_sym_db = prefix.split("_sym_db = _symbol_database.Default()", 1)[1]
+    prefix = prefix.replace(symbol_database_import, "")
+    if symbol_database_default in prefix:
+        before_sym_db, after_sym_db = prefix.split(symbol_database_default, 1)
+        prefix = before_sym_db + after_sym_db
+    else:
+        after_sym_db = prefix
+
     aliases: list[str] = []
     for line in after_sym_db.splitlines():
         match = re.match(r"from\s+.+\s+import\s+.+\s+as\s+([A-Za-z_][A-Za-z0-9_]*)$", line.strip())
         if match:
             aliases.append(match.group(1))
 
-    cleanup_lines = ["", cleanup_marker, "del _sym_db"]
-    cleanup_lines.extend(f"del {alias}" for alias in aliases)
-    path.write_text(prefix.rstrip() + "\n" + "\n".join(cleanup_lines) + descriptor_marker + rest)
+    cleanup = ""
+    if aliases:
+        cleanup_lines = ["", cleanup_marker]
+        cleanup_lines.extend(f"del {alias}" for alias in aliases)
+        cleanup = "\n" + "\n".join(cleanup_lines)
+
+    path.write_text(prefix.rstrip() + cleanup + descriptor_marker + rest)
 PY
 
 echo ""
