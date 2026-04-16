@@ -557,9 +557,10 @@ class KerasH5Scanner(BaseScanner):
                 layer_counts[layer_class] = 1
 
             # Check for suspicious layer types
-            if layer_class in self.suspicious_layer_types:
+            is_lambda_layer = self._is_lambda_layer_class(layer_class)
+            if layer_class in self.suspicious_layer_types or is_lambda_layer:
                 # Special handling for Lambda layers - validate Python code
-                if layer_class == "Lambda":
+                if is_lambda_layer:
                     raw_layer_name = layer.get("name")
                     if not raw_layer_name and isinstance(layer_config, dict):
                         raw_layer_name = layer_config.get("name")
@@ -703,7 +704,7 @@ class KerasH5Scanner(BaseScanner):
                             "description": self.suspicious_layer_types[layer_class],
                             "layer_config": layer_config,
                         },
-                        why=get_pattern_explanation("lambda_layer") if layer_class == "Lambda" else None,
+                        why=get_pattern_explanation("lambda_layer") if is_lambda_layer else None,
                         rule_code="S902",
                     )
 
@@ -897,6 +898,29 @@ class KerasH5Scanner(BaseScanner):
             # Keras 3.x dict-format Lambda: {"class_name": "__lambda__", "config": {"code": ...}}
             check_lambda_dict_function(function_str, result, self.current_file_path, layer_config.get("name", "lambda"))
         # Don't flag Lambda layers without code - they might just be placeholders
+
+    @staticmethod
+    def _is_lambda_layer_class(layer_class: Any) -> bool:
+        """Return True for serialized Lambda variants such as `keras.layers.Lambda`."""
+        if not isinstance(layer_class, str):
+            return False
+
+        normalized = layer_class.strip()
+        if normalized == "Lambda":
+            return True
+
+        module_path, _, class_name = normalized.rpartition(".")
+        if class_name != "Lambda":
+            return False
+
+        framework_prefixes = (
+            "keras.",
+            "tensorflow.keras.",
+            "tensorflow.python.keras.",
+            "tf.keras.",
+            "tf_keras.",
+        )
+        return any(f"{module_path.lower()}.".startswith(prefix) for prefix in framework_prefixes)
 
     @staticmethod
     def _is_vulnerable_to_cve_2024_3660(version: str) -> bool | None:
