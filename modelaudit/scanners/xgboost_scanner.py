@@ -509,6 +509,12 @@ class XGBoostScanner(BaseScanner):
                 self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["binary_pickle_spoof"])
                 return
 
+            # Modern XGBoost (2.0+) saves .bst files in UBJSON format by default.
+            # Detect and route to the UBJ scanner for proper analysis.
+            if self._is_ubjson_file(path):
+                self._scan_ubj_model(path, result)
+                return
+
             # Basic binary structure validation
             self._validate_binary_structure(path, result)
 
@@ -698,6 +704,20 @@ class XGBoostScanner(BaseScanner):
 
             return detect_file_format(path) == "pickle"
         except Exception:
+            return False
+
+    @staticmethod
+    def _is_ubjson_file(path: str) -> bool:
+        """Check if file is in UBJSON format (modern XGBoost default for .bst)."""
+        # UBJSON objects start with '{' followed by a type marker or '}' (empty).
+        # XGBoost UBJSON models use '{' + int-type length (e.g. 'L' for int64).
+        _UBJSON_OBJECT_START = ord("{")
+        _UBJSON_NEXT_VALID = frozenset(b"iUIlLdDSC#$}")
+        try:
+            with open(path, "rb") as f:
+                header = f.read(2)
+            return len(header) == 2 and header[0] == _UBJSON_OBJECT_START and header[1] in _UBJSON_NEXT_VALID
+        except OSError:
             return False
 
     def _validate_binary_structure(self, path: str, result: ScanResult) -> None:
