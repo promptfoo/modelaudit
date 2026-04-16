@@ -429,19 +429,7 @@ class XGBoostScanner(BaseScanner):
     def _scan_ubj_model(self, path: str, result: ScanResult) -> None:
         """Scan XGBoost UBJ (Universal Binary JSON) model for security issues."""
         if not _check_ubjson_available():
-            result.add_check(
-                name="UBJSON Library Check",
-                passed=False,
-                message=(
-                    "Cannot scan UBJ file: ubjson package is not installed. "
-                    "Install with 'pip install ubjson' to enable scanning."
-                ),
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={"required_package": "ubjson", "install_command": "pip install ubjson"},
-                why="UBJ file scanning requires the ubjson package to decode Universal Binary JSON format",
-            )
-            self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["ubj_dependency_missing"])
+            self._record_missing_ubjson_dependency(path, result)
             return
 
         try:
@@ -511,22 +499,25 @@ class XGBoostScanner(BaseScanner):
 
             # Modern XGBoost (2.0+) saves .bst files in UBJSON format by default.
             # Route to the UBJ scanner when the decoder is available; otherwise
-            # fall through to binary validation + optional XGBoost loading so the
-            # load path is still attempted when enable_xgb_loading=True.
+            # fail closed while still attempting the optional XGBoost load.
             is_ubjson = self._is_ubjson_file(path)
-            if is_ubjson and _check_ubjson_available():
-                self._scan_ubj_model(path, result)
+            if is_ubjson:
+                if _check_ubjson_available():
+                    self._scan_ubj_model(path, result)
+                    return
+
+                self._record_missing_ubjson_dependency(path, result)
+                if self.enable_xgb_loading:
+                    self._safe_xgboost_load(path, result)
                 return
 
-            # Basic binary structure validation (skipped for detected UBJSON
-            # since the old binary-marker check would mis-flag it).
-            if not is_ubjson:
-                self._validate_binary_structure(path, result)
+            # Basic binary structure validation
+            self._validate_binary_structure(path, result)
 
             # Attempt safe XGBoost loading if enabled
             if self.enable_xgb_loading:
                 self._safe_xgboost_load(path, result)
-            elif not is_ubjson:
+            else:
                 result.add_check(
                     name="XGBoost Loading",
                     passed=True,
@@ -534,22 +525,6 @@ class XGBoostScanner(BaseScanner):
                     location=path,
                     details={"safe_mode": True},
                 )
-            else:
-                # UBJSON detected but no decoder and loading disabled
-                result.add_check(
-                    name="UBJSON Library Check",
-                    passed=False,
-                    message=(
-                        "File appears to be UBJSON format (modern XGBoost default) "
-                        "but the ubjson package is not installed. "
-                        "Install with 'pip install ubjson' to enable scanning."
-                    ),
-                    severity=IssueSeverity.INFO,
-                    location=path,
-                    details={"required_package": "ubjson", "detected_format": "ubjson"},
-                    why="UBJSON file scanning requires the ubjson package to decode Universal Binary JSON format",
-                )
-                self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["ubj_dependency_missing"])
 
         except Exception as e:
             result.add_check(
@@ -561,6 +536,26 @@ class XGBoostScanner(BaseScanner):
                 details={"exception": str(e)},
             )
             self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["binary_analysis_failed"])
+
+    def _record_missing_ubjson_dependency(self, path: str, result: ScanResult) -> None:
+        """Record that UBJSON structural scanning could not run."""
+        result.add_check(
+            name="UBJSON Library Check",
+            passed=False,
+            message=(
+                "Cannot scan UBJ file: ubjson package is not installed. "
+                "Install with 'pip install ubjson' to enable scanning."
+            ),
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "required_package": "ubjson",
+                "install_command": "pip install ubjson",
+                "detected_format": "ubjson",
+            },
+            why="UBJ file scanning requires the ubjson package to decode Universal Binary JSON format",
+        )
+        self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["ubj_dependency_missing"])
 
     def _validate_xgboost_json_schema(self, data: dict[str, Any], result: ScanResult, path: str) -> None:
         """Validate XGBoost JSON model schema and structure."""

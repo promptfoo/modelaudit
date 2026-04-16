@@ -23,7 +23,7 @@ import pytest
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.xgboost_scanner import XGBOOST_JSON_ROUTING_CHUNK_BYTES, XGBoostScanner
 
 
@@ -602,14 +602,30 @@ class TestXGBoostBinaryScanning:
         ubjson_bst.write_bytes(b"{U")
         loading_scanner = XGBoostScanner({"enable_xgb_loading": True})
 
+        def record_successful_load(path: str, result: ScanResult) -> None:
+            result.add_check(
+                name="XGBoost Model Loading",
+                passed=True,
+                message="XGBoost model loaded successfully in isolated process",
+                location=path,
+                details={"load_test": "passed"},
+            )
+
         with (
             patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=False),
-            patch.object(loading_scanner, "_safe_xgboost_load") as mock_safe_load,
+            patch.object(loading_scanner, "_safe_xgboost_load", side_effect=record_successful_load) as mock_safe_load,
         ):
             result = loading_scanner.scan(str(ubjson_bst))
 
         mock_safe_load.assert_called_once()
         assert mock_safe_load.call_args.args[0] == str(ubjson_bst)
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_ubj_dependency_missing" in result.metadata["scan_outcome_reasons"]
+        assert any(check.name == "UBJSON Library Check" for check in result.checks)
+        assert any(
+            check.name == "XGBoost Model Loading" and check.status == CheckStatus.PASSED for check in result.checks
+        )
         assert not any(check.name == "Binary Structure Validation" for check in result.checks)
 
     def test_ubjson_bst_without_decoder_or_loading_fails_closed(self, temp_dir: Path) -> None:
