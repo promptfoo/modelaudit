@@ -111,6 +111,7 @@ def pytest_runtest_setup(item):
             "test_core_asset_extraction.py",  # Check consolidation and location parsing regressions
             "test_manifest_scanner.py",  # Manifest scanner tests
             "test_metadata_scanner.py",  # Metadata scanner tests
+            "test_metadata_extractor.py",  # Metadata extractor helper routing and CLI tests
             "test_weak_hash_detection.py",  # Weak hash detection tests
             "test_cloud_url_detection.py",  # Cloud storage URL detection tests
             "tests/utils/sources/test_cloud_storage.py",  # Cloud storage source tests
