@@ -1043,6 +1043,12 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if format_result != "unknown":
             return format_result
 
+        lightgbm_probe_size = min(size, _LIGHTGBM_SIGNATURE_READ_BYTES)
+        if len(prefix) < lightgbm_probe_size:
+            prefix += f.read(lightgbm_probe_size - len(prefix))
+        if _is_lightgbm_signature(prefix):
+            return "lightgbm"
+
         if _could_start_proto0_or_1_pickle(prefix):
             max_probe_size = min(size, PROTO0_1_MAX_PROBE_BYTES)
             if len(prefix) < max_probe_size:

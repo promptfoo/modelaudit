@@ -4,7 +4,6 @@ import argparse
 import cProfile
 import json
 import pstats
-import resource
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -12,6 +11,11 @@ from pathlib import Path
 from typing import Any
 
 from modelaudit.core import scan_model_directory_or_file
+
+try:
+    import resource as resource_module
+except ImportError:
+    resource_module = None
 
 
 @dataclass(frozen=True)
@@ -28,7 +32,10 @@ class ScanProfileRecord:
 
 
 def _max_rss_bytes() -> int:
-    max_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if resource_module is None:
+        return 0
+
+    max_rss = resource_module.getrusage(resource_module.RUSAGE_SELF).ru_maxrss
     if sys.platform == "darwin":
         return int(max_rss)
     return int(max_rss) * 1024

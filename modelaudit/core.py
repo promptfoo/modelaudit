@@ -144,20 +144,6 @@ def _calculate_file_hash(file_path: str) -> str:
     return hash_sha256.hexdigest()
 
 
-def _extract_sha256_hash_from_scan_result(file_result: ScanResult) -> str | None:
-    """Return a scanner-computed SHA-256 hash when the scan result includes one."""
-    metadata = getattr(file_result, "metadata", None)
-    if not isinstance(metadata, dict):
-        return None
-
-    file_hashes = metadata.get("file_hashes")
-    if isinstance(file_hashes, dict):
-        sha256_hash = file_hashes.get("sha256")
-        return sha256_hash if isinstance(sha256_hash, str) and sha256_hash else None
-    sha256_hash = getattr(file_hashes, "sha256", None)
-    return sha256_hash if isinstance(sha256_hash, str) and sha256_hash else None
-
-
 def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
     """Group files by their content hash to avoid scanning duplicates.
 
@@ -651,17 +637,16 @@ def scan_model_directory_or_file(
 
                 results.files_scanned += 1
 
-                file_result = scan_file(target, config)
-                file_hash = _extract_sha256_hash_from_scan_result(file_result)
-                if file_hash is None:
-                    # Fall back for scanner paths that do not emit file integrity metadata.
-                    try:
-                        file_hash = _calculate_file_hash(target)
-                    except Exception as e:
-                        logger.debug(f"Failed to hash file {target}: {e}")
-                        file_hash = None
-                if file_hash is not None:
+                # Hash the top-level target before scanning. Archive scanners merge
+                # nested member results into their metadata, so scanner-emitted
+                # hashes are not always the bytes of this target.
+                try:
+                    file_hash = _calculate_file_hash(target)
                     file_hashes.append(file_hash)
+                except Exception as e:
+                    logger.debug(f"Failed to hash file {target}: {e}")
+
+                file_result = scan_file(target, config)
 
                 # Use helper function to add scan result to Pydantic model
                 _add_scan_result_to_model(results, scan_metadata, file_result, target)
