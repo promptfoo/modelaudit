@@ -376,6 +376,8 @@ class GCSCache:
             self.cache_dir = Path(cache_dir)
 
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            self.cache_dir.chmod(0o700)
         self.metadata_file = self.cache_dir / "cache_metadata.json"
         self.metadata = self._load_metadata()
 
@@ -383,17 +385,58 @@ class GCSCache:
         """Load cache metadata from disk."""
         if self.metadata_file.exists():
             try:
-                with open(self.metadata_file) as f:
+                with open(self.metadata_file, encoding="utf-8") as f:
                     data = json.load(f)
-                    return dict(data)  # Ensure it's a dict for type checker
+                    if not isinstance(data, dict):
+                        return {}
+                    return {
+                        str(cache_key): self._sanitize_metadata_entry(entry)
+                        for cache_key, entry in data.items()
+                        if isinstance(entry, dict)
+                    }
             except Exception:
                 return {}
         return {}
 
-    def _save_metadata(self):
+    def _url_metadata(self, url: str) -> dict[str, str]:
+        """Return non-secret URL metadata safe to persist."""
+        parsed = urlsplit(url)
+        return {
+            "url_sha256": self.get_cache_key(url),
+            "url_display": redact_url_for_display(url),
+            "url_scheme": parsed.scheme,
+            "url_host": parsed.hostname or "",
+            "url_path": parsed.path,
+        }
+
+    def _sanitize_metadata_entry(self, entry: dict[str, Any]) -> dict[str, Any]:
+        """Remove legacy raw URL fields before metadata is persisted again."""
+        sanitized = dict(entry)
+        raw_url = sanitized.pop("url", None)
+        if isinstance(raw_url, str):
+            for key, value in self._url_metadata(raw_url).items():
+                sanitized.setdefault(key, value)
+        return sanitized
+
+    def _save_metadata(self) -> None:
         """Save cache metadata to disk."""
-        with open(self.metadata_file, "w") as f:
-            json.dump(self.metadata, f, indent=2)
+        self.metadata = {
+            str(cache_key): self._sanitize_metadata_entry(entry)
+            for cache_key, entry in self.metadata.items()
+            if isinstance(entry, dict)
+        }
+        temp_file = self.metadata_file.with_name(f"{self.metadata_file.name}.tmp")
+        fd = os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self.metadata, f, indent=2)
+                f.write("\n")
+            os.replace(temp_file, self.metadata_file)
+            if os.name != "nt":
+                self.metadata_file.chmod(0o600)
+        finally:
+            if temp_file.exists():
+                temp_file.unlink()
 
     def get_cache_key(self, url: str) -> str:
         """Generate cache key for URL."""
@@ -410,7 +453,7 @@ class GCSCache:
             if not _is_within_directory(self.cache_dir, cached_path):
                 logger.warning(
                     "Dropping cache entry for %s because cached path %s is outside cache dir %s",
-                    url,
+                    redact_url_for_display(url),
                     cached_path,
                     self.cache_dir,
                 )
@@ -465,7 +508,7 @@ class GCSCache:
 
         # Update metadata
         self.metadata[cache_key] = {
-            "url": url,
+            **self._url_metadata(url),
             "path": str(cache_path),
             "etag": etag,
             "size": cache_path.stat().st_size if cache_path.is_file() else 0,

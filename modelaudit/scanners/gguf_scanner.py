@@ -45,6 +45,7 @@ class GgufScanner(BaseScanner):
 
     name = "gguf"
     description = "Validates GGUF/GGML model file headers, metadata, and tensor integrity"
+    default_max_file_read_size: ClassVar[int] = 0
     # Include common GGML variant extensions as well
     supported_extensions: ClassVar[list[str]] = [
         ".gguf",

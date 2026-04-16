@@ -15,7 +15,7 @@ pytest.importorskip("safetensors")
 from safetensors.numpy import save_file
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
 
 
@@ -53,6 +53,14 @@ def write_raw_safetensors_header(path: Path, header_bytes: bytes, data: bytes = 
     path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + data)
 
 
+def write_sparse_safetensors(path: Path, header: dict[str, Any], data_size: int) -> None:
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    with path.open("wb") as handle:
+        handle.write(struct.pack("<Q", len(header_bytes)))
+        handle.write(header_bytes)
+        handle.truncate(8 + len(header_bytes) + data_size)
+
+
 def test_valid_safetensors_file(tmp_path: Path) -> None:
     file_path = tmp_path / "model.safetensors"
     create_safetensors_file(file_path)
@@ -66,6 +74,34 @@ def test_valid_safetensors_file(tmp_path: Path) -> None:
     header_limit_check = next((check for check in result.checks if check.name == "Header Size Limit"), None)
     assert header_limit_check is not None
     assert header_limit_check.status.value == "passed"
+
+
+def test_large_safetensors_scans_header_without_default_full_file_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_size = DEFAULT_MAX_FILE_READ_SIZE + 4096
+    file_path = tmp_path / "large_model.safetensors"
+    write_sparse_safetensors(
+        file_path,
+        {"weights": {"dtype": "U8", "shape": [data_size], "data_offsets": [0, data_size]}},
+        data_size,
+    )
+
+    scanner = SafeTensorsScanner()
+    monkeypatch.setattr(
+        scanner,
+        "calculate_file_hashes",
+        lambda _path: {"md5": "0", "sha256": "0", "sha512": "0"},
+    )
+
+    result = scanner.scan(str(file_path))
+
+    checks = {check.name: check for check in result.checks}
+    assert checks["Header Length Validation"].status == CheckStatus.PASSED
+    assert "File Size Limit" not in checks
+    assert result.success is True
+    assert result.metadata["file_size"] > DEFAULT_MAX_FILE_READ_SIZE
 
 
 def _write_oversized_header_safetensors(path: Path, header_len: int) -> None:

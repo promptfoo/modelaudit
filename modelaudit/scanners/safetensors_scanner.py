@@ -42,6 +42,7 @@ class SafeTensorsScanner(BaseScanner):
     name = "safetensors"
     description = "Scans SafeTensors model files for integrity issues"
     supported_extensions: ClassVar[list[str]] = [".safetensors"]
+    default_max_file_read_size: ClassVar[int] = 0
 
     @staticmethod
     def _mark_inconclusive(result: ScanResult, reason: str) -> None:

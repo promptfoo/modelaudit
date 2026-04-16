@@ -4,9 +4,11 @@ import struct
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
+from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.gguf_scanner import GgufScanner
 
 
@@ -156,6 +158,32 @@ def test_gguf_scanner_can_handle_ggml(tmp_path):
     path = tmp_path / "model.ggml"
     _write_ggml_file(path)
     assert GgufScanner.can_handle(str(path))
+
+
+def test_large_gguf_scans_metadata_without_default_full_file_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Large GGUF files should not trip a full-file read cap before header parsing."""
+    path = tmp_path / "large.gguf"
+    _write_minimal_gguf(path, n_kv=0, n_tensors=0)
+    with path.open("ab") as handle:
+        handle.truncate(DEFAULT_MAX_FILE_READ_SIZE + 4096)
+
+    scanner = GgufScanner()
+    monkeypatch.setattr(
+        scanner,
+        "calculate_file_hashes",
+        lambda _path: {"md5": "0", "sha256": "0", "sha512": "0"},
+    )
+
+    result = scanner.scan(str(path))
+
+    check_names = {check.name for check in result.checks}
+    assert "File Size Limit" not in check_names
+    assert result.success is True
+    assert result.metadata["format"] == "gguf"
+    assert result.metadata["file_size"] > DEFAULT_MAX_FILE_READ_SIZE
 
 
 def test_gguf_scanner_can_handle_ggml_variants(tmp_path):
