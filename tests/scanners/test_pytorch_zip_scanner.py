@@ -1717,6 +1717,10 @@ def test_pytorch_zip_cve_2025_32434_empty_imports_stay_suspicious(tmp_path: Path
     [
         "torch._utils.evil",
         "collections.OrderedDictEvil",
+        "torch._rebuild_tensor_v2.evil",
+        "subprocesssafe.Popen",
+        "webbrowsersafe.open",
+        "socketed.connect",
     ],
 )
 def test_pytorch_zip_cve_2025_32434_safe_prefix_spoofing_stays_suspicious(
@@ -1735,10 +1739,18 @@ def test_pytorch_zip_cve_2025_32434_safe_prefix_spoofing_stays_suspicious(
     assert import_reference in check.details["import_analysis"]["found_imports"]
 
 
-def test_pytorch_zip_cve_2025_32434_known_rebuild_reference_stays_info(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "import_reference",
+    [
+        "torch._utils._rebuild_tensor_v2",
+        "torch._rebuild_tensor",
+        "torch._rebuild_tensor_v2",
+    ],
+)
+def test_pytorch_zip_cve_2025_32434_known_rebuild_reference_stays_info(tmp_path: Path, import_reference: str) -> None:
     """Known PyTorch rebuild functions remain informational to avoid noisy state-dict results."""
     scanner = PyTorchZipScanner()
-    pickle_result = _pickle_result_with_reduce("torch._utils._rebuild_tensor_v2")
+    pickle_result = _pickle_result_with_reduce(import_reference)
     pytorch_result = ScanResult(scanner_name="pytorch_zip")
 
     scanner._add_weights_only_safety_warnings(pickle_result, pytorch_result, str(tmp_path / "model.pt"), "data.pkl")
@@ -1746,6 +1758,34 @@ def test_pytorch_zip_cve_2025_32434_known_rebuild_reference_stays_info(tmp_path:
     check = _weights_only_analysis_check(pytorch_result)
     assert check.severity == IssueSeverity.INFO
     assert check.details["import_analysis"]["all_legitimate"] is True
+
+
+@pytest.mark.parametrize(
+    "import_reference",
+    [
+        "__builtins__.eval",
+        "asyncio.subprocess",
+        "asyncio.subprocess.create_subprocess_shell",
+        "builtins.compile",
+        "builtins.__import__",
+        "socket",
+        "subprocess",
+        "urllib",
+        "urllib2.urlopen",
+        "webbrowser",
+    ],
+)
+def test_pytorch_zip_cve_2025_32434_dangerous_references_stay_critical(tmp_path: Path, import_reference: str) -> None:
+    """Dangerous references reported exactly or by known risky prefixes remain malicious."""
+    scanner = PyTorchZipScanner()
+    pickle_result = _pickle_result_with_reduce(import_reference)
+    pytorch_result = ScanResult(scanner_name="pytorch_zip")
+
+    scanner._add_weights_only_safety_warnings(pickle_result, pytorch_result, str(tmp_path / "model.pt"), "data.pkl")
+
+    check = _weights_only_analysis_check(pytorch_result)
+    assert check.severity == IssueSeverity.CRITICAL
+    assert import_reference in check.details["import_analysis"]["found_malicious"]
 
 
 def test_pytorch_zip_cve_2026_24747_fixed_version(tmp_path: Path) -> None:
