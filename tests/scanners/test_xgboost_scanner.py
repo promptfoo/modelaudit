@@ -596,6 +596,36 @@ class TestXGBoostBinaryScanning:
         # Should indicate safe mode (loading disabled)
         assert any("safe mode" in str(check.message) for check in result.checks)
 
+    def test_ubjson_bst_without_decoder_uses_loading_fallback(self, temp_dir: Path) -> None:
+        """Detected UBJSON .bst files should still exercise XGBoost loading when enabled."""
+        ubjson_bst = temp_dir / "model.bst"
+        ubjson_bst.write_bytes(b"{U")
+        loading_scanner = XGBoostScanner({"enable_xgb_loading": True})
+
+        with (
+            patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=False),
+            patch.object(loading_scanner, "_safe_xgboost_load") as mock_safe_load,
+        ):
+            result = loading_scanner.scan(str(ubjson_bst))
+
+        mock_safe_load.assert_called_once()
+        assert mock_safe_load.call_args.args[0] == str(ubjson_bst)
+        assert not any(check.name == "Binary Structure Validation" for check in result.checks)
+
+    def test_ubjson_bst_without_decoder_or_loading_fails_closed(self, temp_dir: Path) -> None:
+        """Detected UBJSON .bst files should not be misreported as malformed legacy binaries."""
+        ubjson_bst = temp_dir / "model.bst"
+        ubjson_bst.write_bytes(b"{U")
+
+        with patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=False):
+            result = XGBoostScanner({"enable_xgb_loading": False}).scan(str(ubjson_bst))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_ubj_dependency_missing" in result.metadata["scan_outcome_reasons"]
+        assert any(check.name == "UBJSON Library Check" for check in result.checks)
+        assert not any(check.name == "Binary Structure Validation" for check in result.checks)
+
     @patch("modelaudit.scanners.xgboost_scanner._check_xgboost_available")
     @patch("modelaudit.scanners.xgboost_scanner.subprocess")
     def test_xgboost_loading_success(self, mock_subprocess: Mock, mock_check_xgb: Mock, temp_dir: Path) -> None:
