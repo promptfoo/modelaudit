@@ -2113,33 +2113,91 @@ class PyTorchZipScanner(BaseScanner):
 
     def _analyze_pickle_imports(self, pickle_result: ScanResult) -> dict[str, Any]:
         """Analyze pickle imports to distinguish legitimate vs malicious patterns"""
-        # Standard PyTorch imports that are expected in legitimate models
+        # Standard PyTorch imports expected in benign state-dict archives.
+        # Keep these as exact callable/class references so lookalikes such as
+        # ``torch._utils.evil`` or ``collections.OrderedDictEvil`` are not
+        # downgraded by substring matching.
         legitimate_imports = {
-            "torch._utils",
-            "torch.LongStorage",
+            "collections.OrderedDict",
+            "numpy.dtype",
+            "numpy.ndarray",
+            "numpy.core.multiarray.scalar",
+            "numpy._core.multiarray.scalar",
+            "torch._rebuild_tensor",
+            "torch._rebuild_tensor_v2",
+            "torch.BFloat16Storage",
+            "torch.BoolStorage",
+            "torch.ByteStorage",
+            "torch.CharStorage",
+            "torch.ComplexDoubleStorage",
+            "torch.ComplexFloatStorage",
+            "torch.DoubleStorage",
             "torch.FloatStorage",
             "torch.HalfStorage",
             "torch.IntStorage",
+            "torch.LongStorage",
+            "torch.QInt32Storage",
+            "torch.QInt8Storage",
+            "torch.QUInt2x4Storage",
+            "torch.QUInt4x2Storage",
+            "torch.QUInt8Storage",
+            "torch.ShortStorage",
             "torch.Storage",
-            "collections.OrderedDict",
-            "collections",
-            "numpy",
+            "torch.UntypedStorage",
+            "torch._tensor._rebuild_from_type_v2",
+            "torch._utils._rebuild_device_tensor_from_numpy",
+            "torch._utils._rebuild_meta_tensor_no_storage",
+            "torch._utils._rebuild_nested_tensor",
+            "torch._utils._rebuild_parameter",
+            "torch._utils._rebuild_parameter_with_state",
+            "torch._utils._rebuild_qtensor",
+            "torch._utils._rebuild_sparse_tensor",
+            "torch._utils._rebuild_tensor",
+            "torch._utils._rebuild_tensor_v2",
+            "torch._utils._rebuild_tensor_v3",
+            "torch._utils._rebuild_wrapper_subclass",
         }
 
-        # Malicious imports that indicate actual attack
+        # Malicious imports that indicate actual attack. Match exact references
+        # or dotted children only; unknown imports are handled as suspicious.
         malicious_imports = {
-            "os.system",
-            "subprocess",
-            "eval",
-            "exec",
-            "compile",
-            "__builtin__",
+            "__builtin__.eval",
+            "__builtin__.exec",
+            "__builtin__.compile",
+            "__builtin__.__import__",
+            "__builtins__.eval",
+            "__builtins__.exec",
+            "__builtins__.compile",
+            "__builtins__.__import__",
+            "asyncio.subprocess",
             "builtins.eval",
             "builtins.exec",
-            "webbrowser",
+            "builtins.compile",
+            "builtins.__import__",
+            "compile",
+            "eval",
+            "exec",
+            "nt.system",
+            "os.system",
+            "posix.system",
+            "runpy.run_module",
             "socket",
+            "subprocess",
             "urllib",
+            "urllib2",
+            "urllib3",
+            "webbrowser",
         }
+        malicious_import_prefixes = (
+            "asyncio.subprocess.",
+            "os.",
+            "subprocess.",
+            "socket.",
+            "urllib.",
+            "urllib2.",
+            "urllib3.",
+            "webbrowser.",
+        )
 
         found_imports = set()
         found_malicious = set()
@@ -2153,13 +2211,11 @@ class PyTorchZipScanner(BaseScanner):
                 imp = check_details["import_reference"]
                 found_imports.add(imp)
                 # Check if this is a malicious import
-                if any(mal in imp for mal in malicious_imports):
+                if imp in malicious_imports or any(imp.startswith(prefix) for prefix in malicious_import_prefixes):
                     found_malicious.add(imp)
 
         # Determine if all imports are legitimate
-        all_legitimate = (
-            all(any(legit in imp for legit in legitimate_imports) for imp in found_imports) if found_imports else True
-        )
+        all_legitimate = bool(found_imports) and all(imp in legitimate_imports for imp in found_imports)
 
         return {
             "total_imports": len(found_imports),

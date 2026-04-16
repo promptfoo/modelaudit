@@ -10,6 +10,7 @@ from typing import IO
 import pytest
 
 from modelaudit.detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
+from modelaudit.scanner_results import Check, ScanResult
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
@@ -1676,6 +1677,115 @@ def test_pytorch_zip_cve_2025_32434_metadata_not_suppressed_by_local_torch(
     assert len(failed_checks) > 0
     assert failed_checks[0].details.get("detected_pytorch_version") == "2.5.1"
     assert failed_checks[0].details.get("pytorch_version_source") == "metadata:config.json:pytorch_version"
+
+
+def _pickle_result_with_reduce(import_reference: str | None = None) -> ScanResult:
+    result = ScanResult(scanner_name="pickle")
+    details: dict[str, object] = {"opcode": "REDUCE"}
+    if import_reference is not None:
+        details["import_reference"] = import_reference
+    result.add_check(
+        name="Dangerous Pickle Opcode",
+        passed=False,
+        message="REDUCE opcode detected",
+        severity=IssueSeverity.WARNING,
+        details=details,
+    )
+    return result
+
+
+def _weights_only_analysis_check(result: ScanResult) -> Check:
+    return next(check for check in result.checks if check.name == "CVE-2025-32434 Pickle Format Security Analysis")
+
+
+def test_pytorch_zip_cve_2025_32434_empty_imports_stay_suspicious(tmp_path: Path) -> None:
+    """Dangerous opcodes without import evidence must not be downgraded to INFO."""
+    scanner = PyTorchZipScanner()
+    pickle_result = _pickle_result_with_reduce()
+    pytorch_result = ScanResult(scanner_name="pytorch_zip")
+
+    scanner._add_weights_only_safety_warnings(pickle_result, pytorch_result, str(tmp_path / "model.pt"), "data.pkl")
+
+    check = _weights_only_analysis_check(pytorch_result)
+    assert check.severity == IssueSeverity.WARNING
+    assert check.details["import_analysis"]["all_legitimate"] is False
+    assert check.details["import_analysis"]["total_imports"] == 0
+
+
+@pytest.mark.parametrize(
+    "import_reference",
+    [
+        "torch._utils.evil",
+        "collections.OrderedDictEvil",
+        "torch._rebuild_tensor_v2.evil",
+        "subprocesssafe.Popen",
+        "webbrowsersafe.open",
+        "socketed.connect",
+    ],
+)
+def test_pytorch_zip_cve_2025_32434_safe_prefix_spoofing_stays_suspicious(
+    tmp_path: Path, import_reference: str
+) -> None:
+    """Safe-looking prefixes must not count as legitimate imports by substring."""
+    scanner = PyTorchZipScanner()
+    pickle_result = _pickle_result_with_reduce(import_reference)
+    pytorch_result = ScanResult(scanner_name="pytorch_zip")
+
+    scanner._add_weights_only_safety_warnings(pickle_result, pytorch_result, str(tmp_path / "model.pt"), "data.pkl")
+
+    check = _weights_only_analysis_check(pytorch_result)
+    assert check.severity == IssueSeverity.WARNING
+    assert check.details["import_analysis"]["all_legitimate"] is False
+    assert import_reference in check.details["import_analysis"]["found_imports"]
+
+
+@pytest.mark.parametrize(
+    "import_reference",
+    [
+        "torch._utils._rebuild_tensor_v2",
+        "torch._rebuild_tensor",
+        "torch._rebuild_tensor_v2",
+    ],
+)
+def test_pytorch_zip_cve_2025_32434_known_rebuild_reference_stays_info(tmp_path: Path, import_reference: str) -> None:
+    """Known PyTorch rebuild functions remain informational to avoid noisy state-dict results."""
+    scanner = PyTorchZipScanner()
+    pickle_result = _pickle_result_with_reduce(import_reference)
+    pytorch_result = ScanResult(scanner_name="pytorch_zip")
+
+    scanner._add_weights_only_safety_warnings(pickle_result, pytorch_result, str(tmp_path / "model.pt"), "data.pkl")
+
+    check = _weights_only_analysis_check(pytorch_result)
+    assert check.severity == IssueSeverity.INFO
+    assert check.details["import_analysis"]["all_legitimate"] is True
+
+
+@pytest.mark.parametrize(
+    "import_reference",
+    [
+        "__builtins__.eval",
+        "asyncio.subprocess",
+        "asyncio.subprocess.create_subprocess_shell",
+        "builtins.compile",
+        "builtins.__import__",
+        "socket",
+        "subprocess",
+        "urllib",
+        "urllib2.urlopen",
+        "webbrowser",
+    ],
+)
+def test_pytorch_zip_cve_2025_32434_dangerous_references_stay_critical(tmp_path: Path, import_reference: str) -> None:
+    """Dangerous references reported exactly or by known risky prefixes remain malicious."""
+    scanner = PyTorchZipScanner()
+    pickle_result = _pickle_result_with_reduce(import_reference)
+    pytorch_result = ScanResult(scanner_name="pytorch_zip")
+
+    scanner._add_weights_only_safety_warnings(pickle_result, pytorch_result, str(tmp_path / "model.pt"), "data.pkl")
+
+    check = _weights_only_analysis_check(pytorch_result)
+    assert check.severity == IssueSeverity.CRITICAL
+    assert import_reference in check.details["import_analysis"]["found_malicious"]
 
 
 def test_pytorch_zip_cve_2026_24747_fixed_version(tmp_path: Path) -> None:
