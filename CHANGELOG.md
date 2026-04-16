@@ -327,7 +327,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
-- add repo correctness audit ledger ([#921](https://github.com/promptfoo/modelaudit/issues/921)) ([06be0b6](https://github.com/promptfoo/modelaudit/commit/06be0b6eaeb53f5f238612a386665c45f3c27dc2))
+- improve scanner correctness documentation ([#921](https://github.com/promptfoo/modelaudit/issues/921)) ([06be0b6](https://github.com/promptfoo/modelaudit/commit/06be0b6eaeb53f5f238612a386665c45f3c27dc2))
 
 ## [0.2.34](https://github.com/promptfoo/modelaudit/compare/v0.2.33...v0.2.34) (2026-04-10)
 
@@ -758,7 +758,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **chore**: standardize on `add_check()` API - migrated all internal code from legacy `add_issue()` method to modern `add_check()` method for structured check reporting with explicit pass/fail status
+- **chore**: standardize on `add_check()` API - internal code now uses the modern `add_check()` method for structured check reporting with explicit pass/fail status
 
 ## [0.2.17] - 2025-11-19
 
