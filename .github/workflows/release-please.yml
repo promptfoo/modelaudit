@@ -35,10 +35,10 @@ jobs:
         run: |
           PR_OUTPUT='${{ steps.release.outputs.pr }}'
           if [ -n "$PR_OUTPUT" ] && [ "$PR_OUTPUT" != "null" ]; then
-            echo "has_pr=true" >> $GITHUB_OUTPUT
-            echo "pr_branch=$(echo '${{ steps.release.outputs.pr }}' | jq -r '.headBranchName')" >> $GITHUB_OUTPUT
+            echo "has_pr=true" >> "$GITHUB_OUTPUT"
+            echo "pr_branch=$(echo '${{ steps.release.outputs.pr }}' | jq -r '.headBranchName')" >> "$GITHUB_OUTPUT"
           else
-            echo "has_pr=false" >> $GITHUB_OUTPUT
+            echo "has_pr=false" >> "$GITHUB_OUTPUT"
           fi
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -534,7 +534,7 @@ jobs:
           smoke_dir="$(mktemp -d)"
           (
             cd "$smoke_dir"
-            PYTHONPATH= /tmp/modelaudit-picklescan-wheel-smoke/bin/python -I - <<'PY'
+            PYTHONPATH='' /tmp/modelaudit-picklescan-wheel-smoke/bin/python -I - <<'PY'
           import importlib.util
 
           import modelaudit_picklescan
