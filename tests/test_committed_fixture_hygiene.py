@@ -17,20 +17,54 @@ ASSETS_DIR = REPO_ROOT / "tests" / "assets"
 SAFETENSORS_DIR = ASSETS_DIR / "samples" / "safetensors"
 KERAS_DIR = ASSETS_DIR / "samples" / "keras"
 JINJA2_DIR = ASSETS_DIR / "samples" / "jinja2"
-BYPASS_POC_DIR = ASSETS_DIR / "pickles" / "bypass_pocs"
 
 EXPECTED_SAFETENSORS_FIXTURES = {
-    "malicious_import.safetensors",
-    "safe_model.safetensors",
+    "tests/assets/samples/safetensors/malicious_import.safetensors",
+    "tests/assets/samples/safetensors/safe_model.safetensors",
 }
 MAX_COMMITTED_SAFETENSORS_BYTES = 4 * 1024
 
 EXPECTED_KERAS_BINARY_FIXTURES = {
-    "custom_layer_attack.h5",
-    "loss_injection.h5",
-    "malicious_lambda.h5",
-    "metric_injection.h5",
-    "safe_model.h5",
+    "tests/assets/samples/keras/custom_layer_attack.h5",
+    "tests/assets/samples/keras/loss_injection.h5",
+    "tests/assets/samples/keras/malicious_lambda.h5",
+    "tests/assets/samples/keras/metric_injection.h5",
+    "tests/assets/samples/keras/safe_model.h5",
+}
+
+EXPECTED_JINJA2_FIXTURES = {
+    "tests/assets/samples/jinja2/benign/chatml_format.json",
+    "tests/assets/samples/jinja2/benign/complex_legitimate.json",
+    "tests/assets/samples/jinja2/benign/conditional_system.json",
+    "tests/assets/samples/jinja2/benign/huggingface_llama.json",
+    "tests/assets/samples/jinja2/benign/simple_roles.json",
+    "tests/assets/samples/jinja2/benign/special_tokens.json",
+    "tests/assets/samples/jinja2/edge_cases/empty_template.json",
+    "tests/assets/samples/jinja2/edge_cases/malformed_template.json",
+    "tests/assets/samples/jinja2/edge_cases/multiple_templates.json",
+    "tests/assets/samples/jinja2/edge_cases/no_template.json",
+    "tests/assets/samples/jinja2/edge_cases/oversized_template.json",
+    "tests/assets/samples/jinja2/malicious/attr_bypass.json",
+    "tests/assets/samples/jinja2/malicious/combined_attack.json",
+    "tests/assets/samples/jinja2/malicious/config_exploit.json",
+    "tests/assets/samples/jinja2/malicious/cve_2024_34359_original.json",
+    "tests/assets/samples/jinja2/malicious/direct_eval.json",
+    "tests/assets/samples/jinja2/malicious/env_extraction.json",
+    "tests/assets/samples/jinja2/malicious/file_access.json",
+    "tests/assets/samples/jinja2/malicious/hex_bypass.json",
+    "tests/assets/samples/jinja2/malicious/loop_discovery.json",
+    "tests/assets/samples/jinja2/malicious/network_exfil.json",
+    "tests/assets/samples/jinja2/malicious/request_exploit.json",
+    "tests/assets/samples/jinja2/malicious/subprocess_injection.json",
+    "tests/assets/samples/jinja2/obfuscated/base64_payload.json",
+    "tests/assets/samples/jinja2/obfuscated/char_construction.json",
+    "tests/assets/samples/jinja2/obfuscated/format_bypass.json",
+    "tests/assets/samples/jinja2/obfuscated/getattr_bypass.json",
+    "tests/assets/samples/jinja2/standalone/benign_chat.j2",
+    "tests/assets/samples/jinja2/standalone/malicious_standalone.jinja",
+    "tests/assets/samples/jinja2/standalone/suspicious_benign.template",
+    "tests/assets/samples/jinja2/yaml/malicious_config.yaml",
+    "tests/assets/samples/jinja2/yaml/model_config.yaml",
 }
 
 LARGE_ASSET_BYTES = 100 * 1024
@@ -60,41 +94,62 @@ def _tracked_under(directory: Path) -> tuple[Path, ...]:
     return tuple(path for path in _tracked_asset_paths() if path.is_relative_to(directory))
 
 
-def test_committed_safetensors_corpus_stays_small_and_intentional() -> None:
-    safetensors_files = tuple(path for path in _tracked_under(SAFETENSORS_DIR) if path.suffix == ".safetensors")
+def _repo_relative(path: Path) -> str:
+    return path.relative_to(REPO_ROOT).as_posix()
 
-    assert {path.name for path in safetensors_files} == EXPECTED_SAFETENSORS_FIXTURES
+
+def _is_bypass_poc_generator(path: Path) -> bool:
+    relative_path = path.relative_to(REPO_ROOT)
+    parts = relative_path.parts
+    if "bypass_pocs" in parts:
+        return True
+    return path.suffix == ".py" and path.name.startswith("gen_bypass")
+
+
+def test_committed_safetensors_corpus_stays_small_and_intentional() -> None:
+    safetensors_files = {
+        _repo_relative(path) for path in _tracked_under(SAFETENSORS_DIR) if path.suffix == ".safetensors"
+    }
+
+    assert safetensors_files == EXPECTED_SAFETENSORS_FIXTURES
     oversized = {
-        path.relative_to(REPO_ROOT).as_posix(): path.stat().st_size
-        for path in safetensors_files
+        _repo_relative(path): path.stat().st_size
+        for path in _tracked_under(SAFETENSORS_DIR)
+        if path.suffix == ".safetensors"
         if path.stat().st_size > MAX_COMMITTED_SAFETENSORS_BYTES
     }
     assert oversized == {}
 
 
 def test_committed_keras_binary_fixtures_match_exercised_corpus() -> None:
-    keras_files = {path.name for path in _tracked_under(KERAS_DIR) if path.suffix.lower() in {".h5", ".hdf5", ".keras"}}
+    keras_files = {
+        _repo_relative(path) for path in _tracked_under(KERAS_DIR) if path.suffix.lower() in {".h5", ".hdf5", ".keras"}
+    }
 
     assert keras_files == EXPECTED_KERAS_BINARY_FIXTURES
 
 
-def test_jinja2_corpus_uses_routed_subdirectories() -> None:
-    root_level_files = sorted(
-        path.relative_to(REPO_ROOT).as_posix() for path in _tracked_under(JINJA2_DIR) if path.parent == JINJA2_DIR
-    )
+def test_jinja2_corpus_matches_routed_inventory() -> None:
+    jinja2_files = {_repo_relative(path) for path in _tracked_under(JINJA2_DIR)}
 
-    assert root_level_files == []
+    assert jinja2_files == EXPECTED_JINJA2_FIXTURES
 
 
 def test_pickle_bypass_poc_generators_are_not_committed() -> None:
-    bypass_poc_files = sorted(path.relative_to(REPO_ROOT).as_posix() for path in _tracked_under(BYPASS_POC_DIR))
+    bypass_poc_files = sorted(_repo_relative(path) for path in _tracked_asset_paths() if _is_bypass_poc_generator(path))
 
     assert bypass_poc_files == []
 
 
+def test_pickle_bypass_poc_guard_matches_removed_artifact_patterns() -> None:
+    assert _is_bypass_poc_generator(REPO_ROOT / "tests/assets/pickles/bypass_pocs/gen_bypass_v4.py")
+    assert _is_bypass_poc_generator(REPO_ROOT / "tests/assets/exploits/gen_bypass_v5.py")
+    assert not _is_bypass_poc_generator(REPO_ROOT / "tests/assets/generators/generate_evil_pickle.py")
+
+
 def test_large_committed_assets_are_allowlisted() -> None:
     large_assets = {
-        path.relative_to(REPO_ROOT).as_posix(): path.stat().st_size
+        _repo_relative(path): path.stat().st_size
         for path in _tracked_asset_paths()
         if path.stat().st_size > LARGE_ASSET_BYTES
     }
