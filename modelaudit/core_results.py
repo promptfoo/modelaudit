@@ -472,6 +472,9 @@ def determine_exit_code(results: ModelAuditResultModel) -> int:
     if results_have_inconclusive_outcome(results):
         return 2
 
+    if results.success is False:
+        return 2
+
     if results.files_scanned == 0:
         return 2
 

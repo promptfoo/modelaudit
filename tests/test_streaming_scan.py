@@ -646,6 +646,37 @@ def test_scan_model_streaming_informational_failed_scan_does_not_set_operational
     assert determine_exit_code(result) == 1
 
 
+def test_scan_model_streaming_bare_failed_scan_fails_closed(
+    temp_test_files: list[Path],
+) -> None:
+    """Streaming dict aggregation should preserve bare failed-scan inconclusive metadata."""
+
+    def file_generator() -> Iterator[tuple[Path, bool]]:
+        yield (temp_test_files[0], True)
+
+    info_result = ScanResult(scanner_name="numpy")
+    info_result.add_issue(
+        "Object-dtype payload contains trailing bytes after the embedded pickle stream",
+        severity=IssueSeverity.INFO,
+        location=str(temp_test_files[0]),
+    )
+    info_result.finish(success=False)
+
+    with patch("modelaudit.core.scan_file", return_value=info_result):
+        result = scan_model_streaming(
+            file_generator=file_generator(),
+            timeout=30,
+            delete_after_scan=False,
+        )
+
+    metadata = result.file_metadata[str(temp_test_files[0])]
+    assert metadata["scan_outcome"] == "inconclusive"
+    assert "scanner_reported_unsuccessful_without_outcome" in metadata["scan_outcome_reasons"]
+    assert result.has_errors is False
+    assert result.success is False
+    assert determine_exit_code(result) == 2
+
+
 def test_scan_model_streaming_operational_info_failure_sets_exit_code_2(
     temp_test_files: list[Path],
 ) -> None:
