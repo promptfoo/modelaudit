@@ -163,6 +163,7 @@ def pytest_runtest_setup(item):
             "test_zip_scanner.py",  # ZIP archive scanner tests
             "test_sevenzip_scanner.py",  # 7-Zip archive scanner tests
             "test_regression_corpus.py",  # malicious/safe fixture regression gate
+            "test_committed_fixture_hygiene.py",  # committed fixture artifact inventory guardrails
             "test_nested_pickle_integration.py",  # nested pickle false-positive/true-positive integration tests
             "test_ml_context_false_positives.py",  # ML-context executable filtering regression tests
             "test_cli_output.py",  # CliRunner JSON parsing helper regression tests
