@@ -39,6 +39,7 @@ This page shows which model formats work in base install and which require optio
 | MXNet                           | `*-symbol.json`, `*-NNNN.params`                                  | Yes (static graph + params checks)                        | None required                                                                                    |
 | Standalone compressed wrappers  | `.gz`, `.bz2`, `.xz`, `.lz4`, `.zlib`                             | Yes (safe bounded decompression + inner scan routing)     | `lz4` package optional only for `.lz4` payload decompression                                     |
 | 7-Zip archives                  | `.7z`                                                             | No                                                        | `modelaudit[sevenzip]` (required)                                                                |
+| RAR archives                    | `.rar`                                                            | Yes (recognized and failed closed as unsupported)         | None                                                                                             |
 | Archives/config/text            | `.zip`, `.tar*`, `.json`, `.yaml`, `.yml`, `.toml`, `.md`, `.txt` | Yes                                                       | None                                                                                             |
 
 ## Notes
@@ -48,5 +49,6 @@ This page shows which model formats work in base install and which require optio
 - R serialized (`.rds/.rda/.rdata`) support is static-only: ModelAudit does not execute R code or evaluate objects in an R runtime.
 - CNTK scanner scope in v1 is `.dnn`/`.cmf`; `.model` remains owned by XGBoost overlap handling.
 - Llamafile wrappers are executable by design: executable presence is reported at `INFO`, and severity escalates only when suspicious runtime indicators or malformed embedded payloads are found.
+- RAR archives are recognized so they do not disappear from directory scans; ModelAudit reports them as unsupported coverage with a non-clean result.
 - `modelaudit doctor --show-failed` shows unavailable scanners and missing dependencies in your environment.
 - If you need predictable CI behavior across many formats, prefer `modelaudit[all]`; ONNX is included on Python 3.10-3.12, and TensorFlow runtime-dependent paths require adding `modelaudit[tensorflow]` on Python 3.11-3.12.

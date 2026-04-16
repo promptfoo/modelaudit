@@ -45,8 +45,7 @@ report = scan_bytes(
 
 ## Native Scanner
 
-The wheel includes a native Rust scanner for pickle payload analysis. Maintainer
-migration notes and failure-mode details live in the repository maintainer docs.
+The wheel includes a native Rust scanner for pickle payload analysis.
 Nested pickle payload analysis is capped by byte budget and depth; the default
 depth is 2 so common double-wrapped encoded pickle payloads are inspected while
 recursive or adversarial nesting stays bounded.

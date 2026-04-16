@@ -70,7 +70,7 @@ Optional controls:
 
 - `--max-size` to enforce artifact size boundaries
 - `--timeout` for deterministic runtime limits
-- `--stream` when scanning very large local directories with constrained disk
+- `--stream` to process large local directories one file at a time while preserving the source files
 
 ## 6. Operational checklist
 

@@ -29,8 +29,9 @@ ModelAudit performs static analysis on model files before they are loaded into a
 | HuggingFace Hub / S3 / GCS downloads | Untrusted             | Supply chain risk; provenance is caller's responsibility                              |
 | ModelAudit process itself            | Trusted               | Runs with the invoking user's privileges                                              |
 | ModelAudit dependencies              | Conditionally trusted | Monitored via PR CI audit, GitHub dependency alerts, Renovate security PRs, and Trivy |
+| Telemetry endpoint                   | External service      | Receives sanitized usage events unless telemetry is disabled                          |
 
-The scanning engine makes no outbound network requests. The CLI may download model files from remote sources (e.g., HuggingFace Hub) before invoking the scanner.
+The core scanners do not upload model contents. The CLI may download model files from remote sources (for example Hugging Face Hub, S3, GCS, MLflow, JFrog, or DVC remotes) before invoking scanners, and telemetry may submit sanitized command and scan metadata unless disabled.
 
 ---
 
@@ -42,7 +43,7 @@ The scanning engine makes no outbound network requests. The CLI may download mod
 
 **Compression bombs.** Highly compressed archives could exhaust memory or disk during size-ratio checks. ModelAudit enforces documented limits based on the >100x ratio threshold.
 
-**Evasion of detection patterns.** Attackers can obfuscate malicious payloads using encoding, polymorphism, or novel pickle opcode sequences not yet covered by detection rules. Static patterns have inherent coverage gaps.
+**Evasion of detection patterns.** Attackers can obfuscate malicious payloads using encoding, polymorphism, or novel pickle opcode sequences outside the implemented detection rules. Static patterns have inherent coverage gaps.
 
 **Supply chain attacks on ModelAudit's own dependencies.** A compromised version of a dependency (e.g., `defusedxml`, `numpy`, `onnx`) could undermine scanner integrity or introduce vulnerabilities during parsing.
 
@@ -78,7 +79,7 @@ The scanning engine makes no outbound network requests. The CLI may download mod
 
 ## Accepted Risks
 
-**False negatives for novel attack patterns.** Detection rules are based on documented CVEs and known exploits. A new attack technique not yet in detection patterns will pass scanning. Users should not treat a clean scan as a guarantee of safety.
+**False negatives for novel attack patterns.** Detection rules are based on documented CVEs and known exploits. An attack technique outside the implemented detection patterns can pass scanning. Users should not treat a clean scan as a guarantee of safety.
 
 **Parser bugs in binary format readers.** ModelAudit parses GGUF, pickle, and protobuf using custom or third-party code. Bugs in these parsers could cause incorrect results or, in extreme cases, crashes. Fuzzing coverage is incomplete.
 

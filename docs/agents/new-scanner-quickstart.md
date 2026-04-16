@@ -9,7 +9,7 @@ Use this checklist to add a new scanner safely and consistently.
 - Decide whether dependencies are optional and how scanner behavior degrades when missing.
 
 References: `docs/agents/architecture.md` and
-`docs/maintainers/scanner-cve-gap-analysis.md`
+`docs/maintainers/scanner-cve-coverage.md`
 
 ## 2. Implement scanner class
 

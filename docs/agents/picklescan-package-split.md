@@ -65,8 +65,8 @@ report = scanner.scan_stream(stream, source="archive.pt:data.pkl", size=pickle_s
 Resource controls include opcode and wall-clock limits, post-budget tail bytes,
 string-literal scan characters, nested-pickle bytes, and nested scan depth.
 
-The standalone package now uses the native Rust extension directly. The deleted
-package-engine selector and compare runtime are no longer part of the API.
+The standalone package uses the native Rust extension directly. Engine selection
+and compare runtimes are not part of the public API.
 
 Report semantics keep these concepts separate:
 
@@ -78,7 +78,7 @@ Report semantics keep these concepts separate:
 - report mappings are read-only after construction; call `to_dict()` for mutable
   serialized data
 
-## Current Integration
+## Integration
 
 - `modelaudit.scanners.pickle_scanner.PickleScanner` treats the standalone Rust
   package report as the pickle result and only adds ModelAudit wrapper concerns
@@ -91,9 +91,6 @@ Report semantics keep these concepts separate:
   distribution. Root wheel smoke tests install the local standalone wheel via
   `--find-links` so the unpublished dependency is exercised exactly as an
   installed package.
-- For the scoped Rust rewrite plan, parity gates, packaging decisions, and
-  benchmark methodology, see
-  `docs/maintainers/picklescan-rust-rewrite-plan.md`.
 
 ## Validation
 
@@ -128,8 +125,8 @@ uvx twine check /tmp/modelaudit-picklescan-dist/*
 - Detection logic must not weaken at the package boundary.
 - Each moved detector or routing rule has malicious-positive and benign-negative
   regression coverage.
-- Legacy and standalone rule identifiers may differ, but the safety decision
-  and scan-completeness contract must stay aligned.
+- ModelAudit-compatible and standalone rule identifiers may differ, but the
+  safety decision and scan-completeness contract must stay aligned.
 - Inconclusive analysis is represented as first-class status/metadata, not as a
   hidden success boolean.
 - Per-scan state stays isolated so one scan cannot leak source/location context

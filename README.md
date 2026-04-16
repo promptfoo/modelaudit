@@ -50,7 +50,7 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 
 ## Supported Formats
 
-ModelAudit includes specialized scanners covering model, archive, and configuration formats:
+ModelAudit includes 44 registered scanners covering model, archive, and configuration formats:
 
 | Format                  | Extensions                                                                | Risk   |
 | ----------------------- | ------------------------------------------------------------------------- | ------ |
@@ -85,7 +85,7 @@ ModelAudit includes specialized scanners covering model, archive, and configurat
 | **PMML**                | `.pmml`                                                                   | LOW    |
 | **Compressed Wrappers** | `.gz`, `.bz2`, `.xz`, `.lz4`, `.zlib`                                     | MEDIUM |
 
-Plus scanners for ZIP, TAR, 7-Zip, OCI layers, Jinja2 templates, JSON/YAML metadata, manifests, and text files.
+Plus scanners for ZIP, TAR, 7-Zip, OCI layers, Jinja2 templates, JSON/YAML metadata, manifests, model cards, text files, and RAR recognition. RAR archives are reported as unsupported/fail-closed instead of being skipped.
 
 [View complete format documentation](https://www.promptfoo.dev/docs/model-audit/scanners/)
 
@@ -126,10 +126,10 @@ modelaudit model.dvc
 ## Installation
 
 ```bash
-# Broad scanner coverage (recommended; excludes the TensorFlow runtime)
+# Broad scanner coverage (recommended; excludes the TensorFlow runtime and platform-specific TensorRT)
 pip install "modelaudit[all]"
 
-# Core only (pickle, numpy, archives)
+# Core only (static scanners, pickle, NumPy, archives, manifests, metadata)
 pip install modelaudit
 
 # Specific frameworks (TensorFlow installs on Python 3.11-3.12; ONNX installs on Python 3.10-3.12)
@@ -145,7 +145,7 @@ pip install "modelaudit[all,tensorflow]"
 docker run --rm -v "$(pwd)":/app ghcr.io/promptfoo/modelaudit:latest model.pkl
 ```
 
-The ONNX runtime extra, including the ONNX portion of `modelaudit[all]`, is packaged for Python 3.10-3.12 in this release.
+The ONNX extra, including the ONNX portion of `modelaudit[all]`, is packaged for Python 3.10-3.12.
 
 ## CLI Options
 
@@ -167,7 +167,7 @@ Common scan options:
 --output FILE                Write results to file
 --strict                     Fail on warnings, scan all file types, strict license validation
 --sbom FILE                  Generate CycloneDX SBOM
---stream                     Download, scan, and delete files one-by-one (saves disk)
+--stream                     Process files one-by-one; remote downloads are deleted after scanning
 --max-size SIZE              Size limit (e.g., 10GB)
 --timeout SECONDS            Override scan timeout
 --dry-run                    Preview what would be scanned

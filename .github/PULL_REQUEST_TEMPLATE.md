@@ -6,7 +6,7 @@ Describe the change and user impact.
 
 - [ ] `uv run ruff format --check modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/`
 - [ ] `uv run ruff check modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/`
-- [ ] `uv run mypy modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests`
+- [ ] `uv run mypy modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/`
 - [ ] `uv run pytest -n auto -m "not slow and not integration" --maxfail=1`
 
 ## Checklist
