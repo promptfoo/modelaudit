@@ -17,6 +17,13 @@ from modelaudit.integrations.license_checker import (
 )
 from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
 from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
+from modelaudit.scanner_selection import (
+    add_scanner_selection_skip_check,
+    make_scanner_selection_skip_result,
+    normalize_scanner_selection_config,
+    policy_from_config,
+    selected_scanner_extensions,
+)
 from modelaudit.scanners import _registry
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
@@ -318,11 +325,16 @@ def scan_model_directory_or_file(
         "strict_license": strict_license,
         **kwargs,
     }
+    config = normalize_scanner_selection_config(config)
+    scanner_selection = policy_from_config(config)
+    scanner_selection_extensions = selected_scanner_extensions(scanner_selection) if scanner_selection.active else None
+    if scanner_selection.active:
+        results.scanner_selection = scanner_selection.to_metadata()
 
     validate_scan_config(config)
 
     # Check if metadata scanner is available once (optimization - avoids loading scanner)
-    metadata_scanner_available = _registry.has_scanner_class("MetadataScanner")
+    metadata_scanner_available = scanner_selection.allows("metadata") and _registry.has_scanner_class("MetadataScanner")
 
     try:
         # Handle streaming paths
@@ -432,7 +444,9 @@ def scan_model_directory_or_file(
                     # Skip non-model files early if filtering is enabled
                     # Note: skip_file_types parameter already contains the correct value
                     if skip_file_types and should_skip_file(
-                        file_path, metadata_scanner_available=metadata_scanner_available
+                        file_path,
+                        metadata_scanner_available=metadata_scanner_available,
+                        scanner_selection_extensions=scanner_selection_extensions,
                     ):
                         filename_lower = Path(file_path).name.lower()
                         if filename_lower in LICENSE_FILES:
@@ -852,7 +866,7 @@ def scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     Returns:
         ScanResult object with the scan results
     """
-    config = {} if config is None else dict(config)
+    config = normalize_scanner_selection_config({} if config is None else dict(config))
     config.setdefault(NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_file)
     validate_scan_config(config)
 
@@ -873,6 +887,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     """
     if config is None:
         config = {}
+    config = normalize_scanner_selection_config(config)
+    scanner_selection = policy_from_config(config)
     validate_scan_config(config)
 
     # Skip HuggingFace cache files to reduce noise
@@ -1000,8 +1016,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     # Prefer scanners based on trusted structure rather than the filename alone.
     preferred_scanner: type[BaseScanner] | None = None
     scanner_id = _select_preferred_scanner_id(path, header_format, ext)
-    if scanner_id:
+    skipped_preferred_scanner_id: str | None = None
+    if scanner_id and scanner_selection.allows(scanner_id):
         preferred_scanner = _registry.load_scanner_by_id(scanner_id)
+    elif scanner_id:
+        skipped_preferred_scanner_id = scanner_id
 
     result: ScanResult | None
 
@@ -1062,7 +1081,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             result.finish(success=False)
     else:
         # Use registry's lazy loading method to avoid loading all scanners
-        scanner_class = _registry.get_scanner_for_path(path)
+        scanner_class = _registry.get_scanner_for_path(
+            path,
+            scanner_selection=scanner_selection if scanner_selection.active else None,
+        )
         if scanner_class:
             logger.debug(f"Using {scanner_class.name} scanner for {path}")
             scanner = scanner_class(config=config)
@@ -1100,7 +1122,30 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 )
                 _mark_operational_scan_error(result, "scan_timeout")
                 result.finish(success=False)
+            if skipped_preferred_scanner_id and result is not None:
+                add_scanner_selection_skip_check(
+                    result,
+                    path,
+                    skipped_preferred_scanner_id,
+                    scanner_selection,
+                    context="preferred scanner",
+                )
         else:
+            if scanner_selection.active:
+                candidate_scanner_id = skipped_preferred_scanner_id
+                if candidate_scanner_id is None:
+                    candidate_scanner_class = _registry.get_scanner_for_path(path)
+                    if candidate_scanner_class:
+                        candidate_scanner_id = (
+                            _registry._get_scanner_id_for_class(candidate_scanner_class.__name__)
+                            or candidate_scanner_class.name
+                        )
+                if candidate_scanner_id and not scanner_selection.allows(candidate_scanner_id):
+                    result = make_scanner_selection_skip_result(path, candidate_scanner_id, scanner_selection)
+                    if result.bytes_scanned == 0 and file_size > 0:
+                        result.bytes_scanned = file_size
+                    return result
+
             format_ = header_format
             sr = ScanResult(scanner_name="unknown")
             if format_ == "unknown":
@@ -1184,7 +1229,14 @@ def scan_model_streaming(
     file_hashes: list[str] = []
     files_processed = 0
     skip_file_types: bool = bool(kwargs.get("skip_file_types", False))
-    metadata_scanner_available: bool = _registry.has_scanner_class("MetadataScanner")
+    scan_kwargs = normalize_scanner_selection_config(kwargs)
+    scanner_selection = policy_from_config(scan_kwargs)
+    scanner_selection_extensions = selected_scanner_extensions(scanner_selection) if scanner_selection.active else None
+    if scanner_selection.active:
+        results.scanner_selection = scanner_selection.to_metadata()
+    metadata_scanner_available: bool = scanner_selection.allows("metadata") and _registry.has_scanner_class(
+        "MetadataScanner"
+    )
 
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
@@ -1225,6 +1277,7 @@ def scan_model_streaming(
                 if skip_file_types and should_skip_file(
                     str(source_path),
                     metadata_scanner_available=metadata_scanner_available,
+                    scanner_selection_extensions=scanner_selection_extensions,
                 ):
                     filename_lower = source_path.name.lower()
                     if filename_lower in LICENSE_FILES:
@@ -1254,7 +1307,7 @@ def scan_model_streaming(
                 # Build config dict for scan_file
                 scan_config = {
                     "timeout": timeout - int(time.time() - start_time),
-                    **kwargs,
+                    **scan_kwargs,
                 }
 
                 scan_result = scan_file(

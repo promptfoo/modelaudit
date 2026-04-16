@@ -5,6 +5,7 @@ import tempfile
 import zipfile
 from typing import Any, BinaryIO, ClassVar, cast
 
+from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from ..utils import sanitize_archive_path
 from ..utils.file.detection import (
     _is_executorch_binary_signature,
@@ -27,7 +28,8 @@ class ExecuTorchScanner(BaseScanner):
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
-        self.pickle_scanner = PickleScanner(config=self.config)
+        self.scanner_selection = policy_from_config(self.config)
+        self.pickle_scanner = PickleScanner(config=self.config) if self.scanner_selection.allows("pickle") else None
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -122,6 +124,16 @@ class ExecuTorchScanner(BaseScanner):
                 for name in pickle_files:
                     member_info = z.getinfo(name)
                     bytes_scanned += member_info.file_size
+                    if self.pickle_scanner is None:
+                        add_scanner_selection_skip_check(
+                            result,
+                            f"{path}:{name}",
+                            "pickle",
+                            self.scanner_selection,
+                            context="embedded ExecuTorch pickle analysis",
+                        )
+                        continue
+
                     with z.open(name, "r") as file_like:
                         sub_result = self.pickle_scanner.scan_stream(
                             cast(BinaryIO, file_like),
