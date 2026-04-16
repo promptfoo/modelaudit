@@ -16,6 +16,7 @@ try:
 except ImportError:
     HAS_YAML = False
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.nemo_scanner import NemoScanner, _get_nested_scanner_for_file
@@ -846,6 +847,31 @@ class TestCVE202523304HydraTarget:
         assert len(size_checks) == 1
         assert size_checks[0].status == CheckStatus.FAILED
         assert size_checks[0].severity == IssueSeverity.WARNING
+        assert size_checks[0].message == (f"Config file too large: model_config.yaml ({len(oversized_config)} bytes)")
+        assert size_checks[0].details["scan_outcome_reason"] == "nemo_config_size_limit"
+        assert size_checks[0].details["max_config_size"] == NemoScanner.MAX_CONFIG_SIZE
+        assert result.success is True
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_config_size_limit" in result.metadata["scan_outcome_reasons"]
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            metadata = aggregate.file_metadata[str(path)]
+
+            assert aggregate.success is True
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert metadata["scan_outcome_reasons"] == ["nemo_config_size_limit"]
+            assert determine_exit_code(aggregate) == 1
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
 
     def test_safe_nemo_target_passes(self, tmp_path):
         """Known-safe NeMo/PyTorch targets should pass."""

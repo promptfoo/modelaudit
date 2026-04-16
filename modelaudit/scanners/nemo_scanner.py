@@ -231,6 +231,7 @@ class NemoScanner(BaseScanner):
         message: str,
         location: str,
         details: dict[str, Any] | None = None,
+        severity: IssueSeverity = IssueSeverity.INFO,
     ) -> None:
         reasons = result.metadata.get(_INCONCLUSIVE_REASONS_METADATA_KEY)
         if not isinstance(reasons, list):
@@ -244,7 +245,7 @@ class NemoScanner(BaseScanner):
             name=check_name,
             passed=False,
             message=message,
-            severity=IssueSeverity.INFO,
+            severity=severity,
             location=location,
             details={"scan_outcome_reason": reason, **(details or {})},
         )
@@ -353,12 +354,18 @@ class NemoScanner(BaseScanner):
                 if name_lower.endswith((".yaml", ".yml")):
                     yaml_config_files_found += 1
                     if member.size > self.MAX_CONFIG_SIZE:
-                        result.add_check(
-                            name="NeMo Config Size Check",
-                            passed=False,
+                        self._mark_inconclusive_scan_result(
+                            result,
+                            reason="nemo_config_size_limit",
+                            check_name="NeMo Config Size Check",
                             message=(f"Config file too large: {member.name} ({member.size} bytes)"),
-                            severity=IssueSeverity.WARNING,
                             location=f"{path}:{member.name}",
+                            severity=IssueSeverity.WARNING,
+                            details={
+                                "config_file": member.name,
+                                "size_bytes": member.size,
+                                "max_config_size": self.MAX_CONFIG_SIZE,
+                            },
                         )
                         continue
 
@@ -369,12 +376,18 @@ class NemoScanner(BaseScanner):
                         try:
                             raw = f.read(self.MAX_CONFIG_SIZE + 1)
                             if len(raw) > self.MAX_CONFIG_SIZE:
-                                result.add_check(
-                                    name="NeMo Config Size Check",
-                                    passed=False,
+                                self._mark_inconclusive_scan_result(
+                                    result,
+                                    reason="nemo_config_size_limit",
+                                    check_name="NeMo Config Size Check",
                                     message=(f"Config file too large: {member.name} ({len(raw)} bytes)"),
-                                    severity=IssueSeverity.WARNING,
                                     location=f"{path}:{member.name}",
+                                    severity=IssueSeverity.WARNING,
+                                    details={
+                                        "config_file": member.name,
+                                        "size_bytes": len(raw),
+                                        "max_config_size": self.MAX_CONFIG_SIZE,
+                                    },
                                 )
                                 continue
                             config = yaml.safe_load(raw)

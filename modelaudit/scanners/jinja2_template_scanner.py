@@ -59,6 +59,7 @@ except ImportError:
 _INCONCLUSIVE_METADATA_KEY = "scan_outcome"
 _INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
 _JINJA_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
+_JINJA_TEMPLATE_INDICATOR_BYTES = tuple(indicator.encode("utf-8") for indicator in _JINJA_TEMPLATE_INDICATORS)
 _RAW_PARSE_FALLBACK_CONTEXT_BYTES = 1024
 _RAW_PARSE_FALLBACK_MAX_WINDOWS = 8
 _RAW_PARSE_FALLBACK_READ_BYTES = 256 * 1024
@@ -509,26 +510,56 @@ class Jinja2TemplateScanner(BaseScanner):
         }
 
     def _extract_raw_template_fallback(self, path: str, templates: dict[str, str], template_key: str) -> None:
-        try:
-            with open(path, "rb") as f:
-                raw = f.read(_RAW_PARSE_FALLBACK_READ_BYTES)
-        except OSError as exc:
-            logger.debug("Error reading raw template fallback from %s: %s", path, exc)
-            return
-
-        text = raw.decode("utf-8", errors="replace")
-        for index, fallback_text in enumerate(self._raw_template_fallback_windows(text)):
+        for index, fallback_text in enumerate(self._raw_template_fallback_windows_from_file(path)):
             fallback_key = template_key if index == 0 else f"{template_key}_{index + 1}"
             templates[fallback_key] = fallback_text
+
+    def _raw_template_fallback_windows_from_file(self, path: str) -> list[str]:
+        try:
+            file_size = os.path.getsize(path)
+        except OSError as exc:
+            logger.debug("Error sizing raw template fallback from %s: %s", path, exc)
+            return []
+
+        if file_size <= 0:
+            return []
+
+        window_size = self._raw_template_fallback_window_size(file_size)
+        marker_offsets = self._template_marker_offsets_from_file(path, file_size, window_size)
+        if not marker_offsets:
+            return []
+
+        windows: list[tuple[int, int]] = []
+        for marker_offset in marker_offsets:
+            if any(start <= marker_offset < end for start, end in windows):
+                continue
+
+            start = max(0, marker_offset - _RAW_PARSE_FALLBACK_CONTEXT_BYTES)
+            end = min(file_size, start + window_size)
+            start = max(0, end - window_size)
+            windows.append((start, end))
+
+            if len(windows) >= _RAW_PARSE_FALLBACK_MAX_WINDOWS:
+                break
+
+        fallback_windows: list[str] = []
+        try:
+            with open(path, "rb") as f:
+                for start, end in windows:
+                    f.seek(start)
+                    raw = f.read(end - start)
+                    fallback_windows.append(raw.decode("utf-8", errors="replace"))
+        except OSError as exc:
+            logger.debug("Error reading raw template fallback from %s: %s", path, exc)
+            return []
+
+        return fallback_windows
 
     def _raw_template_fallback_windows(self, text: str) -> list[str]:
         if not self._looks_like_template(text):
             return []
 
-        configured_window_size = self.max_template_size
-        if not isinstance(configured_window_size, int) or configured_window_size <= 0:
-            configured_window_size = _RAW_PARSE_FALLBACK_READ_BYTES
-        window_size = min(configured_window_size, _RAW_PARSE_FALLBACK_READ_BYTES, len(text))
+        window_size = self._raw_template_fallback_window_size(len(text))
 
         if len(text) <= window_size:
             return [text]
@@ -548,6 +579,9 @@ class Jinja2TemplateScanner(BaseScanner):
 
         return [text[start:end] for start, end in windows]
 
+    def _raw_template_fallback_window_size(self, content_size: int) -> int:
+        return self._raw_template_fallback_window_size_for_config(content_size, self.max_template_size)
+
     @staticmethod
     def _template_marker_offsets(text: str) -> list[int]:
         offsets: set[int] = set()
@@ -558,6 +592,77 @@ class Jinja2TemplateScanner(BaseScanner):
                 marker_offset = text.find(indicator, marker_offset + len(indicator))
 
         return sorted(offsets)
+
+    @staticmethod
+    def _template_marker_offsets_from_file(path: str, file_size: int, window_size: int) -> list[int]:
+        offsets: set[int] = set()
+        windows: list[tuple[int, int]] = []
+        max_indicator_size = max(len(indicator) for indicator in _JINJA_TEMPLATE_INDICATOR_BYTES)
+        overlap_size = max_indicator_size - 1
+        overlap = b""
+        chunk_start = 0
+
+        try:
+            with open(path, "rb") as f:
+                while len(windows) < _RAW_PARSE_FALLBACK_MAX_WINDOWS:
+                    chunk = f.read(_RAW_PARSE_FALLBACK_READ_BYTES)
+                    if not chunk:
+                        break
+
+                    data_start = max(0, chunk_start - len(overlap))
+                    data = overlap + chunk
+                    chunk_offsets: set[int] = set()
+                    for indicator in _JINJA_TEMPLATE_INDICATOR_BYTES:
+                        marker_offset = data.find(indicator)
+                        while marker_offset != -1:
+                            absolute_offset = data_start + marker_offset
+                            if absolute_offset not in offsets:
+                                chunk_offsets.add(absolute_offset)
+                            marker_offset = data.find(indicator, marker_offset + len(indicator))
+
+                    for absolute_offset in sorted(chunk_offsets):
+                        if Jinja2TemplateScanner._add_fallback_window_for_marker(
+                            windows,
+                            absolute_offset,
+                            file_size,
+                            window_size,
+                        ):
+                            offsets.add(absolute_offset)
+                            if len(windows) >= _RAW_PARSE_FALLBACK_MAX_WINDOWS:
+                                break
+
+                    overlap = data[-overlap_size:] if overlap_size else b""
+                    chunk_start += len(chunk)
+        except OSError as exc:
+            logger.debug("Error searching raw template fallback markers in %s: %s", path, exc)
+            return []
+
+        return sorted(offsets)
+
+    @staticmethod
+    def _raw_template_fallback_window_size_for_config(content_size: int, configured_window_size: Any) -> int:
+        if not isinstance(configured_window_size, int) or configured_window_size <= 0:
+            configured_window_size = _RAW_PARSE_FALLBACK_READ_BYTES
+        return min(configured_window_size, _RAW_PARSE_FALLBACK_READ_BYTES, content_size)
+
+    @staticmethod
+    def _fallback_window_for_marker(marker_offset: int, content_size: int, window_size: int) -> tuple[int, int]:
+        start = max(0, marker_offset - _RAW_PARSE_FALLBACK_CONTEXT_BYTES)
+        end = min(content_size, start + window_size)
+        start = max(0, end - window_size)
+        return start, end
+
+    @staticmethod
+    def _add_fallback_window_for_marker(
+        windows: list[tuple[int, int]],
+        marker_offset: int,
+        content_size: int,
+        window_size: int,
+    ) -> bool:
+        if any(start <= marker_offset < end for start, end in windows):
+            return False
+        windows.append(Jinja2TemplateScanner._fallback_window_for_marker(marker_offset, content_size, window_size))
+        return True
 
     def _extract_template_file(self, path: str) -> dict[str, str]:
         """Extract content from standalone template files"""
