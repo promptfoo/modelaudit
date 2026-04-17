@@ -863,6 +863,47 @@ def test_scan_file_does_not_route_benign_storage_blob_as_hidden_pickle(tmp_path:
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
 
 
+def test_scan_file_marks_hidden_pytorch_zip_probe_failure_inconclusive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/payload", b"maybe hidden")
+
+    original_open = zipfile.ZipFile.open
+
+    def fail_hidden_probe_open(
+        archive: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        mode: str = "r",
+        pwd: bytes | None = None,
+        *,
+        force_zip64: bool = False,
+    ) -> object:
+        member_name = name.filename if isinstance(name, zipfile.ZipInfo) else name
+        if member_name == "archive/payload":
+            raise NotImplementedError("unsupported compression method")
+        return original_open(archive, name, mode=mode, pwd=pwd, force_zip64=force_zip64)
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", fail_hidden_probe_open)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.errors == ()
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    probe_notices = [notice for notice in report.notices if notice.code == "pytorch_zip_member_probe_failed"]
+    assert len(probe_notices) == 1
+    assert probe_notices[0].location == f"{archive_path}:archive/payload"
+    assert probe_notices[0].details["analysis_incomplete"] is True
+    assert probe_notices[0].details["exception_type"] == "NotImplementedError"
+
+
 def test_scan_file_detects_malicious_pytorch_zip_data_pickle(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     with zipfile.ZipFile(archive_path, "w") as archive:

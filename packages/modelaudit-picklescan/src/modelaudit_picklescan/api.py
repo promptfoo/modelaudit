@@ -188,7 +188,7 @@ class PickleScanner:
             if not _is_pytorch_zip_archive(entries):
                 return None
 
-            pickle_entries = _discover_pytorch_zip_pickle_entries(archive, entries)
+            pickle_entries, discovery_notices = _discover_pytorch_zip_pickle_entries(archive, entries, source=source)
             if not pickle_entries:
                 return _pytorch_zip_notice_report(
                     source=source,
@@ -199,7 +199,7 @@ class PickleScanner:
                 )
 
             reports: list[PickleReport] = []
-            skipped_notices: list[Notice] = []
+            skipped_notices: list[Notice] = list(discovery_notices)
             for entry in pickle_entries:
                 member_name = entry.filename
                 member_source = f"{source}:{member_name}"
@@ -360,8 +360,11 @@ def _is_pytorch_zip_archive(entries: list[zipfile.ZipInfo]) -> bool:
 def _discover_pytorch_zip_pickle_entries(
     archive: zipfile.ZipFile,
     entries: list[zipfile.ZipInfo],
-) -> list[zipfile.ZipInfo]:
+    *,
+    source: str,
+) -> tuple[list[zipfile.ZipInfo], tuple[Notice, ...]]:
     pickle_entries: list[zipfile.ZipInfo] = []
+    notices: list[Notice] = []
     seen_entries: set[int] = set()
 
     def add_entry(entry: zipfile.ZipInfo) -> None:
@@ -382,10 +385,13 @@ def _discover_pytorch_zip_pickle_entries(
     for entry in entries:
         if entry.is_dir() or id(entry) in seen_entries:
             continue
-        if _zip_entry_looks_like_pickle(archive, entry):
-            add_entry(entry)
+        try:
+            if _zip_entry_looks_like_pickle(archive, entry):
+                add_entry(entry)
+        except Exception as error:
+            notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
 
-    return pickle_entries
+    return pickle_entries, tuple(notices)
 
 
 def _zip_entry_looks_like_pickle(archive: zipfile.ZipFile, entry: zipfile.ZipInfo) -> bool:
@@ -485,6 +491,21 @@ def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool) -> 
 def _is_data_pickle_member(name: str) -> bool:
     normalized = name.replace("\\", "/").lower()
     return normalized == "data.pkl" or normalized.endswith("/data.pkl")
+
+
+def _pytorch_zip_member_probe_notice(*, source: str, entry: zipfile.ZipInfo, error: Exception) -> Notice:
+    return Notice(
+        message=f"Could not inspect PyTorch ZIP member for hidden pickle payloads: {error!s}",
+        severity=Severity.INFO,
+        location=f"{source}:{entry.filename}",
+        code="pytorch_zip_member_probe_failed",
+        details={
+            "member_name": entry.filename,
+            "member_size": entry.file_size,
+            "exception_type": type(error).__name__,
+            "analysis_incomplete": True,
+        },
+    )
 
 
 def _pytorch_zip_notice_report(
