@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **security:** bound PyTorch ZIP JIT/network member reads and mark oversized or unreadable member coverage inconclusive.
+- **security:** bound PyTorch ZIP JIT/network member reads (default 32 MiB per-member cap, configurable via `max_jit_scan_member_bytes`) and mark oversized or unreadable member coverage inconclusive. Oversize and read-failure events are aggregated into a single summary INFO check per kind (with per-member detail in `details["entries"]`) so adversarial archives cannot flood the checks list, duplicate-name entries are de-duplicated by `ZipInfo` identity rather than filename so the second of two same-name members is still analyzed, directory entries are skipped explicitly, and pickle members already handled by the pickle scanner are not re-scanned.
 - **pickle:** restore ModelAudit nested-pickle findings from Rust standalone notices and keep network raw-detector coverage after native pickle findings
 - **telemetry:** strip query strings, fragments, and URL userinfo from cloud model names and file-extension metadata
 - preserve `S999` unknown-opcode mapping in generic rule fallback

@@ -524,8 +524,15 @@ def test_pytorch_zip_jit_scan_size_limit_marks_inconclusive(tmp_path: Path) -> N
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "pytorch_zip_jit_member_size_limit" in result.metadata["scan_outcome_reasons"]
     size_checks = [check for check in result.checks if check.name == "JIT/Network Scan Size Limit"]
-    assert len(size_checks) >= 1
-    assert all(check.severity == IssueSeverity.INFO for check in size_checks)
+    # Aggregation: many oversize members should surface as a single summary
+    # check with a `details["zip_entries"]` list, not one INFO per member.
+    assert len(size_checks) == 1
+    assert size_checks[0].severity == IssueSeverity.INFO
+    assert "archive/code/debug/source.py" in size_checks[0].details["zip_entries"]
+    assert "archive/byteorder" in size_checks[0].details["zip_entries"]
+    assert size_checks[0].details["skipped_count"] == len(size_checks[0].details["zip_entries"])
+    assert size_checks[0].details["analysis_incomplete"] is True
+    assert size_checks[0].details["max_scan_bytes"] == 4
 
 
 def test_pytorch_zip_jit_scan_read_failure_marks_inconclusive(
@@ -562,8 +569,39 @@ def test_pytorch_zip_jit_scan_read_failure_marks_inconclusive(
     assert result.metadata["analysis_incomplete"] is True
     assert "pytorch_zip_jit_member_read_failed" in result.metadata["scan_outcome_reasons"]
     read_failure_checks = [check for check in result.checks if check.name == "JIT/Network Scan Read Failure"]
+    # Aggregation: per-member exception details live under `details["entries"]`
+    # so even a flood of unreadable members surfaces as a single summary.
     assert len(read_failure_checks) == 1
-    assert read_failure_checks[0].details["exception_type"] == "OSError"
+    details = read_failure_checks[0].details
+    assert details["failed_count"] == 1
+    assert details["zip_entries"] == ["archive/code/debug/source.py"]
+    assert details["entries"][0]["exception_type"] == "OSError"
+    assert details["entries"][0]["exception"] == "member read failed"
+
+
+def test_pytorch_zip_jit_scan_aggregates_many_oversize_members_into_one_check(
+    tmp_path: Path,
+) -> None:
+    """Adversarial archives with many oversize members must not flood the checks list."""
+    model_path = tmp_path / "many_large_jit_members.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        for index in range(25):
+            zip_file.writestr(f"archive/code/debug/src{index}.py", b"print('hello world ')\n")
+
+    result = PyTorchZipScanner(config={"max_jit_scan_member_bytes": 4}).scan(str(model_path))
+
+    size_checks = [check for check in result.checks if check.name == "JIT/Network Scan Size Limit"]
+    assert len(size_checks) == 1
+    entries = size_checks[0].details["zip_entries"]
+    assert len(entries) == 26  # 25 generated sources + byteorder (version is 2 bytes, under the cap)
+    assert size_checks[0].details["skipped_count"] == 26
+    assert all(entry["file_size"] > 4 for entry in size_checks[0].details["entries"])
+    # `scan_outcome_reasons` must be deduplicated even though many members tripped it.
+    reasons = result.metadata.get("scan_outcome_reasons", [])
+    assert reasons.count("pytorch_zip_jit_member_size_limit") == 1
 
 
 def test_pytorch_zip_jit_size_limit_respects_disabled_checks(tmp_path: Path) -> None:
