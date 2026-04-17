@@ -154,6 +154,7 @@ Primary commands:
 ```bash
 modelaudit [PATHS...]                           # Default scan command
 modelaudit scan [OPTIONS] PATHS...              # Explicit scan command
+modelaudit scan --list-scanners                 # List scanner IDs for targeted scans
 modelaudit metadata [OPTIONS] PATH              # Extract model metadata safely (no deserialization by default)
 modelaudit doctor [--show-failed]               # Diagnose scanner/dependency availability
 modelaudit debug [--json] [--verbose]           # Environment and configuration diagnostics
@@ -176,7 +177,32 @@ Common scan options:
 --no-cache                   Disable result caching
 --cache-dir DIR              Set cache directory for downloads and scan results
 --progress                   Force progress display
+--scanners LIST              Only run selected scanners (IDs/classes; comma-separated or repeated)
+--exclude-scanner NAME       Exclude a scanner from the active set (comma-separated or repeated)
+--list-scanners              List scanner IDs, class names, extensions, and dependencies
 ```
+
+Targeted scanner selection:
+
+```bash
+# Discover scanner IDs and class names
+modelaudit scan --list-scanners
+modelaudit scan --list-scanners --format json
+
+# Run only selected scanners
+modelaudit scan ./models --scanners pickle,tf_savedmodel
+modelaudit scan ./model.pkl --scanners PickleScanner
+
+# Run the default scanner set except a noisy or slow scanner
+modelaudit scan ./models --exclude-scanner weight_distribution
+
+# For container formats, include both the container scanner and nested scanner
+modelaudit scan ./archive.zip --scanners zip,pickle
+```
+
+`--scanners` starts from an explicit allowlist. `--exclude-scanner` subtracts scanners from either that allowlist or the default scanner set. Scanner selection is reflected in JSON output under `scanner_selection`.
+
+For remote folders, ModelAudit narrows downloads by selected scanner extensions when safe, and keeps filtering conservative for container or header-routed scanners to avoid dropping extension-spoofed artifacts before scanning.
 
 ## Metadata Extraction
 
@@ -250,6 +276,7 @@ modelaudit model.pkl --format sarif --output results.sarif
 - **[Support policy](https://github.com/promptfoo/modelaudit/blob/main/SUPPORT.md)** — supported Python/OS versions and maintenance policy
 - **[Security model and limitations](https://github.com/promptfoo/modelaudit/blob/main/docs/user/security-model.md)** — what ModelAudit does and does not guarantee
 - **[Compatibility matrix](https://github.com/promptfoo/modelaudit/blob/main/docs/user/compatibility-matrix.md)** — file formats vs optional dependencies
+- **[Scanner selection](https://github.com/promptfoo/modelaudit/blob/main/docs/user/scanner-selection.md)** — targeted scanner allowlists and exclusions
 - **[Metadata extraction guide](https://github.com/promptfoo/modelaudit/blob/main/docs/user/metadata-extraction.md)** — safe metadata workflows and `--trust-loaders` guidance
 - **[Offline/air-gapped guide](https://github.com/promptfoo/modelaudit/blob/main/docs/user/offline-air-gapped.md)** — secure operation without internet access
 - **Troubleshooting** — run `modelaudit doctor --show-failed` to check scanner availability

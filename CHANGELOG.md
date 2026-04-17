@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **cli:** add scanner selection with `--scanners`, `--exclude-scanner`, and `--list-scanners` wired into core routing, nested dispatch, remote prefilters, and scan metadata; selection-suppressed preferred scanners emit a stderr warning and populate `scanner_selection.suppressed_preferred_scanner_ids`, and unknown scanner names suggest the closest match
 - **pickle:** replace the standalone pickle scanner's package-engine selector with the Rust-only runtime and explicit native-extension errors
 - **pickle:** scan PyTorch ZIP checkpoint pickle members directly in the standalone pickle scanner
 - **pickle:** bundle the standalone `modelaudit_picklescan` API in the root `modelaudit` wheel and add source-tree coverage for the package boundary
@@ -35,7 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **security:** scan generic ZIP/TAR/NPZ Python members and ZIP/TAR/NPZ executable members, including wildcard imports and callable rebindings while failing closed on malformed Python source. Findings carry accurate rule codes per risk category (`S101` for `os.system`/`os.popen`, `S103` for `subprocess.*`, `S104` for `eval`/`exec`, `S106` for `__import__`, `S107` for `importlib.import_module`, `S213` for `pickle.load`/`pickle.loads`) instead of a single catch-all, the ZIP path now honors `max_mar_python_analysis_bytes` for non-MAR Python members, and source bytes are parsed directly so PEP 263 encoding declarations are respected.
+- **security:** detect extensionless protocol-0/1 pickle members during 7-Zip nested archive probes.
 - **pickle:** restore ModelAudit nested-pickle findings from Rust standalone notices and keep network raw-detector coverage after native pickle findings
+- **xgboost:** route UBJSON-backed `.bst` models when `version` or booster markers appear after a large `learner` object, and route extensionless XGBoost UBJSON models via content sniffing (requires both the `learner` marker and a booster/model-param strong marker within the probe window).
 - **telemetry:** strip query strings, fragments, and URL userinfo from cloud model names and file-extension metadata
 - preserve `S999` unknown-opcode mapping in generic rule fallback
 - **docker:** run the full parser image as a non-root `appuser`

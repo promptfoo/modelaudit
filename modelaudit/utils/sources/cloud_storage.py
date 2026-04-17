@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Callable, Coroutine, Iterator
+from collections.abc import Callable, Collection, Coroutine, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -550,15 +550,22 @@ class GCSCache:
             click.echo(f"Cleaned {len(keys_to_remove)} old cache entries")
 
 
-def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def filter_scannable_files(
+    files: list[dict[str, Any]],
+    scannable_extensions: Collection[str] | None = None,
+) -> list[dict[str, Any]]:
     """Filter files to only include scannable model types."""
+    extensions = SCANNABLE_MODEL_EXTENSIONS if scannable_extensions is None else frozenset(scannable_extensions)
     scannable = []
     for file in files:
         file_path = str(file["path"])
         path = Path(_cloud_url_basename(file_path) if is_cloud_url(file_path) else file_path)
         suffixes = [s.lower() for s in path.suffixes]
+        if not suffixes and "" in extensions:
+            scannable.append(file)
+            continue
         for i in range(1, len(suffixes) + 1):
-            if "".join(suffixes[-i:]) in SCANNABLE_MODEL_EXTENSIONS:
+            if "".join(suffixes[-i:]) in extensions:
                 scannable.append(file)
                 break
 
@@ -601,6 +608,7 @@ def download_from_cloud(
     show_progress: bool = True,
     selective: bool = True,
     stream_analyze: bool = False,
+    scannable_extensions: Collection[str] | None = None,
 ) -> Path | str:
     """Download a file or directory from cloud storage to a local path.
 
@@ -718,7 +726,7 @@ def download_from_cloud(
 
             if selective:
                 # Filter to only scannable files
-                files = filter_scannable_files(files)
+                files = filter_scannable_files(files, scannable_extensions=scannable_extensions)
                 if show_progress:
                     total = metadata.get("file_count", 0)
                     if files:
@@ -790,6 +798,7 @@ def download_from_cloud_streaming(
     max_size: int | None = None,
     show_progress: bool = True,
     selective: bool = True,
+    scannable_extensions: Collection[str] | None = None,
 ) -> Iterator[tuple[Path, bool]]:
     """
     Download files from cloud storage one at a time (streaming mode).
@@ -842,7 +851,7 @@ def download_from_cloud_streaming(
             raise ValueError(f"Invalid metadata for 'files': expected list, got {type(raw_files).__name__}")
 
         if selective:
-            files = filter_scannable_files(files)
+            files = filter_scannable_files(files, scannable_extensions=scannable_extensions)
             if show_progress and files:
                 click.echo(f"Found {len(files)} scannable files to stream")
 

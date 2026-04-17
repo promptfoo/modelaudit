@@ -378,10 +378,14 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _visit_loop(self, node: ast.For | ast.AsyncFor) -> None:
         self.visit(node.iter)
-        self._shadow_binding_target(node.target)
-        self.visit(node.target)
-        for statement in node.body:
-            self.visit(statement)
+        self.alias_scopes.append({})
+        try:
+            self._shadow_binding_target(node.target)
+            self.visit(node.target)
+            for statement in node.body:
+                self.visit(statement)
+        finally:
+            self.alias_scopes.pop()
         for statement in node.orelse:
             self.visit(statement)
 

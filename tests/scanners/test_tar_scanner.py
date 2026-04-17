@@ -222,6 +222,25 @@ class TestTarScanner:
         assert python_checks[0].status == CheckStatus.FAILED
         assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
+    def test_scan_tar_empty_loop_target_does_not_hide_later_dangerous_call(self, tmp_path: Path) -> None:
+        """Loop targets should not unconditionally shadow imports after a maybe-empty loop."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = (
+            b"import subprocess\nfor subprocess in ():\n    pass\nsubprocess.run(['echo', 'hidden'], check=False)\n"
+        )
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
     def test_scan_tar_marks_malformed_python_member_incomplete(self, tmp_path: Path) -> None:
         """Malformed Python source should fail closed instead of passing as benign."""
         archive_path = tmp_path / "model_bundle.tar"
