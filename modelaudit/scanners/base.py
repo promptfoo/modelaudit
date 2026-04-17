@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import re
 
 # Progress tracking imports with circular dependency detection
 import time
@@ -13,6 +14,8 @@ from typing import Any, ClassVar, Final, Literal
 from ..analysis.unified_context import UnifiedMLContext
 from ..scanner_results import (
     INCONCLUSIVE_SCAN_OUTCOME,
+    OPERATIONAL_ERROR_METADATA_KEY,
+    SCAN_OUTCOME_METADATA_KEY,
     Check,
     CheckStatus,
     Issue,
@@ -53,6 +56,65 @@ TRUSTED_HUGGINGFACE_SOURCES = frozenset({"huggingface"})
 FORMAT_VALIDATION_CONFIG_KEY: Final[str] = "_modelaudit_format_validation"
 _TRUSTED_SOURCE_PROVENANCE_TOKEN: Final[object] = object()
 _WHITELIST_STALE_WARNING_THRESHOLD_DAYS: Final[int] = 90
+_WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES: Final[frozenset[str]] = frozenset(
+    {
+        # S1xx — direct code-execution primitives (os/sys/subprocess/eval/compile/__import__/
+        # importlib/runpy/webbrowser/ctypes/builtins). The embedded payload itself is the
+        # threat, so whitelisted HF models must not hide these.
+        "S101",
+        "S102",
+        "S103",
+        "S104",
+        "S105",
+        "S106",
+        "S107",
+        "S108",
+        "S109",
+        "S110",
+        "S111",
+        "S112",
+        "S113",
+        "S114",
+        "S115",
+        # S3xx — HIGH-severity active network primitives (raw sockets, ftp, telnet,
+        # exfiltration). HTTP/SMTP/DNS/IP/URL codes stay eligible for downgrade since
+        # those are policy-grade rather than active-payload signals.
+        "S301",
+        "S304",
+        "S305",
+        "S310",
+        # S4xx — filesystem-escape and archive-bomb detections.
+        "S405",
+        "S406",
+        "S408",
+        "S410",
+        # S5xx — embedded executable / interpreter content.
+        "S501",
+        "S502",
+        "S503",
+        "S504",
+        "S505",
+        "S506",
+        "S507",
+        "S508",
+        "S509",
+    }
+)
+# Word-boundary matching prevents incidental substrings (e.g. "executable" inside
+# "ExecuTorch", "rce" inside "force") from suppressing whitelist downgrades.
+_WHITELIST_DOWNGRADE_EXEMPT_KEYWORD_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:"
+    r"arbitrary\s+code"
+    r"|dangerous"
+    r"|executable"
+    r"|inconclusive"
+    r"|path\s+traversal"
+    r"|rce"
+    r"|remote\s+code\s+execution"
+    r"|unsafe\s+deserialization"
+    r")\b",
+    re.IGNORECASE,
+)
 DEFAULT_MAX_FILE_READ_SIZE: Final[int] = 512 * 1024 * 1024
 DEFAULT_READ_CHUNK_SIZE: Final[int] = 8 * 1024 * 1024
 
@@ -163,7 +225,50 @@ class BaseScanner(ABC):
             return val.strip().lower() not in {"false", "0", "no", "off"}
         return bool(val)
 
-    def _should_apply_whitelist(self, severity: IssueSeverity) -> bool:
+    @staticmethod
+    def _result_metadata_whitelist_downgrade_exempt(result_metadata: dict[str, Any] | None) -> bool:
+        """Return True when result-level metadata marks incomplete operational coverage."""
+        metadata = result_metadata or {}
+        return (
+            metadata.get("analysis_incomplete") is True
+            or metadata.get(OPERATIONAL_ERROR_METADATA_KEY) is True
+            or metadata.get(SCAN_OUTCOME_METADATA_KEY) == INCONCLUSIVE_SCAN_OUTCOME
+        )
+
+    @staticmethod
+    def _whitelist_downgrade_exempt(
+        *,
+        details: dict[str, Any] | None,
+        result_metadata: dict[str, Any] | None = None,
+        message: str | None,
+        rule_code: str | None,
+        check_name: str | None,
+    ) -> bool:
+        """Return True for active payload or incomplete-coverage findings."""
+        details = details or {}
+        if details.get("analysis_incomplete") is True or details.get("operational_error") is True:
+            return True
+        if BaseScanner._result_metadata_whitelist_downgrade_exempt(result_metadata):
+            return True
+        if details.get("cve_id") or details.get("cve"):
+            return True
+
+        if rule_code and (rule_code.startswith("S2") or rule_code in _WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES):
+            return True
+
+        text = " ".join(value for value in (message, check_name) if value)
+        return bool(_WHITELIST_DOWNGRADE_EXEMPT_KEYWORD_PATTERN.search(text))
+
+    def _should_apply_whitelist(
+        self,
+        severity: IssueSeverity,
+        *,
+        details: dict[str, Any] | None = None,
+        result_metadata: dict[str, Any] | None = None,
+        message: str | None = None,
+        rule_code: str | None = None,
+        check_name: str | None = None,
+    ) -> bool:
         """
         Check if the whitelist should be applied to downgrade an issue's severity.
 
@@ -175,6 +280,15 @@ class BaseScanner(ABC):
         """
         # Only downgrade severities higher than INFO
         if severity in (IssueSeverity.INFO, IssueSeverity.DEBUG):
+            return False
+
+        if self._whitelist_downgrade_exempt(
+            details=details,
+            result_metadata=result_metadata,
+            message=message,
+            rule_code=rule_code,
+            check_name=check_name,
+        ):
             return False
 
         # Check if whitelist is enabled (default: True)
@@ -201,6 +315,11 @@ class BaseScanner(ABC):
         self,
         severity: IssueSeverity,
         details: dict[str, Any] | None,
+        *,
+        result_metadata: dict[str, Any] | None = None,
+        message: str | None = None,
+        rule_code: str | None = None,
+        check_name: str | None = None,
     ) -> tuple[IssueSeverity, dict[str, Any]]:
         """
         Apply whitelist downgrading logic to severity and details.
@@ -213,7 +332,14 @@ class BaseScanner(ABC):
             Tuple of (potentially modified severity, details dict)
         """
         original_severity = severity
-        if self._should_apply_whitelist(severity):
+        if self._should_apply_whitelist(
+            severity,
+            details=details,
+            result_metadata=result_metadata,
+            message=message,
+            rule_code=rule_code,
+            check_name=check_name,
+        ):
             severity = IssueSeverity.INFO
             # Add note about whitelisting to the details
             if details is None:

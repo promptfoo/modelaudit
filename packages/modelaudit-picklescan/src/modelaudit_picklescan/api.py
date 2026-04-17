@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pickletools
 import tempfile
 import zipfile
 from collections.abc import Mapping
@@ -15,6 +16,45 @@ from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdic
 _RUST_STREAM_READ_CHUNK_SIZE = 1024 * 1024
 _PYTORCH_ZIP_METADATA_BASENAMES = frozenset({"version", "byteorder"})
 _PICKLE_MEMBER_SUFFIXES = (".pkl", ".pickle")
+_PICKLE_BINARY_PROTOCOL_PREFIXES = (b"\x80\x01", b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05")
+_PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
+_PICKLE_DISCOVERY_LONG_PROBE_BYTES = 64 * 1024
+_PROTO0_1_START_BYTES = b"()]}cilp0FGIJKLMNSTUVX"
+_PROTO0_1_MAX_PROBE_OPCODES = _PICKLE_DISCOVERY_LONG_PROBE_BYTES
+_PROTO0_1_IGNORABLE_TRAILING_BYTES = b" \t\r\n\x00"
+_PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES = (
+    "pickle exhausted before seeing STOP",
+    "no newline found when trying to read ",
+)
+_PROTO0_1_TRIVIAL_LEADING_OPCODES = frozenset(
+    {
+        "MARK",
+        "POP",
+        "PUT",
+        "EMPTY_TUPLE",
+        "EMPTY_LIST",
+        "EMPTY_DICT",
+        "LIST",
+        "INT",
+        "BININT",
+        "BININT1",
+        "BININT2",
+        "LONG",
+        "LONG1",
+        "LONG4",
+        "FLOAT",
+        "BINFLOAT",
+        "NONE",
+        "NEWTRUE",
+        "NEWFALSE",
+        "STRING",
+        "BINSTRING",
+        "SHORT_BINSTRING",
+        "UNICODE",
+        "BINUNICODE",
+        "SHORT_BINUNICODE",
+    }
+)
 _MAX_PYTORCH_ZIP_ENTRIES = 10_000
 _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES = 512 * 1024 * 1024
 _RUST_EXTENSION_MODULE = "modelaudit_picklescan._rust"
@@ -176,7 +216,7 @@ class PickleScanner:
             if not _is_pytorch_zip_archive(entries):
                 return None
 
-            pickle_entries = _discover_pytorch_zip_pickle_entries(entries)
+            pickle_entries, discovery_notices = _discover_pytorch_zip_pickle_entries(archive, entries, source=source)
             if not pickle_entries:
                 return _pytorch_zip_notice_report(
                     source=source,
@@ -187,7 +227,7 @@ class PickleScanner:
                 )
 
             reports: list[PickleReport] = []
-            skipped_notices: list[Notice] = []
+            skipped_notices: list[Notice] = list(discovery_notices)
             for entry in pickle_entries:
                 member_name = entry.filename
                 member_source = f"{source}:{member_name}"
@@ -345,21 +385,166 @@ def _is_pytorch_zip_archive(entries: list[zipfile.ZipInfo]) -> bool:
     return has_pickle_members
 
 
-def _discover_pytorch_zip_pickle_entries(entries: list[zipfile.ZipInfo]) -> list[zipfile.ZipInfo]:
+def _discover_pytorch_zip_pickle_entries(
+    archive: zipfile.ZipFile,
+    entries: list[zipfile.ZipInfo],
+    *,
+    source: str,
+) -> tuple[list[zipfile.ZipInfo], tuple[Notice, ...]]:
     pickle_entries: list[zipfile.ZipInfo] = []
+    notices: list[Notice] = []
+    seen_entries: set[int] = set()
+
+    def add_entry(entry: zipfile.ZipInfo) -> None:
+        entry_id = id(entry)
+        if entry_id in seen_entries:
+            return
+        pickle_entries.append(entry)
+        seen_entries.add(entry_id)
+
     for entry in entries:
         if entry.is_dir():
             continue
         name = entry.filename
         lowered = name.lower()
         if _is_data_pickle_member(lowered) or lowered.endswith(_PICKLE_MEMBER_SUFFIXES):
-            pickle_entries.append(entry)
-    return pickle_entries
+            add_entry(entry)
+
+    for entry in entries:
+        if entry.is_dir() or id(entry) in seen_entries:
+            continue
+        try:
+            if _zip_entry_looks_like_pickle(archive, entry):
+                add_entry(entry)
+        except Exception as error:
+            notices.append(_pytorch_zip_member_probe_notice(source=source, entry=entry, error=error))
+
+    return pickle_entries, tuple(notices)
+
+
+def _zip_entry_looks_like_pickle(archive: zipfile.ZipFile, entry: zipfile.ZipInfo) -> bool:
+    with archive.open(entry, "r") as member:
+        prefix = member.read(_PICKLE_DISCOVERY_SHORT_PROBE_BYTES)
+    if not prefix:
+        return False
+
+    if prefix.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES):
+        with archive.open(entry, "r") as member:
+            sample = member.read(_PICKLE_DISCOVERY_LONG_PROBE_BYTES)
+        return _looks_like_binary_pickle_prefix(sample, sample_is_prefix=entry.file_size > len(sample))
+
+    if prefix[0] not in _PROTO0_1_START_BYTES:
+        return False
+
+    sample = prefix
+    if entry.file_size > len(prefix):
+        with archive.open(entry, "r") as member:
+            sample = member.read(_PICKLE_DISCOVERY_LONG_PROBE_BYTES)
+    return _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=entry.file_size > len(sample))
+
+
+def _looks_like_binary_pickle_prefix(sample: bytes, *, sample_is_prefix: bool) -> bool:
+    # Keep structurally in sync with
+    # ``modelaudit.scanners.pytorch_zip_scanner.PyTorchZipScanner._looks_like_binary_pickle_prefix``.
+    # The two copies exist because ``modelaudit-picklescan`` ships as a
+    # standalone package with no dependency on the main ``modelaudit`` tree.
+    if not sample.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES):
+        return False
+
+    # Thresholds: ``>= 4`` clean opcodes is enough evidence on a complete
+    # probe, ``>= 2`` when the sample is a prefix of a larger member and
+    # ``genops`` either ran out of bytes or raised a truncation-style error.
+    op_count = 0
+    try:
+        for opcode, _arg, _pos in pickletools.genops(sample):
+            op_count += 1
+            if opcode.name == "STOP":
+                return True
+            if op_count >= 4:
+                return True
+    except ValueError as exc:
+        message = str(exc).lower()
+        return (
+            sample_is_prefix
+            and op_count >= 2
+            and ("exhausted before seeing stop" in message or "not enough data" in message or "expected" in message)
+        )
+
+    return sample_is_prefix and op_count >= 2
+
+
+def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool) -> bool:
+    # Keep structurally in sync with
+    # ``modelaudit.utils.file.detection._looks_like_proto0_or_1_pickle``.
+    # Duplicated for the standalone package (see comment on
+    # ``_looks_like_binary_pickle_prefix``).
+    if len(sample) < 2:
+        return False
+
+    def matches_proto_stream(candidate: bytes) -> bool:
+        if len(candidate) < 2 or candidate[0] not in _PROTO0_1_START_BYTES:
+            return False
+
+        opcode_count = 0
+        has_non_trivial_opcode = False
+        try:
+            for opcode, _arg, pos in pickletools.genops(candidate):
+                opcode_count += 1
+                if opcode.name == "STOP":
+                    stop_pos = 0 if pos is None else pos
+                    trailing = candidate[stop_pos + 1 :]
+                    if not trailing or not trailing.strip(_PROTO0_1_IGNORABLE_TRAILING_BYTES):
+                        return opcode_count >= 2
+                    if has_non_trivial_opcode:
+                        return opcode_count >= 2
+                    stripped_trailing = trailing.lstrip(_PROTO0_1_IGNORABLE_TRAILING_BYTES)
+                    return bool(stripped_trailing) and _looks_like_proto0_or_1_pickle(
+                        stripped_trailing,
+                        sample_is_prefix=sample_is_prefix,
+                    )
+                if opcode.name not in _PROTO0_1_TRIVIAL_LEADING_OPCODES:
+                    has_non_trivial_opcode = True
+                if opcode_count >= _PROTO0_1_MAX_PROBE_OPCODES:
+                    return False
+        except ValueError as exc:
+            exc_message = str(exc)
+            return (
+                sample_is_prefix
+                and opcode_count >= 2
+                and has_non_trivial_opcode
+                and any(
+                    exc_message.startswith(error_prefix) for error_prefix in _PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES
+                )
+            )
+        except Exception:
+            return False
+
+        return sample_is_prefix and opcode_count >= 2 and has_non_trivial_opcode
+
+    if matches_proto_stream(sample):
+        return True
+
+    return sample.startswith(b"#") and matches_proto_stream(sample[1:])
 
 
 def _is_data_pickle_member(name: str) -> bool:
     normalized = name.replace("\\", "/").lower()
     return normalized == "data.pkl" or normalized.endswith("/data.pkl")
+
+
+def _pytorch_zip_member_probe_notice(*, source: str, entry: zipfile.ZipInfo, error: Exception) -> Notice:
+    return Notice(
+        message=f"Could not inspect PyTorch ZIP member for hidden pickle payloads: {error!s}",
+        severity=Severity.INFO,
+        location=f"{source}:{entry.filename}",
+        code="pytorch_zip_member_probe_failed",
+        details={
+            "member_name": entry.filename,
+            "member_size": entry.file_size,
+            "exception_type": type(error).__name__,
+            "analysis_incomplete": True,
+        },
+    )
 
 
 def _pytorch_zip_notice_report(
