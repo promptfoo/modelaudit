@@ -94,6 +94,7 @@ class PythonArchiveMemberParseError(Exception):
 
 _AliasScope = dict[str, str | None]
 _AliasScopes = list[_AliasScope]
+_MISSING_ALIAS = object()
 
 
 def is_executable_archive_member_name(member_name: str) -> bool:
@@ -286,6 +287,39 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         finally:
             self.alias_scopes.pop()
 
+    def _visit_conditional_branch(self, body: list[ast.stmt]) -> _AliasScope:
+        branch_scope: _AliasScope = {}
+        parent_is_class_scope = id(self.alias_scopes[-1]) in self._class_scope_ids
+        self.alias_scopes.append(branch_scope)
+        if parent_is_class_scope:
+            self._class_scope_ids.add(id(branch_scope))
+        try:
+            for statement in body:
+                self.visit(statement)
+            return dict(branch_scope)
+        finally:
+            if parent_is_class_scope:
+                self._class_scope_ids.discard(id(branch_scope))
+            self.alias_scopes.pop()
+
+    @staticmethod
+    def _constant_bool(node: ast.AST) -> bool | None:
+        if isinstance(node, ast.Constant) and isinstance(node.value, bool):
+            return node.value
+        return None
+
+    def _merge_conditional_branch_scopes(self, branch_scopes: list[_AliasScope]) -> None:
+        current_scope = self.alias_scopes[-1]
+        branch_names = {name for scope in branch_scopes for name in scope}
+        for name in branch_names:
+            base_value = current_scope.get(name, _MISSING_ALIAS)
+            values = [scope.get(name, base_value) for scope in branch_scopes]
+            concrete_aliases = {value for value in values if isinstance(value, str)}
+            if len(concrete_aliases) == 1:
+                current_scope[name] = next(iter(concrete_aliases))
+            elif values and all(value is None for value in values):
+                current_scope[name] = None
+
     def _visit_child_scope_without_class_locals(self, body: list[ast.stmt]) -> None:
         original_scopes = self.alias_scopes
         self.alias_scopes = [scope for scope in original_scopes if id(scope) not in self._class_scope_ids]
@@ -394,6 +428,57 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def visit_AsyncFor(self, node: ast.AsyncFor) -> None:
         self._visit_loop(node)
+
+    def visit_While(self, node: ast.While) -> None:
+        self.visit(node.test)
+        constant_bool = self._constant_bool(node.test)
+        if constant_bool is False:
+            for statement in node.orelse:
+                self.visit(statement)
+            return
+
+        branch_scopes = [self._visit_conditional_branch(node.body)]
+        if node.orelse:
+            branch_scopes.append(self._visit_conditional_branch(node.orelse))
+        else:
+            branch_scopes.append({})
+        self._merge_conditional_branch_scopes(branch_scopes)
+
+    def visit_If(self, node: ast.If) -> None:
+        self.visit(node.test)
+        constant_bool = self._constant_bool(node.test)
+        if constant_bool is True:
+            for statement in node.body:
+                self.visit(statement)
+            return
+        if constant_bool is False:
+            for statement in node.orelse:
+                self.visit(statement)
+            return
+
+        branch_scopes = [self._visit_conditional_branch(node.body)]
+        branch_scopes.append(self._visit_conditional_branch(node.orelse) if node.orelse else {})
+        self._merge_conditional_branch_scopes(branch_scopes)
+
+    def visit_Try(self, node: ast.Try) -> None:
+        branch_scopes = [self._visit_conditional_branch([*node.body, *node.orelse])]
+        for handler in node.handlers:
+            if handler.type is not None:
+                self.visit(handler.type)
+            branch_scope: _AliasScope = {}
+            self.alias_scopes.append(branch_scope)
+            try:
+                if handler.name is not None:
+                    self._bind_name(handler.name, None)
+                for statement in handler.body:
+                    self.visit(statement)
+                branch_scope = dict(branch_scope)
+            finally:
+                self.alias_scopes.pop()
+            branch_scopes.append(branch_scope)
+        self._merge_conditional_branch_scopes(branch_scopes)
+        for statement in node.finalbody:
+            self.visit(statement)
 
     def _visit_with(self, node: ast.With | ast.AsyncWith) -> None:
         for item in node.items:

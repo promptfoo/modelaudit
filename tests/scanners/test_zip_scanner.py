@@ -267,6 +267,23 @@ def test_scan_zip_empty_loop_target_does_not_hide_later_dangerous_call(tmp_path:
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
 
+def test_scan_zip_conditional_target_does_not_hide_later_dangerous_call(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import subprocess\nif False:\n    subprocess = None\nsubprocess.run(['echo', 'hidden'], check=False)\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
+
 def test_scan_zip_ignores_shadowed_dangerous_import_name(tmp_path: Path) -> None:
     archive_path = tmp_path / "source_bundle.zip"
     source = (

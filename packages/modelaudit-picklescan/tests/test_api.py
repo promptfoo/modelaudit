@@ -825,6 +825,100 @@ def test_scan_file_scans_pytorch_zip_data_pickle(tmp_path: Path) -> None:
     assert report.coverage.bytes_scanned > 0
 
 
+def test_scan_file_detects_hidden_pytorch_zip_pickle_member_with_data_pickle(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    hidden_payload = b"cposix\nsystem\n(S'echo hidden'\ntR."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/payload", hidden_payload)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl", "archive/payload"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/payload" in finding.location
+        for finding in report.findings
+    )
+
+
+def test_scan_file_does_not_route_benign_storage_blob_as_hidden_pickle(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/data/0", b"\x00" * 1024)
+        archive.writestr("archive/notes", b"cat is a category label, not a GLOBAL opcode stream")
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+
+
+def test_scan_file_does_not_route_large_trivial_proto0_text_as_hidden_pickle(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/constants", b"I0\n0" * 20_000)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+
+
+def test_scan_file_marks_hidden_pytorch_zip_probe_failure_inconclusive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/payload", b"maybe hidden")
+
+    original_open = zipfile.ZipFile.open
+
+    def fail_hidden_probe_open(
+        archive: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        mode: str = "r",
+        pwd: bytes | None = None,
+        *,
+        force_zip64: bool = False,
+    ) -> object:
+        member_name = name.filename if isinstance(name, zipfile.ZipInfo) else name
+        if member_name == "archive/payload":
+            raise NotImplementedError("unsupported compression method")
+        return original_open(archive, name, mode=mode, pwd=pwd, force_zip64=force_zip64)
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", fail_hidden_probe_open)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.errors == ()
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+    probe_notices = [notice for notice in report.notices if notice.code == "pytorch_zip_member_probe_failed"]
+    assert len(probe_notices) == 1
+    assert probe_notices[0].location == f"{archive_path}:archive/payload"
+    assert probe_notices[0].details["analysis_incomplete"] is True
+    assert probe_notices[0].details["exception_type"] == "NotImplementedError"
+
+
 def test_scan_file_detects_malicious_pytorch_zip_data_pickle(tmp_path: Path) -> None:
     archive_path = tmp_path / "model.pt"
     with zipfile.ZipFile(archive_path, "w") as archive:
