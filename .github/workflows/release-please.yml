@@ -10,6 +10,15 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      root_version:
+        description: "Publish an already-versioned root modelaudit release, for example 0.2.39"
+        required: false
+        type: string
+      picklescan_version:
+        description: "Publish an already-versioned modelaudit-picklescan release, for example 0.1.2"
+        required: false
+        type: string
 
 jobs:
   release-please:
@@ -18,18 +27,74 @@ jobs:
       contents: write
       pull-requests: write
     outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-      version: ${{ steps.release.outputs.version }}
-      picklescan_release_created: ${{ steps.release.outputs['packages/modelaudit-picklescan--release_created'] }}
-      picklescan_tag_name: ${{ steps.release.outputs['packages/modelaudit-picklescan--tag_name'] }}
-      picklescan_version: ${{ steps.release.outputs['packages/modelaudit-picklescan--version'] }}
+      release_created: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.release_created || steps.release.outputs.release_created }}
+      tag_name: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.tag_name || steps.release.outputs.tag_name }}
+      version: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.version || steps.release.outputs.version }}
+      picklescan_release_created: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.picklescan_release_created || steps.release.outputs['packages/modelaudit-picklescan--release_created'] }}
+      picklescan_tag_name: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.picklescan_tag_name || steps.release.outputs['packages/modelaudit-picklescan--tag_name'] }}
+      picklescan_version: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.picklescan_version || steps.release.outputs['packages/modelaudit-picklescan--version'] }}
       pr_number: ${{ steps.release.outputs.pr && fromJSON(steps.release.outputs.pr).number || '' }}
     steps:
+      - name: Resolve manual release inputs
+        id: manual
+        env:
+          ROOT_VERSION: ${{ github.event.inputs.root_version || '' }}
+          PICKLESCAN_VERSION: ${{ github.event.inputs.picklescan_version || '' }}
+        run: |
+          {
+            if [[ -n "$ROOT_VERSION" ]]; then
+              echo "release_created=true"
+              echo "version=$ROOT_VERSION"
+              echo "tag_name=v$ROOT_VERSION"
+            else
+              echo "release_created=false"
+            fi
+
+            if [[ -n "$PICKLESCAN_VERSION" ]]; then
+              echo "picklescan_release_created=true"
+              echo "picklescan_version=$PICKLESCAN_VERSION"
+              echo "picklescan_tag_name=modelaudit-picklescan-v$PICKLESCAN_VERSION"
+            else
+              echo "picklescan_release_created=false"
+            fi
+
+            if [[ -n "$ROOT_VERSION" || -n "$PICKLESCAN_VERSION" ]]; then
+              echo "manual_release=true"
+            else
+              echo "manual_release=false"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
       - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+        if: steps.manual.outputs.manual_release != 'true'
         id: release
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Ensure manual GitHub releases exist
+        if: steps.manual.outputs.manual_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ROOT_TAG: ${{ steps.manual.outputs.tag_name }}
+          ROOT_VERSION: ${{ steps.manual.outputs.version }}
+          PICKLESCAN_TAG: ${{ steps.manual.outputs.picklescan_tag_name }}
+          PICKLESCAN_VERSION: ${{ steps.manual.outputs.picklescan_version }}
+        run: |
+          if [[ -n "$ROOT_VERSION" ]] && ! gh release view "$ROOT_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$ROOT_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$ROOT_TAG" \
+              --notes "Manual recovery release for modelaudit $ROOT_VERSION."
+          fi
+
+          if [[ -n "$PICKLESCAN_VERSION" ]] && ! gh release view "$PICKLESCAN_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$PICKLESCAN_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "modelaudit-picklescan: v$PICKLESCAN_VERSION" \
+              --notes "Manual recovery release for modelaudit-picklescan $PICKLESCAN_VERSION."
+          fi
 
       # Format changelogs immediately after release-please creates/updates a PR
       # This runs for BOTH new PRs (prs_created) and existing PRs (pr output exists)
