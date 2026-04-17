@@ -53,6 +53,23 @@ TRUSTED_HUGGINGFACE_SOURCES = frozenset({"huggingface"})
 FORMAT_VALIDATION_CONFIG_KEY: Final[str] = "_modelaudit_format_validation"
 _TRUSTED_SOURCE_PROVENANCE_TOKEN: Final[object] = object()
 _WHITELIST_STALE_WARNING_THRESHOLD_DAYS: Final[int] = 90
+_WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "S405",
+        "S406",
+        "S408",
+        "S410",
+        "S501",
+        "S502",
+        "S503",
+        "S504",
+        "S505",
+        "S506",
+        "S507",
+        "S508",
+        "S509",
+    }
+)
 DEFAULT_MAX_FILE_READ_SIZE: Final[int] = 512 * 1024 * 1024
 DEFAULT_READ_CHUNK_SIZE: Final[int] = 8 * 1024 * 1024
 
@@ -178,19 +195,7 @@ class BaseScanner(ABC):
         if details.get("cve_id"):
             return True
 
-        if rule_code and (
-            rule_code.startswith("S2")
-            or rule_code
-            in {
-                "S405",
-                "S406",
-                "S410",
-                "S501",
-                "S502",
-                "S503",
-                "S504",
-            }
-        ):
+        if rule_code and (rule_code.startswith("S2") or rule_code in _WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES):
             return True
 
         text = " ".join(value for value in (message, check_name) if value).lower()

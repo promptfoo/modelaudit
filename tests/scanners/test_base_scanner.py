@@ -956,8 +956,12 @@ def test_whitelist_downgrade_check_critical():
             IssueSeverity.CRITICAL,
         ),
         ("Traversal", "Path traversal attempt detected", None, {}, IssueSeverity.CRITICAL),
+        ("System Path", "Symlink target points to critical system path", "S408", {}, IssueSeverity.CRITICAL),
         ("Incomplete", "Archive scan inconclusive", None, {"analysis_incomplete": True}, IssueSeverity.WARNING),
         ("Executable", "Executable file detected in archive", "S104", {}, IssueSeverity.WARNING),
+        ("PowerShell", "PowerShell content found in pickle tail", "S506", {}, IssueSeverity.WARNING),
+        ("Embedded Python", "Python script embedded in tensor payload", "S507", {}, IssueSeverity.WARNING),
+        ("WebAssembly", "WASM module found in model payload", "S509", {}, IssueSeverity.WARNING),
     ],
 )
 def test_whitelist_does_not_downgrade_active_or_incomplete_findings(
