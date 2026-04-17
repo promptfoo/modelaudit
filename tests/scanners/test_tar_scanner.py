@@ -139,6 +139,42 @@ class TestTarScanner:
         assert python_checks[0].severity == IssueSeverity.WARNING
         assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
+    def test_scan_tar_flags_wildcard_import_dangerous_python_member(self, tmp_path: Path) -> None:
+        """Wildcard imports should resolve known high-risk call names."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = b"from subprocess import *\nrun(['echo', 'hidden'], check=False)\n"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].severity == IssueSeverity.WARNING
+        assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
+    def test_scan_tar_flags_rebound_dangerous_python_member(self, tmp_path: Path) -> None:
+        """Callable rebindings should not bypass generic TAR Python member scanning."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = b"import subprocess\nrunner = subprocess.run\nrunner(['echo', 'hidden'], check=False)\n"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].severity == IssueSeverity.WARNING
+        assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
     def test_scan_tar_import_aliases_are_scoped_per_python_member(self, tmp_path: Path) -> None:
         """Local imports in one scope should not hide dangerous calls in another scope."""
         archive_path = tmp_path / "model_bundle.tar"
