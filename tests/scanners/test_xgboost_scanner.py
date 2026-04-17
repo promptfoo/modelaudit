@@ -201,18 +201,26 @@ class TestXGBoostScannerBasic:
 
         assert not XGBoostScanner.can_handle(str(model_file))
 
-    def test_can_handle_ubjson_with_version_after_probe_window(self, temp_dir: Path) -> None:
-        model_file = temp_dir / "model"
-        model_file.write_bytes(
-            b"{L"
-            + (b"\0" * 8)
-            + b"learner"
-            + b"learner_model_param"
-            + (b"\0" * XGBoostScanner._UBJSON_PROBE_READ_BYTES)
-            + b"version"
-        )
+    def test_rejects_extensionless_ubjson_when_strong_marker_past_probe_window(self, temp_dir: Path) -> None:
+        """Extensionless files require a strong marker *within* the probe window.
 
-        assert XGBoostScanner.can_handle(str(model_file))
+        `.bst`/`.model` files trust the extension and need only `learner`, but an
+        extensionless file with `learner` early and every strong marker past the
+        probe window must be rejected so unrelated archives that happen to embed
+        `{L...learner` near the top are not misrouted to the UBJ scanner.
+        """
+        probe_bytes = XGBoostScanner._UBJSON_PROBE_READ_BYTES
+        # `learner` sits near the start; all strong markers live past the probe cap.
+        prefix = b"{L" + (b"\0" * 8) + b"learner"
+        padding_len = probe_bytes - len(prefix) + 32
+        payload = prefix + (b"\0" * padding_len) + b"version" + b"gbtree"
+        assert all(marker not in payload[:probe_bytes] for marker in XGBoostScanner._UBJSON_STRONG_MARKERS)
+        assert any(marker in payload for marker in XGBoostScanner._UBJSON_STRONG_MARKERS)
+
+        model_file = temp_dir / "model"
+        model_file.write_bytes(payload)
+
+        assert not XGBoostScanner.can_handle(str(model_file))
 
     def test_scanner_name_and_description(self):
         """Test scanner metadata."""
