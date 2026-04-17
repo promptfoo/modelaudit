@@ -199,6 +199,29 @@ class TestTarScanner:
         assert python_checks[0].status == CheckStatus.FAILED
         assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
+    def test_scan_tar_method_does_not_capture_class_attribute_alias(self, tmp_path: Path) -> None:
+        """Class attributes are not lexical aliases inside method bodies."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = (
+            b"import subprocess\n"
+            b"class Handler:\n"
+            b"    subprocess = None\n"
+            b"    def run(self) -> None:\n"
+            b"        subprocess.run(['echo', 'hidden'], check=False)\n"
+        )
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
     def test_scan_tar_marks_malformed_python_member_incomplete(self, tmp_path: Path) -> None:
         """Malformed Python source should fail closed instead of passing as benign."""
         archive_path = tmp_path / "model_bundle.tar"

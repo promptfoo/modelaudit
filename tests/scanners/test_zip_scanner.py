@@ -227,6 +227,29 @@ def test_scan_zip_import_aliases_are_scoped_per_python_member(tmp_path: Path) ->
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
 
+def test_scan_zip_method_does_not_capture_class_attribute_alias(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import subprocess\n"
+        "class Handler:\n"
+        "    subprocess = None\n"
+        "    def run(self) -> None:\n"
+        "        subprocess.run(['echo', 'hidden'], check=False)\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
+
 def test_scan_zip_ignores_shadowed_dangerous_import_name(tmp_path: Path) -> None:
     archive_path = tmp_path / "source_bundle.zip"
     source = (

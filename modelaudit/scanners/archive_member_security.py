@@ -214,6 +214,7 @@ def _binding_names(target: ast.AST) -> Iterator[str]:
 class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def __init__(self) -> None:
         self.alias_scopes: _AliasScopes = [{}]
+        self._class_scope_ids: set[int] = set()
         self.risky_calls: set[str] = set()
 
     def _record_import(self, alias: ast.alias, import_name: str) -> None:
@@ -285,6 +286,26 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         finally:
             self.alias_scopes.pop()
 
+    def _visit_child_scope_without_class_locals(self, body: list[ast.stmt]) -> None:
+        original_scopes = self.alias_scopes
+        self.alias_scopes = [scope for scope in original_scopes if id(scope) not in self._class_scope_ids]
+        try:
+            for statement in body:
+                self.visit(statement)
+        finally:
+            self.alias_scopes = original_scopes
+
+    def _visit_class_scope(self, body: list[ast.stmt]) -> None:
+        class_scope: _AliasScope = {}
+        self.alias_scopes.append(class_scope)
+        self._class_scope_ids.add(id(class_scope))
+        try:
+            for statement in body:
+                self.visit(statement)
+        finally:
+            self._class_scope_ids.discard(id(class_scope))
+            self.alias_scopes.pop()
+
     def _visit_function_scope(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
         for decorator in node.decorator_list:
             self.visit(decorator)
@@ -296,8 +317,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self.alias_scopes.append({})
         try:
             self._bind_arguments(node.args)
-            for statement in node.body:
-                self.visit(statement)
+            self._visit_child_scope_without_class_locals(node.body)
         finally:
             self.alias_scopes.pop()
 
@@ -316,7 +336,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self.visit(base)
         for keyword in node.keywords:
             self.visit(keyword)
-        self._visit_child_scope(node.body)
+        self._visit_class_scope(node.body)
         self._bind_name(node.name, None)
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
