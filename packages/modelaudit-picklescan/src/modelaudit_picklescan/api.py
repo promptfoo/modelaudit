@@ -26,7 +26,35 @@ _PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES = (
     "pickle exhausted before seeing STOP",
     "no newline found when trying to read ",
 )
-_PROTO0_1_TRIVIAL_LEADING_OPCODES = frozenset({"MARK", "POP", "DUP", "EMPTY_LIST", "EMPTY_DICT"})
+_PROTO0_1_TRIVIAL_LEADING_OPCODES = frozenset(
+    {
+        "MARK",
+        "POP",
+        "PUT",
+        "EMPTY_TUPLE",
+        "EMPTY_LIST",
+        "EMPTY_DICT",
+        "LIST",
+        "INT",
+        "BININT",
+        "BININT1",
+        "BININT2",
+        "LONG",
+        "LONG1",
+        "LONG4",
+        "FLOAT",
+        "BINFLOAT",
+        "NONE",
+        "NEWTRUE",
+        "NEWFALSE",
+        "STRING",
+        "BINSTRING",
+        "SHORT_BINSTRING",
+        "UNICODE",
+        "BINUNICODE",
+        "SHORT_BINUNICODE",
+    }
+)
 _MAX_PYTORCH_ZIP_ENTRIES = 10_000
 _MAX_PYTORCH_ZIP_PICKLE_MEMBER_BYTES = 512 * 1024 * 1024
 _RUST_EXTENSION_MODULE = "modelaudit_picklescan._rust"

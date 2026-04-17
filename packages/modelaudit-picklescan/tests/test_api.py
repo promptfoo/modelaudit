@@ -863,6 +863,21 @@ def test_scan_file_does_not_route_benign_storage_blob_as_hidden_pickle(tmp_path:
     assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
 
 
+def test_scan_file_does_not_route_large_trivial_proto0_text_as_hidden_pickle(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/constants", b"I0\n0" * 20_000)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert list(report.metadata["pickle_files"]) == ["archive/data.pkl"]
+
+
 def test_scan_file_marks_hidden_pytorch_zip_probe_failure_inconclusive(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
