@@ -226,6 +226,20 @@ class XGBoostScanner(BaseScanner):
         b'"gblinear"',
         b'"dart"',
     )
+    _UBJSON_PROBE_READ_BYTES: ClassVar[int] = 256 * 1024
+    _UBJSON_OBJECT_START: ClassVar[int] = ord("{")
+    _UBJSON_NEXT_VALID: ClassVar[frozenset[int]] = frozenset(b"iUIlLdDSC#$}")
+    _UBJSON_REQUIRED_MARKERS: ClassVar[tuple[bytes, ...]] = (b"learner",)
+    _UBJSON_STRONG_MARKERS: ClassVar[tuple[bytes, ...]] = (
+        b"version",
+        b"gradient_booster",
+        b"learner_model_param",
+        b"gbtree_model_param",
+        b"tree_info",
+        b"gbtree",
+        b"gblinear",
+        b"dart",
+    )
     _BINARY_MIN_STRUCTURE_BYTES: ClassVar[int] = 32
     _INCONCLUSIVE_REASONS: ClassVar[dict[str, str]] = {
         "json_parse_failed": "xgboost_json_parse_failed",
@@ -288,6 +302,8 @@ class XGBoostScanner(BaseScanner):
 
         # Check for XGBoost files without extension
         if file_ext == "":
+            if cls._is_ubjson_file(path):
+                return True
             with suppress(OSError), open(path, "rb") as f:
                 header = f.read(16)
                 # Check for XGBoost binary signature patterns
@@ -500,7 +516,8 @@ class XGBoostScanner(BaseScanner):
             # Modern XGBoost (2.0+) saves .bst files in UBJSON format by default.
             # Route to the UBJ scanner when the decoder is available; otherwise
             # fail closed while still attempting the optional XGBoost load.
-            is_ubjson = self._is_ubjson_file(path)
+            file_ext = os.path.splitext(path)[1].lower()
+            is_ubjson = self._is_ubjson_file(path, require_strong_marker=file_ext not in {".bst", ".model"})
             if is_ubjson:
                 if _check_ubjson_available():
                     self._scan_ubj_model(path, result)
@@ -754,16 +771,20 @@ class XGBoostScanner(BaseScanner):
             return False
 
     @staticmethod
-    def _is_ubjson_file(path: str) -> bool:
-        """Check if file is in UBJSON format (modern XGBoost default for .bst)."""
-        # UBJSON objects start with '{' followed by a type marker or '}' (empty).
-        # XGBoost UBJSON models use '{' + int-type length (e.g. 'L' for int64).
-        _UBJSON_OBJECT_START = ord("{")
-        _UBJSON_NEXT_VALID = frozenset(b"iUIlLdDSC#$}")
+    def _is_ubjson_file(path: str, *, require_strong_marker: bool = True) -> bool:
+        """Check if a file is probably an XGBoost UBJSON model."""
         try:
             with open(path, "rb") as f:
-                header = f.read(2)
-            return len(header) == 2 and header[0] == _UBJSON_OBJECT_START and header[1] in _UBJSON_NEXT_VALID
+                probe = f.read(XGBoostScanner._UBJSON_PROBE_READ_BYTES)
+            is_ubjson_with_required_markers = (
+                len(probe) >= 2
+                and probe[0] == XGBoostScanner._UBJSON_OBJECT_START
+                and probe[1] in XGBoostScanner._UBJSON_NEXT_VALID
+                and all(marker in probe for marker in XGBoostScanner._UBJSON_REQUIRED_MARKERS)
+            )
+            if not is_ubjson_with_required_markers:
+                return False
+            return not require_strong_marker or any(marker in probe for marker in XGBoostScanner._UBJSON_STRONG_MARKERS)
         except OSError:
             return False
 
