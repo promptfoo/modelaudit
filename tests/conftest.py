@@ -91,6 +91,7 @@ def pytest_runtest_setup(item):
             "test_picklescan_adapter.py",
             "test_joblib_scanner.py",
             "test_scanner_registry.py",  # Scanner registry routing and metadata tests
+            "test_scanner_selection.py",  # Scanner selection policy and routing tests
             "test_lazy_loading.py",  # Lazy scanner descriptor/catalog tests
             "test_graceful_degradation.py",  # Scanner dependency degradation tests
             "test_joblib_scanner_codecs.py",  # Joblib raw/compressed pickle fallback regression tests

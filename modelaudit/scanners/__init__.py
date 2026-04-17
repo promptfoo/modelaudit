@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from ..scanner_registry_metadata import get_scanner_registry_metadata
+from ..scanner_selection import ScannerSelectionPolicy, policy_from_config
 from .base import BaseScanner, Check, CheckStatus, Issue, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
@@ -170,9 +171,9 @@ class ScannerRegistry:
         Returns:
             True if the scanner is registered and can potentially be loaded
         """
-        return self._get_scanner_id_for_class(class_name) is not None
+        return self.get_scanner_id_for_class(class_name) is not None
 
-    def _get_scanner_id_for_class(self, class_name: str) -> str | None:
+    def get_scanner_id_for_class(self, class_name: str) -> str | None:
         """Resolve a scanner class name from the registry's descriptor catalog."""
         for scanner_id, scanner_info in self._scanners.items():
             if scanner_info.get("class") == class_name:
@@ -198,20 +199,29 @@ class ScannerRegistry:
                 header_format_to_scanner_id[header_format] = scanner_id
         return header_format_to_scanner_id
 
-    def get_scanner_classes(self) -> list[type[BaseScanner]]:
+    def get_scanner_classes(
+        self,
+        scanner_selection: ScannerSelectionPolicy | None = None,
+    ) -> list[type[BaseScanner]]:
         """Get all available scanner classes in priority order"""
         scanner_classes = []
         # Sort by priority
         sorted_scanners = sorted(self._scanners.items(), key=lambda x: x[1]["priority"])
 
         for scanner_id, _ in sorted_scanners:
+            if scanner_selection is not None and not scanner_selection.allows(scanner_id):
+                continue
             scanner_class = self._load_scanner(scanner_id)
             if scanner_class:
                 scanner_classes.append(scanner_class)
 
         return scanner_classes
 
-    def get_scanner_for_path(self, path: str) -> type[BaseScanner] | None:
+    def get_scanner_for_path(
+        self,
+        path: str,
+        scanner_selection: ScannerSelectionPolicy | None = None,
+    ) -> type[BaseScanner] | None:
         """Get the best scanner for a given path (lazy loaded)"""
         import os
 
@@ -221,6 +231,8 @@ class ScannerRegistry:
         filename = os.path.basename(path).lower()
         if os.path.isdir(path):
             for scanner_id, scanner_info in sorted_scanners:
+                if scanner_selection is not None and not scanner_selection.allows(scanner_id):
+                    continue
                 if "" not in scanner_info.get("extensions", []):
                     continue
                 scanner_class = self._load_scanner(scanner_id)
@@ -248,6 +260,8 @@ class ScannerRegistry:
 
         for candidate_extension in candidate_extensions:
             for scanner_id, scanner_info in sorted_scanners:
+                if scanner_selection is not None and not scanner_selection.allows(scanner_id):
+                    continue
                 extensions = scanner_info.get("extensions", [])
                 content_routed_extensions = scanner_info.get("content_routed_extensions", [])
                 if candidate_extension not in extensions and candidate_extension not in content_routed_extensions:
@@ -260,7 +274,7 @@ class ScannerRegistry:
         # Some ZIP-backed artifacts intentionally use pickle/checkpoint suffixes.
         # If stricter extension-specific scanners all decline, fall back to the
         # generic ZIP scanner so helper-level routing does not drop coverage.
-        if is_zip_file:
+        if is_zip_file and (scanner_selection is None or scanner_selection.allows("zip")):
             scanner_class = self._load_scanner("zip")
             if scanner_class and scanner_class.can_handle(path):
                 return scanner_class
@@ -274,7 +288,12 @@ class ScannerRegistry:
 
         header_scanner_id = self.get_scanner_id_for_header_format(header_format)
         header_scanner_info = self._scanners.get(header_scanner_id or "")
-        if header_scanner_id and header_scanner_info and header_format == header_scanner_id:
+        if (
+            header_scanner_id
+            and header_scanner_info
+            and header_format == header_scanner_id
+            and (scanner_selection is None or scanner_selection.allows(header_scanner_id))
+        ):
             scanner_class = self._load_scanner(header_scanner_id)
             if scanner_class and (scanner_class.can_handle(path) or os.path.exists(path)):
                 return scanner_class
@@ -282,6 +301,8 @@ class ScannerRegistry:
         # Manifest-like config files sometimes intentionally use generic or
         # missing extensions, so keep the descriptor-owned filename fallback.
         for scanner_id, scanner_info in sorted_scanners:
+            if scanner_selection is not None and not scanner_selection.allows(scanner_id):
+                continue
             if not self._is_content_routed_filename(filename, scanner_info):
                 continue
 
@@ -427,7 +448,7 @@ SCANNER_REGISTRY = _LazyList(_registry)
 # Export scanner classes with lazy loading
 def __getattr__(name: str) -> Any:
     """Lazy-load scanner classes from the registry's descriptor catalog."""
-    scanner_id = _registry._get_scanner_id_for_class(name)
+    scanner_id = _registry.get_scanner_id_for_class(name)
     if scanner_id is not None:
         scanner_class = _registry.load_scanner_by_id(scanner_id)
         if scanner_class:
@@ -442,7 +463,11 @@ def __getattr__(name: str) -> Any:
 # Helper function for getting scanner for a file
 def get_scanner_for_file(path: str, config: dict[str, Any] | None = None) -> BaseScanner | None:
     """Get an instantiated scanner for a given file path"""
-    scanner_class = _registry.get_scanner_for_path(path)
+    scanner_selection = policy_from_config(config)
+    scanner_class = _registry.get_scanner_for_path(
+        path,
+        scanner_selection=scanner_selection if scanner_selection.active else None,
+    )
     if scanner_class:
         return scanner_class(config=config)
     return None

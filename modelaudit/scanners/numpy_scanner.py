@@ -6,6 +6,7 @@ import sys
 import warnings
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
+from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, Issue, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 
@@ -63,6 +64,7 @@ class NumPyScanner(BaseScanner):
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
+        self.scanner_selection = policy_from_config(self.config)
         # Security limits
         self.max_array_bytes = self.config.get(
             "max_array_bytes",
@@ -108,6 +110,19 @@ class NumPyScanner(BaseScanner):
         context_path: str,
     ) -> ScanResult:
         """Reuse PickleScanner analysis for object-dtype NumPy payloads."""
+        if not self.scanner_selection.allows("pickle"):
+            result = ScanResult(scanner_name="scanner_selection")
+            result.bytes_scanned = payload_size
+            add_scanner_selection_skip_check(
+                result,
+                context_path,
+                "pickle",
+                self.scanner_selection,
+                context="embedded NumPy object pickle analysis",
+            )
+            result.finish(success=True)
+            return result
+
         pickle_scanner = PickleScanner(config=self.config)
         return pickle_scanner.scan_stream(
             file_obj,
@@ -401,16 +416,23 @@ class NumPyScanner(BaseScanner):
                             # Object-dtype .npy payloads are stored as a pickle stream rather than
                             # fixed-width element data, so the numeric dtype/size validation path
                             # is not applicable after we recurse into the embedded pickle payload.
+                            pickle_scan_skipped = embedded_result.scanner_name == "scanner_selection"
                             result.add_check(
                                 name="Data Type Safety Check",
                                 passed=True,
-                                message=f"Object dtype '{dtype}' handled via recursive pickle analysis",
+                                message=(
+                                    f"Object dtype '{dtype}' embedded pickle analysis skipped by scanner selection"
+                                    if pickle_scan_skipped
+                                    else f"Object dtype '{dtype}' handled via recursive pickle analysis"
+                                ),
                                 location=path,
                                 rule_code=None,
                                 details={
                                     "dtype": str(dtype),
                                     "dtype_kind": dtype.kind,
-                                    "handled_via": "embedded_pickle_scan",
+                                    "handled_via": (
+                                        "scanner_selection_skip" if pickle_scan_skipped else "embedded_pickle_scan"
+                                    ),
                                     "cve_id": self.CVE_2019_6446_ID,
                                 },
                             )

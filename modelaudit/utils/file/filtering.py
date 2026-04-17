@@ -3,6 +3,7 @@
 import logging
 import os
 import zipfile
+from collections.abc import Collection
 from pathlib import Path
 
 # Default extensions to skip when scanning directories
@@ -314,6 +315,7 @@ def should_skip_file(
     skip_filenames: set[str] | None = None,
     skip_hidden: bool = True,
     metadata_scanner_available: bool = True,
+    scanner_selection_extensions: Collection[str] | None = None,
 ) -> bool:
     """
     Check if a file should be skipped based on its extension or name.
@@ -324,6 +326,7 @@ def should_skip_file(
         skip_filenames: Set of filenames to skip (defaults to DEFAULT_SKIP_FILENAMES)
         skip_hidden: Whether to skip hidden files (starting with .)
         metadata_scanner_available: Whether metadata scanner is available to handle metadata files
+        scanner_selection_extensions: Selected scanner suffixes that should be preserved from default skips
 
     Returns:
         True if the file should be skipped
@@ -352,6 +355,11 @@ def should_skip_file(
         ext in metadata_extensions or filename.lower() in metadata_filenames or is_readme_txt
     ):
         return False
+
+    if use_default_skip_extensions and scanner_selection_extensions is not None:
+        selected_extensions = {candidate.lower() for candidate in scanner_selection_extensions}
+        if any(candidate in selected_extensions for candidate in candidate_extensions):
+            return False
 
     # Preserve scanner coverage for archive/metadata formats that are otherwise
     # part of the default skip list.
