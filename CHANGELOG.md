@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** detect extensionless protocol-0/1 pickle members during 7-Zip nested archive probes.
 - **pickle:** restore ModelAudit nested-pickle findings from Rust standalone notices and keep network raw-detector coverage after native pickle findings
 - **telemetry:** strip query strings, fragments, and URL userinfo from cloud model names and file-extension metadata
 - preserve `S999` unknown-opcode mapping in generic rule fallback

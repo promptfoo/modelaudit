@@ -1658,6 +1658,20 @@ class TestSevenZipScannerHardening:
 
         assert scanner._probe_detected_format(probe) == "tar"
 
+    def test_probe_detected_format_recognizes_extensionless_proto0_pickle(self) -> None:
+        """7z nested probes should route protocol-0 pickle members without suffixes."""
+        scanner = SevenZipScanner()
+        probe = io.BytesIO(b"cposix\nsystem\n(S'echo hidden'\ntR.")
+
+        assert scanner._probe_detected_format(probe) == "pickle"
+
+    def test_probe_detected_format_ignores_benign_proto0_near_match_text(self) -> None:
+        """Plain text that starts with proto0-looking bytes should not route as pickle."""
+        scanner = SevenZipScanner()
+        probe = io.BytesIO(b"cat is a category label, not a GLOBAL opcode stream")
+
+        assert scanner._probe_detected_format(probe) is None
+
     def test_extensionless_probe_without_header_is_not_scanned(
         self,
         scanner: SevenZipScanner,
