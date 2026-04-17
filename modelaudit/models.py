@@ -425,6 +425,7 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
     assets: list[AssetModel] = Field(default_factory=list, description="List of scanned assets")
     has_errors: bool = Field(..., description="Whether any critical issues were found")
     scanner_names: list[str] = Field(default_factory=list, description="Names of scanners used")
+    scanner_selection: dict[str, Any] | None = Field(default=None, description="Effective scanner selection policy")
     file_metadata: dict[str, FileMetadataModel] = Field(default_factory=dict, description="Metadata for each file")
     content_hash: str | None = Field(
         default=None, description="Aggregate SHA-256 hash of all scanned files (for deduplication)"
@@ -456,6 +457,9 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
         self.files_scanned += results_dict.get("files_scanned", 0)
         if results_dict.get("has_errors", False):
             self.has_errors = True
+        incoming_scanner_selection = results_dict.get("scanner_selection")
+        if self.scanner_selection is None and isinstance(incoming_scanner_selection, dict):
+            self.scanner_selection = incoming_scanner_selection
 
         incoming_issues = results_dict.get("issues", [])
         incoming_has_security_findings = (
@@ -543,6 +547,10 @@ class ModelAuditResultModel(BaseModel, DictCompatMixin):
             self.success = False
 
         if metadata:
+            scanner_selection = metadata.get("scanner_selection")
+            if self.scanner_selection is None and isinstance(scanner_selection, dict):
+                self.scanner_selection = scanner_selection
+
             metadata_dict = metadata.copy()
             if "ml_context" in metadata_dict and isinstance(metadata_dict["ml_context"], dict):
                 metadata_dict["ml_context"] = MLContextModel(**metadata_dict["ml_context"])
@@ -682,6 +690,7 @@ def create_audit_result_model(aggregated_results: dict[str, Any]) -> ModelAuditR
         assets=assets,
         has_errors=aggregated_results.get("has_errors", False),
         scanner_names=aggregated_results.get("scanner_names", []),
+        scanner_selection=aggregated_results.get("scanner_selection"),
         file_metadata=file_metadata,
         start_time=aggregated_results.get("start_time", 0.0),
         duration=aggregated_results.get("duration", 0.0),

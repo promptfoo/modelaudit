@@ -36,6 +36,14 @@ from .integrations.sarif_formatter import format_sarif_output
 from .models import ModelAuditResultModel
 from .rules import Rule, RuleRegistry, Severity
 from .scanner_results import IssueSeverity
+from .scanner_selection import (
+    SCANNER_SELECTION_CONFIG_KEY,
+    collect_suppressed_preferred_scanners,
+    policy_from_config,
+    scanner_catalog,
+    scanner_selection_config_from_inputs,
+    selected_scanner_extensions,
+)
 from .scanners.base import make_trusted_source_provenance
 from .telemetry import (
     flush_telemetry,
@@ -113,6 +121,9 @@ class _ScanRuntimeConfig:
     jfrog_api_token: str | None
     jfrog_access_token: str | None
     mlflow_registry_uri: str | None
+    scanner_selection: dict[str, Any] | None
+    scanner_selection_metadata: dict[str, Any] | None
+    scannable_extensions: frozenset[str] | None
 
 
 @dataclass
@@ -390,6 +401,8 @@ def _build_user_scan_overrides(
     strict: bool,
     verbose: bool,
     quiet: bool,
+    scanners: tuple[str, ...],
+    exclude_scanners: tuple[str, ...],
     scan_start_time: float,
 ) -> dict[str, Any]:
     """Normalize scan command flags into config overrides."""
@@ -431,6 +444,18 @@ def _build_user_scan_overrides(
     if quiet:
         user_overrides["verbose"] = False
 
+    if scanners or exclude_scanners:
+        try:
+            user_overrides[SCANNER_SELECTION_CONFIG_KEY] = scanner_selection_config_from_inputs(
+                scanners=scanners,
+                exclude_scanners=exclude_scanners,
+            )
+        except ValueError as exc:
+            click.echo(f"Error parsing scanner selection: {exc}", err=True)
+            record_scan_failed(time.time() - scan_start_time, f"Invalid scanner selection: {exc}")
+            flush_telemetry()
+            sys.exit(2)
+
     return user_overrides
 
 
@@ -449,6 +474,8 @@ def _resolve_scan_runtime_config(
     strict: bool,
     verbose: bool,
     quiet: bool,
+    scanners: tuple[str, ...],
+    exclude_scanners: tuple[str, ...],
     suppress: tuple[str, ...],
     severity: tuple[str, ...],
     scan_start_time: float,
@@ -467,6 +494,8 @@ def _resolve_scan_runtime_config(
         strict=strict,
         verbose=verbose,
         quiet=quiet,
+        scanners=scanners,
+        exclude_scanners=exclude_scanners,
         scan_start_time=scan_start_time,
     )
     config_values = apply_auto_overrides(user_overrides, auto_defaults)
@@ -502,6 +531,12 @@ def _resolve_scan_runtime_config(
         with contextlib.suppress(ValueError):
             max_download_bytes = parse_size_string(max_size)
 
+    scanner_selection = config_values.get(SCANNER_SELECTION_CONFIG_KEY)
+    scanner_policy = policy_from_config(config_values)
+    scannable_extensions = (
+        selected_scanner_extensions(scanner_policy, conservative=True) if scanner_policy.active else None
+    )
+
     return _ScanRuntimeConfig(
         config=config_values,
         timeout=config_values.get("timeout", 3600),
@@ -522,7 +557,17 @@ def _resolve_scan_runtime_config(
         jfrog_api_token=os.getenv("JFROG_API_TOKEN"),
         jfrog_access_token=os.getenv("JFROG_ACCESS_TOKEN"),
         mlflow_registry_uri=os.getenv("MLFLOW_TRACKING_URI"),
+        scanner_selection=scanner_selection if isinstance(scanner_selection, dict) else None,
+        scanner_selection_metadata=scanner_policy.to_metadata() if scanner_policy.active else None,
+        scannable_extensions=scannable_extensions,
     )
+
+
+def _scanner_selection_overrides(runtime: _ScanRuntimeConfig) -> dict[str, Any]:
+    """Return config kwargs needed to preserve scanner selection across scan paths."""
+    if runtime.scanner_selection is None:
+        return {}
+    return {SCANNER_SELECTION_CONFIG_KEY: runtime.scanner_selection}
 
 
 def _show_scan_runtime_defaults(
@@ -745,6 +790,72 @@ def _emit_scan_output(
     click.echo(output_text)
 
 
+def _format_scanner_catalog(output_format: str) -> str:
+    """Render registered scanners for CLI discovery."""
+    scanners = scanner_catalog()
+    if output_format == "json":
+        return json.dumps({"scanners": scanners}, indent=2)
+
+    lines = ["Registered scanners:"]
+    for scanner in scanners:
+        extensions = ", ".join(scanner["extensions"]) if scanner["extensions"] else "-"
+        dependencies = ", ".join(scanner["dependencies"]) if scanner["dependencies"] else "-"
+        lines.extend(
+            [
+                f"{scanner['id']} ({scanner['class']})",
+                f"  extensions: {extensions}",
+                f"  dependencies: {dependencies}",
+                f"  {scanner['description']}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _emit_scanner_catalog(*, output_format: str, output: str | None) -> None:
+    """Write scanner discovery output to a file or stdout."""
+    if output_format == "sarif":
+        click.echo("Error: --list-scanners supports text or json output, not sarif", err=True)
+        sys.exit(2)
+
+    output_text = _format_scanner_catalog(output_format)
+    if output:
+        with open(output, "w", encoding="utf-8") as output_file:
+            output_file.write(output_text)
+            output_file.write("\n")
+        return
+    click.echo(output_text)
+
+
+def _announce_suppressed_preferred_scanners(suppressions: list[dict[str, Any]]) -> None:
+    """Print a stderr warning summarizing preferred scanners suppressed by selection."""
+    suppressed_ids = sorted({entry["scanner_id"] for entry in suppressions})
+    click.echo(
+        "Warning: scanner selection suppressed the preferred scanner(s) for "
+        f"{len(suppressions)} file(s): {', '.join(suppressed_ids)}. "
+        "These files were not analyzed by the scanner that routing would normally pick; "
+        "rerun without --scanners/--exclude-scanner or widen the selection to close the gap.",
+        err=True,
+    )
+    for entry in suppressions[:5]:
+        click.echo(f"  - {entry['location']} (would have used: {entry['scanner_id']})", err=True)
+    if len(suppressions) > 5:
+        click.echo(f"  … and {len(suppressions) - 5} more", err=True)
+
+
+def _record_suppressed_preferred_scanners(audit_result: ModelAuditResultModel) -> list[dict[str, Any]]:
+    """Populate audit metadata with preferred-scanner suppressions and return them."""
+    suppressions = collect_suppressed_preferred_scanners(audit_result.checks or [])
+    if not suppressions:
+        return suppressions
+
+    if audit_result.scanner_selection is None:
+        audit_result.scanner_selection = {}
+    audit_result.scanner_selection["suppressed_preferred_scanner_ids"] = sorted(
+        {entry["scanner_id"] for entry in suppressions}
+    )
+    return suppressions
+
+
 def _record_scan_end_and_exit(audit_result: ModelAuditResultModel, scan_start_time: float) -> NoReturn:
     """Record final telemetry and exit with the scan result's status code."""
     scan_duration = time.time() - scan_start_time
@@ -902,6 +1013,7 @@ def _scan_local_or_downloaded_path(
                 use_hf_whitelist=runtime.use_hf_whitelist,
                 cache_enabled=runtime.cache_enabled,
                 cache_dir=runtime.cache_dir,
+                **_scanner_selection_overrides(runtime),
             )
             audit_result.aggregate_scan_result(streaming_result.model_dump())
             path_state.track_streaming_paths_for_sbom(streaming_result, actual_path)
@@ -917,6 +1029,7 @@ def _scan_local_or_downloaded_path(
             "progress_update_interval": 2.0,
             "cache_enabled": runtime.cache_enabled,
             "cache_dir": runtime.cache_dir,
+            **_scanner_selection_overrides(runtime),
         }
         if source_result.source_model_id and source_result.source_model_source == "huggingface":
             config_overrides["_trusted_source_provenance"] = make_trusted_source_provenance(
@@ -1132,6 +1245,7 @@ def _resolve_scan_source_for_path(
                 streaming_kwargs: dict[str, Any] = {}
                 if trusted_source_provenance is not None:
                     streaming_kwargs["_trusted_source_provenance"] = trusted_source_provenance
+                streaming_kwargs.update(_scanner_selection_overrides(runtime))
 
                 streaming_result = scan_model_streaming(
                     file_generator=file_generator,
@@ -1249,6 +1363,7 @@ def _resolve_scan_source_for_path(
                     use_hf_whitelist=runtime.use_hf_whitelist,
                     cache_enabled=runtime.cache_enabled,
                     cache_dir=runtime.cache_dir,
+                    **_scanner_selection_overrides(runtime),
                 )
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
                 audit_result.aggregate_scan_result(streaming_result.model_dump())
@@ -1331,7 +1446,10 @@ def _resolve_scan_source_for_path(
                     if runtime.selective_download:
                         from .utils.sources.cloud_storage import filter_scannable_files
 
-                        scannable = filter_scannable_files(metadata.get("files", []))
+                        scannable = filter_scannable_files(
+                            metadata.get("files", []),
+                            scannable_extensions=runtime.scannable_extensions,
+                        )
                         click.echo(f"   Scannable files: {len(scannable)} of {metadata.get('file_count', 0)}")
 
                 return _SourceDispatchResult(actual_path=path, local_scan_required=False)
@@ -1353,12 +1471,16 @@ def _resolve_scan_source_for_path(
                 if runtime.show_styled_output:
                     click.echo(style_text("🔄 Starting streaming scan from cloud storage...", fg="cyan"))
 
+                cloud_stream_kwargs: dict[str, Any] = {}
+                if runtime.scannable_extensions is not None:
+                    cloud_stream_kwargs["scannable_extensions"] = runtime.scannable_extensions
                 file_generator = download_from_cloud_streaming(
                     path,
                     cache_dir=Path(runtime.cache_dir) if runtime.cache_dir else None,
                     max_size=runtime.max_download_bytes,
                     show_progress=runtime.show_progress,
                     selective=runtime.selective_download,
+                    **cloud_stream_kwargs,
                 )
                 streaming_result = scan_model_streaming(
                     file_generator=file_generator,
@@ -1372,6 +1494,7 @@ def _resolve_scan_source_for_path(
                     use_hf_whitelist=runtime.use_hf_whitelist,
                     cache_enabled=runtime.cache_enabled,
                     cache_dir=runtime.cache_dir,
+                    **_scanner_selection_overrides(runtime),
                 )
                 path_state.track_streaming_paths_for_sbom(streaming_result, path)
                 audit_result.aggregate_scan_result(streaming_result.model_dump())
@@ -1389,6 +1512,9 @@ def _resolve_scan_source_for_path(
             elif runtime.show_styled_output:
                 click.echo(f"Downloading from {redact_url_for_display(path)}...")
 
+            cloud_download_kwargs: dict[str, Any] = {}
+            if runtime.scannable_extensions is not None:
+                cloud_download_kwargs["scannable_extensions"] = runtime.scannable_extensions
             download_path = download_from_cloud(  # type: ignore[assignment]
                 path,
                 cache_dir=Path(runtime.cache_dir) if runtime.cache_dir else None,
@@ -1397,6 +1523,7 @@ def _resolve_scan_source_for_path(
                 show_progress=verbose,
                 selective=runtime.selective_download,
                 stream_analyze=runtime.stream_analysis,
+                **cloud_download_kwargs,
             )
             download_duration = time.time() - download_start
             try:
@@ -1465,6 +1592,7 @@ def _resolve_scan_source_for_path(
                 cache_enabled=runtime.cache_enabled,
                 cache_dir=runtime.cache_dir,
                 use_hf_whitelist=runtime.use_hf_whitelist,
+                **_scanner_selection_overrides(runtime),
             )
 
             if download_spinner:
@@ -1503,6 +1631,9 @@ def _resolve_scan_source_for_path(
             record_feature_used("jfrog_download")
             download_start = time.time()
 
+            jfrog_scan_kwargs: dict[str, Any] = {}
+            if runtime.scannable_extensions is not None:
+                jfrog_scan_kwargs["scannable_extensions"] = runtime.scannable_extensions
             jfrog_results: ModelAuditResultModel = scan_jfrog_artifact(
                 path,
                 api_token=runtime.jfrog_api_token,
@@ -1517,6 +1648,8 @@ def _resolve_scan_source_for_path(
                 cache_dir=runtime.cache_dir,
                 selective_download=runtime.selective_download,
                 use_hf_whitelist=runtime.use_hf_whitelist,
+                **jfrog_scan_kwargs,
+                **_scanner_selection_overrides(runtime),
             )
 
             if download_spinner:
@@ -1955,7 +2088,7 @@ def delegate_info() -> None:
 
 
 @cli.command("scan")
-@click.argument("paths", nargs=-1, type=str, required=True)
+@click.argument("paths", nargs=-1, type=str, required=False)
 # Core output control (4 flags)
 @click.option(
     "--format",
@@ -1999,6 +2132,22 @@ def delegate_info() -> None:
     "-S",
     multiple=True,
     help="Override rule severities, format CODE=LEVEL (e.g., S101=CRITICAL). Can be specified multiple times.",
+)
+@click.option(
+    "--scanners",
+    multiple=True,
+    help="Only run the selected scanners (comma-separated or repeat the flag). Accepts scanner IDs or class names.",
+)
+@click.option(
+    "--exclude-scanner",
+    "exclude_scanners",
+    multiple=True,
+    help="Exclude scanners from the active scanner set (comma-separated or repeat the flag).",
+)
+@click.option(
+    "--list-scanners",
+    is_flag=True,
+    help="List registered scanner IDs, class names, extensions, and dependencies, then exit.",
 )
 # Progress & reporting (2 flags)
 @click.option(
@@ -2055,6 +2204,9 @@ def scan_command(
     no_whitelist: bool,
     suppress: tuple[str, ...],
     severity: tuple[str, ...],
+    scanners: tuple[str, ...],
+    exclude_scanners: tuple[str, ...],
+    list_scanners: bool,
     progress: bool,
     sbom: str | None,
     timeout: int | None,
@@ -2101,6 +2253,19 @@ def scan_command(
         2 - Errors occurred during scanning
     """
     scan_start_time = time.time()
+    if list_scanners:
+        output_format = format or "text"
+        _emit_scanner_catalog(output_format=output_format, output=output)
+        record_command_used("scan", duration=time.time() - scan_start_time, list_scanners=True, format=output_format)
+        flush_telemetry()
+        return
+
+    if not paths:
+        click.echo("Error: Missing argument 'PATHS...'.", err=True)
+        record_scan_failed(time.time() - scan_start_time, "No paths provided")
+        flush_telemetry()
+        sys.exit(2)
+
     # Telemetry options - only include non-sensitive data
     # DO NOT include actual blacklist patterns or file paths - only counts
     telemetry_options = {
@@ -2117,6 +2282,7 @@ def scan_command(
         "strict": strict,
         "no_whitelist": no_whitelist,
         "dry_run": dry_run,
+        "has_scanner_selection": bool(scanners or exclude_scanners),
         "num_paths": len(paths),
     }
 
@@ -2138,6 +2304,8 @@ def scan_command(
         strict=strict,
         verbose=verbose,
         quiet=quiet,
+        scanners=scanners,
+        exclude_scanners=exclude_scanners,
         suppress=suppress,
         severity=severity,
         scan_start_time=scan_start_time,
@@ -2161,6 +2329,8 @@ def scan_command(
     from .models import create_initial_audit_result
 
     audit_result = create_initial_audit_result()
+    if runtime.scanner_selection_metadata is not None:
+        audit_result.scanner_selection = dict(runtime.scanner_selection_metadata)
     path_state = _ScanPathState()
 
     # Scan each path with interrupt handling
@@ -2245,6 +2415,9 @@ def scan_command(
     )
     _cleanup_temp_artifacts(path_state.temp_cleanup_entries, verbose=verbose)
 
+    suppressions = _record_suppressed_preferred_scanners(audit_result)
+    if suppressions:
+        _announce_suppressed_preferred_scanners(suppressions)
     output_text = _format_scan_output(
         audit_result,
         expanded_paths,

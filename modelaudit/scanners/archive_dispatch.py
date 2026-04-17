@@ -6,6 +6,12 @@ from typing import Any
 
 from ..scanner_registry_metadata import get_scanner_registry_metadata
 from ..scanner_results import ScanResult
+from ..scanner_selection import (
+    SCANNER_SELECTION_PREFERRED_KIND,
+    add_scanner_selection_skip_check,
+    make_scanner_selection_skip_result,
+    policy_from_config,
+)
 from ..utils.file.detection import (
     detect_file_format,
     is_executorch_archive,
@@ -94,20 +100,49 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
     """Scan an extracted archive member without importing `modelaudit.core`."""
     from . import _registry
 
+    scanner_selection = policy_from_config(config)
     scanner_class = None
     scanner_id = _select_nested_scanner_id(path)
-    if scanner_id:
+    skipped_preferred_scanner_id: str | None = None
+    if scanner_id and scanner_selection.allows(scanner_id):
         scanner_class = _registry.load_scanner_by_id(scanner_id)
         if scanner_class and not _nested_scanner_can_handle(scanner_class, scanner_id, path):
             scanner_class = None
+    elif scanner_id:
+        skipped_preferred_scanner_id = scanner_id
 
     if scanner_class is None:
-        scanner_class = _registry.get_scanner_for_path(path)
+        if scanner_selection.active:
+            scanner_class = _registry.get_scanner_for_path(path, scanner_selection=scanner_selection)
+        else:
+            scanner_class = _registry.get_scanner_for_path(path)
 
     if scanner_class is None:
+        if scanner_selection.active:
+            candidate_scanner_id = skipped_preferred_scanner_id
+            if candidate_scanner_id is None:
+                candidate_scanner_class = _registry.get_scanner_for_path(path)
+                if candidate_scanner_class:
+                    candidate_scanner_id = (
+                        _registry.get_scanner_id_for_class(candidate_scanner_class.__name__)
+                        or candidate_scanner_class.name
+                    )
+            if candidate_scanner_id and not scanner_selection.allows(candidate_scanner_id):
+                return make_scanner_selection_skip_result(path, candidate_scanner_id, scanner_selection)
+
         result = ScanResult(scanner_name="unknown")
         result.finish(success=True)
         return result
 
     scanner = scanner_class(config=config)
-    return scanner.scan_with_cache(path)
+    result = scanner.scan_with_cache(path)
+    if skipped_preferred_scanner_id:
+        add_scanner_selection_skip_check(
+            result,
+            path,
+            skipped_preferred_scanner_id,
+            scanner_selection,
+            context="preferred nested scanner",
+            kind=SCANNER_SELECTION_PREFERRED_KIND,
+        )
+    return result

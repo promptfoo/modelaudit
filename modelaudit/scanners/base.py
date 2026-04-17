@@ -71,6 +71,10 @@ _WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES: Final[frozenset[str]] = frozenset(
         "S108",
         "S109",
         "S110",
+        "S111",
+        "S112",
+        "S113",
+        "S114",
         "S115",
         # S3xx — HIGH-severity active network primitives (raw sockets, ftp, telnet,
         # exfiltration). HTTP/SMTP/DNS/IP/URL codes stay eligible for downgrade since

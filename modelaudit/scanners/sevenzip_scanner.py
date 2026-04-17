@@ -14,7 +14,7 @@ else:
     _py7zr = None
 
 from ..utils import sanitize_archive_path
-from ..utils.file.detection import detect_format_from_magic_bytes
+from ..utils.file.detection import _looks_like_proto0_or_1_pickle, detect_format_from_magic_bytes
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
@@ -623,6 +623,9 @@ class SevenZipScanner(BaseScanner):
         prefix = probe.read(self._NESTED_MEMBER_PROBE_BYTES)
         if len(prefix) < 4:
             return None
+
+        if _looks_like_proto0_or_1_pickle(prefix, sample_is_prefix=len(prefix) == self._NESTED_MEMBER_PROBE_BYTES):
+            return "pickle"
 
         detected_format = detect_format_from_magic_bytes(
             prefix[:4],

@@ -904,7 +904,7 @@ def test_whitelist_no_downgrade_non_whitelisted_hf_cache_model(
     assert result.issues[0].details.get("whitelist_downgrade") is None
 
 
-def test_whitelist_downgrade_check_critical():
+def test_whitelist_downgrade_check_critical() -> None:
     """Test that whitelisted models have critical checks downgraded to INFO."""
     from modelaudit.whitelists import POPULAR_MODELS
 
@@ -986,6 +986,10 @@ def test_whitelist_downgrade_check_critical():
         ("runpy", "Suspicious code pattern detected: runpy.run_module", "S108", {}, IssueSeverity.CRITICAL),
         ("webbrowser", "Suspicious code pattern detected: webbrowser.open", "S109", {}, IssueSeverity.CRITICAL),
         ("ctypes", "Suspicious code pattern detected: ctypes.CDLL", "S110", {}, IssueSeverity.WARNING),
+        ("pty", "Suspicious code pattern detected: pty.spawn", "S111", {}, IssueSeverity.CRITICAL),
+        ("code", "Suspicious code pattern detected: code.InteractiveConsole", "S112", {}, IssueSeverity.CRITICAL),
+        ("types", "Suspicious code pattern detected: types.FunctionType", "S113", {}, IssueSeverity.WARNING),
+        ("ast", "Suspicious code pattern detected: ast.parse", "S114", {}, IssueSeverity.WARNING),
         ("builtins access", "Suspicious code pattern detected: __builtins__", "S115", {}, IssueSeverity.WARNING),
         # S3xx active network primitives at HIGH severity. Lower-severity HTTP/SMTP/DNS
         # codes are intentionally omitted so policy-grade findings remain downgradeable.

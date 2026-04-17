@@ -12,6 +12,7 @@ from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
+from .archive_member_security import scan_archive_member_for_known_risks
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -571,6 +572,17 @@ class ZipScanner(BaseScanner):
                                 result.merge(mar_python_result)
                                 if not mar_python_result.success:
                                     scan_complete = False
+                        else:
+                            scan_archive_member_for_known_risks(
+                                archive_kind="ZIP",
+                                archive_path=path,
+                                member_name=name,
+                                tmp_path=tmp_path,
+                                total_size=total_size,
+                                result=result,
+                                max_python_analysis_bytes=self._max_python_member_analysis_bytes(),
+                                python_analysis_incomplete_reason="zip_python_member_analysis_incomplete",
+                            )
 
                         nested_config = dict(self.config)
                         nested_config["_archive_depth"] = depth + 1
@@ -619,8 +631,15 @@ class ZipScanner(BaseScanner):
         result.metadata["file_size"] = os.path.getsize(path)
         if not scan_complete:
             mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
-        result.finish(success=scan_complete and not result.has_errors)
+        result.finish(success=scan_complete and not member_scan_incomplete(result) and not result.has_errors)
         return result
+
+    def _max_python_member_analysis_bytes(self) -> int:
+        """Resolve the bounded-AST-analysis cap, honoring the config override."""
+        configured = self.config.get("max_mar_python_analysis_bytes", self.MAX_MAR_PYTHON_ANALYSIS_BYTES)
+        if isinstance(configured, bool) or not isinstance(configured, int) or configured <= 0:
+            return self.MAX_MAR_PYTHON_ANALYSIS_BYTES
+        return configured
 
     def _scan_mar_python_entry(
         self,
@@ -630,9 +649,7 @@ class ZipScanner(BaseScanner):
         entry_size: int,
     ) -> ScanResult | None:
         """Apply TorchServe-style Python handler analysis for manifest-less `.mar` fallback."""
-        max_analysis_bytes = self.config.get("max_mar_python_analysis_bytes", self.MAX_MAR_PYTHON_ANALYSIS_BYTES)
-        if isinstance(max_analysis_bytes, bool) or not isinstance(max_analysis_bytes, int) or max_analysis_bytes <= 0:
-            max_analysis_bytes = self.MAX_MAR_PYTHON_ANALYSIS_BYTES
+        max_analysis_bytes = self._max_python_member_analysis_bytes()
 
         if entry_size > max_analysis_bytes:
             result = ScanResult(scanner_name=self.name)
