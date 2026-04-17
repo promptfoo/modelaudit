@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from ..detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
+from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils import sanitize_archive_path
 from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTES, _looks_like_proto0_or_1_pickle
 from .archive_member_security import is_executable_archive_member_name
@@ -229,8 +230,8 @@ class PyTorchZipScanner(BaseScanner):
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
-        # Initialize a pickle scanner for embedded pickles
-        self.pickle_scanner: PickleScanner = PickleScanner(config)
+        pickle_scanner, self.scanner_selection = embedded_pickle_scanner(self.config, PickleScanner)
+        self.pickle_scanner: PickleScanner | None = pickle_scanner
         self.current_file_path = ""  # Will be set when scanning files
         self._relaxed_crc_tracker = RelaxedZipCrcTracker()
         # Configurable limits (can override class defaults via config)
@@ -964,11 +965,22 @@ class PyTorchZipScanner(BaseScanner):
         for info in pickle_files:
             name = self._get_zip_member_name(info)
             pickle_data_size = info.file_size
+            pickle_source = f"{path}:{name}"
+
+            if self.pickle_scanner is None:
+                bytes_scanned += pickle_data_size
+                add_scanner_selection_skip_check(
+                    result,
+                    pickle_source,
+                    "pickle",
+                    self.scanner_selection,
+                    context="embedded PyTorch pickle analysis",
+                )
+                continue
 
             # Choose scanning approach based on file size with spooling for seekability
             cfg = self.config or {}
             max_in_mem = int(cfg.get("pickle_max_memory_read", 32 * 1024 * 1024))  # 32MB default
-            pickle_source = f"{path}:{name}"
             if pickle_data_size <= max_in_mem:
                 data = self._read_member_bytes(
                     zip_file,

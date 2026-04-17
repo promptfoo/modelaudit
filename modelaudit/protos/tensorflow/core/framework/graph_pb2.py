@@ -7,7 +7,6 @@
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import runtime_version as _runtime_version
-from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
 _runtime_version.ValidateProtobufRuntimeVersion(
     _runtime_version.Domain.PUBLIC,
@@ -19,7 +18,7 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 )
 # @@protoc_insertion_point(imports)
 
-_sym_db = _symbol_database.Default()
+
 
 
 from tensorflow.core.framework import function_pb2 as tensorflow_dot_core_dot_framework_dot_function__pb2
@@ -28,7 +27,6 @@ from tensorflow.core.framework import node_def_pb2 as tensorflow_dot_core_dot_fr
 from tensorflow.core.framework import versions_pb2 as tensorflow_dot_core_dot_framework_dot_versions__pb2
 
 # Keep generated dependency imports for descriptor registration side effects.
-del _sym_db
 del tensorflow_dot_core_dot_framework_dot_function__pb2
 del tensorflow_dot_core_dot_framework_dot_graph__debug__info__pb2
 del tensorflow_dot_core_dot_framework_dot_node__def__pb2

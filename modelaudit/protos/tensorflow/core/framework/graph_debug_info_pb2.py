@@ -7,7 +7,6 @@
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import runtime_version as _runtime_version
-from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
 _runtime_version.ValidateProtobufRuntimeVersion(
     _runtime_version.Domain.PUBLIC,
@@ -18,11 +17,6 @@ _runtime_version.ValidateProtobufRuntimeVersion(
     'tensorflow/core/framework/graph_debug_info.proto'
 )
 # @@protoc_insertion_point(imports)
-
-_sym_db = _symbol_database.Default()
-
-# Keep generated dependency imports for descriptor registration side effects.
-del _sym_db
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n0tensorflow/core/framework/graph_debug_info.proto\x12\ntensorflow\"\xa3\x06\n\x0eGraphDebugInfo\x12\r\n\x05\x66iles\x18\x01 \x03(\t\x12@\n\x0c\x66rames_by_id\x18\x04 \x03(\x0b\x32*.tensorflow.GraphDebugInfo.FramesByIdEntry\x12@\n\x0ctraces_by_id\x18\x06 \x03(\x0b\x32*.tensorflow.GraphDebugInfo.TracesByIdEntry\x12\x36\n\x06traces\x18\x02 \x03(\x0b\x32&.tensorflow.GraphDebugInfo.TracesEntry\x12G\n\x10name_to_trace_id\x18\x05 \x03(\x0b\x32-.tensorflow.GraphDebugInfo.NameToTraceIdEntry\x1aX\n\x0b\x46ileLineCol\x12\x12\n\nfile_index\x18\x01 \x01(\x05\x12\x0c\n\x04line\x18\x02 \x01(\x05\x12\x0b\n\x03\x63ol\x18\x03 \x01(\x05\x12\x0c\n\x04\x66unc\x18\x04 \x01(\t\x12\x0c\n\x04\x63ode\x18\x05 \x01(\t\x1a\x62\n\nStackTrace\x12>\n\x0e\x66ile_line_cols\x18\x01 \x03(\x0b\x32&.tensorflow.GraphDebugInfo.FileLineCol\x12\x14\n\x08\x66rame_id\x18\x02 \x03(\x06\x42\x02\x10\x01\x1aY\n\x0f\x46ramesByIdEntry\x12\x0b\n\x03key\x18\x01 \x01(\x06\x12\x35\n\x05value\x18\x02 \x01(\x0b\x32&.tensorflow.GraphDebugInfo.FileLineCol:\x02\x38\x01\x1aX\n\x0fTracesByIdEntry\x12\x0b\n\x03key\x18\x01 \x01(\x06\x12\x34\n\x05value\x18\x02 \x01(\x0b\x32%.tensorflow.GraphDebugInfo.StackTrace:\x02\x38\x01\x1aT\n\x0bTracesEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\x34\n\x05value\x18\x02 \x01(\x0b\x32%.tensorflow.GraphDebugInfo.StackTrace:\x02\x38\x01\x1a\x34\n\x12NameToTraceIdEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x06:\x02\x38\x01\x42\x8c\x01\n\x18org.tensorflow.frameworkB\x14GraphDebugInfoProtosP\x01ZUgithub.com/tensorflow/tensorflow/tensorflow/go/core/protobuf/for_core_protos_go_proto\xf8\x01\x01')
 
 _globals = globals()

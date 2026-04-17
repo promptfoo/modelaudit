@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import tempfile
+from collections.abc import Collection
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, TypedDict
 from urllib.parse import urlparse, urlunparse
@@ -337,8 +338,12 @@ def format_size(size_bytes: int) -> str:
     return f"{size:.1f} PB"
 
 
-def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def filter_scannable_files(
+    files: list[dict[str, Any]],
+    scannable_extensions: Collection[str] | None = None,
+) -> list[dict[str, Any]]:
     """Filter files to only include scannable model types."""
+    extensions = SCANNABLE_MODEL_EXTENSIONS if scannable_extensions is None else frozenset(scannable_extensions)
     scannable = []
     for file in files:
         file_path = file["path"]
@@ -354,8 +359,11 @@ def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
             path = Path(file_path)
 
         suffixes = [s.lower() for s in path.suffixes]
+        if not suffixes and "" in extensions:
+            scannable.append(file)
+            continue
         for i in range(1, len(suffixes) + 1):
-            if "".join(suffixes[-i:]) in SCANNABLE_MODEL_EXTENSIONS:
+            if "".join(suffixes[-i:]) in extensions:
                 scannable.append(file)
                 break
     return scannable
@@ -450,6 +458,7 @@ def list_jfrog_folder_contents(
     recursive: bool = True,
     selective: bool = True,
     fetch_sizes: bool = False,
+    scannable_extensions: Collection[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Recursively list all files in a JFrog folder.
 
@@ -535,7 +544,7 @@ def list_jfrog_folder_contents(
     _collect_files(base_url)
 
     if selective:
-        files = filter_scannable_files(files)
+        files = filter_scannable_files(files, scannable_extensions=scannable_extensions)
 
     return files
 
@@ -549,6 +558,7 @@ def download_jfrog_folder(
     selective: bool = True,
     show_progress: bool = True,
     fetch_sizes: bool = False,
+    scannable_extensions: Collection[str] | None = None,
 ) -> Path:
     """Download all files from a JFrog folder.
 
@@ -574,8 +584,18 @@ def download_jfrog_folder(
         raise ValueError(f"Not a JFrog URL: {display_url}")
 
     # List all files in the folder
+    list_kwargs: dict[str, Any] = {}
+    if scannable_extensions is not None:
+        list_kwargs["scannable_extensions"] = scannable_extensions
     files = list_jfrog_folder_contents(
-        url, api_token, access_token, timeout, recursive=True, selective=selective, fetch_sizes=fetch_sizes
+        url,
+        api_token,
+        access_token,
+        timeout,
+        recursive=True,
+        selective=selective,
+        fetch_sizes=fetch_sizes,
+        **list_kwargs,
     )
 
     if not files:

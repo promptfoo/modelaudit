@@ -7,6 +7,7 @@ import logging
 import shutil
 import tempfile
 import time
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,7 @@ def scan_jfrog_artifact(
     max_file_size: int = 0,
     max_total_size: int = 0,
     selective_download: bool = True,
+    scannable_extensions: Collection[str] | None = None,
     **kwargs: Any,
 ) -> ModelAuditResultModel:
     """Download and scan an artifact or folder from JFrog Artifactory.
@@ -121,6 +123,9 @@ def scan_jfrog_artifact(
             )
         else:
             logger.debug(f"Downloading JFrog folder {display_url} to {download_dir}")
+            folder_download_kwargs: dict[str, Any] = {}
+            if scannable_extensions is not None:
+                folder_download_kwargs["scannable_extensions"] = scannable_extensions
             download_path = download_jfrog_folder(
                 url,
                 cache_dir=download_dir,
@@ -129,6 +134,7 @@ def scan_jfrog_artifact(
                 timeout=timeout,
                 selective=selective_download,
                 show_progress=True,
+                **folder_download_kwargs,
             )
 
         # Calculate remaining timeout for scanning phase
