@@ -14,6 +14,7 @@ from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
+from .archive_member_security import scan_archive_member_for_known_risks
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -34,6 +35,7 @@ DEFAULT_MAX_TAR_ENTRY_SIZE = 1024 * 1024 * 1024
 DEFAULT_MAX_DECOMPRESSED_BYTES = 512 * 1024 * 1024
 DEFAULT_MAX_DECOMPRESSION_RATIO = 250.0
 ARCHIVE_MEMBER_COPY_CHUNK_BYTES = 64 * 1024
+MAX_TAR_PYTHON_ANALYSIS_BYTES = 10 * 1024 * 1024
 
 _GZIP_MAGIC = b"\x1f\x8b"
 _BZIP2_MAGIC = b"BZh"
@@ -586,6 +588,17 @@ class TarScanner(BaseScanner):
                             result.merge(nested_result)
                             asset_entry = asset_from_scan_result(f"{path}:{name}", nested_result)
                         else:
+                            scan_archive_member_for_known_risks(
+                                archive_kind="TAR",
+                                archive_path=path,
+                                member_name=name,
+                                tmp_path=tmp_path,
+                                total_size=total_size,
+                                result=result,
+                                max_python_analysis_bytes=MAX_TAR_PYTHON_ANALYSIS_BYTES,
+                                python_analysis_incomplete_reason="tar_python_member_analysis_incomplete",
+                            )
+
                             nested_config = dict(self.config)
                             nested_config["_archive_depth"] = depth + 1
                             file_result = self._scan_nested_archive_entry(tmp_path, nested_config)
@@ -623,5 +636,5 @@ class TarScanner(BaseScanner):
         result.metadata["file_size"] = os.path.getsize(path)
         if not scan_complete:
             mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
-        result.finish(success=scan_complete and not result.has_errors)
+        result.finish(success=scan_complete and not member_scan_incomplete(result) and not result.has_errors)
         return result
