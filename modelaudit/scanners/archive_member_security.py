@@ -92,7 +92,8 @@ class PythonArchiveMemberParseError(Exception):
     """Raised when Python member security analysis cannot parse source."""
 
 
-_AliasScope = dict[str, str | None]
+_AliasValue = frozenset[str] | None
+_AliasScope = dict[str, _AliasValue]
 _AliasScopes = list[_AliasScope]
 _MISSING_ALIAS = object()
 
@@ -121,31 +122,32 @@ def _resolve_call_name(node: ast.AST) -> str | None:
     return None
 
 
-def _resolve_alias(name: str, alias_scopes: _AliasScopes) -> str | None:
+def _resolve_aliases(name: str, alias_scopes: _AliasScopes) -> _AliasValue:
     for aliases in reversed(alias_scopes):
         if name in aliases:
             return aliases[name]
-    return name
+    return frozenset({name})
 
 
-def _apply_alias(call_name: str, alias_scopes: _AliasScopes) -> str | None:
+def _apply_aliases(call_name: str, alias_scopes: _AliasScopes) -> frozenset[str] | None:
     head, *tail = call_name.split(".")
-    resolved_head = _resolve_alias(head, alias_scopes)
-    if resolved_head is None:
+    resolved_heads = _resolve_aliases(head, alias_scopes)
+    if resolved_heads is None:
         return None
     if not tail:
-        return resolved_head
-    return ".".join([resolved_head, *tail])
+        return resolved_heads
+    suffix = ".".join(tail)
+    return frozenset(f"{resolved_head}.{suffix}" for resolved_head in resolved_heads)
 
 
-def _resolve_getattr_call_name(node: ast.AST, alias_scopes: _AliasScopes) -> str | None:
+def _resolve_getattr_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
     # Only literal-string attribute names are resolved. Payloads that build the
     # attribute name at runtime (``getattr(os, "sys" + "tem")``) need constant
     # folding we deliberately do not perform here — the complexity is not
     # worth chasing every string-arithmetic trick, and such payloads typically
     # still trip pickle or runtime detectors elsewhere in the pipeline.
     if isinstance(node, ast.Attribute) and node.attr == "__call__":
-        return _resolve_getattr_call_name(node.value, alias_scopes)
+        return _resolve_getattr_call_names(node.value, alias_scopes)
 
     if not isinstance(node, ast.Call):
         return None
@@ -154,8 +156,8 @@ def _resolve_getattr_call_name(node: ast.AST, alias_scopes: _AliasScopes) -> str
     if helper_name is None:
         return None
 
-    resolved_helper_name = _apply_alias(helper_name, alias_scopes)
-    if resolved_helper_name not in {"getattr", "builtins.getattr"}:
+    resolved_helper_names = _apply_aliases(helper_name, alias_scopes)
+    if resolved_helper_names is None or not (resolved_helper_names & {"getattr", "builtins.getattr"}):
         return None
 
     target_root_node: ast.AST | None = node.args[0] if node.args else None
@@ -176,17 +178,17 @@ def _resolve_getattr_call_name(node: ast.AST, alias_scopes: _AliasScopes) -> str
     if not isinstance(attr_name_node, ast.Constant) or not isinstance(attr_name_node.value, str):
         return None
 
-    resolved_target_root = _apply_alias(target_root, alias_scopes)
-    if resolved_target_root is None:
+    resolved_target_roots = _apply_aliases(target_root, alias_scopes)
+    if resolved_target_roots is None:
         return None
-    return f"{resolved_target_root}.{attr_name_node.value}"
+    return frozenset(f"{resolved_target_root}.{attr_name_node.value}" for resolved_target_root in resolved_target_roots)
 
 
-def _resolve_static_reference_name(node: ast.AST, alias_scopes: _AliasScopes) -> str | None:
+def _resolve_static_reference_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
     call_name = _resolve_call_name(node)
     if call_name is not None:
-        return _apply_alias(call_name, alias_scopes)
-    return _resolve_getattr_call_name(node, alias_scopes)
+        return _apply_aliases(call_name, alias_scopes)
+    return _resolve_getattr_call_names(node, alias_scopes)
 
 
 def _is_high_risk_python_call_name(name: str) -> bool:
@@ -219,14 +221,14 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self.risky_calls: set[str] = set()
 
     def _record_import(self, alias: ast.alias, import_name: str) -> None:
-        self.alias_scopes[-1][alias.asname or alias.name] = import_name
+        self.alias_scopes[-1][alias.asname or alias.name] = frozenset({import_name})
 
-    def _bind_name(self, name: str, resolved_name: str | None) -> None:
-        self.alias_scopes[-1][name] = resolved_name
+    def _bind_name(self, name: str, resolved_names: _AliasValue) -> None:
+        self.alias_scopes[-1][name] = resolved_names
 
     def _bind_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
         if isinstance(target, ast.Name):
-            self._bind_name(target.id, _resolve_static_reference_name(value, self.alias_scopes))
+            self._bind_name(target.id, _resolve_static_reference_names(value, self.alias_scopes))
         elif isinstance(target, ast.Starred):
             # Starred unpacking (``a, *b = seq``) binds ``b`` to a list slice,
             # which is not a single static reference; drop the binding so we
@@ -253,12 +255,12 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             )
             self._bind_name(
                 arg.arg,
-                _resolve_static_reference_name(default, self.alias_scopes) if default is not None else None,
+                _resolve_static_reference_names(default, self.alias_scopes) if default is not None else None,
             )
         for arg, default in zip(arguments.kwonlyargs, arguments.kw_defaults, strict=True):
             self._bind_name(
                 arg.arg,
-                _resolve_static_reference_name(default, self.alias_scopes) if default is not None else None,
+                _resolve_static_reference_names(default, self.alias_scopes) if default is not None else None,
             )
         if arguments.vararg is not None:
             self._bind_name(arguments.vararg.arg, None)
@@ -275,7 +277,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for alias in node.names:
             if alias.name == "*":
                 for local_name, import_name in _wildcard_import_aliases(node.module):
-                    self._bind_name(local_name, import_name)
+                    self._bind_name(local_name, frozenset({import_name}))
                 continue
             self._record_import(alias, f"{node.module}.{alias.name}")
 
@@ -308,16 +310,26 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             return node.value
         return None
 
+    @staticmethod
+    def _literal_iter_truth(node: ast.AST) -> bool | None:
+        if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+            return bool(node.elts)
+        if isinstance(node, ast.Dict):
+            return bool(node.keys)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+            return bool(node.value)
+        return None
+
     def _merge_conditional_branch_scopes(self, branch_scopes: list[_AliasScope]) -> None:
         current_scope = self.alias_scopes[-1]
         branch_names = {name for scope in branch_scopes for name in scope}
         for name in branch_names:
             base_value = current_scope.get(name, _MISSING_ALIAS)
             values = [scope.get(name, base_value) for scope in branch_scopes]
-            concrete_aliases = {value for value in values if isinstance(value, str)}
-            if len(concrete_aliases) == 1:
-                current_scope[name] = next(iter(concrete_aliases))
-            elif values and all(value is None for value in values):
+            concrete_aliases = frozenset(alias for value in values if isinstance(value, frozenset) for alias in value)
+            if concrete_aliases:
+                current_scope[name] = concrete_aliases
+            elif any(value is None for value in values):
                 current_scope[name] = None
 
     def _visit_child_scope_without_class_locals(self, body: list[ast.stmt]) -> None:
@@ -412,14 +424,26 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _visit_loop(self, node: ast.For | ast.AsyncFor) -> None:
         self.visit(node.iter)
-        self.alias_scopes.append({})
+        iter_truth = self._literal_iter_truth(node.iter)
+        if iter_truth is False:
+            for statement in node.orelse:
+                self.visit(statement)
+            return
+
+        body_scope: _AliasScope = {}
+        self.alias_scopes.append(body_scope)
         try:
             self._shadow_binding_target(node.target)
             self.visit(node.target)
             for statement in node.body:
                 self.visit(statement)
+            body_scope = dict(body_scope)
         finally:
             self.alias_scopes.pop()
+        branch_scopes = [body_scope]
+        if iter_truth is not True:
+            branch_scopes.append({})
+        self._merge_conditional_branch_scopes(branch_scopes)
         for statement in node.orelse:
             self.visit(statement)
 
@@ -504,9 +528,11 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self.visit(statement)
 
     def visit_Call(self, node: ast.Call) -> None:
-        resolved_name = _resolve_static_reference_name(node.func, self.alias_scopes)
-        if resolved_name is not None and _is_high_risk_python_call_name(resolved_name):
-            self.risky_calls.add(resolved_name)
+        resolved_names = _resolve_static_reference_names(node.func, self.alias_scopes)
+        if resolved_names is not None:
+            for resolved_name in resolved_names:
+                if _is_high_risk_python_call_name(resolved_name):
+                    self.risky_calls.add(resolved_name)
         self.generic_visit(node)
 
 

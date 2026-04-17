@@ -267,9 +267,62 @@ def test_scan_zip_empty_loop_target_does_not_hide_later_dangerous_call(tmp_path:
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
 
+def test_scan_zip_nonempty_loop_target_shadows_dangerous_import(tmp_path: Path) -> None:
+    archive_path = tmp_path / "source_bundle.zip"
+    source = "import subprocess\nfor subprocess in (object(),):\n    pass\nsubprocess.run()\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("preprocess.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert result.success is True
+    assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
 def test_scan_zip_conditional_target_does_not_hide_later_dangerous_call(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = "import subprocess\nif False:\n    subprocess = None\nsubprocess.run(['echo', 'hidden'], check=False)\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
+
+def test_scan_zip_conditional_aliases_preserve_dangerous_branch(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "if __name__:\n"
+        "    import subprocess as sp\n"
+        "else:\n"
+        "    import os as sp\n"
+        "sp.run(['echo', 'hidden'], check=False)\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
+
+def test_scan_zip_loop_body_alias_survives_to_later_dangerous_call(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "for _ in (1,):\n    import subprocess as sp\nsp.run(['echo', 'hidden'], check=False)\n"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
 
