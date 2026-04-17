@@ -528,6 +528,66 @@ def test_pytorch_zip_jit_scan_size_limit_marks_inconclusive(tmp_path: Path) -> N
     assert all(check.severity == IssueSeverity.INFO for check in size_checks)
 
 
+def test_pytorch_zip_jit_scan_read_failure_marks_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "unreadable_jit_member.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zip_file.writestr("archive/code/debug/source.py", b"print('hello')\n")
+
+    original_read_member_bytes = PyTorchZipScanner._read_member_bytes
+
+    def fail_jit_member_read(
+        self: PyTorchZipScanner,
+        zip_file: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        *,
+        phase: str,
+        result: ScanResult,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        if phase == "jit_script_scan" and self._get_zip_member_name(name).endswith("source.py"):
+            raise OSError("member read failed")
+        return original_read_member_bytes(self, zip_file, name, phase=phase, result=result, max_bytes=max_bytes)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_read_member_bytes", fail_jit_member_read)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert "pytorch_zip_jit_member_read_failed" in result.metadata["scan_outcome_reasons"]
+    read_failure_checks = [check for check in result.checks if check.name == "JIT/Network Scan Read Failure"]
+    assert len(read_failure_checks) == 1
+    assert read_failure_checks[0].details["exception_type"] == "OSError"
+
+
+def test_pytorch_zip_jit_size_limit_respects_disabled_checks(tmp_path: Path) -> None:
+    model_path = tmp_path / "large_disabled_jit_member.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zip_file.writestr("archive/code/debug/source.py", b"print('hello')\n")
+
+    result = PyTorchZipScanner(
+        config={"check_jit_script": False, "check_network_comm": False, "max_jit_scan_member_bytes": 4}
+    ).scan(str(model_path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert "analysis_incomplete" not in result.metadata
+    assert not any(check.name == "JIT/Network Scan Size Limit" for check in result.checks)
+    assert result.metadata["disabled_checks"] == [
+        "JIT/Script Code Execution Detection",
+        "Network Communication Detection",
+    ]
+
+
 @pytest.mark.performance
 def test_pytorch_zip_skips_numeric_data_files(tmp_path):
     """Test that numeric tensor data files in archive/data/ are skipped during JIT scanning."""

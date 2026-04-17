@@ -1100,14 +1100,26 @@ class PyTorchZipScanner(BaseScanner):
         bytes_scanned = 0
         all_jit_findings = []
         all_network_findings = []
+        check_jit = self._get_bool_config("check_jit_script", True)
+        check_net = self._get_bool_config("check_network_comm", True)
         pickle_member_names = {
             self._get_zip_member_name(entry).replace("\\", "/").lstrip("/") for entry in pickle_files
         }
+
+        if safe_entries:
+            if not check_jit:
+                result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
+            if not check_net:
+                result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
+        if not check_jit and not check_net:
+            return 0
 
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
             normalized_name = name.replace("\\", "/").lstrip("/")
             try:
+                if entry.is_dir() or normalized_name.endswith("/"):
+                    continue
                 # Skip numeric tensor data files to support different versions of PyTorch ZIP files
                 # These are binary weight files that cause performance issues when scanned
                 if _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN.match(normalized_name):
@@ -1159,12 +1171,24 @@ class PyTorchZipScanner(BaseScanner):
                     all_network_findings.extend(network_findings)
 
             except Exception as e:
-                # Skip files that can't be read
                 logger.debug(f"Exception reading {name}: {e}")
+                mark_inconclusive_scan_result(result, "pytorch_zip_jit_member_read_failed")
+                result.add_check(
+                    name="JIT/Network Scan Read Failure",
+                    passed=False,
+                    message=f"PyTorch ZIP member {name} could not be analyzed for JIT/network patterns: {e}",
+                    severity=IssueSeverity.INFO,
+                    location=f"{path}:{name}",
+                    details={
+                        "zip_entry": name,
+                        "exception": str(e),
+                        "exception_type": type(e).__name__,
+                        "analysis_incomplete": True,
+                    },
+                )
 
         # Emit explicit checks for the entire ZIP file
         if safe_entries:  # Only create checks if we processed files
-            check_jit = self._get_bool_config("check_jit_script", True)
             if check_jit:
                 self.add_jit_script_findings(
                     all_jit_findings,
@@ -1172,18 +1196,13 @@ class PyTorchZipScanner(BaseScanner):
                     model_type="pytorch",
                     context=path,
                 )
-            else:
-                result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
 
-            check_net = self._get_bool_config("check_network_comm", True)
             if check_net:
                 self.add_network_communication_findings(
                     all_network_findings,
                     result,
                     context=path,
                 )
-            else:
-                result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
 
         return bytes_scanned
 
