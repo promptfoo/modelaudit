@@ -21,18 +21,20 @@
     "packages/modelaudit-picklescan": {
       "release-type": "python",
       "package-name": "modelaudit-picklescan",
-      "changelog-path": "packages/modelaudit-picklescan/CHANGELOG.md",
+      "component": "modelaudit-picklescan",
+      "include-component-in-tag": true,
+      "changelog-path": "CHANGELOG.md",
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": true,
       "extra-files": [
         {
           "type": "generic",
-          "path": "packages/modelaudit-picklescan/pyproject.toml",
+          "path": "pyproject.toml",
           "glob": false
         },
         {
           "type": "generic",
-          "path": "packages/modelaudit-picklescan/Cargo.toml",
+          "path": "Cargo.toml",
           "glob": false
         }
       ]

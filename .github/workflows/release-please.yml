@@ -21,6 +21,9 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
       version: ${{ steps.release.outputs.version }}
+      picklescan_release_created: ${{ steps.release.outputs['packages/modelaudit-picklescan--release_created'] }}
+      picklescan_tag_name: ${{ steps.release.outputs['packages/modelaudit-picklescan--tag_name'] }}
+      picklescan_version: ${{ steps.release.outputs['packages/modelaudit-picklescan--version'] }}
       pr_number: ${{ steps.release.outputs.pr && fromJSON(steps.release.outputs.pr).number || '' }}
     steps:
       - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
@@ -28,7 +31,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Format CHANGELOG.md immediately after release-please creates/updates a PR
+      # Format changelogs immediately after release-please creates/updates a PR
       # This runs for BOTH new PRs (prs_created) and existing PRs (pr output exists)
       - name: Check if PR exists
         id: check-pr
@@ -101,20 +104,20 @@ jobs:
         if: steps.check-pr.outputs.has_pr == 'true'
         run: npm ci --ignore-scripts
 
-      - name: Format CHANGELOG.md with Prettier
+      - name: Format changelogs with Prettier
         if: steps.check-pr.outputs.has_pr == 'true'
         run: |
-          echo "Formatting CHANGELOG.md on branch: ${{ steps.check-pr.outputs.pr_branch }}"
-          npx prettier --write CHANGELOG.md
+          echo "Formatting changelogs on branch: ${{ steps.check-pr.outputs.pr_branch }}"
+          npx prettier --write CHANGELOG.md packages/modelaudit-picklescan/CHANGELOG.md
 
-          if git diff --quiet CHANGELOG.md; then
+          if git diff --quiet CHANGELOG.md packages/modelaudit-picklescan/CHANGELOG.md; then
             echo "✓ No formatting changes needed"
           else
             echo "→ Formatting changes detected, committing..."
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add CHANGELOG.md
-            git commit -m "chore: format CHANGELOG.md with prettier"
+            git add CHANGELOG.md packages/modelaudit-picklescan/CHANGELOG.md
+            git commit -m "chore: format changelogs with prettier"
             git push
             echo "✓ Formatting committed and pushed"
           fi
@@ -408,7 +411,7 @@ jobs:
           path: dist/
 
   build-picklescan-package:
-    if: needs.release-please.outputs.release_created == 'true'
+    if: needs.release-please.outputs.picklescan_release_created == 'true'
     name: Build standalone pickle package (${{ matrix.artifact-suffix }})
     runs-on: ${{ matrix.os }}
     needs: release-please
@@ -516,6 +519,65 @@ jobs:
       - name: Validate standalone package metadata
         run: uvx twine check /tmp/modelaudit-picklescan-dist/*
 
+      - name: Verify standalone artifact version consistency
+        run: |
+          set -euo pipefail
+          EXPECTED_VERSION="${{ needs.release-please.outputs.picklescan_version }}"
+
+          shopt -s nullglob
+          artifacts=(/tmp/modelaudit-picklescan-dist/modelaudit_picklescan-*.whl /tmp/modelaudit-picklescan-dist/modelaudit_picklescan-*.tar.gz)
+          if [[ ${#artifacts[@]} -eq 0 ]]; then
+            echo "ERROR: Expected at least one modelaudit_picklescan artifact"
+            ls -la /tmp/modelaudit-picklescan-dist/
+            exit 1
+          fi
+
+          for artifact in "${artifacts[@]}"; do
+            ARTIFACT_VERSION="$(
+              python - "${artifact}" <<'PY'
+          import sys
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          artifact_path = Path(sys.argv[1])
+          if artifact_path.suffix == ".whl":
+              with zipfile.ZipFile(artifact_path) as zf:
+                  metadata_files = [name for name in zf.namelist() if name.endswith(".dist-info/METADATA")]
+                  if len(metadata_files) != 1:
+                      raise SystemExit(f"Expected one wheel METADATA file, found {len(metadata_files)}")
+                  metadata_text = zf.read(metadata_files[0]).decode("utf-8", errors="replace")
+          elif artifact_path.name.endswith(".tar.gz"):
+              with tarfile.open(artifact_path, "r:gz") as tf:
+                  pkg_info_files = [member for member in tf.getmembers() if member.name.endswith("/PKG-INFO")]
+                  if len(pkg_info_files) != 1:
+                      raise SystemExit(f"Expected one PKG-INFO file, found {len(pkg_info_files)}")
+                  file_obj = tf.extractfile(pkg_info_files[0])
+                  if file_obj is None:
+                      raise SystemExit("Failed to read PKG-INFO from sdist")
+                  metadata_text = file_obj.read().decode("utf-8", errors="replace")
+          else:
+              raise SystemExit(f"Unsupported artifact type: {artifact_path}")
+
+          for line in metadata_text.splitlines():
+              if line.startswith("Version: "):
+                  print(line.split(":", 1)[1].strip())
+                  break
+          else:
+              raise SystemExit("Could not find Version header")
+          PY
+            )"
+
+            if [[ "$ARTIFACT_VERSION" != "$EXPECTED_VERSION" ]]; then
+              echo "ERROR: Artifact version mismatch for ${artifact}"
+              echo "Expected version: $EXPECTED_VERSION"
+              echo "Artifact version: $ARTIFACT_VERSION"
+              exit 1
+            fi
+          done
+
+          echo "Standalone artifact validation passed for version ${EXPECTED_VERSION}"
+
       - name: Smoke test standalone package wheel install
         run: |
           set -euo pipefail
@@ -557,7 +619,7 @@ jobs:
 
   publish-pypi:
     if: needs.release-please.outputs.release_created == 'true'
-    needs: [build, build-picklescan-package, release-please]
+    needs: [build, release-please]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -572,6 +634,23 @@ jobs:
           name: dist
           path: dist/
 
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          print-hash: true
+          attestations: true
+
+  publish-picklescan-pypi:
+    if: needs.release-please.outputs.picklescan_release_created == 'true'
+    needs: [build-picklescan-package, release-please]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/modelaudit-picklescan/
+    permissions:
+      contents: read
+      id-token: write
+    steps:
       - name: Download standalone pickle package artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -587,7 +666,7 @@ jobs:
 
   provenance:
     if: needs.release-please.outputs.release_created == 'true'
-    needs: [build, build-picklescan-package, publish-pypi, release-please]
+    needs: [build, publish-pypi, release-please]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -610,13 +689,6 @@ jobs:
         with:
           name: dist
           path: dist/
-
-      - name: Download standalone pickle package artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          pattern: modelaudit-picklescan-dist-*
-          path: dist/
-          merge-multiple: true
 
       - name: Generate artifact attestations
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
@@ -642,5 +714,58 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ needs.release-please.outputs.tag_name }}" dist/* \
+            --repo "${{ github.repository }}" \
+            --clobber
+
+  picklescan-provenance:
+    if: needs.release-please.outputs.picklescan_release_created == 'true'
+    needs: [build-picklescan-package, publish-picklescan-pypi, release-please]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          sparse-checkout: |
+            packages/modelaudit-picklescan/pyproject.toml
+            packages/modelaudit-picklescan/uv.lock
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          enable-cache: true
+
+      - name: Download standalone pickle package artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: modelaudit-picklescan-dist-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Generate artifact attestations
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
+        with:
+          subject-path: "dist/*"
+
+      - name: Generate standalone package SBOM
+        working-directory: packages/modelaudit-picklescan
+        run: |
+          uv export \
+            --frozen \
+            --no-dev \
+            --preview-features sbom-export \
+            --format cyclonedx1.5 \
+            --output-file ../../dist/modelaudit-picklescan-${{ needs.release-please.outputs.picklescan_version }}.cdx.json \
+            > /dev/null
+          echo "Standalone package SBOM generated:"
+          ls -la ../../dist/*.cdx.json
+
+      - name: Upload standalone artifacts to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.release-please.outputs.picklescan_tag_name }}" dist/* \
             --repo "${{ github.repository }}" \
             --clobber

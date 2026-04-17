@@ -1,3 +1,4 @@
 {
-  ".": "0.2.37"
+  ".": "0.2.38",
+  "packages/modelaudit-picklescan": "0.1.0"
 }
