@@ -14,6 +14,11 @@ from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
+from .archive_member_security import (
+    dangerous_python_archive_member_reason,
+    is_executable_archive_member_name,
+    is_python_archive_member_name,
+)
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -34,6 +39,7 @@ DEFAULT_MAX_TAR_ENTRY_SIZE = 1024 * 1024 * 1024
 DEFAULT_MAX_DECOMPRESSED_BYTES = 512 * 1024 * 1024
 DEFAULT_MAX_DECOMPRESSION_RATIO = 250.0
 ARCHIVE_MEMBER_COPY_CHUNK_BYTES = 64 * 1024
+MAX_TAR_PYTHON_ANALYSIS_BYTES = 10 * 1024 * 1024
 
 _GZIP_MAGIC = b"\x1f\x8b"
 _BZIP2_MAGIC = b"BZh"
@@ -586,6 +592,8 @@ class TarScanner(BaseScanner):
                             result.merge(nested_result)
                             asset_entry = asset_from_scan_result(f"{path}:{name}", nested_result)
                         else:
+                            self._scan_generic_member_security(path, name, tmp_path, total_size, result)
+
                             nested_config = dict(self.config)
                             nested_config["_archive_depth"] = depth + 1
                             file_result = self._scan_nested_archive_entry(tmp_path, nested_config)
@@ -623,5 +631,60 @@ class TarScanner(BaseScanner):
         result.metadata["file_size"] = os.path.getsize(path)
         if not scan_complete:
             mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
-        result.finish(success=scan_complete and not result.has_errors)
+        result.finish(success=scan_complete and not member_scan_incomplete(result) and not result.has_errors)
         return result
+
+    def _scan_generic_member_security(
+        self,
+        archive_path: str,
+        member_name: str,
+        tmp_path: str,
+        total_size: int,
+        result: ScanResult,
+    ) -> None:
+        """Inspect TAR members that nested dispatch would otherwise treat as unknown."""
+        normalized_name = member_name.replace("\\", "/").lstrip("/")
+        normalized_lower = normalized_name.lower()
+        location = f"{archive_path}:{member_name}"
+
+        if is_python_archive_member_name(normalized_lower):
+            if total_size > MAX_TAR_PYTHON_ANALYSIS_BYTES:
+                mark_archive_scan_incomplete(result, "tar_python_member_analysis_incomplete")
+                result.add_check(
+                    name="Python Archive Member Security",
+                    passed=False,
+                    message=f"Python archive member too large for bounded security analysis: {member_name}",
+                    severity=IssueSeverity.INFO,
+                    location=location,
+                    details={
+                        "entry": member_name,
+                        "file_size": total_size,
+                        "max_scan_bytes": MAX_TAR_PYTHON_ANALYSIS_BYTES,
+                        "analysis_incomplete": True,
+                    },
+                )
+                return
+
+            with open(tmp_path, "rb") as member_file:
+                reason = dangerous_python_archive_member_reason(member_file.read())
+            if reason is not None:
+                result.add_check(
+                    name="Python Archive Member Security",
+                    passed=False,
+                    message=f"High-risk Python code found in TAR member {member_name}: {reason}",
+                    severity=IssueSeverity.WARNING,
+                    location=location,
+                    details={"entry": member_name, "reason": reason},
+                    rule_code="S104",
+                )
+            return
+
+        if is_executable_archive_member_name(normalized_lower):
+            result.add_check(
+                name="Executable Archive Member Detection",
+                passed=False,
+                message=f"Executable file found in TAR archive: {member_name}",
+                severity=IssueSeverity.WARNING,
+                location=location,
+                details={"entry": member_name},
+            )
