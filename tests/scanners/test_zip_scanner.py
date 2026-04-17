@@ -346,6 +346,104 @@ def test_scan_zip_ignores_benign_python_file_operations(tmp_path: Path) -> None:
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
+@pytest.mark.parametrize(
+    ("source", "expected_rule_code", "expected_call"),
+    [
+        ("import os\nos.system('echo hidden')\n", "S101", "os.system"),
+        ("import os\nos.popen('echo hidden')\n", "S101", "os.popen"),
+        ("import subprocess\nsubprocess.run(['echo'], check=False)\n", "S103", "subprocess.run"),
+        ("import importlib\nimportlib.import_module('os')\n", "S107", "importlib.import_module"),
+        ("eval('1 + 1')\n", "S104", "eval"),
+        ("import pickle\npickle.loads(b'\\x80\\x04N.')\n", "S213", "pickle.loads"),
+        ("__import__('os').system('echo hidden')\n", "S106", "__import__"),
+    ],
+)
+def test_scan_zip_python_member_emits_accurate_rule_code(
+    tmp_path: Path, source: str, expected_rule_code: str, expected_call: str
+) -> None:
+    """Each risk category must surface its own rule code (os.system as S101, etc.)."""
+    archive_path = tmp_path / "source_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == expected_rule_code
+    assert expected_call in python_checks[0].details["reason"]
+
+
+def test_scan_zip_python_member_emits_separate_check_per_rule_code(tmp_path: Path) -> None:
+    """Mixed-risk source should yield one finding per rule code, sorted by code."""
+    archive_path = tmp_path / "source_bundle.zip"
+    source = "import os\nimport subprocess\nos.system('echo a')\nsubprocess.run(['echo', 'b'], check=False)\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    rule_codes = [check.rule_code for check in python_checks]
+    assert rule_codes == ["S101", "S103"]
+    assert python_checks[0].details["reason"] == "high-risk calls: os.system"
+    assert python_checks[1].details["reason"] == "high-risk calls: subprocess.run"
+
+
+def test_scan_zip_honors_max_mar_python_analysis_bytes_config(tmp_path: Path) -> None:
+    """Generic ZIP Python scanning must honor the same config knob the MAR path reads."""
+    archive_path = tmp_path / "source_bundle.zip"
+    # ~60 KB payload; a 1 KB configured cap must cause the scanner to mark this
+    # member analysis incomplete instead of silently reading the whole thing.
+    source = "import os\nos.system('echo hidden')\n" + ("# pad\n" * 10_000)
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner({"max_mar_python_analysis_bytes": 1024}).scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    details = python_checks[0].details
+    assert details["analysis_incomplete"] is True
+    assert details["max_scan_bytes"] == 1024
+    assert details["file_size"] >= 60_000
+    assert "zip_python_member_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+
+
+def test_scan_zip_python_member_honors_pep263_encoding_declaration(tmp_path: Path) -> None:
+    """PEP 263 encoding declarations must be honored when parsing member sources."""
+    archive_path = tmp_path / "source_bundle.zip"
+    # Comment contains a non-UTF-8 byte (\xe9 in latin-1 = 'é'); utf-8 replace
+    # would mangle it and could produce a SyntaxError. Passing bytes to
+    # ast.parse directly lets Python honor the coding declaration.
+    source = b"# -*- coding: latin-1 -*-\n# comment \xe9\nimport os\nos.system('echo hidden')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S101"
+    assert python_checks[0].details["reason"] == "high-risk calls: os.system"
+
+
 class _HeaderRoutedTempScanner(BaseScanner):
     name: ClassVar[str] = "header_routed_temp"
 

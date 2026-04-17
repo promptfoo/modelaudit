@@ -1,8 +1,18 @@
-"""Shared security helpers for archive member names."""
+"""Shared security helpers for archive member names and source analysis."""
+
+from __future__ import annotations
 
 import ast
 import re
 from collections.abc import Iterator
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from ._archive_outcomes import mark_archive_scan_incomplete
+from .base import IssueSeverity
+
+if TYPE_CHECKING:
+    from .base import ScanResult
 
 _EXECUTABLE_ARCHIVE_MEMBER_SUFFIXES = (
     ".sh",
@@ -37,6 +47,45 @@ _HIGH_RISK_PYTHON_CALLS = {
     "subprocess.Popen",
     "subprocess.run",
 }
+
+# Map each high-risk call name to the rule code that best describes its risk
+# category. SARIF consumers, dashboards, and per-rule severity overrides rely
+# on accurate codes, so `os.system` must not be reported under `S104`
+# (eval/exec) just because the scanner hard-coded a single fallback.
+_HIGH_RISK_PYTHON_CALL_RULE_CODES: dict[str, str] = {
+    "__import__": "S106",
+    "builtins.__import__": "S106",
+    "builtins.eval": "S104",
+    "builtins.exec": "S104",
+    "eval": "S104",
+    "exec": "S104",
+    "importlib.import_module": "S107",
+    "os.popen": "S101",
+    "os.system": "S101",
+    "pickle.load": "S213",
+    "pickle.loads": "S213",
+}
+_HIGH_RISK_PYTHON_CALL_PREFIX_RULE_CODES: tuple[tuple[str, str], ...] = (("subprocess.", "S103"),)
+_FALLBACK_HIGH_RISK_RULE_CODE = "S104"
+
+
+def _rule_code_for_high_risk_call(call_name: str) -> str:
+    """Return the rule code that most accurately describes ``call_name``."""
+    direct = _HIGH_RISK_PYTHON_CALL_RULE_CODES.get(call_name)
+    if direct is not None:
+        return direct
+    for prefix, code in _HIGH_RISK_PYTHON_CALL_PREFIX_RULE_CODES:
+        if call_name.startswith(prefix):
+            return code
+    return _FALLBACK_HIGH_RISK_RULE_CODE
+
+
+@dataclass(frozen=True)
+class HighRiskPythonCall:
+    """A high-risk call resolved from an archive member's Python source."""
+
+    name: str
+    rule_code: str
 
 
 class PythonArchiveMemberParseError(Exception):
@@ -89,6 +138,11 @@ def _apply_alias(call_name: str, alias_scopes: _AliasScopes) -> str | None:
 
 
 def _resolve_getattr_call_name(node: ast.AST, alias_scopes: _AliasScopes) -> str | None:
+    # Only literal-string attribute names are resolved. Payloads that build the
+    # attribute name at runtime (``getattr(os, "sys" + "tem")``) need constant
+    # folding we deliberately do not perform here — the complexity is not
+    # worth chasing every string-arithmetic trick, and such payloads typically
+    # still trip pickle or runtime detectors elsewhere in the pipeline.
     if isinstance(node, ast.Attribute) and node.attr == "__call__":
         return _resolve_getattr_call_name(node.value, alias_scopes)
 
@@ -172,6 +226,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if isinstance(target, ast.Name):
             self._bind_name(target.id, _resolve_static_reference_name(value, self.alias_scopes))
         elif isinstance(target, ast.Starred):
+            # Starred unpacking (``a, *b = seq``) binds ``b`` to a list slice,
+            # which is not a single static reference; drop the binding so we
+            # don't carry a stale alias for any captured name.
             self._bind_target_to_value(target.value, value)
         elif isinstance(target, (ast.Tuple, ast.List)):
             if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
@@ -344,21 +401,120 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def _find_high_risk_python_calls(source_bytes: bytes) -> set[str]:
-    source = source_bytes.decode("utf-8", "replace")
+def high_risk_python_calls_in_source(source_bytes: bytes) -> set[HighRiskPythonCall]:
+    """Return the set of high-risk Python calls resolvable from ``source_bytes``.
+
+    Passes ``source_bytes`` to ``ast.parse`` directly so PEP 263 encoding
+    declarations (``# -*- coding: latin-1 -*-``) are honored instead of being
+    lossily replaced before parsing.
+
+    Raises:
+        PythonArchiveMemberParseError: when the source cannot be parsed.
+    """
     try:
-        tree = ast.parse(source)
+        tree = ast.parse(source_bytes)
     except (SyntaxError, ValueError) as exc:
         raise PythonArchiveMemberParseError(str(exc)) from exc
 
     visitor = _HighRiskPythonCallVisitor()
     visitor.visit(tree)
-    return visitor.risky_calls
+    return {
+        HighRiskPythonCall(name=name, rule_code=_rule_code_for_high_risk_call(name)) for name in visitor.risky_calls
+    }
 
 
-def dangerous_python_archive_member_reason(source_bytes: bytes) -> str | None:
-    """Return a concise reason when Python source contains high-risk constructs."""
-    risky_calls = _find_high_risk_python_calls(source_bytes)
-    if not risky_calls:
-        return None
-    return f"high-risk calls: {', '.join(sorted(risky_calls))}"
+_PYTHON_MEMBER_CHECK_NAME = "Python Archive Member Security"
+_EXECUTABLE_MEMBER_CHECK_NAME = "Executable Archive Member Detection"
+
+
+def scan_archive_member_for_known_risks(
+    *,
+    archive_kind: str,
+    archive_path: str,
+    member_name: str,
+    tmp_path: str,
+    total_size: int,
+    result: ScanResult,
+    max_python_analysis_bytes: int,
+    python_analysis_incomplete_reason: str,
+) -> None:
+    """Inspect generic archive members that nested dispatch would otherwise ignore.
+
+    ``archive_kind`` is a short label (``"ZIP"`` / ``"TAR"``) used only for the
+    human-readable message text. The dispatcher (1) routes Python-looking
+    members through bounded AST analysis, (2) flags native/script executable-
+    suffix members, and (3) leaves everything else to the caller's normal
+    nested routing.
+    """
+    normalized_name = member_name.replace("\\", "/").lstrip("/")
+    normalized_lower = normalized_name.lower()
+    location = f"{archive_path}:{member_name}"
+
+    if is_python_archive_member_name(normalized_lower):
+        if total_size > max_python_analysis_bytes:
+            mark_archive_scan_incomplete(result, python_analysis_incomplete_reason)
+            result.add_check(
+                name=_PYTHON_MEMBER_CHECK_NAME,
+                passed=False,
+                message=f"Python archive member too large for bounded security analysis: {member_name}",
+                severity=IssueSeverity.INFO,
+                location=location,
+                details={
+                    "entry": member_name,
+                    "file_size": total_size,
+                    "max_scan_bytes": max_python_analysis_bytes,
+                    "analysis_incomplete": True,
+                },
+            )
+            return
+
+        try:
+            with open(tmp_path, "rb") as member_file:
+                calls = high_risk_python_calls_in_source(member_file.read())
+        except PythonArchiveMemberParseError as exc:
+            mark_archive_scan_incomplete(result, python_analysis_incomplete_reason)
+            result.add_check(
+                name=_PYTHON_MEMBER_CHECK_NAME,
+                passed=False,
+                message=f"Python archive member could not be parsed for bounded security analysis: {member_name}",
+                severity=IssueSeverity.INFO,
+                location=location,
+                details={
+                    "entry": member_name,
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                },
+            )
+            return
+
+        # Emit one finding per rule code so SARIF consumers, dashboards, and
+        # per-rule severity overrides see accurate attribution (``os.system``
+        # as S101, ``subprocess.run`` as S103, etc.) instead of one S104
+        # catch-all that aggregates unrelated risk categories.
+        calls_by_rule: dict[str, list[str]] = {}
+        for call in calls:
+            calls_by_rule.setdefault(call.rule_code, []).append(call.name)
+        for rule_code in sorted(calls_by_rule):
+            names = sorted(calls_by_rule[rule_code])
+            reason = f"high-risk calls: {', '.join(names)}"
+            result.add_check(
+                name=_PYTHON_MEMBER_CHECK_NAME,
+                passed=False,
+                message=f"High-risk Python code found in {archive_kind} member {member_name}: {reason}",
+                severity=IssueSeverity.WARNING,
+                location=location,
+                details={"entry": member_name, "reason": reason},
+                rule_code=rule_code,
+            )
+        return
+
+    if is_executable_archive_member_name(normalized_lower):
+        result.add_check(
+            name=_EXECUTABLE_MEMBER_CHECK_NAME,
+            passed=False,
+            message=f"Executable file found in {archive_kind} archive: {member_name}",
+            severity=IssueSeverity.WARNING,
+            location=location,
+            details={"entry": member_name},
+        )

@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **security:** scan generic ZIP/TAR/NPZ Python members and ZIP/NPZ executable members, including wildcard imports and callable rebindings while failing closed on malformed Python source.
+- **security:** scan generic ZIP/TAR/NPZ Python members and ZIP/TAR/NPZ executable members, including wildcard imports and callable rebindings while failing closed on malformed Python source. Findings carry accurate rule codes per risk category (`S101` for `os.system`/`os.popen`, `S103` for `subprocess.*`, `S104` for `eval`/`exec`, `S106` for `__import__`, `S107` for `importlib.import_module`, `S213` for `pickle.load`/`pickle.loads`) instead of a single catch-all, the ZIP path now honors `max_mar_python_analysis_bytes` for non-MAR Python members, and source bytes are parsed directly so PEP 263 encoding declarations are respected.
 - **pickle:** restore ModelAudit nested-pickle findings from Rust standalone notices and keep network raw-detector coverage after native pickle findings
 - **telemetry:** strip query strings, fragments, and URL userinfo from cloud model names and file-extension metadata
 - preserve `S999` unknown-opcode mapping in generic rule fallback

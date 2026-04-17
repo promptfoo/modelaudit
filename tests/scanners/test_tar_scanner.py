@@ -257,6 +257,56 @@ class TestTarScanner:
         assert not any(check.name == "Python Archive Member Security" for check in result.checks)
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
+    def test_scan_tar_flags_executable_member(self, tmp_path: Path) -> None:
+        """TAR archives must surface executable-suffix members for parity with ZIP."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = b"#!/bin/sh\necho hidden\n"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("bin/run.sh")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        executable_checks = [
+            check
+            for check in result.checks
+            if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
+        ]
+        assert len(executable_checks) == 1
+        assert executable_checks[0].severity == IssueSeverity.WARNING
+        assert executable_checks[0].details["entry"] == "bin/run.sh"
+
+    @pytest.mark.parametrize(
+        ("source", "expected_rule_code", "expected_call"),
+        [
+            (b"import os\nos.system('echo hidden')\n", "S101", "os.system"),
+            (b"import subprocess\nsubprocess.run(['echo'], check=False)\n", "S103", "subprocess.run"),
+            (b"import importlib\nimportlib.import_module('os')\n", "S107", "importlib.import_module"),
+            (b"eval('1 + 1')\n", "S104", "eval"),
+            (b"import pickle\npickle.loads(b'\\x80\\x04N.')\n", "S213", "pickle.loads"),
+        ],
+    )
+    def test_scan_tar_python_member_emits_accurate_rule_code(
+        self, tmp_path: Path, source: bytes, expected_rule_code: str, expected_call: str
+    ) -> None:
+        """Each risk category must surface its own rule code (os.system as S101, etc.)."""
+        archive_path = tmp_path / "model_bundle.tar"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(source)
+            archive.addfile(info, tarfile.io.BytesIO(source))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].rule_code == expected_rule_code
+        assert expected_call in python_checks[0].details["reason"]
+
     def test_path_traversal_detection(self):
         """Test detection of path traversal attempts"""
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:
