@@ -572,7 +572,7 @@ jobs:
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: build
-          args: --release --out /tmp/modelaudit-picklescan-dist --compatibility manylinux_2_28
+          args: --release --out /tmp/modelaudit-picklescan-dist
           manylinux: "2_28"
           working-directory: packages/modelaudit-picklescan
 
