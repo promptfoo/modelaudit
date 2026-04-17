@@ -27,6 +27,14 @@ from modelaudit.scanners.zip_scanner import ZipScanner
 from tests.helpers import create_mock_onnx
 
 
+def _npy_payload() -> bytes:
+    import numpy as np
+
+    payload = io.BytesIO()
+    np.save(payload, np.arange(3))
+    return payload.getvalue()
+
+
 def test_rewrite_extracted_member_location_preserves_scanner_specific_suffix_policy() -> None:
     assert (
         rewrite_extracted_member_location(
@@ -123,6 +131,23 @@ def test_scan_zip_flags_aliased_dangerous_python_member(tmp_path: Path) -> None:
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
 
+def test_scan_zip_flags_from_import_dangerous_python_member(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", "from subprocess import run\nrun('echo hidden', shell=True)\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].severity == IssueSeverity.WARNING
+    assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
+
 def test_scan_zip_ignores_benign_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "source_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
@@ -133,6 +158,54 @@ def test_scan_zip_ignores_benign_python_member(tmp_path: Path) -> None:
     assert result.success is True
     assert not any(check.name == "Python Archive Member Security" for check in result.checks)
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_scan_npz_flags_dangerous_python_member(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.npz"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("handler.py", "import os\nos.system('echo hidden')\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].severity == IssueSeverity.WARNING
+    assert python_checks[0].details["entry"] == "handler.py"
+
+
+def test_scan_npz_flags_executable_member(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.npz"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("bin/run.sh", "#!/bin/sh\necho hidden\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    executable_checks = [
+        check
+        for check in result.checks
+        if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert len(executable_checks) == 1
+    assert executable_checks[0].severity == IssueSeverity.WARNING
+    assert executable_checks[0].details["entry"] == "bin/run.sh"
+
+
+def test_scan_npz_ignores_numpy_member_near_python_suffix(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.npz"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("feature_py.npy", _npy_payload())
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert result.success is True
+    assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+    assert not any(check.name == "Executable Archive Member Detection" for check in result.checks)
 
 
 def test_scan_zip_ignores_benign_python_file_operations(tmp_path: Path) -> None:

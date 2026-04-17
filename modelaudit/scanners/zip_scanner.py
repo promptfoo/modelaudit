@@ -576,7 +576,7 @@ class ZipScanner(BaseScanner):
                                 result.merge(mar_python_result)
                                 if not mar_python_result.success:
                                     scan_complete = False
-                        elif archive_ext != ".npz":
+                        else:
                             self._scan_generic_member_security(path, name, tmp_path, total_size, result)
 
                         nested_config = dict(self.config)
