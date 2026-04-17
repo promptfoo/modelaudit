@@ -599,6 +599,20 @@ def test_pytorch_zip_scanner_handles_zip_metadata_oserror(
     assert any("zip metadata unavailable" in check.message for check in result.checks)
 
 
+def test_pytorch_zip_timeout_marks_inconclusive(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "timeout.pt")
+
+    result = PyTorchZipScanner(config={"timeout": -1}).scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_scan_timeout" in result.metadata["scan_outcome_reasons"]
+    timeout_checks = [check for check in result.checks if check.name == "Scan Timeout"]
+    assert len(timeout_checks) == 1
+    assert timeout_checks[0].severity == IssueSeverity.INFO
+
+
 @pytest.mark.performance
 def test_pytorch_zip_skips_numeric_data_files(tmp_path):
     """Test that numeric tensor data files in archive/data/ are skipped during JIT scanning."""
