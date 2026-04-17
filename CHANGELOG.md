@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **pickle:** restore ModelAudit nested-pickle findings from Rust standalone notices and keep network raw-detector coverage after native pickle findings
+- **xgboost:** route UBJSON-backed `.bst` models when `version` or booster markers appear after a large `learner` object, and route extensionless XGBoost UBJSON models via content sniffing (requires both the `learner` marker and a booster/model-param strong marker within the probe window).
 - **telemetry:** strip query strings, fragments, and URL userinfo from cloud model names and file-extension metadata
 - preserve `S999` unknown-opcode mapping in generic rule fallback
 - **docker:** run the full parser image as a non-root `appuser`
