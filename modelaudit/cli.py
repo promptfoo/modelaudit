@@ -37,9 +37,8 @@ from .models import ModelAuditResultModel
 from .rules import Rule, RuleRegistry, Severity
 from .scanner_results import IssueSeverity
 from .scanner_selection import (
-    SCANNER_SELECTION_CHECK_NAME,
     SCANNER_SELECTION_CONFIG_KEY,
-    SCANNER_SELECTION_PREFERRED_KIND,
+    collect_suppressed_preferred_scanners,
     policy_from_config,
     scanner_catalog,
     scanner_selection_config_from_inputs,
@@ -827,36 +826,8 @@ def _emit_scanner_catalog(*, output_format: str, output: str | None) -> None:
     click.echo(output_text)
 
 
-def _collect_suppressed_preferred_scanners(audit_result: ModelAuditResultModel) -> list[dict[str, Any]]:
-    """Return aggregated scanner-selection suppressions of preferred scanners.
-
-    Walks the audit result's aggregated checks and returns one entry per
-    (scanner_id, location) that was flagged as a preferred-scanner skip. Used
-    to surface coverage gaps caused by user selection.
-    """
-    aggregated: dict[tuple[str, str], dict[str, Any]] = {}
-    for check in audit_result.checks or []:
-        if check.name != SCANNER_SELECTION_CHECK_NAME:
-            continue
-        details = check.details if isinstance(check.details, dict) else None
-        if not details or details.get("kind") != SCANNER_SELECTION_PREFERRED_KIND:
-            continue
-        scanner_id = str(details.get("skipped_scanner_id") or "unknown")
-        location = check.location or "<unknown>"
-        aggregated.setdefault(
-            (scanner_id, location),
-            {"scanner_id": scanner_id, "location": location, "context": details.get("context")},
-        )
-
-    return sorted(aggregated.values(), key=lambda entry: (entry["scanner_id"], entry["location"]))
-
-
-def _warn_about_suppressed_preferred_scanners(audit_result: ModelAuditResultModel) -> None:
+def _announce_suppressed_preferred_scanners(suppressions: list[dict[str, Any]]) -> None:
     """Print a stderr warning summarizing preferred scanners suppressed by selection."""
-    suppressions = _collect_suppressed_preferred_scanners(audit_result)
-    if not suppressions:
-        return
-
     suppressed_ids = sorted({entry["scanner_id"] for entry in suppressions})
     click.echo(
         "Warning: scanner selection suppressed the preferred scanner(s) for "
@@ -870,9 +841,19 @@ def _warn_about_suppressed_preferred_scanners(audit_result: ModelAuditResultMode
     if len(suppressions) > 5:
         click.echo(f"  … and {len(suppressions) - 5} more", err=True)
 
+
+def _record_suppressed_preferred_scanners(audit_result: ModelAuditResultModel) -> list[dict[str, Any]]:
+    """Populate audit metadata with preferred-scanner suppressions and return them."""
+    suppressions = collect_suppressed_preferred_scanners(audit_result.checks or [])
+    if not suppressions:
+        return suppressions
+
     if audit_result.scanner_selection is None:
         audit_result.scanner_selection = {}
-    audit_result.scanner_selection["suppressed_preferred_scanner_ids"] = suppressed_ids
+    audit_result.scanner_selection["suppressed_preferred_scanner_ids"] = sorted(
+        {entry["scanner_id"] for entry in suppressions}
+    )
+    return suppressions
 
 
 def _record_scan_end_and_exit(audit_result: ModelAuditResultModel, scan_start_time: float) -> NoReturn:
@@ -2434,7 +2415,9 @@ def scan_command(
     )
     _cleanup_temp_artifacts(path_state.temp_cleanup_entries, verbose=verbose)
 
-    _warn_about_suppressed_preferred_scanners(audit_result)
+    suppressions = _record_suppressed_preferred_scanners(audit_result)
+    if suppressions:
+        _announce_suppressed_preferred_scanners(suppressions)
     output_text = _format_scan_output(
         audit_result,
         expanded_paths,

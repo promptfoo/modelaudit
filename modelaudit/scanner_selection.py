@@ -12,10 +12,12 @@ import difflib
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from .scanner_registry_metadata import get_scanner_registry_metadata
 from .scanner_results import IssueSeverity, ScanResult
+
+ScannerSelectionSkipKind = Literal["preferred", "embedded"]
 
 SCANNER_SELECTION_CONFIG_KEY = "scanner_selection"
 _GENERIC_CONTAINER_SCANNER_IDS = frozenset({"compressed", "rar", "sevenzip", "tar", "zip"})
@@ -251,8 +253,8 @@ def selected_scanner_extensions(
 
 
 SCANNER_SELECTION_CHECK_NAME = "Scanner Selection"
-SCANNER_SELECTION_PREFERRED_KIND = "preferred"
-SCANNER_SELECTION_EMBEDDED_KIND = "embedded"
+SCANNER_SELECTION_PREFERRED_KIND: ScannerSelectionSkipKind = "preferred"
+SCANNER_SELECTION_EMBEDDED_KIND: ScannerSelectionSkipKind = "embedded"
 
 
 def add_scanner_selection_skip_check(
@@ -262,7 +264,7 @@ def add_scanner_selection_skip_check(
     policy: ScannerSelectionPolicy,
     *,
     context: str | None = None,
-    kind: str = SCANNER_SELECTION_EMBEDDED_KIND,
+    kind: ScannerSelectionSkipKind = SCANNER_SELECTION_EMBEDDED_KIND,
 ) -> None:
     """Add a check documenting a scanner that was skipped by selection policy.
 
@@ -303,7 +305,7 @@ def make_scanner_selection_skip_result(
     scanner_id: str | None,
     policy: ScannerSelectionPolicy,
     *,
-    kind: str = SCANNER_SELECTION_PREFERRED_KIND,
+    kind: ScannerSelectionSkipKind = SCANNER_SELECTION_PREFERRED_KIND,
 ) -> ScanResult:
     """Build a successful result that makes intentional policy skips explicit."""
     result = ScanResult(scanner_name="scanner_selection")
@@ -341,3 +343,26 @@ def embedded_pickle_scanner(
     policy = policy_from_config(config)
     scanner = pickle_scanner_factory(config) if policy.allows("pickle") else None
     return scanner, policy
+
+
+def collect_suppressed_preferred_scanners(checks: Iterable[Any]) -> list[dict[str, Any]]:
+    """Return one entry per (scanner_id, location) flagged as preferred skip.
+
+    Walks scan result checks and filters to preferred-kind Scanner Selection
+    skips — the coverage-gap signal that CLI, SDK, and CI consumers need when
+    a selection policy suppressed the scanner that routing would have picked.
+    """
+    aggregated: dict[tuple[str, str], dict[str, Any]] = {}
+    for check in checks:
+        if getattr(check, "name", None) != SCANNER_SELECTION_CHECK_NAME:
+            continue
+        details = getattr(check, "details", None)
+        if not isinstance(details, Mapping) or details.get("kind") != SCANNER_SELECTION_PREFERRED_KIND:
+            continue
+        scanner_id = str(details.get("skipped_scanner_id") or "unknown")
+        location = getattr(check, "location", None) or "<unknown>"
+        aggregated.setdefault(
+            (scanner_id, location),
+            {"scanner_id": scanner_id, "location": location, "context": details.get("context")},
+        )
+    return sorted(aggregated.values(), key=lambda entry: (entry["scanner_id"], entry["location"]))

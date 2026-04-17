@@ -37,4 +37,15 @@ If a scanner is skipped because it is not enabled, ModelAudit records a `Scanner
 
 Unknown scanner names in `--scanners`/`--exclude-scanner` exit with code 2 and include a `did you mean: …` suggestion built from all known IDs and class-name aliases.
 
+Programmatic callers of `scan_file` or `scan_model_directory_or_file` can reuse `modelaudit.scanner_selection.collect_suppressed_preferred_scanners(result.checks)` to enumerate preferred-scanner skips without parsing check details by hand:
+
+```python
+from modelaudit.core import scan_file
+from modelaudit.scanner_selection import collect_suppressed_preferred_scanners
+
+result = scan_file("./model.pkl", config={"exclude_scanners": ["pickle"]})
+for entry in collect_suppressed_preferred_scanners(result.checks):
+    print(entry["scanner_id"], entry["location"])
+```
+
 For remote sources, selective downloads use the enabled scanners' known extensions when it is safe to do so. ModelAudit keeps remote filtering conservative for container and header-routed scanners so extension-spoofed artifacts are not filtered out before download.

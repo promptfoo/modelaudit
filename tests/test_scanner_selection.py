@@ -16,6 +16,7 @@ from modelaudit.cli import cli
 from modelaudit.core import scan_file, scan_model_directory_or_file
 from modelaudit.scanner_registry_metadata import get_scanner_registry_metadata
 from modelaudit.scanner_selection import (
+    collect_suppressed_preferred_scanners,
     resolve_scanner_ids,
     resolve_scanner_selection_policy,
     scanner_catalog,
@@ -107,6 +108,18 @@ def test_scan_file_excluded_scanner_is_explicit_skip(tmp_path: Path) -> None:
     assert not result.issues
     assert any(check.name == "Scanner Selection" for check in result.checks)
     assert result.metadata["skipped_scanner_id"] == "pickle"
+
+
+def test_collect_suppressed_preferred_scanners_derives_from_checks(tmp_path: Path) -> None:
+    path = tmp_path / "payload.pkl"
+    path.write_bytes(_build_malicious_pickle())
+
+    result = scan_file(str(path), config={"exclude_scanners": ["pickle"], "cache_enabled": False})
+
+    suppressions = collect_suppressed_preferred_scanners(result.checks)
+    assert suppressions
+    assert {entry["scanner_id"] for entry in suppressions} == {"pickle"}
+    assert all(entry["location"] == str(path) for entry in suppressions)
 
 
 def test_preferred_scanner_skip_is_warning_and_tracks_suppressed_ids(tmp_path: Path) -> None:
