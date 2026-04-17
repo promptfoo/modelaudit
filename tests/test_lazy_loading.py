@@ -279,7 +279,7 @@ class TestBackwardsCompatibility:
         for scanner_id, scanner_info in _registry._scanners.items():
             class_name = scanner_info["class"]
             assert _registry.has_scanner_class(class_name)
-            assert _registry._get_scanner_id_for_class(class_name) == scanner_id
+            assert _registry.get_scanner_id_for_class(class_name) == scanner_id
 
         for scanner_id, scanner_info in _registry._scanners.items():
             if scanner_info.get("dependencies"):

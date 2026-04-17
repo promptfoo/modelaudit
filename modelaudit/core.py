@@ -18,6 +18,7 @@ from modelaudit.integrations.license_checker import (
 from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
 from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
 from modelaudit.scanner_selection import (
+    SCANNER_SELECTION_PREFERRED_KIND,
     add_scanner_selection_skip_check,
     make_scanner_selection_skip_result,
     normalize_scanner_selection_config,
@@ -1129,6 +1130,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     skipped_preferred_scanner_id,
                     scanner_selection,
                     context="preferred scanner",
+                    kind=SCANNER_SELECTION_PREFERRED_KIND,
                 )
         else:
             if scanner_selection.active:
@@ -1137,7 +1139,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     candidate_scanner_class = _registry.get_scanner_for_path(path)
                     if candidate_scanner_class:
                         candidate_scanner_id = (
-                            _registry._get_scanner_id_for_class(candidate_scanner_class.__name__)
+                            _registry.get_scanner_id_for_class(candidate_scanner_class.__name__)
                             or candidate_scanner_class.name
                         )
                 if candidate_scanner_id and not scanner_selection.allows(candidate_scanner_id):

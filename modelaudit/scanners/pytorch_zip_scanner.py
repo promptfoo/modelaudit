@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from ..detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
-from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
+from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils import sanitize_archive_path
 from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTES, _looks_like_proto0_or_1_pickle
 from .archive_member_security import is_executable_archive_member_name
@@ -230,10 +230,8 @@ class PyTorchZipScanner(BaseScanner):
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
-        self.scanner_selection = policy_from_config(self.config)
-        self.pickle_scanner: PickleScanner | None = (
-            PickleScanner(config) if self.scanner_selection.allows("pickle") else None
-        )
+        pickle_scanner, self.scanner_selection = embedded_pickle_scanner(self.config, PickleScanner)
+        self.pickle_scanner: PickleScanner | None = pickle_scanner
         self.current_file_path = ""  # Will be set when scanning files
         self._relaxed_crc_tracker = RelaxedZipCrcTracker()
         # Configurable limits (can override class defaults via config)

@@ -171,9 +171,9 @@ class ScannerRegistry:
         Returns:
             True if the scanner is registered and can potentially be loaded
         """
-        return self._get_scanner_id_for_class(class_name) is not None
+        return self.get_scanner_id_for_class(class_name) is not None
 
-    def _get_scanner_id_for_class(self, class_name: str) -> str | None:
+    def get_scanner_id_for_class(self, class_name: str) -> str | None:
         """Resolve a scanner class name from the registry's descriptor catalog."""
         for scanner_id, scanner_info in self._scanners.items():
             if scanner_info.get("class") == class_name:
@@ -448,7 +448,7 @@ SCANNER_REGISTRY = _LazyList(_registry)
 # Export scanner classes with lazy loading
 def __getattr__(name: str) -> Any:
     """Lazy-load scanner classes from the registry's descriptor catalog."""
-    scanner_id = _registry._get_scanner_id_for_class(name)
+    scanner_id = _registry.get_scanner_id_for_class(name)
     if scanner_id is not None:
         scanner_class = _registry.load_scanner_by_id(scanner_id)
         if scanner_class:

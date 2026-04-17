@@ -8,6 +8,7 @@ and remote prefilters share the same semantics without loading scanner classes.
 
 from __future__ import annotations
 
+import difflib
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -106,9 +107,16 @@ def resolve_scanner_ids(tokens: Iterable[str] | str | None) -> tuple[str, ...]:
             resolved.append(scanner_id)
 
     if unknown:
+        candidate_ids = sorted(set(metadata.keys()) | set(aliases.values()))
+        suggestions: list[str] = []
+        for bad in unknown:
+            close = difflib.get_close_matches(bad.lower(), candidate_ids, n=2, cutoff=0.6)
+            if close:
+                suggestions.append(f"{bad} (did you mean: {', '.join(close)}?)")
+            else:
+                suggestions.append(bad)
         available = ", ".join(sorted(metadata.keys()))
-        unknown_text = ", ".join(unknown)
-        raise ValueError(f"Unknown scanner name(s): {unknown_text}. Available scanners: {available}")
+        raise ValueError(f"Unknown scanner name(s): {'; '.join(suggestions)}. Available scanners: {available}")
 
     return tuple(resolved)
 
@@ -242,6 +250,11 @@ def selected_scanner_extensions(
     return frozenset(extensions)
 
 
+SCANNER_SELECTION_CHECK_NAME = "Scanner Selection"
+SCANNER_SELECTION_PREFERRED_KIND = "preferred"
+SCANNER_SELECTION_EMBEDDED_KIND = "embedded"
+
+
 def add_scanner_selection_skip_check(
     result: ScanResult,
     location: str,
@@ -249,8 +262,16 @@ def add_scanner_selection_skip_check(
     policy: ScannerSelectionPolicy,
     *,
     context: str | None = None,
+    kind: str = SCANNER_SELECTION_EMBEDDED_KIND,
 ) -> None:
-    """Add an informational check for a scanner skipped by selection policy."""
+    """Add a check documenting a scanner that was skipped by selection policy.
+
+    ``kind`` controls severity: ``"preferred"`` uses WARNING because the
+    selection suppressed the scanner that routing would have picked for the
+    file (a potential coverage gap); ``"embedded"`` uses INFO because the file
+    is still being analyzed by its primary scanner and only an auxiliary
+    embedded pass was skipped.
+    """
     result.metadata.setdefault("scanner_selection", policy.to_metadata())
     skipped_scanner_ids = result.metadata.setdefault("skipped_scanner_ids", [])
     if isinstance(skipped_scanner_ids, list) and scanner_id and scanner_id not in skipped_scanner_ids:
@@ -261,16 +282,18 @@ def add_scanner_selection_skip_check(
     if context:
         message = f"{message} ({context})"
 
+    severity = IssueSeverity.WARNING if kind == SCANNER_SELECTION_PREFERRED_KIND else IssueSeverity.INFO
+
     result.add_check(
-        name="Scanner Selection",
+        name=SCANNER_SELECTION_CHECK_NAME,
         passed=True,
         message=message,
-        severity=IssueSeverity.INFO,
+        severity=severity,
         location=location,
         details={
             "skipped_scanner_id": scanner_id,
-            "enabled_scanner_ids": sorted(policy.enabled_scanner_ids),
             "context": context,
+            "kind": kind,
         },
     )
 
@@ -279,6 +302,8 @@ def make_scanner_selection_skip_result(
     path: str,
     scanner_id: str | None,
     policy: ScannerSelectionPolicy,
+    *,
+    kind: str = SCANNER_SELECTION_PREFERRED_KIND,
 ) -> ScanResult:
     """Build a successful result that makes intentional policy skips explicit."""
     result = ScanResult(scanner_name="scanner_selection")
@@ -297,6 +322,22 @@ def make_scanner_selection_skip_result(
     if result.bytes_scanned:
         result.metadata["file_size"] = result.bytes_scanned
 
-    add_scanner_selection_skip_check(result, path, scanner_id, policy)
+    add_scanner_selection_skip_check(result, path, scanner_id, policy, kind=kind)
     result.finish(success=True)
     return result
+
+
+def embedded_pickle_scanner(
+    config: Mapping[str, Any] | None,
+    pickle_scanner_factory: Any,
+) -> tuple[Any, ScannerSelectionPolicy]:
+    """Instantiate an embedded pickle helper scanner only if selection allows it.
+
+    Returns ``(scanner, policy)``. The scanner is ``None`` when pickle analysis
+    is disabled by the active selection policy; callers should record a
+    scanner-selection skip check for each embedded pickle they would have
+    scanned and continue processing.
+    """
+    policy = policy_from_config(config)
+    scanner = pickle_scanner_factory(config) if policy.allows("pickle") else None
+    return scanner, policy

@@ -33,6 +33,8 @@ Container scanners and nested scanners are selected independently. If you want t
 modelaudit scan ./archive.zip --scanners zip,pickle
 ```
 
-If a scanner is skipped because it is not enabled, ModelAudit records an informational `Scanner Selection` check. JSON output includes the effective policy under `scanner_selection`, so CI pipelines can verify which scanners were enabled.
+If a scanner is skipped because it is not enabled, ModelAudit records a `Scanner Selection` check. When the scanner that routing would have picked for a file is suppressed, the check is raised to WARNING severity, ModelAudit prints a stderr warning, and `scanner_selection.suppressed_preferred_scanner_ids` lists the affected scanner IDs. Embedded helper skips (for example, inner pickle analysis inside a PyTorch ZIP) remain informational because the primary scanner still runs. JSON output includes the effective policy under `scanner_selection`, so CI pipelines can verify both which scanners were enabled and which were suppressed.
+
+Unknown scanner names in `--scanners`/`--exclude-scanner` exit with code 2 and include a `did you mean: …` suggestion built from all known IDs and class-name aliases.
 
 For remote sources, selective downloads use the enabled scanners' known extensions when it is safe to do so. ModelAudit keeps remote filtering conservative for container and header-routed scanners so extension-spoofed artifacts are not filtered out before download.

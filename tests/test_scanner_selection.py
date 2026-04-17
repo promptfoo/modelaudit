@@ -53,6 +53,19 @@ def test_scanner_name_resolution_accepts_ids_classes_and_common_aliases() -> Non
     )
 
 
+def test_hardcoded_user_facing_aliases_resolve() -> None:
+    """Pin the issue-facing aliases so class renames can't silently break selection."""
+    cases = {
+        "H5Scanner": "keras_h5",
+        "TensorflowSavedModelScanner": "tf_savedmodel",
+        "TensorFlowSavedModelScanner": "tf_savedmodel",
+        "TensorflowMetaGraphScanner": "tf_metagraph",
+        "TensorFlowMetaGraphScanner": "tf_metagraph",
+    }
+    for alias, expected_id in cases.items():
+        assert resolve_scanner_ids([alias]) == (expected_id,), f"alias {alias!r} failed to resolve"
+
+
 def test_every_registered_scanner_resolves_by_id_and_class() -> None:
     metadata = get_scanner_registry_metadata()
 
@@ -94,6 +107,49 @@ def test_scan_file_excluded_scanner_is_explicit_skip(tmp_path: Path) -> None:
     assert not result.issues
     assert any(check.name == "Scanner Selection" for check in result.checks)
     assert result.metadata["skipped_scanner_id"] == "pickle"
+
+
+def test_preferred_scanner_skip_is_warning_and_tracks_suppressed_ids(tmp_path: Path) -> None:
+    path = tmp_path / "payload.pkl"
+    path.write_bytes(_build_malicious_pickle())
+
+    result = scan_file(str(path), config={"exclude_scanners": ["pickle"], "cache_enabled": False})
+
+    from modelaudit.scanner_results import IssueSeverity
+
+    selection_checks = [c for c in result.checks if c.name == "Scanner Selection"]
+    assert selection_checks, "expected preferred-scanner skip to emit a Scanner Selection check"
+    assert any(c.severity == IssueSeverity.WARNING for c in selection_checks)
+    assert any(
+        c.details.get("kind") == "preferred" and c.details.get("skipped_scanner_id") == "pickle"
+        for c in selection_checks
+    )
+
+
+def test_cli_warns_on_preferred_scanner_suppression(tmp_path: Path) -> None:
+    path = tmp_path / "payload.pkl"
+    path.write_bytes(_build_malicious_pickle())
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            str(path),
+            "--exclude-scanner",
+            "pickle",
+            "--format",
+            "json",
+            "--no-cache",
+            "--quiet",
+        ],
+        env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+    )
+
+    assert result.exit_code == 0
+    assert "scanner selection suppressed the preferred scanner" in result.stderr.lower()
+    output = json.loads(result.stdout)
+    assert "pickle" in (output.get("scanner_selection") or {}).get("suppressed_preferred_scanner_ids", [])
 
 
 def test_nested_archive_dispatch_honors_selection_policy(tmp_path: Path) -> None:
@@ -267,6 +323,22 @@ def test_cli_rejects_unknown_scanner(tmp_path: Path) -> None:
 
     assert result.exit_code == 2
     assert "Unknown scanner name" in result.output
+
+
+def test_cli_unknown_scanner_suggests_closest_match(tmp_path: Path) -> None:
+    path = tmp_path / "payload.pkl"
+    path.write_bytes(_build_malicious_pickle())
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["scan", str(path), "--scanners", "picle"],
+        env={"PROMPTFOO_DISABLE_TELEMETRY": "1"},
+    )
+
+    assert result.exit_code == 2
+    assert "did you mean" in result.output.lower()
+    assert "pickle" in result.output
 
 
 def test_remote_prefilters_use_selected_scanner_extensions() -> None:

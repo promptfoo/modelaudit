@@ -13,7 +13,7 @@ from contextlib import suppress
 from typing import Any, ClassVar
 
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
-from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
+from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils.file.detection import read_magic_bytes
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner, _looks_like_pickle
@@ -128,8 +128,7 @@ class JoblibScanner(BaseScanner):
     def __init__(self, config: dict[str, Any] | None = None):
         """Initialize Joblib scanning limits and the embedded Pickle scanner."""
         super().__init__(config)
-        self.scanner_selection = policy_from_config(self.config)
-        self.pickle_scanner = PickleScanner(config=self.config) if self.scanner_selection.allows("pickle") else None
+        self.pickle_scanner, self.scanner_selection = embedded_pickle_scanner(self.config, PickleScanner)
         # Security limits
         self.max_decompression_ratio = self.config.get("max_decompression_ratio", 100.0)
         self.max_decompressed_size = self.config.get(

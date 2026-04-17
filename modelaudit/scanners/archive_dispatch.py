@@ -6,7 +6,12 @@ from typing import Any
 
 from ..scanner_registry_metadata import get_scanner_registry_metadata
 from ..scanner_results import ScanResult
-from ..scanner_selection import add_scanner_selection_skip_check, make_scanner_selection_skip_result, policy_from_config
+from ..scanner_selection import (
+    SCANNER_SELECTION_PREFERRED_KIND,
+    add_scanner_selection_skip_check,
+    make_scanner_selection_skip_result,
+    policy_from_config,
+)
 from ..utils.file.detection import (
     detect_file_format,
     is_executorch_archive,
@@ -119,7 +124,7 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
                 candidate_scanner_class = _registry.get_scanner_for_path(path)
                 if candidate_scanner_class:
                     candidate_scanner_id = (
-                        _registry._get_scanner_id_for_class(candidate_scanner_class.__name__)
+                        _registry.get_scanner_id_for_class(candidate_scanner_class.__name__)
                         or candidate_scanner_class.name
                     )
             if candidate_scanner_id and not scanner_selection.allows(candidate_scanner_id):
@@ -138,5 +143,6 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
             skipped_preferred_scanner_id,
             scanner_selection,
             context="preferred nested scanner",
+            kind=SCANNER_SELECTION_PREFERRED_KIND,
         )
     return result
