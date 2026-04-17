@@ -145,11 +145,13 @@ We recommend always upgrading to the latest version. See the [CHANGELOG](CHANGEL
 
 ## Coordinated disclosure
 
-After a fix is released, we will:
+After a fix is released for a CVE/advisory-eligible vulnerability, we will:
 
 1. **Publish a GitHub Security Advisory** with CVE ID, affected and patched versions, CVSS score, and a description of the vulnerability and its impact.
 2. **Credit the reporter** in the advisory and CHANGELOG, unless you prefer anonymity.
 3. **Include the fix** in the `### Security` section of the [CHANGELOG](CHANGELOG.md).
+
+For reports triaged as detection-quality improvements, heuristic/signature gaps, or narrow low-impact scanner coverage misses, we may close the private report without publishing a GitHub Security Advisory or requesting a CVE. In those cases, we will still thank the reporter and provide appropriate public credit in release notes or acknowledgments unless they prefer anonymity.
 
 ## Safe harbor
 
