@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** detect hidden PyTorch ZIP pickle members even when a benign `data.pkl` is already present. The bounded-prefix sniff now always runs across unselected members (including extensionless payloads and files under `data/<n>`), fails closed with one aggregated INFO check if probe reads raise (was one check per failed member), and is mirrored in the standalone `modelaudit-picklescan` package so both code paths discover the same hidden payloads.
 - **security:** mark PyTorch ZIP scan timeouts inconclusive and unsuccessful instead of reporting complete coverage.
 - **security:** detect extensionless protocol-0/1 pickle members during 7-Zip nested archive probes.
 - **pickle:** restore ModelAudit nested-pickle findings from Rust standalone notices and keep network raw-detector coverage after native pickle findings

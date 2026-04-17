@@ -52,6 +52,10 @@ def _malicious_eval_pickle_payload() -> bytes:
     return pickle.dumps({"payload": MaliciousClass()})
 
 
+def _malicious_proto0_system_payload() -> bytes:
+    return b"cposix\nsystem\n(S'echo hidden'\ntR."
+
+
 def _pytorch_storage_persistent_id_payload(key: str | bytes) -> bytes:
     if isinstance(key, str):
         key_bytes = key.encode("utf-8")
@@ -194,6 +198,110 @@ def test_pytorch_zip_discovery_scans_only_real_extensionless_pickle_near_text(tm
 
     assert result.metadata["pickle_files"] == ["archive/data"]
     assert any(issue.severity == IssueSeverity.CRITICAL and "eval" in issue.message.lower() for issue in result.issues)
+
+
+def test_pytorch_zip_discovery_finds_hidden_extensionless_pickle_with_data_pkl(tmp_path: Path) -> None:
+    """A normal data.pkl must not short-circuit hidden member pickle discovery."""
+    model_path = tmp_path / "hidden_extensionless_pickle.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zip_file.writestr("archive/payload", _malicious_proto0_system_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.metadata["pickle_files"] == ["archive/data.pkl", "archive/payload"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/payload"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_finds_hidden_storage_pickle_with_data_pkl(tmp_path: Path) -> None:
+    """Bounded storage-prefix sniffing should catch pickles hidden under data/<n>."""
+    model_path = tmp_path / "hidden_storage_pickle.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zip_file.writestr("archive/data/0", _malicious_proto0_system_payload())
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.metadata["pickle_files"] == ["archive/data.pkl", "archive/data/0"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("pickle_filename") == "archive/data/0"
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_ignores_benign_pickleish_text_with_data_pkl(tmp_path: Path) -> None:
+    """Text that starts with protocol-0-looking bytes should not become a hidden pickle false positive."""
+    model_path = tmp_path / "benign_pickleish_text.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zip_file.writestr("archive/notes", b"cat is a category label, not a GLOBAL opcode stream")
+        zip_file.writestr("archive/data/0", b"\x00" * 1024)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(
+        issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        and issue.details.get("pickle_filename") in {"archive/notes", "archive/data/0"}
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_discovery_aggregates_probe_failures_into_single_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multiple probe failures must collapse into one aggregated INFO check."""
+    model_path = tmp_path / "unreadable_hidden_pickles.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        for index in range(5):
+            zip_file.writestr(f"archive/blob{index}", b"\xff" * 128)
+
+    original = PyTorchZipScanner._read_member_prefix
+
+    def fail_probe(
+        self: PyTorchZipScanner,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        length: int,
+        *,
+        phase: str,
+        result: ScanResult,
+    ) -> bytes:
+        name = self._get_zip_member_name(entry)
+        if phase == "pickle_discovery" and "blob" in name:
+            raise NotImplementedError(f"unsupported compression: {name}")
+        return original(self, zip_file, entry, length, phase=phase, result=result)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_read_member_prefix", fail_probe)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    reasons = result.metadata["scan_outcome_reasons"]
+    assert reasons.count("pytorch_zip_pickle_discovery_incomplete") == 1
+
+    probe_checks = [check for check in result.checks if check.name == "Pickle Discovery"]
+    assert len(probe_checks) == 1
+    details = probe_checks[0].details
+    assert details["failed_count"] == 5
+    assert sorted(details["zip_entries"]) == [f"archive/blob{index}" for index in range(5)]
+    assert all(entry["exception_type"] == "NotImplementedError" for entry in details["entries"])
 
 
 def test_pytorch_zip_scanner_detects_case_insensitive_native_library_members(tmp_path: Path) -> None:
@@ -452,11 +560,8 @@ def test_pytorch_zip_initialize_scan_does_not_read_archive_members(
     assert "pickle_files" not in result.metadata
 
 
-def test_pytorch_zip_scan_does_not_open_numeric_tensor_data_files(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Numeric tensor payloads should not be opened anywhere in the ZIP scan."""
+def test_pytorch_zip_scan_does_not_route_numeric_tensor_data_files_as_pickles(tmp_path: Path) -> None:
+    """Numeric tensor payloads should be prefix-probed but not routed as pickles."""
     zip_path = tmp_path / "model.pt"
 
     with zipfile.ZipFile(zip_path, "w") as zipf:
@@ -465,29 +570,14 @@ def test_pytorch_zip_scan_does_not_open_numeric_tensor_data_files(
         zipf.writestr("archive/data/0", b"\x00" * 1024)
         zipf.writestr("archive/data/1", b"\x00" * 1024)
 
-    opened_members: list[str] = []
-    original_open = zipfile.ZipFile.open
-
-    def track_open(
-        self: zipfile.ZipFile,
-        name: str | zipfile.ZipInfo,
-        mode: str = "r",
-        pwd: bytes | None = None,
-        *,
-        force_zip64: bool = False,
-    ) -> IO[bytes]:
-        opened_members.append(name.filename if isinstance(name, zipfile.ZipInfo) else str(name))
-        return original_open(self, name, mode, pwd, force_zip64=force_zip64)
-
-    monkeypatch.setattr(zipfile.ZipFile, "open", track_open)
-
     scanner = PyTorchZipScanner()
     result = scanner.scan(str(zip_path))
 
     assert result.success is True
-    assert "archive/data.pkl" in opened_members
-    assert "archive/data/0" not in opened_members
-    assert "archive/data/1" not in opened_members
+    assert result.metadata["pickle_files"] == ["archive/data.pkl"]
+    assert not any(
+        issue.details.get("pickle_filename") in {"archive/data/0", "archive/data/1"} for issue in result.issues
+    )
 
 
 def test_pytorch_zip_scanner_handles_zip_metadata_oserror(
