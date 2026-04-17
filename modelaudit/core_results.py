@@ -32,6 +32,7 @@ def mark_operational_scan_error(scan_result: ScanResult, reason: str) -> None:
     """Mark a scan result as an operational failure for exit-code aggregation."""
     scan_result.metadata[OPERATIONAL_ERROR_METADATA_KEY] = True
     scan_result.metadata[OPERATIONAL_ERROR_REASON_METADATA_KEY] = reason
+    scan_result._refresh_metadata_dependent_state()
 
 
 def mark_inconclusive_scan_outcome(scan_result: ScanResult, reason: str) -> None:

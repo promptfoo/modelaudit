@@ -7,6 +7,7 @@ from typing import ClassVar
 import pytest
 
 from modelaudit.analysis.unified_context import UnifiedMLContext
+from modelaudit.scanner_results import mark_inconclusive_scan_result
 from modelaudit.scanners.base import (
     INCONCLUSIVE_SCAN_OUTCOME,
     BaseScanner,
@@ -1083,6 +1084,70 @@ def test_whitelist_restores_downgrade_when_operational_metadata_set_after_check(
     assert result.checks[0].severity == IssueSeverity.CRITICAL
     assert result.checks[0].details.get("whitelist_downgrade") is None
     assert result.checks[0].details.get("whitelist_downgrade_restored") is True
+
+
+def test_finish_recomputes_success_after_restoring_metadata_exempt_severity(tmp_path: Path) -> None:
+    """Restored CRITICAL findings must make finished results unsuccessful."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=tmp_path / "test.joblib",
+        file_size=100,
+        file_type=".joblib",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name="Joblib Decompression",
+        passed=False,
+        message="Error decompressing joblib file",
+        severity=IssueSeverity.CRITICAL,
+    )
+    assert result.issues[0].severity == IssueSeverity.INFO
+
+    result.metadata["operational_error"] = True
+    result.metadata["operational_error_reason"] = "joblib_decompression_failed"
+    result.finish(success=True)
+
+    assert result.issues[0].severity.value == "critical"
+    assert result.checks[0].severity == IssueSeverity.CRITICAL
+    assert result.success is False
+
+
+def test_finished_result_refreshes_whitelist_restore_after_late_inconclusive_metadata(tmp_path: Path) -> None:
+    """Post-finish inconclusive metadata should restore downgraded severities."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=tmp_path / "test.pkl",
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name="Late Coverage Check",
+        passed=False,
+        message="High confidence model anomaly detected",
+        severity=IssueSeverity.CRITICAL,
+    )
+    result.finish(success=True)
+    assert result.issues[0].severity.value == "info"
+    assert result.success is True
+
+    mark_inconclusive_scan_result(result, "streaming_analysis_incomplete")
+
+    assert result.issues[0].severity.value == "critical"
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+    assert result.issues[0].details.get("whitelist_downgrade_restored") is True
+    assert result.checks[0].severity == IssueSeverity.CRITICAL
+    assert result.success is False
 
 
 def test_whitelist_downgrade_check_warning():

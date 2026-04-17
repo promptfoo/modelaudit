@@ -37,6 +37,7 @@ def mark_inconclusive_scan_result(scan_result: "ScanResult", reason: str) -> Non
     if reason not in reasons:
         reasons.append(reason)
     scan_result.metadata[SCAN_OUTCOME_REASONS_METADATA_KEY] = reasons
+    scan_result._refresh_metadata_dependent_state()
 
 
 def normalize_unclassified_scan_failure(scan_result: "ScanResult") -> None:
@@ -324,9 +325,11 @@ class ScanResult:
 
     def finish(self, success: bool = True) -> None:
         """Mark the scan as finished"""
-        self._restore_result_metadata_whitelist_downgrades()
+        restored_critical = self._restore_result_metadata_whitelist_downgrades()
         self.end_time = time.time()
         self.success = success
+        if restored_critical and self.has_errors:
+            self.success = False
 
     @staticmethod
     def _severity_from_original_whitelist_value(value: Any) -> IssueSeverity | None:
@@ -342,13 +345,16 @@ class ScanResult:
             except ValueError:
                 return None
 
-    def _restore_result_metadata_whitelist_downgrades(self) -> None:
+    def _restore_result_metadata_whitelist_downgrades(self) -> bool:
         """Restore downgraded severities when result metadata later marks incomplete coverage."""
         metadata_exempt = getattr(self.scanner, "_result_metadata_whitelist_downgrade_exempt", None)
         if not callable(metadata_exempt) or not metadata_exempt(self.metadata):
-            return
+            return False
+
+        restored_critical = False
 
         def restore_finding(finding: Check | Issue) -> None:
+            nonlocal restored_critical
             if finding.details.get("whitelist_downgrade") is not True:
                 return
             original_severity = self._severity_from_original_whitelist_value(finding.details.get("original_severity"))
@@ -357,11 +363,20 @@ class ScanResult:
             finding.severity = original_severity
             finding.details.pop("whitelist_downgrade", None)
             finding.details["whitelist_downgrade_restored"] = True
+            if original_severity == IssueSeverity.CRITICAL:
+                restored_critical = True
 
         for check in self.checks:
             restore_finding(check)
         for issue in self.issues:
             restore_finding(issue)
+        return restored_critical
+
+    def _refresh_metadata_dependent_state(self) -> None:
+        """Reconcile severities and success after metadata changes outside finish()."""
+        restored_critical = self._restore_result_metadata_whitelist_downgrades()
+        if self.end_time is not None and restored_critical and self.has_errors:
+            self.success = False
 
     @property
     def duration(self) -> float:
