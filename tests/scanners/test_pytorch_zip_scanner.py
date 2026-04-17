@@ -588,6 +588,31 @@ def test_pytorch_zip_jit_size_limit_respects_disabled_checks(tmp_path: Path) -> 
     ]
 
 
+def test_pytorch_zip_scans_pickle_members_for_network_when_pickle_scanner_disabled(tmp_path: Path) -> None:
+    model_path = tmp_path / "network_in_data_pkl.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr(
+            "archive/data.pkl",
+            pickle.dumps({"endpoint": "http://attacker.example/model"}, protocol=4),
+        )
+
+    result = PyTorchZipScanner(config={"scanners": ["pytorch_zip"]}).scan(str(model_path))
+
+    assert any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "pickle"
+        for check in result.checks
+    )
+    network_failures = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert network_failures
+    assert any(check.location == f"{model_path}:archive/data.pkl" for check in network_failures)
+
+
 @pytest.mark.performance
 def test_pytorch_zip_skips_numeric_data_files(tmp_path):
     """Test that numeric tensor data files in archive/data/ are skipped during JIT scanning."""
