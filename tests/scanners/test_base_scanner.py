@@ -1003,6 +1003,74 @@ def test_whitelist_does_not_downgrade_active_or_incomplete_findings(
     assert result.checks[0].details.get("whitelist_downgrade") is None
 
 
+def test_whitelist_does_not_downgrade_result_metadata_operational_errors() -> None:
+    """Operational error metadata must preserve fail-closed severities."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    whitelisted_model = next(iter(POPULAR_MODELS))
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.joblib"),
+        file_size=100,
+        file_type=".joblib",
+        model_id=whitelisted_model,
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.metadata["operational_error"] = True
+    result.metadata["operational_error_reason"] = "joblib_decompression_failed"
+    result.add_check(
+        name="Joblib Decompression",
+        passed=False,
+        message="Error decompressing joblib file",
+        severity=IssueSeverity.CRITICAL,
+    )
+
+    assert result.issues[0].severity.value == "critical"
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+    assert result.checks[0].severity == IssueSeverity.CRITICAL
+    assert result.checks[0].details.get("whitelist_downgrade") is None
+
+
+def test_whitelist_restores_downgrade_when_operational_metadata_set_after_check() -> None:
+    """Late operational metadata should restore already-downgraded checks."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    whitelisted_model = next(iter(POPULAR_MODELS))
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.joblib"),
+        file_size=100,
+        file_type=".joblib",
+        model_id=whitelisted_model,
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name="Joblib Decompression",
+        passed=False,
+        message="Error decompressing joblib file",
+        severity=IssueSeverity.CRITICAL,
+    )
+    assert result.issues[0].severity.value == "info"
+    assert result.issues[0].details.get("whitelist_downgrade") is True
+
+    result.metadata["operational_error"] = True
+    result.metadata["operational_error_reason"] = "joblib_decompression_failed"
+    result.finish(success=False)
+
+    assert result.issues[0].severity.value == "critical"
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+    assert result.issues[0].details.get("whitelist_downgrade_restored") is True
+    assert result.checks[0].severity == IssueSeverity.CRITICAL
+    assert result.checks[0].details.get("whitelist_downgrade") is None
+    assert result.checks[0].details.get("whitelist_downgrade_restored") is True
+
+
 def test_whitelist_downgrade_check_warning():
     """Test that whitelisted models have warning checks downgraded to INFO."""
     from modelaudit.whitelists import POPULAR_MODELS

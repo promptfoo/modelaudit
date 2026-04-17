@@ -13,6 +13,8 @@ from typing import Any, ClassVar, Final, Literal
 from ..analysis.unified_context import UnifiedMLContext
 from ..scanner_results import (
     INCONCLUSIVE_SCAN_OUTCOME,
+    OPERATIONAL_ERROR_METADATA_KEY,
+    SCAN_OUTCOME_METADATA_KEY,
     Check,
     CheckStatus,
     Issue,
@@ -181,9 +183,20 @@ class BaseScanner(ABC):
         return bool(val)
 
     @staticmethod
+    def _result_metadata_whitelist_downgrade_exempt(result_metadata: dict[str, Any] | None) -> bool:
+        """Return True when result-level metadata marks incomplete operational coverage."""
+        metadata = result_metadata or {}
+        return (
+            metadata.get("analysis_incomplete") is True
+            or metadata.get(OPERATIONAL_ERROR_METADATA_KEY) is True
+            or metadata.get(SCAN_OUTCOME_METADATA_KEY) == INCONCLUSIVE_SCAN_OUTCOME
+        )
+
+    @staticmethod
     def _whitelist_downgrade_exempt(
         *,
         details: dict[str, Any] | None,
+        result_metadata: dict[str, Any] | None = None,
         message: str | None,
         rule_code: str | None,
         check_name: str | None,
@@ -191,6 +204,8 @@ class BaseScanner(ABC):
         """Return True for active payload or incomplete-coverage findings."""
         details = details or {}
         if details.get("analysis_incomplete") is True or details.get("operational_error") is True:
+            return True
+        if BaseScanner._result_metadata_whitelist_downgrade_exempt(result_metadata):
             return True
         if details.get("cve_id"):
             return True
@@ -218,6 +233,7 @@ class BaseScanner(ABC):
         severity: IssueSeverity,
         *,
         details: dict[str, Any] | None = None,
+        result_metadata: dict[str, Any] | None = None,
         message: str | None = None,
         rule_code: str | None = None,
         check_name: str | None = None,
@@ -237,6 +253,7 @@ class BaseScanner(ABC):
 
         if self._whitelist_downgrade_exempt(
             details=details,
+            result_metadata=result_metadata,
             message=message,
             rule_code=rule_code,
             check_name=check_name,
@@ -268,6 +285,7 @@ class BaseScanner(ABC):
         severity: IssueSeverity,
         details: dict[str, Any] | None,
         *,
+        result_metadata: dict[str, Any] | None = None,
         message: str | None = None,
         rule_code: str | None = None,
         check_name: str | None = None,
@@ -286,6 +304,7 @@ class BaseScanner(ABC):
         if self._should_apply_whitelist(
             severity,
             details=details,
+            result_metadata=result_metadata,
             message=message,
             rule_code=rule_code,
             check_name=check_name,

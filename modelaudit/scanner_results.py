@@ -220,6 +220,7 @@ class ScanResult:
             severity, details = self.scanner._apply_whitelist_downgrade(
                 severity,
                 details,
+                result_metadata=self.metadata,
                 message=message,
                 rule_code=rule_code,
                 check_name=name,
@@ -323,8 +324,44 @@ class ScanResult:
 
     def finish(self, success: bool = True) -> None:
         """Mark the scan as finished"""
+        self._restore_result_metadata_whitelist_downgrades()
         self.end_time = time.time()
         self.success = success
+
+    @staticmethod
+    def _severity_from_original_whitelist_value(value: Any) -> IssueSeverity | None:
+        if isinstance(value, IssueSeverity):
+            return value
+        if not isinstance(value, str):
+            return None
+        try:
+            return IssueSeverity[value]
+        except KeyError:
+            try:
+                return IssueSeverity(value.lower())
+            except ValueError:
+                return None
+
+    def _restore_result_metadata_whitelist_downgrades(self) -> None:
+        """Restore downgraded severities when result metadata later marks incomplete coverage."""
+        metadata_exempt = getattr(self.scanner, "_result_metadata_whitelist_downgrade_exempt", None)
+        if not callable(metadata_exempt) or not metadata_exempt(self.metadata):
+            return
+
+        def restore_finding(finding: Check | Issue) -> None:
+            if finding.details.get("whitelist_downgrade") is not True:
+                return
+            original_severity = self._severity_from_original_whitelist_value(finding.details.get("original_severity"))
+            if original_severity is None:
+                return
+            finding.severity = original_severity
+            finding.details.pop("whitelist_downgrade", None)
+            finding.details["whitelist_downgrade_restored"] = True
+
+        for check in self.checks:
+            restore_finding(check)
+        for issue in self.issues:
+            restore_finding(issue)
 
     @property
     def duration(self) -> float:
