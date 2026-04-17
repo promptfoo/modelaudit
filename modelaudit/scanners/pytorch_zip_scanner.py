@@ -107,6 +107,7 @@ _PICKLE_BINARY_PROTOCOL_PREFIXES: tuple[bytes, ...] = (
     b"\x80\x05",
 )
 _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
+_JIT_SCAN_MEMBER_MAX_BYTES = 32 * 1024 * 1024
 _PICKLE_DISCOVERY_LONG_PROBE_BYTES = PROTO0_1_MAX_PROBE_BYTES
 _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN = re.compile(r"^(?:.+/)?data/[0-9]+$")
 
@@ -244,6 +245,15 @@ class PyTorchZipScanner(BaseScanner):
             self.MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE,
         )
         self.max_archive_entries = self.config.get("max_archive_entries", self.MAX_ARCHIVE_ENTRIES)
+        # ``max_jit_scan_member_bytes`` caps per-member reads during the JIT /
+        # network pattern pass to avoid unbounded memory blowup. Non-positive
+        # or non-integer values fall back to the default; there is *no*
+        # "0 = unlimited" escape hatch here (unlike ``ZipScanner.max_entry_size``)
+        # because this pass cannot afford to run without a bound.
+        self.max_jit_scan_member_bytes = self._normalize_positive_int_config(
+            self.config.get("max_jit_scan_member_bytes"),
+            _JIT_SCAN_MEMBER_MAX_BYTES,
+        )
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -1195,13 +1205,40 @@ class PyTorchZipScanner(BaseScanner):
         bytes_scanned = 0
         all_jit_findings = []
         all_network_findings = []
+        check_jit = self._get_bool_config("check_jit_script", True)
+        check_net = self._get_bool_config("check_network_comm", True)
+        if safe_entries:
+            if not check_jit:
+                result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
+            if not check_net:
+                result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
+        if not check_jit and not check_net:
+            return 0
+
+        # Aggregate oversize and read-failure events so adversarial archives
+        # with many unreachable members produce one summary check apiece
+        # instead of one INFO finding per entry in the checks list.
+        size_limited_entries: list[dict[str, Any]] = []
+        read_failed_entries: list[dict[str, Any]] = []
 
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
+            normalized_name = name.replace("\\", "/").lstrip("/")
             try:
+                if entry.is_dir() or normalized_name.endswith("/"):
+                    continue
                 # Skip numeric tensor data files to support different versions of PyTorch ZIP files
                 # These are binary weight files that cause performance issues when scanned
-                if _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN.match(name):
+                if _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN.match(normalized_name):
+                    continue
+                if entry.file_size > self.max_jit_scan_member_bytes:
+                    size_limited_entries.append(
+                        {
+                            "zip_entry": name,
+                            "file_size": entry.file_size,
+                            "location": f"{path}:{name}",
+                        }
+                    )
                     continue
 
                 file_data = self._read_member_bytes(
@@ -1209,6 +1246,7 @@ class PyTorchZipScanner(BaseScanner):
                     entry,
                     phase="jit_script_scan",
                     result=result,
+                    max_bytes=self.max_jit_scan_member_bytes,
                 )
                 bytes_scanned += len(file_data)
 
@@ -1228,12 +1266,59 @@ class PyTorchZipScanner(BaseScanner):
                     all_network_findings.extend(network_findings)
 
             except Exception as e:
-                # Skip files that can't be read
                 logger.debug(f"Exception reading {name}: {e}")
+                read_failed_entries.append(
+                    {
+                        "zip_entry": name,
+                        "exception": str(e),
+                        "exception_type": type(e).__name__,
+                        "location": f"{path}:{name}",
+                    }
+                )
+
+        if size_limited_entries:
+            mark_inconclusive_scan_result(result, "pytorch_zip_jit_member_size_limit")
+            count = len(size_limited_entries)
+            noun = "member" if count == 1 else "members"
+            result.add_check(
+                name="JIT/Network Scan Size Limit",
+                passed=False,
+                message=(
+                    f"{count} PyTorch ZIP {noun} skipped by JIT/network scanning because "
+                    f"{'it exceeds' if count == 1 else 'they exceed'} the bounded read limit "
+                    f"({self.max_jit_scan_member_bytes} bytes)"
+                ),
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "zip_entries": [entry["zip_entry"] for entry in size_limited_entries],
+                    "entries": size_limited_entries,
+                    "max_scan_bytes": self.max_jit_scan_member_bytes,
+                    "skipped_count": count,
+                    "analysis_incomplete": True,
+                },
+            )
+
+        if read_failed_entries:
+            mark_inconclusive_scan_result(result, "pytorch_zip_jit_member_read_failed")
+            count = len(read_failed_entries)
+            noun = "member" if count == 1 else "members"
+            result.add_check(
+                name="JIT/Network Scan Read Failure",
+                passed=False,
+                message=(f"{count} PyTorch ZIP {noun} could not be analyzed for JIT/network patterns"),
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "zip_entries": [entry["zip_entry"] for entry in read_failed_entries],
+                    "entries": read_failed_entries,
+                    "failed_count": count,
+                    "analysis_incomplete": True,
+                },
+            )
 
         # Emit explicit checks for the entire ZIP file
         if safe_entries:  # Only create checks if we processed files
-            check_jit = self._get_bool_config("check_jit_script", True)
             if check_jit:
                 self.add_jit_script_findings(
                     all_jit_findings,
@@ -1241,18 +1326,13 @@ class PyTorchZipScanner(BaseScanner):
                     model_type="pytorch",
                     context=path,
                 )
-            else:
-                result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
 
-            check_net = self._get_bool_config("check_network_comm", True)
             if check_net:
                 self.add_network_communication_findings(
                     all_network_findings,
                     result,
                     context=path,
                 )
-            else:
-                result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
 
         return bytes_scanned
 

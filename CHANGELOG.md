@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** bound PyTorch ZIP JIT/network member reads (default 32 MiB per-member cap, configurable via `max_jit_scan_member_bytes`) and mark oversized or unreadable member coverage inconclusive. Oversize and read-failure events are aggregated into a single summary INFO check per kind (with per-member detail in `details["entries"]`) so adversarial archives cannot flood the checks list, duplicate-name entries are de-duplicated by `ZipInfo` identity rather than filename so the second of two same-name members is still analyzed, directory entries are skipped explicitly, and pickle members continue through the bounded JIT/network pass so padded payloads remain covered beyond the pickle scanner raw window.
 - **security:** detect hidden PyTorch ZIP pickle members even when a benign `data.pkl` is already present. The bounded-prefix sniff now always runs across unselected members (including extensionless payloads and files under `data/<n>`), fails closed with one aggregated INFO check if probe reads raise (was one check per failed member), and is mirrored in the standalone `modelaudit-picklescan` package so both code paths discover the same hidden payloads.
 - **security:** mark PyTorch ZIP scan timeouts inconclusive and unsuccessful instead of reporting complete coverage.
 - **security:** detect extensionless protocol-0/1 pickle members during 7-Zip nested archive probes.
