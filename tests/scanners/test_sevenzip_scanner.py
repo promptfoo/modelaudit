@@ -1658,6 +1658,20 @@ class TestSevenZipScannerHardening:
 
         assert scanner._probe_detected_format(probe) == "tar"
 
+    def test_probe_detected_format_recognizes_extensionless_proto0_pickle(self) -> None:
+        """7z nested probes should route protocol-0 pickle members without suffixes."""
+        scanner = SevenZipScanner()
+        probe = io.BytesIO(b"cposix\nsystem\n(S'echo hidden'\ntR.")
+
+        assert scanner._probe_detected_format(probe) == "pickle"
+
+    def test_probe_detected_format_ignores_benign_proto0_near_match_text(self) -> None:
+        """Plain text that starts with proto0-looking bytes should not route as pickle."""
+        scanner = SevenZipScanner()
+        probe = io.BytesIO(b"cat is a category label, not a GLOBAL opcode stream")
+
+        assert scanner._probe_detected_format(probe) is None
+
     def test_extensionless_probe_without_header_is_not_scanned(
         self,
         scanner: SevenZipScanner,
@@ -1719,6 +1733,40 @@ class TestSevenZipScannerHardening:
             mock_archive = MagicMock()
             mock_archive.getnames.return_value = ["nested_payload"]
             mock_archive.getinfo.return_value = MagicMock(uncompressed=16, is_directory=False)
+            mock_archive.extract.side_effect = fake_extract
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(str(archive_path))
+
+            assert result.success
+            assert result.metadata["scannable_files"] == 1
+            mock_scan_extracted_file.assert_called_once()
+
+    def test_extensionless_proto0_pickle_probe_reaches_full_extraction(self, tmp_path: Path) -> None:
+        """Header probes should route extensionless protocol-0 pickle members through scanner extraction."""
+        scanner = SevenZipScanner()
+        archive_path = tmp_path / "proto0_probe.7z"
+        archive_path.write_bytes(scanner._SEVENZIP_MAGIC + b"\0" * 26)
+        payload = b"cposix\nsystem\n(S'echo hidden'\ntR."
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_has_7z_magic", return_value=True),
+            patch.object(scanner, "_scan_extracted_file", return_value=_mock_scan_result()) as mock_scan_extracted_file,
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.islink", return_value=False),
+            patch("os.path.getsize", return_value=32),
+        ):
+
+            def fake_extract(*_args: Any, **kwargs: Any) -> None:
+                factory = kwargs.get("factory")
+                if factory is not None:
+                    factory.create("nested_payload").write(payload)
+
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["nested_payload"]
+            mock_archive.getinfo.return_value = MagicMock(uncompressed=len(payload), is_directory=False)
             mock_archive.extract.side_effect = fake_extract
             mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
 

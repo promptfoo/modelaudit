@@ -16,7 +16,7 @@ import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 import pytest
 
@@ -153,6 +153,10 @@ def _assert_inconclusive_metadata(result: ModelAuditResultModel, path: Path, rea
     assert reason in metadata.get("scan_outcome_reasons", [])
 
 
+def _xgboost_ubjson_probe() -> bytes:
+    return b"{L" + (b"\0" * 8) + b"learner" + b"learner_model_param" + b"version"
+
+
 class TestXGBoostScannerBasic:
     """Test basic XGBoost scanner functionality."""
 
@@ -178,6 +182,45 @@ class TestXGBoostScannerBasic:
             test_file.write_text("dummy content")
 
             assert not XGBoostScanner.can_handle(str(test_file))
+
+    def test_can_handle_extensionless_ubjson_with_xgboost_markers(self, temp_dir: Path) -> None:
+        model_file = temp_dir / "model"
+        model_file.write_bytes(_xgboost_ubjson_probe())
+
+        assert XGBoostScanner.can_handle(str(model_file))
+
+    def test_rejects_extensionless_ubjson_like_header_without_xgboost_markers(self, temp_dir: Path) -> None:
+        model_file = temp_dir / "model"
+        model_file.write_bytes(b"{L" + (b"\0" * 64))
+
+        assert not XGBoostScanner.can_handle(str(model_file))
+
+    def test_rejects_extensionless_ubjson_with_only_learner_marker(self, temp_dir: Path) -> None:
+        model_file = temp_dir / "model"
+        model_file.write_bytes(b"{L" + (b"\0" * 8) + b"learner")
+
+        assert not XGBoostScanner.can_handle(str(model_file))
+
+    def test_rejects_extensionless_ubjson_when_strong_marker_past_probe_window(self, temp_dir: Path) -> None:
+        """Extensionless files require a strong marker *within* the probe window.
+
+        `.bst`/`.model` files trust the extension and need only `learner`, but an
+        extensionless file with `learner` early and every strong marker past the
+        probe window must be rejected so unrelated archives that happen to embed
+        `{L...learner` near the top are not misrouted to the UBJ scanner.
+        """
+        probe_bytes = XGBoostScanner._UBJSON_PROBE_READ_BYTES
+        # `learner` sits near the start; all strong markers live past the probe cap.
+        prefix = b"{L" + (b"\0" * 8) + b"learner"
+        padding_len = probe_bytes - len(prefix) + 32
+        payload = prefix + (b"\0" * padding_len) + b"version" + b"gbtree"
+        assert all(marker not in payload[:probe_bytes] for marker in XGBoostScanner._UBJSON_STRONG_MARKERS)
+        assert any(marker in payload for marker in XGBoostScanner._UBJSON_STRONG_MARKERS)
+
+        model_file = temp_dir / "model"
+        model_file.write_bytes(payload)
+
+        assert not XGBoostScanner.can_handle(str(model_file))
 
     def test_scanner_name_and_description(self):
         """Test scanner metadata."""
@@ -490,6 +533,55 @@ class TestXGBoostBinaryScanning:
         assert "scan_outcome" not in result.metadata
         assert not any("pickle file" in str(issue.message) for issue in result.issues)
 
+    def test_bst_with_ubjson_header_routes_to_ubj_scan(self, temp_dir: Path) -> None:
+        """Modern UBJSON-backed .bst files should bypass binary structure validation."""
+        binary_file = temp_dir / "modern.bst"
+        binary_file.write_bytes(_xgboost_ubjson_probe())
+        scanner = XGBoostScanner()
+
+        with (
+            patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=True),
+            patch.object(scanner, "_scan_ubj_model") as mock_scan_ubj,
+            patch.object(scanner, "_validate_binary_structure") as mock_validate_binary_structure,
+        ):
+            result = scanner.scan(str(binary_file))
+
+        mock_scan_ubj.assert_called_once_with(str(binary_file), result)
+        mock_validate_binary_structure.assert_not_called()
+
+    def test_bst_with_late_ubjson_strong_marker_routes_to_ubj_scan(self, temp_dir: Path) -> None:
+        """Large UBJSON .bst files should not require strong markers in the probe window."""
+        binary_file = temp_dir / "modern_large.bst"
+        binary_file.write_bytes(
+            b"{L" + (b"\0" * 8) + b"learner" + (b"\0" * XGBoostScanner._UBJSON_PROBE_READ_BYTES) + b"version"
+        )
+        scanner = XGBoostScanner()
+
+        with (
+            patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=True),
+            patch.object(scanner, "_scan_ubj_model") as mock_scan_ubj,
+            patch.object(scanner, "_validate_binary_structure") as mock_validate_binary_structure,
+        ):
+            result = scanner.scan(str(binary_file))
+
+        mock_scan_ubj.assert_called_once_with(str(binary_file), result)
+        mock_validate_binary_structure.assert_not_called()
+
+    def test_bst_with_ubjson_like_header_without_markers_uses_binary_validation(self, temp_dir: Path) -> None:
+        """UBJSON-looking bytes without XGBoost markers should not bypass binary validation."""
+        binary_file = temp_dir / "custom.bst"
+        binary_file.write_bytes(b"{Llegacy gbtree reg:squarederror with enough bytes")
+        scanner = XGBoostScanner()
+
+        with (
+            patch.object(scanner, "_scan_ubj_model") as mock_scan_ubj,
+            patch.object(scanner, "_validate_binary_structure") as mock_validate_binary_structure,
+        ):
+            scanner.scan(str(binary_file))
+
+        mock_scan_ubj.assert_not_called()
+        mock_validate_binary_structure.assert_called_once_with(str(binary_file), ANY)
+
     def test_binary_structure_exception_is_inconclusive(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
         """Binary analyzer exceptions should fail closed instead of returning success."""
         binary_file = temp_dir / "broken.bst"
@@ -599,7 +691,7 @@ class TestXGBoostBinaryScanning:
     def test_ubjson_bst_without_decoder_uses_loading_fallback(self, temp_dir: Path) -> None:
         """Detected UBJSON .bst files should still exercise XGBoost loading when enabled."""
         ubjson_bst = temp_dir / "model.bst"
-        ubjson_bst.write_bytes(b"{U")
+        ubjson_bst.write_bytes(_xgboost_ubjson_probe())
         loading_scanner = XGBoostScanner({"enable_xgb_loading": True})
 
         def record_successful_load(path: str, result: ScanResult) -> None:
@@ -631,7 +723,7 @@ class TestXGBoostBinaryScanning:
     def test_ubjson_bst_without_decoder_or_loading_fails_closed(self, temp_dir: Path) -> None:
         """Detected UBJSON .bst files should not be misreported as malformed legacy binaries."""
         ubjson_bst = temp_dir / "model.bst"
-        ubjson_bst.write_bytes(b"{U")
+        ubjson_bst.write_bytes(_xgboost_ubjson_probe())
 
         with patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=False):
             result = XGBoostScanner({"enable_xgb_loading": False}).scan(str(ubjson_bst))
@@ -779,6 +871,27 @@ class TestXGBoostFailClosedEndToEnd:
                 assert result.success is False
                 assert determine_exit_code(result) == 2
                 _assert_inconclusive_metadata(result, ubj_file, "xgboost_ubj_dependency_missing")
+                assert any("Cannot scan UBJ file" in str(issue.message) for issue in result.issues)
+
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_missing_ubjson_for_bst_header_core_fails_closed_and_is_uncached(self, tmp_path: Path) -> None:
+        bst_file = tmp_path / "model.bst"
+        bst_file.write_bytes(_xgboost_ubjson_probe())
+        cache_dir = tmp_path / "cache"
+
+        reset_cache_manager()
+        try:
+            with patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=False):
+                first, second = _scan_twice_with_cache(bst_file, cache_dir)
+
+            for result in (first, second):
+                assert result.success is False
+                assert determine_exit_code(result) == 2
+                assert "xgboost" in result.scanner_names
+                _assert_inconclusive_metadata(result, bst_file, "xgboost_ubj_dependency_missing")
                 assert any("Cannot scan UBJ file" in str(issue.message) for issue in result.issues)
 
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
