@@ -157,6 +157,25 @@ class TestTarScanner:
         assert python_checks[0].severity == IssueSeverity.WARNING
         assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
+    def test_scan_tar_flags_builtins_getattr_keyword_call_dangerous_python_member(self, tmp_path: Path) -> None:
+        """Keyword-based getattr indirection should still resolve to the risky call name."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = b"import builtins as bi\nimport os\nbi.getattr(object=os, name='system').__call__('echo hidden')\n"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].severity == IssueSeverity.WARNING
+        assert python_checks[0].rule_code == "S101"
+        assert python_checks[0].details["reason"] == "high-risk calls: os.system"
+
     def test_scan_tar_flags_rebound_dangerous_python_member(self, tmp_path: Path) -> None:
         """Callable rebindings should not bypass generic TAR Python member scanning."""
         archive_path = tmp_path / "model_bundle.tar"
