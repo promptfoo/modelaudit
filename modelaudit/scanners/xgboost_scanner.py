@@ -516,7 +516,8 @@ class XGBoostScanner(BaseScanner):
             # Modern XGBoost (2.0+) saves .bst files in UBJSON format by default.
             # Route to the UBJ scanner when the decoder is available; otherwise
             # fail closed while still attempting the optional XGBoost load.
-            is_ubjson = self._is_ubjson_file(path)
+            file_ext = os.path.splitext(path)[1].lower()
+            is_ubjson = self._is_ubjson_file(path, require_strong_marker=file_ext not in {".bst", ".model"})
             if is_ubjson:
                 if _check_ubjson_available():
                     self._scan_ubj_model(path, result)
@@ -770,18 +771,20 @@ class XGBoostScanner(BaseScanner):
             return False
 
     @staticmethod
-    def _is_ubjson_file(path: str) -> bool:
+    def _is_ubjson_file(path: str, *, require_strong_marker: bool = True) -> bool:
         """Check if a file is probably an XGBoost UBJSON model."""
         try:
             with open(path, "rb") as f:
                 probe = f.read(XGBoostScanner._UBJSON_PROBE_READ_BYTES)
-            return (
+            is_ubjson_with_required_markers = (
                 len(probe) >= 2
                 and probe[0] == XGBoostScanner._UBJSON_OBJECT_START
                 and probe[1] in XGBoostScanner._UBJSON_NEXT_VALID
                 and all(marker in probe for marker in XGBoostScanner._UBJSON_REQUIRED_MARKERS)
-                and any(marker in probe for marker in XGBoostScanner._UBJSON_STRONG_MARKERS)
             )
+            if not is_ubjson_with_required_markers:
+                return False
+            return not require_strong_marker or any(marker in probe for marker in XGBoostScanner._UBJSON_STRONG_MARKERS)
         except OSError:
             return False
 

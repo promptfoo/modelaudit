@@ -541,6 +541,24 @@ class TestXGBoostBinaryScanning:
         mock_scan_ubj.assert_called_once_with(str(binary_file), result)
         mock_validate_binary_structure.assert_not_called()
 
+    def test_bst_with_late_ubjson_strong_marker_routes_to_ubj_scan(self, temp_dir: Path) -> None:
+        """Large UBJSON .bst files should not require strong markers in the probe window."""
+        binary_file = temp_dir / "modern_large.bst"
+        binary_file.write_bytes(
+            b"{L" + (b"\0" * 8) + b"learner" + (b"\0" * XGBoostScanner._UBJSON_PROBE_READ_BYTES) + b"version"
+        )
+        scanner = XGBoostScanner()
+
+        with (
+            patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=True),
+            patch.object(scanner, "_scan_ubj_model") as mock_scan_ubj,
+            patch.object(scanner, "_validate_binary_structure") as mock_validate_binary_structure,
+        ):
+            result = scanner.scan(str(binary_file))
+
+        mock_scan_ubj.assert_called_once_with(str(binary_file), result)
+        mock_validate_binary_structure.assert_not_called()
+
     def test_bst_with_ubjson_like_header_without_markers_uses_binary_validation(self, temp_dir: Path) -> None:
         """UBJSON-looking bytes without XGBoost markers should not bypass binary validation."""
         binary_file = temp_dir / "custom.bst"
