@@ -7,10 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.39](https://github.com/promptfoo/modelaudit/compare/v0.2.38...v0.2.39) (2026-04-17)
 
-
 ### Bug Fixes
 
-* repair picklescan release wheel jobs ([#1051](https://github.com/promptfoo/modelaudit/issues/1051)) ([6c23190](https://github.com/promptfoo/modelaudit/commit/6c23190f9b23686d33d5da0a8b5522a59490084e))
+- repair picklescan release wheel jobs ([#1051](https://github.com/promptfoo/modelaudit/issues/1051)) ([6c23190](https://github.com/promptfoo/modelaudit/commit/6c23190f9b23686d33d5da0a8b5522a59490084e))
 
 ## [0.2.38](https://github.com/promptfoo/modelaudit/compare/v0.2.37...v0.2.38) (2026-04-17)
 
