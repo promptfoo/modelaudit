@@ -229,7 +229,17 @@ class XGBoostScanner(BaseScanner):
     _UBJSON_PROBE_READ_BYTES: ClassVar[int] = 256 * 1024
     _UBJSON_OBJECT_START: ClassVar[int] = ord("{")
     _UBJSON_NEXT_VALID: ClassVar[frozenset[int]] = frozenset(b"iUIlLdDSC#$}")
-    _UBJSON_XGBOOST_MARKERS: ClassVar[tuple[bytes, ...]] = (b"learner", b"version")
+    _UBJSON_REQUIRED_MARKERS: ClassVar[tuple[bytes, ...]] = (b"learner",)
+    _UBJSON_STRONG_MARKERS: ClassVar[tuple[bytes, ...]] = (
+        b"version",
+        b"gradient_booster",
+        b"learner_model_param",
+        b"gbtree_model_param",
+        b"tree_info",
+        b"gbtree",
+        b"gblinear",
+        b"dart",
+    )
     _BINARY_MIN_STRUCTURE_BYTES: ClassVar[int] = 32
     _INCONCLUSIVE_REASONS: ClassVar[dict[str, str]] = {
         "json_parse_failed": "xgboost_json_parse_failed",
@@ -769,7 +779,8 @@ class XGBoostScanner(BaseScanner):
                 len(probe) >= 2
                 and probe[0] == XGBoostScanner._UBJSON_OBJECT_START
                 and probe[1] in XGBoostScanner._UBJSON_NEXT_VALID
-                and all(marker in probe for marker in XGBoostScanner._UBJSON_XGBOOST_MARKERS)
+                and all(marker in probe for marker in XGBoostScanner._UBJSON_REQUIRED_MARKERS)
+                and any(marker in probe for marker in XGBoostScanner._UBJSON_STRONG_MARKERS)
             )
         except OSError:
             return False

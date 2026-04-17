@@ -154,7 +154,7 @@ def _assert_inconclusive_metadata(result: ModelAuditResultModel, path: Path, rea
 
 
 def _xgboost_ubjson_probe() -> bytes:
-    return b"{L" + (b"\0" * 8) + b"learner" + b"version"
+    return b"{L" + (b"\0" * 8) + b"learner" + b"learner_model_param" + b"version"
 
 
 class TestXGBoostScannerBasic:
@@ -194,6 +194,25 @@ class TestXGBoostScannerBasic:
         model_file.write_bytes(b"{L" + (b"\0" * 64))
 
         assert not XGBoostScanner.can_handle(str(model_file))
+
+    def test_rejects_extensionless_ubjson_with_only_learner_marker(self, temp_dir: Path) -> None:
+        model_file = temp_dir / "model"
+        model_file.write_bytes(b"{L" + (b"\0" * 8) + b"learner")
+
+        assert not XGBoostScanner.can_handle(str(model_file))
+
+    def test_can_handle_ubjson_with_version_after_probe_window(self, temp_dir: Path) -> None:
+        model_file = temp_dir / "model"
+        model_file.write_bytes(
+            b"{L"
+            + (b"\0" * 8)
+            + b"learner"
+            + b"learner_model_param"
+            + (b"\0" * XGBoostScanner._UBJSON_PROBE_READ_BYTES)
+            + b"version"
+        )
+
+        assert XGBoostScanner.can_handle(str(model_file))
 
     def test_scanner_name_and_description(self):
         """Test scanner metadata."""
