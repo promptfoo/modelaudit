@@ -207,7 +207,7 @@ class BaseScanner(ABC):
             return True
         if BaseScanner._result_metadata_whitelist_downgrade_exempt(result_metadata):
             return True
-        if details.get("cve_id"):
+        if details.get("cve_id") or details.get("cve"):
             return True
 
         if rule_code and (rule_code.startswith("S2") or rule_code in _WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES):
@@ -219,7 +219,7 @@ class BaseScanner(ABC):
             for token in (
                 "arbitrary code",
                 "dangerous",
-                "executable file",
+                "executable",
                 "inconclusive",
                 "path traversal",
                 "rce",
