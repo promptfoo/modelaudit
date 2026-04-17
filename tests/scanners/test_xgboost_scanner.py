@@ -16,7 +16,7 @@ import tempfile
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 import pytest
 
@@ -153,6 +153,10 @@ def _assert_inconclusive_metadata(result: ModelAuditResultModel, path: Path, rea
     assert reason in metadata.get("scan_outcome_reasons", [])
 
 
+def _xgboost_ubjson_probe() -> bytes:
+    return b"{L" + (b"\0" * 8) + b"learner" + b"version"
+
+
 class TestXGBoostScannerBasic:
     """Test basic XGBoost scanner functionality."""
 
@@ -178,6 +182,18 @@ class TestXGBoostScannerBasic:
             test_file.write_text("dummy content")
 
             assert not XGBoostScanner.can_handle(str(test_file))
+
+    def test_can_handle_extensionless_ubjson_with_xgboost_markers(self, temp_dir: Path) -> None:
+        model_file = temp_dir / "model"
+        model_file.write_bytes(_xgboost_ubjson_probe())
+
+        assert XGBoostScanner.can_handle(str(model_file))
+
+    def test_rejects_extensionless_ubjson_like_header_without_xgboost_markers(self, temp_dir: Path) -> None:
+        model_file = temp_dir / "model"
+        model_file.write_bytes(b"{L" + (b"\0" * 64))
+
+        assert not XGBoostScanner.can_handle(str(model_file))
 
     def test_scanner_name_and_description(self):
         """Test scanner metadata."""
@@ -434,7 +450,7 @@ class TestXGBoostBinaryScanning:
     def test_bst_with_ubjson_header_routes_to_ubj_scan(self, temp_dir: Path) -> None:
         """Modern UBJSON-backed .bst files should bypass binary structure validation."""
         binary_file = temp_dir / "modern.bst"
-        binary_file.write_bytes(b"{L" + (b"\0" * 64))
+        binary_file.write_bytes(_xgboost_ubjson_probe())
         scanner = XGBoostScanner()
 
         with (
@@ -445,6 +461,21 @@ class TestXGBoostBinaryScanning:
 
         mock_scan_ubj.assert_called_once_with(str(binary_file), result)
         mock_validate_binary_structure.assert_not_called()
+
+    def test_bst_with_ubjson_like_header_without_markers_uses_binary_validation(self, temp_dir: Path) -> None:
+        """UBJSON-looking bytes without XGBoost markers should not bypass binary validation."""
+        binary_file = temp_dir / "custom.bst"
+        binary_file.write_bytes(b"{Llegacy gbtree reg:squarederror with enough bytes")
+        scanner = XGBoostScanner()
+
+        with (
+            patch.object(scanner, "_scan_ubj_model") as mock_scan_ubj,
+            patch.object(scanner, "_validate_binary_structure") as mock_validate_binary_structure,
+        ):
+            scanner.scan(str(binary_file))
+
+        mock_scan_ubj.assert_not_called()
+        mock_validate_binary_structure.assert_called_once_with(str(binary_file), ANY)
 
     def test_binary_structure_exception_is_inconclusive(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
         """Binary analyzer exceptions should fail closed instead of returning success."""
@@ -690,7 +721,7 @@ class TestXGBoostFailClosedEndToEnd:
 
     def test_missing_ubjson_for_bst_header_core_fails_closed_and_is_uncached(self, tmp_path: Path) -> None:
         bst_file = tmp_path / "model.bst"
-        bst_file.write_bytes(b"{L" + (b"\0" * 64))
+        bst_file.write_bytes(_xgboost_ubjson_probe())
         cache_dir = tmp_path / "cache"
 
         reset_cache_manager()

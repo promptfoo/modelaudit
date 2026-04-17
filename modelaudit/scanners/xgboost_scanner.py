@@ -226,6 +226,10 @@ class XGBoostScanner(BaseScanner):
         b'"gblinear"',
         b'"dart"',
     )
+    _UBJSON_PROBE_READ_BYTES: ClassVar[int] = 256 * 1024
+    _UBJSON_OBJECT_START: ClassVar[int] = ord("{")
+    _UBJSON_NEXT_VALID: ClassVar[frozenset[int]] = frozenset(b"iUIlLdDSC#$}")
+    _UBJSON_XGBOOST_MARKERS: ClassVar[tuple[bytes, ...]] = (b"learner", b"version")
     _BINARY_MIN_STRUCTURE_BYTES: ClassVar[int] = 32
     _INCONCLUSIVE_REASONS: ClassVar[dict[str, str]] = {
         "json_parse_failed": "xgboost_json_parse_failed",
@@ -288,6 +292,8 @@ class XGBoostScanner(BaseScanner):
 
         # Check for XGBoost files without extension
         if file_ext == "":
+            if cls._is_ubjson_file(path):
+                return True
             with suppress(OSError), open(path, "rb") as f:
                 header = f.read(16)
                 # Check for XGBoost binary signature patterns
@@ -708,15 +714,16 @@ class XGBoostScanner(BaseScanner):
 
     @staticmethod
     def _is_ubjson_file(path: str) -> bool:
-        """Check if file is in UBJSON format (modern XGBoost default for .bst)."""
-        # UBJSON objects start with '{' followed by a type marker or '}' (empty).
-        # XGBoost UBJSON models use '{' + int-type length (e.g. 'L' for int64).
-        _UBJSON_OBJECT_START = ord("{")
-        _UBJSON_NEXT_VALID = frozenset(b"iUIlLdDSC#$}")
+        """Check if a file is probably an XGBoost UBJSON model."""
         try:
             with open(path, "rb") as f:
-                header = f.read(2)
-            return len(header) == 2 and header[0] == _UBJSON_OBJECT_START and header[1] in _UBJSON_NEXT_VALID
+                probe = f.read(XGBoostScanner._UBJSON_PROBE_READ_BYTES)
+            return (
+                len(probe) >= 2
+                and probe[0] == XGBoostScanner._UBJSON_OBJECT_START
+                and probe[1] in XGBoostScanner._UBJSON_NEXT_VALID
+                and all(marker in probe for marker in XGBoostScanner._UBJSON_XGBOOST_MARKERS)
+            )
         except OSError:
             return False
 
