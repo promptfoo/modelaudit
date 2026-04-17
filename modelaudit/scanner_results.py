@@ -161,6 +161,7 @@ class ScanResult:
         self.bytes_scanned: int = 0
         self.success: bool = True
         self.metadata: dict[str, Any] = {}
+        self._metadata_restored_critical: bool = False
 
     def add_check(
         self,
@@ -328,7 +329,7 @@ class ScanResult:
         restored_critical = self._restore_result_metadata_whitelist_downgrades()
         self.end_time = time.time()
         self.success = success
-        if restored_critical and self.has_errors:
+        if (restored_critical or self._metadata_restored_critical) and self.has_errors:
             self.success = False
 
     @staticmethod
@@ -370,6 +371,8 @@ class ScanResult:
             restore_finding(check)
         for issue in self.issues:
             restore_finding(issue)
+        if restored_critical:
+            self._metadata_restored_critical = True
         return restored_critical
 
     def _refresh_metadata_dependent_state(self) -> None:

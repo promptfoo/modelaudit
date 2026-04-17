@@ -1150,6 +1150,38 @@ def test_finished_result_refreshes_whitelist_restore_after_late_inconclusive_met
     assert result.success is False
 
 
+def test_finish_remembers_pre_finish_metadata_restored_critical(tmp_path: Path) -> None:
+    """Pre-finish metadata refreshes must still affect final success."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=tmp_path / "test.pkl",
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name="Pre-Finish Coverage Check",
+        passed=False,
+        message="High confidence model anomaly detected",
+        severity=IssueSeverity.CRITICAL,
+    )
+    assert result.issues[0].severity.value == "info"
+
+    mark_inconclusive_scan_result(result, "streaming_analysis_incomplete")
+    assert result.end_time is None
+    assert result.issues[0].severity.value == "critical"
+
+    result.finish(success=True)
+
+    assert result.checks[0].severity == IssueSeverity.CRITICAL
+    assert result.success is False
+
+
 def test_whitelist_downgrade_check_warning():
     """Test that whitelisted models have warning checks downgraded to INFO."""
     from modelaudit.whitelists import POPULAR_MODELS
