@@ -148,6 +148,30 @@ def test_scan_zip_flags_from_import_dangerous_python_member(tmp_path: Path) -> N
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
 
+def test_scan_zip_import_aliases_are_scoped_per_python_member(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import subprocess\n"
+        "def helper() -> str:\n"
+        "    import os as subprocess\n"
+        "    return subprocess.getcwd()\n"
+        "def handler() -> None:\n"
+        "    subprocess.run(['echo', 'hidden'], check=False)\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
+
 def test_scan_zip_ignores_benign_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "source_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
@@ -158,6 +182,26 @@ def test_scan_zip_ignores_benign_python_member(tmp_path: Path) -> None:
     assert result.success is True
     assert not any(check.name == "Python Archive Member Security" for check in result.checks)
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_scan_zip_marks_malformed_python_member_incomplete(tmp_path: Path) -> None:
+    archive_path = tmp_path / "source_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", "def handler(:\n    pass\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert "zip_python_member_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].details["entry"] == "handler.py"
+    assert python_checks[0].details["analysis_incomplete"] is True
 
 
 def test_scan_npz_flags_dangerous_python_member(tmp_path: Path) -> None:

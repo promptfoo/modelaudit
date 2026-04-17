@@ -139,6 +139,51 @@ class TestTarScanner:
         assert python_checks[0].severity == IssueSeverity.WARNING
         assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
+    def test_scan_tar_import_aliases_are_scoped_per_python_member(self, tmp_path: Path) -> None:
+        """Local imports in one scope should not hide dangerous calls in another scope."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = (
+            b"import subprocess\n"
+            b"def helper() -> str:\n"
+            b"    import os as subprocess\n"
+            b"    return subprocess.getcwd()\n"
+            b"def handler() -> None:\n"
+            b"    subprocess.run(['echo', 'hidden'], check=False)\n"
+        )
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
+    def test_scan_tar_marks_malformed_python_member_incomplete(self, tmp_path: Path) -> None:
+        """Malformed Python source should fail closed instead of passing as benign."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = b"def handler(:\n    pass\n"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is False
+        assert result.metadata["analysis_incomplete"] is True
+        assert "tar_python_member_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].details["entry"] == "handler.py"
+        assert python_checks[0].details["analysis_incomplete"] is True
+
     def test_scan_tar_ignores_benign_python_member(self, tmp_path: Path) -> None:
         """Benign Python source in generic TAR archives should not produce security findings."""
         archive_path = tmp_path / "model_bundle.tar"

@@ -15,6 +15,7 @@ from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
 from .archive_member_security import (
+    PythonArchiveMemberParseError,
     dangerous_python_archive_member_reason,
     is_executable_archive_member_name,
     is_python_archive_member_name,
@@ -665,8 +666,25 @@ class TarScanner(BaseScanner):
                 )
                 return
 
-            with open(tmp_path, "rb") as member_file:
-                reason = dangerous_python_archive_member_reason(member_file.read())
+            try:
+                with open(tmp_path, "rb") as member_file:
+                    reason = dangerous_python_archive_member_reason(member_file.read())
+            except PythonArchiveMemberParseError as exc:
+                mark_archive_scan_incomplete(result, "tar_python_member_analysis_incomplete")
+                result.add_check(
+                    name="Python Archive Member Security",
+                    passed=False,
+                    message=f"Python archive member could not be parsed for bounded security analysis: {member_name}",
+                    severity=IssueSeverity.INFO,
+                    location=location,
+                    details={
+                        "entry": member_name,
+                        "exception": str(exc),
+                        "exception_type": type(exc).__name__,
+                        "analysis_incomplete": True,
+                    },
+                )
+                return
             if reason is not None:
                 result.add_check(
                     name="Python Archive Member Security",

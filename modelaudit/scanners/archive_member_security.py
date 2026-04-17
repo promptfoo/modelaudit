@@ -38,6 +38,10 @@ _HIGH_RISK_PYTHON_CALLS = {
 }
 
 
+class PythonArchiveMemberParseError(Exception):
+    """Raised when Python member security analysis cannot parse source."""
+
+
 def is_executable_archive_member_name(member_name: str) -> bool:
     """Return True when an archive member name has an executable/native-library suffix."""
     normalized_name = member_name.lower()
@@ -51,18 +55,6 @@ def is_python_archive_member_name(member_name: str) -> bool:
     return member_name.lower().endswith(_PYTHON_ARCHIVE_MEMBER_SUFFIXES)
 
 
-def _collect_import_aliases(tree: ast.AST) -> dict[str, str]:
-    aliases: dict[str, str] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                aliases[alias.asname or alias.name] = alias.name
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            for alias in node.names:
-                aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
-    return aliases
-
-
 def _resolve_call_name(node: ast.AST) -> str | None:
     if isinstance(node, ast.Name):
         return node.id
@@ -74,17 +66,25 @@ def _resolve_call_name(node: ast.AST) -> str | None:
     return None
 
 
-def _apply_alias(call_name: str, aliases: dict[str, str]) -> str:
+def _resolve_alias(name: str, alias_scopes: list[dict[str, str]]) -> str:
+    for aliases in reversed(alias_scopes):
+        resolved = aliases.get(name)
+        if resolved is not None:
+            return resolved
+    return name
+
+
+def _apply_alias(call_name: str, alias_scopes: list[dict[str, str]]) -> str:
     head, *tail = call_name.split(".")
-    resolved_head = aliases.get(head, head)
+    resolved_head = _resolve_alias(head, alias_scopes)
     if not tail:
         return resolved_head
     return ".".join([resolved_head, *tail])
 
 
-def _resolve_getattr_call_name(node: ast.AST, aliases: dict[str, str]) -> str | None:
+def _resolve_getattr_call_name(node: ast.AST, alias_scopes: list[dict[str, str]]) -> str | None:
     if isinstance(node, ast.Attribute) and node.attr == "__call__":
-        return _resolve_getattr_call_name(node.value, aliases)
+        return _resolve_getattr_call_name(node.value, alias_scopes)
 
     if not isinstance(node, ast.Call):
         return None
@@ -93,7 +93,7 @@ def _resolve_getattr_call_name(node: ast.AST, aliases: dict[str, str]) -> str | 
     if helper_name is None:
         return None
 
-    resolved_helper_name = _apply_alias(helper_name, aliases)
+    resolved_helper_name = _apply_alias(helper_name, alias_scopes)
     if resolved_helper_name not in {"getattr", "builtins.getattr"}:
         return None
 
@@ -115,35 +115,95 @@ def _resolve_getattr_call_name(node: ast.AST, aliases: dict[str, str]) -> str | 
     if not isinstance(attr_name_node, ast.Constant) or not isinstance(attr_name_node.value, str):
         return None
 
-    resolved_target_root = _apply_alias(target_root, aliases)
+    resolved_target_root = _apply_alias(target_root, alias_scopes)
     return f"{resolved_target_root}.{attr_name_node.value}"
+
+
+class _HighRiskPythonCallVisitor(ast.NodeVisitor):
+    def __init__(self) -> None:
+        self.alias_scopes: list[dict[str, str]] = [{}]
+        self.risky_calls: set[str] = set()
+
+    def _record_import(self, alias: ast.alias, import_name: str) -> None:
+        self.alias_scopes[-1][alias.asname or alias.name] = import_name
+
+    def visit_Import(self, node: ast.Import) -> None:
+        for alias in node.names:
+            self._record_import(alias, alias.name)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if node.module is None:
+            return
+        for alias in node.names:
+            self._record_import(alias, f"{node.module}.{alias.name}")
+
+    def _visit_child_scope(self, body: list[ast.stmt]) -> None:
+        self.alias_scopes.append({})
+        try:
+            for statement in body:
+                self.visit(statement)
+        finally:
+            self.alias_scopes.pop()
+
+    def _visit_function_scope(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for default in [*node.args.defaults, *node.args.kw_defaults]:
+            if default is not None:
+                self.visit(default)
+        if node.returns is not None:
+            self.visit(node.returns)
+        self._visit_child_scope(node.body)
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._visit_function_scope(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._visit_function_scope(node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        for decorator in node.decorator_list:
+            self.visit(decorator)
+        for base in node.bases:
+            self.visit(base)
+        for keyword in node.keywords:
+            self.visit(keyword)
+        self._visit_child_scope(node.body)
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        for default in [*node.args.defaults, *node.args.kw_defaults]:
+            if default is not None:
+                self.visit(default)
+        self.alias_scopes.append({})
+        try:
+            self.visit(node.body)
+        finally:
+            self.alias_scopes.pop()
+
+    def visit_Call(self, node: ast.Call) -> None:
+        call_name = _resolve_call_name(node.func)
+        resolved_name = (
+            _apply_alias(call_name, self.alias_scopes)
+            if call_name is not None
+            else _resolve_getattr_call_name(node.func, self.alias_scopes)
+        )
+        if resolved_name is not None and (
+            resolved_name in _HIGH_RISK_PYTHON_CALLS or resolved_name.startswith("subprocess.")
+        ):
+            self.risky_calls.add(resolved_name)
+        self.generic_visit(node)
 
 
 def _find_high_risk_python_calls(source_bytes: bytes) -> set[str]:
     source = source_bytes.decode("utf-8", "replace")
     try:
         tree = ast.parse(source)
-    except (SyntaxError, ValueError):
-        return set()
+    except (SyntaxError, ValueError) as exc:
+        raise PythonArchiveMemberParseError(str(exc)) from exc
 
-    aliases = _collect_import_aliases(tree)
-    risky_calls: set[str] = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-
-        call_name = _resolve_call_name(node.func)
-        resolved_name = (
-            _apply_alias(call_name, aliases)
-            if call_name is not None
-            else _resolve_getattr_call_name(node.func, aliases)
-        )
-        if resolved_name is None:
-            continue
-        if resolved_name in _HIGH_RISK_PYTHON_CALLS or resolved_name.startswith("subprocess."):
-            risky_calls.add(resolved_name)
-
-    return risky_calls
+    visitor = _HighRiskPythonCallVisitor()
+    visitor.visit(tree)
+    return visitor.risky_calls
 
 
 def dangerous_python_archive_member_reason(source_bytes: bytes) -> str | None:
