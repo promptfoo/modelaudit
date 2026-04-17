@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** mark PyTorch ZIP scan timeouts inconclusive and unsuccessful instead of reporting complete coverage.
 - **security:** detect extensionless protocol-0/1 pickle members during 7-Zip nested archive probes.
 - **pickle:** restore ModelAudit nested-pickle findings from Rust standalone notices and keep network raw-detector coverage after native pickle findings
 - **xgboost:** route UBJSON-backed `.bst` models when `version` or booster markers appear after a large `learner` object, and route extensionless XGBoost UBJSON models via content sniffing (requires both the `learner` marker and a booster/model-param strong marker within the probe window).
