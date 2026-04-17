@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **security:** prevent HuggingFace whitelist provenance from downgrading active payload, CVE, traversal, executable, operational-error, or incomplete-coverage findings.
+- **security:** prevent HuggingFace whitelist provenance from downgrading active payload, CVE, traversal, executable, operational-error, or incomplete-coverage findings. Exemptions now cover S1xx code-execution primitives (`S101`–`S110`, `S115`) and HIGH-severity S3xx network primitives (`S301`/`S304`/`S305`/`S310`), and the keyword fallback uses word-boundary matching so substrings like "executable" inside "ExecuTorch" no longer over-suppress legitimate downgrades.
 - **pickle:** restore ModelAudit nested-pickle findings from Rust standalone notices and keep network raw-detector coverage after native pickle findings
 - **telemetry:** strip query strings, fragments, and URL userinfo from cloud model names and file-extension metadata
 - preserve `S999` unknown-opcode mapping in generic rule fallback

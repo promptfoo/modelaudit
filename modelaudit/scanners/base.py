@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import re
 
 # Progress tracking imports with circular dependency detection
 import time
@@ -57,10 +58,33 @@ _TRUSTED_SOURCE_PROVENANCE_TOKEN: Final[object] = object()
 _WHITELIST_STALE_WARNING_THRESHOLD_DAYS: Final[int] = 90
 _WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES: Final[frozenset[str]] = frozenset(
     {
+        # S1xx — direct code-execution primitives (os/sys/subprocess/eval/compile/__import__/
+        # importlib/runpy/webbrowser/ctypes/builtins). The embedded payload itself is the
+        # threat, so whitelisted HF models must not hide these.
+        "S101",
+        "S102",
+        "S103",
+        "S104",
+        "S105",
+        "S106",
+        "S107",
+        "S108",
+        "S109",
+        "S110",
+        "S115",
+        # S3xx — HIGH-severity active network primitives (raw sockets, ftp, telnet,
+        # exfiltration). HTTP/SMTP/DNS/IP/URL codes stay eligible for downgrade since
+        # those are policy-grade rather than active-payload signals.
+        "S301",
+        "S304",
+        "S305",
+        "S310",
+        # S4xx — filesystem-escape and archive-bomb detections.
         "S405",
         "S406",
         "S408",
         "S410",
+        # S5xx — embedded executable / interpreter content.
         "S501",
         "S502",
         "S503",
@@ -71,6 +95,21 @@ _WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES: Final[frozenset[str]] = frozenset(
         "S508",
         "S509",
     }
+)
+# Word-boundary matching prevents incidental substrings (e.g. "executable" inside
+# "ExecuTorch", "rce" inside "force") from suppressing whitelist downgrades.
+_WHITELIST_DOWNGRADE_EXEMPT_KEYWORD_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:"
+    r"arbitrary\s+code"
+    r"|dangerous"
+    r"|executable"
+    r"|inconclusive"
+    r"|path\s+traversal"
+    r"|rce"
+    r"|remote\s+code\s+execution"
+    r"|unsafe\s+deserialization"
+    r")\b",
+    re.IGNORECASE,
 )
 DEFAULT_MAX_FILE_READ_SIZE: Final[int] = 512 * 1024 * 1024
 DEFAULT_READ_CHUNK_SIZE: Final[int] = 8 * 1024 * 1024
@@ -213,20 +252,8 @@ class BaseScanner(ABC):
         if rule_code and (rule_code.startswith("S2") or rule_code in _WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES):
             return True
 
-        text = " ".join(value for value in (message, check_name) if value).lower()
-        return any(
-            token in text
-            for token in (
-                "arbitrary code",
-                "dangerous",
-                "executable",
-                "inconclusive",
-                "path traversal",
-                "rce",
-                "remote code execution",
-                "unsafe deserialization",
-            )
-        )
+        text = " ".join(value for value in (message, check_name) if value)
+        return bool(_WHITELIST_DOWNGRADE_EXEMPT_KEYWORD_PATTERN.search(text))
 
     def _should_apply_whitelist(
         self,

@@ -966,7 +966,36 @@ def test_whitelist_downgrade_check_critical():
         ("Traversal", "Path traversal attempt detected", None, {}, IssueSeverity.CRITICAL),
         ("System Path", "Symlink target points to critical system path", "S408", {}, IssueSeverity.CRITICAL),
         ("Incomplete", "Archive scan inconclusive", None, {"analysis_incomplete": True}, IssueSeverity.WARNING),
-        ("Executable", "Executable file detected in archive", "S104", {}, IssueSeverity.WARNING),
+        # S1xx active code-execution primitives. Messages are deliberately neutral
+        # ("Suspicious code pattern detected: ...") so the rule code itself carries
+        # the exemption rather than the keyword fallback. Mirrors the emission shape
+        # used by `flax_msgpack_scanner._check_suspicious_strings`.
+        ("os import", r"Suspicious code pattern detected: import\s+os", "S101", {}, IssueSeverity.CRITICAL),
+        ("sys import", r"Suspicious code pattern detected: import\s+sys", "S102", {}, IssueSeverity.CRITICAL),
+        (
+            "subprocess import",
+            r"Suspicious code pattern detected: subprocess\.",
+            "S103",
+            {},
+            IssueSeverity.CRITICAL,
+        ),
+        ("eval pattern", r"Suspicious code pattern detected: \beval\s*\(", "S104", {}, IssueSeverity.CRITICAL),
+        ("compile pattern", r"Suspicious code pattern detected: \bcompile\s*\(", "S105", {}, IssueSeverity.CRITICAL),
+        ("__import__ pattern", "Suspicious code pattern detected: __import__", "S106", {}, IssueSeverity.CRITICAL),
+        ("importlib", "Suspicious code pattern detected: importlib.import_module", "S107", {}, IssueSeverity.WARNING),
+        ("runpy", "Suspicious code pattern detected: runpy.run_module", "S108", {}, IssueSeverity.CRITICAL),
+        ("webbrowser", "Suspicious code pattern detected: webbrowser.open", "S109", {}, IssueSeverity.CRITICAL),
+        ("ctypes", "Suspicious code pattern detected: ctypes.CDLL", "S110", {}, IssueSeverity.WARNING),
+        ("builtins access", "Suspicious code pattern detected: __builtins__", "S115", {}, IssueSeverity.WARNING),
+        # S3xx active network primitives at HIGH severity. Lower-severity HTTP/SMTP/DNS
+        # codes are intentionally omitted so policy-grade findings remain downgradeable.
+        ("socket usage", "Network primitive detected: socket call", "S301", {}, IssueSeverity.WARNING),
+        ("ftplib usage", "Network primitive detected: ftplib session", "S304", {}, IssueSeverity.WARNING),
+        ("telnetlib usage", "Network primitive detected: telnetlib session", "S305", {}, IssueSeverity.WARNING),
+        ("exfiltration", "Potential outbound data transfer detected", "S310", {}, IssueSeverity.WARNING),
+        # S5xx embedded executable / interpreter content (regression coverage so future
+        # refactors of the exempt set do not silently drop them).
+        ("Executable", "Executable file detected in archive", "S501", {}, IssueSeverity.WARNING),
         (
             "Executable Fragments",
             "Executable script fragments detected in CatBoost text-bearing sections",
@@ -1016,6 +1045,42 @@ def test_whitelist_does_not_downgrade_active_or_incomplete_findings(
     assert len(result.checks) == 1
     assert result.checks[0].severity == severity
     assert result.checks[0].details.get("whitelist_downgrade") is None
+
+
+@pytest.mark.parametrize(
+    ("name", "message"),
+    [
+        # "executable" inside "ExecuTorch" must not exempt an unrelated informational note.
+        ("ExecuTorch substring", "ExecuTorch tensor metadata observed"),
+        # "rce" inside "enforce"/"source" must not exempt unrelated findings either.
+        ("enforce substring", "Tensor enforce_layout flag observed"),
+        ("source substring", "Source-tracked metadata observed"),
+    ],
+)
+def test_whitelist_keyword_fallback_uses_word_boundaries(name: str, message: str) -> None:
+    """Substring-only matches in unrelated words must not block whitelist downgrades."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name=name,
+        passed=False,
+        message=message,
+        severity=IssueSeverity.WARNING,
+    )
+
+    assert result.issues[0].severity == IssueSeverity.INFO
+    assert result.issues[0].details.get("whitelist_downgrade") is True
+    assert result.issues[0].details.get("original_severity") == "WARNING"
 
 
 def test_whitelist_does_not_downgrade_result_metadata_operational_errors() -> None:
