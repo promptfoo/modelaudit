@@ -1107,20 +1107,6 @@ class PyTorchZipScanner(BaseScanner):
         all_network_findings = []
         check_jit = self._get_bool_config("check_jit_script", True)
         check_net = self._get_bool_config("check_network_comm", True)
-        # Identity-based dedup: ``pickle_files`` and ``safe_entries`` both come
-        # from the same ``zipfile.ZipFile.infolist()`` walk performed upstream,
-        # so the ``ZipInfo`` instances are shared and ``id()`` matches. If a
-        # future refactor ever rebuilds ``pickle_files`` from a separate
-        # ``infolist()`` call or from filenames, this dedup silently stops
-        # working; switch to a ``(name, header_offset)`` key if that happens.
-        pickle_member_ids = {id(entry) for entry in pickle_files}
-        # Proxy, not truth: we only know the pickle scanner is wired up. If it
-        # ran but crashed mid-scan on a given pickle member, that member is
-        # still skipped here — findings buried inside it will be missed. The
-        # alternative (tracking per-entry success) is more state than the
-        # trade-off warrants for this pass.
-        pickle_members_scanned = self.pickle_scanner is not None
-
         if safe_entries:
             if not check_jit:
                 result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
@@ -1144,8 +1130,6 @@ class PyTorchZipScanner(BaseScanner):
                 # Skip numeric tensor data files to support different versions of PyTorch ZIP files
                 # These are binary weight files that cause performance issues when scanned
                 if _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN.match(normalized_name):
-                    continue
-                if pickle_members_scanned and id(entry) in pickle_member_ids:
                     continue
                 if entry.file_size > self.max_jit_scan_member_bytes:
                     size_limited_entries.append(

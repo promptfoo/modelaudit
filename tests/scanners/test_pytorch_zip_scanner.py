@@ -596,8 +596,8 @@ def test_pytorch_zip_jit_scan_aggregates_many_oversize_members_into_one_check(
     size_checks = [check for check in result.checks if check.name == "JIT/Network Scan Size Limit"]
     assert len(size_checks) == 1
     entries = size_checks[0].details["zip_entries"]
-    assert len(entries) == 26  # 25 generated sources + byteorder (version is 2 bytes, under the cap)
-    assert size_checks[0].details["skipped_count"] == 26
+    assert len(entries) == 27  # 25 generated sources + byteorder + data.pkl
+    assert size_checks[0].details["skipped_count"] == 27
     assert all(entry["file_size"] > 4 for entry in size_checks[0].details["entries"])
     # `scan_outcome_reasons` must be deduplicated even though many members tripped it.
     reasons = result.metadata.get("scan_outcome_reasons", [])
@@ -642,6 +642,37 @@ def test_pytorch_zip_scans_pickle_members_for_network_when_pickle_scanner_disabl
         check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "pickle"
         for check in result.checks
     )
+    network_failures = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert network_failures
+    assert any(check.location == f"{model_path}:archive/data.pkl" for check in network_failures)
+
+
+def test_pytorch_zip_scans_pickle_members_past_pickle_raw_window(tmp_path: Path) -> None:
+    model_path = tmp_path / "padded_network_in_data_pkl.pt"
+    payload = pickle.dumps(
+        {
+            "padding": "A" * 512,
+            "endpoint": "http://attacker.example/model",
+        },
+        protocol=4,
+    )
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", payload)
+
+    result = PyTorchZipScanner(
+        config={
+            "pickle_root_raw_scan_limit_bytes": 64,
+            "pickle_expensive_raw_scan_limit_bytes": 64,
+            "max_jit_scan_member_bytes": len(payload) + 1,
+        }
+    ).scan(str(model_path))
+
     network_failures = [
         check
         for check in result.checks
