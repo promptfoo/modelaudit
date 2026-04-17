@@ -4,6 +4,7 @@ import ast
 import io
 import logging
 import os
+import pickletools
 import re
 import stat
 import tempfile
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from ..detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils import sanitize_archive_path
 from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTES, _looks_like_proto0_or_1_pickle
 from .archive_member_security import is_executable_archive_member_name
@@ -104,6 +106,8 @@ _PICKLE_BINARY_PROTOCOL_PREFIXES: tuple[bytes, ...] = (
     b"\x80\x05",
 )
 _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
+_PICKLE_DISCOVERY_LONG_PROBE_BYTES = PROTO0_1_MAX_PROBE_BYTES
+_JIT_SCAN_MEMBER_MAX_BYTES = 32 * 1024 * 1024
 _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN = re.compile(r"^(?:.+/)?data/[0-9]+$")
 
 
@@ -240,6 +244,10 @@ class PyTorchZipScanner(BaseScanner):
             self.MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE,
         )
         self.max_archive_entries = self.config.get("max_archive_entries", self.MAX_ARCHIVE_ENTRIES)
+        self.max_jit_scan_member_bytes = self._normalize_positive_int_config(
+            self.config.get("max_jit_scan_member_bytes"),
+            _JIT_SCAN_MEMBER_MAX_BYTES,
+        )
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -309,7 +317,7 @@ class PyTorchZipScanner(BaseScanner):
                 self._validate_tensor_metadata_consistency(zip_file, safe_entries, pickle_files, result, path)
 
                 # Check for JIT/Script code execution risks
-                bytes_scanned += self._scan_for_jit_patterns(zip_file, safe_entries, result, path)
+                bytes_scanned += self._scan_for_jit_patterns(zip_file, safe_entries, pickle_files, result, path)
 
                 # Detect suspicious non-pickle files
                 self._detect_suspicious_files(zip_file, safe_entries, result, path)
@@ -324,22 +332,23 @@ class PyTorchZipScanner(BaseScanner):
 
         except TimeoutError as e:
             # Handle timeout gracefully
+            mark_inconclusive_scan_result(result, "pytorch_zip_scan_timeout")
             result.add_check(
                 name="Scan Timeout",
                 passed=False,
                 message=f"Scan timed out: {e!s}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"timeout_seconds": self.timeout},
+                details={"timeout_seconds": self.timeout, "analysis_incomplete": True},
             )
-            result.finish(success=True)  # Partial results are still valid
+            result.finish(success=False)
             return result
         except zipfile.BadZipFile:
             return self._handle_bad_zip_error(path)
         except Exception as e:
             return self._handle_scan_error(path, e)
 
-        result.finish(success=True)
+        result.finish(success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME)
         return result
 
     @staticmethod
@@ -881,48 +890,116 @@ class PyTorchZipScanner(BaseScanner):
         """Discover pickle files in the ZIP archive"""
         pickle_files: list[zipfile.ZipInfo] = []
 
+        seen_entries: set[int] = set()
+
+        def add_pickle_entry(entry: zipfile.ZipInfo) -> None:
+            entry_key = id(entry)
+            if entry_key in seen_entries:
+                return
+            pickle_files.append(entry)
+            seen_entries.add(entry_key)
+
         # First pass: Look for common pickle file patterns
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
             if name.endswith(".pkl") or name == "data.pkl" or name.endswith("/data.pkl"):
-                pickle_files.append(entry)
+                add_pickle_entry(entry)
 
-        # Second pass: If no obvious pickle files found, check for pickle magic bytes
-        if not pickle_files:
-            for entry in safe_entries:
-                try:
-                    data_start = self._read_member_prefix(
-                        zip_file,
-                        entry,
-                        _PICKLE_DISCOVERY_SHORT_PROBE_BYTES,
-                        phase="pickle_discovery",
-                        result=result,
-                    )
-                    if any(data_start.startswith(magic) for magic in _PICKLE_BINARY_PROTOCOL_PREFIXES):
-                        pickle_files.append(entry)
-                        continue
-
-                    if not data_start or data_start[0] not in PROTO0_1_START_BYTES:
-                        continue
-
-                    if entry.file_size > len(data_start):
-                        data_start = self._read_member_prefix(
-                            zip_file,
-                            entry,
-                            PROTO0_1_MAX_PROBE_BYTES,
-                            phase="pickle_discovery",
-                            result=result,
-                        )
-                    if _looks_like_proto0_or_1_pickle(
-                        data_start,
-                        sample_is_prefix=entry.file_size > len(data_start),
-                    ):
-                        pickle_files.append(entry)
-                except Exception as exc:
-                    logger.debug("Unable to inspect ZIP member %s as a pickle: %s", entry.filename, exc)
+        # Second pass: always sniff unselected members. A benign data.pkl must not
+        # hide an extensionless pickle payload or one placed under data/<n>.
+        for entry in safe_entries:
+            if id(entry) in seen_entries or entry.is_dir():
+                continue
+            try:
+                if self._entry_looks_like_pickle(zip_file, entry, result):
+                    add_pickle_entry(entry)
+            except Exception as exc:
+                logger.debug("Unable to inspect ZIP member %s as a pickle: %s", entry.filename, exc)
+                mark_inconclusive_scan_result(result, "pytorch_zip_pickle_discovery_incomplete")
+                result.add_check(
+                    name="Pickle Discovery",
+                    passed=False,
+                    message=f"Could not inspect PyTorch ZIP member {entry.filename} for hidden pickle payloads: {exc}",
+                    severity=IssueSeverity.INFO,
+                    location=f"{self.current_file_path}:{entry.filename}",
+                    details={
+                        "zip_entry": entry.filename,
+                        "exception": str(exc),
+                        "exception_type": type(exc).__name__,
+                        "analysis_incomplete": True,
+                    },
+                )
 
         result.metadata["pickle_files"] = self._get_zip_member_names(pickle_files)
         return pickle_files
+
+    def _entry_looks_like_pickle(
+        self,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        result: ScanResult,
+    ) -> bool:
+        """Return True when a bounded ZIP member prefix structurally resembles pickle."""
+        data_start = self._read_member_prefix(
+            zip_file,
+            entry,
+            _PICKLE_DISCOVERY_SHORT_PROBE_BYTES,
+            phase="pickle_discovery",
+            result=result,
+        )
+        if not data_start:
+            return False
+
+        if any(data_start.startswith(magic) for magic in _PICKLE_BINARY_PROTOCOL_PREFIXES):
+            sample = self._read_member_prefix(
+                zip_file,
+                entry,
+                _PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+                phase="pickle_discovery",
+                result=result,
+            )
+            return self._looks_like_binary_pickle_prefix(sample, sample_is_prefix=entry.file_size > len(sample))
+
+        if data_start[0] not in PROTO0_1_START_BYTES:
+            return False
+
+        sample = data_start
+        if entry.file_size > len(data_start):
+            sample = self._read_member_prefix(
+                zip_file,
+                entry,
+                PROTO0_1_MAX_PROBE_BYTES,
+                phase="pickle_discovery",
+                result=result,
+            )
+        return _looks_like_proto0_or_1_pickle(
+            sample,
+            sample_is_prefix=entry.file_size > len(sample),
+        )
+
+    @staticmethod
+    def _looks_like_binary_pickle_prefix(sample: bytes, *, sample_is_prefix: bool) -> bool:
+        """Validate binary pickle-looking bytes enough to avoid random tensor false positives."""
+        if not any(sample.startswith(magic) for magic in _PICKLE_BINARY_PROTOCOL_PREFIXES):
+            return False
+
+        op_count = 0
+        try:
+            for opcode, _arg, _pos in pickletools.genops(sample):
+                op_count += 1
+                if opcode.name == "STOP":
+                    return True
+                if op_count >= 4:
+                    return True
+        except ValueError as exc:
+            message = str(exc).lower()
+            return (
+                sample_is_prefix
+                and op_count >= 2
+                and ("exhausted before seeing stop" in message or "not enough data" in message or "expected" in message)
+            )
+
+        return sample_is_prefix and op_count >= 2
 
     def _check_pytorch_vulnerabilities(
         self,
@@ -1074,6 +1151,7 @@ class PyTorchZipScanner(BaseScanner):
         self,
         zip_file: zipfile.ZipFile,
         safe_entries: list[zipfile.ZipInfo],
+        pickle_files: list[zipfile.ZipInfo],
         result: ScanResult,
         path: str,
     ) -> int:
@@ -1081,13 +1159,38 @@ class PyTorchZipScanner(BaseScanner):
         bytes_scanned = 0
         all_jit_findings = []
         all_network_findings = []
+        pickle_member_names = {
+            self._get_zip_member_name(entry).replace("\\", "/").lstrip("/") for entry in pickle_files
+        }
 
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
+            normalized_name = name.replace("\\", "/").lstrip("/")
             try:
                 # Skip numeric tensor data files to support different versions of PyTorch ZIP files
                 # These are binary weight files that cause performance issues when scanned
-                if _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN.match(name):
+                if _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN.match(normalized_name):
+                    continue
+                if normalized_name in pickle_member_names:
+                    continue
+                if entry.file_size > self.max_jit_scan_member_bytes:
+                    mark_inconclusive_scan_result(result, "pytorch_zip_jit_member_size_limit")
+                    result.add_check(
+                        name="JIT/Network Scan Size Limit",
+                        passed=False,
+                        message=(
+                            f"PyTorch ZIP member {name} skipped by JIT/network scanning because it exceeds "
+                            f"the bounded read limit ({entry.file_size} > {self.max_jit_scan_member_bytes})"
+                        ),
+                        severity=IssueSeverity.INFO,
+                        location=f"{path}:{name}",
+                        details={
+                            "zip_entry": name,
+                            "file_size": entry.file_size,
+                            "max_scan_bytes": self.max_jit_scan_member_bytes,
+                            "analysis_incomplete": True,
+                        },
+                    )
                     continue
 
                 file_data = self._read_member_bytes(
@@ -1095,6 +1198,7 @@ class PyTorchZipScanner(BaseScanner):
                     entry,
                     phase="jit_script_scan",
                     result=result,
+                    max_bytes=self.max_jit_scan_member_bytes,
                 )
                 bytes_scanned += len(file_data)
 

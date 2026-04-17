@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** close archive payload coverage gaps by sniffing hidden PyTorch ZIP pickles, detecting extensionless 7-Zip protocol-0/1 pickles, failing closed on incomplete archive scans, preserving active-payload severities for trusted provenance, and scanning generic ZIP/TAR Python members.
 - **pickle:** restore ModelAudit nested-pickle findings from Rust standalone notices and keep network raw-detector coverage after native pickle findings
 - **telemetry:** strip query strings, fragments, and URL userinfo from cloud model names and file-extension metadata
 - preserve `S999` unknown-opcode mapping in generic rule fallback

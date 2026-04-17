@@ -163,7 +163,60 @@ class BaseScanner(ABC):
             return val.strip().lower() not in {"false", "0", "no", "off"}
         return bool(val)
 
-    def _should_apply_whitelist(self, severity: IssueSeverity) -> bool:
+    @staticmethod
+    def _whitelist_downgrade_exempt(
+        *,
+        details: dict[str, Any] | None,
+        message: str | None,
+        rule_code: str | None,
+        check_name: str | None,
+    ) -> bool:
+        """Return True for active payload or incomplete-coverage findings."""
+        details = details or {}
+        if details.get("analysis_incomplete") is True or details.get("operational_error") is True:
+            return True
+        if details.get("cve_id"):
+            return True
+
+        if rule_code and (
+            rule_code.startswith("S2")
+            or rule_code
+            in {
+                "S405",
+                "S406",
+                "S410",
+                "S501",
+                "S502",
+                "S503",
+                "S504",
+            }
+        ):
+            return True
+
+        text = " ".join(value for value in (message, check_name) if value).lower()
+        return any(
+            token in text
+            for token in (
+                "arbitrary code",
+                "dangerous",
+                "executable file",
+                "inconclusive",
+                "path traversal",
+                "rce",
+                "remote code execution",
+                "unsafe deserialization",
+            )
+        )
+
+    def _should_apply_whitelist(
+        self,
+        severity: IssueSeverity,
+        *,
+        details: dict[str, Any] | None = None,
+        message: str | None = None,
+        rule_code: str | None = None,
+        check_name: str | None = None,
+    ) -> bool:
         """
         Check if the whitelist should be applied to downgrade an issue's severity.
 
@@ -175,6 +228,14 @@ class BaseScanner(ABC):
         """
         # Only downgrade severities higher than INFO
         if severity in (IssueSeverity.INFO, IssueSeverity.DEBUG):
+            return False
+
+        if self._whitelist_downgrade_exempt(
+            details=details,
+            message=message,
+            rule_code=rule_code,
+            check_name=check_name,
+        ):
             return False
 
         # Check if whitelist is enabled (default: True)
@@ -201,6 +262,10 @@ class BaseScanner(ABC):
         self,
         severity: IssueSeverity,
         details: dict[str, Any] | None,
+        *,
+        message: str | None = None,
+        rule_code: str | None = None,
+        check_name: str | None = None,
     ) -> tuple[IssueSeverity, dict[str, Any]]:
         """
         Apply whitelist downgrading logic to severity and details.
@@ -213,7 +278,13 @@ class BaseScanner(ABC):
             Tuple of (potentially modified severity, details dict)
         """
         original_severity = severity
-        if self._should_apply_whitelist(severity):
+        if self._should_apply_whitelist(
+            severity,
+            details=details,
+            message=message,
+            rule_code=rule_code,
+            check_name=check_name,
+        ):
             severity = IssueSeverity.INFO
             # Add note about whitelisting to the details
             if details is None:

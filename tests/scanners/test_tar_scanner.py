@@ -102,6 +102,41 @@ class TestTarScanner:
         finally:
             os.unlink(tmp_path)
 
+    def test_scan_tar_flags_dangerous_python_member(self, tmp_path: Path) -> None:
+        """Generic TAR files should scan Python source members for active payloads."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = b"import os\nos.system('echo hidden')\n"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].severity == IssueSeverity.WARNING
+        assert python_checks[0].details["entry"] == "handler.py"
+        assert result.success is True
+
+    def test_scan_tar_ignores_benign_python_member(self, tmp_path: Path) -> None:
+        """Benign Python source in generic TAR archives should not produce security findings."""
+        archive_path = tmp_path / "model_bundle.tar"
+        source = b"def preprocess(value: str) -> str:\n    return value.strip().lower()\n"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("preprocess.py")
+            info.size = len(source)
+            archive.addfile(info, tarfile.io.BytesIO(source))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
     def test_path_traversal_detection(self):
         """Test detection of path traversal attempts"""
         with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as tmp:

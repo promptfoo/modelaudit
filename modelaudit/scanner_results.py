@@ -217,7 +217,13 @@ class ScanResult:
         if not passed and self.scanner:
             # At this point severity cannot be None due to the check above
             assert severity is not None
-            severity, details = self.scanner._apply_whitelist_downgrade(severity, details)
+            severity, details = self.scanner._apply_whitelist_downgrade(
+                severity,
+                details,
+                message=message,
+                rule_code=rule_code,
+                check_name=name,
+            )
 
         check = Check(
             name=name,

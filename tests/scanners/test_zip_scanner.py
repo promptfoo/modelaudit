@@ -89,6 +89,35 @@ def test_nested_dispatch_routes_compressed_header_aliases_to_compressed_scanner(
     assert _select_nested_scanner_id(str(member_path)) == "compressed"
 
 
+def test_scan_zip_flags_dangerous_python_member(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", "import os\nos.system('echo hidden')\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].severity == IssueSeverity.WARNING
+    assert python_checks[0].details["entry"] == "handler.py"
+
+
+def test_scan_zip_ignores_benign_python_member(tmp_path: Path) -> None:
+    archive_path = tmp_path / "source_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("preprocess.py", "def normalize(value: float) -> float:\n    return value / 255.0\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert result.success is True
+    assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
 class _HeaderRoutedTempScanner(BaseScanner):
     name: ClassVar[str] = "header_routed_temp"
 

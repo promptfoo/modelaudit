@@ -12,6 +12,11 @@ from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
+from .archive_member_security import (
+    dangerous_python_archive_member_reason,
+    is_executable_archive_member_name,
+    is_python_archive_member_name,
+)
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -571,6 +576,8 @@ class ZipScanner(BaseScanner):
                                 result.merge(mar_python_result)
                                 if not mar_python_result.success:
                                     scan_complete = False
+                        elif archive_ext != ".npz":
+                            self._scan_generic_member_security(path, name, tmp_path, total_size, result)
 
                         nested_config = dict(self.config)
                         nested_config["_archive_depth"] = depth + 1
@@ -619,8 +626,63 @@ class ZipScanner(BaseScanner):
         result.metadata["file_size"] = os.path.getsize(path)
         if not scan_complete:
             mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
-        result.finish(success=scan_complete and not result.has_errors)
+        result.finish(success=scan_complete and not member_scan_incomplete(result) and not result.has_errors)
         return result
+
+    def _scan_generic_member_security(
+        self,
+        archive_path: str,
+        member_name: str,
+        tmp_path: str,
+        total_size: int,
+        result: ScanResult,
+    ) -> None:
+        """Inspect generic archive members that nested dispatch would otherwise treat as unknown."""
+        normalized_name = member_name.replace("\\", "/").lstrip("/")
+        normalized_lower = normalized_name.lower()
+        location = f"{archive_path}:{member_name}"
+
+        if is_python_archive_member_name(normalized_lower):
+            if total_size > self.MAX_MAR_PYTHON_ANALYSIS_BYTES:
+                mark_archive_scan_incomplete(result, "zip_python_member_analysis_incomplete")
+                result.add_check(
+                    name="Python Archive Member Security",
+                    passed=False,
+                    message=f"Python archive member too large for bounded security analysis: {member_name}",
+                    severity=IssueSeverity.INFO,
+                    location=location,
+                    details={
+                        "entry": member_name,
+                        "file_size": total_size,
+                        "max_scan_bytes": self.MAX_MAR_PYTHON_ANALYSIS_BYTES,
+                        "analysis_incomplete": True,
+                    },
+                )
+                return
+
+            with open(tmp_path, "rb") as member_file:
+                reason = dangerous_python_archive_member_reason(member_file.read())
+            if reason is not None:
+                result.add_check(
+                    name="Python Archive Member Security",
+                    passed=False,
+                    message=f"High-risk Python code found in ZIP member {member_name}: {reason}",
+                    severity=IssueSeverity.WARNING,
+                    location=location,
+                    details={"entry": member_name, "reason": reason},
+                    rule_code="S104",
+                )
+            return
+
+        if is_executable_archive_member_name(normalized_lower):
+            result.add_check(
+                name="Executable Archive Member Detection",
+                passed=False,
+                message=f"Executable file found in ZIP archive: {member_name}",
+                severity=IssueSeverity.WARNING,
+                location=location,
+                details={"entry": member_name},
+            )
 
     def _scan_mar_python_entry(
         self,

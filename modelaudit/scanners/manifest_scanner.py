@@ -677,11 +677,12 @@ class ManifestScanner(BaseScanner):
                 name="Manifest Scan Timeout",
                 passed=False,
                 message=f"Scan timed out: {e!s}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"timeout_seconds": self.timeout},
+                details={"timeout_seconds": self.timeout, "analysis_incomplete": True},
             )
-            result.finish(success=True)
+            self._mark_inconclusive_scan_result(result, "manifest_scan_timeout")
+            result.finish(success=False)
             return result
         except Exception as e:
             result.add_check(

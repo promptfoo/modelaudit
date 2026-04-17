@@ -925,7 +925,7 @@ def test_whitelist_downgrade_check_critical():
     result.add_check(
         name="Test Security Check",
         passed=False,
-        message="Dangerous pattern detected",
+        message="High confidence model anomaly detected",
         severity=IssueSeverity.CRITICAL,
     )
 
@@ -942,6 +942,61 @@ def test_whitelist_downgrade_check_critical():
     assert result.checks[0].severity == IssueSeverity.INFO
     assert result.checks[0].details.get("whitelist_downgrade") is True
     assert result.checks[0].details.get("original_severity") == "CRITICAL"
+
+
+@pytest.mark.parametrize(
+    ("name", "message", "rule_code", "details", "severity"),
+    [
+        ("Active Reducer", "Dangerous reducer invokes posix.system", "S201", {}, IssueSeverity.CRITICAL),
+        (
+            "RCE CVE",
+            "Known vulnerable deserialization construct",
+            None,
+            {"cve_id": "CVE-2026-1234"},
+            IssueSeverity.CRITICAL,
+        ),
+        ("Traversal", "Path traversal attempt detected", None, {}, IssueSeverity.CRITICAL),
+        ("Incomplete", "Archive scan inconclusive", None, {"analysis_incomplete": True}, IssueSeverity.WARNING),
+        ("Executable", "Executable file detected in archive", "S104", {}, IssueSeverity.WARNING),
+    ],
+)
+def test_whitelist_does_not_downgrade_active_or_incomplete_findings(
+    name: str,
+    message: str,
+    rule_code: str | None,
+    details: dict[str, object],
+    severity: IssueSeverity,
+) -> None:
+    """Trusted provenance must not hide active payloads or incomplete coverage."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    whitelisted_model = next(iter(POPULAR_MODELS))
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=whitelisted_model,
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name=name,
+        passed=False,
+        message=message,
+        severity=severity,
+        details=dict(details),
+        rule_code=rule_code,
+    )
+
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == severity
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+    assert len(result.checks) == 1
+    assert result.checks[0].severity == severity
+    assert result.checks[0].details.get("whitelist_downgrade") is None
 
 
 def test_whitelist_downgrade_check_warning():

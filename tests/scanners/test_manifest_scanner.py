@@ -14,6 +14,18 @@ def _https_url(host: str, path: str = "/model.bin") -> str:
     return f"https://{host}{path}"
 
 
+def _assert_manifest_timeout_result(result: ScanResult) -> None:
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
+    assert "manifest_scan_timeout" in result.metadata["scan_outcome_reasons"]
+    timeout_checks = [check for check in result.checks if check.name == "Manifest Scan Timeout"]
+    assert len(timeout_checks) == 1
+    assert timeout_checks[0].status == CheckStatus.FAILED
+    assert timeout_checks[0].severity == IssueSeverity.INFO
+    assert timeout_checks[0].details["analysis_incomplete"] is True
+
+
 def test_manifest_scanner_blacklist(tmp_path):
     """Test the manifest scanner with blacklisted terms."""
     test_file = tmp_path / "model_card.json"
@@ -811,11 +823,7 @@ def test_manifest_scanner_enforces_timeout(
 
     result = scanner.scan(str(test_file))
 
-    assert result.success is True
-    timeout_checks = [check for check in result.checks if check.name == "Manifest Scan Timeout"]
-    assert len(timeout_checks) == 1
-    assert timeout_checks[0].status == CheckStatus.FAILED
-    assert timeout_checks[0].severity == IssueSeverity.WARNING
+    _assert_manifest_timeout_result(result)
 
 
 def test_manifest_scanner_blacklist_timeout_reports_only_timeout(
@@ -840,7 +848,7 @@ def test_manifest_scanner_blacklist_timeout_reports_only_timeout(
 
     result = scanner.scan(str(test_file))
 
-    assert result.success is True
+    _assert_manifest_timeout_result(result)
     assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
 
 
@@ -863,7 +871,7 @@ def test_manifest_scanner_parse_timeout_reports_only_timeout(
 
     result = scanner.scan(str(test_file))
 
-    assert result.success is True
+    _assert_manifest_timeout_result(result)
     assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
     assert not any(check.name == "File Parse Error" for check in result.checks)
     assert not any(check.name == "Manifest Parse Attempt" for check in result.checks)
@@ -892,7 +900,7 @@ def test_manifest_scanner_cloud_url_timeout_reports_only_timeout(
 
     result = scanner.scan(str(test_file))
 
-    assert result.success is True
+    _assert_manifest_timeout_result(result)
     assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
     assert not any(check.name == "Manifest File Scan" for check in result.checks)
 
@@ -918,7 +926,7 @@ def test_manifest_scanner_weak_hash_timeout_reports_only_timeout(
 
     result = scanner.scan(str(test_file))
 
-    assert result.success is True
+    _assert_manifest_timeout_result(result)
     assert [check.name for check in result.checks if check.status == CheckStatus.FAILED] == ["Manifest Scan Timeout"]
     assert not any(check.name == "Manifest File Scan" for check in result.checks)
 
