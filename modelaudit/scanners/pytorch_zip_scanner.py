@@ -884,6 +884,12 @@ class PyTorchZipScanner(BaseScanner):
     ) -> list[zipfile.ZipInfo]:
         """Discover pickle files in the ZIP archive"""
         pickle_files: list[zipfile.ZipInfo] = []
+        # Identity-based dedup: the same ``ZipInfo`` instance can be considered
+        # by both the filename pass and the sniff pass, and since both iterate
+        # the same ``safe_entries`` list the ``id()`` of each entry is stable
+        # for the duration of this discovery. If a future refactor ever feeds
+        # these passes from separate ``infolist()`` walks or from reconstructed
+        # ``ZipInfo`` objects, fall back to a ``(name, header_offset)`` key.
         seen_entries: set[int] = set()
 
         def add_pickle_entry(entry: zipfile.ZipInfo) -> None:
@@ -901,6 +907,10 @@ class PyTorchZipScanner(BaseScanner):
 
         # Second pass: always sniff unselected members. A benign data.pkl must not
         # hide an extensionless pickle payload or one placed under data/<n>.
+        # Aggregate probe failures into a single summary check so an
+        # adversarial archive with many unreadable members does not flood the
+        # checks list with one INFO finding apiece.
+        probe_failures: list[dict[str, Any]] = []
         for entry in safe_entries:
             if id(entry) in seen_entries or entry.is_dir():
                 continue
@@ -909,20 +919,32 @@ class PyTorchZipScanner(BaseScanner):
                     add_pickle_entry(entry)
             except Exception as exc:
                 logger.debug("Unable to inspect ZIP member %s as a pickle: %s", entry.filename, exc)
-                mark_inconclusive_scan_result(result, "pytorch_zip_pickle_discovery_incomplete")
-                result.add_check(
-                    name="Pickle Discovery",
-                    passed=False,
-                    message=f"Could not inspect PyTorch ZIP member {entry.filename} for hidden pickle payloads: {exc}",
-                    severity=IssueSeverity.INFO,
-                    location=f"{self.current_file_path}:{entry.filename}",
-                    details={
+                probe_failures.append(
+                    {
                         "zip_entry": entry.filename,
                         "exception": str(exc),
                         "exception_type": type(exc).__name__,
-                        "analysis_incomplete": True,
-                    },
+                        "location": f"{self.current_file_path}:{entry.filename}",
+                    }
                 )
+
+        if probe_failures:
+            mark_inconclusive_scan_result(result, "pytorch_zip_pickle_discovery_incomplete")
+            count = len(probe_failures)
+            noun = "member" if count == 1 else "members"
+            result.add_check(
+                name="Pickle Discovery",
+                passed=False,
+                message=f"{count} PyTorch ZIP {noun} could not be inspected for hidden pickle payloads",
+                severity=IssueSeverity.INFO,
+                location=self.current_file_path,
+                details={
+                    "zip_entries": [failure["zip_entry"] for failure in probe_failures],
+                    "entries": probe_failures,
+                    "failed_count": count,
+                    "analysis_incomplete": True,
+                },
+            )
 
         result.metadata["pickle_files"] = self._get_zip_member_names(pickle_files)
         return pickle_files
@@ -977,6 +999,15 @@ class PyTorchZipScanner(BaseScanner):
         if not any(sample.startswith(magic) for magic in _PICKLE_BINARY_PROTOCOL_PREFIXES):
             return False
 
+        # Thresholds tuned for the discovery probe:
+        # * ``>= 4`` on a clean parse — a ``PROTO`` byte plus three additional
+        #   opcodes is unlikely to appear coincidentally in tensor storage noise
+        #   that just happens to start with ``\x80\x0?``, but any real pickle
+        #   (even trivial ones) will clear it quickly.
+        # * ``>= 2`` when ``genops`` either ran out of bytes mid-stream (prefix
+        #   sample) or raised a truncation-style ``ValueError``. Two valid
+        #   opcodes before the cliff is enough structural evidence to route to
+        #   the full pickle scanner, where the authoritative parse happens.
         op_count = 0
         try:
             for opcode, _arg, _pos in pickletools.genops(sample):

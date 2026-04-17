@@ -10,7 +10,7 @@ from typing import IO
 import pytest
 
 from modelaudit.detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
-from modelaudit.scanner_results import Check, ScanResult
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Check, ScanResult
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
@@ -255,6 +255,53 @@ def test_pytorch_zip_discovery_ignores_benign_pickleish_text_with_data_pkl(tmp_p
         and issue.details.get("pickle_filename") in {"archive/notes", "archive/data/0"}
         for issue in result.issues
     )
+
+
+def test_pytorch_zip_discovery_aggregates_probe_failures_into_single_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multiple probe failures must collapse into one aggregated INFO check."""
+    model_path = tmp_path / "unreadable_hidden_pickles.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        for index in range(5):
+            zip_file.writestr(f"archive/blob{index}", b"\xff" * 128)
+
+    original = PyTorchZipScanner._read_member_prefix
+
+    def fail_probe(
+        self: PyTorchZipScanner,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        length: int,
+        *,
+        phase: str,
+        result: ScanResult,
+    ) -> bytes:
+        name = self._get_zip_member_name(entry)
+        if phase == "pickle_discovery" and "blob" in name:
+            raise NotImplementedError(f"unsupported compression: {name}")
+        return original(self, zip_file, entry, length, phase=phase, result=result)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_read_member_prefix", fail_probe)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    reasons = result.metadata["scan_outcome_reasons"]
+    assert reasons.count("pytorch_zip_pickle_discovery_incomplete") == 1
+
+    probe_checks = [check for check in result.checks if check.name == "Pickle Discovery"]
+    assert len(probe_checks) == 1
+    details = probe_checks[0].details
+    assert details["failed_count"] == 5
+    assert sorted(details["zip_entries"]) == [f"archive/blob{index}" for index in range(5)]
+    assert all(entry["exception_type"] == "NotImplementedError" for entry in details["entries"])
 
 
 def test_pytorch_zip_scanner_detects_case_insensitive_native_library_members(tmp_path: Path) -> None:

@@ -416,9 +416,16 @@ def _zip_entry_looks_like_pickle(archive: zipfile.ZipFile, entry: zipfile.ZipInf
 
 
 def _looks_like_binary_pickle_prefix(sample: bytes, *, sample_is_prefix: bool) -> bool:
+    # Keep structurally in sync with
+    # ``modelaudit.scanners.pytorch_zip_scanner.PyTorchZipScanner._looks_like_binary_pickle_prefix``.
+    # The two copies exist because ``modelaudit-picklescan`` ships as a
+    # standalone package with no dependency on the main ``modelaudit`` tree.
     if not sample.startswith(_PICKLE_BINARY_PROTOCOL_PREFIXES):
         return False
 
+    # Thresholds: ``>= 4`` clean opcodes is enough evidence on a complete
+    # probe, ``>= 2`` when the sample is a prefix of a larger member and
+    # ``genops`` either ran out of bytes or raised a truncation-style error.
     op_count = 0
     try:
         for opcode, _arg, _pos in pickletools.genops(sample):
@@ -439,6 +446,10 @@ def _looks_like_binary_pickle_prefix(sample: bytes, *, sample_is_prefix: bool) -
 
 
 def _looks_like_proto0_or_1_pickle(sample: bytes, *, sample_is_prefix: bool) -> bool:
+    # Keep structurally in sync with
+    # ``modelaudit.utils.file.detection._looks_like_proto0_or_1_pickle``.
+    # Duplicated for the standalone package (see comment on
+    # ``_looks_like_binary_pickle_prefix``).
     if len(sample) < 2:
         return False
 
