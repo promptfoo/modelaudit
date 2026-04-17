@@ -507,7 +507,7 @@ jobs:
         uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
         with:
           command: build
-          args: --release --wheel --out /tmp/modelaudit-picklescan-dist --compatibility manylinux_2_28
+          args: --release --out /tmp/modelaudit-picklescan-dist --compatibility manylinux_2_28
           manylinux: "2_28"
           working-directory: packages/modelaudit-picklescan
 
@@ -582,6 +582,11 @@ jobs:
         run: |
           set -euo pipefail
           uv venv /tmp/modelaudit-picklescan-wheel-smoke
+          if [[ -x /tmp/modelaudit-picklescan-wheel-smoke/bin/python ]]; then
+            SMOKE_PYTHON=/tmp/modelaudit-picklescan-wheel-smoke/bin/python
+          else
+            SMOKE_PYTHON=/tmp/modelaudit-picklescan-wheel-smoke/Scripts/python.exe
+          fi
 
           shopt -s nullglob
           picklescan_wheels=(/tmp/modelaudit-picklescan-dist/modelaudit_picklescan-*.whl)
@@ -591,12 +596,12 @@ jobs:
             exit 1
           fi
 
-          uv pip install --python /tmp/modelaudit-picklescan-wheel-smoke/bin/python "${picklescan_wheels[0]}"
+          uv pip install --python "$SMOKE_PYTHON" "${picklescan_wheels[0]}"
 
           smoke_dir="$(mktemp -d)"
           (
             cd "$smoke_dir"
-            PYTHONPATH='' /tmp/modelaudit-picklescan-wheel-smoke/bin/python -I - <<'PY'
+            PYTHONPATH='' "$SMOKE_PYTHON" -I - <<'PY'
           import importlib.util
 
           import modelaudit_picklescan
