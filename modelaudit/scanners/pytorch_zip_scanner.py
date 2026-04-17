@@ -1102,9 +1102,7 @@ class PyTorchZipScanner(BaseScanner):
         all_network_findings = []
         check_jit = self._get_bool_config("check_jit_script", True)
         check_net = self._get_bool_config("check_network_comm", True)
-        pickle_member_names = {
-            self._get_zip_member_name(entry).replace("\\", "/").lstrip("/") for entry in pickle_files
-        }
+        pickle_member_ids = {id(entry) for entry in pickle_files}
         pickle_members_scanned = self.pickle_scanner is not None
 
         if safe_entries:
@@ -1125,7 +1123,7 @@ class PyTorchZipScanner(BaseScanner):
                 # These are binary weight files that cause performance issues when scanned
                 if _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN.match(normalized_name):
                     continue
-                if pickle_members_scanned and normalized_name in pickle_member_names:
+                if pickle_members_scanned and id(entry) in pickle_member_ids:
                     continue
                 if entry.file_size > self.max_jit_scan_member_bytes:
                     mark_inconclusive_scan_result(result, "pytorch_zip_jit_member_size_limit")
