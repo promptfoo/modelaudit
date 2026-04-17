@@ -10,7 +10,7 @@ from typing import IO
 import pytest
 
 from modelaudit.detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
-from modelaudit.scanner_results import Check, ScanResult
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Check, ScanResult
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
@@ -507,6 +507,25 @@ def test_pytorch_zip_scanner_handles_zip_metadata_oserror(
 
     assert result.success is False
     assert any("zip metadata unavailable" in check.message for check in result.checks)
+
+
+def test_pytorch_zip_jit_scan_size_limit_marks_inconclusive(tmp_path: Path) -> None:
+    model_path = tmp_path / "large_jit_member.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("archive/version", "3\n")
+        zip_file.writestr("archive/byteorder", "little")
+        zip_file.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zip_file.writestr("archive/code/debug/source.py", b"print('hello')\n")
+
+    result = PyTorchZipScanner(config={"max_jit_scan_member_bytes": 4}).scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_jit_member_size_limit" in result.metadata["scan_outcome_reasons"]
+    size_checks = [check for check in result.checks if check.name == "JIT/Network Scan Size Limit"]
+    assert len(size_checks) >= 1
+    assert all(check.severity == IssueSeverity.INFO for check in size_checks)
 
 
 @pytest.mark.performance

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from ..detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils import sanitize_archive_path
 from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTES, _looks_like_proto0_or_1_pickle
@@ -105,6 +106,7 @@ _PICKLE_BINARY_PROTOCOL_PREFIXES: tuple[bytes, ...] = (
     b"\x80\x05",
 )
 _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
+_JIT_SCAN_MEMBER_MAX_BYTES = 32 * 1024 * 1024
 _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN = re.compile(r"^(?:.+/)?data/[0-9]+$")
 
 
@@ -241,6 +243,10 @@ class PyTorchZipScanner(BaseScanner):
             self.MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE,
         )
         self.max_archive_entries = self.config.get("max_archive_entries", self.MAX_ARCHIVE_ENTRIES)
+        self.max_jit_scan_member_bytes = self._normalize_positive_int_config(
+            self.config.get("max_jit_scan_member_bytes"),
+            _JIT_SCAN_MEMBER_MAX_BYTES,
+        )
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -310,7 +316,7 @@ class PyTorchZipScanner(BaseScanner):
                 self._validate_tensor_metadata_consistency(zip_file, safe_entries, pickle_files, result, path)
 
                 # Check for JIT/Script code execution risks
-                bytes_scanned += self._scan_for_jit_patterns(zip_file, safe_entries, result, path)
+                bytes_scanned += self._scan_for_jit_patterns(zip_file, safe_entries, pickle_files, result, path)
 
                 # Detect suspicious non-pickle files
                 self._detect_suspicious_files(zip_file, safe_entries, result, path)
@@ -340,7 +346,7 @@ class PyTorchZipScanner(BaseScanner):
         except Exception as e:
             return self._handle_scan_error(path, e)
 
-        result.finish(success=True)
+        result.finish(success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME)
         return result
 
     @staticmethod
@@ -1086,6 +1092,7 @@ class PyTorchZipScanner(BaseScanner):
         self,
         zip_file: zipfile.ZipFile,
         safe_entries: list[zipfile.ZipInfo],
+        pickle_files: list[zipfile.ZipInfo],
         result: ScanResult,
         path: str,
     ) -> int:
@@ -1093,13 +1100,38 @@ class PyTorchZipScanner(BaseScanner):
         bytes_scanned = 0
         all_jit_findings = []
         all_network_findings = []
+        pickle_member_names = {
+            self._get_zip_member_name(entry).replace("\\", "/").lstrip("/") for entry in pickle_files
+        }
 
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
+            normalized_name = name.replace("\\", "/").lstrip("/")
             try:
                 # Skip numeric tensor data files to support different versions of PyTorch ZIP files
                 # These are binary weight files that cause performance issues when scanned
-                if _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN.match(name):
+                if _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN.match(normalized_name):
+                    continue
+                if normalized_name in pickle_member_names:
+                    continue
+                if entry.file_size > self.max_jit_scan_member_bytes:
+                    mark_inconclusive_scan_result(result, "pytorch_zip_jit_member_size_limit")
+                    result.add_check(
+                        name="JIT/Network Scan Size Limit",
+                        passed=False,
+                        message=(
+                            f"PyTorch ZIP member {name} skipped by JIT/network scanning because it exceeds "
+                            f"the bounded read limit ({entry.file_size} > {self.max_jit_scan_member_bytes})"
+                        ),
+                        severity=IssueSeverity.INFO,
+                        location=f"{path}:{name}",
+                        details={
+                            "zip_entry": name,
+                            "file_size": entry.file_size,
+                            "max_scan_bytes": self.max_jit_scan_member_bytes,
+                            "analysis_incomplete": True,
+                        },
+                    )
                     continue
 
                 file_data = self._read_member_bytes(
@@ -1107,6 +1139,7 @@ class PyTorchZipScanner(BaseScanner):
                     entry,
                     phase="jit_script_scan",
                     result=result,
+                    max_bytes=self.max_jit_scan_member_bytes,
                 )
                 bytes_scanned += len(file_data)
 
