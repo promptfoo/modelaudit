@@ -180,6 +180,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("collections", "eval"),
     ("copyreg", "add_extension"),
     ("copyreg", "remove_extension"),
+    ("dataclasses", "_create_fn"),
     ("dill", "load"),
     ("dill", "load_module"),
     ("dill", "load_module_asdict"),
@@ -276,6 +277,10 @@ mod tests {
         assert_eq!(global_severity("typing", "_eval_type"), Some("critical"));
         assert_eq!(
             global_severity("copyreg", "add_extension"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("dataclasses", "_create_fn"),
             Some("critical")
         );
         assert_eq!(global_severity("custom", "load"), None);

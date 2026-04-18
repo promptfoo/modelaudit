@@ -246,3 +246,69 @@ Blocking plan:
 Performance note: the fix is a single additional binary-search entry. It does
 not add expression parsing, string scanning, or special handling for typing
 objects.
+
+## Turn 9 - `dataclasses._create_fn` generated-source exec gap
+
+Goal: produce another self-contained code-execution pickle that
+`packages/modelaudit-picklescan` does not flag.
+
+Payload shape:
+
+```python
+import dataclasses
+import pickle
+
+
+class DataclassesCreateFnRce:
+    def __reduce__(self):
+        return (
+            dataclasses._create_fn,
+            (
+                "x",
+                ["a=open('/tmp/ma_dataclasses_create_fn_marker','w').write('x')"],
+                ["return int"],
+            ),
+        )
+
+
+payload = pickle.dumps(DataclassesCreateFnRce(), protocol=4)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `findings=[]`,
+  `notices=[]`
+- Unpickle result: creates `/tmp/ma_dataclasses_create_fn_marker` and returns a
+  generated function named `x`
+- RCE mechanism: `dataclasses._create_fn()` builds Python source from the
+  supplied `name`, `args`, and `body`, then calls `exec(txt, globals, ns)`.
+  The payload places the side effect in a default argument expression, so it
+  executes while the generated inner function is defined during unpickling.
+
+Why the scanner missed it:
+
+- `dataclasses` is absent from both `DANGEROUS_WILDCARD_MODULES` and
+  `DANGEROUS_GLOBALS`.
+- The only import reference is `dataclasses._create_fn`, and it is recorded as
+  `is_dangerous=False`.
+- The generated-source string avoids current suspicious string seeds such as
+  `eval(`, `exec(`, `__import__`, `os.system`, and `subprocess`.
+
+Performance note: this is another direct policy coverage gap around an exec
+sink. The narrow next block is a sorted `DANGEROUS_GLOBALS` entry for
+`("dataclasses", "_create_fn")`, plus a regression that proves scan-time
+detection before unpickle-time marker creation.
+
+## Turn 10 - Block `dataclasses._create_fn`
+
+Blocking plan:
+
+- Add `("dataclasses", "_create_fn")` to the sorted dangerous-global table.
+- Add portable policy coverage for raw `GLOBAL dataclasses _create_fn`
+  reductions.
+- Add a CPython oracle regression that pickles a default-argument side effect,
+  verifies scanner detection, then verifies the marker file appears only during
+  unpickle.
+
+Performance note: the fix is a single additional binary-search entry. It does
+not add generated-source parsing or broader string scanning.

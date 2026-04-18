@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import pickle
 import shlex
 import shutil
@@ -293,6 +294,15 @@ def _has_critical_mailcap_findmatch_finding(report: PickleReport) -> bool:
     )
 
 
+def _has_critical_dataclasses_create_fn_finding(report: PickleReport) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "dataclasses"
+        and finding.details.get("name") == "_create_fn"
+        for finding in report.findings
+    )
+
+
 def _has_critical_setuptools_distutils_spawn_finding(report: PickleReport) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -392,6 +402,34 @@ def test_scan_bytes_blocks_mailcap_findmatch_test_command_rce(tmp_path: Path) ->
     assert not marker.exists()
     pickle.loads(payload)
     assert marker.exists()
+
+
+def test_scan_bytes_blocks_dataclasses_create_fn_default_arg_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "dataclasses_create_fn_rce_marker"
+
+    class DataclassesCreateFnRce:
+        def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+            create_fn = dataclasses.__dict__["_create_fn"]
+            return (
+                create_fn,
+                (
+                    "x",
+                    [f"a=open({str(marker)!r}, 'w').write('x')"],
+                    ["return int"],
+                ),
+            )
+
+    payload = pickle.dumps(DataclassesCreateFnRce(), protocol=4)
+
+    report = scan_bytes(payload, source="dataclasses-create-fn-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_dataclasses_create_fn_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result.__name__ == "x"
+    assert marker.read_text() == "x"
 
 
 def test_scan_bytes_blocks_pipes_template_copy_pipeline_rce(tmp_path: Path) -> None:
