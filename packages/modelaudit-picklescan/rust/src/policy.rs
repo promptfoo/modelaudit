@@ -190,6 +190,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("contextlib", "ExitStack.__exit__"),
     ("contextlib", "ExitStack.callback"),
     ("contextlib", "ExitStack.close"),
+    ("contextvars", "Context.run"),
     ("copyreg", "add_extension"),
     ("copyreg", "remove_extension"),
     ("dataclasses", "_create_fn"),
@@ -361,6 +362,10 @@ mod tests {
         );
         assert_eq!(
             global_severity("contextlib", "ExitStack.__exit__"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("contextvars", "Context.run"),
             Some("critical")
         );
         assert_eq!(global_severity("weakref", "finalize"), Some("critical"));
