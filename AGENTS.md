@@ -9,6 +9,17 @@ This is the single source of truth for all AI coding agents (Claude, Gemini, oth
 - Keep instructions universal and minimal; lean on deterministic tools (ruff, mypy, pytest, prettier) rather than embedding style rules.
 - When unsure, ask or fetch targeted context instead of expanding instructions.
 
+### Monorepo at a glance
+
+This repo publishes **two PyPI packages with independent versions**:
+
+| PyPI name               | Path                              | Version file                    | CHANGELOG                                     |
+| ----------------------- | --------------------------------- | ------------------------------- | --------------------------------------------- |
+| `modelaudit`            | `./` (root)                       | `pyproject.toml` + `uv.lock`    | `CHANGELOG.md`                                |
+| `modelaudit-picklescan` | `packages/modelaudit-picklescan/` | `pyproject.toml` + `Cargo.toml` | `packages/modelaudit-picklescan/CHANGELOG.md` |
+
+Root `modelaudit` hard-requires `modelaudit-picklescan>=0.1.0,<0.2.0` — when the sibling crosses `0.2.0`, bump the constraint in the same PR or the next `modelaudit` release is uninstallable. Both packages are driven by a single `release-please` workflow (`.github/workflows/release-please.yml`) with components defined in `release-please-config.json` and current versions in `.release-please-manifest.json`. Full publishing details — trusted publishing, manual `workflow_dispatch` recovery (`root_version` / `picklescan_version`), and yank procedure — are in [`docs/agents/release-process.md`](docs/agents/release-process.md). For work inside the picklescan package, start from [`packages/modelaudit-picklescan/AGENTS.md`](packages/modelaudit-picklescan/AGENTS.md).
+
 ## Mission & Principles
 
 - **Security first:** Never weaken detections or bypass safeguards.
@@ -184,7 +195,7 @@ modelaudit/
 └── CHANGELOG.md          # Keep a Changelog format
 ```
 
-Key docs: `docs/agents/architecture.md`, `docs/agents/dependencies.md`, `docs/agents/release-process.md`, `docs/agents/new-scanner-quickstart.md`.
+Key docs: `docs/agents/architecture.md`, `docs/agents/dependencies.md`, `docs/agents/release-process.md`, `docs/agents/new-scanner-quickstart.md`, `docs/agents/picklescan-package-split.md`, `packages/modelaudit-picklescan/AGENTS.md`.
 
 ## README.md Content Guidelines
 
