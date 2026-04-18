@@ -7,6 +7,7 @@ import pickle
 import shlex
 import shutil
 import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from importlib.util import find_spec
@@ -285,6 +286,15 @@ def _has_critical_subprocess_run_finding(report: PickleReport) -> bool:
     )
 
 
+def _has_critical_atexit_register_finding(report: PickleReport) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "atexit"
+        and finding.details.get("name") == "register"
+        for finding in report.findings
+    )
+
+
 def _has_critical_mailcap_findmatch_finding(report: PickleReport) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -418,6 +428,20 @@ def _has_critical_typing_get_type_hints_finding(report: PickleReport) -> bool:
         and finding.details.get("name") == "get_type_hints"
         for finding in report.findings
     )
+
+
+def _atexit_register_payload(marker: Path) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"atexit"), _short_binunicode(b"register"), b"\x93"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(marker).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
+    parts += [b"tR", b"\x86R."]
+    return b"".join(parts)
 
 
 def _typing_eval_type_forward_ref_payload(marker: Path) -> bytes:
@@ -665,6 +689,29 @@ def test_scan_bytes_blocks_mailcap_findmatch_test_command_rce(tmp_path: Path) ->
 
     assert not marker.exists()
     pickle.loads(payload)
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_atexit_register_exit_callback_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "atexit_register_exit_callback_rce_marker"
+    payload = _atexit_register_payload(marker)
+
+    report = scan_bytes(payload, source="atexit-register-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_atexit_register_finding(report)
+
+    assert not marker.exists()
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            f"import pickle; pickle.loads(bytes.fromhex({payload.hex()!r}))",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     assert marker.exists()
 
 

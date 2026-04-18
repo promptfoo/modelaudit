@@ -174,6 +174,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("_osx_support", "_read_output"),
     ("_posixsubprocess", "fork_exec"),
     ("_pyrepl.pager", "pipe_pager"),
+    ("atexit", "register"),
     ("base64", "b64decode"),
     ("base64", "b64encode"),
     ("base64", "decode"),
@@ -278,6 +279,7 @@ mod tests {
     fn dangerous_global_lookup_uses_sorted_table() {
         assert_eq!(global_severity("joblib", "load"), Some("critical"));
         assert_eq!(global_severity("mailcap", "findmatch"), Some("critical"));
+        assert_eq!(global_severity("atexit", "register"), Some("critical"));
         assert_eq!(
             global_severity("setuptools._distutils.spawn", "spawn"),
             Some("critical")
