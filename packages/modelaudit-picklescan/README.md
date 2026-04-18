@@ -16,7 +16,7 @@ Pickle deserialization is the most common supply-chain attack vector in ML check
 - **Bounded by construction.** Opcode count, wall-clock timeout, string-literal bytes, nested-payload bytes, and recursion depth are all configurable caps with safe defaults. A malicious producer cannot force unbounded memory or CPU.
 - **Zero Python runtime dependencies.** The wheel is self-contained — `pip install modelaudit-picklescan` and nothing else.
 - **Attested provenance.** Release wheels are published to PyPI with sigstore attestations via GitHub Actions trusted publishing.
-- **Typed, immutable reports.** `PickleReport`, `Finding`, `Notice`, and `ScanError` are frozen dataclasses with `to_dict()` for serialization.
+- **Typed, immutable reports.** `PickleReport`, `Finding`, `Notice`, and `ScanError` are frozen dataclasses with `to_dict()` for serialization. The package ships `py.typed` for mypy / pyright.
 
 ## Install
 
@@ -40,40 +40,44 @@ for finding in report.findings:
         print(f"    at {finding.location}")
 ```
 
-Example output on a pickle that attempts to execute `os.system`:
+Example output on a PyTorch ZIP whose inner pickle reduces on `os.system`:
 
 ```
 status=complete verdict=malicious
-  [critical] DANGEROUS_CALL: Pickle invokes os.system which can execute shell commands
-    at suspicious_model.pt:archive/data.pkl (opcode REDUCE @ offset 42)
+  [critical] DANGEROUS_CALL: Found REDUCE opcode invoking os.system
+    at suspicious_model.pt:archive/data.pkl (pos 42)
 ```
 
 Example output on a truncated or oversized pickle where analysis is incomplete:
 
 ```
 status=inconclusive verdict=unknown
-  (no findings — scan was truncated, see report.notices)
+  (no findings — scan was truncated, inspect report.notices and report.coverage)
 ```
+
+The `finding.location` string follows the format `{source} (pos {byte_offset})`. The `source` on PyTorch ZIP members is `{archive_path}:{member_name}`.
 
 ## What it detects
 
 Each finding carries a `rule_code` so downstream tooling can allowlist, suppress, or route alerts:
 
-| Rule code                | What it flags                                                                     |
-| ------------------------ | --------------------------------------------------------------------------------- |
-| `DANGEROUS_CALL`         | Reduce/newobj invocations of built-in or library functions that execute code      |
-| `DANGEROUS_GLOBAL`       | Imports of classes and modules known to enable code execution when unpickled      |
-| `EXTENSION_REF`          | Pickle extension opcodes that resolve to arbitrary callables at load time         |
-| `MALFORMED_STACK_GLOBAL` | `STACK_GLOBAL` opcodes whose operands have been tampered to bypass naive scanners |
-| `PERSISTENT_ID`          | `PERSID` / `BINPERSID` references that delegate object construction to the loader |
-| `PICKLE_EXPANSION`       | Oversized or amplified pickle structures consistent with zip-bomb-style payloads  |
-| `POST_BUDGET_GLOBAL`     | Dangerous globals observed after the opcode budget, surfaced conservatively       |
-| `STRUCTURAL_TAMPER`      | Opcode sequences that do not correspond to any legitimate pickle producer         |
-| `SUSPICIOUS_STRING`      | High-signal string literals (shell metacharacters, import payloads, URLs)         |
-| `S203`, `S213`           | Semgrep-style rule codes for specific dangerous-call and dangerous-global classes |
-| `S601`, `S602`           | Nested base64/hex-encoded pickle payloads discovered inside string literals       |
+| Rule code                | What it flags                                                                         |
+| ------------------------ | ------------------------------------------------------------------------------------- |
+| `DANGEROUS_CALL`         | REDUCE/NEWOBJ/NEWOBJ_EX opcodes invoking a callable known to execute code             |
+| `DANGEROUS_GLOBAL`       | Imports of modules or classes that enable code execution when the pickle is loaded    |
+| `EXTENSION_REF`          | `copyreg.extension` / `EXT1`/`EXT2`/`EXT4` opcodes that resolve through process state |
+| `MALFORMED_STACK_GLOBAL` | `STACK_GLOBAL` operands crafted to bypass naive string-matching scanners              |
+| `PERSISTENT_ID`          | `PERSID` / `BINPERSID` references that delegate object construction to the loader     |
+| `PICKLE_EXPANSION`       | Oversized or amplified pickle structures consistent with zip-bomb-style payloads      |
+| `POST_BUDGET_GLOBAL`     | Dangerous globals observed after the opcode budget, surfaced conservatively           |
+| `STRUCTURAL_TAMPER`      | Opcode sequences that do not correspond to any legitimate pickle producer             |
+| `SUSPICIOUS_STRING`      | High-signal string literals (shell metacharacters, import payloads, URLs)             |
+| `S203`                   | Non-allowlisted `__main__` global reference (requires manual review before loading)   |
+| `S213`                   | Raw (unencoded) nested pickle payload inside a byte field                             |
+| `S601`                   | Base64-encoded nested pickle payload inside a string literal                          |
+| `S602`                   | Hex-encoded nested pickle payload inside a string literal                             |
 
-The scanner understands pickle protocols 0–5, recognizes short and extended opcodes, and reconstructs `module.class` targets for `STACK_GLOBAL` and friends without executing them.
+The scanner covers pickle protocols 0 through 5, recognizes short and extended opcodes, and reconstructs `module.class` targets for `STACK_GLOBAL` without executing them.
 
 ## When to use this vs. `modelaudit`
 
@@ -155,14 +159,14 @@ maturin develop --release -m packages/modelaudit-picklescan/Cargo.toml
 
 ## Stability and versioning
 
-`modelaudit-picklescan` follows semantic versioning. `0.x` is considered pre-1.0:
+`modelaudit-picklescan` follows semantic versioning. `0.x` should be read as pre-1.0 — expect small adjustments as the API settles. The working intent, reflected in the current code, is:
 
-- **`ScanOptions` defaults** are safe to rely on across patch releases. New fields may be added in minor releases with conservative defaults.
-- **`PickleReport`, `Finding`, `Notice`, `ScanError`** field names are stable within a minor version. New optional fields may be added; removed or renamed only in minor version bumps.
-- **Rule codes** are stable — we add new rule codes rather than renaming existing ones. Existing rule codes are a supported surface for downstream allowlisting.
-- **Verdict semantics** (`clean` requires `status=complete`; truncation never returns `clean`) are a hard contract.
+- **Resource-control defaults** (`ScanOptions`) are tuned conservatively; changes that relax a default will be called out in the changelog.
+- **Public report models** (`PickleReport`, `Finding`, `Notice`, `ScanError`) and their field names are the supported surface for serialization and downstream tooling.
+- **Rule codes** are intended to be additive — new codes rather than renames — so that downstream allowlists and suppressions remain stable.
+- **Verdict semantics** — `SafetyVerdict.CLEAN` is only returned when `ScanStatus.COMPLETE` holds and there are no findings; truncation, timeouts, and engine errors never produce `CLEAN`. This is enforced in `_combine_verdict` / `_with_*_notice` in `api.py`.
 
-Breaking changes, when they happen, are called out in [CHANGELOG.md](https://github.com/promptfoo/modelaudit/blob/main/packages/modelaudit-picklescan/CHANGELOG.md) and the GitHub release notes.
+Any change to the items above will be announced in [CHANGELOG.md](https://github.com/promptfoo/modelaudit/blob/main/packages/modelaudit-picklescan/CHANGELOG.md) and the GitHub release notes.
 
 ## Security and reporting
 
