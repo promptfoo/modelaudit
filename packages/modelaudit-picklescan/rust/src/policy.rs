@@ -174,6 +174,10 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("_aix_support", "_read_cmd_output"),
     ("_functools", "partial"),
     ("_functools", "reduce"),
+    ("_io", "FileIO"),
+    ("_io", "FileIO.write"),
+    ("_io", "TextIOWrapper.write"),
+    ("_io", "open"),
     ("_operator", "attrgetter"),
     ("_operator", "itemgetter"),
     ("_operator", "methodcaller"),
@@ -219,6 +223,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("functools", "reduce"),
     ("functools", "singledispatch"),
     ("inspect", "getmembers"),
+    ("io", "open"),
     ("itertools", "accumulate"),
     ("itertools", "dropwhile"),
     ("itertools", "filterfalse"),
@@ -239,6 +244,9 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("operator", "call"),
     ("operator", "itemgetter"),
     ("operator", "methodcaller"),
+    ("pathlib", "Path.open"),
+    ("pathlib", "Path.write_bytes"),
+    ("pathlib", "Path.write_text"),
     ("pip", "main"),
     ("pip._internal", "main"),
     ("pip._internal.cli.main", "main"),
@@ -355,6 +363,9 @@ mod tests {
         );
         assert_eq!(global_severity("_functools", "partial"), Some("critical"));
         assert_eq!(global_severity("_functools", "reduce"), Some("critical"));
+        for name in ["FileIO", "FileIO.write", "TextIOWrapper.write", "open"] {
+            assert_eq!(global_severity("_io", name), Some("critical"));
+        }
         assert_eq!(global_severity("functools", "cache"), Some("critical"));
         assert_eq!(
             global_severity("functools", "cached_property.__get__"),
@@ -385,6 +396,10 @@ mod tests {
             global_severity("logging", "Filterer.filter"),
             Some("critical")
         );
+        assert_eq!(global_severity("io", "open"), Some("critical"));
+        for name in ["Path.open", "Path.write_bytes", "Path.write_text"] {
+            assert_eq!(global_severity("pathlib", name), Some("critical"));
+        }
         for (module, name) in [
             ("unittest", "TestLoader.discover"),
             ("unittest", "defaultTestLoader.discover"),

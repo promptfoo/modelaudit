@@ -51,6 +51,12 @@ def _text_operand(value: str) -> bytes:
     return _binunicode(data)
 
 
+def _bytes_operand(data: bytes) -> bytes:
+    if len(data) <= 0xFF:
+        return b"C" + bytes([len(data)]) + data
+    return b"B" + len(data).to_bytes(4, "little") + data
+
+
 def _binunicode8(data: bytes) -> bytes:
     return b"\x8d" + len(data).to_bytes(8, "little") + data
 
@@ -343,6 +349,15 @@ def _has_suspicious_magic_method_finding(report: PickleReport) -> bool:
         finding.severity == Severity.WARNING
         and finding.rule_code == "SUSPICIOUS_STRING"
         and finding.details.get("pattern") == "magic method"
+        for finding in report.findings
+    )
+
+
+def _has_critical_global_finding(report: PickleReport, module: str, name: str) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == module
+        and finding.details.get("name") == name
         for finding in report.findings
     )
 
@@ -1093,6 +1108,68 @@ def _builtins_type_fspath_protocol_payload(
         parts += [b"h\x02", b"\x85R"]
     else:
         parts += [b"h\x01"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _path_instance_payload(marker: Path) -> list[bytes]:
+    return [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(marker).__name__.encode()),
+        b"\x93",
+        _text_operand(str(marker)),
+        b"\x85R\x94",
+    ]
+
+
+def _direct_file_write_sink_payload(marker: Path, *, sink_name: str, include_write: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    if not include_write:
+        parts += _path_instance_payload(marker)
+        parts += [b"h\x00"]
+        parts += [b"."]
+        return b"".join(parts)
+
+    if sink_name == "path_write_text":
+        parts += _path_instance_payload(marker)
+        parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.write_text"), b"\x93"]
+        parts += [b"h\x00", _text_operand("owned-by-path-write-text"), b"\x86R"]
+    elif sink_name == "path_write_bytes":
+        parts += _path_instance_payload(marker)
+        parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.write_bytes"), b"\x93"]
+        parts += [b"h\x00", _bytes_operand(b"owned-by-path-write-bytes"), b"\x86R"]
+    elif sink_name == "path_open":
+        parts += _path_instance_payload(marker)
+        parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.open"), b"\x93"]
+        parts += [b"h\x00", _text_operand("w"), b"\x86R\x940"]
+        parts += [_short_binunicode(b"_io"), _short_binunicode(b"TextIOWrapper.write"), b"\x93"]
+        parts += [b"h\x01", _text_operand("owned-by-path-open"), b"\x86R0"]
+        parts += [_short_binunicode(b"_io"), _short_binunicode(b"TextIOWrapper.close"), b"\x93"]
+        parts += [b"h\x01", b"\x85R"]
+    elif sink_name == "io_open":
+        parts += [_short_binunicode(b"io"), _short_binunicode(b"open"), b"\x93"]
+        parts += [_text_operand(str(marker)), _text_operand("w"), b"\x86R\x940"]
+        parts += [_short_binunicode(b"_io"), _short_binunicode(b"TextIOWrapper.write"), b"\x93"]
+        parts += [b"h\x00", _text_operand("owned-by-io-open"), b"\x86R0"]
+        parts += [_short_binunicode(b"_io"), _short_binunicode(b"TextIOWrapper.close"), b"\x93"]
+        parts += [b"h\x00", b"\x85R"]
+    elif sink_name == "_io_open":
+        parts += [_short_binunicode(b"_io"), _short_binunicode(b"open"), b"\x93"]
+        parts += [_text_operand(str(marker)), _text_operand("w"), b"\x86R\x940"]
+        parts += [_short_binunicode(b"_io"), _short_binunicode(b"TextIOWrapper.write"), b"\x93"]
+        parts += [b"h\x00", _text_operand("owned-by-_io-open"), b"\x86R0"]
+        parts += [_short_binunicode(b"_io"), _short_binunicode(b"TextIOWrapper.close"), b"\x93"]
+        parts += [b"h\x00", b"\x85R"]
+    elif sink_name == "fileio":
+        parts += [_short_binunicode(b"_io"), _short_binunicode(b"FileIO"), b"\x93"]
+        parts += [_text_operand(str(marker)), _text_operand("w"), b"\x86R\x940"]
+        parts += [_short_binunicode(b"_io"), _short_binunicode(b"FileIO.write"), b"\x93"]
+        parts += [b"h\x00", _bytes_operand(b"owned-by-fileio"), b"\x86R0"]
+        parts += [_short_binunicode(b"_io"), _short_binunicode(b"FileIO.close"), b"\x93"]
+        parts += [b"h\x00", b"\x85R"]
+    else:
+        raise ValueError(f"unexpected direct file sink: {sink_name}")
+
     parts += [b"."]
     return b"".join(parts)
 
@@ -2311,13 +2388,79 @@ def test_scan_bytes_blocks_builtins_type_fspath_protocol_file_write_rce(tmp_path
 
     report = scan_bytes(payload, source="builtins-type-fspath-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert report.verdict == SafetyVerdict.MALICIOUS
     assert _has_suspicious_magic_method_finding(report)
+    assert _has_critical_global_finding(report, "io", "open")
+    assert _has_critical_global_finding(report, "_io", "TextIOWrapper.write")
 
     assert not marker.exists()
     result = pickle.loads(payload)
     assert result is None
     assert marker.read_text() == "owned-by-fspath"
+
+
+@pytest.mark.parametrize(
+    ("sink_name", "expected_content", "expected_globals"),
+    [
+        (
+            "path_write_text",
+            b"owned-by-path-write-text",
+            [("pathlib", "Path.write_text")],
+        ),
+        (
+            "path_write_bytes",
+            b"owned-by-path-write-bytes",
+            [("pathlib", "Path.write_bytes")],
+        ),
+        (
+            "path_open",
+            b"owned-by-path-open",
+            [("pathlib", "Path.open"), ("_io", "TextIOWrapper.write")],
+        ),
+        (
+            "io_open",
+            b"owned-by-io-open",
+            [("io", "open"), ("_io", "TextIOWrapper.write")],
+        ),
+        (
+            "_io_open",
+            b"owned-by-_io-open",
+            [("_io", "open"), ("_io", "TextIOWrapper.write")],
+        ),
+        (
+            "fileio",
+            b"owned-by-fileio",
+            [("_io", "FileIO"), ("_io", "FileIO.write")],
+        ),
+    ],
+)
+def test_scan_bytes_blocks_direct_file_write_sinks(
+    tmp_path: Path,
+    sink_name: str,
+    expected_content: bytes,
+    expected_globals: list[tuple[str, str]],
+) -> None:
+    marker = tmp_path / f"direct_file_write_{sink_name}_rce_marker"
+    control_payload = _direct_file_write_sink_payload(marker, sink_name=sink_name, include_write=False)
+    payload = _direct_file_write_sink_payload(marker, sink_name=sink_name, include_write=True)
+
+    control_report = scan_bytes(control_payload, source=f"direct-file-write-{sink_name}-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == type(marker).__name__
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source=f"direct-file-write-{sink_name}-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    for module, name in expected_globals:
+        assert _has_critical_global_finding(report, module, name)
+
+    assert not marker.exists()
+    pickle.loads(payload)
+    assert marker.read_bytes() == expected_content
 
 
 def test_scan_bytes_blocks_builtins_type_descriptor_set_name_rce(tmp_path: Path) -> None:
@@ -2895,7 +3038,8 @@ def test_scan_bytes_blocks_site_addsitedir_pth_execution_rce(tmp_path: Path) -> 
 
     try:
         control_report = scan_bytes(control_payload, source="site-addsitedir-pth-control.pkl")
-        assert control_report.verdict == SafetyVerdict.CLEAN
+        assert control_report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_global_finding(control_report, "pathlib", "Path.write_text")
 
         assert not marker.exists()
         control_result = pickle.loads(control_payload)
@@ -2932,7 +3076,8 @@ def test_scan_bytes_blocks_unittest_loader_discover_import_execution_rce(tmp_pat
     try:
         sys.modules.pop(module_name, None)
         control_report = scan_bytes(control_payload, source="unittest-loader-discover-control.pkl")
-        assert control_report.verdict == SafetyVerdict.CLEAN
+        assert control_report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_global_finding(control_report, "pathlib", "Path.write_text")
 
         assert not marker.exists()
         control_result = pickle.loads(control_payload)
@@ -2973,7 +3118,8 @@ def test_scan_bytes_blocks_unittest_mock_patch_start_import_execution_rce(tmp_pa
         sys.path.insert(0, str(tmp_path))
         sys.modules.pop(module_name, None)
         control_report = scan_bytes(control_payload, source="unittest-mock-patch-start-control.pkl")
-        assert control_report.verdict == SafetyVerdict.CLEAN
+        assert control_report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_global_finding(control_report, "pathlib", "Path.write_text")
 
         assert not marker.exists()
         control_result = pickle.loads(control_payload)
