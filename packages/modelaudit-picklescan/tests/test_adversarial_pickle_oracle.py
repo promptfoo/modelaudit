@@ -1004,6 +1004,38 @@ def _csv_tempfile_pth_payload(
     return b"".join(parts)
 
 
+def _mailbox_singlefile_pth_payload(
+    pth_path: Path,
+    marker: Path,
+    *,
+    mailbox_class: str,
+    method_owner: str,
+    marker_content: str,
+    include_add: bool,
+) -> bytes:
+    fragments = [
+        "Subject: x\n\n",
+        "im",
+        "port pathlib;pathlib.Path(",
+        repr(str(marker)),
+        f").write_text({marker_content!r})\n",
+    ]
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"mailbox"), _short_binunicode(mailbox_class.encode()), b"\x93"]
+    parts += [_text_operand(str(pth_path)), b"\x85R\x94"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"str.join"), b"\x93"]
+    parts += [_text_operand(""), _tuple_payload_operands([_text_operand(fragment) for fragment in fragments])]
+    parts += [b"\x86R\x94"]
+    if include_add:
+        parts += [_short_binunicode(b"mailbox"), _short_binunicode(f"{method_owner}.add".encode()), b"\x93"]
+        parts += [b"h\x00h\x01\x86R0"]
+    parts += [_short_binunicode(b"mailbox"), _short_binunicode(f"{method_owner}.flush".encode()), b"\x93"]
+    parts += [b"h\x00\x85R0"]
+    parts += [_short_binunicode(b"mailbox"), _short_binunicode(f"{method_owner}.close".encode()), b"\x93"]
+    parts += [b"h\x00\x85R."]
+    return b"".join(parts)
+
+
 def _inspect_getmembers_property_payload(marker: Path, *, include_call: bool) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
@@ -2450,6 +2482,84 @@ def test_scan_bytes_blocks_csv_tempfile_fragmented_pth_rce(tmp_path: Path, write
 
         site.addsitedir(str(tmp_path))
         assert marker.read_text() == "owned-by-csv-tempfile"
+    finally:
+        sys.path[:] = original_sys_path
+
+
+@pytest.mark.parametrize(
+    ("case_name", "mailbox_class", "method_owner", "marker_content", "expected_global"),
+    [
+        ("mbox", "mbox", "mbox", "owned-by-mailbox-mbox", "mbox.add"),
+        ("mmdf", "MMDF", "MMDF", "owned-by-mailbox-mmdf", "MMDF.add"),
+        ("babyl", "Babyl", "Babyl", "owned-by-mailbox-babyl", "Babyl.add"),
+        (
+            "singlefile-base",
+            "mbox",
+            "_singlefileMailbox",
+            "owned-by-mailbox-base",
+            "_singlefileMailbox.add",
+        ),
+    ],
+)
+def test_scan_bytes_blocks_mailbox_singlefile_pth_writes(
+    tmp_path: Path,
+    case_name: str,
+    mailbox_class: str,
+    method_owner: str,
+    marker_content: str,
+    expected_global: str,
+) -> None:
+    pth_path = tmp_path / f"mailbox_{case_name}_exec.pth"
+    marker = tmp_path / f"mailbox_{case_name}_pth_rce_marker"
+    control_payload = _mailbox_singlefile_pth_payload(
+        pth_path,
+        marker,
+        mailbox_class=mailbox_class,
+        method_owner=method_owner,
+        marker_content=marker_content,
+        include_add=False,
+    )
+    payload = _mailbox_singlefile_pth_payload(
+        pth_path,
+        marker,
+        mailbox_class=mailbox_class,
+        method_owner=method_owner,
+        marker_content=marker_content,
+        include_add=True,
+    )
+    original_sys_path = list(sys.path)
+
+    try:
+        control_report = scan_bytes(control_payload, source=f"mailbox-{case_name}-control.pkl")
+        assert control_report.verdict == SafetyVerdict.CLEAN
+
+        assert not pth_path.exists()
+        assert not marker.exists()
+        control_result = pickle.loads(control_payload)
+        assert control_result is None
+        assert pth_path.read_text() == ""
+        assert not marker.exists()
+
+        site.addsitedir(str(tmp_path))
+        assert not marker.exists()
+        sys.path[:] = original_sys_path
+        pth_path.unlink()
+
+        report = scan_bytes(payload, source=f"mailbox-{case_name}-pth-rce.pkl")
+
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_global_finding(report, "mailbox", expected_global)
+
+        assert not pth_path.exists()
+        assert not marker.exists()
+        result = pickle.loads(payload)
+        assert result is None
+        assert pth_path.exists()
+        assert f"import pathlib;pathlib.Path({str(marker)!r}).write_text({marker_content!r})\n" in pth_path.read_text()
+        assert not marker.exists()
+
+        site.addsitedir(str(tmp_path))
+        assert marker.read_text() == marker_content
     finally:
         sys.path[:] = original_sys_path
 

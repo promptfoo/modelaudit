@@ -143,6 +143,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that can write attacker-controlled startup hooks
 - **security:** detect pickle calls to durable tempfile creation and CSV
   `DictWriter` row dispatch that can write attacker-controlled startup hooks
+- **security:** detect pickle calls to mailbox single-file `add` dispatch
+  methods that can write attacker-controlled startup hooks
 - **security:** detect `builtins.staticmethod` pickle call targets that can
   synthesize callable descriptors for later invocation
 - **security:** detect `builtins.property.__get__` pickle call targets that

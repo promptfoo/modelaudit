@@ -247,6 +247,10 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("logging.handlers", "RotatingFileHandler"),
     ("logging.handlers", "TimedRotatingFileHandler"),
     ("logging.handlers", "WatchedFileHandler"),
+    ("mailbox", "Babyl.add"),
+    ("mailbox", "MMDF.add"),
+    ("mailbox", "_singlefileMailbox.add"),
+    ("mailbox", "mbox.add"),
     ("mailcap", "findmatch"),
     ("numpy", "load"),
     ("numpy.f2py.crackfortran", "getlincoef"),
@@ -427,6 +431,14 @@ mod tests {
             "WatchedFileHandler",
         ] {
             assert_eq!(global_severity("logging.handlers", name), Some("critical"));
+        }
+        for name in [
+            "Babyl.add",
+            "MMDF.add",
+            "_singlefileMailbox.add",
+            "mbox.add",
+        ] {
+            assert_eq!(global_severity("mailbox", name), Some("critical"));
         }
         assert_eq!(global_severity("io", "open"), Some("critical"));
         for name in ["Path.open", "Path.write_bytes", "Path.write_text"] {

