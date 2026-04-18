@@ -64,6 +64,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attacker-controlled callables when iterated.
 - Detect `itertools.filterfalse` pickle call targets that can lazily invoke
   attacker-controlled callables when iterated.
+- Detect `itertools.groupby` pickle call targets that can lazily invoke
+  attacker-controlled key functions when iterated.
 - Detect `itertools.takewhile` pickle call targets that can lazily invoke
   attacker-controlled callables when iterated.
 - Introduce the Rust-native pickle scanning engine and standalone Python API package.
