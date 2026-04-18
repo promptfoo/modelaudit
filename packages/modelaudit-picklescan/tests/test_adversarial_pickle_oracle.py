@@ -1071,6 +1071,32 @@ def _builtins_type_presentation_protocol_payload(
     return b"".join(parts)
 
 
+def _builtins_type_fspath_protocol_payload(
+    marker: Path,
+    *,
+    include_write: bool,
+) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
+    parts += [b"(", _text_operand("PathLikeString")]
+    parts += [_short_binunicode(b"collections"), _short_binunicode(b"UserString"), b"\x93"]
+    parts += [b"\x85", b"}", _text_operand("__fspath__")]
+    parts += [_short_binunicode(b"collections"), _short_binunicode(b"UserString.encode"), b"\x93"]
+    parts += [b"s", b"tR\x940"]
+    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R\x940"]
+    if include_write:
+        parts += [_short_binunicode(b"io"), _short_binunicode(b"open"), b"\x93"]
+        parts += [b"h\x01", _text_operand("w"), b"\x86R\x940"]
+        parts += [_short_binunicode(b"_io"), _short_binunicode(b"TextIOWrapper.write"), b"\x93"]
+        parts += [b"h\x02", _text_operand("owned-by-fspath"), b"\x86R0"]
+        parts += [_short_binunicode(b"_io"), _short_binunicode(b"TextIOWrapper.close"), b"\x93"]
+        parts += [b"h\x02", b"\x85R"]
+    else:
+        parts += [b"h\x01"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
 def _builtins_type_descriptor_set_name_payload(marker: Path, *, include_owner_class: bool) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
@@ -2267,6 +2293,31 @@ def test_scan_bytes_blocks_builtins_type_presentation_protocol_rce(
         assert marker.readlink() == Path(helper_arg or "")
     else:
         raise AssertionError(f"unexpected runtime effect: {runtime_effect}")
+
+
+def test_scan_bytes_blocks_builtins_type_fspath_protocol_file_write_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "builtins_type_fspath_protocol_rce_marker"
+    control_payload = _builtins_type_fspath_protocol_payload(marker, include_write=False)
+    payload = _builtins_type_fspath_protocol_payload(marker, include_write=True)
+
+    control_report = scan_bytes(control_payload, source="builtins-type-fspath-control.pkl")
+    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(control_report)
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "PathLikeString"
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="builtins-type-fspath-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.read_text() == "owned-by-fspath"
 
 
 def test_scan_bytes_blocks_builtins_type_descriptor_set_name_rce(tmp_path: Path) -> None:

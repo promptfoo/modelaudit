@@ -394,6 +394,7 @@ fn is_suspicious_magic_method(value: &str) -> bool {
             | "__exit__"
             | "__floor__"
             | "__format__"
+            | "__fspath__"
             | "__ge__"
             | "__getattribute__"
             | "__getattr__"
@@ -883,6 +884,7 @@ mod tests {
         assert!(suspicious_string_matches("__exit__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__floor__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__format__").contains(&"magic method".to_string()));
+        assert!(suspicious_string_matches("__fspath__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__ge__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__getitem__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__gt__").contains(&"magic method".to_string()));
