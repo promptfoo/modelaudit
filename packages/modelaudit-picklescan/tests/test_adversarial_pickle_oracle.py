@@ -885,6 +885,24 @@ def _builtins_type_contains_membership_payload(marker: Path, *, include_call: bo
     return b"".join(parts)
 
 
+def _builtins_type_setitem_assignment_payload(marker: Path, *, include_call: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
+    parts += [b"(", _text_operand("DerivedPath")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
+    parts += [b"\x85", b"}", _text_operand("__setitem__")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"s", b"tR\x940"]
+    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R\x940"]
+    if include_call:
+        parts += [_short_binunicode(b"operator"), _short_binunicode(b"setitem"), b"\x93"]
+        parts += [b"h\x01", b"M" + (0o666).to_bytes(2, "little"), b"\x88", b"\x87R"]
+    else:
+        parts += [b"h\x01"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
 def _builtins_staticmethod_descriptor_payload(marker: Path, *, include_call: bool) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"builtins"), _short_binunicode(b"staticmethod"), b"\x93"]
@@ -1753,6 +1771,31 @@ def test_scan_bytes_blocks_builtins_type_contains_membership_rce(tmp_path: Path)
     assert not marker.exists()
     result = pickle.loads(payload)
     assert result is False
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_builtins_type_setitem_assignment_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "builtins_type_setitem_assignment_rce_marker"
+    control_payload = _builtins_type_setitem_assignment_payload(marker, include_call=False)
+    payload = _builtins_type_setitem_assignment_payload(marker, include_call=True)
+
+    control_report = scan_bytes(control_payload, source="builtins-type-setitem-assignment-control.pkl")
+    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(control_report)
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "DerivedPath"
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="builtins-type-setitem-assignment-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
     assert marker.exists()
 
 

