@@ -9,9 +9,9 @@
 
 ## Why this package
 
-Pickle deserialization is the most common supply-chain attack vector in ML checkpoints, and existing Python-only scanners either unpickle the payload (unsafe), scan string literals only (imprecise), or fail open on large/malformed inputs (dangerous in CI). `modelaudit-picklescan` is built as a first-class security primitive:
+Pickle deserialization is the most common supply-chain attack vector in ML checkpoints, and existing Python-only scanners either unpickle the payload (unsafe), scan string literals only (imprecise), or fail open on large/malformed inputs (dangerous in CI). This package is a direct response:
 
-- **Rust scanner engine.** Opcode walker, string analyzer, and nested-payload decoder are all native code. Fast enough to run in pre-commit and CI without budget games.
+- **Rust scanner engine.** Opcode walker, string analyzer, and nested-payload decoder are all native code.
 - **Fail-closed semantics.** Every scan returns both a `status` (complete / inconclusive / error) and a `verdict` (clean / suspicious / malicious / unknown). Truncation, timeouts, budget exhaustion, and parser errors downgrade the verdict instead of silently returning clean.
 - **Bounded by construction.** Opcode count, wall-clock timeout, string-literal bytes, nested-payload bytes, and recursion depth are all configurable caps with safe defaults. A malicious producer cannot force unbounded memory or CPU.
 - **Zero Python runtime dependencies.** The wheel is self-contained — `pip install modelaudit-picklescan` and nothing else.

@@ -14,7 +14,7 @@
 
 ## Why ModelAudit
 
-Models download from untrusted registries, pass through CI, and end up running in production. Traditional SAST tools do not look at pickle opcodes, HDF5 group layouts, ONNX proto graphs, or TensorFlow SavedModel signatures — ModelAudit does. It is purpose-built to:
+Models download from untrusted registries, pass through CI, and end up running in production. Traditional SAST tools do not look at pickle opcodes, HDF5 group layouts, ONNX proto graphs, or TensorFlow SavedModel signatures — ModelAudit does:
 
 - **Scan statically.** No model is ever loaded, unpickled, or executed.
 - **Cover the formats you actually ship.** 40+ scanners spanning pickle, PyTorch, SafeTensors, ONNX, TensorFlow, Keras, GGUF, archives, and configs.

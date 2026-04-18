@@ -154,7 +154,7 @@ If `modelaudit` is published with a dependency on a `modelaudit-picklescan` vers
 2. Yank the affected `modelaudit` versions.
 3. Cut a new `modelaudit` patch release pointing at the now-resolvable sibling.
 
-This happened once (2026-04-17, `modelaudit` 0.2.38/0.2.39 with `modelaudit-picklescan` 0.1.2 never reaching PyPI) — see the [CHANGELOG](../../CHANGELOG.md) for the 0.2.40 recovery note.
+This happened once during the initial `modelaudit-picklescan` publish (resolved in `modelaudit` 0.2.40) — see the [CHANGELOG](../../CHANGELOG.md) for the recovery note.
 
 ### Release metadata / tagging incorrect
 

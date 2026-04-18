@@ -58,10 +58,10 @@ uv build --out-dir /tmp/modelaudit-picklescan-dist
 uvx twine check /tmp/modelaudit-picklescan-dist/*
 ```
 
-Dev with hot-reload (rebuilds the Rust extension into your current venv):
+Dev with hot-reload (rebuilds the Rust extension into your current venv), from this directory:
 
 ```bash
-maturin develop --release -m Cargo.toml
+maturin develop --release
 ```
 
 Root-level validation (`uv run ruff check modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/`) must also pass for any PR.
