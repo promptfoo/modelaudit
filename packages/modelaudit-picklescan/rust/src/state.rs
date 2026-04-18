@@ -2726,6 +2726,67 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_probe_and_process_state_pickles_are_dangerous_calls() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut pathlib_iterdir_payload =
+            b"\x80\x04cbuiltins\nlist\n(cpathlib\nPosixPath.iterdir\ncpathlib\nPosixPath\n"
+                .to_vec();
+        pathlib_iterdir_payload.extend_from_slice(&short_binunicode(b"/tmp/modelaudit-secret-dir"));
+        pathlib_iterdir_payload.extend_from_slice(b"\x85R\x85RtR.");
+
+        let cases = [
+            (
+                "pathlib-iterdir-list",
+                pathlib_iterdir_payload,
+                "pathlib.PosixPath.iterdir",
+            ),
+            (
+                "decimal-setcontext",
+                b"\x80\x04cdecimal\nsetcontext\ncdecimal\nContext\nK\x01\x85R\x85R.".to_vec(),
+                "decimal.setcontext",
+            ),
+            (
+                "gc-disable",
+                b"\x80\x04cgc\ndisable\n)R.".to_vec(),
+                "gc.disable",
+            ),
+        ];
+
+        for (label, payload, expected_reference) in cases {
+            let mut scan = ScanState::new(
+                format!("{label}.pkl"),
+                &payload,
+                &options,
+                Some(payload.len()),
+                0,
+                0,
+                None,
+            );
+
+            scan.run();
+
+            assert_eq!(scan.verdict, "malicious", "missed {label}");
+            let finding = scan
+                .findings
+                .iter()
+                .find(|finding| {
+                    finding.rule_code == Some("DANGEROUS_CALL")
+                        && detail_string(&finding.details, "import_reference").as_deref()
+                            == Some(expected_reference)
+                })
+                .unwrap_or_else(|| panic!("missing dangerous call finding for {label}"));
+            assert_eq!(finding.severity, "critical");
+        }
+    }
+
+    #[test]
     fn obj_dispatch_uses_first_mark_value_as_callable() {
         let options = ScanOptions {
             timeout_s: DEFAULT_TIMEOUT_S,
