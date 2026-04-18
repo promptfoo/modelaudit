@@ -377,6 +377,7 @@ fn is_suspicious_magic_method(value: &str) -> bool {
             | "__mro__"
             | "__base__"
             | "__bases__"
+            | "__abs__"
             | "__add__"
             | "__and__"
             | "__call__"
@@ -395,6 +396,7 @@ fn is_suspicious_magic_method(value: &str) -> bool {
             | "__imatmul__"
             | "__imod__"
             | "__imul__"
+            | "__invert__"
             | "__ior__"
             | "__ipow__"
             | "__irshift__"
@@ -408,7 +410,9 @@ fn is_suspicious_magic_method(value: &str) -> bool {
             | "__mod__"
             | "__mul__"
             | "__ne__"
+            | "__neg__"
             | "__or__"
+            | "__pos__"
             | "__pow__"
             | "__radd__"
             | "__rand__"
@@ -842,6 +846,7 @@ mod tests {
         assert!(
             suspicious_string_matches("__getnewargs_ex__").contains(&"magic method".to_string())
         );
+        assert!(suspicious_string_matches("__abs__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__add__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__and__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__contains__").contains(&"magic method".to_string()));
@@ -857,6 +862,7 @@ mod tests {
         assert!(suspicious_string_matches("__imatmul__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__imod__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__imul__").contains(&"magic method".to_string()));
+        assert!(suspicious_string_matches("__invert__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__ior__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__ipow__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__irshift__").contains(&"magic method".to_string()));
@@ -870,7 +876,9 @@ mod tests {
         assert!(suspicious_string_matches("__mod__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__mul__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__ne__").contains(&"magic method".to_string()));
+        assert!(suspicious_string_matches("__neg__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__or__").contains(&"magic method".to_string()));
+        assert!(suspicious_string_matches("__pos__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__pow__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__radd__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__rand__").contains(&"magic method".to_string()));
