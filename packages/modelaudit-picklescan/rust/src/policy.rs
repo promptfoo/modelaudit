@@ -195,6 +195,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("faulthandler", "_sigsegv"),
     ("faulthandler", "_stack_overflow"),
     ("functools", "reduce"),
+    ("itertools", "accumulate"),
     ("itertools", "dropwhile"),
     ("itertools", "filterfalse"),
     ("itertools", "groupby"),
@@ -286,6 +287,7 @@ mod tests {
         assert_eq!(global_severity("operator", "call"), Some("critical"));
         assert_eq!(global_severity("builtins", "filter"), Some("critical"));
         assert_eq!(global_severity("builtins", "map"), Some("critical"));
+        assert_eq!(global_severity("itertools", "accumulate"), Some("critical"));
         assert_eq!(global_severity("itertools", "dropwhile"), Some("critical"));
         assert_eq!(
             global_severity("itertools", "filterfalse"),

