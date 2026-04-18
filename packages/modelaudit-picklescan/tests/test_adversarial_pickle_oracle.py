@@ -312,6 +312,15 @@ def _has_critical_builtins_filter_finding(report: PickleReport) -> bool:
     )
 
 
+def _has_critical_itertools_dropwhile_finding(report: PickleReport) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "itertools"
+        and finding.details.get("name") == "dropwhile"
+        for finding in report.findings
+    )
+
+
 def _has_critical_itertools_starmap_finding(report: PickleReport) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -468,6 +477,22 @@ def _builtins_filter_tuple_payload(marker: Path) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"builtins"), _short_binunicode(b"tuple"), b"\x93"]
     parts += [_short_binunicode(b"builtins"), _short_binunicode(b"filter"), b"\x93"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"]"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(marker).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
+    parts += [b"tRa", b"\x86R", b"\x85R."]
+    return b"".join(parts)
+
+
+def _itertools_dropwhile_tuple_payload(marker: Path) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"tuple"), b"\x93"]
+    parts += [_short_binunicode(b"itertools"), _short_binunicode(b"dropwhile"), b"\x93"]
     parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
     parts += [b"]"]
     parts += [
@@ -664,6 +689,21 @@ def test_scan_bytes_blocks_builtins_filter_forced_iteration_rce(tmp_path: Path) 
     assert not marker.exists()
     result = pickle.loads(payload)
     assert result == ()
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_itertools_dropwhile_forced_iteration_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "itertools_dropwhile_tuple_rce_marker"
+    payload = _itertools_dropwhile_tuple_payload(marker)
+
+    report = scan_bytes(payload, source="itertools-dropwhile-tuple-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_itertools_dropwhile_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result == (marker,)
     assert marker.exists()
 
 
