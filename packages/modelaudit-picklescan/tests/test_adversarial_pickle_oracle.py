@@ -457,6 +457,15 @@ def _has_critical_contextlib_exitstack_finding(report: PickleReport, name: str) 
     )
 
 
+def _has_critical_unittest_mock_finding(report: PickleReport, name: str) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "unittest.mock"
+        and finding.details.get("name") == name
+        for finding in report.findings
+    )
+
+
 def _atexit_register_payload(marker: Path) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"atexit"), _short_binunicode(b"register"), b"\x93"]
@@ -517,6 +526,22 @@ def _contextlib_exitstack_close_payload(marker: Path) -> bytes:
     parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
     parts += [b"tR", b"tR0"]
     parts += [_short_binunicode(b"contextlib"), _short_binunicode(b"ExitStack.close"), b"\x93h\x00\x85R."]
+    return b"".join(parts)
+
+
+def _unittest_mock_side_effect_payload(marker: Path, class_name: bytes = b"Mock") -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"unittest.mock"), _short_binunicode(class_name), b"\x93("]
+    parts += [b"N"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"tR\x94h\x00"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(marker).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
+    parts += [b"tR", b"\x85R."]
     return b"".join(parts)
 
 
@@ -833,6 +858,21 @@ def test_scan_bytes_blocks_contextlib_exitstack_cleanup_callback_rce(tmp_path: P
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_contextlib_exitstack_finding(report, "ExitStack.callback")
     assert _has_critical_contextlib_exitstack_finding(report, "ExitStack.close")
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_unittest_mock_side_effect_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "unittest_mock_side_effect_rce_marker"
+    payload = _unittest_mock_side_effect_payload(marker)
+
+    report = scan_bytes(payload, source="unittest-mock-side-effect-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_unittest_mock_finding(report, "Mock")
 
     assert not marker.exists()
     result = pickle.loads(payload)

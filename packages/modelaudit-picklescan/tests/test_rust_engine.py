@@ -179,6 +179,8 @@ def test_rust_parser_declares_all_pickletools_opcodes() -> None:
         ("torch", "load"),
         ("typing", "_eval_type"),
         ("typing", "get_type_hints"),
+        ("unittest.mock", "MagicMock"),
+        ("unittest.mock", "Mock"),
         ("uuid", "_ip_getnode"),
         ("weakref", "finalize"),
     ],

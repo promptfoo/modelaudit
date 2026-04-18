@@ -258,6 +258,8 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("types", "FunctionType"),
     ("typing", "_eval_type"),
     ("typing", "get_type_hints"),
+    ("unittest.mock", "MagicMock"),
+    ("unittest.mock", "Mock"),
     ("uuid", "_arp_getnode"),
     ("uuid", "_get_command_stdout"),
     ("uuid", "_ifconfig_getnode"),
@@ -308,6 +310,11 @@ mod tests {
         assert_eq!(global_severity("typing", "_eval_type"), Some("critical"));
         assert_eq!(
             global_severity("typing", "get_type_hints"),
+            Some("critical")
+        );
+        assert_eq!(global_severity("unittest.mock", "Mock"), Some("critical"));
+        assert_eq!(
+            global_severity("unittest.mock", "MagicMock"),
             Some("critical")
         );
         assert_eq!(
