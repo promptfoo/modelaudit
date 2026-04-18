@@ -381,8 +381,13 @@ fn is_suspicious_magic_method(value: &str) -> bool {
             | "__contains__"
             | "__del__"
             | "__eq__"
+            | "__ge__"
             | "__getattribute__"
             | "__getattr__"
+            | "__gt__"
+            | "__le__"
+            | "__lt__"
+            | "__ne__"
             | "__setitem__"
             | "__setattr__"
             | "__delattr__"
@@ -802,6 +807,11 @@ mod tests {
         assert!(suspicious_string_matches("__contains__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__del__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__eq__").contains(&"magic method".to_string()));
+        assert!(suspicious_string_matches("__ge__").contains(&"magic method".to_string()));
+        assert!(suspicious_string_matches("__gt__").contains(&"magic method".to_string()));
+        assert!(suspicious_string_matches("__le__").contains(&"magic method".to_string()));
+        assert!(suspicious_string_matches("__lt__").contains(&"magic method".to_string()));
+        assert!(suspicious_string_matches("__ne__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__setitem__").contains(&"magic method".to_string()));
         assert!(!suspicious_string_matches("__1__").contains(&"magic method".to_string()));
         assert!(!suspicious_string_matches("__a__").contains(&"magic method".to_string()));

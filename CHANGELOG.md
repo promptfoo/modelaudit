@@ -107,6 +107,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attacker-controlled methods when pickle-built objects are dropped
 - **security:** detect `__eq__` rich-comparison string seeds that can execute
   attacker-controlled methods during equality checks
+- **security:** detect `__lt__`, `__le__`, `__gt__`, `__ge__`, and `__ne__`
+  rich-comparison string seeds that can execute attacker-controlled methods
+  during ordering checks
 - **security:** detect `__contains__` membership string seeds that can execute
   attacker-controlled methods during containment checks
 - **security:** detect `__setitem__` item-assignment string seeds that can
