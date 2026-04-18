@@ -227,6 +227,9 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("pkgutil", "resolve_name"),
     ("pkgutil", "walk_packages"),
     ("resource", "setrlimit"),
+    ("sched", "scheduler.enter"),
+    ("sched", "scheduler.enterabs"),
+    ("sched", "scheduler.run"),
     ("setuptools._distutils.spawn", "spawn"),
     ("site", "main"),
     ("tarfile", "open"),
@@ -309,6 +312,15 @@ mod tests {
             Some("critical")
         );
         assert_eq!(global_severity("weakref", "finalize"), Some("critical"));
+        assert_eq!(
+            global_severity("sched", "scheduler.enter"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("sched", "scheduler.enterabs"),
+            Some("critical")
+        );
+        assert_eq!(global_severity("sched", "scheduler.run"), Some("critical"));
         assert_eq!(
             global_severity("dataclasses", "_create_fn"),
             Some("critical")

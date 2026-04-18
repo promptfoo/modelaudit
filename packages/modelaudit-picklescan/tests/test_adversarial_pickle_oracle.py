@@ -439,6 +439,15 @@ def _has_critical_weakref_finalize_finding(report: PickleReport) -> bool:
     )
 
 
+def _has_critical_sched_scheduler_finding(report: PickleReport, name: str) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "sched"
+        and finding.details.get("name") == name
+        for finding in report.findings
+    )
+
+
 def _atexit_register_payload(marker: Path) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"atexit"), _short_binunicode(b"register"), b"\x93"]
@@ -465,6 +474,23 @@ def _weakref_finalize_payload(marker: Path) -> bytes:
     ]
     parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
     parts += [b"tR", b"\x87R."]
+    return b"".join(parts)
+
+
+def _sched_scheduler_run_payload(marker: Path) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"sched"), _short_binunicode(b"scheduler"), b"\x93)R\x94"]
+    parts += [_short_binunicode(b"sched"), _short_binunicode(b"scheduler.enter"), b"\x93("]
+    parts += [b"h\x00", b"K\x00", b"K\x00"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(marker).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
+    parts += [b"tR", b"\x85", b"tR0"]
+    parts += [_short_binunicode(b"sched"), _short_binunicode(b"scheduler.run"), b"\x93h\x00\x85R."]
     return b"".join(parts)
 
 
@@ -753,6 +779,22 @@ def test_scan_bytes_blocks_weakref_finalize_reclaim_callback_rce(tmp_path: Path)
     assert type(result).__module__ == "weakref"
     assert type(result).__name__ == "finalize"
     assert not result.alive
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_sched_scheduler_queued_callback_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "sched_scheduler_queued_callback_rce_marker"
+    payload = _sched_scheduler_run_payload(marker)
+
+    report = scan_bytes(payload, source="sched-scheduler-run-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_sched_scheduler_finding(report, "scheduler.enter")
+    assert _has_critical_sched_scheduler_finding(report, "scheduler.run")
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
     assert marker.exists()
 
 
