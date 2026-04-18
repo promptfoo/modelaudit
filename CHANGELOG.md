@@ -139,6 +139,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pathlib.Path.write_text`, `io.open`, and `_io.FileIO`
 - **security:** detect pickle calls to logging file handlers and emit/handle
   dispatch methods that can write attacker-controlled startup hooks
+- **security:** detect pickle calls to `codecs.open` and codec stream writes
+  that can write attacker-controlled startup hooks
 - **security:** detect `builtins.staticmethod` pickle call targets that can
   synthesize callable descriptors for later invocation
 - **security:** detect `builtins.property.__get__` pickle call targets that

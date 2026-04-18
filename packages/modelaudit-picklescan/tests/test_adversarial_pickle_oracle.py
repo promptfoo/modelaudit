@@ -911,6 +911,37 @@ def _logging_file_handler_pth_payload(pth_path: Path, marker: Path) -> bytes:
     return b"".join(parts)
 
 
+def _codecs_open_write_payload(marker: Path, *, include_write: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"codecs"), _short_binunicode(b"open"), b"\x93"]
+    parts += [_text_operand(str(marker)), _text_operand("w"), _text_operand("utf-8"), b"\x87R\x94"]
+    if include_write:
+        parts += [_short_binunicode(b"codecs"), _short_binunicode(b"StreamReaderWriter.write"), b"\x93"]
+        parts += [b"h\x00", _text_operand("owned-by-codecs-open"), b"\x86R"]
+    else:
+        parts += [b"h\x00"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _codecs_open_pth_payload(pth_path: Path, marker: Path) -> bytes:
+    fragments = [
+        "im",
+        "port pathlib;pathlib.Path(",
+        repr(str(marker)),
+        ").write_text('owned-by-codecs-pth')\n",
+    ]
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"codecs"), _short_binunicode(b"open"), b"\x93"]
+    parts += [_text_operand(str(pth_path)), _text_operand("w"), _text_operand("utf-8"), b"\x87R\x94"]
+    for fragment in fragments[:-1]:
+        parts += [_short_binunicode(b"codecs"), _short_binunicode(b"StreamReaderWriter.write"), b"\x93"]
+        parts += [b"h\x00", _text_operand(fragment), b"\x86R0"]
+    parts += [_short_binunicode(b"codecs"), _short_binunicode(b"StreamReaderWriter.write"), b"\x93"]
+    parts += [b"h\x00", _text_operand(fragments[-1]), b"\x86R."]
+    return b"".join(parts)
+
+
 def _inspect_getmembers_property_payload(marker: Path, *, include_call: bool) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
@@ -2240,6 +2271,64 @@ def test_scan_bytes_blocks_logging_file_handler_fragmented_pth_rce(tmp_path: Pat
 
         site.addsitedir(str(tmp_path))
         assert marker.read_text() == "owned-by-logging-pth"
+    finally:
+        sys.path[:] = original_sys_path
+
+
+def test_scan_bytes_blocks_codecs_open_write_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "codecs_open_write_rce_marker"
+    control_payload = _codecs_open_write_payload(marker, include_write=False)
+    payload = _codecs_open_write_payload(marker, include_write=True)
+
+    control_report = scan_bytes(control_payload, source="codecs-open-control.pkl")
+    assert control_report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_global_finding(control_report, "codecs", "open")
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    try:
+        assert type(control_result).__name__ == "StreamReaderWriter"
+        assert marker.read_text() == ""
+    finally:
+        control_result.close()
+    marker.unlink()
+
+    report = scan_bytes(payload, source="codecs-open-write-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_global_finding(report, "codecs", "open")
+    assert _has_critical_global_finding(report, "codecs", "StreamReaderWriter.write")
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.read_text() == "owned-by-codecs-open"
+
+
+def test_scan_bytes_blocks_codecs_open_fragmented_pth_rce(tmp_path: Path) -> None:
+    pth_path = tmp_path / "codecs_open_exec.pth"
+    marker = tmp_path / "codecs_open_pth_rce_marker"
+    payload = _codecs_open_pth_payload(pth_path, marker)
+    original_sys_path = list(sys.path)
+
+    try:
+        report = scan_bytes(payload, source="codecs-open-pth-rce.pkl")
+
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_global_finding(report, "codecs", "open")
+        assert _has_critical_global_finding(report, "codecs", "StreamReaderWriter.write")
+
+        assert not pth_path.exists()
+        assert not marker.exists()
+        result = pickle.loads(payload)
+        assert result is None
+        assert pth_path.read_text() == (
+            f"import pathlib;pathlib.Path({str(marker)!r}).write_text('owned-by-codecs-pth')\n"
+        )
+        assert not marker.exists()
+
+        site.addsitedir(str(tmp_path))
+        assert marker.read_text() == "owned-by-codecs-pth"
     finally:
         sys.path[:] = original_sys_path
 

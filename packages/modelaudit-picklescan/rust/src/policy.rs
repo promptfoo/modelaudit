@@ -188,8 +188,10 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("base64", "b64decode"),
     ("base64", "b64encode"),
     ("base64", "decode"),
+    ("codecs", "StreamReaderWriter.write"),
     ("codecs", "decode"),
     ("codecs", "encode"),
+    ("codecs", "open"),
     ("collections", "eval"),
     ("concurrent.futures", "ProcessPoolExecutor.map"),
     ("concurrent.futures", "ProcessPoolExecutor.shutdown"),
@@ -368,6 +370,11 @@ mod tests {
             global_severity("builtins", "classmethod.__get__"),
             Some("critical")
         );
+        assert_eq!(
+            global_severity("codecs", "StreamReaderWriter.write"),
+            Some("critical")
+        );
+        assert_eq!(global_severity("codecs", "open"), Some("critical"));
         assert_eq!(global_severity("_functools", "partial"), Some("critical"));
         assert_eq!(global_severity("_functools", "reduce"), Some("critical"));
         for name in ["FileIO", "FileIO.write", "TextIOWrapper.write", "open"] {
