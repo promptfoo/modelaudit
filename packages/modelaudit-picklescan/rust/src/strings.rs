@@ -402,6 +402,7 @@ fn is_suspicious_magic_method(value: &str) -> bool {
             | "__imatmul__"
             | "__imod__"
             | "__imul__"
+            | "__index__"
             | "__invert__"
             | "__ior__"
             | "__ipow__"
@@ -439,6 +440,7 @@ fn is_suspicious_magic_method(value: &str) -> bool {
             | "__rxor__"
             | "__setitem__"
             | "__setattr__"
+            | "__set_name__"
             | "__sub__"
             | "__trunc__"
             | "__truediv__"
@@ -879,6 +881,7 @@ mod tests {
         assert!(suspicious_string_matches("__imatmul__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__imod__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__imul__").contains(&"magic method".to_string()));
+        assert!(suspicious_string_matches("__index__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__invert__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__ior__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__ipow__").contains(&"magic method".to_string()));
@@ -915,6 +918,7 @@ mod tests {
         assert!(suspicious_string_matches("__rtruediv__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__rxor__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__setitem__").contains(&"magic method".to_string()));
+        assert!(suspicious_string_matches("__set_name__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__sub__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__trunc__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__truediv__").contains(&"magic method".to_string()));

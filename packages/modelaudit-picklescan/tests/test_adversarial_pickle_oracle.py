@@ -1037,6 +1037,29 @@ def _builtins_type_rounding_protocol_payload(
     return b"".join(parts)
 
 
+def _builtins_type_descriptor_set_name_payload(marker: Path, *, include_owner_class: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
+    parts += [b"(", _text_operand("DescriptorPath")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
+    parts += [b"\x85", b"}", _text_operand("__set_name__")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"s", b"tR\x940"]
+    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R\x940"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
+    parts += [b"(", _text_operand("Meta")]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
+    parts += [b"\x85", b"}", _text_operand("__index__")]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"object.__sizeof__"), b"\x93"]
+    parts += [b"s", b"tR\x940"]
+    if include_owner_class:
+        parts += [b"h\x02", b"(", _text_operand("Owner"), b")", b"}", _text_operand("x"), b"h\x01", b"s", b"tR"]
+    else:
+        parts += [b"h\x01"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
 def _builtins_type_contains_membership_payload(marker: Path, *, include_call: bool) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
@@ -1776,7 +1799,8 @@ def test_scan_bytes_blocks_functools_cached_property_get_descriptor_rce(tmp_path
     payload = _functools_cached_property_get_payload(marker, include_call=True)
 
     control_report = scan_bytes(control_payload, source="functools-cached-property-get-control.pkl")
-    assert control_report.verdict == SafetyVerdict.CLEAN
+    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(control_report)
 
     assert not marker.exists()
     control_result = pickle.loads(control_payload)
@@ -2095,6 +2119,32 @@ def test_scan_bytes_blocks_builtins_type_rounding_protocol_rce(
     assert not marker.exists()
     result = pickle.loads(payload)
     assert result is None
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_builtins_type_descriptor_set_name_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "builtins_type_descriptor_set_name_rce_marker"
+    control_payload = _builtins_type_descriptor_set_name_payload(marker, include_owner_class=False)
+    payload = _builtins_type_descriptor_set_name_payload(marker, include_owner_class=True)
+
+    control_report = scan_bytes(control_payload, source="builtins-type-descriptor-set-name-control.pkl")
+    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(control_report)
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "DescriptorPath"
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="builtins-type-descriptor-set-name-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert type(result).__name__ == "Meta"
+    assert result.__name__ == "Owner"
     assert marker.exists()
 
 

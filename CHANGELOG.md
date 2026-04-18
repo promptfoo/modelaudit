@@ -129,6 +129,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attacker-controlled methods during builtin iteration dispatch
 - **security:** detect numeric rounding protocol dunder string seeds that can
   execute attacker-controlled methods during rounding helper dispatch
+- **security:** detect descriptor setup and numeric coercion dunder string
+  seeds that can execute attacker-controlled methods during class creation
 - **security:** detect `builtins.staticmethod` pickle call targets that can
   synthesize callable descriptors for later invocation
 - **security:** detect `builtins.property.__get__` pickle call targets that

