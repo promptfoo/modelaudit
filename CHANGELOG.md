@@ -114,6 +114,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attacker-controlled methods during containment checks
 - **security:** detect `__setitem__` item-assignment string seeds that can
   execute attacker-controlled methods during item mutation
+- **security:** detect `__getitem__` and `__delitem__` item-protocol string
+  seeds that can execute attacker-controlled methods during item access
 - **security:** detect `builtins.staticmethod` pickle call targets that can
   synthesize callable descriptors for later invocation
 - **security:** detect `builtins.property.__get__` pickle call targets that
