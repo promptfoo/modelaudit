@@ -4,7 +4,7 @@ This repo is a monorepo with **two independently versioned PyPI packages**:
 
 | PyPI name               | Path                              | Version source                  | Git tag format                   |
 | ----------------------- | --------------------------------- | ------------------------------- | -------------------------------- |
-| `modelaudit`            | `./` (root)                       | `pyproject.toml` + `uv.lock`    | `v{X.Y.Z}` (e.g. `v0.2.40`)      |
+| `modelaudit`            | `./` (root)                       | `pyproject.toml` + `uv.lock`    | `v{X.Y.Z}`                       |
 | `modelaudit-picklescan` | `packages/modelaudit-picklescan/` | `pyproject.toml` + `Cargo.toml` | `modelaudit-picklescan-v{X.Y.Z}` |
 
 Both packages are driven by a single [release-please](https://github.com/googleapis/release-please) workflow (`.github/workflows/release-please.yml`) with two components declared in `release-please-config.json` and current versions pinned in `.release-please-manifest.json`.
@@ -15,17 +15,17 @@ The root `modelaudit` wheel declares a **hard dependency** on `modelaudit-pickle
 
 1. **Write Conventional Commits** — `feat:`, `fix:`, `docs:`, etc. Release-please uses these to compute the next version and the changelog entry.
 2. **Merge to `main`** — release-please creates or updates a "Release PR" per changed component. Commits that only touch `packages/modelaudit-picklescan/` feed the picklescan component; everything else feeds the root component.
-3. **Review and merge the Release PR** — release-please tags the release (`v0.2.40` / `modelaudit-picklescan-v0.1.3`) and the workflow:
-   - **For `modelaudit`** — `build` job produces sdist+wheel → `publish-pypi` uploads via OIDC → `provenance` attests and uploads SBOM.
+3. **Review and merge the Release PR** — release-please tags the release and the workflow runs the matching publish jobs:
+   - **For `modelaudit`** — `build` produces sdist+wheel → `publish-pypi` uploads via OIDC → `provenance` attests and uploads SBOM.
    - **For `modelaudit-picklescan`** — `build-picklescan-package` matrix builds 5 native wheels (Linux x86_64, Linux aarch64, macOS arm64, macOS x86_64, Windows x64) + sdist → `publish-picklescan-pypi` uploads → `picklescan-provenance` attests.
 
 ## Version scheme (0ver)
 
 Both packages follow [0ver](https://0ver.org/) — we stay in `0.x.y` indefinitely:
 
-- `fix:` commits bump **patch** (0.2.39 → 0.2.40)
+- `fix:` commits bump **patch**
 - `feat:` commits bump **patch**
-- `feat!:` or `BREAKING CHANGE:` bumps **minor** (0.2.39 → 0.3.0)
+- `feat!:` or `BREAKING CHANGE:` bumps **minor**
 
 The two components bump independently: a picklescan-only `fix:` bumps only `modelaudit-picklescan`.
 
@@ -47,38 +47,28 @@ The release-please workflow accepts inputs to re-run the publish step for an alr
 - You need to re-publish an existing version to a package that was registered on PyPI after the fact.
 
 ```bash
-# Re-publish modelaudit 0.2.40
-gh workflow run release-please.yml -f root_version=0.2.40
+# Re-publish modelaudit at an already-tagged version
+gh workflow run release-please.yml -f root_version=<X.Y.Z>
 
-# Re-publish modelaudit-picklescan 0.1.2
-gh workflow run release-please.yml -f picklescan_version=0.1.2
+# Re-publish modelaudit-picklescan at an already-tagged version
+gh workflow run release-please.yml -f picklescan_version=<X.Y.Z>
 ```
 
-The workflow’s `Resolve manual release inputs` step flips `manual_release=true`, skips the release-please action, ensures the GitHub release exists (creating it if not), then feeds `release_created=true` / `picklescan_release_created=true` into the publish jobs. `uv build` always reads from `pyproject.toml` at the current `HEAD`, so the tagged commit must already contain the target version; dispatching `root_version=0.2.41` at a HEAD still on `0.2.40` will fail the PyPI upload (`400 File already exists` at best).
+The workflow's `Resolve manual release inputs` step flips `manual_release=true`, skips the release-please action, ensures the GitHub release exists (creating it if not), then feeds `release_created=true` / `picklescan_release_created=true` into the publish jobs. `uv build` always reads from `pyproject.toml` at the current `HEAD`, so the tagged commit must already contain the target version; dispatching a version that does not match what's in `HEAD` will fail the PyPI upload.
 
 ## PyPI trusted publishing (first-time setup)
 
-Both packages publish via PyPI [Trusted Publishing](https://docs.pypi.org/trusted-publishers/). The `publish-pypi` and `publish-picklescan-pypi` jobs both use environment `pypi` and `id-token: write` permissions. PyPI is configured with:
-
-- An **active trusted publisher** on each existing project (`modelaudit`, `modelaudit-picklescan`).
-- Config: owner `promptfoo`, repository `modelaudit`, workflow `release-please.yml`, environment `pypi`.
+Both packages publish via PyPI [Trusted Publishing](https://docs.pypi.org/trusted-publishers/). The `publish-pypi` and `publish-picklescan-pypi` jobs both use environment `pypi` and `id-token: write` permissions. PyPI is configured with an **active trusted publisher** on each project, scoped to owner `promptfoo`, repository `modelaudit`, workflow `release-please.yml`, environment `pypi`.
 
 ### Adding a new PyPI package
 
-When you introduce a third PyPI package in this repo, you must register a **pending trusted publisher** on PyPI _before_ the first publish attempt, or the workflow will fail with:
-
-```
-400 Bad Request — Non-user identities cannot create new projects.
-This was probably caused by successfully using a pending publisher but specifying the [wrong project name]...
-```
+When you introduce a new PyPI package in this repo, register a **pending trusted publisher** on PyPI _before_ the first publish attempt, or the workflow will fail with `400 Non-user identities cannot create new projects`.
 
 Steps:
 
 1. Log in to PyPI → Your account → Publishing → **Add a new pending publisher**.
 2. Fields: PyPI Project Name (hyphenated — PyPI normalizes), Owner (`promptfoo`), Repository (`modelaudit`), Workflow filename (`release-please.yml`), Environment (`pypi`).
 3. The pending publisher is automatically promoted to an active one after the first successful publish.
-
-This has already been done for `modelaudit` and `modelaudit-picklescan` as of `modelaudit-picklescan` 0.1.2 (2026-04-17).
 
 ## Commit conventions
 
@@ -115,7 +105,7 @@ Before merging a Release PR:
    # modelaudit
    curl -s https://pypi.org/pypi/modelaudit/json | jq .info.version
 
-   # modelaudit-picklescan (check simple index to see yanks)
+   # modelaudit-picklescan (simple index surfaces yank flags)
    curl -sH "Accept: application/vnd.pypi.simple.v1+json" \
      https://pypi.org/simple/modelaudit-picklescan/ | jq '.files[-1].filename'
    ```
@@ -148,13 +138,11 @@ Use the least disruptive path.
 
 ### Broken monorepo version coupling
 
-If `modelaudit` is published with a dependency on a `modelaudit-picklescan` version that does not exist on PyPI, **every dependent `modelaudit` release is unusable** — pip will either silently downgrade to an older `modelaudit` or fail resolution. Recovery:
+If `modelaudit` is published with a dependency on a `modelaudit-picklescan` version that is not on PyPI, **every dependent `modelaudit` release is unusable** — pip will either silently downgrade to an older `modelaudit` or fail resolution. Recovery:
 
-1. Publish the missing `modelaudit-picklescan` version first (via manual recovery path).
+1. Publish the missing `modelaudit-picklescan` version first (via the manual recovery path above).
 2. Yank the affected `modelaudit` versions.
 3. Cut a new `modelaudit` patch release pointing at the now-resolvable sibling.
-
-This happened once during the initial `modelaudit-picklescan` publish (resolved in `modelaudit` 0.2.40) — see the [CHANGELOG](../../CHANGELOG.md) for the recovery note.
 
 ### Release metadata / tagging incorrect
 
