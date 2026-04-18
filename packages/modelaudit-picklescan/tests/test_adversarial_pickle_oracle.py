@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import pickle
+import shlex
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from importlib.util import find_spec
+from pathlib import Path
 
 import pytest
 
@@ -281,6 +283,15 @@ def _has_critical_subprocess_run_finding(report: PickleReport) -> bool:
     )
 
 
+def _has_critical_mailcap_findmatch_finding(report: PickleReport) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "mailcap"
+        and finding.details.get("name") == "findmatch"
+        for finding in report.findings
+    )
+
+
 def test_adversarial_oracle_corpus_is_large_enough() -> None:
     assert len(ADVERSARIAL_CASES) >= 300
 
@@ -300,3 +311,36 @@ def test_scan_bytes_matches_cpython_oracle_for_adversarial_stack_global(
         assert scanner_reports_subprocess_run, case.name
     else:
         assert not scanner_reports_subprocess_run, case.name
+
+
+def test_scan_bytes_blocks_mailcap_findmatch_test_command_rce(tmp_path: Path) -> None:
+    if find_spec("mailcap") is None:
+        pytest.skip("mailcap was removed in Python 3.13")
+
+    import mailcap
+
+    marker = tmp_path / "mailcap_findmatch_rce_marker"
+    safe_input = tmp_path / "safe_input"
+
+    class MailcapFindmatchRce:
+        def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+            caps = {
+                "text/plain": [
+                    {
+                        "view": "cat %s",
+                        "test": f"touch {shlex.quote(str(marker))}",
+                    }
+                ]
+            }
+            return (mailcap.findmatch, (caps, "text/plain", "view", str(safe_input), []))
+
+    payload = pickle.dumps(MailcapFindmatchRce(), protocol=4)
+
+    report = scan_bytes(payload, source="mailcap-findmatch-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_mailcap_findmatch_finding(report)
+
+    assert not marker.exists()
+    pickle.loads(payload)
+    assert marker.exists()

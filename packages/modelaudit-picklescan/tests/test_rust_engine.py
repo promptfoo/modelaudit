@@ -152,6 +152,7 @@ def test_rust_parser_declares_all_pickletools_opcodes() -> None:
         ("socket", "socket"),
         ("ctypes", "CDLL"),
         ("pickle", "loads"),
+        ("mailcap", "findmatch"),
         ("numpy", "load"),
         ("torch", "load"),
         ("uuid", "_ip_getnode"),

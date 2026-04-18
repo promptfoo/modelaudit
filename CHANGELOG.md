@@ -66,6 +66,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **security:** detect `mailcap.findmatch` pickle call targets that can execute
+  attacker-controlled mailcap `test` commands on Python versions that still
+  provide `mailcap`
 - **cli:** add scanner selection with `--scanners`, `--exclude-scanner`, and `--list-scanners` wired into core routing, nested dispatch, remote prefilters, and scan metadata; selection-suppressed preferred scanners emit a stderr warning and populate `scanner_selection.suppressed_preferred_scanner_ids`, and unknown scanner names suggest the closest match
 - **pickle:** replace the standalone pickle scanner's package-engine selector with the Rust-only runtime and explicit native-extension errors
 - **pickle:** scan PyTorch ZIP checkpoint pickle members directly in the standalone pickle scanner

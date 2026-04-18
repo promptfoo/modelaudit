@@ -197,6 +197,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("logging.config", "dictConfig"),
     ("logging.config", "fileConfig"),
     ("logging.config", "listen"),
+    ("mailcap", "findmatch"),
     ("numpy", "load"),
     ("numpy.f2py.crackfortran", "getlincoef"),
     ("numpy.testing._private.utils", "runstring"),
@@ -259,6 +260,7 @@ mod tests {
     #[test]
     fn dangerous_global_lookup_uses_sorted_table() {
         assert_eq!(global_severity("joblib", "load"), Some("critical"));
+        assert_eq!(global_severity("mailcap", "findmatch"), Some("critical"));
         assert_eq!(
             global_severity("copyreg", "add_extension"),
             Some("critical")
