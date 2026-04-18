@@ -2741,11 +2741,28 @@ mod tests {
         pathlib_iterdir_payload.extend_from_slice(&short_binunicode(b"/tmp/modelaudit-secret-dir"));
         pathlib_iterdir_payload.extend_from_slice(b"\x85R\x85RtR.");
 
+        let mut pathlib_local_iterdir_payload =
+            b"\x80\x04cbuiltins\nlist\n(cpathlib._local\nPosixPath.iterdir\ncpathlib._local\nPosixPath\n"
+                .to_vec();
+        pathlib_local_iterdir_payload
+            .extend_from_slice(&short_binunicode(b"/tmp/modelaudit-secret-dir"));
+        pathlib_local_iterdir_payload.extend_from_slice(b"\x85R\x85RtR.");
+
         let cases = [
             (
                 "pathlib-iterdir-list",
                 pathlib_iterdir_payload,
                 "pathlib.PosixPath.iterdir",
+            ),
+            (
+                "pathlib-local-iterdir-list",
+                pathlib_local_iterdir_payload,
+                "pathlib._local.PosixPath.iterdir",
+            ),
+            (
+                "pathlib-local-read-text",
+                b"\x80\x04cpathlib._local\nPosixPath.read_text\n)R.".to_vec(),
+                "pathlib._local.PosixPath.read_text",
             ),
             (
                 "decimal-setcontext",

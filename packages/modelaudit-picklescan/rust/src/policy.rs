@@ -60,7 +60,7 @@ fn dangerous_global_is_listed(module: &str, name: &str) -> bool {
 }
 
 fn dangerous_pathlib_method_is_listed(module: &str, name: &str) -> bool {
-    if module != "pathlib" {
+    if !PATHLIB_MODULES.contains(&module) {
         return false;
     }
     let Some((path_class, method)) = name.rsplit_once('.') else {
@@ -122,6 +122,7 @@ const BUILTIN_DANGEROUS_NAMES: &[&str] = &[
     "setattr",
     "vars",
 ];
+const PATHLIB_MODULES: &[&str] = &["pathlib", "pathlib._local"];
 const PATHLIB_CONCRETE_PATH_CLASSES: &[&str] = &["Path", "PosixPath", "WindowsPath"];
 const PATHLIB_FILESYSTEM_ACCESS_METHODS: &[&str] = &[
     "chmod",
@@ -487,6 +488,14 @@ mod tests {
             global_severity("pathlib", "PosixPath.iterdir"),
             Some("critical")
         );
+        assert_eq!(
+            global_severity("pathlib._local", "PosixPath.iterdir"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("pathlib._local", "PosixPath.read_text"),
+            Some("critical")
+        );
         assert_eq!(global_severity("pathlib", "Path.glob"), Some("critical"));
         assert_eq!(global_severity("pathlib", "Path.rglob"), Some("critical"));
         assert_eq!(global_severity("pathlib", "Path.stat"), Some("critical"));
@@ -505,6 +514,10 @@ mod tests {
         assert_eq!(global_severity("pathlib", "PosixPath"), None);
         assert_eq!(global_severity("pathlib", "PurePosixPath.touch"), None);
         assert_eq!(global_severity("pathlib", "PosixPath.as_posix"), None);
+        assert_eq!(
+            global_severity("pathlib._local", "PosixPath.as_posix"),
+            None
+        );
         assert_eq!(global_severity("pathlib.extra", "PosixPath.touch"), None);
     }
 }

@@ -1990,6 +1990,29 @@ def test_scan_bytes_detects_pathlib_read_bytes_dotted_method_reduce(tmp_path: Pa
     assert pickle.loads(payload) == b"\x00modelaudit-secret-8\xff"
 
 
+@pytest.mark.parametrize(
+    "expected_reference",
+    [
+        "pathlib._local.PosixPath.iterdir",
+        "pathlib._local.PosixPath.read_text",
+    ],
+)
+def test_scan_bytes_detects_python313_pathlib_local_dotted_method_reduce(expected_reference: str) -> None:
+    method_name = expected_reference.removeprefix("pathlib._local.")
+    payload = b"\x80\x04cpathlib._local\n" + method_name.encode("ascii") + b"\n)R."
+
+    report = scan_bytes(payload, source=f"{expected_reference}-local-method.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == expected_reference
+        for finding in report.findings
+    )
+
+
 def test_scan_bytes_allows_benign_pathlib_path_constructor() -> None:
     class_name = _concrete_pathlib_class_name()
     payload = b"\x80\x04" + f"cpathlib\n{class_name}\n".encode("ascii") + _binunicode(b"model.bin") + b"\x85R."
