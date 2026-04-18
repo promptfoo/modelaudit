@@ -719,6 +719,42 @@ def _unittest_loader_discover_payload(
     return b"".join(parts)
 
 
+def _unittest_mock_patch_start_payload(
+    module_path: Path,
+    marker: Path,
+    *,
+    include_start: bool,
+) -> bytes:
+    content_fragments = [
+        "im",
+        "port pathlib; pathlib.Path(",
+        repr(str(marker)),
+        ").touch()\nsomeattr = 1\n",
+    ]
+
+    parts = [b"\x80\x04"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(module_path).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_text_operand(part) for part in module_path.parts)
+    parts += [b"tR\x940"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"str.join"), b"\x93("]
+    parts += [_short_binunicode(b""), b"("]
+    parts.extend(_text_operand(fragment) for fragment in content_fragments)
+    parts += [b"ttR\x940"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.write_text"), b"\x93("]
+    parts += [b"h\x00", b"h\x01", b"tR"]
+    if include_start:
+        target = f"{module_path.stem}.someattr"
+        parts += [b"0", _short_binunicode(b"unittest.mock"), _short_binunicode(b"patch"), b"\x93("]
+        parts += [_text_operand(target), b"K\x02", b"tR\x940"]
+        parts += [_short_binunicode(b"unittest.mock"), _short_binunicode(b"_patch.start"), b"\x93h\x02\x85R"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
 def _typing_eval_type_forward_ref_payload(marker: Path) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"typing"), _short_binunicode(b"_eval_type"), b"\x93"]
@@ -1187,6 +1223,51 @@ def test_scan_bytes_blocks_unittest_loader_discover_import_execution_rce(tmp_pat
     finally:
         sys.path[:] = original_sys_path
         sys.modules.pop(module_name, None)
+
+
+def test_scan_bytes_blocks_unittest_mock_patch_start_import_execution_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "unittest_mock_patch_start_import_execution_rce_marker"
+    module_path = tmp_path / "ma_unittest_mock_patch_exec.py"
+    module_name = module_path.stem
+    control_payload = _unittest_mock_patch_start_payload(
+        module_path,
+        marker,
+        include_start=False,
+    )
+    payload = _unittest_mock_patch_start_payload(module_path, marker, include_start=True)
+    original_sys_path = list(sys.path)
+
+    try:
+        sys.path.insert(0, str(tmp_path))
+        sys.modules.pop(module_name, None)
+        control_report = scan_bytes(control_payload, source="unittest-mock-patch-start-control.pkl")
+        assert control_report.verdict == SafetyVerdict.CLEAN
+
+        assert not marker.exists()
+        control_result = pickle.loads(control_payload)
+        assert isinstance(control_result, int)
+        assert module_path.exists()
+        assert not marker.exists()
+
+        module_path.unlink()
+        sys.modules.pop(module_name, None)
+
+        report = scan_bytes(payload, source="unittest-mock-patch-start-rce.pkl")
+
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_unittest_mock_finding(report, "patch")
+        assert _has_critical_unittest_mock_finding(report, "_patch.start")
+
+        result = pickle.loads(payload)
+        assert result == 2
+        assert marker.exists()
+    finally:
+        sys.path[:] = original_sys_path
+        sys.modules.pop(module_name, None)
+
+        import unittest.mock as mock
+
+        mock.patch.stopall()
 
 
 def test_scan_bytes_blocks_dataclasses_create_fn_default_arg_rce(tmp_path: Path) -> None:

@@ -281,6 +281,11 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("unittest.loader", "defaultTestLoader.loadTestsFromNames"),
     ("unittest.mock", "MagicMock"),
     ("unittest.mock", "Mock"),
+    ("unittest.mock", "_patch.__enter__"),
+    ("unittest.mock", "_patch.start"),
+    ("unittest.mock", "patch"),
+    ("unittest.mock", "patch.dict"),
+    ("unittest.mock", "patch.multiple"),
     ("uuid", "_arp_getnode"),
     ("uuid", "_get_command_stdout"),
     ("uuid", "_ifconfig_getnode"),
@@ -348,6 +353,15 @@ mod tests {
             global_severity("unittest.mock", "MagicMock"),
             Some("critical")
         );
+        for name in [
+            "_patch.__enter__",
+            "_patch.start",
+            "patch",
+            "patch.dict",
+            "patch.multiple",
+        ] {
+            assert_eq!(global_severity("unittest.mock", name), Some("critical"));
+        }
         assert_eq!(
             global_severity("copyreg", "add_extension"),
             Some("critical")
