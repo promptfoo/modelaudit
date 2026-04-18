@@ -160,6 +160,7 @@ def test_rust_parser_declares_all_pickletools_opcodes() -> None:
         ("pipes", "Template.open_w"),
         ("setuptools._distutils.spawn", "spawn"),
         ("torch", "load"),
+        ("typing", "_eval_type"),
         ("uuid", "_ip_getnode"),
     ],
 )
