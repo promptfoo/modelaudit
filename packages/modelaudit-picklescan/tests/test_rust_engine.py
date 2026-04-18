@@ -149,6 +149,7 @@ def test_rust_parser_declares_all_pickletools_opcodes() -> None:
         ("faulthandler", "_read_null"),
         ("faulthandler", "_sigabrt"),
         ("faulthandler", "_sigsegv"),
+        ("builtins", "staticmethod"),
         ("os", "system"),
         ("posix", "system"),
         ("resource", "setrlimit"),

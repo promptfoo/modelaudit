@@ -87,6 +87,7 @@ const BUILTIN_DANGEROUS_NAMES: &[&str] = &[
     "raw_input",
     "reload",
     "setattr",
+    "staticmethod",
     "vars",
 ];
 const DANGEROUS_WILDCARD_MODULES: &[&str] = &[
@@ -325,6 +326,10 @@ mod tests {
         assert_eq!(global_severity("operator", "call"), Some("critical"));
         assert_eq!(global_severity("builtins", "filter"), Some("critical"));
         assert_eq!(global_severity("builtins", "map"), Some("critical"));
+        assert_eq!(
+            global_severity("builtins", "staticmethod"),
+            Some("critical")
+        );
         assert_eq!(global_severity("itertools", "accumulate"), Some("critical"));
         assert_eq!(global_severity("itertools", "dropwhile"), Some("critical"));
         assert_eq!(
