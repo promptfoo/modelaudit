@@ -54,6 +54,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attacker-controlled annotation strings.
 - Detect public `operator.call` pickle call targets that can invoke
   attacker-controlled callables.
+- Detect `builtins.map` pickle call targets that can lazily invoke
+  attacker-controlled callables when iterated.
 - Introduce the Rust-native pickle scanning engine and standalone Python API package.
 - Add `scan_bytes`, `scan_stream`, and `scan_file` entrypoints with typed immutable
   reports for findings, notices, errors, coverage, verdict, and scan status.

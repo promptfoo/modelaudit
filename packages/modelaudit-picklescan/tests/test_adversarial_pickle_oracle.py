@@ -294,6 +294,15 @@ def _has_critical_mailcap_findmatch_finding(report: PickleReport) -> bool:
     )
 
 
+def _has_critical_builtins_map_finding(report: PickleReport) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "builtins"
+        and finding.details.get("name") == "map"
+        for finding in report.findings
+    )
+
+
 def _has_critical_dataclasses_create_fn_finding(report: PickleReport) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -409,6 +418,22 @@ def _operator_call_payload(marker: Path) -> bytes:
     ]
     parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
     parts += [b"tR", b"\x86R."]
+    return b"".join(parts)
+
+
+def _builtins_map_tuple_payload(marker: Path) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"tuple"), b"\x93"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"map"), b"\x93"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"]"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(marker).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
+    parts += [b"tRa", b"\x86R", b"\x85R."]
     return b"".join(parts)
 
 
@@ -534,6 +559,21 @@ def test_scan_bytes_blocks_operator_call_public_alias_rce(tmp_path: Path) -> Non
     assert not marker.exists()
     result = pickle.loads(payload)
     assert result is None
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_builtins_map_forced_iteration_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "builtins_map_tuple_rce_marker"
+    payload = _builtins_map_tuple_payload(marker)
+
+    report = scan_bytes(payload, source="builtins-map-tuple-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_builtins_map_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result == (None,)
     assert marker.exists()
 
 

@@ -83,6 +83,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   evaluate attacker-controlled annotation strings
 - **security:** detect public `operator.call` pickle call targets that can
   invoke attacker-controlled callables
+- **security:** detect `builtins.map` pickle call targets that can lazily
+  invoke attacker-controlled callables when iterated
 - **cli:** add scanner selection with `--scanners`, `--exclude-scanner`, and `--list-scanners` wired into core routing, nested dispatch, remote prefilters, and scan metadata; selection-suppressed preferred scanners emit a stderr warning and populate `scanner_selection.suppressed_preferred_scanner_ids`, and unknown scanner names suggest the closest match
 - **pickle:** replace the standalone pickle scanner's package-engine selector with the Rust-only runtime and explicit native-extension errors
 - **pickle:** scan PyTorch ZIP checkpoint pickle members directly in the standalone pickle scanner

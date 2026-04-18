@@ -138,6 +138,7 @@ def test_rust_parser_declares_all_pickletools_opcodes() -> None:
         ("builtins", "exec"),
         ("builtins", "exit"),
         ("builtins", "getattr"),
+        ("builtins", "map"),
         ("builtins", "open"),
         ("builtins", "quit"),
         ("builtins", "__import__"),

