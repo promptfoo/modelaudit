@@ -50,6 +50,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attacker-controlled `ForwardRef` expressions.
 - Detect `dataclasses._create_fn` pickle call targets that can execute
   attacker-controlled generated Python source.
+- Detect `typing.get_type_hints` pickle call targets that can evaluate
+  attacker-controlled annotation strings.
 - Introduce the Rust-native pickle scanning engine and standalone Python API package.
 - Add `scan_bytes`, `scan_stream`, and `scan_file` entrypoints with typed immutable
   reports for findings, notices, errors, coverage, verdict, and scan status.
