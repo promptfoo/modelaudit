@@ -83,6 +83,7 @@ const BUILTIN_DANGEROUS_NAMES: &[&str] = &[
     "locals",
     "map",
     "open",
+    "property.__get__",
     "quit",
     "raw_input",
     "reload",
@@ -333,6 +334,10 @@ mod tests {
         assert_eq!(global_severity("builtins", "map"), Some("critical"));
         assert_eq!(
             global_severity("builtins", "staticmethod"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("builtins", "property.__get__"),
             Some("critical")
         );
         assert_eq!(global_severity("_functools", "partial"), Some("critical"));
