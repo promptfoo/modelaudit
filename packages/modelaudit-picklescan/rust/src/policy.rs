@@ -241,6 +241,8 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("sched", "scheduler.enterabs"),
     ("sched", "scheduler.run"),
     ("setuptools._distutils.spawn", "spawn"),
+    ("site", "addpackage"),
+    ("site", "addsitedir"),
     ("site", "main"),
     ("tarfile", "open"),
     ("test.support.script_helper", "assert_python_ok"),
@@ -382,6 +384,8 @@ mod tests {
             global_severity("dataclasses", "_create_fn"),
             Some("critical")
         );
+        assert_eq!(global_severity("site", "addsitedir"), Some("critical"));
+        assert_eq!(global_severity("site", "addpackage"), Some("critical"));
         assert_eq!(global_severity("custom", "load"), None);
     }
 

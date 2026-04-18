@@ -44,6 +44,13 @@ def _binunicode(data: bytes) -> bytes:
     return b"X" + len(data).to_bytes(4, "little") + data
 
 
+def _text_operand(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return _short_binunicode(data)
+    return _binunicode(data)
+
+
 def _binunicode8(data: bytes) -> bytes:
     return b"\x8d" + len(data).to_bytes(8, "little") + data
 
@@ -394,6 +401,15 @@ def _has_critical_setuptools_distutils_spawn_finding(report: PickleReport) -> bo
     )
 
 
+def _has_critical_site_finding(report: PickleReport, name: str) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "site"
+        and finding.details.get("name") == name
+        for finding in report.findings
+    )
+
+
 def _has_critical_pipes_template_copy_finding(report: PickleReport) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -618,6 +634,35 @@ def _processpool_executor_submit_payload(marker: Path) -> bytes:
         _short_binunicode(b"ProcessPoolExecutor.shutdown"),
         b"\x93h\x00\x85R.",
     ]
+    return b"".join(parts)
+
+
+def _site_addsitedir_pth_payload(pth_path: Path, marker: Path, *, include_addsitedir: bool) -> bytes:
+    content_fragments = [
+        "im",
+        "port pathlib; pathlib.Path(",
+        repr(str(marker)),
+        ").touch()\n",
+    ]
+
+    parts = [b"\x80\x04"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(pth_path).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_text_operand(part) for part in pth_path.parts)
+    parts += [b"tR\x940"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"str.join"), b"\x93("]
+    parts += [_short_binunicode(b""), b"("]
+    parts.extend(_text_operand(fragment) for fragment in content_fragments)
+    parts += [b"ttR\x940"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.write_text"), b"\x93("]
+    parts += [b"h\x00", b"h\x01", b"tR"]
+    if include_addsitedir:
+        parts += [b"0", _short_binunicode(b"site"), _short_binunicode(b"addsitedir"), b"\x93"]
+        parts += [_text_operand(str(pth_path.parent)), b"\x85R"]
+    parts += [b"."]
     return b"".join(parts)
 
 
@@ -1014,6 +1059,41 @@ def test_scan_bytes_blocks_processpool_executor_submitted_callback_rce(tmp_path:
         timeout=30,
     )
     assert marker.exists()
+
+
+def test_scan_bytes_blocks_site_addsitedir_pth_execution_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "site_addsitedir_pth_execution_rce_marker"
+    pth_path = tmp_path / "site_addsitedir_exec.pth"
+    control_payload = _site_addsitedir_pth_payload(
+        pth_path,
+        marker,
+        include_addsitedir=False,
+    )
+    payload = _site_addsitedir_pth_payload(pth_path, marker, include_addsitedir=True)
+    original_sys_path = list(sys.path)
+
+    try:
+        control_report = scan_bytes(control_payload, source="site-addsitedir-pth-control.pkl")
+        assert control_report.verdict == SafetyVerdict.CLEAN
+
+        assert not marker.exists()
+        control_result = pickle.loads(control_payload)
+        assert isinstance(control_result, int)
+        assert pth_path.exists()
+        assert not marker.exists()
+
+        pth_path.unlink()
+
+        report = scan_bytes(payload, source="site-addsitedir-pth-rce.pkl")
+
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_site_finding(report, "addsitedir")
+
+        result = pickle.loads(payload)
+        assert result is None
+        assert marker.exists()
+    finally:
+        sys.path[:] = original_sys_path
 
 
 def test_scan_bytes_blocks_dataclasses_create_fn_default_arg_rce(tmp_path: Path) -> None:

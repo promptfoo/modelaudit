@@ -183,6 +183,8 @@ def test_rust_parser_declares_all_pickletools_opcodes() -> None:
         ("sched", "scheduler.enterabs"),
         ("sched", "scheduler.run"),
         ("setuptools._distutils.spawn", "spawn"),
+        ("site", "addpackage"),
+        ("site", "addsitedir"),
         ("torch", "load"),
         ("typing", "_eval_type"),
         ("typing", "get_type_hints"),
