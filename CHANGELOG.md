@@ -107,6 +107,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attacker-controlled methods when pickle-built objects are dropped
 - **security:** detect `__eq__` rich-comparison string seeds that can execute
   attacker-controlled methods during equality checks
+- **security:** detect `__contains__` membership string seeds that can execute
+  attacker-controlled methods during containment checks
 - **security:** detect `builtins.staticmethod` pickle call targets that can
   synthesize callable descriptors for later invocation
 - **security:** detect `builtins.property.__get__` pickle call targets that

