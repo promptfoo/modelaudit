@@ -44,6 +44,10 @@ def _short_binunicode(data: bytes) -> bytes:
     return b"\x8c" + bytes([len(data)]) + data
 
 
+def _global(module: bytes, name: bytes) -> bytes:
+    return b"c" + module + b"\n" + name + b"\n"
+
+
 def _binunicode(data: bytes) -> bytes:
     return b"X" + len(data).to_bytes(4, "little") + data
 
@@ -110,12 +114,14 @@ def _temporary_directory_payload(parent: Path) -> bytes:
     )
 
 
-def _configparser_read_get_payload(config_path: Path) -> bytes:
+def _configparser_read_get_payload(config_path: Path, read_method: bytes) -> bytes:
     return (
         b"\x80\x04"
         b"cconfigparser\nConfigParser\n)R\x94"
-        b"cconfigparser\nConfigParser.read\n"
-        b"h\x00" + _binunicode(str(config_path).encode()) + b"\x86R0"
+        + _global(b"configparser", read_method)
+        + b"h\x00"
+        + _binunicode(str(config_path).encode())
+        + b"\x86R0"
         b"cconfigparser\nConfigParser.get\n"
         b"h\x00" + _short_binunicode(b"secrets") + _short_binunicode(b"token") + b"\x87R."
     )
@@ -154,11 +160,13 @@ def _copyreg_dispatch_table_ior_payload() -> bytes:
 
 
 def _copyreg_dispatch_table_pop_union_payload() -> bytes:
-    return b"\x80\x04cbuiltins\ndict.pop\nccopyreg\ndispatch_table\nctypes\nUnionType\n\x86R."
+    return b"\x80\x04cbuiltins\ndict.pop\nccopyreg\ndispatch_table\n" + _global(b"types", b"UnionType") + b"\x86R."
 
 
 def _copyreg_dispatch_table_delitem_union_payload() -> bytes:
-    return b"\x80\x04cbuiltins\ndict.__delitem__\nccopyreg\ndispatch_table\nctypes\nUnionType\n\x86R."
+    return (
+        b"\x80\x04cbuiltins\ndict.__delitem__\nccopyreg\ndispatch_table\n" + _global(b"types", b"UnionType") + b"\x86R."
+    )
 
 
 def _copyreg_dispatch_table_popitem_payload() -> bytes:
@@ -2542,19 +2550,30 @@ def test_scan_bytes_detects_temporary_directory_resource_creation(tmp_path: Path
         temporary_directory.cleanup()
 
 
-def test_scan_bytes_detects_configparser_read_get_disclosure_chain(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("read_method", "expected_reference"),
+    [
+        (b"ConfigParser.read", "configparser.ConfigParser.read"),
+        (b"RawConfigParser.read", "configparser.RawConfigParser.read"),
+    ],
+)
+def test_scan_bytes_detects_configparser_read_get_disclosure_chain(
+    tmp_path: Path,
+    read_method: bytes,
+    expected_reference: str,
+) -> None:
     config_path = tmp_path / "secret.ini"
     config_path.write_text("[secrets]\ntoken = modelaudit-config-secret-10\n", encoding="utf-8")
-    payload = _configparser_read_get_payload(config_path)
+    payload = _configparser_read_get_payload(config_path, read_method)
 
-    report = scan_bytes(payload, source="configparser-read-get.pkl")
+    report = scan_bytes(payload, source=f"{expected_reference}-read-get.pkl")
 
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert any(
         finding.rule_code == "DANGEROUS_CALL"
         and finding.severity == Severity.CRITICAL
-        and finding.details.get("import_reference") == "configparser.ConfigParser.read"
+        and finding.details.get("import_reference") == expected_reference
         for finding in report.findings
     )
     assert pickle.loads(payload) == "modelaudit-config-secret-10"
@@ -2776,6 +2795,7 @@ def test_scan_bytes_allows_benign_dill_text_literal() -> None:
         (b"ccodecs\nencode\n(tR.", "codecs.encode"),
         (b"ccodecs\nopen\n(tR.", "codecs.open"),
         (b"cconfigparser\nConfigParser.read\n(tR.", "configparser.ConfigParser.read"),
+        (b"cconfigparser\nRawConfigParser.read\n(tR.", "configparser.RawConfigParser.read"),
         (b"ccopyreg\npickle\n(tR.", "copyreg.pickle"),
         (b"cdbm\nopen\n(tR.", "dbm.open"),
         (b"cfaulthandler\ndisable\n(tR.", "faulthandler.disable"),

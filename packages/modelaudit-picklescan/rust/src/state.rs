@@ -2770,6 +2770,11 @@ mod tests {
                 "decimal.setcontext",
             ),
             (
+                "configparser-raw-read",
+                b"\x80\x04cconfigparser\nRawConfigParser.read\n)R.".to_vec(),
+                "configparser.RawConfigParser.read",
+            ),
+            (
                 "gc-disable",
                 b"\x80\x04cgc\ndisable\n)R.".to_vec(),
                 "gc.disable",

@@ -8,7 +8,7 @@ pub(crate) fn global_severity(module: &str, name: &str) -> Option<&'static str> 
     }
 
     if BUILTIN_MODULES.contains(&module) {
-        return if BUILTIN_DANGEROUS_NAMES.contains(&name) {
+        return if builtin_dangerous_name_is_listed(name) {
             Some("critical")
         } else {
             None
@@ -46,6 +46,10 @@ impl WarningGlobalMatch {
             Self::OneOf(names) => names.contains(&name),
         }
     }
+}
+
+fn builtin_dangerous_name_is_listed(name: &str) -> bool {
+    BUILTIN_DANGEROUS_NAMES.binary_search(&name).is_ok()
 }
 
 fn dangerous_global_is_listed(module: &str, name: &str) -> bool {
@@ -86,7 +90,6 @@ const BUILTIN_DANGEROUS_NAMES: &[&str] = &[
     "breakpoint",
     "compile",
     "delattr",
-    "dir",
     "dict.__delitem__",
     "dict.__ior__",
     "dict.__setitem__",
@@ -95,6 +98,7 @@ const BUILTIN_DANGEROUS_NAMES: &[&str] = &[
     "dict.popitem",
     "dict.setdefault",
     "dict.update",
+    "dir",
     "eval",
     "exec",
     "execfile",
@@ -246,6 +250,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("codecs", "open"),
     ("collections", "eval"),
     ("configparser", "ConfigParser.read"),
+    ("configparser", "RawConfigParser.read"),
     ("copyreg", "add_extension"),
     ("copyreg", "pickle"),
     ("copyreg", "remove_extension"),
@@ -351,6 +356,16 @@ mod tests {
     }
 
     #[test]
+    fn builtin_dangerous_names_are_sorted_for_binary_search() {
+        for pair in BUILTIN_DANGEROUS_NAMES.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "BUILTIN_DANGEROUS_NAMES must stay sorted"
+            );
+        }
+    }
+
+    #[test]
     fn dangerous_global_lookup_uses_sorted_table() {
         assert_eq!(global_severity("joblib", "load"), Some("critical"));
         assert_eq!(
@@ -446,6 +461,10 @@ mod tests {
         assert_eq!(global_severity("faulthandler", "disable"), Some("critical"));
         assert_eq!(
             global_severity("configparser", "ConfigParser.read"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("configparser", "RawConfigParser.read"),
             Some("critical")
         );
         assert_eq!(global_severity("site", "addpackage"), Some("critical"));
