@@ -95,6 +95,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   targets that can invoke attacker-controlled descriptor getters
 - **security:** detect `functools.cached_property.__get__` pickle call targets
   that can invoke attacker-controlled cached-property getters
+- **security:** detect `functools.cmp_to_key` pickle call targets that can
+  invoke attacker-controlled comparators during rich comparison
 - **security:** detect `builtins.staticmethod` pickle call targets that can
   synthesize callable descriptors for later invocation
 - **security:** detect `builtins.property.__get__` pickle call targets that

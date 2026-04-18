@@ -711,6 +711,29 @@ def _functools_cached_property_get_payload(marker: Path, *, include_call: bool) 
     return b"".join(parts)
 
 
+def _functools_cmp_to_key_operator_lt_payload(marker: Path, *, include_call: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"functools"), _short_binunicode(b"cmp_to_key"), b"\x93"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.write_text"), b"\x93"]
+    parts += [b"\x85R\x940"]
+    parts += [b"h\x00"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(marker).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_text_operand(part) for part in marker.parts)
+    parts += [b"tR", b"\x85R\x940"]
+    parts += [b"h\x00", _text_operand("x"), b"\x85R\x940"]
+    if include_call:
+        parts += [_short_binunicode(b"operator"), _short_binunicode(b"lt"), b"\x93"]
+        parts += [b"h\x01h\x02\x86R"]
+    else:
+        parts += [b"h\x01h\x02\x86"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
 def _builtins_staticmethod_descriptor_payload(marker: Path, *, include_call: bool) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"builtins"), _short_binunicode(b"staticmethod"), b"\x93"]
@@ -1405,6 +1428,32 @@ def test_scan_bytes_blocks_functools_cached_property_get_descriptor_rce(tmp_path
     result = pickle.loads(payload)
     assert result is None
     assert marker.exists()
+
+
+def test_scan_bytes_blocks_functools_cmp_to_key_comparison_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "functools_cmp_to_key_comparison_rce_marker"
+    control_payload = _functools_cmp_to_key_operator_lt_payload(marker, include_call=False)
+    payload = _functools_cmp_to_key_operator_lt_payload(marker, include_call=True)
+
+    control_report = scan_bytes(control_payload, source="functools-cmp-to-key-control.pkl")
+    assert control_report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_functools_wrapper_finding(control_report, "cmp_to_key")
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert isinstance(control_result, tuple)
+    assert len(control_result) == 2
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="functools-cmp-to-key-operator-lt-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_functools_wrapper_finding(report, "cmp_to_key")
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is False
+    assert marker.read_text() == "x"
 
 
 def test_scan_bytes_blocks_builtins_staticmethod_descriptor_rce(tmp_path: Path) -> None:

