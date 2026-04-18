@@ -181,6 +181,9 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("codecs", "decode"),
     ("codecs", "encode"),
     ("collections", "eval"),
+    ("contextlib", "ExitStack.__exit__"),
+    ("contextlib", "ExitStack.callback"),
+    ("contextlib", "ExitStack.close"),
     ("copyreg", "add_extension"),
     ("copyreg", "remove_extension"),
     ("dataclasses", "_create_fn"),
@@ -309,6 +312,18 @@ mod tests {
         );
         assert_eq!(
             global_severity("copyreg", "add_extension"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("contextlib", "ExitStack.callback"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("contextlib", "ExitStack.close"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("contextlib", "ExitStack.__exit__"),
             Some("critical")
         );
         assert_eq!(global_severity("weakref", "finalize"), Some("critical"));

