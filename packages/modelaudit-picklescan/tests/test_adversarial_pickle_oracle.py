@@ -356,6 +356,15 @@ def _has_critical_private_functools_reduce_finding(report: PickleReport) -> bool
     )
 
 
+def _has_critical_functools_wrapper_finding(report: PickleReport, name: str) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "functools"
+        and finding.details.get("name") == name
+        for finding in report.findings
+    )
+
+
 def _has_critical_itertools_accumulate_finding(report: PickleReport) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -695,6 +704,26 @@ def _private_functools_reduce_payload(marker: Path, *, include_call: bool) -> by
     parts += [b"tR", b"\x87"]
     if include_call:
         parts += [b"R"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _functools_callable_wrapper_payload(marker: Path, factory_name: bytes, *, include_call: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"functools"), _short_binunicode(factory_name), b"\x93"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"\x85R\x94"]
+    if include_call:
+        parts += [b"h\x00"]
+        parts += [
+            _short_binunicode(b"pathlib"),
+            _short_binunicode(type(marker).__name__.encode()),
+            b"\x93(",
+        ]
+        parts.extend(_text_operand(part) for part in marker.parts)
+        parts += [b"tR", b"\x85R"]
+    else:
+        parts += [b"h\x00"]
     parts += [b"."]
     return b"".join(parts)
 
@@ -1296,6 +1325,40 @@ def test_scan_bytes_blocks_private_functools_reduce_rce(tmp_path: Path) -> None:
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_private_functools_reduce_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.exists()
+
+
+@pytest.mark.parametrize("factory_name", ["cache", "lru_cache", "singledispatch"])
+def test_scan_bytes_blocks_functools_callable_wrapper_rce(tmp_path: Path, factory_name: str) -> None:
+    marker = tmp_path / f"functools_{factory_name}_callable_wrapper_rce_marker"
+    control_payload = _functools_callable_wrapper_payload(
+        marker,
+        factory_name.encode(),
+        include_call=False,
+    )
+    payload = _functools_callable_wrapper_payload(
+        marker,
+        factory_name.encode(),
+        include_call=True,
+    )
+
+    control_report = scan_bytes(control_payload, source=f"functools-{factory_name}-wrapper-control.pkl")
+    assert control_report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_functools_wrapper_finding(control_report, factory_name)
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert callable(control_result)
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source=f"functools-{factory_name}-wrapper-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_functools_wrapper_finding(report, factory_name)
 
     assert not marker.exists()
     result = pickle.loads(payload)

