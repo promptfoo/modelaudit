@@ -383,6 +383,15 @@ def _has_critical_functools_wrapper_finding(report: PickleReport, name: str) -> 
     )
 
 
+def _has_critical_logging_filterer_filter_finding(report: PickleReport) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "logging"
+        and finding.details.get("name") == "Filterer.filter"
+        for finding in report.findings
+    )
+
+
 def _has_critical_itertools_accumulate_finding(report: PickleReport) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -730,6 +739,28 @@ def _functools_cmp_to_key_operator_lt_payload(marker: Path, *, include_call: boo
         parts += [b"h\x01h\x02\x86R"]
     else:
         parts += [b"h\x01h\x02\x86"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _logging_filterer_filter_payload(marker: Path, *, include_call: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"logging"), _short_binunicode(b"Filterer"), b"\x93"]
+    parts += [b")R\x940"]
+    parts += [_short_binunicode(b"logging"), _short_binunicode(b"Filterer.addFilter"), b"\x93"]
+    parts += [b"(", b"h\x00", _short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93", b"tR0"]
+    if include_call:
+        parts += [
+            _short_binunicode(b"pathlib"),
+            _short_binunicode(type(marker).__name__.encode()),
+            b"\x93(",
+        ]
+        parts.extend(_text_operand(part) for part in marker.parts)
+        parts += [b"tR", b"\x940"]
+        parts += [_short_binunicode(b"logging"), _short_binunicode(b"Filterer.filter"), b"\x93"]
+        parts += [b"(", b"h\x00", b"h\x01", b"tR"]
+    else:
+        parts += [b"h\x00"]
     parts += [b"."]
     return b"".join(parts)
 
@@ -1454,6 +1485,31 @@ def test_scan_bytes_blocks_functools_cmp_to_key_comparison_rce(tmp_path: Path) -
     result = pickle.loads(payload)
     assert result is False
     assert marker.read_text() == "x"
+
+
+def test_scan_bytes_blocks_logging_filterer_filter_callback_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "logging_filterer_filter_callback_rce_marker"
+    control_payload = _logging_filterer_filter_payload(marker, include_call=False)
+    payload = _logging_filterer_filter_payload(marker, include_call=True)
+
+    control_report = scan_bytes(control_payload, source="logging-filterer-filter-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "Filterer"
+    assert len(control_result.filters) == 1
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="logging-filterer-filter-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_logging_filterer_filter_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is False
+    assert marker.exists()
 
 
 def test_scan_bytes_blocks_builtins_staticmethod_descriptor_rce(tmp_path: Path) -> None:
