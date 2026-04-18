@@ -260,6 +260,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("uuid", "_netstat_getnode"),
     ("uuid", "_popen"),
     ("uuid", "getnode"),
+    ("weakref", "finalize"),
     ("zipfile", "PyZipFile"),
     ("zipfile", "ZipFile"),
 ];
@@ -307,6 +308,7 @@ mod tests {
             global_severity("copyreg", "add_extension"),
             Some("critical")
         );
+        assert_eq!(global_severity("weakref", "finalize"), Some("critical"));
         assert_eq!(
             global_severity("dataclasses", "_create_fn"),
             Some("critical")

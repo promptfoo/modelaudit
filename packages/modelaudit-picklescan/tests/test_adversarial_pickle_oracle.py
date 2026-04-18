@@ -430,6 +430,15 @@ def _has_critical_typing_get_type_hints_finding(report: PickleReport) -> bool:
     )
 
 
+def _has_critical_weakref_finalize_finding(report: PickleReport) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "weakref"
+        and finding.details.get("name") == "finalize"
+        for finding in report.findings
+    )
+
+
 def _atexit_register_payload(marker: Path) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"atexit"), _short_binunicode(b"register"), b"\x93"]
@@ -441,6 +450,21 @@ def _atexit_register_payload(marker: Path) -> bytes:
     ]
     parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
     parts += [b"tR", b"\x86R."]
+    return b"".join(parts)
+
+
+def _weakref_finalize_payload(marker: Path) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"weakref"), _short_binunicode(b"finalize"), b"\x93"]
+    parts += [_short_binunicode(b"collections"), _short_binunicode(b"UserList"), b"\x93)R"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(marker).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
+    parts += [b"tR", b"\x87R."]
     return b"".join(parts)
 
 
@@ -712,6 +736,23 @@ def test_scan_bytes_blocks_atexit_register_exit_callback_rce(tmp_path: Path) -> 
         capture_output=True,
         text=True,
     )
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_weakref_finalize_reclaim_callback_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "weakref_finalize_reclaim_callback_rce_marker"
+    payload = _weakref_finalize_payload(marker)
+
+    report = scan_bytes(payload, source="weakref-finalize-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_weakref_finalize_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert type(result).__module__ == "weakref"
+    assert type(result).__name__ == "finalize"
+    assert not result.alive
     assert marker.exists()
 
 

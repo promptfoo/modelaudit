@@ -174,6 +174,7 @@ def test_rust_parser_declares_all_pickletools_opcodes() -> None:
         ("typing", "_eval_type"),
         ("typing", "get_type_hints"),
         ("uuid", "_ip_getnode"),
+        ("weakref", "finalize"),
     ],
 )
 def test_rust_policy_detects_required_security_coverage(module: str, name: str) -> None:
