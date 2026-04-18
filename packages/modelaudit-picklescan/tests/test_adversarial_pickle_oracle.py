@@ -6,6 +6,7 @@ import dataclasses
 import pickle
 import shlex
 import shutil
+import site
 import subprocess
 import sys
 from collections.abc import Callable
@@ -824,6 +825,89 @@ def _logging_filterer_filter_payload(marker: Path, *, include_call: bool) -> byt
     else:
         parts += [b"h\x00"]
     parts += [b"."]
+    return b"".join(parts)
+
+
+def _tuple_payload_operands(operands: list[bytes]) -> bytes:
+    if not operands:
+        return b")"
+    if len(operands) == 1:
+        return operands[0] + b"\x85"
+    if len(operands) == 2:
+        return operands[0] + operands[1] + b"\x86"
+    if len(operands) == 3:
+        return operands[0] + operands[1] + operands[2] + b"\x87"
+    return b"(" + b"".join(operands) + b"t"
+
+
+def _log_record_payload(message: str, args: bytes = b")") -> list[bytes]:
+    return [
+        _short_binunicode(b"logging"),
+        _short_binunicode(b"LogRecord"),
+        b"\x93",
+        b"(",
+        _text_operand("picklescan"),
+        b"K\x14",
+        _text_operand("model.pkl"),
+        b"K\x01",
+        _text_operand(message),
+        args,
+        b"N",
+        b"tR\x94",
+    ]
+
+
+def _logging_file_handler_payload(
+    marker: Path,
+    *,
+    handler_module: str,
+    handler_name: str,
+    handler_args: list[bytes],
+    driver_module: str,
+    driver_name: str,
+    message: str,
+    include_emit: bool,
+) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [
+        _short_binunicode(handler_module.encode()),
+        _short_binunicode(handler_name.encode()),
+        b"\x93",
+    ]
+    parts += [_tuple_payload_operands([_text_operand(str(marker)), *handler_args]), b"R\x94"]
+    if not include_emit:
+        parts += [b"h\x00", b"."]
+        return b"".join(parts)
+
+    parts += _log_record_payload(message)
+    parts += [
+        _short_binunicode(driver_module.encode()),
+        _short_binunicode(driver_name.encode()),
+        b"\x93",
+    ]
+    parts += [b"h\x00h\x01\x86R0"]
+    parts += [_short_binunicode(b"logging"), _short_binunicode(b"Handler.close"), b"\x93"]
+    parts += [b"h\x00\x85R."]
+    return b"".join(parts)
+
+
+def _logging_file_handler_pth_payload(pth_path: Path, marker: Path) -> bytes:
+    pth_args = _tuple_payload_operands(
+        [
+            _text_operand("im"),
+            _text_operand("port pathlib;pathlib.Path("),
+            _text_operand(repr(str(marker))),
+            _text_operand(").write_text('owned-by-logging-pth')"),
+        ]
+    )
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"logging"), _short_binunicode(b"FileHandler"), b"\x93"]
+    parts += [_tuple_payload_operands([_text_operand(str(pth_path)), _text_operand("w")]), b"R\x94"]
+    parts += _log_record_payload("%s%s%s%s", pth_args)
+    parts += [_short_binunicode(b"logging"), _short_binunicode(b"Handler.handle"), b"\x93"]
+    parts += [b"h\x00h\x01\x86R0"]
+    parts += [_short_binunicode(b"logging"), _short_binunicode(b"Handler.close"), b"\x93"]
+    parts += [b"h\x00\x85R."]
     return b"".join(parts)
 
 
@@ -2005,6 +2089,159 @@ def test_scan_bytes_blocks_logging_filterer_filter_callback_rce(tmp_path: Path) 
     result = pickle.loads(payload)
     assert result is False
     assert marker.exists()
+
+
+@pytest.mark.parametrize(
+    (
+        "sink_name",
+        "handler_module",
+        "handler_name",
+        "handler_args",
+        "driver_module",
+        "driver_name",
+        "expected_globals",
+    ),
+    [
+        (
+            "filehandler_file_emit",
+            "logging",
+            "FileHandler",
+            [_text_operand("w")],
+            "logging",
+            "FileHandler.emit",
+            [("logging", "FileHandler"), ("logging", "FileHandler.emit")],
+        ),
+        (
+            "filehandler_stream_emit",
+            "logging",
+            "FileHandler",
+            [_text_operand("w")],
+            "logging",
+            "StreamHandler.emit",
+            [("logging", "FileHandler"), ("logging", "StreamHandler.emit")],
+        ),
+        (
+            "filehandler_handler_handle",
+            "logging",
+            "FileHandler",
+            [_text_operand("w")],
+            "logging",
+            "Handler.handle",
+            [("logging", "FileHandler"), ("logging", "Handler.handle")],
+        ),
+        (
+            "watched_stream_emit",
+            "logging.handlers",
+            "WatchedFileHandler",
+            [_text_operand("w")],
+            "logging",
+            "StreamHandler.emit",
+            [("logging.handlers", "WatchedFileHandler"), ("logging", "StreamHandler.emit")],
+        ),
+        (
+            "rotating_stream_emit",
+            "logging.handlers",
+            "RotatingFileHandler",
+            [_text_operand("w")],
+            "logging",
+            "StreamHandler.emit",
+            [("logging.handlers", "RotatingFileHandler"), ("logging", "StreamHandler.emit")],
+        ),
+        (
+            "timed_stream_emit",
+            "logging.handlers",
+            "TimedRotatingFileHandler",
+            [],
+            "logging",
+            "StreamHandler.emit",
+            [("logging.handlers", "TimedRotatingFileHandler"), ("logging", "StreamHandler.emit")],
+        ),
+    ],
+)
+def test_scan_bytes_blocks_logging_file_handler_writes(
+    tmp_path: Path,
+    sink_name: str,
+    handler_module: str,
+    handler_name: str,
+    handler_args: list[bytes],
+    driver_module: str,
+    driver_name: str,
+    expected_globals: list[tuple[str, str]],
+) -> None:
+    marker = tmp_path / f"logging_{sink_name}_rce_marker"
+    message = f"owned-by-{sink_name}"
+    control_payload = _logging_file_handler_payload(
+        marker,
+        handler_module=handler_module,
+        handler_name=handler_name,
+        handler_args=handler_args,
+        driver_module=driver_module,
+        driver_name=driver_name,
+        message=message,
+        include_emit=False,
+    )
+    payload = _logging_file_handler_payload(
+        marker,
+        handler_module=handler_module,
+        handler_name=handler_name,
+        handler_args=handler_args,
+        driver_module=driver_module,
+        driver_name=driver_name,
+        message=message,
+        include_emit=True,
+    )
+
+    control_report = scan_bytes(control_payload, source=f"logging-file-handler-{sink_name}-control.pkl")
+    assert control_report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_global_finding(control_report, handler_module, handler_name)
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    try:
+        assert type(control_result).__name__ == handler_name
+        assert marker.read_text() == ""
+    finally:
+        control_result.close()
+    marker.unlink()
+
+    report = scan_bytes(payload, source=f"logging-file-handler-{sink_name}-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    for module, name in expected_globals:
+        assert _has_critical_global_finding(report, module, name)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.read_text() == f"{message}\n"
+
+
+def test_scan_bytes_blocks_logging_file_handler_fragmented_pth_rce(tmp_path: Path) -> None:
+    pth_path = tmp_path / "logging_filehandler_exec.pth"
+    marker = tmp_path / "logging_filehandler_pth_rce_marker"
+    payload = _logging_file_handler_pth_payload(pth_path, marker)
+    original_sys_path = list(sys.path)
+
+    try:
+        report = scan_bytes(payload, source="logging-file-handler-pth-rce.pkl")
+
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_global_finding(report, "logging", "FileHandler")
+        assert _has_critical_global_finding(report, "logging", "Handler.handle")
+
+        assert not pth_path.exists()
+        assert not marker.exists()
+        result = pickle.loads(payload)
+        assert result is None
+        assert pth_path.read_text() == (
+            f"import pathlib;pathlib.Path({str(marker)!r}).write_text('owned-by-logging-pth')\n"
+        )
+        assert not marker.exists()
+
+        site.addsitedir(str(tmp_path))
+        assert marker.read_text() == "owned-by-logging-pth"
+    finally:
+        sys.path[:] = original_sys_path
 
 
 def test_scan_bytes_blocks_inspect_getmembers_descriptor_rce(tmp_path: Path) -> None:

@@ -232,10 +232,17 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("itertools", "takewhile"),
     ("joblib", "_pickle_load"),
     ("joblib", "load"),
+    ("logging", "FileHandler"),
+    ("logging", "FileHandler.emit"),
     ("logging", "Filterer.filter"),
+    ("logging", "Handler.handle"),
+    ("logging", "StreamHandler.emit"),
     ("logging.config", "dictConfig"),
     ("logging.config", "fileConfig"),
     ("logging.config", "listen"),
+    ("logging.handlers", "RotatingFileHandler"),
+    ("logging.handlers", "TimedRotatingFileHandler"),
+    ("logging.handlers", "WatchedFileHandler"),
     ("mailcap", "findmatch"),
     ("numpy", "load"),
     ("numpy.f2py.crackfortran", "getlincoef"),
@@ -396,6 +403,21 @@ mod tests {
             global_severity("logging", "Filterer.filter"),
             Some("critical")
         );
+        for name in [
+            "FileHandler",
+            "FileHandler.emit",
+            "Handler.handle",
+            "StreamHandler.emit",
+        ] {
+            assert_eq!(global_severity("logging", name), Some("critical"));
+        }
+        for name in [
+            "RotatingFileHandler",
+            "TimedRotatingFileHandler",
+            "WatchedFileHandler",
+        ] {
+            assert_eq!(global_severity("logging.handlers", name), Some("critical"));
+        }
         assert_eq!(global_severity("io", "open"), Some("critical"));
         for name in ["Path.open", "Path.write_bytes", "Path.write_text"] {
             assert_eq!(global_severity("pathlib", name), Some("critical"));
