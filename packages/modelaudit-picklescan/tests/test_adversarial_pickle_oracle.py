@@ -392,6 +392,15 @@ def _has_critical_logging_filterer_filter_finding(report: PickleReport) -> bool:
     )
 
 
+def _has_critical_inspect_getmembers_finding(report: PickleReport) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "inspect"
+        and finding.details.get("name") == "getmembers"
+        for finding in report.findings
+    )
+
+
 def _has_critical_itertools_accumulate_finding(report: PickleReport) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -761,6 +770,25 @@ def _logging_filterer_filter_payload(marker: Path, *, include_call: bool) -> byt
         parts += [b"(", b"h\x00", b"h\x01", b"tR"]
     else:
         parts += [b"h\x00"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _inspect_getmembers_property_payload(marker: Path, *, include_call: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
+    parts += [b"(", _text_operand("DerivedPath")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
+    parts += [b"\x85", b"}", _text_operand("x")]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"property"), b"\x93"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"\x85R", b"s", b"tR\x940"]
+    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R\x940"]
+    if include_call:
+        parts += [_short_binunicode(b"inspect"), _short_binunicode(b"getmembers"), b"\x93"]
+        parts += [b"h\x01\x85R"]
+    else:
+        parts += [b"h\x01"]
     parts += [b"."]
     return b"".join(parts)
 
@@ -1509,6 +1537,30 @@ def test_scan_bytes_blocks_logging_filterer_filter_callback_rce(tmp_path: Path) 
     assert not marker.exists()
     result = pickle.loads(payload)
     assert result is False
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_inspect_getmembers_descriptor_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "inspect_getmembers_descriptor_rce_marker"
+    control_payload = _inspect_getmembers_property_payload(marker, include_call=False)
+    payload = _inspect_getmembers_property_payload(marker, include_call=True)
+
+    control_report = scan_bytes(control_payload, source="inspect-getmembers-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "DerivedPath"
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="inspect-getmembers-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_inspect_getmembers_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert ("x", None) in result
     assert marker.exists()
 
 

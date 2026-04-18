@@ -216,6 +216,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("functools", "lru_cache"),
     ("functools", "reduce"),
     ("functools", "singledispatch"),
+    ("inspect", "getmembers"),
     ("itertools", "accumulate"),
     ("itertools", "dropwhile"),
     ("itertools", "filterfalse"),
@@ -362,6 +363,7 @@ mod tests {
             global_severity("functools", "singledispatch"),
             Some("critical")
         );
+        assert_eq!(global_severity("inspect", "getmembers"), Some("critical"));
         assert_eq!(global_severity("itertools", "accumulate"), Some("critical"));
         assert_eq!(global_severity("itertools", "dropwhile"), Some("critical"));
         assert_eq!(

