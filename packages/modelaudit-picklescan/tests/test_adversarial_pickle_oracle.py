@@ -1012,6 +1012,31 @@ def _builtins_type_iteration_protocol_payload(
     return b"".join(parts)
 
 
+def _builtins_type_rounding_protocol_payload(
+    marker: Path,
+    *,
+    method_name: str,
+    module_name: str,
+    helper_name: str,
+    include_call: bool,
+) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
+    parts += [b"(", _text_operand("DerivedPath")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
+    parts += [b"\x85", b"}", _text_operand(method_name)]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"s", b"tR\x940"]
+    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R\x940"]
+    if include_call:
+        parts += [_short_binunicode(module_name.encode()), _short_binunicode(helper_name.encode()), b"\x93"]
+        parts += [b"h\x01", b"\x85R"]
+    else:
+        parts += [b"h\x01"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
 def _builtins_type_contains_membership_payload(marker: Path, *, include_call: bool) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
@@ -2019,6 +2044,57 @@ def test_scan_bytes_blocks_builtins_type_iteration_protocol_rce(
     else:
         result = pickle.loads(payload)
         assert result is None
+    assert marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("method_name", "module_name", "helper_name"),
+    [
+        ("__round__", "builtins", "round"),
+        ("__floor__", "math", "floor"),
+        ("__ceil__", "math", "ceil"),
+        ("__trunc__", "math", "trunc"),
+    ],
+)
+def test_scan_bytes_blocks_builtins_type_rounding_protocol_rce(
+    tmp_path: Path,
+    method_name: str,
+    module_name: str,
+    helper_name: str,
+) -> None:
+    marker = tmp_path / f"builtins_type_{helper_name}_rounding_protocol_rce_marker"
+    control_payload = _builtins_type_rounding_protocol_payload(
+        marker,
+        method_name=method_name,
+        module_name=module_name,
+        helper_name=helper_name,
+        include_call=False,
+    )
+    payload = _builtins_type_rounding_protocol_payload(
+        marker,
+        method_name=method_name,
+        module_name=module_name,
+        helper_name=helper_name,
+        include_call=True,
+    )
+
+    control_report = scan_bytes(control_payload, source=f"builtins-type-{helper_name}-rounding-control.pkl")
+    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(control_report)
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "DerivedPath"
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source=f"builtins-type-{helper_name}-rounding-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
     assert marker.exists()
 
 

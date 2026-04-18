@@ -383,12 +383,14 @@ fn is_suspicious_magic_method(value: &str) -> bool {
             | "__and__"
             | "__anext__"
             | "__call__"
+            | "__ceil__"
             | "__contains__"
             | "__del__"
             | "__delitem__"
             | "__enter__"
             | "__eq__"
             | "__exit__"
+            | "__floor__"
             | "__ge__"
             | "__getattribute__"
             | "__getattr__"
@@ -429,6 +431,7 @@ fn is_suspicious_magic_method(value: &str) -> bool {
             | "__ror__"
             | "__rpow__"
             | "__reversed__"
+            | "__round__"
             | "__rshift__"
             | "__rrshift__"
             | "__rsub__"
@@ -437,6 +440,7 @@ fn is_suspicious_magic_method(value: &str) -> bool {
             | "__setitem__"
             | "__setattr__"
             | "__sub__"
+            | "__trunc__"
             | "__truediv__"
             | "__xor__"
             | "__delattr__"
@@ -858,12 +862,14 @@ mod tests {
         assert!(suspicious_string_matches("__aiter__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__and__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__anext__").contains(&"magic method".to_string()));
+        assert!(suspicious_string_matches("__ceil__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__contains__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__del__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__delitem__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__enter__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__eq__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__exit__").contains(&"magic method".to_string()));
+        assert!(suspicious_string_matches("__floor__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__ge__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__getitem__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__gt__").contains(&"magic method".to_string()));
@@ -902,6 +908,7 @@ mod tests {
         assert!(suspicious_string_matches("__ror__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__rpow__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__reversed__").contains(&"magic method".to_string()));
+        assert!(suspicious_string_matches("__round__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__rshift__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__rrshift__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__rsub__").contains(&"magic method".to_string()));
@@ -909,6 +916,7 @@ mod tests {
         assert!(suspicious_string_matches("__rxor__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__setitem__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__sub__").contains(&"magic method".to_string()));
+        assert!(suspicious_string_matches("__trunc__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__truediv__").contains(&"magic method".to_string()));
         assert!(suspicious_string_matches("__xor__").contains(&"magic method".to_string()));
         assert!(!suspicious_string_matches("__1__").contains(&"magic method".to_string()));
