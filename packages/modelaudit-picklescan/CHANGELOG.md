@@ -40,6 +40,9 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Detect `mailcap.findmatch` pickle call targets that can execute
   attacker-controlled mailcap `test` commands on Python versions that still
   provide `mailcap`.
+- Detect `setuptools._distutils.spawn.spawn` pickle call targets that can
+  execute attacker-controlled subprocess command lists when `setuptools` is
+  installed.
 - Introduce the Rust-native pickle scanning engine and standalone Python API package.
 - Add `scan_bytes`, `scan_stream`, and `scan_file` entrypoints with typed immutable
   reports for findings, notices, errors, coverage, verdict, and scan status.

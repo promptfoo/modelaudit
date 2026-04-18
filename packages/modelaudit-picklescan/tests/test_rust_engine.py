@@ -154,6 +154,7 @@ def test_rust_parser_declares_all_pickletools_opcodes() -> None:
         ("pickle", "loads"),
         ("mailcap", "findmatch"),
         ("numpy", "load"),
+        ("setuptools._distutils.spawn", "spawn"),
         ("torch", "load"),
         ("uuid", "_ip_getnode"),
     ],

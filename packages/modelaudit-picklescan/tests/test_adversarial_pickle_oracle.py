@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pickle
 import shlex
+import shutil
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -292,6 +293,15 @@ def _has_critical_mailcap_findmatch_finding(report: PickleReport) -> bool:
     )
 
 
+def _has_critical_setuptools_distutils_spawn_finding(report: PickleReport) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "setuptools._distutils.spawn"
+        and finding.details.get("name") == "spawn"
+        for finding in report.findings
+    )
+
+
 def test_adversarial_oracle_corpus_is_large_enough() -> None:
     assert len(ADVERSARIAL_CASES) >= 300
 
@@ -340,6 +350,34 @@ def test_scan_bytes_blocks_mailcap_findmatch_test_command_rce(tmp_path: Path) ->
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_mailcap_findmatch_finding(report)
+
+    assert not marker.exists()
+    pickle.loads(payload)
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_setuptools_distutils_spawn_rce(tmp_path: Path) -> None:
+    try:
+        import setuptools._distutils.spawn as dist_spawn
+    except Exception as error:
+        pytest.skip(f"setuptools._distutils.spawn is unavailable: {error!s}")
+
+    touch_path = shutil.which("touch")
+    if touch_path is None:
+        pytest.skip("touch command is unavailable")
+
+    marker = tmp_path / "setuptools_distutils_spawn_rce_marker"
+
+    class SetuptoolsDistutilsSpawnRce:
+        def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+            return (dist_spawn.spawn, ([touch_path, str(marker)],))
+
+    payload = pickle.dumps(SetuptoolsDistutilsSpawnRce(), protocol=4)
+
+    report = scan_bytes(payload, source="setuptools-distutils-spawn-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_setuptools_distutils_spawn_finding(report)
 
     assert not marker.exists()
     pickle.loads(payload)

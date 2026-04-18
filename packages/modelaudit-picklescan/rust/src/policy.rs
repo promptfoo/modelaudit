@@ -212,6 +212,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("pkgutil", "resolve_name"),
     ("pkgutil", "walk_packages"),
     ("resource", "setrlimit"),
+    ("setuptools._distutils.spawn", "spawn"),
     ("site", "main"),
     ("tarfile", "open"),
     ("test.support.script_helper", "assert_python_ok"),
@@ -261,6 +262,10 @@ mod tests {
     fn dangerous_global_lookup_uses_sorted_table() {
         assert_eq!(global_severity("joblib", "load"), Some("critical"));
         assert_eq!(global_severity("mailcap", "findmatch"), Some("critical"));
+        assert_eq!(
+            global_severity("setuptools._distutils.spawn", "spawn"),
+            Some("critical")
+        );
         assert_eq!(
             global_severity("copyreg", "add_extension"),
             Some("critical")
