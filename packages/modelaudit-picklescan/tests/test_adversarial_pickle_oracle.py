@@ -321,6 +321,15 @@ def _has_critical_pipes_template_copy_finding(report: PickleReport) -> bool:
     )
 
 
+def _has_critical_operator_call_finding(report: PickleReport) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "operator"
+        and finding.details.get("name") == "call"
+        for finding in report.findings
+    )
+
+
 def _has_critical_typing_eval_type_finding(report: PickleReport) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -386,6 +395,20 @@ def _typing_get_type_hints_payload(marker: Path) -> bytes:
     parts += [b"tRs"]
     parts += [_short_binunicode(b"int"), _short_binunicode(b"builtins"), _short_binunicode(b"int"), b"\x93s"]
     parts += [b"N\x87R."]
+    return b"".join(parts)
+
+
+def _operator_call_payload(marker: Path) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"operator"), _short_binunicode(b"call"), b"\x93"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(marker).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
+    parts += [b"tR", b"\x86R."]
     return b"".join(parts)
 
 
@@ -497,6 +520,21 @@ def test_scan_bytes_blocks_pipes_template_copy_pipeline_rce(tmp_path: Path) -> N
     pickle.loads(payload)
     assert marker.exists()
     assert output.exists()
+
+
+def test_scan_bytes_blocks_operator_call_public_alias_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "operator_call_rce_marker"
+    payload = _operator_call_payload(marker)
+
+    report = scan_bytes(payload, source="operator-call-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_operator_call_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.exists()
 
 
 def test_scan_bytes_blocks_typing_eval_type_forward_ref_rce(tmp_path: Path) -> None:

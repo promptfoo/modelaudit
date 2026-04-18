@@ -155,6 +155,7 @@ def test_rust_parser_declares_all_pickletools_opcodes() -> None:
         ("pickle", "loads"),
         ("mailcap", "findmatch"),
         ("numpy", "load"),
+        ("operator", "call"),
         ("pipes", "Template.copy"),
         ("pipes", "Template.open"),
         ("pipes", "Template.open_r"),

