@@ -80,6 +80,9 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Detect additional stdlib callable pickle targets that can access files,
+  mutate registries, suppress diagnostics, or change process state, including
+  Python 3.13 `pathlib._local` concrete path aliases.
 - Detect policy-backed dangerous globals in post-budget tails instead of relying
   on a small hardcoded byte-needle table.
 - Detect nested payloads that use PERSID/BINPERSID semantics, proto-0 payloads,
