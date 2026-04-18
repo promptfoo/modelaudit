@@ -80,6 +80,7 @@ const BUILTIN_DANGEROUS_NAMES: &[&str] = &[
     "filter",
     "getattr",
     "globals",
+    "hasattr",
     "input",
     "locals",
     "map",
@@ -337,6 +338,7 @@ mod tests {
         assert_eq!(global_severity("pipes", "Template.open"), Some("critical"));
         assert_eq!(global_severity("operator", "call"), Some("critical"));
         assert_eq!(global_severity("builtins", "filter"), Some("critical"));
+        assert_eq!(global_severity("builtins", "hasattr"), Some("critical"));
         assert_eq!(global_severity("builtins", "map"), Some("critical"));
         assert_eq!(
             global_severity("builtins", "staticmethod"),

@@ -101,6 +101,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invoke attacker-controlled logging filter callbacks
 - **security:** detect `inspect.getmembers` pickle call targets that can
   invoke attacker-controlled descriptors during introspection
+- **security:** detect `builtins.hasattr` pickle call targets that can invoke
+  attacker-controlled descriptors during attribute-existence checks
 - **security:** detect `builtins.staticmethod` pickle call targets that can
   synthesize callable descriptors for later invocation
 - **security:** detect `builtins.property.__get__` pickle call targets that

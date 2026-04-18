@@ -329,6 +329,15 @@ def _has_critical_builtins_filter_finding(report: PickleReport) -> bool:
     )
 
 
+def _has_critical_builtins_hasattr_finding(report: PickleReport) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "builtins"
+        and finding.details.get("name") == "hasattr"
+        for finding in report.findings
+    )
+
+
 def _has_critical_builtins_staticmethod_finding(report: PickleReport) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -787,6 +796,25 @@ def _inspect_getmembers_property_payload(marker: Path, *, include_call: bool) ->
     if include_call:
         parts += [_short_binunicode(b"inspect"), _short_binunicode(b"getmembers"), b"\x93"]
         parts += [b"h\x01\x85R"]
+    else:
+        parts += [b"h\x01"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _builtins_hasattr_property_payload(marker: Path, *, include_call: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
+    parts += [b"(", _text_operand("DerivedPath")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
+    parts += [b"\x85", b"}", _text_operand("x")]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"property"), b"\x93"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"\x85R", b"s", b"tR\x940"]
+    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R\x940"]
+    if include_call:
+        parts += [_short_binunicode(b"builtins"), _short_binunicode(b"hasattr"), b"\x93"]
+        parts += [b"h\x01", _text_operand("x"), b"\x86R"]
     else:
         parts += [b"h\x01"]
     parts += [b"."]
@@ -1561,6 +1589,30 @@ def test_scan_bytes_blocks_inspect_getmembers_descriptor_rce(tmp_path: Path) -> 
     assert not marker.exists()
     result = pickle.loads(payload)
     assert ("x", None) in result
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_builtins_hasattr_descriptor_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "builtins_hasattr_descriptor_rce_marker"
+    control_payload = _builtins_hasattr_property_payload(marker, include_call=False)
+    payload = _builtins_hasattr_property_payload(marker, include_call=True)
+
+    control_report = scan_bytes(control_payload, source="builtins-hasattr-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "DerivedPath"
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="builtins-hasattr-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_builtins_hasattr_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is True
     assert marker.exists()
 
 
