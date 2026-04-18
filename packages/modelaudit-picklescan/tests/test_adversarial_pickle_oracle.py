@@ -575,6 +575,27 @@ def _threadpool_executor_submit_payload(marker: Path) -> bytes:
     return b"".join(parts)
 
 
+def _processpool_executor_submit_payload(marker: Path) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"concurrent.futures"), _short_binunicode(b"ProcessPoolExecutor"), b"\x93)R\x94"]
+    parts += [_short_binunicode(b"concurrent.futures"), _short_binunicode(b"ProcessPoolExecutor.submit"), b"\x93("]
+    parts += [b"h\x00"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(marker).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
+    parts += [b"tR", b"tR0"]
+    parts += [
+        _short_binunicode(b"concurrent.futures"),
+        _short_binunicode(b"ProcessPoolExecutor.shutdown"),
+        b"\x93h\x00\x85R.",
+    ]
+    return b"".join(parts)
+
+
 def _typing_eval_type_forward_ref_payload(marker: Path) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"typing"), _short_binunicode(b"_eval_type"), b"\x93"]
@@ -923,6 +944,35 @@ def test_scan_bytes_blocks_threadpool_executor_submitted_callback_rce(tmp_path: 
     assert not marker.exists()
     result = pickle.loads(payload)
     assert result is None
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_processpool_executor_submitted_callback_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "processpool_executor_submitted_callback_rce_marker"
+    payload = _processpool_executor_submit_payload(marker)
+
+    report = scan_bytes(payload, source="processpool-executor-submit-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_concurrent_futures_finding(report, "ProcessPoolExecutor.submit")
+    assert _has_critical_concurrent_futures_finding(report, "ProcessPoolExecutor.shutdown")
+
+    script_path = tmp_path / "run_processpool_payload.py"
+    script_path.write_text(
+        "import pickle\n"
+        f"PAYLOAD = bytes.fromhex({payload.hex()!r})\n"
+        "if __name__ == '__main__':\n"
+        "    assert pickle.loads(PAYLOAD) is None\n"
+    )
+
+    assert not marker.exists()
+    subprocess.run(
+        [sys.executable, str(script_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
     assert marker.exists()
 
 
