@@ -208,6 +208,10 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("pip._internal", "main"),
     ("pip._internal.cli.main", "main"),
     ("pip._vendor.distlib.scripts", "ScriptMaker"),
+    ("pipes", "Template.copy"),
+    ("pipes", "Template.open"),
+    ("pipes", "Template.open_r"),
+    ("pipes", "Template.open_w"),
     ("pkgutil", "get_importer"),
     ("pkgutil", "resolve_name"),
     ("pkgutil", "walk_packages"),
@@ -266,6 +270,8 @@ mod tests {
             global_severity("setuptools._distutils.spawn", "spawn"),
             Some("critical")
         );
+        assert_eq!(global_severity("pipes", "Template.copy"), Some("critical"));
+        assert_eq!(global_severity("pipes", "Template.open"), Some("critical"));
         assert_eq!(
             global_severity("copyreg", "add_extension"),
             Some("critical")

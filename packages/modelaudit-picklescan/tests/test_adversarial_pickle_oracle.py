@@ -302,6 +302,15 @@ def _has_critical_setuptools_distutils_spawn_finding(report: PickleReport) -> bo
     )
 
 
+def _has_critical_pipes_template_copy_finding(report: PickleReport) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "pipes"
+        and finding.details.get("name") == "Template.copy"
+        for finding in report.findings
+    )
+
+
 def test_adversarial_oracle_corpus_is_large_enough() -> None:
     assert len(ADVERSARIAL_CASES) >= 300
 
@@ -354,6 +363,34 @@ def test_scan_bytes_blocks_mailcap_findmatch_test_command_rce(tmp_path: Path) ->
     assert not marker.exists()
     pickle.loads(payload)
     assert marker.exists()
+
+
+def test_scan_bytes_blocks_pipes_template_copy_pipeline_rce(tmp_path: Path) -> None:
+    try:
+        import pipes
+    except Exception as error:
+        pytest.skip(f"pipes is unavailable: {error!s}")
+
+    marker = tmp_path / "pipes_template_copy_rce_marker"
+    output = tmp_path / "pipes_template_copy_output"
+
+    class PipesTemplateCopyRce:
+        def __reduce__(self) -> tuple[object, tuple[object, ...]]:
+            template = pipes.Template()
+            template.append(f"touch {shlex.quote(str(marker))}; cat $IN > $OUT", "ff")
+            return (pipes.Template.copy, (template, "/dev/null", str(output)))
+
+    payload = pickle.dumps(PipesTemplateCopyRce(), protocol=4)
+
+    report = scan_bytes(payload, source="pipes-template-copy-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_pipes_template_copy_finding(report)
+
+    assert not marker.exists()
+    pickle.loads(payload)
+    assert marker.exists()
+    assert output.exists()
 
 
 def test_scan_bytes_blocks_setuptools_distutils_spawn_rce(tmp_path: Path) -> None:

