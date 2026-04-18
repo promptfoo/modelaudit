@@ -186,6 +186,7 @@ def test_rust_parser_declares_all_pickletools_opcodes() -> None:
         ("site", "addpackage"),
         ("site", "addsitedir"),
         ("torch", "load"),
+        ("types", "MethodType"),
         ("typing", "_eval_type"),
         ("typing", "get_type_hints"),
         ("unittest", "TestLoader.discover"),

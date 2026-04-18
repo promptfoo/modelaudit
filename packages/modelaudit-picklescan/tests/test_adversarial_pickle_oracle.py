@@ -491,6 +491,15 @@ def _has_critical_contextvars_finding(report: PickleReport, name: str) -> bool:
     )
 
 
+def _has_critical_types_finding(report: PickleReport, name: str) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "types"
+        and finding.details.get("name") == name
+        for finding in report.findings
+    )
+
+
 def _has_critical_unittest_mock_finding(report: PickleReport, name: str) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -585,6 +594,24 @@ def _contextvars_context_run_payload(marker: Path) -> bytes:
     ]
     parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
     parts += [b"tR", b"tR."]
+    return b"".join(parts)
+
+
+def _types_methodtype_bound_method_payload(marker: Path, *, include_call: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(marker).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_text_operand(part) for part in marker.parts)
+    parts += [b"tR\x940"]
+    parts += [_short_binunicode(b"types"), _short_binunicode(b"MethodType"), b"\x93("]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"h\x00", b"tR"]
+    if include_call:
+        parts += [b")R"]
+    parts += [b"."]
     return b"".join(parts)
 
 
@@ -1083,6 +1110,31 @@ def test_scan_bytes_blocks_contextvars_context_run_callback_rce(tmp_path: Path) 
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_contextvars_finding(report, "Context.run")
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_types_methodtype_bound_method_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "types_methodtype_bound_method_rce_marker"
+    control_payload = _types_methodtype_bound_method_payload(marker, include_call=False)
+    payload = _types_methodtype_bound_method_payload(marker, include_call=True)
+
+    control_report = scan_bytes(control_payload, source="types-methodtype-bound-method-control.pkl")
+    assert control_report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_types_finding(control_report, "MethodType")
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "method"
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="types-methodtype-bound-method-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_types_finding(report, "MethodType")
 
     assert not marker.exists()
     result = pickle.loads(payload)

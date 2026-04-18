@@ -265,6 +265,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("torch.utils.data.datapipes.utils.decoder", "basichandlers"),
     ("types", "CodeType"),
     ("types", "FunctionType"),
+    ("types", "MethodType"),
     ("typing", "_eval_type"),
     ("typing", "get_type_hints"),
     ("unittest", "TestLoader.discover"),
@@ -420,6 +421,7 @@ mod tests {
             global_severity("dataclasses", "_create_fn"),
             Some("critical")
         );
+        assert_eq!(global_severity("types", "MethodType"), Some("critical"));
         assert_eq!(global_severity("site", "addsitedir"), Some("critical"));
         assert_eq!(global_severity("site", "addpackage"), Some("critical"));
         assert_eq!(global_severity("custom", "load"), None);
