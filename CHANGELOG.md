@@ -122,6 +122,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seeds that can execute attacker-controlled methods during operator dispatch
 - **security:** detect unary operator dunder string seeds that can execute
   attacker-controlled methods during operator dispatch
+- **security:** detect context-manager entry dunder string seeds and
+  `contextlib.ExitStack.enter_context` pickle call targets that can invoke
+  attacker-controlled `__enter__` methods
 - **security:** detect `builtins.staticmethod` pickle call targets that can
   synthesize callable descriptors for later invocation
 - **security:** detect `builtins.property.__get__` pickle call targets that

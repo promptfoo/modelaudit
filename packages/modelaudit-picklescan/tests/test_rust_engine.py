@@ -169,6 +169,7 @@ def test_rust_parser_declares_all_pickletools_opcodes() -> None:
         ("contextlib", "ExitStack.__exit__"),
         ("contextlib", "ExitStack.callback"),
         ("contextlib", "ExitStack.close"),
+        ("contextlib", "ExitStack.enter_context"),
         ("contextvars", "Context.run"),
         ("numpy", "load"),
         ("itertools", "accumulate"),

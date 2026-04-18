@@ -671,6 +671,26 @@ def _contextlib_exitstack_close_payload(marker: Path) -> bytes:
     return b"".join(parts)
 
 
+def _contextlib_exitstack_enter_context_payload(marker: Path, *, include_call: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
+    parts += [b"(", _text_operand("DerivedPath")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
+    parts += [b"\x85", b"}"]
+    parts += [_text_operand("__enter__"), _short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93s"]
+    parts += [_text_operand("__exit__"), _short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93s"]
+    parts += [b"tR\x940"]
+    parts += [_short_binunicode(b"contextlib"), _short_binunicode(b"ExitStack"), b"\x93)R\x940"]
+    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R\x940"]
+    if include_call:
+        parts += [_short_binunicode(b"contextlib"), _short_binunicode(b"ExitStack.enter_context"), b"\x93"]
+        parts += [b"h\x01h\x02\x86R"]
+    else:
+        parts += [b"h\x02"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
 def _contextvars_context_run_payload(marker: Path) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"contextvars"), _short_binunicode(b"Context"), b"\x93)R\x940"]
@@ -1604,6 +1624,32 @@ def test_scan_bytes_blocks_contextlib_exitstack_cleanup_callback_rce(tmp_path: P
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_contextlib_exitstack_finding(report, "ExitStack.callback")
     assert _has_critical_contextlib_exitstack_finding(report, "ExitStack.close")
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_contextlib_exitstack_enter_context_dunder_enter_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "contextlib_exitstack_enter_context_dunder_enter_rce_marker"
+    control_payload = _contextlib_exitstack_enter_context_payload(marker, include_call=False)
+    payload = _contextlib_exitstack_enter_context_payload(marker, include_call=True)
+
+    control_report = scan_bytes(control_payload, source="contextlib-exitstack-enter-context-control.pkl")
+    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(control_report)
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "DerivedPath"
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="contextlib-exitstack-enter-context-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_suspicious_magic_method_finding(report)
+    assert _has_critical_contextlib_exitstack_finding(report, "ExitStack.enter_context")
 
     assert not marker.exists()
     result = pickle.loads(payload)

