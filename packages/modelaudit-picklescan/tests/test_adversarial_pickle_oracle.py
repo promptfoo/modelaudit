@@ -690,6 +690,27 @@ def _types_dynamicclassattribute_get_payload(marker: Path, *, include_call: bool
     return b"".join(parts)
 
 
+def _functools_cached_property_get_payload(marker: Path, *, include_call: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"types"), _short_binunicode(b"new_class"), b"\x93"]
+    parts += [_text_operand("DerivedPath")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
+    parts += [b"\x85\x86R\x940"]
+    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R\x940"]
+    parts += [_short_binunicode(b"functools"), _short_binunicode(b"cached_property"), b"\x93"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"\x85R\x940"]
+    parts += [_short_binunicode(b"functools"), _short_binunicode(b"cached_property.__set_name__"), b"\x93"]
+    parts += [b"(", b"h\x02", b"h\x00", _text_operand("x"), b"tR0"]
+    if include_call:
+        parts += [_short_binunicode(b"functools"), _short_binunicode(b"cached_property.__get__"), b"\x93"]
+        parts += [b"(", b"h\x02", b"h\x01", b"h\x00", b"tR"]
+    else:
+        parts += [b"h\x02"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
 def _builtins_staticmethod_descriptor_payload(marker: Path, *, include_call: bool) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"builtins"), _short_binunicode(b"staticmethod"), b"\x93"]
@@ -1354,6 +1375,31 @@ def test_scan_bytes_blocks_types_dynamicclassattribute_get_descriptor_rce(tmp_pa
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_types_finding(report, "DynamicClassAttribute.__get__")
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_functools_cached_property_get_descriptor_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "functools_cached_property_get_descriptor_rce_marker"
+    control_payload = _functools_cached_property_get_payload(marker, include_call=False)
+    payload = _functools_cached_property_get_payload(marker, include_call=True)
+
+    control_report = scan_bytes(control_payload, source="functools-cached-property-get-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "cached_property"
+    assert control_result.attrname == "x"
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="functools-cached-property-get-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_functools_wrapper_finding(report, "cached_property.__get__")
 
     assert not marker.exists()
     result = pickle.loads(payload)

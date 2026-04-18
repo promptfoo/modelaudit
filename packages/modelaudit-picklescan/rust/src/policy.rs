@@ -211,6 +211,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("faulthandler", "_sigsegv"),
     ("faulthandler", "_stack_overflow"),
     ("functools", "cache"),
+    ("functools", "cached_property.__get__"),
     ("functools", "lru_cache"),
     ("functools", "reduce"),
     ("functools", "singledispatch"),
@@ -349,6 +350,10 @@ mod tests {
         assert_eq!(global_severity("_functools", "partial"), Some("critical"));
         assert_eq!(global_severity("_functools", "reduce"), Some("critical"));
         assert_eq!(global_severity("functools", "cache"), Some("critical"));
+        assert_eq!(
+            global_severity("functools", "cached_property.__get__"),
+            Some("critical")
+        );
         assert_eq!(global_severity("functools", "lru_cache"), Some("critical"));
         assert_eq!(
             global_severity("functools", "singledispatch"),

