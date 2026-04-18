@@ -145,6 +145,7 @@ def test_rust_parser_declares_all_pickletools_opcodes() -> None:
         ("builtins", "__import__"),
         ("atexit", "register"),
         ("_functools", "partial"),
+        ("_functools", "reduce"),
         ("_posixsubprocess", "fork_exec"),
         ("dataclasses", "_create_fn"),
         ("faulthandler", "_read_null"),

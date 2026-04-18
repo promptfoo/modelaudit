@@ -347,6 +347,15 @@ def _has_critical_private_functools_partial_finding(report: PickleReport) -> boo
     )
 
 
+def _has_critical_private_functools_reduce_finding(report: PickleReport) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "_functools"
+        and finding.details.get("name") == "reduce"
+        for finding in report.findings
+    )
+
+
 def _has_critical_itertools_accumulate_finding(report: PickleReport) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -668,6 +677,24 @@ def _private_functools_partial_payload(marker: Path, *, include_call: bool) -> b
         parts += [b"h\x00)R"]
     else:
         parts += [b"h\x00"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _private_functools_reduce_payload(marker: Path, *, include_call: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"_functools"), _short_binunicode(b"reduce"), b"\x93"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"]", b"M\xb6\x01", b"a"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(marker).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_text_operand(part) for part in marker.parts)
+    parts += [b"tR", b"\x87"]
+    if include_call:
+        parts += [b"R"]
     parts += [b"."]
     return b"".join(parts)
 
@@ -1243,6 +1270,32 @@ def test_scan_bytes_blocks_private_functools_partial_rce(tmp_path: Path) -> None
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_private_functools_partial_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_private_functools_reduce_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "private_functools_reduce_rce_marker"
+    control_payload = _private_functools_reduce_payload(marker, include_call=False)
+    payload = _private_functools_reduce_payload(marker, include_call=True)
+
+    control_report = scan_bytes(control_payload, source="private-functools-reduce-control.pkl")
+    assert control_report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_private_functools_reduce_finding(control_report)
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert isinstance(control_result, tuple)
+    assert len(control_result) == 3
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="private-functools-reduce-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_private_functools_reduce_finding(report)
 
     assert not marker.exists()
     result = pickle.loads(payload)

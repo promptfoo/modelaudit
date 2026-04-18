@@ -170,6 +170,7 @@ const DANGEROUS_WILDCARD_MODULES: &[&str] = &[
 const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("_aix_support", "_read_cmd_output"),
     ("_functools", "partial"),
+    ("_functools", "reduce"),
     ("_operator", "attrgetter"),
     ("_operator", "itemgetter"),
     ("_operator", "methodcaller"),
@@ -332,6 +333,7 @@ mod tests {
             Some("critical")
         );
         assert_eq!(global_severity("_functools", "partial"), Some("critical"));
+        assert_eq!(global_severity("_functools", "reduce"), Some("critical"));
         assert_eq!(global_severity("itertools", "accumulate"), Some("critical"));
         assert_eq!(global_severity("itertools", "dropwhile"), Some("critical"));
         assert_eq!(
