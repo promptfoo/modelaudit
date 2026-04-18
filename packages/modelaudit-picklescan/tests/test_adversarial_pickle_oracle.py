@@ -466,6 +466,15 @@ def _has_critical_unittest_mock_finding(report: PickleReport, name: str) -> bool
     )
 
 
+def _has_critical_concurrent_futures_finding(report: PickleReport, name: str) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "concurrent.futures"
+        and finding.details.get("name") == name
+        for finding in report.findings
+    )
+
+
 def _atexit_register_payload(marker: Path) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"atexit"), _short_binunicode(b"register"), b"\x93"]
@@ -542,6 +551,27 @@ def _unittest_mock_side_effect_payload(marker: Path, class_name: bytes = b"Mock"
     ]
     parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
     parts += [b"tR", b"\x85R."]
+    return b"".join(parts)
+
+
+def _threadpool_executor_submit_payload(marker: Path) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"concurrent.futures"), _short_binunicode(b"ThreadPoolExecutor"), b"\x93)R\x94"]
+    parts += [_short_binunicode(b"concurrent.futures"), _short_binunicode(b"ThreadPoolExecutor.submit"), b"\x93("]
+    parts += [b"h\x00"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(marker).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_short_binunicode(part.encode()) for part in marker.parts)
+    parts += [b"tR", b"tR0"]
+    parts += [
+        _short_binunicode(b"concurrent.futures"),
+        _short_binunicode(b"ThreadPoolExecutor.shutdown"),
+        b"\x93h\x00\x85R.",
+    ]
     return b"".join(parts)
 
 
@@ -873,6 +903,22 @@ def test_scan_bytes_blocks_unittest_mock_side_effect_rce(tmp_path: Path) -> None
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_unittest_mock_finding(report, "Mock")
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.exists()
+
+
+def test_scan_bytes_blocks_threadpool_executor_submitted_callback_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "threadpool_executor_submitted_callback_rce_marker"
+    payload = _threadpool_executor_submit_payload(marker)
+
+    report = scan_bytes(payload, source="threadpool-executor-submit-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_concurrent_futures_finding(report, "ThreadPoolExecutor.submit")
+    assert _has_critical_concurrent_futures_finding(report, "ThreadPoolExecutor.shutdown")
 
     assert not marker.exists()
     result = pickle.loads(payload)

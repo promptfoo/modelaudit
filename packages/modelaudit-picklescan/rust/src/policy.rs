@@ -181,6 +181,9 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("codecs", "decode"),
     ("codecs", "encode"),
     ("collections", "eval"),
+    ("concurrent.futures", "ThreadPoolExecutor.map"),
+    ("concurrent.futures", "ThreadPoolExecutor.shutdown"),
+    ("concurrent.futures", "ThreadPoolExecutor.submit"),
     ("contextlib", "ExitStack.__exit__"),
     ("contextlib", "ExitStack.callback"),
     ("contextlib", "ExitStack.close"),
@@ -319,6 +322,18 @@ mod tests {
         );
         assert_eq!(
             global_severity("copyreg", "add_extension"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("concurrent.futures", "ThreadPoolExecutor.submit"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("concurrent.futures", "ThreadPoolExecutor.map"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("concurrent.futures", "ThreadPoolExecutor.shutdown"),
             Some("critical")
         );
         assert_eq!(
