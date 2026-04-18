@@ -95,6 +95,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   synthesize callable descriptors for later invocation
 - **security:** detect `builtins.property.__get__` pickle call targets that
   can invoke attacker-controlled property getters during descriptor access
+- **security:** detect `builtins.classmethod.__get__` pickle call targets that
+  can synthesize attacker-controlled bound methods during descriptor access
 - **security:** detect `_functools.partial` pickle call targets that can
   synthesize private-alias partial callables for later invocation
 - **security:** detect `_functools.reduce` pickle call targets that can invoke

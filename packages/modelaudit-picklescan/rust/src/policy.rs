@@ -69,6 +69,7 @@ const BUILTIN_MODULES: &[&str] = &["builtins", "__builtin__", "__builtins__"];
 const BUILTIN_DANGEROUS_NAMES: &[&str] = &[
     "__import__",
     "breakpoint",
+    "classmethod.__get__",
     "compile",
     "delattr",
     "dir",
@@ -338,6 +339,10 @@ mod tests {
         );
         assert_eq!(
             global_severity("builtins", "property.__get__"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("builtins", "classmethod.__get__"),
             Some("critical")
         );
         assert_eq!(global_severity("_functools", "partial"), Some("critical"));

