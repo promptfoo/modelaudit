@@ -410,6 +410,15 @@ def _has_critical_site_finding(report: PickleReport, name: str) -> bool:
     )
 
 
+def _has_critical_unittest_loader_finding(report: PickleReport, name: str) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.details.get("module") == "unittest.loader"
+        and finding.details.get("name") == name
+        for finding in report.findings
+    )
+
+
 def _has_critical_pipes_template_copy_finding(report: PickleReport) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -662,6 +671,50 @@ def _site_addsitedir_pth_payload(pth_path: Path, marker: Path, *, include_addsit
     if include_addsitedir:
         parts += [b"0", _short_binunicode(b"site"), _short_binunicode(b"addsitedir"), b"\x93"]
         parts += [_text_operand(str(pth_path.parent)), b"\x85R"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _unittest_loader_discover_payload(
+    module_path: Path,
+    marker: Path,
+    *,
+    include_discover: bool,
+) -> bytes:
+    content_fragments = [
+        "im",
+        "port pathlib; pathlib.Path(",
+        repr(str(marker)),
+        ").touch()\n",
+    ]
+
+    parts = [b"\x80\x04"]
+    parts += [
+        _short_binunicode(b"pathlib"),
+        _short_binunicode(type(module_path).__name__.encode()),
+        b"\x93(",
+    ]
+    parts.extend(_text_operand(part) for part in module_path.parts)
+    parts += [b"tR\x940"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"str.join"), b"\x93("]
+    parts += [_short_binunicode(b""), b"("]
+    parts.extend(_text_operand(fragment) for fragment in content_fragments)
+    parts += [b"ttR\x940"]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.write_text"), b"\x93("]
+    parts += [b"h\x00", b"h\x01", b"tR"]
+    if include_discover:
+        parts += [
+            b"0",
+            _short_binunicode(b"unittest.loader"),
+            _short_binunicode(b"TestLoader"),
+            b"\x93)R\x940",
+        ]
+        parts += [
+            _short_binunicode(b"unittest.loader"),
+            _short_binunicode(b"TestLoader.discover"),
+            b"\x93(",
+        ]
+        parts += [b"h\x02", _text_operand(str(module_path.parent)), _text_operand(module_path.name), b"tR"]
     parts += [b"."]
     return b"".join(parts)
 
@@ -1094,6 +1147,46 @@ def test_scan_bytes_blocks_site_addsitedir_pth_execution_rce(tmp_path: Path) -> 
         assert marker.exists()
     finally:
         sys.path[:] = original_sys_path
+
+
+def test_scan_bytes_blocks_unittest_loader_discover_import_execution_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "unittest_loader_discover_import_execution_rce_marker"
+    module_path = tmp_path / "ma_unittest_loader_discover_exec.py"
+    module_name = module_path.stem
+    control_payload = _unittest_loader_discover_payload(
+        module_path,
+        marker,
+        include_discover=False,
+    )
+    payload = _unittest_loader_discover_payload(module_path, marker, include_discover=True)
+    original_sys_path = list(sys.path)
+
+    try:
+        sys.modules.pop(module_name, None)
+        control_report = scan_bytes(control_payload, source="unittest-loader-discover-control.pkl")
+        assert control_report.verdict == SafetyVerdict.CLEAN
+
+        assert not marker.exists()
+        control_result = pickle.loads(control_payload)
+        assert isinstance(control_result, int)
+        assert module_path.exists()
+        assert not marker.exists()
+
+        module_path.unlink()
+        sys.modules.pop(module_name, None)
+
+        report = scan_bytes(payload, source="unittest-loader-discover-rce.pkl")
+
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_unittest_loader_finding(report, "TestLoader.discover")
+
+        result = pickle.loads(payload)
+        assert type(result).__module__ == "unittest.suite"
+        assert type(result).__name__ == "TestSuite"
+        assert marker.exists()
+    finally:
+        sys.path[:] = original_sys_path
+        sys.modules.pop(module_name, None)
 
 
 def test_scan_bytes_blocks_dataclasses_create_fn_default_arg_rce(tmp_path: Path) -> None:

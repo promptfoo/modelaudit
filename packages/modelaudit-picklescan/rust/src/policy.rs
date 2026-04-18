@@ -267,6 +267,18 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("types", "FunctionType"),
     ("typing", "_eval_type"),
     ("typing", "get_type_hints"),
+    ("unittest", "TestLoader.discover"),
+    ("unittest", "TestLoader.loadTestsFromName"),
+    ("unittest", "TestLoader.loadTestsFromNames"),
+    ("unittest", "defaultTestLoader.discover"),
+    ("unittest", "defaultTestLoader.loadTestsFromName"),
+    ("unittest", "defaultTestLoader.loadTestsFromNames"),
+    ("unittest.loader", "TestLoader.discover"),
+    ("unittest.loader", "TestLoader.loadTestsFromName"),
+    ("unittest.loader", "TestLoader.loadTestsFromNames"),
+    ("unittest.loader", "defaultTestLoader.discover"),
+    ("unittest.loader", "defaultTestLoader.loadTestsFromName"),
+    ("unittest.loader", "defaultTestLoader.loadTestsFromNames"),
     ("unittest.mock", "MagicMock"),
     ("unittest.mock", "Mock"),
     ("uuid", "_arp_getnode"),
@@ -321,6 +333,16 @@ mod tests {
             global_severity("typing", "get_type_hints"),
             Some("critical")
         );
+        for (module, name) in [
+            ("unittest", "TestLoader.discover"),
+            ("unittest", "defaultTestLoader.discover"),
+            ("unittest.loader", "TestLoader.discover"),
+            ("unittest.loader", "defaultTestLoader.discover"),
+            ("unittest.loader", "TestLoader.loadTestsFromName"),
+            ("unittest.loader", "TestLoader.loadTestsFromNames"),
+        ] {
+            assert_eq!(global_severity(module, name), Some("critical"));
+        }
         assert_eq!(global_severity("unittest.mock", "Mock"), Some("critical"));
         assert_eq!(
             global_severity("unittest.mock", "MagicMock"),
