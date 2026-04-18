@@ -118,6 +118,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   seeds that can execute attacker-controlled methods during item access
 - **security:** detect binary arithmetic and bitwise dunder string seeds that
   can execute attacker-controlled methods during operator dispatch
+- **security:** detect reflected and in-place binary operator dunder string
+  seeds that can execute attacker-controlled methods during operator dispatch
 - **security:** detect `builtins.staticmethod` pickle call targets that can
   synthesize callable descriptors for later invocation
 - **security:** detect `builtins.property.__get__` pickle call targets that

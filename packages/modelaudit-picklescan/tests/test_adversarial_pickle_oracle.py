@@ -921,6 +921,7 @@ def _builtins_type_binary_operator_payload(
     method_name: str,
     operator_name: str,
     include_call: bool,
+    reverse_operands: bool = False,
 ) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
@@ -932,7 +933,11 @@ def _builtins_type_binary_operator_payload(
     parts += [b"h\x00", _text_operand(str(marker)), b"\x85R\x940"]
     if include_call:
         parts += [_short_binunicode(b"operator"), _short_binunicode(operator_name.encode()), b"\x93"]
-        parts += [b"h\x01", b"M" + (0o666).to_bytes(2, "little"), b"\x86R"]
+        mode_arg = b"M" + (0o666).to_bytes(2, "little")
+        if reverse_operands:
+            parts += [mode_arg, b"h\x01", b"\x86R"]
+        else:
+            parts += [b"h\x01", mode_arg, b"\x86R"]
     else:
         parts += [b"h\x01"]
     parts += [b"."]
@@ -1867,6 +1872,120 @@ def test_scan_bytes_blocks_builtins_type_binary_operator_rce(
     assert not marker.exists()
 
     report = scan_bytes(payload, source=f"builtins-type-{operator_name}-binary-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("method_name", "operator_name"),
+    [
+        ("__radd__", "add"),
+        ("__rsub__", "sub"),
+        ("__rmul__", "mul"),
+        ("__rmatmul__", "matmul"),
+        ("__rtruediv__", "truediv"),
+        ("__rmod__", "mod"),
+        ("__rpow__", "pow"),
+        ("__rlshift__", "lshift"),
+        ("__rrshift__", "rshift"),
+        ("__rand__", "and_"),
+        ("__rxor__", "xor"),
+        ("__ror__", "or_"),
+    ],
+)
+def test_scan_bytes_blocks_builtins_type_reflected_binary_operator_rce(
+    tmp_path: Path,
+    method_name: str,
+    operator_name: str,
+) -> None:
+    marker = tmp_path / f"builtins_type_{operator_name}_reflected_operator_rce_marker"
+    control_payload = _builtins_type_binary_operator_payload(
+        marker,
+        method_name=method_name,
+        operator_name=operator_name,
+        include_call=False,
+        reverse_operands=True,
+    )
+    payload = _builtins_type_binary_operator_payload(
+        marker,
+        method_name=method_name,
+        operator_name=operator_name,
+        include_call=True,
+        reverse_operands=True,
+    )
+
+    control_report = scan_bytes(control_payload, source=f"builtins-type-{operator_name}-reflected-control.pkl")
+    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(control_report)
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "DerivedPath"
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source=f"builtins-type-{operator_name}-reflected-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(report)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("method_name", "operator_name"),
+    [
+        ("__iadd__", "iadd"),
+        ("__isub__", "isub"),
+        ("__imul__", "imul"),
+        ("__imatmul__", "imatmul"),
+        ("__itruediv__", "itruediv"),
+        ("__imod__", "imod"),
+        ("__ipow__", "ipow"),
+        ("__ilshift__", "ilshift"),
+        ("__irshift__", "irshift"),
+        ("__iand__", "iand"),
+        ("__ixor__", "ixor"),
+        ("__ior__", "ior"),
+    ],
+)
+def test_scan_bytes_blocks_builtins_type_inplace_binary_operator_rce(
+    tmp_path: Path,
+    method_name: str,
+    operator_name: str,
+) -> None:
+    marker = tmp_path / f"builtins_type_{operator_name}_inplace_operator_rce_marker"
+    control_payload = _builtins_type_binary_operator_payload(
+        marker,
+        method_name=method_name,
+        operator_name=operator_name,
+        include_call=False,
+    )
+    payload = _builtins_type_binary_operator_payload(
+        marker,
+        method_name=method_name,
+        operator_name=operator_name,
+        include_call=True,
+    )
+
+    control_report = scan_bytes(control_payload, source=f"builtins-type-{operator_name}-inplace-control.pkl")
+    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(control_report)
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "DerivedPath"
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source=f"builtins-type-{operator_name}-inplace-rce.pkl")
 
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert _has_suspicious_magic_method_finding(report)
