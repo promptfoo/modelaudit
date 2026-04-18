@@ -988,6 +988,30 @@ def _builtins_type_unary_operator_payload(
     return b"".join(parts)
 
 
+def _builtins_type_iteration_protocol_payload(
+    marker: Path,
+    *,
+    method_name: str,
+    builtin_name: str,
+    include_call: bool,
+) -> bytes:
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
+    parts += [b"(", _text_operand("DerivedPath")]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(type(marker).__name__.encode()), b"\x93"]
+    parts += [b"\x85", b"}", _text_operand(method_name)]
+    parts += [_short_binunicode(b"pathlib"), _short_binunicode(b"Path.touch"), b"\x93"]
+    parts += [b"s", b"tR\x940"]
+    parts += [b"h\x00", _text_operand(str(marker)), b"\x85R\x940"]
+    if include_call:
+        parts += [_short_binunicode(b"builtins"), _short_binunicode(builtin_name.encode()), b"\x93"]
+        parts += [b"h\x01", b"\x85R"]
+    else:
+        parts += [b"h\x01"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
 def _builtins_type_contains_membership_payload(marker: Path, *, include_call: bool) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
@@ -1941,6 +1965,60 @@ def test_scan_bytes_blocks_builtins_type_unary_operator_rce(
     assert not marker.exists()
     result = pickle.loads(payload)
     assert result is None
+    assert marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("method_name", "builtin_name", "raises_type_error"),
+    [
+        ("__next__", "next", False),
+        ("__reversed__", "reversed", False),
+        ("__anext__", "anext", False),
+        ("__iter__", "iter", True),
+        ("__aiter__", "aiter", True),
+    ],
+)
+def test_scan_bytes_blocks_builtins_type_iteration_protocol_rce(
+    tmp_path: Path,
+    method_name: str,
+    builtin_name: str,
+    raises_type_error: bool,
+) -> None:
+    marker = tmp_path / f"builtins_type_{builtin_name}_iteration_protocol_rce_marker"
+    control_payload = _builtins_type_iteration_protocol_payload(
+        marker,
+        method_name=method_name,
+        builtin_name=builtin_name,
+        include_call=False,
+    )
+    payload = _builtins_type_iteration_protocol_payload(
+        marker,
+        method_name=method_name,
+        builtin_name=builtin_name,
+        include_call=True,
+    )
+
+    control_report = scan_bytes(control_payload, source=f"builtins-type-{builtin_name}-iteration-control.pkl")
+    assert control_report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(control_report)
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "DerivedPath"
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source=f"builtins-type-{builtin_name}-iteration-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert _has_suspicious_magic_method_finding(report)
+
+    assert not marker.exists()
+    if raises_type_error:
+        with pytest.raises(TypeError):
+            pickle.loads(payload)
+    else:
+        result = pickle.loads(payload)
+        assert result is None
     assert marker.exists()
 
 

