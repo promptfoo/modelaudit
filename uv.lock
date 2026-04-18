@@ -2395,7 +2395,7 @@ wheels = [
 
 [[package]]
 name = "modelaudit"
-version = "0.2.39"
+version = "0.2.40"
 source = { editable = "." }
 dependencies = [
     { name = "click" },

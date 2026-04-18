@@ -6,10 +6,22 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/modelaudit.svg)](https://pypi.org/project/modelaudit/)
 [![Code Style: ruff](https://img.shields.io/badge/code%20style-ruff-005cd7.svg)](https://github.com/astral-sh/ruff)
 [![License](https://img.shields.io/github/license/promptfoo/modelaudit)](https://github.com/promptfoo/modelaudit/blob/main/LICENSE)
+[![Security policy](https://img.shields.io/badge/security-policy-brightgreen.svg)](https://github.com/promptfoo/modelaudit/security/policy)
 
 <img width="989" alt="ModelAudit scan results" src="https://www.promptfoo.dev/img/docs/modelaudit/modelaudit-result.png" />
 
 **[Full Documentation](https://www.promptfoo.dev/docs/model-audit/)** | **[Usage Examples](https://www.promptfoo.dev/docs/model-audit/usage/)** | **[Supported Formats](https://www.promptfoo.dev/docs/model-audit/scanners/)**
+
+## Why ModelAudit
+
+Models download from untrusted registries, pass through CI, and end up running in production. Traditional SAST tools do not look at pickle opcodes, HDF5 group layouts, ONNX proto graphs, or TensorFlow SavedModel signatures — ModelAudit does:
+
+- **Scan statically.** No model is ever loaded, unpickled, or executed.
+- **Cover the formats you actually ship.** 40+ scanners spanning pickle, PyTorch, SafeTensors, ONNX, TensorFlow, Keras, GGUF, archives, and configs.
+- **Fit into CI.** Machine-readable output (JSON, SARIF), strict mode, exit codes, and [selectable scanners](https://github.com/promptfoo/modelaudit/blob/main/docs/user/scanner-selection.md).
+- **Fail closed.** Truncated reads, exhausted budgets, and unsupported formats are reported as coverage gaps, not silent passes.
+
+Comparable tools: [`picklescan`](https://github.com/mmaitre314/picklescan) (pickle only, Python-based), [`fickling`](https://github.com/trailofbits/fickling) (pickle only, AST-based), [`modelscan`](https://github.com/protectai/modelscan) (pickle + TensorFlow + Keras subset). ModelAudit is broader in coverage and ships a native Rust pickle engine via its companion package [`modelaudit-picklescan`](https://pypi.org/project/modelaudit-picklescan/).
 
 ## Quick Start
 
@@ -280,6 +292,18 @@ modelaudit model.pkl --format sarif --output results.sarif
 - **[Metadata extraction guide](https://github.com/promptfoo/modelaudit/blob/main/docs/user/metadata-extraction.md)** — safe metadata workflows and `--trust-loaders` guidance
 - **[Offline/air-gapped guide](https://github.com/promptfoo/modelaudit/blob/main/docs/user/offline-air-gapped.md)** — secure operation without internet access
 - **Troubleshooting** — run `modelaudit doctor --show-failed` to check scanner availability
+
+## Related Packages
+
+- **[`modelaudit-picklescan`](https://pypi.org/project/modelaudit-picklescan/)** — the standalone Rust-backed pickle scanner used by ModelAudit's pickle, PyTorch, ExecuTorch, and PyTorch-ZIP scanners. Install it directly if you only need pickle analysis (as a library, not a CLI) and do not want the full scanner bundle.
+
+## Reporting Vulnerabilities
+
+Do not open public issues for suspected vulnerabilities. See [SECURITY.md](https://github.com/promptfoo/modelaudit/blob/main/SECURITY.md) for coordinated disclosure.
+
+## Contributing
+
+Issues, feature requests, and PRs are welcome. See [CONTRIBUTING.md](https://github.com/promptfoo/modelaudit/blob/main/CONTRIBUTING.md).
 
 ## License
 
