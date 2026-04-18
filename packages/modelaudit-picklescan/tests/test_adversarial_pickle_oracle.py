@@ -840,6 +840,10 @@ def _tuple_payload_operands(operands: list[bytes]) -> bytes:
     return b"(" + b"".join(operands) + b"t"
 
 
+def _dict_setitem(key: str, value: bytes) -> bytes:
+    return _text_operand(key) + value + b"s"
+
+
 def _log_record_payload(message: str, args: bytes = b")") -> list[bytes]:
     return [
         _short_binunicode(b"logging"),
@@ -939,6 +943,64 @@ def _codecs_open_pth_payload(pth_path: Path, marker: Path) -> bytes:
         parts += [b"h\x00", _text_operand(fragment), b"\x86R0"]
     parts += [_short_binunicode(b"codecs"), _short_binunicode(b"StreamReaderWriter.write"), b"\x93"]
     parts += [b"h\x00", _text_operand(fragments[-1]), b"\x86R."]
+    return b"".join(parts)
+
+
+def _csv_tempfile_pth_payload(
+    target_dir: Path,
+    marker: Path,
+    *,
+    include_write: bool,
+    writer_method: str,
+) -> bytes:
+    fragments = [
+        "im",
+        "port pathlib;pathlib.Path(",
+        repr(str(marker)),
+        ").write_text('owned-by-csv-tempfile')\n",
+    ]
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"tempfile"), _short_binunicode(b"NamedTemporaryFile"), b"\x93"]
+    parts += [
+        b"(",
+        _text_operand("w"),
+        b"J\xff\xff\xff\xff",
+        b"N",
+        _text_operand(""),
+        _text_operand(".pth"),
+        _text_operand("ma_csv_"),
+        _text_operand(str(target_dir)),
+        b"\x89",
+        b"tR\x94",
+    ]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"str.join"), b"\x93"]
+    parts += [_text_operand(""), _tuple_payload_operands([_text_operand(fragment) for fragment in fragments])]
+    parts += [b"\x86R\x94"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
+    parts += [b"(", _text_operand("CsvPthDialect"), b")", b"}"]
+    parts += [
+        _dict_setitem("delimiter", _text_operand(",")),
+        _dict_setitem("quotechar", _text_operand('"')),
+        _dict_setitem("lineterminator", b"h\x01"),
+        _dict_setitem("quoting", b"K\x03"),
+        _dict_setitem("doublequote", b"\x88"),
+        _dict_setitem("skipinitialspace", b"\x89"),
+        _dict_setitem("escapechar", _text_operand("\\")),
+        _dict_setitem("strict", b"\x89"),
+        b"tR\x94",
+    ]
+    parts += [_short_binunicode(b"csv"), _short_binunicode(b"DictWriter"), b"\x93"]
+    parts += [b"(", b"h\x00", b")", _text_operand(""), _text_operand("raise"), b"h\x02", b"tR\x94"]
+    if include_write:
+        parts += [_short_binunicode(b"csv"), _short_binunicode(writer_method.encode()), b"\x93"]
+        if writer_method == "DictWriter.writerow":
+            parts += [b"h\x03", b"}", b"\x86R0"]
+        elif writer_method == "DictWriter.writerows":
+            parts += [b"h\x03", b"]}a", b"\x86R0"]
+        else:
+            raise ValueError(f"unexpected CSV writer method: {writer_method}")
+    parts += [_short_binunicode(b"tempfile"), _short_binunicode(b"_TemporaryFileWrapper.close"), b"\x93"]
+    parts += [b"h\x00\x85R."]
     return b"".join(parts)
 
 
@@ -2329,6 +2391,65 @@ def test_scan_bytes_blocks_codecs_open_fragmented_pth_rce(tmp_path: Path) -> Non
 
         site.addsitedir(str(tmp_path))
         assert marker.read_text() == "owned-by-codecs-pth"
+    finally:
+        sys.path[:] = original_sys_path
+
+
+@pytest.mark.parametrize("writer_method", ["DictWriter.writerow", "DictWriter.writerows"])
+def test_scan_bytes_blocks_csv_tempfile_fragmented_pth_rce(tmp_path: Path, writer_method: str) -> None:
+    marker = tmp_path / f"csv_tempfile_{writer_method.rsplit('.', maxsplit=1)[-1]}_pth_rce_marker"
+    control_payload = _csv_tempfile_pth_payload(
+        tmp_path,
+        marker,
+        include_write=False,
+        writer_method=writer_method,
+    )
+    payload = _csv_tempfile_pth_payload(
+        tmp_path,
+        marker,
+        include_write=True,
+        writer_method=writer_method,
+    )
+    original_sys_path = list(sys.path)
+
+    try:
+        control_report = scan_bytes(control_payload, source=f"csv-tempfile-{writer_method}-control.pkl")
+        assert control_report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_global_finding(control_report, "tempfile", "NamedTemporaryFile")
+
+        assert not list(tmp_path.glob("ma_csv_*.pth"))
+        assert not marker.exists()
+        control_result = pickle.loads(control_payload)
+        assert control_result is None
+        control_pths = list(tmp_path.glob("ma_csv_*.pth"))
+        assert len(control_pths) == 1
+        assert control_pths[0].read_text() == ""
+        assert not marker.exists()
+
+        site.addsitedir(str(tmp_path))
+        assert not marker.exists()
+        sys.path[:] = original_sys_path
+        control_pths[0].unlink()
+
+        report = scan_bytes(payload, source=f"csv-tempfile-{writer_method}-pth-rce.pkl")
+
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_global_finding(report, "tempfile", "NamedTemporaryFile")
+        assert _has_critical_global_finding(report, "csv", writer_method)
+
+        assert not list(tmp_path.glob("ma_csv_*.pth"))
+        assert not marker.exists()
+        result = pickle.loads(payload)
+        assert result is None
+        pths = list(tmp_path.glob("ma_csv_*.pth"))
+        assert len(pths) == 1
+        assert pths[0].read_text() == (
+            f"import pathlib;pathlib.Path({str(marker)!r}).write_text('owned-by-csv-tempfile')\n"
+        )
+        assert not marker.exists()
+
+        site.addsitedir(str(tmp_path))
+        assert marker.read_text() == "owned-by-csv-tempfile"
     finally:
         sys.path[:] = original_sys_path
 

@@ -206,6 +206,8 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("contextvars", "Context.run"),
     ("copyreg", "add_extension"),
     ("copyreg", "remove_extension"),
+    ("csv", "DictWriter.writerow"),
+    ("csv", "DictWriter.writerows"),
     ("dataclasses", "_create_fn"),
     ("dill", "load"),
     ("dill", "load_module"),
@@ -276,6 +278,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("site", "addsitedir"),
     ("site", "main"),
     ("tarfile", "open"),
+    ("tempfile", "NamedTemporaryFile"),
     ("test.support.script_helper", "assert_python_ok"),
     ("torch", "compile"),
     ("torch", "load"),
@@ -458,6 +461,14 @@ mod tests {
             Some("critical")
         );
         assert_eq!(
+            global_severity("csv", "DictWriter.writerow"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("csv", "DictWriter.writerows"),
+            Some("critical")
+        );
+        assert_eq!(
             global_severity("concurrent.futures", "ProcessPoolExecutor.submit"),
             Some("critical")
         );
@@ -513,6 +524,10 @@ mod tests {
         assert_eq!(global_severity("sched", "scheduler.run"), Some("critical"));
         assert_eq!(
             global_severity("dataclasses", "_create_fn"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("tempfile", "NamedTemporaryFile"),
             Some("critical")
         );
         assert_eq!(global_severity("types", "MethodType"), Some("critical"));

