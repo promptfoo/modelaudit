@@ -106,6 +106,28 @@ def _builtins_help_call_iterator_next_payload(*, consume: bool, with_default: bo
     return b"".join(parts)
 
 
+def _builtins_help_call_iterator_deque_payload(*, consume: bool, with_maxlen: bool = False) -> bytes:
+    parts = [
+        b"\x80\x04",
+        _global_operand("builtins", "iter"),
+        _global_operand("builtins", "help"),
+        _unicode_operand("stop"),
+        b"\x86R",
+    ]
+    if consume:
+        parts.extend(
+            [
+                b"\x94",
+                b"0",
+                _global_operand("collections", "deque"),
+                _args_tuple(b"h\x00", b"K\x00") if with_maxlen else _args_tuple(b"h\x00"),
+                b"R",
+            ]
+        )
+    parts.append(b".")
+    return b"".join(parts)
+
+
 def _sitebuiltins_helper_defaultdict_payload(*, lookup: bool) -> bytes:
     parts = [
         b"\x80\x04",
@@ -894,6 +916,97 @@ if marker.read_text() != marker_content:
 """
     result = subprocess.run(
         [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+@pytest.mark.parametrize("with_maxlen", [False, True])
+def test_scan_bytes_blocks_deque_call_iterator_consumption_rce(
+    tmp_path: Path,
+    with_maxlen: bool,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "deque_call_iterator_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'stop'\n",
+        encoding="utf-8",
+    )
+
+    lazy_payload = _builtins_help_call_iterator_deque_payload(consume=False)
+    report = scan_bytes(lazy_payload, source="deque-call-iterator-lazy.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+
+    payload = _builtins_help_call_iterator_deque_payload(consume=True, with_maxlen=with_maxlen)
+    suffix = "maxlen" if with_maxlen else "single"
+    report = scan_bytes(payload, source=f"deque-call-iterator-{suffix}-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+expected_maxlen = None if sys.argv[5] == "None" else int(sys.argv[5])
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if type(result).__name__ != "deque":
+    raise SystemExit(f"expected deque result, got {type(result).__name__}")
+if len(result) != 0:
+    raise SystemExit(f"expected empty deque result, got {result!r}")
+if result.maxlen != expected_maxlen:
+    raise SystemExit(f"expected maxlen {expected_maxlen!r}, got {result.maxlen!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    expected_maxlen = "0" if with_maxlen else "None"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            str(module_dir),
+            str(marker),
+            payload.hex(),
+            marker_content,
+            expected_maxlen,
+        ],
         cwd=str(tmp_path.parent),
         env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
         check=False,

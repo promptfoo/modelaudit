@@ -1198,13 +1198,11 @@ impl<'a> ScanState<'a> {
         let Some(arguments) = argument_values else {
             return Vec::new();
         };
-        if Self::is_eager_call_iterator_consumer(
+        if let Some(callable) = Self::eager_call_iterator_consumed_callable(
             &callable_reference.module,
             &callable_reference.name,
+            arguments,
         ) {
-            let [StackValue::CallIterator { callable }] = arguments else {
-                return Vec::new();
-            };
             return vec![Self::zero_arg_invocation(callable, op_name, position)];
         }
 
@@ -1221,14 +1219,40 @@ impl<'a> ScanState<'a> {
         vec![Self::zero_arg_invocation(callable, op_name, position)]
     }
 
-    fn is_eager_call_iterator_consumer(module: &str, name: &str) -> bool {
+    fn eager_call_iterator_consumed_callable<'b>(
+        module: &str,
+        name: &str,
+        arguments: &'b [StackValue],
+    ) -> Option<&'b GlobalRef> {
+        if Self::is_single_arg_eager_call_iterator_consumer(module, name) {
+            let [StackValue::CallIterator { callable }] = arguments else {
+                return None;
+            };
+            return Some(callable);
+        }
+        if !Self::is_deque_call_iterator_consumer(module, name)
+            || !(1..=2).contains(&arguments.len())
+        {
+            return None;
+        }
+        match arguments.first() {
+            Some(StackValue::CallIterator { callable }) => Some(callable),
+            _ => None,
+        }
+    }
+
+    fn is_single_arg_eager_call_iterator_consumer(module: &str, name: &str) -> bool {
         matches!(
             (module, name),
             (
                 "builtins" | "__builtin__" | "__builtins__",
                 "dict" | "frozenset" | "list" | "set" | "tuple"
-            ) | ("collections", "deque")
+            )
         )
+    }
+
+    fn is_deque_call_iterator_consumer(module: &str, name: &str) -> bool {
+        matches!((module, name), ("collections", "deque"))
     }
 
     fn is_next_call_iterator_consumer(module: &str, name: &str) -> bool {
