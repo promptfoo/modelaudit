@@ -10017,3 +10017,120 @@ Performance sanity:
   subprocess.getstatusoutput -> subprocess.check_output`.
 - Existing wrapper timings stayed in the same range:
   `click.edit` at `0.0489s` and `execnet.makegateway` at `0.0409s`.
+
+## Turn 181 - Bypass via `six.moves.cPickle.loads` with constructed bytes
+
+Found a scanner-clean RCE primitive through another `six.moves` compatibility
+alias, this time to the pickle deserializer itself.
+
+Malicious pickle shape:
+
+- Import `six.moves.cPickle.loads` with `STACK_GLOBAL`.
+- Build the inner malicious pickle bytes at unpickle time by calling
+  `builtins.bytes(list_of_ints)`.
+- Pass that constructed `bytes` object to `six.moves.cPickle.loads`.
+- The inner pickle then reduces to `posix.system` and writes the marker.
+
+The payload intentionally does not contain a raw, base64, or hex nested pickle
+literal. The inner pickle byte stream is split into individual `BININT1` opcode
+values and reassembled by `builtins.bytes`, so the nested-literal scanner has no
+contiguous pickle blob to decode.
+
+Proof on CPython 3.12.12 with `six==1.17.0` installed:
+
+- Runtime `six.moves.cPickle.loads` resolves to `<built-in function loads>` with
+  `__module__ == "_pickle"` and `__name__ == "loads"`.
+- `six.py` registers the alias as `MovedModule("cPickle", "cPickle", "pickle")`.
+- `_call_graph_entrypoints("six.moves.cPickle.loads") == ()`.
+- `_find_sink_path("six.moves.cPickle.loads") is None`.
+- Active payload scanner result: `len=295`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references:
+  `six.moves.cPickle.loads` with `is_dangerous=False` and
+  `builtins.bytes` with `is_dangerous=False`.
+- Runtime before unpickle: marker absent.
+- Runtime after unpickle: marker exists and contains
+  `owned-by-six-cpickle-int-list`; `pickle.loads(payload)` returns `0`.
+
+Additional probe results:
+
+- The same integer-list payload shape also scanned clean and executed through
+  module/name `six.moves`/`cPickle.loads`.
+- The same payload shape also scanned clean and executed through vendored
+  module/name `botocore.vendored.six.moves.cPickle`/`loads` and
+  `botocore.vendored.six.moves`/`cPickle.loads`.
+- Direct `pickle.loads` with the same `builtins.bytes(list_of_ints)` argument
+  scans `malicious` with `DANGEROUS_CALL`, proving the lower-level primitive is
+  already blocked when imported directly.
+- `six.moves.cPickle.loads` with a raw nested pickle bytes argument scans
+  `malicious` through the nested-pickle detector (`DANGEROUS_CALL` plus `S213`),
+  proving this bypass depends on runtime byte construction rather than raw
+  nested bytes.
+- A control pickle that only calls `builtins.bytes(list_of_ints)` scans `clean`
+  and returns the intended inner pickle bytes without executing them.
+
+Why the scanner missed it:
+
+- Turn 180 generalized only the `*.six.moves.getoutput` subprocess alias.
+- `six.moves.cPickle` is a lazy synthetic module alias to `pickle`; the call
+  graph does not parse `MovedModule("cPickle", ..., "pickle")`, and the native
+  dangerous-global table sees only the literal import reference
+  `six.moves.cPickle.loads`.
+- The nested-pickle scanner handles raw/base64/hex nested pickle literals, but
+  it does not emulate arbitrary object construction such as
+  `bytes([0x80, 0x04, ...])`.
+
+Performance note: the next defensive turn should fix closest to the source by
+normalizing `*.six.moves.cPickle.loads` to `pickle.loads` (and likely
+`*.six.moves.cPickle.load` to `pickle.load`) before call-graph analysis. That
+blocks the deserialization sink regardless of how the bytes argument is built,
+without adding expensive stack-value emulation for arbitrary integer lists.
+
+## Turn 182 - Block `six.moves.cPickle` deserializer aliases
+
+Implemented a source-focused block for the Turn 181 constructed-bytes bypass.
+
+The static import-reference alias suffix table now includes:
+
+- `*.six.moves.cPickle.load -> pickle.load`
+- `*.six.moves.cPickle.loads -> pickle.loads`
+- existing `*.six.moves.getoutput -> subprocess.getoutput`
+
+The call-path walker also now treats an alias-resolved target as a terminal sink
+when the target itself is dangerous. That matters for `pickle.loads`, because it
+is already a sink even when there is no Python source body to traverse.
+
+Regression coverage updated in
+`packages/modelaudit-picklescan/tests/test_call_graph_six.py`:
+
+- `_call_graph_entrypoints("six.moves.cPickle.loads")` now resolves to
+  `pickle.loads`.
+- `_find_sink_path("six.moves.cPickle.loads")` now returns a path ending in
+  `pickle.loads`.
+- The same assertions cover vendored
+  `botocore.vendored.six.moves.cPickle.loads`.
+- Both `load` and `loads` aliases are normalized.
+- The Turn 181 payload that reconstructs the inner pickle with
+  `builtins.bytes(list_of_ints)` now scans `malicious` with
+  `DANGEROUS_CALL_GRAPH` for both top-level and vendored `six` import spellings.
+- The control pickle that only constructs the bytes remains `clean`.
+
+Focused validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_call_graph_six.py`
+  passed: `14 passed`.
+- `ruff format`, `ruff check --fix`, and `mypy` passed on the standard
+  ModelAudit paths.
+- Full non-slow/non-integration validation passed:
+  `3689 passed, 1022 skipped, 21 warnings in 54.21s`.
+
+Performance sanity:
+
+- `_find_sink_path("six.moves.cPickle.loads")`: effectively `0.0000s`, path
+  `six.moves.cPickle.loads -> pickle.loads`.
+- `_find_sink_path("botocore.vendored.six.moves.cPickle.loads")`:
+  effectively `0.0000s`, path
+  `botocore.vendored.six.moves.cPickle.loads -> pickle.loads`.
+- Existing wrapper timings stayed in the same range:
+  `six.moves.getoutput` at `0.0115s`, `click.edit` at `0.0552s`, and
+  `execnet.makegateway` at `0.0457s`.

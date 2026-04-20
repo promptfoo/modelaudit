@@ -77,6 +77,8 @@ _SUBPROCESS_DISPATCH_SUFFIXES = (
     ".subprocess.run",
 )
 _STATIC_IMPORT_REFERENCE_ALIAS_SUFFIXES = {
+    "six.moves.cPickle.load": "pickle.load",
+    "six.moves.cPickle.loads": "pickle.loads",
     "six.moves.getoutput": "subprocess.getoutput",
 }
 _SHORT_SINK_PRIORITY_TOKENS = (
@@ -268,6 +270,15 @@ def _find_matching_call_path(start: str, sink_for: Callable[[str], str | None]) 
 
     while queue and len(visited) <= _MAX_VISITED_FUNCTIONS:
         function_name, path = queue.popleft()
+        sink = sink_for(function_name)
+        if sink is not None:
+            return path
+        resolved_function = _resolve_function_target(function_name)
+        if resolved_function is not None and resolved_function != function_name:
+            sink = sink_for(resolved_function)
+            if sink is not None:
+                return (*path, sink)
+
         calls = _calls_for_function(function_name)
         if calls is None:
             continue
@@ -363,7 +374,7 @@ def _call_graph_entrypoints(function_name: str) -> tuple[str, ...]:
 def _resolve_function_target(function_name: str) -> str | None:
     alias_target = _static_import_reference_alias(function_name)
     if alias_target is not None and alias_target != function_name:
-        return _resolve_function_target(alias_target)
+        return _resolve_alias_function_target(alias_target)
 
     module_name, qualified_name = _split_function_name(function_name)
     if module_name is None:
@@ -377,8 +388,18 @@ def _resolve_function_target(function_name: str) -> str | None:
     if "." not in qualified_name:
         alias_target = analysis.aliases.get(qualified_name)
         if alias_target is not None and alias_target != function_name:
-            return _resolve_function_target(alias_target)
+            return _resolve_alias_function_target(alias_target)
     return None
+
+
+def _resolve_alias_function_target(alias_target: str) -> str | None:
+    if (
+        _rce_sink(alias_target) is not None
+        or _file_open_sink(alias_target) is not None
+        or _file_write_sink(alias_target) is not None
+    ):
+        return alias_target
+    return _resolve_function_target(alias_target)
 
 
 def _static_import_reference_alias(function_name: str) -> str | None:

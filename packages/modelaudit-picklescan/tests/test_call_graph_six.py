@@ -73,8 +73,52 @@ def _six_moves_getoutput_payload(module: str, name: str, marker: Path) -> tuple[
     return payload, marker_content
 
 
+def _int_list_operand(values: bytes) -> bytes:
+    return b"](" + b"".join(b"K" + bytes([value]) for value in values) + b"e"
+
+
+def _constructed_bytes_operand(values: bytes) -> bytes:
+    return b"".join(
+        [
+            _global_operand("builtins", "bytes"),
+            _tuple_payload_operands([_int_list_operand(values)]),
+            b"R",
+        ]
+    )
+
+
+def _posix_system_payload(command: str) -> bytes:
+    return b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("posix", "system"),
+            _tuple_payload_operands([_text_operand(command)]),
+            b"R.",
+        ]
+    )
+
+
+def _six_moves_cpickle_loads_payload(module: str, name: str, marker: Path) -> tuple[bytes, bytes, str]:
+    marker_content = "owned-by-six-cpickle-int-list"
+    command = f"printf {shlex.quote(marker_content)} > {shlex.quote(str(marker))}"
+    inner_payload = _posix_system_payload(command)
+    payload = b"".join(
+        [
+            b"\x80\x04",
+            _global_operand(module, name),
+            _tuple_payload_operands([_constructed_bytes_operand(inner_payload)]),
+            b"R.",
+        ]
+    )
+    return payload, inner_payload, marker_content
+
+
 def _control_payload(command: str) -> bytes:
     return b"\x80\x04" + _text_operand(command) + b"."
+
+
+def _constructed_bytes_control_payload(values: bytes) -> bytes:
+    return b"\x80\x04" + _constructed_bytes_operand(values) + b"."
 
 
 def _has_critical_call_graph_finding(report: PickleReport, module: str, name: str, sink: str) -> bool:
@@ -101,6 +145,23 @@ def test_call_graph_resolves_six_moves_getoutput_alias(reference: str) -> None:
     path = _find_sink_path(reference)
     assert path is not None
     assert path[-2:] == ("subprocess.getstatusoutput", "subprocess.check_output")
+
+
+@pytest.mark.parametrize(
+    ("reference", "sink"),
+    [
+        ("six.moves.cPickle.load", "pickle.load"),
+        ("six.moves.cPickle.loads", "pickle.loads"),
+        ("botocore.vendored.six.moves.cPickle.load", "pickle.load"),
+        ("botocore.vendored.six.moves.cPickle.loads", "pickle.loads"),
+    ],
+)
+def test_call_graph_resolves_six_moves_cpickle_aliases(reference: str, sink: str) -> None:
+    assert _call_graph_entrypoints(reference) == (sink,)
+
+    path = _find_sink_path(reference)
+    assert path is not None
+    assert path[-1] == sink
 
 
 @pytest.mark.parametrize(
@@ -135,4 +196,42 @@ def test_scan_bytes_blocks_six_moves_getoutput_rce(module: str, name: str, tmp_p
 
     assert not marker.exists()
     assert pickle.loads(payload) == ""
+    assert marker.read_text() == marker_content
+
+
+@pytest.mark.parametrize(
+    ("module", "name"),
+    [
+        ("six.moves.cPickle", "loads"),
+        ("six.moves", "cPickle.loads"),
+        ("botocore.vendored.six.moves.cPickle", "loads"),
+        ("botocore.vendored.six.moves", "cPickle.loads"),
+    ],
+)
+@pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
+def test_scan_bytes_blocks_six_moves_cpickle_loads_constructed_bytes_rce(
+    module: str,
+    name: str,
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / f"{module.replace('.', '_')}_{name.replace('.', '_')}_rce_marker"
+    payload, inner_payload, marker_content = _six_moves_cpickle_loads_payload(module, name, marker)
+    control_payload = _constructed_bytes_control_payload(inner_payload)
+
+    control_report = scan_bytes(control_payload, source="six-moves-cpickle-loads-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    assert pickle.loads(control_payload) == inner_payload
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="six-moves-cpickle-loads-rce.pkl")
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(report, module, name, "pickle.loads")
+
+    if module.startswith("botocore.") and not _has_module("botocore.vendored.six"):
+        return
+
+    assert not marker.exists()
+    assert pickle.loads(payload) == 0
     assert marker.read_text() == marker_content
