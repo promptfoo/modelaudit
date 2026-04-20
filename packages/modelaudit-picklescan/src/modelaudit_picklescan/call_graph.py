@@ -687,6 +687,18 @@ def _collect_class_instance_default_aliases(
                 instance_aliases[f"{statement.name}.{target_name}"] = resolved
                 if len(instance_aliases) >= _MAX_CLASS_INSTANCE_ALIASES:
                     return instance_aliases
+        for call_node in _iter_call_nodes(init_node):
+            if not _is_super_init_call(call_node.func):
+                continue
+            forwarded_defaults = _super_init_forwarded_sink_defaults(call_node, default_aliases)
+            if not forwarded_defaults:
+                continue
+            for base_target in _class_base_targets(statement, module_name, aliases, local_defs):
+                for parameter_name, resolved in forwarded_defaults.items():
+                    for target_name in _constructor_parameter_self_attribute_targets(base_target, parameter_name):
+                        instance_aliases[f"{statement.name}.{target_name}"] = resolved
+                        if len(instance_aliases) >= _MAX_CLASS_INSTANCE_ALIASES:
+                            return instance_aliases
     return instance_aliases
 
 
@@ -743,6 +755,101 @@ def _self_attribute_assignment_target_names(node: ast.Assign | ast.AnnAssign) ->
         if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "self":
             names.add(target.attr)
     return names
+
+
+def _is_super_init_call(expression: ast.AST) -> bool:
+    return (
+        isinstance(expression, ast.Attribute)
+        and expression.attr == "__init__"
+        and isinstance(expression.value, ast.Call)
+        and isinstance(expression.value.func, ast.Name)
+        and expression.value.func.id == "super"
+    )
+
+
+def _super_init_forwarded_sink_defaults(call_node: ast.Call, default_aliases: dict[str, str]) -> dict[str, str]:
+    forwarded: dict[str, str] = {}
+    for keyword in call_node.keywords:
+        if keyword.arg is None or not isinstance(keyword.value, ast.Name):
+            continue
+        resolved = default_aliases.get(keyword.value.id)
+        if resolved is not None:
+            forwarded[keyword.arg] = resolved
+    return forwarded
+
+
+def _class_base_targets(
+    class_node: ast.ClassDef,
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+) -> tuple[str, ...]:
+    targets: list[str] = []
+    for base in class_node.bases:
+        resolved = _resolve_expr(base, module_name, aliases, local_defs)
+        if resolved is not None:
+            targets.append(resolved)
+    return tuple(targets)
+
+
+@lru_cache(maxsize=4096)
+def _constructor_parameter_self_attribute_targets(class_name: str, parameter_name: str) -> tuple[str, ...]:
+    module_name, qualified_name = _split_source_qualified_name(class_name)
+    if module_name is None:
+        return ()
+    source_path = _resolve_module_source(module_name)
+    if source_path is None:
+        return ()
+    try:
+        if source_path.stat().st_size > _MAX_SOURCE_BYTES:
+            return ()
+        source = source_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(source_path))
+    except Exception:
+        return ()
+
+    class_node = _find_qualified_class_def(tree, qualified_name)
+    if class_node is None:
+        return ()
+    init_node = next(
+        (
+            child
+            for child in class_node.body
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef) and child.name == "__init__"
+        ),
+        None,
+    )
+    if init_node is None:
+        return ()
+
+    target_names: set[str] = set()
+    for node in ast.walk(init_node):
+        if not isinstance(node, ast.Assign | ast.AnnAssign):
+            continue
+        value = node.value
+        if isinstance(value, ast.Name) and value.id == parameter_name:
+            target_names.update(_self_attribute_assignment_target_names(node))
+    return tuple(sorted(target_names))
+
+
+def _split_source_qualified_name(function_name: str) -> tuple[str | None, str]:
+    parts = function_name.split(".")
+    for index in range(len(parts) - 1, 0, -1):
+        module_name = ".".join(parts[:index])
+        if _resolve_module_source(module_name) is not None:
+            return module_name, ".".join(parts[index:])
+    return None, function_name
+
+
+def _find_qualified_class_def(tree: ast.Module, qualified_name: str) -> ast.ClassDef | None:
+    nodes: Iterable[ast.AST] = tree.body
+    current: ast.ClassDef | None = None
+    for part in qualified_name.split("."):
+        current = next((node for node in nodes if isinstance(node, ast.ClassDef) and node.name == part), None)
+        if current is None:
+            return None
+        nodes = current.body
+    return current
 
 
 def _collect_function_calls(

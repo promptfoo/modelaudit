@@ -93,6 +93,55 @@ def _botocore_process_provider_rce_payload(marker: Path) -> tuple[bytes, str]:
     return payload, marker_content
 
 
+def _aiobotocore_process_provider_operand() -> bytes:
+    return b"".join(
+        [
+            _global_operand("aiobotocore.credentials", "AioProcessProvider"),
+            _tuple_payload_operands(
+                [
+                    _text_operand("default"),
+                    _global_operand("builtins", "dict"),
+                ]
+            ),
+            b"R",
+        ]
+    )
+
+
+def _aiobotocore_process_provider_control_payload() -> bytes:
+    return b"\x80\x04" + _aiobotocore_process_provider_operand() + b"."
+
+
+def _aiobotocore_anyio_backend_rce_payload(marker: Path) -> tuple[bytes, str]:
+    marker_content = "owned-by-aiobotocore-anyio"
+    credential_json = '{"Version":1,"AccessKeyId":"A","SecretAccessKey":"S","AccountId":"1"}'
+    script = (
+        f"printf {shlex.quote(marker_content)} > {shlex.quote(str(marker))}; printf '%s' {shlex.quote(credential_json)}"
+    )
+    credential_process = f"/bin/sh -c {shlex.quote(script)}"
+    payload = b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("anyio._backends._asyncio", "AsyncIOBackend.run"),
+            _tuple_payload_operands(
+                [
+                    _global_operand("aiobotocore.credentials", "AioProcessProvider._retrieve_credentials_using"),
+                    _tuple_payload_operands(
+                        [
+                            _aiobotocore_process_provider_operand(),
+                            _text_operand(credential_process),
+                        ]
+                    ),
+                    b"}",
+                    b"}",
+                ]
+            ),
+            b"R.",
+        ]
+    )
+    return payload, marker_content
+
+
 def _has_critical_call_graph_finding(report: PickleReport, module: str, name: str, sink: str) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -112,6 +161,17 @@ def test_call_graph_resolves_constructor_default_instance_aliases() -> None:
     path = _find_sink_path("botocore.credentials.ProcessProvider._retrieve_credentials_using")
     assert path is not None
     assert path[-1] == "subprocess.Popen"
+
+
+@pytest.mark.skipif(find_spec("aiobotocore") is None, reason="aiobotocore is unavailable")
+def test_call_graph_resolves_super_forwarded_constructor_default_instance_aliases() -> None:
+    calls = _calls_for_function("aiobotocore.credentials.AioProcessProvider._retrieve_credentials_using")
+    assert calls is not None
+    assert "aiobotocore.credentials.AioProcessProvider._popen" in calls
+
+    path = _find_sink_path("aiobotocore.credentials.AioProcessProvider._retrieve_credentials_using")
+    assert path is not None
+    assert path[-1] == "asyncio.create_subprocess_exec"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
@@ -134,6 +194,42 @@ def test_scan_bytes_blocks_botocore_process_provider_rce(tmp_path: Path) -> None
         "botocore.credentials",
         "ProcessProvider._retrieve_credentials_using",
         "subprocess.Popen",
+    )
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result == {
+        "access_key": "A",
+        "secret_key": "S",
+        "token": None,
+        "expiry_time": None,
+        "account_id": "1",
+    }
+    assert marker.read_text() == marker_content
+
+
+@pytest.mark.skipif(find_spec("aiobotocore") is None, reason="aiobotocore is unavailable")
+@pytest.mark.skipif(find_spec("anyio") is None, reason="anyio is unavailable")
+@pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
+def test_scan_bytes_blocks_aiobotocore_anyio_backend_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "aiobotocore_anyio_backend_rce_marker"
+    control_payload = _aiobotocore_process_provider_control_payload()
+    payload, marker_content = _aiobotocore_anyio_backend_rce_payload(marker)
+
+    control_report = scan_bytes(control_payload, source="aiobotocore-process-provider-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    pickle.loads(control_payload)
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="aiobotocore-anyio-backend-rce.pkl")
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "aiobotocore.credentials",
+        "AioProcessProvider._retrieve_credentials_using",
+        "asyncio.create_subprocess_exec",
     )
 
     assert not marker.exists()

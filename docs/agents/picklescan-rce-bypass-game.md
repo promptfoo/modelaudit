@@ -10366,3 +10366,127 @@ Performance sanity after clearing call-graph caches:
 - Existing wrapper timings stayed in the same range:
   `six.moves.getoutput` at `0.0104s`, `click.edit` at `0.0604s`, and
   `execnet.makegateway` at `0.0425s`.
+
+## Turn 187 - Bypass via `aiobotocore` async credential process through AnyIO backend
+
+Found another scanner-clean RCE path in the same credential-process family,
+this time through `aiobotocore.credentials.AioProcessProvider` and a clean
+AnyIO backend runner.
+
+Malicious pickle shape:
+
+- Import module/name `anyio._backends._asyncio` / `AsyncIOBackend.run`.
+- Import module/name `aiobotocore.credentials` /
+  `AioProcessProvider._retrieve_credentials_using`.
+- Construct `aiobotocore.credentials.AioProcessProvider("default", dict)`.
+- Call `AsyncIOBackend.run(async_method, (instance, credential_process), {}, {})`.
+- The async provider constructor has
+  `popen=asyncio.create_subprocess_exec` and forwards it through
+  `super().__init__(*args, **kwargs, popen=popen)`.
+- The inherited Botocore constructor stores it as `self._popen`, and the async
+  retrieval method later awaits `self._popen(*process_list, ...)`.
+- Use a credential process command of the form
+  `/bin/sh -c "printf MARKER_CONTENT > MARKER; printf '%s' '{...valid credential JSON...}'"`.
+
+Proof on CPython 3.12.12 with `aiobotocore==3.4.0`, `botocore==1.42.84`,
+and `anyio==4.13.0` installed:
+
+- Control provider-construction payload: `len=78`, `verdict=clean`,
+  `findings=[]`.
+- Active RCE payload: `len=399`, `status=complete`, `verdict=clean`,
+  `findings=[]`, `notices=[]`.
+- Active import references all have `is_dangerous=False`:
+  `anyio._backends._asyncio.AsyncIOBackend.run`,
+  `aiobotocore.credentials.AioProcessProvider._retrieve_credentials_using`,
+  `aiobotocore.credentials.AioProcessProvider`, and `builtins.dict`.
+- `_find_sink_path("anyio._backends._asyncio.AsyncIOBackend.run")` returns
+  `None`; `_calls_for_function(...)` sees the parameter call as `func`, but
+  does not treat the pickle-supplied callable as an invoked import reference.
+- `_find_sink_path("aiobotocore.credentials.AioProcessProvider._retrieve_credentials_using")`
+  returns `None`; `_calls_for_function(...)` sees
+  `aiobotocore.credentials.AioProcessProvider._popen`, but does not resolve
+  that attribute through the subclass `super().__init__(..., popen=popen)`
+  forwarding path.
+- `_find_sink_path("aiobotocore.credentials.AioProcessProvider")` returns
+  `None`; its constructor call graph only sees `super`.
+- Runtime before unpickle: marker absent.
+- Runtime after unpickle: marker exists and contains
+  `owned-by-aiobotocore-anyio`.
+- `pickle.loads(payload)` returns a valid credentials dict:
+  `{"access_key": "A", "secret_key": "S", "token": None, "expiry_time": None, "account_id": "1"}`.
+
+Why the scanner missed it:
+
+- Native policy does not treat AnyIO or Aiobotocore as dangerous modules, and
+  the pickle does not import `asyncio` or `subprocess` directly.
+- The Turn 186 defense resolves direct constructor-default sink assignments
+  like `self._popen = popen`, but it does not propagate subclass defaults
+  forwarded into a base constructor with `super().__init__(..., popen=popen)`.
+- The call graph records `AioProcessProvider._popen` as an unresolved class
+  attribute rather than `asyncio.create_subprocess_exec`.
+- The payload also uses `AsyncIOBackend.run` as a clean higher-order runner.
+  The runner itself is not a process primitive; it becomes dangerous only
+  because the pickle supplies the async provider method as its callable.
+
+Performance note: the next defensive turn should still fix closest to the
+finite call-graph source. Extending the constructor-default alias pass to
+recognize simple `super().__init__` forwarding of sink-default parameters into
+base-class constructors would make
+`AioProcessProvider._retrieve_credentials_using` resolve to
+`asyncio.create_subprocess_exec`, causing this payload to be blocked even
+without modeling every higher-order async runner. Keep it bounded to local
+class inheritance, explicit keyword forwarding, and known sink defaults.
+
+## Turn 188 - Block `super().__init__` forwarded constructor sink aliases
+
+Implemented a source-focused call-graph fix for the Turn 187 Aiobotocore async
+credential-process bypass.
+
+The constructor-default instance alias pass now also handles simple superclass
+forwarding:
+
+- It still resolves constructor parameters whose defaults are known RCE,
+  file-open, or file-write sinks.
+- It recognizes `super().__init__(..., keyword=parameter)` calls where
+  `parameter` is one of those sink-default parameters.
+- It resolves the current class's explicit base classes from the local import
+  aliases.
+- It parses the base class constructor source, without importing either package,
+  to find assignments like `self._popen = popen`.
+- It records the subclass alias, for example
+  `AioProcessProvider._popen -> asyncio.create_subprocess_exec`.
+
+Regression coverage extended in
+`packages/modelaudit-picklescan/tests/test_call_graph_instance_defaults.py`:
+
+- The original Turn 185 Botocore direct-default test still resolves
+  `ProcessProvider._popen -> subprocess.Popen`.
+- `_find_sink_path("aiobotocore.credentials.AioProcessProvider._retrieve_credentials_using")`
+  now reaches `asyncio.create_subprocess_exec`.
+- The Turn 187 payload that executes
+  `AioProcessProvider._retrieve_credentials_using` through
+  `anyio._backends._asyncio.AsyncIOBackend.run` now scans `malicious` with
+  `DANGEROUS_CALL_GRAPH`.
+- The control pickle that only constructs
+  `AioProcessProvider("default", dict)` remains `clean`.
+
+Focused validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_call_graph_instance_defaults.py`
+  passed: `4 passed`.
+- `ruff format`, `ruff check --fix`, and `mypy` passed on the standard
+  ModelAudit paths.
+- Full non-slow/non-integration validation passed:
+  `3703 passed, 1022 skipped, 21 warnings in 41.88s`.
+
+Performance sanity after clearing call-graph caches:
+
+- `_find_sink_path("aiobotocore.credentials.AioProcessProvider._retrieve_credentials_using")`:
+  `0.1302s`, path
+  `aiobotocore.credentials.AioProcessProvider._retrieve_credentials_using -> asyncio.create_subprocess_exec`.
+- `_find_sink_path("botocore.credentials.ProcessProvider._retrieve_credentials_using")`:
+  `0.1275s`, path
+  `botocore.credentials.ProcessProvider._retrieve_credentials_using -> subprocess.Popen`.
+- Existing wrapper timings stayed in the same range:
+  `six.moves.getoutput` at `0.0131s`, `click.edit` at `0.0669s`, and
+  `execnet.makegateway` at `0.0461s`.
