@@ -20,6 +20,8 @@ _MAX_ASSIGNMENT_ALIASES = 128
 _MAX_FUNCTION_INSTANCE_ALIASES = 32
 _MAX_CLASS_INSTANCE_ALIASES = 128
 _MAX_INHERITED_CLASS_METHODS = 128
+_MAX_WILDCARD_IMPORTS = 16
+_MAX_WILDCARD_REEXPORT_DEPTH = 4
 _MAX_SHORT_SINK_DEPTH = 2
 _CONTROLLED_GETATTR_DISPATCH_SINK = "builtins.getattr.__call__"
 _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS = ("__setstate__",)
@@ -131,6 +133,12 @@ class _ModuleAnalysis:
     aliases: dict[str, str]
     calls_by_function: dict[str, tuple[str, ...]]
     class_entrypoints: dict[str, tuple[str, ...]]
+
+
+@dataclass(frozen=True)
+class _WildcardExportSummary:
+    direct_names: frozenset[str]
+    wildcard_imports: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -416,6 +424,10 @@ def _resolve_function_target(function_name: str) -> str | None:
     alias_target = analysis.aliases.get(qualified_name)
     if alias_target is not None and alias_target != function_name:
         return _resolve_alias_function_target(alias_target)
+    if "." not in qualified_name:
+        wildcard_target = _resolve_wildcard_reexport_alias(module_name, qualified_name)
+        if wildcard_target is not None and wildcard_target != function_name:
+            return _resolve_alias_function_target(wildcard_target)
     return None
 
 
@@ -437,6 +449,80 @@ def _static_import_reference_alias(function_name: str) -> str | None:
 
 
 @lru_cache(maxsize=4096)
+def _resolve_wildcard_reexport_alias(module_name: str, qualified_name: str) -> str | None:
+    return _resolve_wildcard_reexport_alias_inner(module_name, qualified_name, set(), 0)
+
+
+def _resolve_wildcard_reexport_alias_inner(
+    module_name: str,
+    qualified_name: str,
+    visited: set[str],
+    depth: int,
+) -> str | None:
+    if depth >= _MAX_WILDCARD_REEXPORT_DEPTH or module_name in visited:
+        return None
+    summary = _wildcard_export_summary(module_name)
+    if summary is None:
+        return None
+
+    next_visited = {*visited, module_name}
+    for imported_module in summary.wildcard_imports[:_MAX_WILDCARD_IMPORTS]:
+        if imported_module in next_visited:
+            continue
+        imported_summary = _wildcard_export_summary(imported_module)
+        if imported_summary is None:
+            continue
+        if qualified_name in imported_summary.direct_names:
+            return f"{imported_module}.{qualified_name}"
+        nested_target = _resolve_wildcard_reexport_alias_inner(
+            imported_module,
+            qualified_name,
+            next_visited,
+            depth + 1,
+        )
+        if nested_target is not None:
+            return nested_target
+    return None
+
+
+@lru_cache(maxsize=4096)
+def _wildcard_export_summary(module_name: str) -> _WildcardExportSummary | None:
+    source_path = _resolve_module_source(module_name)
+    if source_path is None:
+        return None
+    try:
+        if source_path.stat().st_size > _MAX_SOURCE_BYTES:
+            return None
+        source = source_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(source_path))
+    except Exception:
+        return None
+
+    is_package = source_path.name == "__init__.py"
+    direct_names: set[str] = set()
+    wildcard_imports: list[str] = []
+    for statement in tree.body:
+        if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            direct_names.add(statement.name)
+        elif isinstance(statement, ast.Import):
+            for alias in statement.names:
+                direct_names.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(statement, ast.ImportFrom):
+            if statement.module == "__future__":
+                continue
+            imported_module = _resolve_import_from_module(module_name, is_package, statement.level, statement.module)
+            for alias in statement.names:
+                if alias.name == "*":
+                    if imported_module and len(wildcard_imports) < _MAX_WILDCARD_IMPORTS:
+                        wildcard_imports.append(imported_module)
+                    continue
+                direct_names.add(alias.asname or alias.name)
+        elif isinstance(statement, ast.Assign | ast.AnnAssign):
+            direct_names.update(_assignment_alias_target_names(statement))
+    return _WildcardExportSummary(frozenset(direct_names), tuple(wildcard_imports))
+
+
+@lru_cache(maxsize=4096)
 def _resolve_class_target(function_name: str) -> str | None:
     module_name, qualified_name = _split_function_name(function_name)
     if module_name is None:
@@ -451,6 +537,9 @@ def _resolve_class_target(function_name: str) -> str | None:
         alias_target = analysis.aliases.get(qualified_name)
         if alias_target is not None and alias_target != function_name:
             return _resolve_class_target(alias_target)
+        wildcard_target = _resolve_wildcard_reexport_alias(module_name, qualified_name)
+        if wildcard_target is not None and wildcard_target != function_name:
+            return _resolve_class_target(wildcard_target)
     return None
 
 

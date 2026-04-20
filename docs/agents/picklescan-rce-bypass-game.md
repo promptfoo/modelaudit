@@ -10913,3 +10913,165 @@ Measured after clearing relevant caches:
 - Existing wrapper timings stayed in range:
   `numpy._core.fromnumeric._wrapfunc` at `0.0077s` and `click.edit` at
   `0.0740s`.
+
+## Turn 195 - Bypass via public star-reexported SciPy distribution singleton
+
+Found and proved a scanner-clean RCE-capable pickle that stays close to the
+pickle lifecycle source but avoids the class-global path blocked in Turn 194.
+
+The payload imports only:
+
+- `scipy.stats.norm`
+
+At runtime, that public top-level export is the same live object as
+`scipy.stats._continuous_distns.norm`:
+
+```text
+scipy.stats.norm is scipy.stats._continuous_distns.norm -> True
+type(scipy.stats.norm) -> scipy.stats._continuous_distns.norm_gen
+scipy.stats.norm.__setstate__ -> scipy.stats._distn_infrastructure.rv_generic.__setstate__
+```
+
+The pickle pushes the public singleton global and then applies `BUILD` with an
+attacker-controlled state dictionary. `BUILD` invokes the inherited
+`rv_generic.__setstate__`, which updates the singleton `__dict__`, calls
+`self._attach_methods()`, reaches `rv_continuous._attach_argparser_methods`,
+and executes `self._parse_arg_template` with `builtins.exec`.
+
+The malicious state uses only the `_parse_arg_template` key and a source string
+that avoids raw `import`, `exec(`, `eval(`, `compile(`, `os`, `subprocess`,
+and dunder seeds while writing a marker:
+
+```python
+open("<marker>", "w").write("owned-by-scipy-stats-norm-singleton")
+def _parse_args(*args):
+    return (), 0, 1
+def _parse_args_stats(*args):
+    return (), 0, 1
+def _parse_args_rvs(*args):
+    return (), 0, 1, None
+```
+
+Proof:
+
+- Payload length: `353` bytes.
+- Scanner verdict: `clean`.
+- Finding count: `0`.
+- Import refs:
+  - `scipy.stats.norm`, `is_dangerous=False`
+- Call-graph state:
+  - `_call_graph_entrypoints("scipy.stats.norm") -> ()`
+  - `_call_graph_entrypoints("scipy.stats._continuous_distns.norm") -> ("scipy.stats._continuous_distns.norm_gen.__setstate__",)`
+  - `_find_sink_path("scipy.stats._continuous_distns.norm_gen.__setstate__") -> ("scipy.stats._continuous_distns.norm_gen.__setstate__", "scipy.stats._continuous_distns.norm_gen._attach_methods", "scipy.stats._continuous_distns.norm_gen._attach_argparser_methods", "builtins.exec")`
+- Runtime after `pickle.loads(payload)` in a subprocess: marker exists and
+  contains `owned-by-scipy-stats-norm-singleton`.
+
+Why the scanner missed it:
+
+- Native policy sees only the clean public `scipy.stats.norm` global.
+- `scipy.stats.__init__` imports `norm` through
+  `from .distributions import *`, and `scipy.stats.distributions` imports it
+  through `from ._continuous_distns import *`.
+- The current static alias collector intentionally ignores wildcard imports,
+  so the public name is not connected back to the internal
+  `norm_gen` singleton alias.
+- The Turn 194 lifecycle model catches the internal singleton and class
+  (`scipy.stats._continuous_distns.norm` and `norm_gen`), but the top-level
+  star-reexported global has no modeled entrypoints.
+- `BUILD` can apply attacker-controlled state to an already-imported module
+  singleton, so a class-only lifecycle model is not enough at public package
+  boundaries.
+
+Performance note: the missing public lookup is fast because it stops at
+`scipy.stats.__init__.py` (`18839` bytes) and does not follow star imports.
+The internal cold analysis remains the expensive part:
+
+- `scipy.stats.distributions.py`: `859` bytes.
+- `scipy.stats._continuous_distns.py`: `409353` bytes.
+- `scipy.stats._distn_infrastructure.py`: `153570` bytes.
+- Cold `_call_graph_entrypoints("scipy.stats.norm")`: `0.0004s`, no
+  entrypoints.
+- Cold `_call_graph_entrypoints("scipy.stats._continuous_distns.norm")`:
+  `1.8094s`, then cached sink lookup for `norm_gen.__setstate__` was
+  `0.0002s`.
+
+The next defensive turn should resolve wildcard reexports only on demand for a
+specific missing public global, under the existing source-size and call-graph
+caps. A bounded approach is to record star-import modules during alias
+collection, consult each candidate module only when a requested import name
+has no direct alias, and reuse the existing assignment/class-entrypoint logic
+from the target module rather than eagerly expanding every exported symbol.
+
+## Turn 196 - Block star-reexported singleton lifecycle paths
+
+Implemented a focused block for the Turn 195 `scipy.stats.norm` bypass.
+
+The call-graph resolver now performs bounded, on-demand wildcard reexport
+resolution when a requested top-level module attribute has no direct function,
+class, or alias target:
+
+- It builds a lightweight `_WildcardExportSummary` for star-import traversal
+  instead of invoking the full call-graph analyzer while resolving reexports.
+- The summary records only direct top-level names plus wildcard-imported
+  modules, using the existing `_MAX_SOURCE_BYTES` cap.
+- Traversal is bounded by `_MAX_WILDCARD_IMPORTS = 16` per module and
+  `_MAX_WILDCARD_REEXPORT_DEPTH = 4`.
+- Once a concrete module/name is found, resolution hands that reference back
+  to the existing function/class alias and pickle lifecycle model.
+- This avoids eager expansion of large wildcard modules and avoids recursive
+  analyzer re-entry while a module is still being analyzed.
+
+That closes the Turn 195 path:
+
+```text
+scipy.stats.norm
+  -> scipy.stats.distributions.norm
+  -> scipy.stats._continuous_distns.norm
+  -> scipy.stats._continuous_distns.norm_gen.__setstate__
+  -> scipy.stats._continuous_distns.norm_gen._attach_methods
+  -> scipy.stats._continuous_distns.norm_gen._attach_argparser_methods
+  -> builtins.exec
+```
+
+Regression coverage added to
+`packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py`:
+
+- The test constructs the public singleton `STACK_GLOBAL` + `BUILD` payload
+  from Turn 195.
+- It asserts `_call_graph_entrypoints("scipy.stats.norm")` resolves to the
+  internal `norm_gen.__setstate__` lifecycle entrypoint.
+- It asserts the sink path reaches `builtins.exec`.
+- The payload now scans `malicious` with `DANGEROUS_CALL_GRAPH` on the public
+  `scipy.stats.norm` import reference.
+- The runtime proof runs in a subprocess so the real `scipy.stats.norm`
+  singleton is not mutated in the test process; it still writes
+  `owned-by-scipy-stats-norm-singleton`.
+
+Focused validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_scipy_stats_norm_star_reexported_singleton_setstate_rce`
+  passed: `1 passed`.
+- The previous internal `norm_gen` lifecycle regression also passed in the
+  same focused run: `2 passed`.
+
+Full pre-commit validation:
+
+- `ruff format` passed after reformatting one test file.
+- `ruff check --fix` passed.
+- `mypy` passed: `Success: no issues found in 446 source files`.
+- Full non-slow/non-integration validation passed:
+  `3707 passed, 1022 skipped, 21 warnings in 36.29s`.
+
+Performance note: cold resolution for the new public path remains dominated by
+the already-modeled internal SciPy distribution source. Measured after clearing
+the relevant caches:
+
+- `_call_graph_entrypoints("scipy.stats.norm")`: `1.8813s`, entrypoint
+  `scipy.stats._continuous_distns.norm_gen.__setstate__`.
+- `_find_sink_path("scipy.stats._continuous_distns.norm_gen.__setstate__")`:
+  `0.0002s`, path through `_attach_methods` and
+  `_attach_argparser_methods` to `builtins.exec`.
+- Subsequent internal lookups were cached:
+  `_call_graph_entrypoints("scipy.stats._continuous_distns.norm")` and
+  `_call_graph_entrypoints("scipy.stats._continuous_distns.norm_gen")` both
+  returned in `0.0000s`.
