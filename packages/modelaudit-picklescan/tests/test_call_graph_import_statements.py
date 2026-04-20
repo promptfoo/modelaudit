@@ -2226,6 +2226,86 @@ if marker.read_text() != marker_content:
             "set()",
         ),
         (
+            _builtins_help_call_iterator_method_descriptor_payload("builtins", "set.difference", b"\x8f", b"h\x00"),
+            "['owned-value', 'stop']",
+            "set()",
+        ),
+        (
+            _builtins_help_call_iterator_method_descriptor_payload(
+                "builtins",
+                "set.difference_update",
+                b"\x8f",
+                b"h\x00",
+            ),
+            "['owned-value', 'stop']",
+            "None",
+        ),
+        (
+            _builtins_help_call_iterator_method_descriptor_payload(
+                "builtins",
+                "set.symmetric_difference",
+                b"\x8f",
+                b"h\x00",
+            ),
+            "['owned-value', 'stop']",
+            "{'owned-value'}",
+        ),
+        (
+            _builtins_help_call_iterator_method_descriptor_payload(
+                "builtins",
+                "set.symmetric_difference_update",
+                b"\x8f",
+                b"h\x00",
+            ),
+            "['owned-value', 'stop']",
+            "None",
+        ),
+        (
+            _builtins_help_call_iterator_method_descriptor_payload(
+                "builtins",
+                "set.intersection_update",
+                b"\x8f",
+                b"h\x00",
+            ),
+            "['owned-value', 'stop']",
+            "None",
+        ),
+        (
+            _builtins_help_call_iterator_method_descriptor_payload("builtins", "set.isdisjoint", b"\x8f", b"h\x00"),
+            "['owned-value', 'stop']",
+            "True",
+        ),
+        (
+            _builtins_help_call_iterator_method_descriptor_payload(
+                "builtins",
+                "frozenset.union",
+                _constructed_call_operand("builtins", "frozenset"),
+                b"h\x00",
+            ),
+            "['owned-value', 'stop']",
+            "frozenset({'owned-value'})",
+        ),
+        (
+            _builtins_help_call_iterator_method_descriptor_payload(
+                "builtins",
+                "frozenset.difference",
+                _constructed_call_operand("builtins", "frozenset"),
+                b"h\x00",
+            ),
+            "['owned-value', 'stop']",
+            "frozenset()",
+        ),
+        (
+            _builtins_help_call_iterator_method_descriptor_payload(
+                "builtins",
+                "frozenset.isdisjoint",
+                _constructed_call_operand("builtins", "frozenset"),
+                b"h\x00",
+            ),
+            "['owned-value', 'stop']",
+            "True",
+        ),
+        (
             _builtins_help_call_iterator_method_descriptor_payload("builtins", "set.__init__", b"\x8f", b"h\x00"),
             "['owned-value', 'stop']",
             "None",
@@ -2278,6 +2358,56 @@ if marker.read_text() != marker_content:
                 b"h\x00",
             ),
             "[7, 'stop']",
+            "None",
+        ),
+        (
+            _builtins_help_call_iterator_method_descriptor_payload(
+                "collections",
+                "Counter.update",
+                _constructed_call_operand("collections", "Counter"),
+                b"h\x00",
+            ),
+            "['owned-value', 'stop']",
+            "None",
+        ),
+        (
+            _builtins_help_call_iterator_method_descriptor_payload(
+                "collections",
+                "Counter.subtract",
+                _constructed_call_operand("collections", "Counter"),
+                b"h\x00",
+            ),
+            "['owned-value', 'stop']",
+            "None",
+        ),
+        (
+            _builtins_help_call_iterator_method_descriptor_payload(
+                "collections",
+                "OrderedDict.update",
+                _constructed_call_operand("collections", "OrderedDict"),
+                b"h\x00",
+            ),
+            "[('owned-key', 'owned-value'), 'stop']",
+            "None",
+        ),
+        (
+            _builtins_help_call_iterator_method_descriptor_payload(
+                "collections",
+                "UserList.extend",
+                _constructed_call_operand("collections", "UserList"),
+                b"h\x00",
+            ),
+            "['owned-value', 'stop']",
+            "None",
+        ),
+        (
+            _builtins_help_call_iterator_method_descriptor_payload(
+                "collections",
+                "UserDict.update",
+                _constructed_call_operand("collections", "UserDict"),
+                b"h\x00",
+            ),
+            "[('owned-key', 'owned-value'), 'stop']",
             "None",
         ),
     ],
@@ -2343,6 +2473,108 @@ if marker.read_text() != marker_content:
 """
     result = subprocess.run(
         [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, expected_repr],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+@pytest.mark.parametrize(
+    ("payload", "setup_code"),
+    [
+        (
+            _builtins_help_call_iterator_method_descriptor_payload(
+                "weakref",
+                "WeakSet.update",
+                _constructed_call_operand("weakref", "WeakSet"),
+                b"h\x00",
+            ),
+            "class Box:\n    pass\n_box = Box()\n_values = [_box, 'stop']\n",
+        ),
+        (
+            _builtins_help_call_iterator_method_descriptor_payload(
+                "weakref",
+                "WeakKeyDictionary.update",
+                _constructed_call_operand("weakref", "WeakKeyDictionary"),
+                b"h\x00",
+            ),
+            "class Box:\n    pass\n_key = Box()\n_values = [(_key, 'owned-value'), 'stop']\n",
+        ),
+        (
+            _builtins_help_call_iterator_method_descriptor_payload(
+                "weakref",
+                "WeakValueDictionary.update",
+                _constructed_call_operand("weakref", "WeakValueDictionary"),
+                b"h\x00",
+            ),
+            "class Box:\n    pass\n_value = Box()\n_values = [('owned-key', _value), 'stop']\n",
+        ),
+    ],
+)
+def test_scan_bytes_blocks_weakref_method_descriptor_call_iterator_consumption_rce(
+    tmp_path: Path,
+    payload: bytes,
+    setup_code: str,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "weakref_method_descriptor_call_iterator_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        f"{setup_code}"
+        "def help(*args, **kwargs):\n"
+        "    return _values.pop(0) if _values else 'stop'\n",
+        encoding="utf-8",
+    )
+
+    report = scan_bytes(payload, source="weakref-method-descriptor-call-iterator-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result is not None:
+    raise SystemExit(f"expected None, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
         cwd=str(tmp_path.parent),
         env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
         check=False,

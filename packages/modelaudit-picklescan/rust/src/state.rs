@@ -1364,7 +1364,20 @@ impl<'a> ScanState<'a> {
             }
             (
                 "builtins" | "__builtin__" | "__builtins__",
-                "set.intersection" | "set.union" | "set.update",
+                "frozenset.difference"
+                | "frozenset.intersection"
+                | "frozenset.isdisjoint"
+                | "frozenset.symmetric_difference"
+                | "frozenset.union"
+                | "set.difference"
+                | "set.difference_update"
+                | "set.intersection"
+                | "set.intersection_update"
+                | "set.isdisjoint"
+                | "set.symmetric_difference"
+                | "set.symmetric_difference_update"
+                | "set.union"
+                | "set.update",
             ) if arguments.len() >= 2 => arguments
                 .iter()
                 .skip(1)
@@ -1372,9 +1385,17 @@ impl<'a> ScanState<'a> {
             ("array", "array.extend") if arguments.len() == 2 => {
                 arguments.get(1).and_then(Self::call_iterator_callable_ref)
             }
-            ("collections", "deque.__init__" | "deque.extend" | "deque.extendleft")
-                if arguments.len() == 2 =>
-            {
+            (
+                "collections",
+                "Counter.subtract" | "Counter.update" | "OrderedDict.update" | "UserDict.update"
+                | "UserList.extend" | "deque.__init__" | "deque.extend" | "deque.extendleft",
+            ) if arguments.len() == 2 => {
+                arguments.get(1).and_then(Self::call_iterator_callable_ref)
+            }
+            (
+                "weakref",
+                "WeakKeyDictionary.update" | "WeakSet.update" | "WeakValueDictionary.update",
+            ) if arguments.len() == 2 => {
                 arguments.get(1).and_then(Self::call_iterator_callable_ref)
             }
             _ => None,
