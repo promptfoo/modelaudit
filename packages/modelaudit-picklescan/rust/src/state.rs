@@ -70,6 +70,11 @@ const EXACT_ARITY_STDLIB_EAGER_ITERABLE_CONSUMERS: &[(&str, &str, usize, usize)]
     ("weakref", "WeakValueDictionary", 1, 0),
 ];
 
+const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(&str, &str, usize, usize, usize, usize)] = &[
+    ("heapq", "nlargest", 3, 2, 1, 1),
+    ("heapq", "nsmallest", 3, 2, 1, 1),
+];
+
 const EXACT_ARITY_ITERABLE_DESCRIPTOR_CONSUMERS: &[(&str, &str, usize, usize)] = &[
     ("array", "array.extend", 2, 1),
     ("builtins", "bytearray.__init__", 2, 1),
@@ -1002,6 +1007,12 @@ impl<'a> ScanState<'a> {
             opcode.name,
             position,
         ));
+        invocations.extend(Self::callback_dispatch_invocations(
+            callable_value.as_ref(),
+            argument_values.as_deref(),
+            opcode.name,
+            position,
+        ));
         invocations.extend(Self::call_iterator_consumption_invocations(
             callable_value.as_ref(),
             argument_values.as_deref(),
@@ -1100,6 +1111,53 @@ impl<'a> ScanState<'a> {
             }
             _ => Vec::new(),
         }
+    }
+
+    fn callback_dispatch_invocations(
+        callable_value: Option<&StackValue>,
+        argument_values: Option<&[StackValue]>,
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if !matches!(op_name, "REDUCE" | "OBJ") {
+            return Vec::new();
+        }
+        let Some(StackValue::Global(callable_reference)) = callable_value else {
+            return Vec::new();
+        };
+        if callable_reference.malformed {
+            return Vec::new();
+        }
+        let Some(arguments) = argument_values else {
+            return Vec::new();
+        };
+        let Some((_, _, _, callback_arg_index, callback_arg_count, non_empty_iterable_arg_index)) =
+            EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS.iter().find(
+                |(consumer_module, consumer_name, arity, _, _, _)| {
+                    Self::consumer_module_matches(&callable_reference.module, consumer_module)
+                        && *consumer_name == callable_reference.name
+                        && *arity == arguments.len()
+                },
+            )
+        else {
+            return Vec::new();
+        };
+        if !Self::is_definitely_non_empty_iterable_argument(
+            arguments.get(*non_empty_iterable_arg_index),
+        ) {
+            return Vec::new();
+        }
+        let Some(reference) =
+            Self::callable_reference_from_value(arguments.get(*callback_arg_index))
+        else {
+            return Vec::new();
+        };
+        vec![Self::callable_invocation(
+            reference,
+            op_name,
+            position,
+            Some(*callback_arg_count),
+        )]
     }
 
     fn builtins_format_invocations(
@@ -1210,6 +1268,17 @@ impl<'a> ScanState<'a> {
             value,
             Some(StackValue::Text(_) | StackValue::TextSpan { .. })
         )
+    }
+
+    fn is_definitely_non_empty_iterable_argument(value: Option<&StackValue>) -> bool {
+        match value {
+            Some(StackValue::Tuple(items)) => !items.is_empty(),
+            Some(StackValue::Text(value)) => !value.is_empty(),
+            Some(StackValue::TextSpan { start, end }) | Some(StackValue::Bytes { start, end }) => {
+                start < end
+            }
+            _ => false,
+        }
     }
 
     fn format_invocation(
@@ -1663,11 +1732,20 @@ impl<'a> ScanState<'a> {
         op_name: &'static str,
         position: usize,
     ) -> CallableInvocation {
+        Self::callable_invocation(reference.clone(), op_name, position, Some(0))
+    }
+
+    fn callable_invocation(
+        reference: GlobalRef,
+        op_name: &'static str,
+        position: usize,
+        positional_arg_count: Option<usize>,
+    ) -> CallableInvocation {
         CallableInvocation {
-            reference: reference.clone(),
+            reference,
             op_name,
             opcode_position: position,
-            positional_arg_count: Some(0),
+            positional_arg_count,
         }
     }
 
