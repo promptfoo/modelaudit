@@ -44,6 +44,9 @@ pub(crate) enum StackValue {
     DefaultDict {
         default_factory: GlobalRef,
     },
+    RegexPattern {
+        pattern: String,
+    },
     Tuple(Vec<StackValue>),
     Primitive {
         type_name: &'static str,
@@ -80,6 +83,7 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
         Some(StackValue::DefaultDict { default_factory }) => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
+        Some(StackValue::RegexPattern { pattern }) => format!("regex_pattern:{pattern:?}"),
         Some(StackValue::TextSpan { start, end }) => {
             format!("str_span(len={})", end.saturating_sub(*start))
         }
@@ -148,6 +152,7 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
         StackValue::DefaultDict { default_factory } => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
+        StackValue::RegexPattern { pattern } => format!("regex_pattern:{pattern:?}"),
         StackValue::Tuple(values) => {
             let mut parts: Vec<String> = values
                 .iter()

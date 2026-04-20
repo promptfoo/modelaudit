@@ -171,6 +171,50 @@ const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(
             input_arg_index: 2,
         },
     ),
+    (
+        "re",
+        "Pattern.sub",
+        3,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+        },
+    ),
+    (
+        "re",
+        "Pattern.sub",
+        4,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+        },
+    ),
+    (
+        "re",
+        "Pattern.subn",
+        3,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+        },
+    ),
+    (
+        "re",
+        "Pattern.subn",
+        4,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+        },
+    ),
 ];
 
 const EXACT_ARITY_LAZY_ZERO_ARG_CALLBACK_ITERABLES: &[(&str, &str, usize, usize)] = &[
@@ -1286,8 +1330,7 @@ impl<'a> ScanState<'a> {
         pattern_value: Option<&StackValue>,
         input_value: Option<&StackValue>,
     ) -> bool {
-        let Some(pattern) = pattern_value.and_then(|value| stack_value_string(value, self.payload))
-        else {
+        let Some(pattern) = self.regex_pattern_from_value(pattern_value) else {
             return false;
         };
         let Some(input) = input_value.and_then(|value| stack_value_string(value, self.payload))
@@ -1298,6 +1341,14 @@ impl<'a> ScanState<'a> {
             return false;
         }
         pattern.is_empty() || input.as_str().contains(pattern.as_str())
+    }
+
+    fn regex_pattern_from_value(&self, value: Option<&StackValue>) -> Option<String> {
+        match value {
+            Some(StackValue::RegexPattern { pattern }) => Some(pattern.clone()),
+            Some(value) => stack_value_string(value, self.payload),
+            None => None,
+        }
     }
 
     fn is_plain_regex_literal(pattern: &str) -> bool {
@@ -1974,6 +2025,10 @@ impl<'a> ScanState<'a> {
             self.stack.push(tuple_item);
             return;
         }
+        if let Some(regex_pattern) = self.regex_pattern_result(values) {
+            self.stack.push(regex_pattern);
+            return;
+        }
         self.push_constructed_result(values.first());
     }
 
@@ -2000,6 +2055,28 @@ impl<'a> ScanState<'a> {
         }
         let callable = Self::callable_reference_from_value(arguments.first())?;
         Some(StackValue::CallIterator { callable })
+    }
+
+    fn regex_pattern_result(&self, values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed
+            || callable_reference.module != "re"
+            || callable_reference.name != "compile"
+        {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        if !(1..=2).contains(&arguments.len()) {
+            return None;
+        }
+        let pattern = arguments
+            .first()
+            .and_then(|value| stack_value_string(value, self.payload))?;
+        Some(StackValue::RegexPattern { pattern })
     }
 
     fn lazy_zero_arg_callback_iterable_result(values: &[StackValue]) -> Option<StackValue> {
