@@ -36,6 +36,9 @@ pub(crate) enum StackValue {
     CallIterator {
         callable: GlobalRef,
     },
+    DefaultDict {
+        default_factory: GlobalRef,
+    },
     Tuple(Vec<StackValue>),
     Primitive {
         type_name: &'static str,
@@ -60,6 +63,9 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
         Some(StackValue::Constructed(reference)) => format!("constructed:{}", reference.symbol()),
         Some(StackValue::CallIterator { callable }) => {
             format!("call_iterator:{}", callable.symbol())
+        }
+        Some(StackValue::DefaultDict { default_factory }) => {
+            format!("defaultdict(factory={})", default_factory.symbol())
         }
         Some(StackValue::TextSpan { start, end }) => {
             format!("str_span(len={})", end.saturating_sub(*start))
@@ -104,6 +110,9 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
         StackValue::Constructed(reference) => format!("constructed:{}", reference.symbol()),
         StackValue::CallIterator { callable } => {
             format!("call_iterator:{}", callable.symbol())
+        }
+        StackValue::DefaultDict { default_factory } => {
+            format!("defaultdict(factory={})", default_factory.symbol())
         }
         StackValue::Tuple(values) => {
             let mut parts: Vec<String> = values

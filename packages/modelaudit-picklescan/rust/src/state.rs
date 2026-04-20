@@ -958,6 +958,12 @@ impl<'a> ScanState<'a> {
             opcode.name,
             position,
         ));
+        invocations.extend(Self::defaultdict_factory_invocations(
+            callable_value.as_ref(),
+            argument_values.as_deref(),
+            opcode.name,
+            position,
+        ));
         invocations
     }
 
@@ -1084,6 +1090,35 @@ impl<'a> ScanState<'a> {
         )
     }
 
+    fn defaultdict_factory_invocations(
+        callable_value: Option<&StackValue>,
+        argument_values: Option<&[StackValue]>,
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if !matches!(op_name, "REDUCE" | "OBJ") {
+            return Vec::new();
+        }
+        let Some(StackValue::Global(callable_reference)) = callable_value else {
+            return Vec::new();
+        };
+        if callable_reference.malformed
+            || callable_reference.module != "operator"
+            || callable_reference.name != "getitem"
+        {
+            return Vec::new();
+        }
+        let Some([StackValue::DefaultDict { default_factory }, _]) = argument_values else {
+            return Vec::new();
+        };
+        vec![CallableInvocation {
+            reference: default_factory.clone(),
+            op_name,
+            opcode_position: position,
+            positional_arg_count: Some(0),
+        }]
+    }
+
     fn constructed_callable_reference(reference: &GlobalRef) -> GlobalRef {
         Self::constructed_protocol_method_reference(reference, "__call__")
     }
@@ -1140,6 +1175,10 @@ impl<'a> ScanState<'a> {
             self.stack.push(call_iterator);
             return;
         }
+        if let Some(defaultdict) = Self::defaultdict_result(values) {
+            self.stack.push(defaultdict);
+            return;
+        }
         self.push_constructed_result(values.first());
     }
 
@@ -1164,19 +1203,43 @@ impl<'a> ScanState<'a> {
         if arguments.len() != 2 {
             return None;
         }
-        let callable = match arguments.first() {
-            Some(StackValue::Global(reference)) if !reference.malformed => reference.clone(),
+        let callable = Self::callable_reference_from_value(arguments.first())?;
+        Some(StackValue::CallIterator { callable })
+    }
+
+    fn defaultdict_result(values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed
+            || callable_reference.module != "collections"
+            || callable_reference.name != "defaultdict"
+        {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        if arguments.len() != 1 {
+            return None;
+        }
+        let default_factory = Self::callable_reference_from_value(arguments.first())?;
+        Some(StackValue::DefaultDict { default_factory })
+    }
+
+    fn callable_reference_from_value(value: Option<&StackValue>) -> Option<GlobalRef> {
+        match value {
+            Some(StackValue::Global(reference)) if !reference.malformed => Some(reference.clone()),
             Some(StackValue::Constructed(reference)) if !reference.malformed => {
-                Self::constructed_callable_reference(reference)
+                Some(Self::constructed_callable_reference(reference))
             }
             Some(StackValue::Global(reference) | StackValue::Constructed(reference))
                 if reference.module == "copyreg.extension" =>
             {
-                reference.clone()
+                Some(reference.clone())
             }
-            _ => return None,
-        };
-        Some(StackValue::CallIterator { callable })
+            _ => None,
+        }
     }
 
     fn push_constructed_result(&mut self, callable_value: Option<&StackValue>) {
