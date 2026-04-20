@@ -54,6 +54,10 @@ def _global_call_payload(module: str, name: str, *arg_operands: bytes) -> bytes:
     return b"".join([b"\x80\x04", _global_operand(module, name), _args_tuple(*arg_operands), b"R."])
 
 
+def _sitebuiltins_helper_instance_call_payload() -> bytes:
+    return b"".join([b"\x80\x04", _global_operand("_sitebuiltins", "_Helper"), b")R)R."])
+
+
 def _typing_extensions_get_type_hints_payload(marker: Path) -> bytes:
     marker_content = "typing-ext-owned"
     annotation_expr = f"open({str(marker)!r},'w').write({marker_content!r})"
@@ -205,6 +209,41 @@ def test_call_graph_models_required_arg_imports_when_pickle_supplies_args() -> N
     assert findings[0].call_path == ("_pyio._open_code_with_warning", "builtins.__import__")
 
 
+def test_call_graph_models_constructed_callable_instance_invocations() -> None:
+    import_references = [
+        {
+            "module": "_sitebuiltins",
+            "name": "_Helper",
+            "import_reference": "_sitebuiltins._Helper",
+        }
+    ]
+    constructor_only_invocations = [
+        {
+            "module": "_sitebuiltins",
+            "name": "_Helper",
+            "positional_arg_count": 0,
+        }
+    ]
+    callable_instance_invocations = [
+        *constructor_only_invocations,
+        {
+            "module": "_sitebuiltins",
+            "name": "_Helper.__call__",
+            "positional_arg_count": 0,
+        },
+    ]
+
+    assert find_dangerous_call_graphs(import_references, constructor_only_invocations) == ()
+
+    findings = find_dangerous_call_graphs(import_references, callable_instance_invocations)
+
+    assert len(findings) == 1
+    assert findings[0].module == "_sitebuiltins"
+    assert findings[0].name == "_Helper.__call__"
+    assert findings[0].sink == "builtins.__import__"
+    assert findings[0].call_path == ("_sitebuiltins._Helper.__call__", "builtins.__import__")
+
+
 @pytest.mark.parametrize(
     ("helper_name", "module_name", "marker_content"),
     [
@@ -258,6 +297,72 @@ if marker.read_text() != marker_content:
 """
     result = subprocess.run(
         [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), module_name, marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+def test_scan_bytes_blocks_sitebuiltins_helper_callable_instance_import_rce(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "sitebuiltins_helper_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'shadow-help'\n",
+        encoding="utf-8",
+    )
+    payload = _sitebuiltins_helper_instance_call_payload()
+
+    report = scan_bytes(payload, source="sitebuiltins-helper-callable-instance-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "_sitebuiltins"
+        and invocation.get("name") == "_Helper.__call__"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != "shadow-help":
+    raise SystemExit(f"expected shadow help result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
         cwd=str(tmp_path.parent),
         env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
         check=False,

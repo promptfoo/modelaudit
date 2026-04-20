@@ -186,7 +186,7 @@ def find_dangerous_call_graphs(
     findings: list[CallGraphFinding] = []
     seen: set[tuple[str, str]] = set()
     positional_arg_counts = _callable_invocation_positional_arg_counts(callable_invocations)
-    for reference in _iter_import_references(import_references):
+    for reference in _iter_call_graph_references(import_references, callable_invocations):
         module = str(reference.get("module", ""))
         name = str(reference.get("name", ""))
         if not module or not name or (module, name) in seen:
@@ -196,12 +196,16 @@ def find_dangerous_call_graphs(
         entrypoints = _safe_call_graph_entrypoints(f"{module}.{name}")
         if not entrypoints:
             continue
+        allow_invoked_non_lifecycle_entrypoint = _is_explicit_method_import_reference(name)
         sink_path = _first_matching_path(entrypoints, _find_sink_path)
         if sink_path is None:
             for positional_arg_count in positional_arg_counts.get((module, name), ()):
                 sink_path = _first_matching_path(
                     entrypoints,
-                    _invoked_import_execution_path_callback(positional_arg_count),
+                    _invoked_import_execution_path_callback(
+                        positional_arg_count,
+                        allow_non_lifecycle_entrypoint=allow_invoked_non_lifecycle_entrypoint,
+                    ),
                 )
                 if sink_path is not None:
                     break
@@ -314,11 +318,38 @@ def _first_matching_path(
 
 def _invoked_import_execution_path_callback(
     positional_arg_count: int,
+    *,
+    allow_non_lifecycle_entrypoint: bool = False,
 ) -> Callable[[str], tuple[str, ...] | None]:
     def path_for(entrypoint: str) -> tuple[str, ...] | None:
-        return _find_invoked_import_execution_path(entrypoint, positional_arg_count)
+        return _find_invoked_import_execution_path(
+            entrypoint,
+            positional_arg_count,
+            allow_non_lifecycle_entrypoint=allow_non_lifecycle_entrypoint,
+        )
 
     return path_for
+
+
+def _iter_call_graph_references(
+    import_references: object,
+    callable_invocations: object | None,
+) -> tuple[dict[str, object], ...]:
+    normalized: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in (
+        *_iter_import_references(import_references),
+        *_iter_callable_invocation_references(callable_invocations),
+    ):
+        module = str(item.get("module", ""))
+        name = str(item.get("name", ""))
+        if not module or not name or (module, name) in seen:
+            continue
+        seen.add((module, name))
+        normalized.append(dict(item))
+        if len(normalized) >= _MAX_IMPORT_REFERENCES:
+            break
+    return tuple(normalized)
 
 
 def _iter_import_references(import_references: object) -> tuple[dict[str, object], ...]:
@@ -338,6 +369,30 @@ def _iter_import_references(import_references: object) -> tuple[dict[str, object
         if len(normalized) >= _MAX_IMPORT_REFERENCES:
             break
     return tuple(normalized)
+
+
+def _iter_callable_invocation_references(callable_invocations: object | None) -> tuple[dict[str, object], ...]:
+    if not isinstance(callable_invocations, list | tuple):
+        return ()
+
+    normalized: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in callable_invocations:
+        if not isinstance(item, Mapping):
+            continue
+        module = str(item.get("module", ""))
+        name = str(item.get("name", ""))
+        if not module or not name or (module, name) in seen:
+            continue
+        seen.add((module, name))
+        normalized.append(dict(item))
+        if len(normalized) >= _MAX_IMPORT_REFERENCES:
+            break
+    return tuple(normalized)
+
+
+def _is_explicit_method_import_reference(name: str) -> bool:
+    return "." in name
 
 
 def _callable_invocation_positional_arg_counts(
@@ -394,7 +449,12 @@ def _find_sink_path(start: str) -> tuple[str, ...] | None:
 
 
 @lru_cache(maxsize=4096)
-def _find_invoked_import_execution_path(start: str, positional_arg_count: int) -> tuple[str, ...] | None:
+def _find_invoked_import_execution_path(
+    start: str,
+    positional_arg_count: int,
+    *,
+    allow_non_lifecycle_entrypoint: bool = False,
+) -> tuple[str, ...] | None:
     resolved = _resolve_function_target(start)
     if resolved is None:
         return None
@@ -402,7 +462,7 @@ def _find_invoked_import_execution_path(start: str, positional_arg_count: int) -
     if context is None:
         return None
     module_name, is_package, function_node = context
-    if not _is_pickle_entered_import_execution_entrypoint(resolved):
+    if not allow_non_lifecycle_entrypoint and not _is_pickle_entered_import_execution_entrypoint(resolved):
         return None
     if not _can_enter_function_with_positional_args(function_node, positional_arg_count):
         return None
