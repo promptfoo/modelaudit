@@ -21,6 +21,12 @@ impl GlobalRef {
 }
 
 #[derive(Clone)]
+pub(crate) struct RegexScannerRule {
+    pub(crate) pattern: String,
+    pub(crate) action: GlobalRef,
+}
+
+#[derive(Clone)]
 pub(crate) enum StackValue {
     Mark,
     Text(String),
@@ -46,6 +52,12 @@ pub(crate) enum StackValue {
     },
     RegexPattern {
         pattern: String,
+    },
+    RegexScannerLexicon {
+        rules: Vec<RegexScannerRule>,
+    },
+    RegexScanner {
+        rules: Vec<RegexScannerRule>,
     },
     Tuple(Vec<StackValue>),
     Primitive {
@@ -84,6 +96,12 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
         Some(StackValue::RegexPattern { pattern }) => format!("regex_pattern:{pattern:?}"),
+        Some(StackValue::RegexScannerLexicon { rules }) => {
+            format!("regex_scanner_lexicon(rules={})", rules.len())
+        }
+        Some(StackValue::RegexScanner { rules }) => {
+            format!("regex_scanner(rules={})", rules.len())
+        }
         Some(StackValue::TextSpan { start, end }) => {
             format!("str_span(len={})", end.saturating_sub(*start))
         }
@@ -153,6 +171,10 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
         StackValue::RegexPattern { pattern } => format!("regex_pattern:{pattern:?}"),
+        StackValue::RegexScannerLexicon { rules } => {
+            format!("regex_scanner_lexicon(rules={})", rules.len())
+        }
+        StackValue::RegexScanner { rules } => format!("regex_scanner(rules={})", rules.len()),
         StackValue::Tuple(values) => {
             let mut parts: Vec<String> = values
                 .iter()

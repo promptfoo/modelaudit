@@ -31,7 +31,7 @@ use crate::report::{
 use crate::stack::{
     collapse_tuple_values, operand_preview, pytorch_storage_key, resolve_global_operand,
     stack_value_from_integer_arg, stack_value_from_text_arg, stack_value_preview,
-    stack_value_string, GlobalRef, StackValue,
+    stack_value_string, GlobalRef, RegexScannerRule, StackValue,
 };
 use crate::strings::{is_repeated_single_byte, suspicious_string_matches};
 
@@ -790,7 +790,7 @@ impl<'a> ScanState<'a> {
             }
             "TUPLE" => {
                 let values = self.pop_to_mark();
-                self.stack.push(collapse_tuple_values(values));
+                self.stack.push(self.collapse_stack_values(values));
             }
             "LIST" | "DICT" | "SET" | "FROZENSET" => {
                 let _ = self.pop_to_mark();
@@ -1081,7 +1081,39 @@ impl<'a> ScanState<'a> {
             }
         }
         values.reverse();
-        self.stack.push(collapse_tuple_values(values));
+        self.stack.push(self.collapse_stack_values(values));
+    }
+
+    fn collapse_stack_values(&self, values: Vec<StackValue>) -> StackValue {
+        if let Some(rules) = self.regex_scanner_lexicon_rules(&values) {
+            return StackValue::RegexScannerLexicon { rules };
+        }
+        collapse_tuple_values(values)
+    }
+
+    fn regex_scanner_lexicon_rules(&self, values: &[StackValue]) -> Option<Vec<RegexScannerRule>> {
+        let mut rules = Vec::new();
+        let mut saw_scanner_rule_shape = false;
+        for value in values {
+            let StackValue::Tuple(items) = value else {
+                return None;
+            };
+            let [pattern_value, action_value] = items.as_slice() else {
+                return None;
+            };
+            let Some(pattern) = stack_value_string(pattern_value, self.payload) else {
+                return None;
+            };
+            saw_scanner_rule_shape = true;
+            if let Some(action) = Self::callable_reference_from_value(Some(action_value)) {
+                rules.push(RegexScannerRule { pattern, action });
+            }
+        }
+        if saw_scanner_rule_shape && !rules.is_empty() {
+            Some(rules)
+        } else {
+            None
+        }
     }
 
     fn consume_callable_opcode(
@@ -1183,6 +1215,9 @@ impl<'a> ScanState<'a> {
     ) -> Option<CallableInvocation> {
         match callable_value {
             Some(StackValue::Global(reference)) if !reference.malformed => {
+                if Self::suppress_plain_constructor_invocation(reference, op_name) {
+                    return None;
+                }
                 Some(CallableInvocation {
                     reference: reference.clone(),
                     op_name,
@@ -1214,6 +1249,12 @@ impl<'a> ScanState<'a> {
             }
             _ => None,
         }
+    }
+
+    fn suppress_plain_constructor_invocation(reference: &GlobalRef, op_name: &'static str) -> bool {
+        matches!(op_name, "REDUCE" | "OBJ")
+            && reference.module == "re"
+            && reference.name == "Scanner"
     }
 
     fn protocol_dispatch_invocations(
@@ -1279,6 +1320,15 @@ impl<'a> ScanState<'a> {
         let Some(arguments) = argument_values else {
             return Vec::new();
         };
+        if let Some(invocation) = self.regex_scanner_scan_invocation(
+            &callable_reference.module,
+            &callable_reference.name,
+            arguments,
+            op_name,
+            position,
+        ) {
+            return vec![invocation];
+        }
         let Some((_, _, _, callback_arg_index, callback_arg_count, guard)) =
             EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS.iter().find(
                 |(consumer_module, consumer_name, arity, _, _, _)| {
@@ -1337,10 +1387,30 @@ impl<'a> ScanState<'a> {
         else {
             return false;
         };
-        if !Self::is_plain_regex_literal(&pattern) {
-            return false;
+        Self::literal_regex_pattern_matches_text(&pattern, &input)
+    }
+
+    fn regex_scanner_scan_invocation(
+        &self,
+        module: &str,
+        name: &str,
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Option<CallableInvocation> {
+        if module != "re" || name != "Scanner.scan" || arguments.len() != 2 {
+            return None;
         }
-        pattern.is_empty() || input.as_str().contains(pattern.as_str())
+        let Some(StackValue::RegexScanner { rules }) = arguments.first() else {
+            return None;
+        };
+        let input = arguments
+            .get(1)
+            .and_then(|value| stack_value_string(value, self.payload))?;
+        rules
+            .iter()
+            .find(|rule| Self::literal_regex_pattern_matches_text(&rule.pattern, &input))
+            .map(|rule| Self::callable_invocation(rule.action.clone(), op_name, position, Some(2)))
     }
 
     fn regex_pattern_from_value(&self, value: Option<&StackValue>) -> Option<String> {
@@ -1358,6 +1428,10 @@ impl<'a> ScanState<'a> {
                 '.' | '^' | '$' | '*' | '+' | '?' | '{' | '}' | '[' | ']' | '\\' | '|' | '(' | ')'
             )
         })
+    }
+
+    fn literal_regex_pattern_matches_text(pattern: &str, input: &str) -> bool {
+        Self::is_plain_regex_literal(pattern) && (pattern.is_empty() || input.contains(pattern))
     }
 
     fn builtins_format_invocations(
@@ -2029,6 +2103,10 @@ impl<'a> ScanState<'a> {
             self.stack.push(regex_pattern);
             return;
         }
+        if let Some(regex_scanner) = Self::regex_scanner_result(values) {
+            self.stack.push(regex_scanner);
+            return;
+        }
         self.push_constructed_result(values.first());
     }
 
@@ -2077,6 +2155,30 @@ impl<'a> ScanState<'a> {
             .first()
             .and_then(|value| stack_value_string(value, self.payload))?;
         Some(StackValue::RegexPattern { pattern })
+    }
+
+    fn regex_scanner_result(values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed
+            || callable_reference.module != "re"
+            || callable_reference.name != "Scanner"
+        {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        if !(1..=2).contains(&arguments.len()) {
+            return None;
+        }
+        let Some(StackValue::RegexScannerLexicon { rules }) = arguments.first() else {
+            return None;
+        };
+        Some(StackValue::RegexScanner {
+            rules: rules.clone(),
+        })
     }
 
     fn lazy_zero_arg_callback_iterable_result(values: &[StackValue]) -> Option<StackValue> {
