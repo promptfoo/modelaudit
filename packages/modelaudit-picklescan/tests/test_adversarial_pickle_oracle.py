@@ -897,6 +897,10 @@ def _global_operand(module: str, name: str) -> bytes:
     return _short_binunicode(module.encode()) + _short_binunicode(name.encode()) + b"\x93"
 
 
+def _legacy_global_operand(module: str, name: str) -> bytes:
+    return b"c" + module.encode() + b"\n" + name.encode() + b"\n"
+
+
 def _dict_setitem(key: str, value: bytes) -> bytes:
     return _text_operand(key) + value + b"s"
 
@@ -1314,6 +1318,34 @@ def _wrapper_descriptor_getattribute_eval_payload(marker: Path, *, include_looku
     parts += join_fragments(code_fragments)
     if include_lookup:
         parts += [b"\x940h\x03h\x04\x85R"]
+    parts += [b"."]
+    return b"".join(parts), code
+
+
+def _legacy_bound_getattribute_eval_payload(marker: Path, *, include_lookup: bool) -> tuple[bytes, str]:
+    code = f"open({str(marker)!r},'w').write('owned-by-bound-function-getattribute')"
+    code_fragments = [code[offset : offset + 19] for offset in range(0, len(code), 19)]
+
+    def join_fragments(fragments: list[str]) -> list[bytes]:
+        return [
+            _global_operand("builtins", "str.join"),
+            _text_operand(""),
+            _tuple_payload_operands([_text_operand(fragment) for fragment in fragments]),
+            b"\x86R",
+        ]
+
+    parts = [b"\x80\x04"]
+    if include_lookup:
+        parts += [_legacy_global_operand("statistics", "mean.__getattribute__")]
+        parts += join_fragments(["_", "_", "builtins", "_", "_"])
+        parts += [b"\x85R\x940"]
+        parts += [_global_operand("builtins", "dict.get")]
+        parts += [b"h\x00"]
+        parts += join_fragments(["ev", "al"])
+        parts += [b"\x86R\x940"]
+    parts += join_fragments(code_fragments)
+    if include_lookup:
+        parts += [b"\x940h\x01h\x02\x85R"]
     parts += [b"."]
     return b"".join(parts), code
 
@@ -3496,6 +3528,40 @@ def test_scan_bytes_blocks_wrapper_descriptor_getattribute_eval_recovery_rce(tmp
     result = pickle.loads(payload)
     assert result == len("owned-by-wrapper-descriptor")
     assert marker.read_text() == "owned-by-wrapper-descriptor"
+
+
+def test_scan_bytes_blocks_legacy_global_bound_getattribute_eval_recovery_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "legacy_bound_getattribute_eval_marker"
+    control_payload, expected_code = _legacy_bound_getattribute_eval_payload(marker, include_lookup=False)
+    payload, _ = _legacy_bound_getattribute_eval_payload(marker, include_lookup=True)
+
+    control_report = scan_bytes(control_payload, source="legacy-bound-getattribute-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert control_result == expected_code
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="legacy-bound-getattribute-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_global_finding(report, "statistics", "mean.__getattribute__")
+
+    for module, name in [
+        ("statistics", "__getattribute__"),
+        ("builtins", "object.__getattribute__"),
+        ("statistics", "mean.__globals__"),
+    ]:
+        direct_payload = b"\x80\x04" + _legacy_global_operand(module, name) + b"."
+        direct_report = scan_bytes(direct_payload, source=f"{module}-{name}-legacy-direct.pkl")
+        assert direct_report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_global_finding(direct_report, module, name)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result == len("owned-by-bound-function-getattribute")
+    assert marker.read_text() == "owned-by-bound-function-getattribute"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="os.system proof uses POSIX shell redirection")

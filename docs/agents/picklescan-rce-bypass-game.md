@@ -8578,3 +8578,110 @@ Blocking plan:
 Performance note: the fix remains a constant Rust policy lookup over parsed
 pickle globals. It does not import modules, bind descriptors, inspect source,
 or expand the Python call graph.
+
+## Turn 155 - Bypass via legacy dotted `GLOBAL` bound `__getattribute__`
+
+Found a scanner-clean RCE that bypasses the descriptor-binder blocks by letting
+pickle's legacy `GLOBAL` opcode do the attribute traversal. A `GLOBAL` reference
+to `statistics\nmean.__getattribute__\n` resolves to the method-wrapper already
+bound to the standard-library function object `statistics.mean`. Calling that
+bound method with a fragmented `__builtins__` name returns the function's
+builtin namespace, which then yields `eval`.
+
+This is stronger than directly importing `builtins.object.__getattribute__`:
+the dangerous source primitive is hidden behind a clean function object in an
+otherwise benign module, and the legacy `GLOBAL` operand is not scanned as a
+string literal. The equivalent `STACK_GLOBAL` form exposes
+`mean.__getattribute__` as a string operand and only raises a warning, but the
+legacy form is fully clean.
+
+The payload builds the builtin attribute name, eval key, and code at unpickle
+time:
+
+```python
+read_attr = statistics.mean.__getattribute__
+builtins_dict = read_attr("".join(["_", "_", "builtins", "_", "_"]))
+fn = dict.get(builtins_dict, "".join(["ev", "al"]))
+code = "".join(
+    [
+        "open('/tmp/.../marker','w').write('owned-by-bound-function-getattribute')",
+    ]
+)
+fn(code)
+```
+
+The active pickle imports only:
+
+- `statistics.mean.__getattribute__` via legacy `GLOBAL`
+- `builtins.str.join`
+- `builtins.dict.get`
+- `builtins.str.join`
+- `builtins.str.join`
+
+Proof on CPython 3.12.12:
+
+- Control payload scanner result: `len=196`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control import references: one clean `builtins.str.join`.
+- Control runtime: `pickle.loads(control)` returns the assembled eval code
+  string and creates no marker.
+- Active payload scanner result: `len=355`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references: `statistics.mean.__getattribute__`,
+  `builtins.dict.get`, and three `builtins.str.join` references, all with
+  `is_dangerous=False`.
+- Active runtime before unpickle: marker absent.
+- Active runtime after unpickle: marker exists and contains
+  `owned-by-bound-function-getattribute`; `pickle.loads(active)` returns the
+  integer byte count from `open(...).write(...)`.
+
+Why the scanner missed it:
+
+- Dotted-name tail severity decomposes only the pickle global name, so
+  `module=statistics`, `name=mean.__getattribute__` tries candidates such as
+  `mean.__getattribute__` rather than recognizing the source primitive tail.
+- The Python call-graph pass only analyzes importable Python functions and
+  class entrypoints from source. It does not model legacy `GLOBAL` attribute
+  traversal that returns a bound C method-wrapper from an otherwise clean
+  function object.
+- The suspicious-string scan sees the fragmented `__builtins__`, `eval`, and
+  code strings, but it does not scan legacy `GLOBAL` operands as string
+  literals. The dangerous contiguous `__getattribute__` text appears only in
+  the legacy global operand.
+- Existing descriptor-binder blocks do not fire because no descriptor getter is
+  imported or called; pickle resolves the bound method directly before the
+  scanner's stack model has any object provenance.
+
+Performance note: the next block should stay close to the source primitive by
+treating dotted global tails for dangerous class entrypoint/source methods such
+as `__getattribute__` as critical even when they are reached through legacy
+`GLOBAL` attribute traversal. That is still a bounded string/tail policy check
+over parsed global references, not runtime imports, descriptor binding, or
+package-by-package call-graph expansion.
+
+## Turn 156 - Block attribute-access source globals
+
+Blocking plan:
+
+- Add a finite parsed-global component check for `__getattribute__`. This
+  catches exact module-level references such as `statistics.__getattribute__`,
+  dotted legacy traversal references such as
+  `statistics.mean.__getattribute__`, and builtin slot references such as
+  `builtins.object.__getattribute__`.
+- Extend the namespace-source check from `__dict__` and `__builtins__` to also
+  include `__globals__`, so function global dictionaries reached through
+  legacy dotted traversal are blocked at the same source layer.
+- Add Rust unit coverage for exact and dotted `__getattribute__`, builtin
+  `object.__getattribute__`, and dotted function `__globals__` references.
+- Add a CPython oracle regression for the Turn 155 payload. The control payload
+  only assembles the eval code string and remains clean; the active payload
+  imports `statistics.mean.__getattribute__` through legacy `GLOBAL`, is
+  flagged as malicious, and still writes the marker if loaded.
+- Add direct legacy-`GLOBAL` regressions for module-level
+  `__getattribute__`, builtin `object.__getattribute__`, and function
+  `__globals__`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: this stays in the Rust policy path and checks a tiny fixed
+set of parsed global-name components. It adds no imports, no object traversal,
+no descriptor binding, and no package-specific call-graph expansion.

@@ -7,8 +7,17 @@ fn direct_global_severity(module: &str, name: &str) -> Option<&'static str> {
         return None;
     }
 
+    if attribute_access_source_method_is_dangerous(name) {
+        return Some("critical");
+    }
+
     if warning_globals(module).is_some_and(|warning_match| warning_match.matches(name)) {
         return Some("warning");
+    }
+
+    if pathlib_concrete_path_alias_is_dangerous(module, name) || namespace_global_is_dangerous(name)
+    {
+        return Some("critical");
     }
 
     if BUILTIN_MODULES.contains(&module) {
@@ -17,11 +26,6 @@ fn direct_global_severity(module: &str, name: &str) -> Option<&'static str> {
         } else {
             None
         };
-    }
-
-    if pathlib_concrete_path_alias_is_dangerous(module, name) || namespace_global_is_dangerous(name)
-    {
-        return Some("critical");
     }
 
     if dangerous_global_is_listed(module, name) {
@@ -108,10 +112,16 @@ fn pathlib_concrete_path_alias_is_dangerous(module: &str, name: &str) -> bool {
 }
 
 fn namespace_global_is_dangerous(name: &str) -> bool {
-    name == "__dict__"
-        || name.starts_with("__dict__.")
-        || name == "__builtins__"
-        || name.starts_with("__builtins__.")
+    name_contains_component(name, &["__builtins__", "__dict__", "__globals__"])
+}
+
+fn attribute_access_source_method_is_dangerous(name: &str) -> bool {
+    name_contains_component(name, &["__getattribute__"])
+}
+
+fn name_contains_component(name: &str, blocked_components: &[&str]) -> bool {
+    name.split('.')
+        .any(|component| blocked_components.contains(&component))
 }
 
 const BUILTIN_MODULES: &[&str] = &["builtins", "__builtin__", "__builtins__"];
@@ -479,10 +489,21 @@ mod tests {
                 "__dict__.__getitem__",
                 "__builtins__",
                 "__builtins__.get",
+                "__globals__",
+                "__globals__.get",
+                "object.__getattribute__",
             ] {
                 assert_eq!(global_severity(module, name), Some("critical"));
             }
         }
+        for (module, name) in [
+            ("statistics", "__getattribute__"),
+            ("statistics", "mean.__getattribute__"),
+            ("statistics", "mean.__globals__"),
+        ] {
+            assert_eq!(global_severity(module, name), Some("critical"));
+        }
+        assert_eq!(global_severity("statistics", "mean.__name__"), None);
         assert_eq!(global_severity("builtins", "filter"), Some("critical"));
         assert_eq!(global_severity("builtins", "hasattr"), Some("critical"));
         assert_eq!(global_severity("builtins", "map"), Some("critical"));
