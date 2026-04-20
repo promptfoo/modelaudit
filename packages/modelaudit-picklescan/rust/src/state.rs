@@ -1347,8 +1347,10 @@ impl<'a> ScanState<'a> {
             return Vec::new();
         };
         if callable_reference.malformed
-            || callable_reference.module != "operator"
-            || callable_reference.name != "getitem"
+            || !Self::is_defaultdict_factory_lookup(
+                &callable_reference.module,
+                &callable_reference.name,
+            )
         {
             return Vec::new();
         }
@@ -1360,6 +1362,15 @@ impl<'a> ScanState<'a> {
             op_name,
             position,
         )]
+    }
+
+    fn is_defaultdict_factory_lookup(module: &str, name: &str) -> bool {
+        match (module, name) {
+            ("operator", "getitem") => true,
+            ("collections", "defaultdict.__getitem__" | "defaultdict.__missing__") => true,
+            ("builtins" | "__builtin__" | "__builtins__", "dict.__getitem__") => true,
+            _ => false,
+        }
     }
 
     fn zero_arg_invocation(
