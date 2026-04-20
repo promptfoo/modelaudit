@@ -1134,6 +1134,26 @@ def _io_fileio_pth_payload(pth_path: Path, _marker: Path, *, include_write: bool
     return b"".join(parts), expected_line
 
 
+def _builtin_dict_get_eval_payload(marker: Path, *, include_lookup: bool) -> tuple[bytes, str]:
+    code = f"open({str(marker)!r},'w').write('owned-by-dict-get')"
+    code_fragments = [code[offset : offset + 18] for offset in range(0, len(code), 18)]
+    parts = [b"\x80\x04"]
+    if include_lookup:
+        parts += [_global_operand("builtins", "__dict__"), b"\x940"]
+        parts += [_global_operand("builtins", "str.join")]
+        parts += [_text_operand(""), _tuple_payload_operands([_text_operand("ev"), _text_operand("al")])]
+        parts += [b"\x86R\x940"]
+        parts += [_global_operand("builtins", "dict.get")]
+        parts += [b"h\x00h\x01\x86R\x940"]
+    parts += [_global_operand("builtins", "str.join")]
+    parts += [_text_operand(""), _tuple_payload_operands([_text_operand(fragment) for fragment in code_fragments])]
+    parts += [b"\x86R"]
+    if include_lookup:
+        parts += [b"\x940h\x02h\x03\x85R"]
+    parts += [b"."]
+    return b"".join(parts), code
+
+
 def _dotenv_run_command_payload(command: list[str], *, include_call: bool) -> bytes:
     command_list = _list_payload_operands([_text_operand(part) for part in command])
     parts = [b"\x80\x04"]
@@ -3097,6 +3117,35 @@ def test_scan_bytes_blocks_io_fileio_fragmented_pth_rce(tmp_path: Path, monkeypa
         assert marker.read_text() == "owned-by-io-fileio"
     finally:
         sys.path[:] = original_sys_path
+
+
+def test_scan_bytes_blocks_builtin_dict_lookup_eval_recovery_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "builtin_dict_get_eval_marker"
+    control_payload, expected_code = _builtin_dict_get_eval_payload(marker, include_lookup=False)
+    payload, _ = _builtin_dict_get_eval_payload(marker, include_lookup=True)
+
+    control_report = scan_bytes(control_payload, source="builtin-dict-get-eval-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert control_result == expected_code
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="builtin-dict-get-eval-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_global_finding(report, "builtins", "__dict__")
+
+    direct_lookup = b"\x80\x04" + _global_operand("builtins", "__dict__.get") + b"."
+    direct_report = scan_bytes(direct_lookup, source="builtin-dict-get-bound-method.pkl")
+    assert direct_report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_global_finding(direct_report, "builtins", "__dict__.get")
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result == len("owned-by-dict-get")
+    assert marker.read_text() == "owned-by-dict-get"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="dotenv.cli.run_command uses POSIX os.execvpe in this proof")

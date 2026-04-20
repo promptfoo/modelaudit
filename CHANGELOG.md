@@ -154,6 +154,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   constructor and object-method call graph entrypoints
 - **security:** detect public `io.FileIO` and `io.TextIOWrapper.write` aliases
   for blocked `_io` file-writing primitives
+- **security:** detect builtin namespace dictionary access that can recover
+  blocked primitives through mapping lookups
 - **security:** detect pickle calls to PyYAML unsafe loaders that can execute
   attacker-controlled Python constructors
 - **security:** detect pickle calls to `codecs.open` and codec stream writes

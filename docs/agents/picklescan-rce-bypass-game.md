@@ -7754,3 +7754,100 @@ Blocking plan:
 Performance note: this is a constant-size exact lookup addition in the Rust
 policy table. It adds no Python source parsing, no C introspection, and no
 package enumeration.
+
+## Turn 139 - Bypass via clean builtin namespace lookup to recover `eval`
+
+Found a scanner-clean RCE that reconstructs a blocked builtin at unpickle time
+without ever importing the blocked global directly. The scanner blocks
+`builtins.eval`, `builtins.getattr`, `operator.attrgetter`, and
+`operator.itemgetter`, but it currently treats these builtin descriptor globals
+as clean:
+
+- `builtins.__dict__`
+- `builtins.dict.get`
+- `builtins.str.join`
+
+The payload first rebuilds the key `eval` from harmless fragments, then uses
+the builtin dictionary descriptor to recover the real function:
+
+```python
+builtins_dict = builtins.__dict__
+key = "".join(["ev", "al"])
+fn = dict.get(builtins_dict, key)
+code = "".join(
+    [
+        "open('/tmp/.../dict_get_marker",
+        "', 'w').write('owned-by-dict-get')",
+    ]
+)
+fn(code)
+```
+
+The active pickle imports only:
+
+- `builtins.__dict__`
+- `builtins.str.join`
+- `builtins.dict.get`
+- `builtins.str.join`
+
+Proof on CPython 3.12.12:
+
+- Control payload scanner result: `len=90`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control import references: `builtins.__dict__`, `builtins.str.join`, and
+  `builtins.dict.get`, all with `is_dangerous=False`.
+- Control runtime: `pickle.loads(control)` returns `<built-in function eval>`
+  and creates no marker.
+- Active payload scanner result: `len=255`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references: `builtins.__dict__`, two `builtins.str.join`
+  references, and `builtins.dict.get`, all with `is_dangerous=False`.
+- Active runtime before unpickle: marker absent.
+- Active runtime after unpickle: marker exists and contains
+  `owned-by-dict-get`; `pickle.loads(active)` returns the integer byte count
+  from `open(...).write(...)`.
+
+Why the scanner missed it:
+
+- The exact dangerous-global policy keys on the imported global name. This
+  pickle never imports `builtins.eval`; it imports a clean dictionary object and
+  a clean dictionary method descriptor, then resolves `eval` dynamically.
+- The suspicious-string policy does not see a contiguous `eval`, `eval(`,
+  `exec`, `getattr`, `import`, `os.system`, or subprocess string. The dangerous
+  builtin name and executable expression are assembled with `str.join` during
+  unpickle.
+- The Python call-graph pass cannot inspect builtin C descriptors such as
+  `dict.get` and does not model dataflow from a module namespace dictionary
+  lookup into a later `REDUCE` call.
+
+Performance note: the next block should handle this close to the primitive by
+treating access to builtin/module namespace dictionaries plus mapping lookup
+descriptors as dangerous when reachable from pickle, or by fail-closing on
+`builtins.__dict__` and equivalent namespace recovery primitives. This is a
+finite source-level rule for dynamic global recovery, not a package-specific
+enumeration.
+
+## Turn 140 - Block builtin namespace dictionary recovery
+
+Blocking plan:
+
+- Treat builtin-module `__dict__` access as critical for all builtin module
+  spellings covered by the policy (`builtins`, `__builtin__`, and
+  `__builtins__`).
+- Treat dotted builtin namespace dictionary attributes such as
+  `builtins.__dict__.get` and `builtins.__dict__.__getitem__` as critical too.
+  CPython resolves these as bound dictionary methods, so blocking only the bare
+  namespace dictionary still leaves a direct recovery path.
+- Keep the rule narrow: it is a builtin namespace recovery primitive, not a
+  broad block on all dictionaries or all `dict.get` descriptors.
+- Add a CPython oracle regression for the Turn 139 payload. The control payload
+  only assembles the code string and stays clean; the active payload imports
+  `builtins.__dict__`, reconstructs the `eval` key, recovers the function via
+  `dict.get`, and executes a marker write if loaded.
+- Add a direct bound-method check for `builtins.__dict__.get` so the dotted
+  namespace accessor remains covered.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: this is a constant-time name-prefix rule inside the existing
+builtin-module branch of the Rust policy check. It adds no dataflow analysis,
+no Python imports, no package enumeration, and no extra call-graph traversal.

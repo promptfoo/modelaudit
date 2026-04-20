@@ -8,7 +8,7 @@ pub(crate) fn global_severity(module: &str, name: &str) -> Option<&'static str> 
     }
 
     if BUILTIN_MODULES.contains(&module) {
-        return if BUILTIN_DANGEROUS_NAMES.contains(&name) {
+        return if builtin_global_is_dangerous(name) {
             Some("critical")
         } else {
             None
@@ -63,6 +63,10 @@ fn warning_globals(module: &str) -> Option<WarningGlobalMatch> {
         "tempfile" => Some(WarningGlobalMatch::OneOf(&["mktemp"])),
         _ => None,
     }
+}
+
+fn builtin_global_is_dangerous(name: &str) -> bool {
+    BUILTIN_DANGEROUS_NAMES.contains(&name) || name == "__dict__" || name.starts_with("__dict__.")
 }
 
 const BUILTIN_MODULES: &[&str] = &["builtins", "__builtin__", "__builtins__"];
@@ -407,6 +411,11 @@ mod tests {
         assert_eq!(global_severity("pipes", "Template.copy"), Some("critical"));
         assert_eq!(global_severity("pipes", "Template.open"), Some("critical"));
         assert_eq!(global_severity("operator", "call"), Some("critical"));
+        for module in BUILTIN_MODULES {
+            for name in ["__dict__", "__dict__.get", "__dict__.__getitem__"] {
+                assert_eq!(global_severity(module, name), Some("critical"));
+            }
+        }
         assert_eq!(global_severity("builtins", "filter"), Some("critical"));
         assert_eq!(global_severity("builtins", "hasattr"), Some("critical"));
         assert_eq!(global_severity("builtins", "map"), Some("critical"));
