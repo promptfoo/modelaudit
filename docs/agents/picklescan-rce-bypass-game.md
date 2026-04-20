@@ -9805,3 +9805,105 @@ Performance sanity:
 - The full adversarial oracle passed: `499 passed, 1 skipped` in `1.31s`.
 - Full validation passed:
   `3675 passed, 1022 skipped, 21 warnings in 55.29s`.
+
+## Turn 177 - Bypass via synthetic `six.moves.getoutput` subprocess alias
+
+Found a scanner-clean RCE primitive through the `six.moves` compatibility
+module.
+
+Malicious pickle shape:
+
+- Import `six.moves.getoutput` with `STACK_GLOBAL`.
+- Call it with one attacker-controlled command string:
+  `printf owned-by-six-moves-getoutput > /tmp/modelaudit_six_moves_six_moves_getoutput`.
+- Runtime resolution returns `subprocess.getoutput`, which calls
+  `subprocess.getstatusoutput`, which calls `subprocess.check_output(...,
+  shell=True, ...)`.
+
+Proof on CPython 3.12.12 with `six==1.17.0` installed:
+
+- `six.moves.getoutput` resolves at runtime to `<function getoutput>` with
+  `__module__ == "subprocess"` and `__name__ == "getoutput"`.
+- `six.py` registers the alias as
+  `MovedAttribute("getoutput", "commands", "subprocess")`.
+- `_call_graph_entrypoints("six.moves.getoutput") == ()`.
+- `_find_sink_path("six.moves.getoutput") is None`.
+- `_call_graph_entrypoints("subprocess.getoutput") ==
+  ("subprocess.getoutput",)`.
+- `_find_sink_path("subprocess.getoutput")` reaches
+  `subprocess.getstatusoutput` and `subprocess.check_output`.
+- Direct `subprocess.getoutput` pickle scans `malicious` with
+  `DANGEROUS_CALL`.
+- Alias pickle scanner result: `len=114`, `status=complete`, `verdict=clean`,
+  `findings=[]`, `notices=[]`.
+- Alias import reference:
+  `six.moves.getoutput` with `is_dangerous=False`.
+- Runtime before unpickle: marker absent.
+- Runtime after unpickle: marker exists and contains
+  `owned-by-six-moves-getoutput`; `pickle.loads(payload)` returns `""`.
+
+Why the scanner missed it:
+
+- The lower-level primitive is already blocked, which answers the "is something
+  lower level catching this?" question for the direct import path.
+- The bypass imports a synthetic lazy module path, not `subprocess`. The native
+  scanner records the literal pickle global as `six.moves.getoutput`, so the
+  existing dangerous-global table does not match.
+- The Python call graph is source-based. `_resolve_module_source("six.moves")`
+  has no normal source file to parse, and `_resolve_function_target()` does not
+  inspect runtime object metadata or `six._moved_attributes`.
+- This is another finite-source problem, not an infinite-package problem:
+  compatibility shims can hide the same small set of dangerous primitives behind
+  alternate import references.
+
+Performance note: the defensive turn should normalize known compatibility shim
+aliases close to import-reference handling, not import arbitrary modules or walk
+dynamic objects at scan time. A bounded static alias table for `six.moves`
+entries, or a safe source parse of `six._moved_attributes`, can map
+`six.moves.getoutput` to `subprocess.getoutput`; the existing dangerous-global
+and call-graph checks then catch it without broadening graph exploration.
+
+## Turn 178 - Block `six.moves.getoutput` compatibility alias
+
+Implemented a focused call-graph normalization for the Turn 177 bypass.
+
+The call graph now has a bounded static import-reference alias map:
+
+- `six.moves.getoutput -> subprocess.getoutput`
+
+This keeps the fix close to the synthetic compatibility source. The scanner does
+not import `six`, inspect live objects, or expand dynamic module traversal during
+scans; it only normalizes this known dangerous alias before the existing
+call-graph resolver runs.
+
+Regression coverage added in
+`packages/modelaudit-picklescan/tests/test_call_graph_six.py`:
+
+- `_call_graph_entrypoints("six.moves.getoutput")` now resolves to
+  `subprocess.getoutput`.
+- `_find_sink_path("six.moves.getoutput")` now reaches
+  `subprocess.getstatusoutput` and `subprocess.check_output`.
+- Both pickle spellings now scan `malicious` with `DANGEROUS_CALL_GRAPH`:
+  module/name `six.moves`/`getoutput` and `six`/`moves.getoutput`.
+- The test still executes the payload after the scan assertion to prove the
+  marker write would occur if a caller ignored the malicious verdict.
+- The control pickle containing only the command string remains `clean`.
+
+Focused validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_call_graph_six.py`
+  passed: `3 passed`.
+- `ruff format`, `ruff check --fix`, and `mypy` passed on the standard
+  ModelAudit paths.
+- Full non-slow/non-integration validation passed:
+  `3678 passed, 1022 skipped, 21 warnings in 51.20s`.
+
+Performance sanity:
+
+- `_find_sink_path("six.moves.getoutput")`: `0.0109s`, path
+  `six.moves.getoutput -> subprocess.getstatusoutput ->
+  subprocess.check_output`.
+- `_find_sink_path("subprocess.getoutput")`: effectively `0.0000s` after the
+  subprocess module analysis cache is warm.
+- Existing wrapper timings stayed in the same range:
+  `click.edit` at `0.0502s` and `execnet.makegateway` at `0.0426s`.
