@@ -14925,3 +14925,179 @@ Validation:
 - `mypy`: `Success: no issues found in 447 source files`.
 - Full non-slow/non-integration validation:
   `3744 passed, 1022 skipped, 21 warnings in 52.52s`.
+
+## Turn 243 - Bypass via one-step call-iterator consumption with `builtins.next`
+
+Found another scanner-clean RCE-capable bypass in the same finite call-iterator
+source family. The native stack model already recognizes
+`iter(callable, sentinel)` as `StackValue::CallIterator { callable }`, and it
+models eager container consumption through `list(...)`, `tuple(...)`,
+`dict(...)`, `set(...)`, `frozenset(...)`, and `collections.deque(...)`.
+However, the one-step consumer `next(iterator)` also invokes the stored callable
+with no arguments and is currently clean.
+
+The payload constructs `iter(builtins.help, "stop")`, then invokes
+`builtins.next(iterator)`. `next()` calls `help()` once; `builtins.help()`
+enters `_sitebuiltins._Helper.__call__`, which imports `pydoc`. A shadow
+`pydoc.py` at the front of `sys.path` executes during `pickle.loads`.
+
+Payload shape:
+
+```text
+PROTO 4
+STACK_GLOBAL builtins iter
+STACK_GLOBAL builtins help
+SHORT_BINUNICODE "stop"
+TUPLE2
+REDUCE              # iter(help, "stop")
+MEMOIZE
+POP
+STACK_GLOBAL builtins next
+BINGET 0
+TUPLE1
+REDUCE              # next(iter(help, "stop"))
+STOP
+```
+
+Raw payload:
+
+```text
+80048c086275696c74696e738c0469746572938c086275696c74696e738c0468656c70938c0473746f70865294308c086275696c74696e738c046e65787493680085522e
+```
+
+Scanner proof:
+
+```text
+payload_len 68
+scan clean findings 0 errors ()
+imports [
+  ('builtins', 'iter', False, None),
+  ('builtins', 'help', False, None),
+  ('builtins', 'next', False, None),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('builtins', 'next', 1, 66),
+]
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime_result 'factory-value'
+marker_exists True
+marker_text pydoc-owned
+runtime stderr
+```
+
+The child proof inserted a temporary module directory at the front of
+`sys.path`, removed `pydoc` from `sys.modules`, and ran `pickle.loads(payload)`.
+The shadow `pydoc.py` wrote the marker at import time and provided a minimal
+`help` function returning `"factory-value"`.
+
+Why it bypasses:
+
+- Native policy does not mark `builtins.iter`, `builtins.help`, or
+  `builtins.next` as dangerous.
+- The scanner records `iter(help, "stop")` and `next(iterator)` as direct
+  invocations, but it does not emit the hidden zero-argument `builtins.help`
+  invocation caused by `next()`.
+- The call graph already maps an invoked `builtins.help()` to
+  `_sitebuiltins._Helper.__call__ -> builtins.__import__`, but that edge is
+  absent from native metadata.
+- Existing call-iterator defenses cover eager full consumers, not the one-step
+  consumer.
+- The payload contains no `pydoc`, `import`, `__import__`, `eval`, `exec`,
+  `os.system`, or `subprocess` strings.
+
+Likely source-level defense:
+
+- Extend native call-iterator consumption modeling to cover
+  `builtins.next(iterator)` and `builtins.next(iterator, default)`.
+- When the first argument is `StackValue::CallIterator { callable }`, emit a
+  synthetic zero-argument invocation of `callable` at the `next` opcode.
+- Keep this alongside the existing eager-consumer helper. This is finite and
+  stack-local: it inspects already-extracted reducer arguments for one clean
+  built-in consumer.
+
+Performance note:
+
+- Payload size is 68 bytes.
+- Warm scan median over 1000 runs was `0.000052s` with max `0.000112s`.
+- A fix only needs to inspect already-extracted reducer arguments for
+  `builtins.next`.
+
+## Turn 244 - Defense for one-step call-iterator consumption with `builtins.next`
+
+Blocked the Turn 243 bypass at the existing call-iterator source. The native
+stack model already represents `iter(callable, sentinel)` as
+`StackValue::CallIterator { callable }`; this turn extends the finite consumer
+model from eager container constructors to `builtins.next`.
+
+Implementation:
+
+- `call_iterator_consumption_invocations(...)` now handles two consumer
+  families:
+  - eager full consumers such as `list(iterator)`, unchanged;
+  - one-step `builtins.next(iterator)` and `builtins.next(iterator, default)`.
+- When the first `next` argument is a tracked call iterator, the scanner emits a
+  synthetic zero-argument invocation of the stored callable at the `next`
+  opcode.
+- Kept `builtins.next` itself clean. The detection fires on the hidden call
+  edge, not a broad dangerous-global policy entry.
+
+Regression coverage:
+
+- Added `test_scan_bytes_blocks_next_call_iterator_consumption_rce`.
+- The test verifies lazy `iter(help, "stop")` construction remains clean.
+- The malicious cases verify both `next(iterator)` and
+  `next(iterator, "fallback")` are malicious, record a hidden zero-argument
+  `builtins.help` invocation, and execute in a child interpreter with a shadow
+  `pydoc.py` marker proof.
+
+Post-fix proof:
+
+```text
+payload_len 68
+scan malicious findings 1 errors ()
+dangerous [('_sitebuiltins', '_Helper.__call__', 'builtins.__import__')]
+imports [('builtins', 'iter', False, None), ('builtins', 'help', False, None), ('builtins', 'next', False, None)]
+invocations [('builtins', 'iter', 2, 43), ('builtins', 'next', 1, 66), ('builtins', 'help', 0, 66)]
+runtime rc 0
+runtime_result 'factory-value'
+marker_exists True
+marker_text pydoc-owned
+runtime stderr
+timing_median 0.000117
+timing_max 0.000901
+```
+
+Performance note:
+
+- The new path is stack-local and only runs for `builtins.next` reducer
+  invocations.
+- It reuses the existing `zero_arg_invocation(...)` helper instead of adding a
+  package-specific policy rule.
+- Warm scan median for the fixed 68-byte payload was `0.000117s` over 1000
+  runs.
+
+Validation:
+
+- Rust formatting:
+  `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml`.
+- Rust unit tests: `78 passed`.
+- Rebuilt local ignored extension with release `cargo build` plus macOS
+  dynamic-lookup linker flags, then copied it to
+  `packages/modelaudit-picklescan/src/modelaudit_picklescan/_rust.abi3.so` for
+  Python tests.
+- Focused `builtins.next` regression: `2 passed in 0.38s`.
+- Focused import/call-graph regression file: `31 passed in 1.16s`.
+- Focused call-graph suite: `69 passed in 3.15s`.
+- Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
+  1.32s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3746 passed, 1022 skipped, 21 warnings in 54.52s`.

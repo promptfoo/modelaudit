@@ -1191,23 +1191,34 @@ impl<'a> ScanState<'a> {
         let Some(StackValue::Global(callable_reference)) = callable_value else {
             return Vec::new();
         };
-        if callable_reference.malformed
-            || !Self::is_eager_call_iterator_consumer(
-                &callable_reference.module,
-                &callable_reference.name,
-            )
+        if callable_reference.malformed {
+            return Vec::new();
+        }
+
+        let Some(arguments) = argument_values else {
+            return Vec::new();
+        };
+        if Self::is_eager_call_iterator_consumer(
+            &callable_reference.module,
+            &callable_reference.name,
+        ) {
+            let [StackValue::CallIterator { callable }] = arguments else {
+                return Vec::new();
+            };
+            return vec![Self::zero_arg_invocation(callable, op_name, position)];
+        }
+
+        if !Self::is_next_call_iterator_consumer(
+            &callable_reference.module,
+            &callable_reference.name,
+        ) || !(1..=2).contains(&arguments.len())
         {
             return Vec::new();
         }
-        let Some([StackValue::CallIterator { callable }]) = argument_values else {
+        let Some(StackValue::CallIterator { callable }) = arguments.first() else {
             return Vec::new();
         };
-        vec![CallableInvocation {
-            reference: callable.clone(),
-            op_name,
-            opcode_position: position,
-            positional_arg_count: Some(0),
-        }]
+        vec![Self::zero_arg_invocation(callable, op_name, position)]
     }
 
     fn is_eager_call_iterator_consumer(module: &str, name: &str) -> bool {
@@ -1217,6 +1228,13 @@ impl<'a> ScanState<'a> {
                 "builtins" | "__builtin__" | "__builtins__",
                 "dict" | "frozenset" | "list" | "set" | "tuple"
             ) | ("collections", "deque")
+        )
+    }
+
+    fn is_next_call_iterator_consumer(module: &str, name: &str) -> bool {
+        matches!(
+            (module, name),
+            ("builtins" | "__builtin__" | "__builtins__", "next")
         )
     }
 
