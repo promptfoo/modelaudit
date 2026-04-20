@@ -57,6 +57,10 @@ pub(crate) enum StackValue {
     DefaultDict {
         default_factory: GlobalRef,
     },
+    MappingWrapper {
+        reference: GlobalRef,
+        mappings: Vec<StackValue>,
+    },
     StringTemplate {
         template: String,
     },
@@ -108,6 +112,14 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
         Some(StackValue::DefaultDict { default_factory }) => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
+        Some(StackValue::MappingWrapper {
+            reference,
+            mappings,
+        }) => format!(
+            "mapping_wrapper:{}(mappings={})",
+            reference.symbol(),
+            mappings.len()
+        ),
         Some(StackValue::StringTemplate { template }) => {
             format!("string_template:{template:?}")
         }
@@ -203,6 +215,14 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
         StackValue::DefaultDict { default_factory } => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
+        StackValue::MappingWrapper {
+            reference,
+            mappings,
+        } => format!(
+            "mapping_wrapper:{}(mappings={})",
+            reference.symbol(),
+            mappings.len()
+        ),
         StackValue::StringTemplate { template } => format!("string_template:{template:?}"),
         StackValue::RegexPattern { pattern, flags } => {
             format!(

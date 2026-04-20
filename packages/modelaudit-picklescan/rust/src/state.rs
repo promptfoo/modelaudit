@@ -39,6 +39,7 @@ const MIN_SUSPICIOUS_LITERAL_SCAN_WINDOW_CHARS: usize = 8192;
 const SUSPICIOUS_LITERAL_SCAN_OVERLAP_CHARS: usize = 4096;
 const TIME_CHECK_INTERVAL_OPCODES: usize = 4096;
 const MAX_IMPORT_REFERENCES: usize = 10_000;
+const MAX_MAPPING_WRAPPER_UNWRAP_DEPTH: usize = 4;
 
 const STACK_GLOBAL_STRING_OPCODES: &[&str] = &[
     "BINSTRING",
@@ -1892,7 +1893,7 @@ impl<'a> ScanState<'a> {
         if arguments.len() != 2 || !Self::is_format_string_argument(arguments.first()) {
             return Vec::new();
         }
-        Self::defaultdict_mapping_lookup_invocations(arguments.get(1), op_name, position)
+        Self::mapping_lookup_invocations(arguments.get(1), op_name, position)
     }
 
     fn operator_mod_invocations(
@@ -1903,15 +1904,15 @@ impl<'a> ScanState<'a> {
         if arguments.len() != 2 || !Self::is_format_string_argument(arguments.first()) {
             return Vec::new();
         }
-        Self::defaultdict_mapping_lookup_invocations(arguments.get(1), op_name, position)
+        Self::mapping_lookup_invocations(arguments.get(1), op_name, position)
     }
 
-    fn defaultdict_mapping_lookup_invocations(
+    fn mapping_lookup_invocations(
         mapping: Option<&StackValue>,
         op_name: &'static str,
         position: usize,
     ) -> Vec<CallableInvocation> {
-        let Some(StackValue::DefaultDict { default_factory }) = mapping else {
+        let Some(default_factory) = Self::mapping_default_factory(mapping, 0) else {
             return Vec::new();
         };
         vec![Self::zero_arg_invocation(
@@ -1919,6 +1920,20 @@ impl<'a> ScanState<'a> {
             op_name,
             position,
         )]
+    }
+
+    fn mapping_default_factory(mapping: Option<&StackValue>, depth: usize) -> Option<&GlobalRef> {
+        match mapping? {
+            StackValue::DefaultDict { default_factory } => Some(default_factory),
+            StackValue::MappingWrapper { mappings, .. }
+                if depth < MAX_MAPPING_WRAPPER_UNWRAP_DEPTH =>
+            {
+                mappings
+                    .iter()
+                    .find_map(|mapping| Self::mapping_default_factory(Some(mapping), depth + 1))
+            }
+            _ => None,
+        }
     }
 
     fn formatter_vformat_invocations(
@@ -1948,7 +1963,7 @@ impl<'a> ScanState<'a> {
         {
             return Vec::new();
         }
-        Self::defaultdict_mapping_lookup_invocations(arguments.get(3), op_name, position)
+        Self::mapping_lookup_invocations(arguments.get(3), op_name, position)
     }
 
     fn template_substitute_invocations(
@@ -1959,7 +1974,7 @@ impl<'a> ScanState<'a> {
         if arguments.len() != 2 || !Self::string_template_may_lookup(arguments.first()) {
             return Vec::new();
         }
-        Self::defaultdict_mapping_lookup_invocations(arguments.get(1), op_name, position)
+        Self::mapping_lookup_invocations(arguments.get(1), op_name, position)
     }
 
     fn string_template_may_lookup(value: Option<&StackValue>) -> bool {
@@ -2372,9 +2387,9 @@ impl<'a> ScanState<'a> {
         name: &str,
     ) -> bool {
         match value {
-            Some(StackValue::Constructed(reference)) if !reference.malformed => {
-                reference.module == module && reference.name == name
-            }
+            Some(
+                StackValue::Constructed(reference) | StackValue::MappingWrapper { reference, .. },
+            ) if !reference.malformed => reference.module == module && reference.name == name,
             _ => false,
         }
     }
@@ -2431,7 +2446,11 @@ impl<'a> ScanState<'a> {
         {
             return Vec::new();
         }
-        let Some([StackValue::DefaultDict { default_factory }, _]) = argument_values else {
+        let Some(argument_values) = argument_values else {
+            return Vec::new();
+        };
+        let Some(default_factory) = Self::mapping_default_factory(argument_values.first(), 0)
+        else {
             return Vec::new();
         };
         vec![Self::zero_arg_invocation(
@@ -2570,6 +2589,10 @@ impl<'a> ScanState<'a> {
         }
         if let Some(defaultdict) = Self::defaultdict_result(values) {
             self.stack.push(defaultdict);
+            return;
+        }
+        if let Some(mapping_wrapper) = Self::mapping_wrapper_result(values) {
+            self.stack.push(mapping_wrapper);
             return;
         }
         if let Some(template) = self.string_template_result(values) {
@@ -2957,6 +2980,41 @@ impl<'a> ScanState<'a> {
         }
         let default_factory = Self::callable_reference_from_value(arguments.first())?;
         Some(StackValue::DefaultDict { default_factory })
+    }
+
+    fn mapping_wrapper_result(values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+
+        let mappings = match (
+            callable_reference.module.as_str(),
+            callable_reference.name.as_str(),
+        ) {
+            ("collections", "ChainMap") if !arguments.is_empty() => arguments.clone(),
+            ("types", "MappingProxyType") if arguments.len() == 1 => {
+                vec![arguments[0].clone()]
+            }
+            _ => return None,
+        };
+
+        if mappings
+            .iter()
+            .all(|mapping| Self::mapping_default_factory(Some(mapping), 0).is_none())
+        {
+            return None;
+        }
+
+        Some(StackValue::MappingWrapper {
+            reference: callable_reference.clone(),
+            mappings,
+        })
     }
 
     fn callable_reference_from_value(value: Option<&StackValue>) -> Option<GlobalRef> {

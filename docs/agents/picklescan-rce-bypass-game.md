@@ -20881,3 +20881,69 @@ Performance note:
   `MappingProxyType`.
 - Warm scan timing over 200 scans stayed flat: both representatives measured
   median `0.00007s` and p95 about `0.00008s`.
+
+## Turn 300 - Block transparent mapping-wrapper lookup into `defaultdict`
+
+Defensive turn for the Turn 299 mapping-wrapper bypass. The fix keeps the
+block at the call-graph source: clean stdlib mapping wrappers can now carry
+their bounded child mappings through the stack model, and mapping lookup
+modeling unwraps those transparent wrappers before deciding whether a
+`defaultdict` factory is reachable.
+
+Implementation:
+
+- Added `StackValue::MappingWrapper { reference, mappings }`.
+- Track `collections.ChainMap(...)` when any bounded child mapping contains a
+  tracked `defaultdict` factory.
+- Track `types.MappingProxyType(mapping)` when the proxied mapping contains a
+  tracked `defaultdict` factory.
+- Updated mapping lookup synthesis so `operator.getitem`, direct
+  `defaultdict`/`dict.__getitem__`, `%` formatting, `str.format_map`,
+  `string.Formatter`, and `string.Template` paths all use the same bounded
+  wrapper-unwrapping helper before synthesizing the zero-argument factory call.
+- Kept normal constructed-instance identity for wrappers so existing
+  `ChainMap.update` / mapping-update receiver logic still sees a `ChainMap`.
+
+Regression coverage:
+
+- Malicious positives for
+  `operator.getitem(collections.ChainMap(defaultdict(builtins.help)), key)` and
+  `operator.getitem(types.MappingProxyType(defaultdict(builtins.help)), key)`.
+- Runtime proof for both positives using shadowed `pydoc`.
+- Benign constructor-only negatives for both wrappers around a `defaultdict`.
+- Benign plain-`dict` lookup negatives for both wrappers.
+
+Validation:
+
+```text
+PROMPTFOO_DISABLE_TELEMETRY=1 UV_CACHE_DIR=/tmp/modelaudit-uv-cache uv run pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q -k "mapping_wrapper"
+6 passed, 187 deselected in 0.56s
+
+PROMPTFOO_DISABLE_TELEMETRY=1 UV_CACHE_DIR=/tmp/modelaudit-uv-cache uv run pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+193 passed in 5.97s
+
+PROMPTFOO_DISABLE_TELEMETRY=1 UV_CACHE_DIR=/tmp/modelaudit-uv-cache uv run pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+231 passed in 8.38s
+
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+78 passed
+
+UV_CACHE_DIR=/tmp/modelaudit-uv-cache uv run ruff format modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+392 files left unchanged
+
+UV_CACHE_DIR=/tmp/modelaudit-uv-cache uv run ruff check --fix modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+All checks passed
+
+UV_CACHE_DIR=/tmp/modelaudit-uv-cache uv run mypy modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+Success: no issues found in 447 source files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 UV_CACHE_DIR=/tmp/modelaudit-uv-cache uv run pytest -n auto -m "not slow and not integration" --maxfail=1
+3907 passed, 1023 skipped, 21 warnings in 71.81s
+```
+
+Performance note:
+
+- Wrapper tracking only happens for literal constructor calls already captured
+  in bounded pickle argument tuples.
+- Lookup unwrapping is capped at depth 4 and scans the already-bounded child
+  mapping list, so the fix stays proportional to existing stack-model state.
