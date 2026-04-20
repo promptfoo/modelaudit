@@ -51,6 +51,25 @@ const STACK_GLOBAL_STRING_OPCODES: &[&str] = &[
 ];
 const REDUCE_OPCODES: &[&str] = &["REDUCE", "NEWOBJ", "NEWOBJ_EX", "OBJ", "INST", "BUILD"];
 
+const EXACT_ARITY_STDLIB_EAGER_ITERABLE_CONSUMERS: &[(&str, &str, usize, usize)] = &[
+    ("array", "array", 2, 1),
+    ("collections", "Counter", 1, 0),
+    ("collections", "OrderedDict", 1, 0),
+    ("collections", "UserDict", 1, 0),
+    ("collections", "UserList", 1, 0),
+    ("heapq", "nlargest", 2, 1),
+    ("heapq", "nlargest", 3, 1),
+    ("heapq", "nsmallest", 2, 1),
+    ("heapq", "nsmallest", 3, 1),
+    ("math", "fsum", 1, 0),
+    ("math", "prod", 1, 0),
+    ("statistics", "mean", 1, 0),
+    ("statistics", "median", 1, 0),
+    ("weakref", "WeakKeyDictionary", 1, 0),
+    ("weakref", "WeakSet", 1, 0),
+    ("weakref", "WeakValueDictionary", 1, 0),
+];
+
 const EXACT_ARITY_ITERABLE_DESCRIPTOR_CONSUMERS: &[(&str, &str, usize, usize)] = &[
     ("array", "array.extend", 2, 1),
     ("builtins", "bytearray.__init__", 2, 1),
@@ -1357,22 +1376,12 @@ impl<'a> ScanState<'a> {
         name: &str,
         arguments: &'b [StackValue],
     ) -> Option<&'b GlobalRef> {
-        match (module, name) {
-            ("array", "array") if arguments.len() == 2 => {
-                arguments.get(1).and_then(Self::call_iterator_callable_ref)
-            }
-            ("collections", "Counter" | "OrderedDict" | "UserDict" | "UserList")
-                if arguments.len() == 1 =>
-            {
-                arguments.first().and_then(Self::call_iterator_callable_ref)
-            }
-            ("weakref", "WeakKeyDictionary" | "WeakSet" | "WeakValueDictionary")
-                if arguments.len() == 1 =>
-            {
-                arguments.first().and_then(Self::call_iterator_callable_ref)
-            }
-            _ => None,
-        }
+        Self::exact_arity_consumed_callable(
+            EXACT_ARITY_STDLIB_EAGER_ITERABLE_CONSUMERS,
+            module,
+            name,
+            arguments,
+        )
     }
 
     fn builtin_iterable_consumed_callable<'b>(
@@ -1396,9 +1405,12 @@ impl<'a> ScanState<'a> {
         name: &str,
         arguments: &'b [StackValue],
     ) -> Option<&'b GlobalRef> {
-        if let Some(callable) =
-            Self::exact_arity_iterable_descriptor_consumed_callable(module, name, arguments)
-        {
+        if let Some(callable) = Self::exact_arity_consumed_callable(
+            EXACT_ARITY_ITERABLE_DESCRIPTOR_CONSUMERS,
+            module,
+            name,
+            arguments,
+        ) {
             return Some(callable);
         }
         match (module, name) {
@@ -1426,24 +1438,26 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn exact_arity_iterable_descriptor_consumed_callable<'b>(
+    fn exact_arity_consumed_callable<'b>(
+        consumers: &[(&str, &str, usize, usize)],
         module: &str,
         name: &str,
         arguments: &'b [StackValue],
     ) -> Option<&'b GlobalRef> {
-        let (_, _, _, consumed_arg_index) = EXACT_ARITY_ITERABLE_DESCRIPTOR_CONSUMERS.iter().find(
-            |(consumer_module, consumer_name, arity, _)| {
-                Self::descriptor_consumer_module_matches(module, consumer_module)
-                    && *consumer_name == name
-                    && *arity == arguments.len()
-            },
-        )?;
+        let (_, _, _, consumed_arg_index) =
+            consumers
+                .iter()
+                .find(|(consumer_module, consumer_name, arity, _)| {
+                    Self::consumer_module_matches(module, consumer_module)
+                        && *consumer_name == name
+                        && *arity == arguments.len()
+                })?;
         arguments
             .get(*consumed_arg_index)
             .and_then(Self::call_iterator_callable_ref)
     }
 
-    fn descriptor_consumer_module_matches(module: &str, expected: &str) -> bool {
+    fn consumer_module_matches(module: &str, expected: &str) -> bool {
         if expected == "builtins" {
             matches!(module, "builtins" | "__builtin__" | "__builtins__")
         } else {

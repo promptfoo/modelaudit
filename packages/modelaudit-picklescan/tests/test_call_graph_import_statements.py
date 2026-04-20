@@ -2031,9 +2031,49 @@ if marker.read_text() != marker_content:
             "['owned-value', 'stop']",
             "['owned-value']",
         ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("math", "prod", b"h\x00"),
+            "[7, 'stop']",
+            "7",
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("math", "fsum", b"h\x00"),
+            "[7, 'stop']",
+            "7.0",
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("heapq", "nlargest", b"K\x01", b"h\x00"),
+            "['owned-value', 'stop']",
+            "['owned-value']",
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("heapq", "nlargest", b"K\x01", b"h\x00", b"N"),
+            "['owned-value', 'stop']",
+            "['owned-value']",
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("heapq", "nsmallest", b"K\x01", b"h\x00"),
+            "['owned-value', 'stop']",
+            "['owned-value']",
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("heapq", "nsmallest", b"K\x01", b"h\x00", b"N"),
+            "['owned-value', 'stop']",
+            "['owned-value']",
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "mean", b"h\x00"),
+            "[7, 'stop']",
+            "7",
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "median", b"h\x00"),
+            "[7, 'stop']",
+            "7",
+        ),
     ],
 )
-def test_scan_bytes_blocks_stdlib_materializer_call_iterator_consumption_rce(
+def test_scan_bytes_blocks_stdlib_eager_call_iterator_consumption_rce(
     tmp_path: Path,
     payload: bytes,
     values_literal: str,
@@ -2041,7 +2081,7 @@ def test_scan_bytes_blocks_stdlib_materializer_call_iterator_consumption_rce(
 ) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
-    marker = tmp_path / "stdlib_materializer_call_iterator_marker"
+    marker = tmp_path / "stdlib_eager_call_iterator_marker"
     marker_content = "pydoc-owned"
     (module_dir / "pydoc.py").write_text(
         "from pathlib import Path\n"
@@ -2052,7 +2092,7 @@ def test_scan_bytes_blocks_stdlib_materializer_call_iterator_consumption_rce(
         encoding="utf-8",
     )
 
-    report = scan_bytes(payload, source="stdlib-materializer-call-iterator-rce.pkl")
+    report = scan_bytes(payload, source="stdlib-eager-call-iterator-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_call_graph_finding(

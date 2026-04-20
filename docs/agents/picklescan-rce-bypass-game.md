@@ -18719,3 +18719,221 @@ format unchanged; lint clean; mypy clean across 447 files
 PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
 3844 passed, 1022 skipped, 21 warnings in 38.98s
 ```
+
+## Turn 277 - Bypass via residual stdlib eager iterable aggregators
+
+Offensive turn after the Turn 276 defense. The call-iterator model now covers
+core built-in iterable consumers, selected `itertools` adapters, descriptor
+mutators, and public `operator` protocol helpers, but clean stdlib aggregators
+can still consume a tracked `iter(callable, sentinel)` immediately.
+
+Representative payload:
+
+```python
+math.prod(iter(builtins.help, "stop"))
+```
+
+The shadow `pydoc.py` returns `7` once, then the sentinel `"stop"`, so
+`math.prod(...)` succeeds while the zero-argument `help()` call imports the
+shadow module and writes the marker.
+
+```text
+payload_len 64
+payload_hex 80048c086275696c74696e738c0469746572938c086275696c74696e738c0468656c70938c0473746f70865294308c046d6174688c0470726f6493680085522e
+
+0: PROTO              4
+18: STACK_GLOBAL       # builtins.iter
+35: STACK_GLOBAL       # builtins.help
+43: REDUCE             # iter(help, "stop")
+44: MEMOIZE            # memo[0] = call iterator
+58: STACK_GLOBAL       # math.prod
+62: REDUCE             # math.prod(memo[0]), drains iterable
+63: STOP
+```
+
+Scanner proof:
+
+```text
+scan clean findings 0 errors ()
+imports [
+  ('builtins', 'iter', 18, False),
+  ('builtins', 'help', 35, False),
+  ('math', 'prod', 58, False),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('math', 'prod', 1, 62),
+]
+```
+
+Runtime proof:
+
+```text
+runtime_rc 0
+runtime_type int
+runtime_repr 7
+marker_exists True
+marker_text owned-by-math-prod
+```
+
+Sibling clean bypasses from the same source family:
+
+```text
+math.fsum
+  payload_len 64 scan clean findings 0
+  runtime float 7.0 True owned-by-math.fsum
+
+heapq.nlargest
+  payload_len 72 scan clean findings 0
+  runtime list ['owned-value'] True owned-by-heapq.nlargest
+
+heapq.nsmallest
+  payload_len 73 scan clean findings 0
+  runtime list ['owned-value'] True owned-by-heapq.nsmallest
+
+statistics.mean
+  payload_len 70 scan clean findings 0
+  runtime int 7 True owned-by-statistics.mean
+
+statistics.median
+  payload_len 72 scan clean findings 0
+  runtime int 7 True owned-by-statistics.median
+```
+
+Why it bypasses:
+
+- The native stack model correctly tracks `iter(help, "stop")` as a
+  `StackValue::CallIterator`.
+- `stdlib_eager_call_iterator_consumed_callable(...)` only covers
+  `array.array`, selected `collections` materializers, and selected `weakref`
+  materializers.
+- `math.prod`, `math.fsum`, `heapq.nlargest`, `heapq.nsmallest`, and
+  `statistics` aggregators are clean imports and record only the visible outer
+  reducer invocation.
+- Each outer reducer consumes the iterable before returning, so the hidden
+  zero-argument `builtins.help()` invocation occurs during unpickling.
+
+Likely source-level defense:
+
+- Extend stdlib eager iterable consumer modeling with exact module/name/arity
+  rows for one-argument aggregators such as `math.prod`, `math.fsum`,
+  `statistics.mean`, and `statistics.median`.
+- Add arity-aware entries for `heapq.nlargest(n, iterable)` and
+  `heapq.nsmallest(n, iterable)`, where the consumed iterator is argument 1.
+- Keep this as a reducer-local table with `(module, name, arity,
+  consumed_argument_index)` rather than adding policy entries for every
+  aggregator package. This matches the finite call-graph source and keeps the
+  hot path bounded.
+
+Simplification note:
+
+- The new descriptor table from Turn 276 suggests the same shape for eager
+  stdlib consumers. A compact exact table can absorb the existing
+  `array`/`collections`/`weakref` materializer cases plus these aggregators,
+  leaving only variable-arity consumers in small custom branches.
+
+Performance note:
+
+- The representative payload is 64 bytes.
+- Warm scan timing over 1000 runs was median `0.000052s`, p95 `0.000055s`,
+  and max `0.000095s`.
+
+## Turn 278 - Block residual stdlib eager iterable aggregators
+
+Defensive turn for the Turn 277 `math.prod(iter(help, "stop"))` bypass. The
+fix stays at the call-graph source by modeling exact stdlib reducers that
+eagerly consume one iterable argument and therefore advance a tracked
+`iter(callable, sentinel)` during unpickling.
+
+Focused change:
+
+```text
+math.prod(call_iterator) -> drains arg 0
+math.fsum(call_iterator) -> drains arg 0
+statistics.mean(call_iterator) -> drains arg 0
+statistics.median(call_iterator) -> drains arg 0
+heapq.nlargest(n, call_iterator) -> drains arg 1
+heapq.nlargest(n, call_iterator, key) -> drains arg 1
+heapq.nsmallest(n, call_iterator) -> drains arg 1
+heapq.nsmallest(n, call_iterator, key) -> drains arg 1
+```
+
+Implementation note:
+
+- Added `EXACT_ARITY_STDLIB_EAGER_ITERABLE_CONSUMERS`, a compact
+  `(module, name, arity, consumed_argument_index)` table.
+- Moved existing `array.array`, selected `collections` materializers, and
+  selected `weakref` materializers into the same table.
+- Reused the exact-table lookup helper from the descriptor work so fixed-arity
+  iterable consumers now share one implementation shape.
+
+Post-fix proof for the Turn 277 representative payload:
+
+```text
+payload_len 64
+scan malicious findings 1 errors ()
+imports [
+  ('builtins', 'iter', 18),
+  ('builtins', 'help', 35),
+  ('math', 'prod', 58),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('math', 'prod', 1, 62),
+  ('builtins', 'help', 0, 62),
+]
+finding DANGEROUS_CALL_GRAPH {
+  'module': '_sitebuiltins',
+  'name': '_Helper.__call__',
+  'sink': 'builtins.__import__',
+  'call_path': ('_sitebuiltins._Helper.__call__', 'builtins.__import__'),
+}
+runtime_rc 0
+runtime_type int
+runtime_repr 7
+marker_exists True
+marker_text owned-by-math-prod
+```
+
+Regression coverage:
+
+- Added malicious positives for `math.prod`, `math.fsum`, `heapq.nlargest`,
+  `heapq.nsmallest`, `statistics.mean`, and `statistics.median`.
+- Added arity-3 positives for `heapq.nlargest(..., key=None)` and
+  `heapq.nsmallest(..., key=None)`.
+- Existing stdlib materializer positives continue through the same test matrix.
+
+Simplification note:
+
+- The stdlib eager consumer logic now mirrors the descriptor consumer table from
+  Turn 276. Future fixed-arity eager consumers should be one table row instead
+  of another bespoke `match` arm.
+
+Performance note:
+
+- Warm post-fix scan timing over 1000 runs: median `0.000118s`, p95
+  `0.000122s`, max `0.000169s`.
+- The table is checked only after a reducer callable and argument tuple have
+  already been decoded.
+
+Validation:
+
+```text
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+78 passed
+
+pytest targeted stdlib eager regressions
+13 passed in 0.82s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+137 passed in 3.44s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+175 passed in 4.96s
+
+ruff format/check, mypy
+format unchanged; lint clean; mypy clean across 447 files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3852 passed, 1022 skipped, 21 warnings in 53.00s
+```
