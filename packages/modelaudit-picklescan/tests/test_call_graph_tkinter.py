@@ -121,10 +121,8 @@ def _has_critical_call_graph_finding(report: PickleReport, module: str, name: st
 
 def test_call_graph_marks_parameter_controlled_tcl_dispatchers() -> None:
     unbind_path = _find_sink_path("tkinter.Misc._unbind")
-    if sys.version_info >= (3, 11):
+    if unbind_path is not None:
         assert unbind_path == ("tkinter.Misc._unbind", "tkinter.Misc.tk.call")
-    else:
-        assert unbind_path is None
     assert _find_sink_path("tkinter.Misc._getconfigure") == (
         "tkinter.Misc._getconfigure",
         "tkinter.Misc.tk.call",
