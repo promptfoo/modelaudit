@@ -1036,6 +1036,80 @@ def _mailbox_singlefile_pth_payload(
     return b"".join(parts)
 
 
+def _tkinter_tcl_control_payload() -> bytes:
+    return b"".join(
+        [
+            b"\x80\x04",
+            _short_binunicode(b"_tkinter"),
+            _short_binunicode(b"create"),
+            b"\x93",
+            _tkinter_tcl_create_args(),
+            b"R.",
+        ]
+    )
+
+
+def _tkinter_tcl_create_args() -> bytes:
+    return _tuple_payload_operands(
+        [
+            b"N",
+            _text_operand(""),
+            _text_operand("Tk"),
+            b"\x89",
+            b"\x88",
+            b"\x89",
+            b"\x89",
+            b"N",
+        ]
+    )
+
+
+def _tkinter_tcl_eval_payload(marker: Path) -> bytes:
+    script = f"exec /bin/sh -c {{printf owned-by-tcl-eval > {marker}}}"
+    return b"".join(
+        [
+            b"\x80\x04",
+            _short_binunicode(b"_tkinter"),
+            _short_binunicode(b"create"),
+            b"\x93",
+            _tkinter_tcl_create_args(),
+            b"R\x94",
+            _short_binunicode(b"_tkinter"),
+            _short_binunicode(b"TkappType.eval"),
+            b"\x93h\x00",
+            _text_operand(script),
+            b"\x86R.",
+        ]
+    )
+
+
+def _tkinter_tcl_call_payload(marker: Path) -> bytes:
+    command = f"printf owned-by-tcl-call > {marker}"
+    return b"".join(
+        [
+            b"\x80\x04",
+            _short_binunicode(b"_tkinter"),
+            _short_binunicode(b"create"),
+            b"\x93",
+            _tkinter_tcl_create_args(),
+            b"R\x94",
+            _short_binunicode(b"_tkinter"),
+            _short_binunicode(b"TkappType.call"),
+            b"\x93",
+            _tuple_payload_operands(
+                [
+                    b"h\x00",
+                    _text_operand("exec"),
+                    _text_operand("/bin/sh"),
+                    _text_operand("-c"),
+                    _text_operand(command),
+                ]
+            ),
+            b"R.",
+        ]
+    )
+
+
 def _inspect_getmembers_property_payload(marker: Path, *, include_call: bool) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
@@ -2562,6 +2636,40 @@ def test_scan_bytes_blocks_mailbox_singlefile_pth_writes(
         assert marker.read_text() == marker_content
     finally:
         sys.path[:] = original_sys_path
+
+
+@pytest.mark.skipif(find_spec("_tkinter") is None, reason="_tkinter is unavailable")
+@pytest.mark.parametrize(
+    ("method_name", "payload_builder", "marker_content"),
+    [
+        ("TkappType.eval", _tkinter_tcl_eval_payload, "owned-by-tcl-eval"),
+        ("TkappType.call", _tkinter_tcl_call_payload, "owned-by-tcl-call"),
+    ],
+)
+def test_scan_bytes_blocks_tkinter_tcl_process_execution(
+    tmp_path: Path,
+    method_name: str,
+    payload_builder: Callable[[Path], bytes],
+    marker_content: str,
+) -> None:
+    control_payload = _tkinter_tcl_control_payload()
+    control_report = scan_bytes(control_payload, source="tkinter-tcl-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "tkapp"
+
+    marker = tmp_path / f"tkinter_tcl_{method_name.rsplit('.', 1)[1]}_marker"
+    payload = payload_builder(marker)
+    report = scan_bytes(payload, source=f"tkinter-tcl-{method_name}.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_global_finding(report, "_tkinter", method_name)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result == ""
+    assert marker.read_text() == marker_content
 
 
 def test_scan_bytes_blocks_inspect_getmembers_descriptor_rce(tmp_path: Path) -> None:

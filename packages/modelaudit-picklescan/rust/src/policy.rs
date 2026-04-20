@@ -184,6 +184,8 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("_osx_support", "_read_output"),
     ("_posixsubprocess", "fork_exec"),
     ("_pyrepl.pager", "pipe_pager"),
+    ("_tkinter", "TkappType.call"),
+    ("_tkinter", "TkappType.eval"),
     ("atexit", "register"),
     ("base64", "b64decode"),
     ("base64", "b64encode"),
@@ -386,6 +388,9 @@ mod tests {
         assert_eq!(global_severity("_functools", "reduce"), Some("critical"));
         for name in ["FileIO", "FileIO.write", "TextIOWrapper.write", "open"] {
             assert_eq!(global_severity("_io", name), Some("critical"));
+        }
+        for name in ["TkappType.call", "TkappType.eval"] {
+            assert_eq!(global_severity("_tkinter", name), Some("critical"));
         }
         assert_eq!(global_severity("functools", "cache"), Some("critical"));
         assert_eq!(

