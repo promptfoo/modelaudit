@@ -4345,7 +4345,17 @@ def test_scan_bytes_blocks_dotenv_run_command_rce(tmp_path: Path) -> None:
     report = scan_bytes(payload, source="dotenv-run-command-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
-    assert _has_critical_call_graph_finding(report, "dotenv.cli", "run_command", "os.execvpe")
+    assert _has_critical_call_graph_finding(
+        report,
+        "dotenv.cli",
+        "run_command",
+        "os.execvpe",
+    ) or _has_critical_call_graph_finding(
+        report,
+        "dotenv.cli",
+        "run_command",
+        "subprocess.Popen",
+    )
 
     assert not marker.exists()
     child_code = f"import pickle; pickle.loads({payload!r})"

@@ -12,7 +12,12 @@ import pytest
 
 from modelaudit_picklescan import PickleReport, SafetyVerdict, Severity, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
-from modelaudit_picklescan.call_graph import _calls_for_function, _find_sink_path, find_dangerous_call_graphs
+from modelaudit_picklescan.call_graph import (
+    _call_graph_entrypoints,
+    _calls_for_function,
+    _find_sink_path,
+    find_dangerous_call_graphs,
+)
 
 pytestmark = pytest.mark.skipif(
     find_spec(_RUST_EXTENSION_MODULE) is None,
@@ -49,6 +54,33 @@ def _global_call_payload(module: str, name: str, *arg_operands: bytes) -> bytes:
     return b"".join([b"\x80\x04", _global_operand(module, name), _args_tuple(*arg_operands), b"R."])
 
 
+def _typing_extensions_get_type_hints_payload(marker: Path) -> bytes:
+    marker_content = "typing-ext-owned"
+    annotation_expr = f"open({str(marker)!r},'w').write({marker_content!r})"
+    return b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("types", "ModuleType"),
+            _args_tuple(_unicode_operand("modelaudit_te_probe")),
+            b"R",
+            b"\x94",
+            b"}",
+            _unicode_operand("__annotations__"),
+            b"}",
+            _unicode_operand("x"),
+            _unicode_operand(annotation_expr),
+            b"s",
+            b"s",
+            b"b",
+            b"0",
+            _global_operand("typing_extensions", "get_type_hints"),
+            b"h\x00",
+            b"\x85",
+            b"R.",
+        ]
+    )
+
+
 def _has_critical_call_graph_finding(report: PickleReport, module: str, name: str, sink: str) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -56,6 +88,22 @@ def _has_critical_call_graph_finding(report: PickleReport, module: str, name: st
         and finding.details.get("module") == module
         and finding.details.get("name") == name
         and finding.details.get("sink") == sink
+        for finding in report.findings
+    )
+
+
+def _has_critical_call_graph_finding_with_sink_prefix(
+    report: PickleReport,
+    module: str,
+    name: str,
+    sink_prefix: str,
+) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.details.get("module") == module
+        and finding.details.get("name") == name
+        and str(finding.details.get("sink", "")).startswith(sink_prefix)
         for finding in report.findings
     )
 
@@ -91,6 +139,18 @@ def test_call_graph_models_getattr_default_callable_fallbacks() -> None:
         "platform._Processor.from_subprocess",
         "subprocess.check_output",
     )
+
+
+def test_call_graph_models_version_gated_typing_extensions_definitions() -> None:
+    function_name = "typing_extensions.get_type_hints"
+    calls = _calls_for_function(function_name) or ()
+    path = _find_sink_path(function_name)
+
+    assert _call_graph_entrypoints(function_name) == (function_name,)
+    assert "typing.get_type_hints" in calls
+    assert path is not None
+    assert path[0] == function_name
+    assert path[-1] in {"builtins.compile", "builtins.eval"}
 
 
 def test_call_graph_models_required_arg_imports_when_pickle_supplies_args() -> None:
@@ -256,6 +316,54 @@ if marker.read_text() != marker_content:
 """
     result = subprocess.run(
         [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+def test_scan_bytes_blocks_typing_extensions_get_type_hints_annotation_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "typing_extensions_marker"
+    marker_content = "typing-ext-owned"
+    payload = _typing_extensions_get_type_hints_payload(marker)
+
+    report = scan_bytes(payload, source="typing-extensions-get-type-hints-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding_with_sink_prefix(
+        report,
+        "typing_extensions",
+        "get_type_hints",
+        "builtins.",
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+payload = bytes.fromhex(sys.argv[2])
+marker_content = sys.argv[3]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+result = pickle.loads(payload)
+if result != {"x": len(marker_content)}:
+    raise SystemExit(f"unexpected get_type_hints result: {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(marker), payload.hex(), marker_content],
         cwd=str(tmp_path.parent),
         env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
         check=False,

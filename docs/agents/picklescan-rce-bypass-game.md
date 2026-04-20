@@ -12650,3 +12650,154 @@ Performance note:
   contains a `getattr` call and the cached call-node list has local-name calls.
 - It records local-name-to-default-callable edges, not a broad package policy.
 - The old 32-byte payload now scans malicious with warm median `0.000100s`.
+
+## Turn 219 - Bypass via version-gated `typing_extensions.get_type_hints`
+
+Found a new scanner-clean RCE-capable bypass in the Python call graph. The
+payload constructs a synthetic `types.ModuleType`, sets its `__annotations__`
+to a string expression, then calls `typing_extensions.get_type_hints(module)`.
+At runtime, `typing_extensions` evaluates that annotation string.
+
+Payload shape:
+
+```text
+types.ModuleType("modelaudit_te_probe")
+BUILD {"__annotations__": {"x": "open(MARKER,'w').write('typing-ext-owned')"}}
+typing_extensions.get_type_hints(module)
+```
+
+Scanner proof:
+
+```text
+payload_len 252
+scan clean complete findings 0 elapsed 0.049364
+metadata import_refs (
+  {'module': 'types', 'name': 'ModuleType', 'is_dangerous': False},
+  {'module': 'typing_extensions', 'name': 'get_type_hints', 'is_dangerous': False}
+)
+metadata invocations (
+  {'module': 'types', 'name': 'ModuleType', 'positional_arg_count': 1},
+  {'module': 'types', 'name': 'ModuleType', 'opcode': 'BUILD'},
+  {'module': 'typing_extensions', 'name': 'get_type_hints',
+   'positional_arg_count': 1}
+)
+entry ()
+calls None
+path None
+dangerous cg ()
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime stdout
+result {'x': 16}
+marker_exists True
+marker_text typing-ext-owned
+
+runtime stderr
+```
+
+Why it bypasses:
+
+- Native policy blocks `typing.get_type_hints`, but not the backport
+  `typing_extensions.get_type_hints`.
+- The call graph can resolve `typing_extensions.py`, but `_analyze_module()`
+  only collects functions and classes that are direct children of
+  `tree.body`.
+- In this installed `typing_extensions`, `ForwardRef`, `_eval_with_owner`,
+  `get_annotations`, and `get_type_hints` are defined inside version-gated
+  `if`/`else` blocks, so `typing_extensions.get_type_hints` has no entrypoint.
+- The string expression avoids scanner string heuristics: it does not contain
+  `eval(`, `exec(`, `__import__`, `os.system`, or `subprocess`, but execution
+  has already crossed into attacker-controlled Python code.
+
+Likely source-level defense:
+
+- Replace the direct `tree.body` function/class collectors with one bounded
+  helper that walks module-level control-flow blocks (`if`, `else`, `try`,
+  `except`, `finally`, `with`) and yields module-level definitions without
+  descending into function bodies.
+- Reuse that helper for `_collect_local_defs()`, `_local_class_nodes()`,
+  `_collect_local_class_entrypoints()`, and `_collect_function_calls()` so
+  version-gated definitions are analyzed once, consistently.
+- After that, `typing_extensions.get_type_hints` should resolve to a path
+  through its forward-reference evaluator and `builtins.eval`.
+
+Performance note:
+
+- Cold scan was `0.049364s`, mostly source-analysis cache population.
+- Warm scan median over 25 runs was `0.000143s` with max `0.000235s`.
+- The proposed fix is bounded by existing source-size and call-count caps, and
+  should simplify the module-definition collection code by centralizing the
+  "module-level but nested under control flow" traversal.
+
+## Turn 220 - Block version-gated module definitions in call graph
+
+Implemented the Turn 219 fix at the source-analysis layer rather than adding a
+one-off `typing_extensions` policy entry.
+
+Fix details:
+
+- Added one bounded definition-scope traversal for module/class bodies. It
+  includes statements nested under module-level control flow such as `if`,
+  `else`, `try`, `except`, `finally`, `with`, loops, and `match`, while still
+  avoiding descent into function bodies.
+- Reused that traversal for export summaries, import aliases, local defs,
+  local class lookup, class entrypoints, assignment aliases, source-context
+  lookup, and function-call collection.
+- Merged duplicate version-gated function/class entrypoints instead of letting
+  one branch overwrite another, so mutually exclusive platform/version branches
+  are overapproximated for security.
+- Updated the existing `dotenv.cli.run_command` regression to accept either
+  dangerous platform branch sink (`os.execvpe` or `subprocess.Popen`) now that
+  both sides of its platform split are visible.
+
+Regression coverage:
+
+- `test_call_graph_models_version_gated_typing_extensions_definitions` verifies
+  `typing_extensions.get_type_hints` is now a call-graph entrypoint and reaches
+  a builtin execution primitive.
+- `test_scan_bytes_blocks_typing_extensions_get_type_hints_annotation_rce`
+  scans the Turn 219 synthetic-module annotation payload as malicious and then
+  executes the payload in a child process, proving the marker write during
+  `pickle.loads`.
+
+Post-fix proof:
+
+```text
+payload_len 246
+scan malicious complete findings 1 elapsed 0.169194
+call_graph [{'module': 'typing_extensions', 'name': 'get_type_hints',
+  'sink': 'builtins.compile',
+  'call_path': ('typing_extensions.get_type_hints',
+                'typing.get_type_hints',
+                'typing.ForwardRef.__init__',
+                'builtins.compile')}]
+entry ('typing_extensions.get_type_hints',)
+calls ('typing.get_type_hints', 'typing_extensions._clean_optional',
+       'typing_extensions._strip_extras', 'hint.items')
+path ('typing_extensions.get_type_hints', 'typing.get_type_hints',
+      'typing.ForwardRef.__init__', 'builtins.compile')
+warm_median 0.000192
+```
+
+Validation:
+
+- Focused import/call-graph regression file: `13 passed in 0.55s`.
+- Focused call-graph suite: `51 passed in 2.28s`.
+- Focused dotenv regression after overapproximation update: `1 passed in 0.74s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3728 passed, 1022 skipped, 21 warnings in 54.86s`.
+
+Performance note:
+
+- The old bypass now scans malicious with warm median `0.000192s`.
+- Cold scan for the first `typing_extensions` analysis is higher because the
+  module is large and now more of its version-gated definitions are visible.
+- The traversal is still bounded by the existing 1 MB source cap and call/path
+  limits, and it consolidates several previous direct-`tree.body` passes.

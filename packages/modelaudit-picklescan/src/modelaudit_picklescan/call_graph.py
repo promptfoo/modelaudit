@@ -672,7 +672,7 @@ def _wildcard_export_summary(module_name: str) -> _WildcardExportSummary | None:
         return None
 
     is_package = source_path.name == "__init__.py"
-    return _collect_module_export_summary(tree, module_name, is_package)
+    return _collect_module_export_summary(_module_level_statements(tree), module_name, is_package)
 
 
 @lru_cache(maxsize=4096)
@@ -735,15 +735,18 @@ def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
         return None
 
     is_package = source_path.name == "__init__.py"
-    export_summary = _collect_module_export_summary(tree, module_name, is_package)
-    import_aliases = _collect_aliases(tree, module_name, is_package)
-    local_defs = _collect_local_defs(tree)
-    local_class_entrypoints = _collect_local_class_entrypoints(tree, module_name, import_aliases, local_defs)
+    module_statements = _module_level_statements(tree)
+    export_summary = _collect_module_export_summary(module_statements, module_name, is_package)
+    import_aliases = _collect_aliases(module_statements, module_name, is_package)
+    local_defs = _collect_local_defs(module_statements)
+    local_class_entrypoints = _collect_local_class_entrypoints(
+        module_statements, module_name, import_aliases, local_defs
+    )
     local_class_targets = set(local_class_entrypoints)
     aliases = {
         **import_aliases,
         **_collect_assignment_aliases(
-            tree.body,
+            module_statements,
             module_name,
             import_aliases,
             local_defs,
@@ -752,7 +755,7 @@ def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
     }
     aliases.update(
         _collect_class_instance_default_aliases(
-            tree,
+            module_statements,
             module_name,
             aliases,
             local_defs,
@@ -760,7 +763,7 @@ def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
         )
     )
     calls_by_function, class_entrypoints = _collect_function_calls(
-        tree,
+        module_statements,
         module_name,
         is_package,
         aliases,
@@ -778,10 +781,50 @@ def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
     )
 
 
-def _collect_module_export_summary(tree: ast.Module, module_name: str, is_package: bool) -> _WildcardExportSummary:
+def _module_level_statements(tree: ast.Module) -> tuple[ast.stmt, ...]:
+    return _definition_scope_statements(tree.body)
+
+
+def _definition_scope_statements(nodes: Iterable[ast.stmt]) -> tuple[ast.stmt, ...]:
+    statements: list[ast.stmt] = []
+
+    def visit(scope_nodes: Iterable[ast.stmt]) -> None:
+        for statement in scope_nodes:
+            statements.append(statement)
+            for child_body in _definition_scope_child_bodies(statement):
+                visit(child_body)
+
+    visit(nodes)
+    return tuple(statements)
+
+
+def _definition_scope_child_bodies(statement: ast.stmt) -> tuple[Iterable[ast.stmt], ...]:
+    if isinstance(statement, ast.If):
+        return (statement.body, statement.orelse)
+    if isinstance(statement, ast.Try):
+        return (
+            statement.body,
+            *(handler.body for handler in statement.handlers),
+            statement.orelse,
+            statement.finalbody,
+        )
+    if isinstance(statement, ast.With | ast.AsyncWith):
+        return (statement.body,)
+    if isinstance(statement, ast.For | ast.AsyncFor | ast.While):
+        return (statement.body, statement.orelse)
+    if isinstance(statement, ast.Match):
+        return tuple(match_case.body for match_case in statement.cases)
+    return ()
+
+
+def _collect_module_export_summary(
+    statements: Iterable[ast.stmt],
+    module_name: str,
+    is_package: bool,
+) -> _WildcardExportSummary:
     direct_names: set[str] = set()
     wildcard_imports: list[str] = []
-    for statement in tree.body:
+    for statement in statements:
         if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
             direct_names.add(statement.name)
         elif isinstance(statement, ast.Import):
@@ -802,8 +845,8 @@ def _collect_module_export_summary(tree: ast.Module, module_name: str, is_packag
     return _WildcardExportSummary(frozenset(direct_names), tuple(wildcard_imports))
 
 
-def _collect_aliases(tree: ast.Module, module_name: str, is_package: bool) -> dict[str, str]:
-    return _collect_import_aliases(tree.body, module_name, is_package)
+def _collect_aliases(statements: Iterable[ast.stmt], module_name: str, is_package: bool) -> dict[str, str]:
+    return _collect_import_aliases(statements, module_name, is_package)
 
 
 def _collect_import_aliases(nodes: Iterable[ast.AST], module_name: str, is_package: bool) -> dict[str, str]:
@@ -828,23 +871,24 @@ def _collect_import_aliases(nodes: Iterable[ast.AST], module_name: str, is_packa
     return aliases
 
 
-def _collect_local_defs(tree: ast.Module) -> set[str]:
+def _collect_local_defs(statements: Iterable[ast.stmt]) -> set[str]:
     local_defs: set[str] = set()
-    for statement in tree.body:
+    for statement in statements:
         if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
             local_defs.add(statement.name)
     return local_defs
 
 
 def _collect_local_class_entrypoints(
-    tree: ast.Module,
+    statements: Iterable[ast.stmt],
     module_name: str,
     aliases: dict[str, str],
     local_defs: set[str],
 ) -> dict[str, tuple[str, ...]]:
     class_entrypoints: dict[str, tuple[str, ...]] = {}
-    local_class_nodes = _local_class_nodes(tree)
-    for statement in tree.body:
+    statement_tuple = tuple(statements)
+    local_class_nodes = _local_class_nodes(statement_tuple)
+    for statement in statement_tuple:
         if not isinstance(statement, ast.ClassDef):
             continue
         class_name = f"{module_name}.{statement.name}"
@@ -858,21 +902,27 @@ def _collect_local_class_entrypoints(
                 local_class_nodes,
             )
         )
-        class_entrypoints[class_name] = tuple(
+        entrypoints = tuple(
             f"{class_name}.{method_name}"
             for method_name in _CLASS_ENTRYPOINT_METHODS
             if method_name in method_names
             or (method_name in inherited_method_names and method_name in _INHERITED_CLASS_ENTRYPOINT_METHODS)
         )
+        existing = class_entrypoints.get(class_name)
+        class_entrypoints[class_name] = entrypoints if existing is None else _dedupe_calls((*existing, *entrypoints))
     return class_entrypoints
 
 
-def _local_class_nodes(tree: ast.Module) -> dict[str, ast.ClassDef]:
-    return {statement.name: statement for statement in tree.body if isinstance(statement, ast.ClassDef)}
+def _local_class_nodes(statements: Iterable[ast.stmt]) -> dict[str, ast.ClassDef]:
+    return {statement.name: statement for statement in statements if isinstance(statement, ast.ClassDef)}
 
 
 def _class_method_nodes(class_node: ast.ClassDef) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
-    return {child.name: child for child in class_node.body if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)}
+    return {
+        child.name: child
+        for child in _definition_scope_statements(class_node.body)
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
 
 
 def _inherited_class_methods(
@@ -969,7 +1019,7 @@ def _source_function_context(
     except Exception:
         return None
 
-    function_node = _find_qualified_function_def(tree, qualified_name)
+    function_node = _find_qualified_function_def(_module_level_statements(tree), qualified_name)
     if function_node is None:
         return None
     return module_name, source_path.name == "__init__.py", function_node
@@ -991,18 +1041,19 @@ def _source_class_context(class_name: str) -> _ClassSourceContext | None:
     except Exception:
         return None
 
-    class_node = _find_qualified_class_def(tree, qualified_name)
+    module_statements = _module_level_statements(tree)
+    class_node = _find_qualified_class_def(module_statements, qualified_name)
     if class_node is None:
         return None
     is_package = source_path.name == "__init__.py"
-    aliases = _collect_aliases(tree, module_name, is_package)
-    local_defs = _collect_local_defs(tree)
+    aliases = _collect_aliases(module_statements, module_name, is_package)
+    local_defs = _collect_local_defs(module_statements)
     return _ClassSourceContext(
         module_name=module_name,
         class_node=class_node,
         aliases=aliases,
         local_defs=local_defs,
-        local_class_nodes=_local_class_nodes(tree),
+        local_class_nodes=_local_class_nodes(module_statements),
     )
 
 
@@ -1113,14 +1164,14 @@ def _is_local_class_member_alias(resolved: str, local_class_targets: set[str]) -
 
 
 def _collect_class_instance_default_aliases(
-    tree: ast.Module,
+    statements: Iterable[ast.stmt],
     module_name: str,
     aliases: dict[str, str],
     local_defs: set[str],
     local_class_targets: set[str],
 ) -> dict[str, str]:
     instance_aliases: dict[str, str] = {}
-    for statement in tree.body:
+    for statement in statements:
         if not isinstance(statement, ast.ClassDef):
             continue
         init_node = next(
@@ -1276,7 +1327,7 @@ def _constructor_parameter_self_attribute_targets(class_name: str, parameter_nam
     except Exception:
         return ()
 
-    class_node = _find_qualified_class_def(tree, qualified_name)
+    class_node = _find_qualified_class_def(_module_level_statements(tree), qualified_name)
     if class_node is None:
         return ()
     init_node = next(
@@ -1309,23 +1360,23 @@ def _split_source_qualified_name(function_name: str) -> tuple[str | None, str]:
     return None, function_name
 
 
-def _find_qualified_class_def(tree: ast.Module, qualified_name: str) -> ast.ClassDef | None:
-    nodes: Iterable[ast.AST] = tree.body
+def _find_qualified_class_def(statements: Iterable[ast.stmt], qualified_name: str) -> ast.ClassDef | None:
+    nodes: Iterable[ast.stmt] = statements
     current: ast.ClassDef | None = None
     for part in qualified_name.split("."):
         current = next((node for node in nodes if isinstance(node, ast.ClassDef) and node.name == part), None)
         if current is None:
             return None
-        nodes = current.body
+        nodes = _definition_scope_statements(current.body)
     return current
 
 
 def _find_qualified_function_def(
-    tree: ast.Module,
+    statements: Iterable[ast.stmt],
     qualified_name: str,
 ) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
     parts = qualified_name.split(".")
-    nodes: Iterable[ast.AST] = tree.body
+    nodes: Iterable[ast.stmt] = statements
     for index, part in enumerate(parts):
         is_leaf = index == len(parts) - 1
         if is_leaf:
@@ -1343,12 +1394,12 @@ def _find_qualified_function_def(
         )
         if parent is None:
             return None
-        nodes = parent.body
+        nodes = _definition_scope_statements(parent.body)
     return None
 
 
 def _collect_function_calls(
-    tree: ast.Module,
+    statements: Iterable[ast.stmt],
     module_name: str,
     is_package: bool,
     aliases: dict[str, str],
@@ -1357,24 +1408,31 @@ def _collect_function_calls(
     local_class_entrypoints: dict[str, tuple[str, ...]],
 ) -> tuple[dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]:
     calls_by_function: dict[str, tuple[str, ...]] = {}
-    local_class_nodes = _local_class_nodes(tree)
-    for statement in tree.body:
+    statement_tuple = tuple(statements)
+    local_class_nodes = _local_class_nodes(statement_tuple)
+    for statement in statement_tuple:
         if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef):
             function_name = f"{module_name}.{statement.name}"
-            calls_by_function[function_name] = _calls_in_function(
-                statement,
-                module_name,
-                is_package,
-                aliases,
-                local_defs,
-                local_class_targets,
-                local_class_entrypoints,
+            _add_function_calls(
+                calls_by_function,
+                function_name,
+                _calls_in_function(
+                    statement,
+                    module_name,
+                    is_package,
+                    aliases,
+                    local_defs,
+                    local_class_targets,
+                    local_class_entrypoints,
+                ),
             )
         elif isinstance(statement, ast.ClassDef):
-            for child in statement.body:
-                if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
-                    function_name = f"{module_name}.{statement.name}.{child.name}"
-                    calls_by_function[function_name] = _calls_in_function(
+            for method_name, child in _class_method_nodes(statement).items():
+                function_name = f"{module_name}.{statement.name}.{method_name}"
+                _add_function_calls(
+                    calls_by_function,
+                    function_name,
+                    _calls_in_function(
                         child,
                         module_name,
                         is_package,
@@ -1383,7 +1441,8 @@ def _collect_function_calls(
                         local_class_targets,
                         local_class_entrypoints,
                         class_name=statement.name,
-                    )
+                    ),
+                )
             for method_name, method in _inherited_class_methods(
                 statement,
                 module_name,
@@ -1399,17 +1458,41 @@ def _collect_function_calls(
                     **method.aliases,
                     **{local_name: f"{method.module_name}.{local_name}" for local_name in method.local_defs},
                 }
-                calls_by_function[function_name] = _calls_in_function(
-                    method.node,
-                    module_name,
-                    is_package,
-                    inherited_aliases,
-                    local_defs,
-                    local_class_targets,
-                    local_class_entrypoints,
-                    class_name=statement.name,
+                _add_function_calls(
+                    calls_by_function,
+                    function_name,
+                    _calls_in_function(
+                        method.node,
+                        module_name,
+                        is_package,
+                        inherited_aliases,
+                        local_defs,
+                        local_class_targets,
+                        local_class_entrypoints,
+                        class_name=statement.name,
+                    ),
                 )
     return calls_by_function, local_class_entrypoints
+
+
+def _add_function_calls(
+    calls_by_function: dict[str, tuple[str, ...]],
+    function_name: str,
+    calls: tuple[str, ...],
+) -> None:
+    existing = calls_by_function.get(function_name)
+    calls_by_function[function_name] = calls if existing is None else _dedupe_calls((*existing, *calls))
+
+
+def _dedupe_calls(calls: Iterable[str]) -> tuple[str, ...]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for call in calls:
+        if call in seen:
+            continue
+        seen.add(call)
+        deduped.append(call)
+    return tuple(deduped)
 
 
 def _calls_in_function(
