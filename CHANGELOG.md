@@ -75,6 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** detect `pipes.Template` pickle call targets that can execute
   attacker-controlled shell pipelines on Python versions that still provide
   `pipes`
+- **security:** resolve function-local import aliases in pickle call-graph
+  analysis so wrappers that import RCE sinks inside function bodies are blocked
 - **security:** detect `typing._eval_type` pickle call targets that can
   evaluate attacker-controlled `ForwardRef` expressions
 - **security:** detect `dataclasses._create_fn` pickle call targets that can

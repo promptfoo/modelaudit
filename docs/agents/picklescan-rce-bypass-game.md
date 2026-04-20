@@ -9447,3 +9447,98 @@ runs only for already-resolved call expressions whose names end in a small Tcl
 dispatch suffix set, then checks the first Tcl command expression with existing
 parameter-control propagation. It adds no module imports, no live Tcl/Tk
 interpreter creation, no descriptor binding, and no blanket `tkinter` wildcard.
+
+## Turn 171 - Bypass via function-local import aliases in call graph
+
+Found a scanner-clean RCE primitive in `_pytest._py.path.LocalPath.sysexec`.
+This function is directly attacker-argument controlled and spawns a process:
+
+```python
+def sysexec(self, *argv, **popen_opts):
+    from subprocess import PIPE
+    from subprocess import Popen
+
+    proc = Popen([str(self)] + [str(arg) for arg in argv], ...)
+```
+
+Malicious pickle shape:
+
+- Construct `_pytest._py.path.LocalPath("/bin/sh")`.
+- Call `_pytest._py.path.LocalPath.sysexec(path, "-c", command)`.
+- The command writes a marker under a temporary directory during unpickling.
+
+Proof on CPython 3.12.12:
+
+- Call graph probe:
+  `_find_sink_path("_pytest._py.path.LocalPath.sysexec") is None`.
+- Recorded calls for `sysexec` include bare `Popen`, not
+  `subprocess.Popen`:
+  `("popen_opts.pop", "popen_opts.pop", "Popen", "proc.communicate",
+  "proc.wait", ...)`.
+- Control payload scanner result: `len=45`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control runtime: `pickle.loads(control)` returns a
+  `_pytest._py.path.LocalPath` for `/bin/sh` and does not create the marker.
+- Active payload scanner result: `len=209`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references:
+  `_pytest._py.path.LocalPath` and
+  `_pytest._py.path.LocalPath.sysexec`, both `is_dangerous=False`.
+- Active runtime before unpickle: marker absent.
+- Active runtime after unpickle: marker exists and contains
+  `owned-by-pytest-localpath-sysexec`; `pickle.loads(active)` returns `""`.
+
+Why the scanner missed it:
+
+- `_collect_aliases()` records only module-level `import` and `from ... import`
+  statements.
+- `_calls_in_function()` walks into function bodies and sees the call to
+  `Popen(...)`, but `_resolve_expr(Name("Popen"))` cannot map that local name to
+  `subprocess.Popen`.
+- The payload imports no blocked Python primitive such as `subprocess.Popen`,
+  `os.system`, `eval`, `exec`, `getattr`, frame/object graph helpers, file-write
+  globals, or suspicious magic-method strings.
+- The issue is source-level and package-agnostic: any wrapper that imports an
+  RCE sink inside the function body can erase the sink from the bounded call
+  graph.
+
+Performance note: the next defensive turn should extend the call graph closest
+to the source by collecting function-local import aliases and merging them with
+module aliases while analyzing that function. This remains a bounded AST-only
+pass over already-loaded source files; it does not require importing candidate
+packages, executing descriptors, expanding the global denylist, or enumerating
+third-party packages one by one.
+
+## Turn 172 - Block function-local import alias call-graph bypasses
+
+Blocking plan implemented:
+
+- Add function-local import alias collection to the bounded Python call graph.
+  `_calls_in_function()` now merges `import` and `from ... import ...` aliases
+  found inside the analyzed function body with the module-level aliases before
+  resolving call expressions.
+- Preserve relative-import handling by passing the module/package context into
+  function analysis.
+- Add a focused regression for the Turn 171 payload:
+  `_pytest._py.path.LocalPath.sysexec(LocalPath("/bin/sh"), "-c", command)`.
+- Assert the source-level behavior directly:
+  `_calls_for_function("_pytest._py.path.LocalPath.sysexec")` now includes
+  `subprocess.Popen`, and
+  `_find_sink_path("_pytest._py.path.LocalPath.sysexec")` returns
+  `("_pytest._py.path.LocalPath.sysexec", "subprocess.Popen")`.
+- Assert the scanner behavior end to end: the benign `LocalPath("/bin/sh")`
+  control remains clean, while the active `sysexec` payload is malicious with a
+  `DANGEROUS_CALL_GRAPH` finding for sink `subprocess.Popen`.
+- Add the new focused test file to the reduced Python-version allowlist and add
+  root plus standalone picklescan changelog entries.
+
+Validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_call_graph_local_imports.py packages/modelaudit-picklescan/tests/test_call_graph_tkinter.py`
+  passed (`6 passed`).
+
+Performance note: this remains a bounded AST-only source pass over modules the
+scanner already resolved from pickle import references. The extra work is one
+local alias map per analyzed function and does not import candidate packages,
+execute descriptors, expand the global denylist, or enumerate third-party
+packages. It blocks the source pattern rather than `_pytest` specifically.

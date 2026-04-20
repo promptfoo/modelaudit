@@ -6,7 +6,7 @@ import ast
 import os
 import sys
 from collections import deque
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -365,7 +365,7 @@ def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
     is_package = source_path.name == "__init__.py"
     aliases = _collect_aliases(tree, module_name, is_package)
     local_defs = _collect_local_defs(tree)
-    calls_by_function, class_entrypoints = _collect_function_calls(tree, module_name, aliases, local_defs)
+    calls_by_function, class_entrypoints = _collect_function_calls(tree, module_name, is_package, aliases, local_defs)
     return _ModuleAnalysis(
         module=module_name,
         source_path=str(source_path),
@@ -376,8 +376,12 @@ def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
 
 
 def _collect_aliases(tree: ast.Module, module_name: str, is_package: bool) -> dict[str, str]:
+    return _collect_import_aliases(tree.body, module_name, is_package)
+
+
+def _collect_import_aliases(nodes: Iterable[ast.AST], module_name: str, is_package: bool) -> dict[str, str]:
     aliases: dict[str, str] = {}
-    for statement in tree.body:
+    for statement in nodes:
         if isinstance(statement, ast.Import):
             for alias in statement.names:
                 aliases[alias.asname or alias.name.split(".")[0]] = alias.name
@@ -404,6 +408,7 @@ def _collect_local_defs(tree: ast.Module) -> set[str]:
 def _collect_function_calls(
     tree: ast.Module,
     module_name: str,
+    is_package: bool,
     aliases: dict[str, str],
     local_defs: set[str],
 ) -> tuple[dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]:
@@ -412,7 +417,13 @@ def _collect_function_calls(
     for statement in tree.body:
         if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef):
             function_name = f"{module_name}.{statement.name}"
-            calls_by_function[function_name] = _calls_in_function(statement, module_name, aliases, local_defs)
+            calls_by_function[function_name] = _calls_in_function(
+                statement,
+                module_name,
+                is_package,
+                aliases,
+                local_defs,
+            )
         elif isinstance(statement, ast.ClassDef):
             class_name = f"{module_name}.{statement.name}"
             method_names: set[str] = set()
@@ -423,6 +434,7 @@ def _collect_function_calls(
                     calls_by_function[function_name] = _calls_in_function(
                         child,
                         module_name,
+                        is_package,
                         aliases,
                         local_defs,
                         class_name=statement.name,
@@ -438,18 +450,23 @@ def _collect_function_calls(
 def _calls_in_function(
     function_node: ast.FunctionDef | ast.AsyncFunctionDef,
     module_name: str,
+    is_package: bool,
     aliases: dict[str, str],
     local_defs: set[str],
     *,
     class_name: str | None = None,
 ) -> tuple[str, ...]:
     calls: list[str] = []
+    function_aliases = {
+        **aliases,
+        **_collect_import_aliases(ast.walk(function_node), module_name, is_package),
+    }
     parameter_controlled_names: set[str] | None = None
     tcl_command_controlled_names: set[str] | None = None
     for node in ast.walk(function_node):
         if not isinstance(node, ast.Call):
             continue
-        resolved = _resolve_expr(node.func, module_name, aliases, local_defs, class_name)
+        resolved = _resolve_expr(node.func, module_name, function_aliases, local_defs, class_name)
         if resolved is not None:
             if _is_tcl_interpreter_dispatch_call(resolved):
                 if parameter_controlled_names is None:
