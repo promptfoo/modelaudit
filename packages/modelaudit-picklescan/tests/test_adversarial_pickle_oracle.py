@@ -1110,6 +1110,34 @@ def _tkinter_tcl_call_payload(marker: Path) -> bytes:
     )
 
 
+def _subinterpreters_control_payload() -> bytes:
+    return b"".join(
+        [
+            b"\x80\x04",
+            _short_binunicode(b"_xxsubinterpreters"),
+            _short_binunicode(b"create"),
+            b"\x93)R.",
+        ]
+    )
+
+
+def _subinterpreters_run_string_payload(marker: Path) -> bytes:
+    source = f"open({str(marker)!r}, 'w').write('owned-by-subinterp')"
+    return b"".join(
+        [
+            b"\x80\x04",
+            _short_binunicode(b"_xxsubinterpreters"),
+            _short_binunicode(b"create"),
+            b"\x93)R\x94",
+            _short_binunicode(b"_xxsubinterpreters"),
+            _short_binunicode(b"run_string"),
+            b"\x93h\x00",
+            _text_operand(source),
+            b"\x86R.",
+        ]
+    )
+
+
 def _inspect_getmembers_property_payload(marker: Path, *, include_call: bool) -> bytes:
     parts = [b"\x80\x04"]
     parts += [_short_binunicode(b"builtins"), _short_binunicode(b"type"), b"\x93"]
@@ -2670,6 +2698,30 @@ def test_scan_bytes_blocks_tkinter_tcl_process_execution(
     result = pickle.loads(payload)
     assert result == ""
     assert marker.read_text() == marker_content
+
+
+@pytest.mark.skipif(find_spec("_xxsubinterpreters") is None, reason="_xxsubinterpreters is unavailable")
+def test_scan_bytes_blocks_subinterpreters_run_string_rce(tmp_path: Path) -> None:
+    control_payload = _subinterpreters_control_payload()
+    control_report = scan_bytes(control_payload, source="subinterpreters-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    marker = tmp_path / "subinterpreters_run_string_marker"
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert type(control_result).__name__ == "InterpreterID"
+    assert not marker.exists()
+
+    payload = _subinterpreters_run_string_payload(marker)
+    report = scan_bytes(payload, source="subinterpreters-run-string-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_global_finding(report, "_xxsubinterpreters", "run_string")
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result is None
+    assert marker.read_text() == "owned-by-subinterp"
 
 
 def test_scan_bytes_blocks_inspect_getmembers_descriptor_rce(tmp_path: Path) -> None:

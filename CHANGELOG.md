@@ -147,6 +147,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   methods that can write attacker-controlled startup hooks
 - **security:** detect pickle calls to `_tkinter` Tcl interpreter dispatch
   methods that can execute local commands
+- **security:** detect pickle calls to `_xxsubinterpreters.run_string` that
+  can execute attacker-controlled Python source
 - **security:** detect `builtins.staticmethod` pickle call targets that can
   synthesize callable descriptors for later invocation
 - **security:** detect `builtins.property.__get__` pickle call targets that
