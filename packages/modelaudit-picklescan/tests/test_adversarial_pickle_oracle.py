@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import pickle
 import shlex
@@ -12,6 +13,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
+from importlib import import_module
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -280,6 +282,14 @@ def _module_available(module_name: str) -> bool:
         return find_spec(module_name) is not None
     except ModuleNotFoundError:
         return False
+
+
+def _module_global_available(module_name: str, name: str) -> bool:
+    try:
+        module = import_module(module_name)
+    except Exception:
+        return False
+    return hasattr(module, name)
 
 
 def _calls_subprocess_run_under_cpython(payload: bytes, monkeypatch: pytest.MonkeyPatch) -> bool:
@@ -848,6 +858,10 @@ def _tuple_payload_operands(operands: list[bytes]) -> bytes:
     return b"(" + b"".join(operands) + b"t"
 
 
+def _global_operand(module: str, name: str) -> bytes:
+    return _short_binunicode(module.encode()) + _short_binunicode(name.encode()) + b"\x93"
+
+
 def _dict_setitem(key: str, value: bytes) -> bytes:
     return _text_operand(key) + value + b"s"
 
@@ -988,6 +1002,38 @@ def _numpy_savetxt_pth_payload(pth_path: Path, marker: Path, *, writer_module: s
         parts += [_text_operand(str(pth_path)), b"]h\x00a", _text_operand("%s"), b"\x87R"]
     else:
         parts += [b"h\x00"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _pyyaml_unsafe_document(marker: Path, marker_content: str) -> str:
+    source_tail = f"port pathlib\npathlib.Path({str(marker)!r}).write_text({marker_content!r})"
+    return (
+        "!!python/object/apply:builtins.exec\n"
+        "- !!python/object/apply:operator.add\n"
+        "  - im\n"
+        f"  - {json.dumps(source_tail)}\n"
+    )
+
+
+def _pyyaml_unsafe_load_payload(
+    document: str,
+    *,
+    load_name: str,
+    loader_module: str | None,
+    loader_name: str | None,
+    force_iteration: bool,
+) -> bytes:
+    parts = [b"\x80\x04"]
+    if force_iteration:
+        parts += [_global_operand("builtins", "tuple")]
+    parts += [_global_operand("yaml", load_name), _text_operand(document)]
+    if loader_module is None or loader_name is None:
+        parts += [b"\x85R"]
+    else:
+        parts += [_global_operand(loader_module, loader_name), b"\x86R"]
+    if force_iteration:
+        parts += [b"\x85R"]
     parts += [b"."]
     return b"".join(parts)
 
@@ -2689,6 +2735,130 @@ def test_scan_bytes_blocks_numpy_savetxt_fragmented_pth_rce(tmp_path: Path, writ
         assert marker.read_text() == "owned-by-numpy-savetxt"
     finally:
         sys.path[:] = original_sys_path
+
+
+@pytest.mark.skipif(not _module_available("yaml"), reason="PyYAML is unavailable")
+@pytest.mark.parametrize(
+    (
+        "case_name",
+        "load_name",
+        "loader_module",
+        "loader_name",
+        "force_iteration",
+        "expected_globals",
+    ),
+    [
+        ("unsafe-load", "unsafe_load", None, None, False, [("yaml", "unsafe_load")]),
+        ("load-loader", "load", "yaml", "Loader", False, [("yaml", "load"), ("yaml", "Loader")]),
+        (
+            "load-unsafe-loader",
+            "load",
+            "yaml",
+            "UnsafeLoader",
+            False,
+            [("yaml", "load"), ("yaml", "UnsafeLoader")],
+        ),
+        ("load-c-loader", "load", "yaml", "CLoader", False, [("yaml", "load"), ("yaml", "CLoader")]),
+        (
+            "load-c-unsafe-loader",
+            "load",
+            "yaml",
+            "CUnsafeLoader",
+            False,
+            [("yaml", "load"), ("yaml", "CUnsafeLoader")],
+        ),
+        (
+            "load-loader-module",
+            "load",
+            "yaml.loader",
+            "Loader",
+            False,
+            [("yaml", "load"), ("yaml.loader", "Loader")],
+        ),
+        (
+            "load-cyaml-loader",
+            "load",
+            "yaml.cyaml",
+            "CLoader",
+            False,
+            [("yaml", "load"), ("yaml.cyaml", "CLoader")],
+        ),
+        (
+            "load-cyaml-unsafe-loader",
+            "load",
+            "yaml.cyaml",
+            "CUnsafeLoader",
+            False,
+            [("yaml", "load"), ("yaml.cyaml", "CUnsafeLoader")],
+        ),
+        ("unsafe-load-all", "unsafe_load_all", None, None, True, [("yaml", "unsafe_load_all")]),
+        (
+            "load-all-loader",
+            "load_all",
+            "yaml",
+            "Loader",
+            True,
+            [("yaml", "load_all"), ("yaml", "Loader")],
+        ),
+        (
+            "load-all-c-unsafe-loader",
+            "load_all",
+            "yaml",
+            "CUnsafeLoader",
+            True,
+            [("yaml", "load_all"), ("yaml", "CUnsafeLoader")],
+        ),
+    ],
+)
+def test_scan_bytes_blocks_pyyaml_unsafe_loader_rce(
+    tmp_path: Path,
+    case_name: str,
+    load_name: str,
+    loader_module: str | None,
+    loader_name: str | None,
+    force_iteration: bool,
+    expected_globals: list[tuple[str, str]],
+) -> None:
+    if (
+        loader_module is not None
+        and loader_name is not None
+        and not _module_global_available(loader_module, loader_name)
+    ):
+        pytest.skip(f"{loader_module}.{loader_name} is unavailable")
+
+    marker = tmp_path / f"{case_name}_marker"
+    marker_content = f"owned-by-pyyaml-{case_name}"
+    document = _pyyaml_unsafe_document(marker, marker_content)
+    control_payload = b"\x80\x04" + _text_operand(document) + b"."
+    payload = _pyyaml_unsafe_load_payload(
+        document,
+        load_name=load_name,
+        loader_module=loader_module,
+        loader_name=loader_name,
+        force_iteration=force_iteration,
+    )
+
+    control_report = scan_bytes(control_payload, source=f"pyyaml-{case_name}-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert control_result == document
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source=f"pyyaml-{case_name}-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    for module, name in expected_globals:
+        assert _has_critical_global_finding(report, module, name)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    if force_iteration:
+        assert result == (None,)
+    else:
+        assert result is None
+    assert marker.read_text() == marker_content
 
 
 def test_scan_bytes_blocks_codecs_open_write_rce(tmp_path: Path) -> None:

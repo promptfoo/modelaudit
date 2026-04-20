@@ -144,6 +144,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hooks
 - **security:** detect pickle calls to NumPy text writers that can write
   attacker-controlled startup hooks
+- **security:** detect pickle calls to PyYAML unsafe loaders that can execute
+  attacker-controlled Python constructors
 - **security:** detect pickle calls to `codecs.open` and codec stream writes
   that can write attacker-controlled startup hooks
 - **security:** detect pickle calls to durable tempfile creation and CSV

@@ -7228,3 +7228,95 @@ Blocking plan:
 Performance note: two exact entries in the sorted policy table and no NumPy
 argument inspection, array coercion modeling, path/content analysis, or broad
 `numpy` wildcard block.
+
+## Turn 127 - Bypass via PyYAML unsafe second-stage execution
+
+Found a scanner-clean, immediate RCE primitive by using pickle only as a
+launcher for PyYAML's unsafe Python-object constructors. The pickle imports
+`yaml.unsafe_load` or `yaml.load`; the YAML document then calls
+`builtins.exec` on source assembled from split YAML scalars:
+
+```yaml
+!!python/object/apply:builtins.exec
+- !!python/object/apply:operator.add
+  - im
+  - "port pathlib\npathlib.Path('/tmp/.../marker.txt').write_text('owned-by-yaml-pickle')"
+```
+
+The executable source is never present as one pickle string: `im` and
+`port pathlib...` are separate YAML values and `operator.add` joins them only
+inside PyYAML. `pickle.loads(payload)` therefore writes the marker immediately,
+without requiring a later `.pth` import hook or subprocess.
+
+Proof on CPython 3.12.12 with PyYAML 6.0.3:
+
+- Control scanner result for a pickle containing only the YAML document string:
+  `status=complete`, `verdict=clean`, `is_clean=True`, `findings=[]`,
+  `notices=[]`, `errors=[]`; `pickle.loads(control)` returns the string and
+  does not create the marker.
+- `yaml.unsafe_load` payload: `len=250`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`, `errors=[]`.
+- `yaml.unsafe_load` coverage: `bytes_scanned=250`, `bytes_total=250`,
+  `opcode_count=8`, `raw_scan_complete=True`, `opcode_scan_complete=True`.
+- `yaml.unsafe_load` import references: `yaml.unsafe_load` with
+  `is_dangerous=False`.
+- `yaml.unsafe_load` runtime: `pickle.loads(payload)` returns `None` and
+  creates the marker with `owned-by-yaml-pickle`.
+- `yaml.load` with `yaml.Loader`: clean, 0 findings, 0 notices, 0 errors;
+  runtime executes and creates the marker.
+- `yaml.load` with `yaml.UnsafeLoader`: clean, 0 findings, 0 notices, 0
+  errors; runtime executes and creates the marker.
+- `yaml.load` with `yaml.CLoader`: clean, 0 findings, 0 notices, 0 errors;
+  runtime executes and creates the marker.
+- `yaml.load` with `yaml.CUnsafeLoader`: clean, 0 findings, 0 notices, 0
+  errors; runtime executes and creates the marker.
+- `yaml.load` with `yaml.FullLoader`, `yaml.CFullLoader`, `yaml.SafeLoader`,
+  and `yaml.CSafeLoader`: scanner-clean but PyYAML rejects the
+  `python/object/apply` tag, so these are not RCE variants.
+
+Generator variants also bypass when the pickle forces iteration:
+
+| Loader global | Forcing global | Scanner verdict | Runtime result |
+| --- | --- | --- | --- |
+| `yaml.unsafe_load_all` | `builtins.tuple` | clean, 0 findings, 0 notices | tuple consumption executes and writes `owned-by-yaml-load-all` |
+| `yaml.load_all` + `yaml.Loader` | `builtins.tuple` | clean, 0 findings, 0 notices | tuple consumption executes and writes `owned-by-yaml-load-all` |
+| `yaml.load_all` + `yaml.CUnsafeLoader` | `builtins.tuple` | clean, 0 findings, 0 notices | tuple consumption executes and writes `owned-by-yaml-load-all` |
+
+Why the scanner missed it:
+
+- `yaml` is not a wildcard-dangerous module.
+- None of `yaml.unsafe_load`, `yaml.unsafe_load_all`, `yaml.load`, or
+  `yaml.load_all` are exact dangerous globals.
+- Loader classes such as `yaml.Loader`, `yaml.UnsafeLoader`, `yaml.CLoader`,
+  and `yaml.CUnsafeLoader` are imported as clean globals.
+- The pickle contains no direct `builtins.exec` import reference; that callable
+  appears only inside the YAML document.
+- The suspicious-string scanner did not match the YAML document because the
+  `import pathlib` source is split across YAML scalars and joined at runtime.
+
+Performance note: the next block should use exact dangerous-global entries for
+`yaml.unsafe_load`, `yaml.unsafe_load_all`, `yaml.load`, `yaml.load_all`, and
+the unsafe loader classes (`Loader`, `UnsafeLoader`, `CLoader`,
+`CUnsafeLoader`) rather than parsing YAML. That keeps detection to the existing
+sorted policy tables and avoids content-aware YAML simulation.
+
+## Turn 128 - Block PyYAML unsafe loader dispatch
+
+Blocking plan:
+
+- Add exact dangerous-global entries for `yaml.unsafe_load`,
+  `yaml.unsafe_load_all`, `yaml.load`, and `yaml.load_all`.
+- Add exact dangerous-global entries for unsafe loader classes exposed through
+  `yaml`, `yaml.loader`, and `yaml.cyaml`: `Loader`, `UnsafeLoader`,
+  `CLoader`, and `CUnsafeLoader`.
+- Keep `SafeLoader`, `CSafeLoader`, `FullLoader`, and `CFullLoader` out of the
+  dangerous table because PyYAML rejects `python/object/apply` constructors for
+  those loaders in the Turn 127 proof.
+- Add a CPython oracle regression that keeps the YAML document string itself
+  clean, then verifies the direct unsafe-load and forced-iteration
+  unsafe-load-all payloads are malicious and still execute under `pickle.loads`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: the block stays in the existing sorted exact-global table.
+It avoids YAML parsing, constructor simulation, string deobfuscation, loader
+argument tracking, or broad `yaml` wildcard blocking.

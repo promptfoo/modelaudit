@@ -362,6 +362,18 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("uuid", "_popen"),
     ("uuid", "getnode"),
     ("weakref", "finalize"),
+    ("yaml", "CLoader"),
+    ("yaml", "CUnsafeLoader"),
+    ("yaml", "Loader"),
+    ("yaml", "UnsafeLoader"),
+    ("yaml", "load"),
+    ("yaml", "load_all"),
+    ("yaml", "unsafe_load"),
+    ("yaml", "unsafe_load_all"),
+    ("yaml.cyaml", "CLoader"),
+    ("yaml.cyaml", "CUnsafeLoader"),
+    ("yaml.loader", "Loader"),
+    ("yaml.loader", "UnsafeLoader"),
     ("zipfile", "PyZipFile"),
     ("zipfile", "ZipFile"),
 ];
@@ -586,6 +598,29 @@ mod tests {
             Some("critical")
         );
         assert_eq!(global_severity("weakref", "finalize"), Some("critical"));
+        for name in [
+            "CLoader",
+            "CUnsafeLoader",
+            "Loader",
+            "UnsafeLoader",
+            "load",
+            "load_all",
+            "unsafe_load",
+            "unsafe_load_all",
+        ] {
+            assert_eq!(global_severity("yaml", name), Some("critical"));
+        }
+        for (module, name) in [
+            ("yaml.cyaml", "CLoader"),
+            ("yaml.cyaml", "CUnsafeLoader"),
+            ("yaml.loader", "Loader"),
+            ("yaml.loader", "UnsafeLoader"),
+        ] {
+            assert_eq!(global_severity(module, name), Some("critical"));
+        }
+        for name in ["CFullLoader", "CSafeLoader", "FullLoader", "SafeLoader"] {
+            assert_eq!(global_severity("yaml", name), None);
+        }
         assert_eq!(
             global_severity("sched", "scheduler.enter"),
             Some("critical")
