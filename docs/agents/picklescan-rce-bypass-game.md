@@ -8771,3 +8771,114 @@ Blocking plan:
 Performance note: this remains a tiny Rust component check over parsed global
 names. It does not enumerate subclasses, resolve class indexes, import target
 packages, or add object-provenance tracking to the pickle stack model.
+
+## Turn 159 - Bypass via `gc.get_referents` function builtin recovery
+
+Found a scanner-clean RCE that bypasses the namespace-name and object-subclass
+blocks by using the garbage collector's referent graph. The payload imports a
+clean standard-library function object, calls `gc.get_referents()` on it, and
+uses clean `operator.getitem` to select the function's builtin dictionary from
+the referent list. It then recovers `eval` with `dict.get` and executes a
+fragmented source string.
+
+For `statistics.mean` on CPython 3.12.12, `gc.get_referents(statistics.mean)`
+returns:
+
+```python
+[
+    <code object mean>,
+    statistics.__dict__,
+    builtins.__dict__,
+    "statistics",
+    "...docstring...",
+    "mean",
+    "mean",
+]
+```
+
+The payload never imports `__globals__`, `__builtins__`, `__dict__`,
+`__getattribute__`, `__subclasses__`, `eval`, `exec`, `open`, `os`, or
+`subprocess` as a pickle global.
+
+Proof payload shape:
+
+```python
+referents = gc.get_referents(statistics.mean)
+builtins_dict = operator.getitem(referents, 2)
+fn = dict.get(builtins_dict, "".join(["ev", "al"]))
+code = "".join(
+    [
+        "open('/tmp/.../marker','w').write('owned-by-gc-referents')",
+    ]
+)
+fn(code)
+```
+
+The active pickle imports only:
+
+- `gc.get_referents` via legacy `GLOBAL`
+- `statistics.mean`
+- `operator.getitem` via legacy `GLOBAL`
+- `builtins.dict.get`
+- two `builtins.str.join` references
+
+Proof on CPython 3.12.12:
+
+- Control payload scanner result: `len=235`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control import references: one clean `builtins.str.join`.
+- Control runtime: `pickle.loads(control)` returns the assembled eval code
+  string and creates no marker.
+- Active payload scanner result: `len=371`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references: clean `gc.get_referents`, clean
+  `statistics.mean`, clean `operator.getitem`, clean `builtins.dict.get`, and
+  two clean `builtins.str.join` references, all with `is_dangerous=False`.
+- Active runtime before unpickle: marker absent.
+- Active runtime after unpickle: marker exists and contains
+  `owned-by-gc-referents`; `pickle.loads(active)` returns the integer byte
+  count from `open(...).write(...)`.
+
+Why the scanner missed it:
+
+- `gc.get_referents` is not in the dangerous global policy table and the `gc`
+  module is not wildcard-blocked.
+- The Turn 156 namespace-source block only checks parsed global-name
+  components such as `__globals__`, `__builtins__`, and `__dict__`. This
+  payload obtains the same dictionaries through the GC referent graph, without
+  those names appearing as pickle globals.
+- The payload fragments `eval` and the source string with `str.join`, so the
+  suspicious-string scan sees only short harmless fragments.
+- The stack model treats `gc.get_referents(statistics.mean)` and
+  `operator.getitem(..., 2)` as opaque values. It does not model function
+  referent layout or know that item `2` is the builtin namespace dictionary.
+
+Performance note: the next block should stay close to the finite GC object
+graph source primitives. Marking `gc.get_referents`, `gc.get_referrers`, and
+`gc.get_objects` as critical would cut off deterministic referent recovery and
+heap object recovery without runtime GC traversal, index modeling, or
+package-specific call-graph expansion.
+
+## Turn 160 - Block GC object-graph source primitives
+
+Blocking plan:
+
+- Add `gc.get_objects`, `gc.get_referents`, and `gc.get_referrers` to the
+  finite dangerous-global policy table. These expose the live Python object
+  graph and can recover hidden module/function namespaces or already-loaded
+  process capabilities without direct pickle imports of the target sink.
+- Add Rust unit coverage for all three GC source globals.
+- Add a CPython oracle regression for the Turn 159 payload. The control payload
+  only assembles the eval code string and remains clean; the active payload
+  calls `gc.get_referents(statistics.mean)`, selects the builtin dictionary,
+  is flagged as malicious, and still writes the marker if loaded.
+- Compute the builtin-dictionary referent index at test time so the regression
+  stays tied to CPython semantics without hardcoding a version-specific layout
+  number.
+- Add direct legacy-`GLOBAL` and `STACK_GLOBAL` regressions for all three GC
+  source primitives.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: this remains a sorted Rust policy-table lookup over parsed
+pickle globals. It adds no runtime GC traversal, referent layout modeling,
+heap-index tracking, or package-specific call-graph expansion.

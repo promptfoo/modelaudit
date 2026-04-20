@@ -174,6 +174,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   namespace source methods used for dynamic builtin recovery
 - **security:** detect object subclass enumeration globals that can recover
   loaded process capabilities without direct imports
+- **security:** detect garbage collector object-graph globals that can recover
+  hidden namespaces and loaded process capabilities
 - **security:** detect pickle calls to PyYAML unsafe loaders that can execute
   attacker-controlled Python constructors
 - **security:** detect pickle calls to `codecs.open` and codec stream writes

@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import builtins
 import dataclasses
+import gc
 import json
 import logging
 import pickle
 import shlex
 import shutil
 import site
+import statistics
 import subprocess
 import sys
 from collections.abc import Callable
@@ -1390,6 +1393,39 @@ def _subclasses_popen_payload(marker: Path, *, include_call: bool) -> tuple[byte
         parts += [command]
     parts += [b"."]
     return b"".join(parts), popen_index
+
+
+def _gc_referents_eval_payload(marker: Path, *, include_lookup: bool) -> tuple[bytes, str, int]:
+    referent_index = next(
+        index for index, referent in enumerate(gc.get_referents(statistics.mean)) if referent is builtins.__dict__
+    )
+    code = f"open({str(marker)!r},'w').write('owned-by-gc-referents')"
+    code_fragments = [code[offset : offset + 3] for offset in range(0, len(code), 3)]
+
+    def join_fragments(fragments: list[str]) -> list[bytes]:
+        return [
+            _global_operand("builtins", "str.join"),
+            _text_operand(""),
+            _tuple_payload_operands([_text_operand(fragment) for fragment in fragments]),
+            b"\x86R",
+        ]
+
+    parts = [b"\x80\x04"]
+    if include_lookup:
+        parts += [_legacy_global_operand("gc", "get_referents")]
+        parts += [_global_operand("statistics", "mean")]
+        parts += [b"\x85R\x940"]
+        parts += [_legacy_global_operand("operator", "getitem")]
+        parts += [b"h\x00", _int_operand(referent_index), b"\x86R\x940"]
+        parts += [_global_operand("builtins", "dict.get")]
+        parts += [b"h\x01"]
+        parts += join_fragments(["ev", "al"])
+        parts += [b"\x86R\x940"]
+    parts += join_fragments(code_fragments)
+    if include_lookup:
+        parts += [b"\x940h\x02h\x03\x85R"]
+    parts += [b"."]
+    return b"".join(parts), code, referent_index
 
 
 def _site_os_system_payload(command: str, *, include_call: bool) -> bytes:
@@ -3641,6 +3677,37 @@ def test_scan_bytes_blocks_object_subclasses_popen_recovery_rce(tmp_path: Path) 
     assert object.__subclasses__()[popen_index] is popen_class
     assert result.wait(timeout=5) == 0
     assert marker.read_text() == "owned-by-subclasses-popen"
+
+
+def test_scan_bytes_blocks_gc_referents_builtin_eval_recovery_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "gc_referents_eval_marker"
+    control_payload, expected_code, _ = _gc_referents_eval_payload(marker, include_lookup=False)
+    payload, _, referent_index = _gc_referents_eval_payload(marker, include_lookup=True)
+
+    control_report = scan_bytes(control_payload, source="gc-referents-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert control_result == expected_code
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="gc-referents-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_global_finding(report, "gc", "get_referents")
+
+    for name in ["get_objects", "get_referents", "get_referrers"]:
+        for global_payload in [_legacy_global_operand("gc", name), _global_operand("gc", name)]:
+            direct_report = scan_bytes(b"\x80\x04" + global_payload + b".", source=f"gc-{name}-direct.pkl")
+            assert direct_report.verdict == SafetyVerdict.MALICIOUS
+            assert _has_critical_global_finding(direct_report, "gc", name)
+
+    assert gc.get_referents(statistics.mean)[referent_index] is builtins.__dict__
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result == len("owned-by-gc-referents")
+    assert marker.read_text() == "owned-by-gc-referents"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="os.system proof uses POSIX shell redirection")
