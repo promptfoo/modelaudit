@@ -1148,9 +1148,7 @@ impl<'a> ScanState<'a> {
             let [pattern_value, action_value] = items.as_slice() else {
                 return None;
             };
-            let Some(pattern) = stack_value_string(pattern_value, self.payload) else {
-                return None;
-            };
+            let pattern = stack_value_string(pattern_value, self.payload)?;
             saw_scanner_rule_shape = true;
             if let Some(action) = Self::callable_reference_from_value(Some(action_value)) {
                 rules.push(RegexScannerRule { pattern, action });
@@ -1280,7 +1278,7 @@ impl<'a> ScanState<'a> {
             }
             Some(StackValue::Constructed(reference)) if !reference.malformed => {
                 let reference = match op_name {
-                    "REDUCE" | "OBJ" => Self::constructed_callable_reference(&reference),
+                    "REDUCE" | "OBJ" => Self::constructed_callable_reference(reference),
                     _ => reference.clone(),
                 };
                 Some(CallableInvocation {
@@ -1601,7 +1599,7 @@ impl<'a> ScanState<'a> {
     }
 
     fn regex_flags_may_enable(flags: Option<isize>, flag: isize) -> bool {
-        flags.map_or(true, |bits| bits & flag != 0)
+        flags.is_none_or(|bits| bits & flag != 0)
     }
 
     fn regex_any_line_matches(input: &str, predicate: impl Fn(&str) -> bool) -> bool {
@@ -2438,12 +2436,18 @@ impl<'a> ScanState<'a> {
     }
 
     fn is_defaultdict_factory_lookup(module: &str, name: &str) -> bool {
-        match (module, name) {
-            ("operator", "getitem") => true,
-            ("collections", "defaultdict.__getitem__" | "defaultdict.__missing__") => true,
-            ("builtins" | "__builtin__" | "__builtins__", "dict.__getitem__") => true,
-            _ => false,
-        }
+        matches!(
+            (module, name),
+            ("operator", "getitem")
+                | (
+                    "collections",
+                    "defaultdict.__getitem__" | "defaultdict.__missing__"
+                )
+                | (
+                    "builtins" | "__builtin__" | "__builtins__",
+                    "dict.__getitem__"
+                )
+        )
     }
 
     fn zero_arg_invocation(
@@ -2713,16 +2717,13 @@ impl<'a> ScanState<'a> {
         let Some(StackValue::Tuple(arguments)) = values.get(1) else {
             return None;
         };
-        let Some((_, _, _, callback_arg_index)) = EXACT_ARITY_LAZY_ZERO_ARG_CALLBACK_ITERABLES
+        let (_, _, _, callback_arg_index) = EXACT_ARITY_LAZY_ZERO_ARG_CALLBACK_ITERABLES
             .iter()
             .find(|(consumer_module, consumer_name, arity, _)| {
                 Self::consumer_module_matches(&callable_reference.module, consumer_module)
                     && *consumer_name == callable_reference.name
                     && *arity == arguments.len()
-            })
-        else {
-            return None;
-        };
+            })?;
         let callable = Self::callable_reference_from_value(arguments.get(*callback_arg_index))?;
         Some(StackValue::CallIterator { callable })
     }

@@ -6236,6 +6236,15 @@ def test_scan_bytes_blocks_threadpool_executor_submitted_callback_rce(tmp_path: 
 
 
 def test_scan_bytes_blocks_processpool_executor_submitted_callback_rce(tmp_path: Path) -> None:
+    try:
+        import concurrent.futures
+
+        executor = concurrent.futures.ProcessPoolExecutor(max_workers=1)
+    except (OSError, PermissionError) as exc:
+        pytest.skip(f"ProcessPoolExecutor is unavailable: {exc}")
+    else:
+        executor.shutdown(wait=True, cancel_futures=True)
+
     marker = tmp_path / "processpool_executor_submitted_callback_rce_marker"
     payload = _processpool_executor_submit_payload(marker)
 

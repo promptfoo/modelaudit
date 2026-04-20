@@ -94,7 +94,7 @@ Blocking plan:
 - Add `("setuptools._distutils.spawn", "spawn")` to the sorted
   dangerous-global table instead of wildcarding all `setuptools`.
 - Add portable policy coverage for raw `GLOBAL setuptools._distutils.spawn
-  spawn` reductions so detection does not depend on `setuptools` being
+spawn` reductions so detection does not depend on `setuptools` being
   installed in the test environment.
 - Add an optional CPython oracle regression that imports
   `setuptools._distutils.spawn` when available, verifies scanner detection, then
@@ -4281,8 +4281,8 @@ Proof on CPython 3.12.12 for the `__lt__` representative:
 
 Sibling slot proof:
 
-| Operator | Method | Scanner verdict | Runtime result |
-| --- | --- | --- | --- |
+| Operator      | Method   | Scanner verdict              | Runtime result                 |
+| ------------- | -------- | ---------------------------- | ------------------------------ |
 | `operator.lt` | `__lt__` | clean, 0 findings, 0 notices | marker created, returns `None` |
 | `operator.le` | `__le__` | clean, 0 findings, 0 notices | marker created, returns `None` |
 | `operator.gt` | `__gt__` | clean, 0 findings, 0 notices | marker created, returns `None` |
@@ -4425,8 +4425,8 @@ Proof on CPython 3.12.12 for the `__getitem__` representative:
 
 Sibling slot proof:
 
-| Operator | Method | Scanner verdict | Runtime result |
-| --- | --- | --- | --- |
+| Operator           | Method        | Scanner verdict              | Runtime result                 |
+| ------------------ | ------------- | ---------------------------- | ------------------------------ |
 | `operator.getitem` | `__getitem__` | clean, 0 findings, 0 notices | marker created, returns `None` |
 | `operator.delitem` | `__delitem__` | clean, 0 findings, 0 notices | marker created, returns `None` |
 
@@ -4564,20 +4564,20 @@ Proof on CPython 3.12.12 for the `__add__` representative:
 
 Sibling slot proof:
 
-| Operator | Method | Scanner verdict | Runtime result |
-| --- | --- | --- | --- |
-| `operator.add` | `__add__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.sub` | `__sub__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.mul` | `__mul__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.matmul` | `__matmul__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| Operator           | Method        | Scanner verdict              | Runtime result                 |
+| ------------------ | ------------- | ---------------------------- | ------------------------------ |
+| `operator.add`     | `__add__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.sub`     | `__sub__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.mul`     | `__mul__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.matmul`  | `__matmul__`  | clean, 0 findings, 0 notices | marker created, returns `None` |
 | `operator.truediv` | `__truediv__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.mod` | `__mod__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.pow` | `__pow__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.lshift` | `__lshift__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.rshift` | `__rshift__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.and_` | `__and__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.xor` | `__xor__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.or_` | `__or__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.mod`     | `__mod__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.pow`     | `__pow__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.lshift`  | `__lshift__`  | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.rshift`  | `__rshift__`  | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.and_`    | `__and__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.xor`     | `__xor__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.or_`     | `__or__`      | clean, 0 findings, 0 notices | marker created, returns `None` |
 
 `__floordiv__` was not counted as a clean bypass in this probe because the
 existing nested-raw-pickle heuristic already made that exact payload
@@ -4726,37 +4726,37 @@ Proof on CPython 3.12.12:
 
 Sibling reflected slot proof:
 
-| Operator | Method | Scanner verdict | Runtime result |
-| --- | --- | --- | --- |
-| `operator.add` | `__radd__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.sub` | `__rsub__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.mul` | `__rmul__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.matmul` | `__rmatmul__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| Operator           | Method         | Scanner verdict              | Runtime result                 |
+| ------------------ | -------------- | ---------------------------- | ------------------------------ |
+| `operator.add`     | `__radd__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.sub`     | `__rsub__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.mul`     | `__rmul__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.matmul`  | `__rmatmul__`  | clean, 0 findings, 0 notices | marker created, returns `None` |
 | `operator.truediv` | `__rtruediv__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.mod` | `__rmod__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.pow` | `__rpow__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.lshift` | `__rlshift__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.rshift` | `__rrshift__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.and_` | `__rand__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.xor` | `__rxor__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.or_` | `__ror__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.mod`     | `__rmod__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.pow`     | `__rpow__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.lshift`  | `__rlshift__`  | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.rshift`  | `__rrshift__`  | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.and_`    | `__rand__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.xor`     | `__rxor__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.or_`     | `__ror__`      | clean, 0 findings, 0 notices | marker created, returns `None` |
 
 Sibling in-place slot proof:
 
-| Operator | Method | Scanner verdict | Runtime result |
-| --- | --- | --- | --- |
-| `operator.iadd` | `__iadd__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.isub` | `__isub__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.imul` | `__imul__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.imatmul` | `__imatmul__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| Operator            | Method         | Scanner verdict              | Runtime result                 |
+| ------------------- | -------------- | ---------------------------- | ------------------------------ |
+| `operator.iadd`     | `__iadd__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.isub`     | `__isub__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.imul`     | `__imul__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.imatmul`  | `__imatmul__`  | clean, 0 findings, 0 notices | marker created, returns `None` |
 | `operator.itruediv` | `__itruediv__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.imod` | `__imod__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.ipow` | `__ipow__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.ilshift` | `__ilshift__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.irshift` | `__irshift__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.iand` | `__iand__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.ixor` | `__ixor__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.ior` | `__ior__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.imod`     | `__imod__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.ipow`     | `__ipow__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.ilshift`  | `__ilshift__`  | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.irshift`  | `__irshift__`  | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.iand`     | `__iand__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.ixor`     | `__ixor__`     | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.ior`      | `__ior__`      | clean, 0 findings, 0 notices | marker created, returns `None` |
 
 RCE mechanism:
 
@@ -4892,11 +4892,11 @@ Proof on CPython 3.12.12 for the `__neg__` representative:
 
 Sibling slot proof:
 
-| Operator | Method | Scanner verdict | Runtime result |
-| --- | --- | --- | --- |
-| `operator.neg` | `__neg__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.pos` | `__pos__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `operator.abs` | `__abs__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| Operator          | Method       | Scanner verdict              | Runtime result                 |
+| ----------------- | ------------ | ---------------------------- | ------------------------------ |
+| `operator.neg`    | `__neg__`    | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.pos`    | `__pos__`    | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `operator.abs`    | `__abs__`    | clean, 0 findings, 0 notices | marker created, returns `None` |
 | `operator.invert` | `__invert__` | clean, 0 findings, 0 notices | marker created, returns `None` |
 
 RCE mechanism:
@@ -5160,13 +5160,13 @@ Proof on CPython 3.12.12 for the `__next__` representative:
 
 Sibling slot proof:
 
-| Builtin | Method | Scanner verdict | Runtime result |
-| --- | --- | --- | --- |
-| `builtins.next` | `__next__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `builtins.reversed` | `__reversed__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `builtins.anext` | `__anext__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `builtins.iter` | `__iter__` | clean, 0 findings, 0 notices | marker created before `TypeError` |
-| `builtins.aiter` | `__aiter__` | clean, 0 findings, 0 notices | marker created before `TypeError` |
+| Builtin             | Method         | Scanner verdict              | Runtime result                    |
+| ------------------- | -------------- | ---------------------------- | --------------------------------- |
+| `builtins.next`     | `__next__`     | clean, 0 findings, 0 notices | marker created, returns `None`    |
+| `builtins.reversed` | `__reversed__` | clean, 0 findings, 0 notices | marker created, returns `None`    |
+| `builtins.anext`    | `__anext__`    | clean, 0 findings, 0 notices | marker created, returns `None`    |
+| `builtins.iter`     | `__iter__`     | clean, 0 findings, 0 notices | marker created before `TypeError` |
+| `builtins.aiter`    | `__aiter__`    | clean, 0 findings, 0 notices | marker created before `TypeError` |
 
 RCE mechanism:
 
@@ -5296,12 +5296,12 @@ Proof on CPython 3.12.12 for the `__round__` representative:
 
 Sibling slot proof:
 
-| Helper | Method | Scanner verdict | Runtime result |
-| --- | --- | --- | --- |
+| Helper           | Method      | Scanner verdict              | Runtime result                 |
+| ---------------- | ----------- | ---------------------------- | ------------------------------ |
 | `builtins.round` | `__round__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `math.floor` | `__floor__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `math.ceil` | `__ceil__` | clean, 0 findings, 0 notices | marker created, returns `None` |
-| `math.trunc` | `__trunc__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `math.floor`     | `__floor__` | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `math.ceil`      | `__ceil__`  | clean, 0 findings, 0 notices | marker created, returns `None` |
+| `math.trunc`     | `__trunc__` | clean, 0 findings, 0 notices | marker created, returns `None` |
 
 RCE mechanism:
 
@@ -5578,16 +5578,16 @@ Proof on CPython 3.12.12 for the `__repr__` representative:
 
 Sibling slot proof:
 
-| Helper | Method | Scanner verdict | Runtime result |
-| --- | --- | --- | --- |
-| `builtins.repr` | `__repr__` | clean, 0 findings, 0 notices | marker created, then return-type `TypeError` |
-| `builtins.str` | `__str__` | clean, 0 findings, 0 notices | marker created, then return-type `TypeError` |
-| `builtins.bytes` | `__bytes__` | clean, 0 findings, 0 notices | marker created, then return-type `TypeError` |
-| `builtins.hash` | `__hash__` | clean, 0 findings, 0 notices | marker created, then return-type `TypeError` |
-| `builtins.len` | `__len__` | clean, 0 findings, 0 notices | marker created, then return-type `TypeError` |
-| `builtins.bool` | `__bool__` | clean, 0 findings, 0 notices | marker created, then return-type `TypeError` |
-| `operator.length_hint` | `__length_hint__` | clean, 0 findings, 0 notices | marker created, then return-type `TypeError` |
-| `builtins.format` | `__format__` | clean, 0 findings, 0 notices | dangling symlink created by `Path.symlink_to`, then return-type `TypeError` |
+| Helper                 | Method            | Scanner verdict              | Runtime result                                                              |
+| ---------------------- | ----------------- | ---------------------------- | --------------------------------------------------------------------------- |
+| `builtins.repr`        | `__repr__`        | clean, 0 findings, 0 notices | marker created, then return-type `TypeError`                                |
+| `builtins.str`         | `__str__`         | clean, 0 findings, 0 notices | marker created, then return-type `TypeError`                                |
+| `builtins.bytes`       | `__bytes__`       | clean, 0 findings, 0 notices | marker created, then return-type `TypeError`                                |
+| `builtins.hash`        | `__hash__`        | clean, 0 findings, 0 notices | marker created, then return-type `TypeError`                                |
+| `builtins.len`         | `__len__`         | clean, 0 findings, 0 notices | marker created, then return-type `TypeError`                                |
+| `builtins.bool`        | `__bool__`        | clean, 0 findings, 0 notices | marker created, then return-type `TypeError`                                |
+| `operator.length_hint` | `__length_hint__` | clean, 0 findings, 0 notices | marker created, then return-type `TypeError`                                |
+| `builtins.format`      | `__format__`      | clean, 0 findings, 0 notices | dangling symlink created by `Path.symlink_to`, then return-type `TypeError` |
 
 RCE mechanism:
 
@@ -5852,15 +5852,15 @@ Proof on CPython 3.12.12:
 
 Sibling sink proof:
 
-| Helper sequence | Scanner verdict | Runtime result |
-| --- | --- | --- |
-| `pathlib.Path.write_text(path, text)` | clean, 0 findings, 0 notices | file created with attacker text, returns byte count |
-| `pathlib.Path.write_bytes(path, bytes)` | clean, 0 findings, 0 notices | file created with attacker bytes, returns byte count |
-| `pathlib.Path.touch(path)` | clean, 0 findings, 0 notices | file created, returns `None` |
-| `pathlib.Path.open(path, "w")` plus `_io.TextIOWrapper.write/close` | clean, 0 findings, 0 notices | file created with attacker text, returns `None` |
-| `io.open(path, "w")` plus `_io.TextIOWrapper.write/close` | clean, 0 findings, 0 notices | file created with attacker text, returns `None` |
-| `_io.open(path, "w")` plus `_io.TextIOWrapper.write/close` | clean, 0 findings, 0 notices | file created with attacker text, returns `None` |
-| `_io.FileIO(path, "w")` plus `_io.FileIO.write/close` | clean, 0 findings, 0 notices | file created with attacker bytes, returns `None` |
+| Helper sequence                                                     | Scanner verdict              | Runtime result                                       |
+| ------------------------------------------------------------------- | ---------------------------- | ---------------------------------------------------- |
+| `pathlib.Path.write_text(path, text)`                               | clean, 0 findings, 0 notices | file created with attacker text, returns byte count  |
+| `pathlib.Path.write_bytes(path, bytes)`                             | clean, 0 findings, 0 notices | file created with attacker bytes, returns byte count |
+| `pathlib.Path.touch(path)`                                          | clean, 0 findings, 0 notices | file created, returns `None`                         |
+| `pathlib.Path.open(path, "w")` plus `_io.TextIOWrapper.write/close` | clean, 0 findings, 0 notices | file created with attacker text, returns `None`      |
+| `io.open(path, "w")` plus `_io.TextIOWrapper.write/close`           | clean, 0 findings, 0 notices | file created with attacker text, returns `None`      |
+| `_io.open(path, "w")` plus `_io.TextIOWrapper.write/close`          | clean, 0 findings, 0 notices | file created with attacker text, returns `None`      |
+| `_io.FileIO(path, "w")` plus `_io.FileIO.write/close`               | clean, 0 findings, 0 notices | file created with attacker bytes, returns `None`     |
 
 RCE mechanism:
 
@@ -6022,14 +6022,14 @@ Proof on CPython 3.12.12:
 
 Sibling dispatch proof:
 
-| Helper sequence | Scanner verdict | Runtime result |
-| --- | --- | --- |
-| `logging.FileHandler(path, "w")` plus `logging.FileHandler.emit(handler, record)` | clean, 0 findings, 0 notices | file created with attacker text |
-| `logging.FileHandler(path, "w")` plus `logging.StreamHandler.emit(handler, record)` | clean, 0 findings, 0 notices | file created with attacker text |
-| `logging.FileHandler(path, "w")` plus `logging.Handler.handle(handler, record)` | clean, 0 findings, 0 notices | file created with attacker text through logging dispatch |
-| `logging.handlers.WatchedFileHandler(path, "w")` plus `logging.StreamHandler.emit(handler, record)` | clean, 0 findings, 0 notices | file created with attacker text |
-| `logging.handlers.RotatingFileHandler(path, "w")` plus `logging.StreamHandler.emit(handler, record)` | clean, 0 findings, 0 notices | file created with attacker text |
-| `logging.handlers.TimedRotatingFileHandler(path)` plus `logging.StreamHandler.emit(handler, record)` | clean, 0 findings, 0 notices | file created with attacker text |
+| Helper sequence                                                                                      | Scanner verdict              | Runtime result                                           |
+| ---------------------------------------------------------------------------------------------------- | ---------------------------- | -------------------------------------------------------- |
+| `logging.FileHandler(path, "w")` plus `logging.FileHandler.emit(handler, record)`                    | clean, 0 findings, 0 notices | file created with attacker text                          |
+| `logging.FileHandler(path, "w")` plus `logging.StreamHandler.emit(handler, record)`                  | clean, 0 findings, 0 notices | file created with attacker text                          |
+| `logging.FileHandler(path, "w")` plus `logging.Handler.handle(handler, record)`                      | clean, 0 findings, 0 notices | file created with attacker text through logging dispatch |
+| `logging.handlers.WatchedFileHandler(path, "w")` plus `logging.StreamHandler.emit(handler, record)`  | clean, 0 findings, 0 notices | file created with attacker text                          |
+| `logging.handlers.RotatingFileHandler(path, "w")` plus `logging.StreamHandler.emit(handler, record)` | clean, 0 findings, 0 notices | file created with attacker text                          |
+| `logging.handlers.TimedRotatingFileHandler(path)` plus `logging.StreamHandler.emit(handler, record)` | clean, 0 findings, 0 notices | file created with attacker text                          |
 
 RCE mechanism:
 
@@ -6237,7 +6237,7 @@ Blocking plan:
   were already blocked for data-transformation abuse, while this turn targets
   codec-backed filesystem writes.
 - Add a CPython oracle regression for the simple `codecs.open(..., "w",
-  "utf-8")` plus `StreamReaderWriter.write()` arbitrary-write payload. The
+"utf-8")` plus `StreamReaderWriter.write()` arbitrary-write payload. The
   constructor-only control is now malicious because opening a write-mode codec
   stream creates attacker-selected files as a side effect.
 - Add a focused fragmented `.pth` regression. The test verifies the scanner
@@ -6260,7 +6260,7 @@ assemble the executable startup-hook line at write time.
 Candidate payload:
 
 - Call `tempfile.NamedTemporaryFile("w", -1, None, "", ".pth", "ma_csv_",
-  target_dir, False)` during unpickling. This creates a random `.pth` file
+target_dir, False)` during unpickling. This creates a random `.pth` file
   under an attacker-selected directory and keeps it after close.
 - Build a CSV dialect class with `builtins.type`. The dialect uses
   `quoting=csv.QUOTE_NONE`, an escape character, and a custom
@@ -6541,12 +6541,12 @@ Proof on CPython 3.12.12:
 
 Sibling dispatch proof:
 
-| Helper sequence | Scanner verdict | Runtime result |
-| --- | --- | --- |
-| `mailbox.mbox(path)` plus `mailbox.mbox.add/flush/close` | clean, 0 findings, 0 notices | `.pth` body executes and writes `owned-by-mailbox-mbox` |
-| `mailbox.MMDF(path)` plus `mailbox.MMDF.add/flush/close` | clean, 0 findings, 0 notices | `.pth` body executes and writes `owned-by-mailbox-mmdf` |
-| `mailbox.Babyl(path)` plus `mailbox.Babyl.add/flush/close` | clean, 0 findings, 0 notices | `.pth` body executes and writes `owned-by-mailbox-babyl` |
-| `mailbox.mbox(path)` plus `mailbox._singlefileMailbox.add/flush/close` | clean, 0 findings, 0 notices | `.pth` body executes and writes `owned-by-mailbox-base` |
+| Helper sequence                                                        | Scanner verdict              | Runtime result                                           |
+| ---------------------------------------------------------------------- | ---------------------------- | -------------------------------------------------------- |
+| `mailbox.mbox(path)` plus `mailbox.mbox.add/flush/close`               | clean, 0 findings, 0 notices | `.pth` body executes and writes `owned-by-mailbox-mbox`  |
+| `mailbox.MMDF(path)` plus `mailbox.MMDF.add/flush/close`               | clean, 0 findings, 0 notices | `.pth` body executes and writes `owned-by-mailbox-mmdf`  |
+| `mailbox.Babyl(path)` plus `mailbox.Babyl.add/flush/close`             | clean, 0 findings, 0 notices | `.pth` body executes and writes `owned-by-mailbox-babyl` |
+| `mailbox.mbox(path)` plus `mailbox._singlefileMailbox.add/flush/close` | clean, 0 findings, 0 notices | `.pth` body executes and writes `owned-by-mailbox-base`  |
 
 RCE mechanism:
 
@@ -6610,7 +6610,7 @@ Candidate payload:
 - Call `_tkinter.TkappType.eval(interp, script)` with a Tcl script such as
   `exec /bin/sh -c {printf owned-by-tcl-eval > /tmp/.../eval_marker}`.
 - Sibling form: call `_tkinter.TkappType.call(interp, "exec", "/bin/sh",
-  "-c", "printf owned-by-tcl-call > /tmp/.../call_marker")`.
+"-c", "printf owned-by-tcl-call > /tmp/.../call_marker")`.
 - No pickle global references `os`, `subprocess`, `sys`, `runpy`, `importlib`,
   `builtins.exec`, or `builtins.eval`.
 - The strings contain Tcl command words, not Python-shaped `exec(...)`,
@@ -7181,9 +7181,9 @@ Proof on CPython 3.12.12 with NumPy 2.4.4:
 
 Sibling alias proof:
 
-| Writer global | Scanner verdict | Runtime result |
-| --- | --- | --- |
-| `numpy.savetxt` | clean, 0 findings, 0 notices | `.pth` line executes and writes `owned-by-numpy-savetxt-alias` |
+| Writer global                   | Scanner verdict              | Runtime result                                                 |
+| ------------------------------- | ---------------------------- | -------------------------------------------------------------- |
+| `numpy.savetxt`                 | clean, 0 findings, 0 notices | `.pth` line executes and writes `owned-by-numpy-savetxt-alias` |
 | `numpy.lib._npyio_impl.savetxt` | clean, 0 findings, 0 notices | `.pth` line executes and writes `owned-by-numpy-savetxt-alias` |
 
 RCE mechanism:
@@ -7276,10 +7276,10 @@ Proof on CPython 3.12.12 with PyYAML 6.0.3:
 
 Generator variants also bypass when the pickle forces iteration:
 
-| Loader global | Forcing global | Scanner verdict | Runtime result |
-| --- | --- | --- | --- |
-| `yaml.unsafe_load_all` | `builtins.tuple` | clean, 0 findings, 0 notices | tuple consumption executes and writes `owned-by-yaml-load-all` |
-| `yaml.load_all` + `yaml.Loader` | `builtins.tuple` | clean, 0 findings, 0 notices | tuple consumption executes and writes `owned-by-yaml-load-all` |
+| Loader global                          | Forcing global   | Scanner verdict              | Runtime result                                                 |
+| -------------------------------------- | ---------------- | ---------------------------- | -------------------------------------------------------------- |
+| `yaml.unsafe_load_all`                 | `builtins.tuple` | clean, 0 findings, 0 notices | tuple consumption executes and writes `owned-by-yaml-load-all` |
+| `yaml.load_all` + `yaml.Loader`        | `builtins.tuple` | clean, 0 findings, 0 notices | tuple consumption executes and writes `owned-by-yaml-load-all` |
 | `yaml.load_all` + `yaml.CUnsafeLoader` | `builtins.tuple` | clean, 0 findings, 0 notices | tuple consumption executes and writes `owned-by-yaml-load-all` |
 
 Why the scanner missed it:
@@ -7369,11 +7369,11 @@ Proof on CPython 3.12.12 with `python-dotenv` installed:
 
 Sibling alias proof:
 
-| Writer global | Scanner verdict | Runtime result |
-| --- | --- | --- |
-| `dotenv.set_key` | clean, 0 findings, 0 notices | `.pth` line executes and writes `owned-by-dotenv-alias` |
+| Writer global         | Scanner verdict              | Runtime result                                          |
+| --------------------- | ---------------------------- | ------------------------------------------------------- |
+| `dotenv.set_key`      | clean, 0 findings, 0 notices | `.pth` line executes and writes `owned-by-dotenv-alias` |
 | `dotenv.main.set_key` | clean, 0 findings, 0 notices | `.pth` line executes and writes `owned-by-dotenv-alias` |
-| `dotenv.cli.set_key` | clean, 0 findings, 0 notices | `.pth` line executes and writes `owned-by-dotenv-alias` |
+| `dotenv.cli.set_key`  | clean, 0 findings, 0 notices | `.pth` line executes and writes `owned-by-dotenv-alias` |
 
 Why the scanner missed it:
 
@@ -7537,9 +7537,9 @@ Proof on CPython 3.12.12 with Click installed:
 
 Sibling alias proof:
 
-| Writer globals | Scanner verdict | Runtime result |
-| --- | --- | --- |
-| `click.open_file` + `click.echo` | clean, 0 findings, 0 notices | `.pth` line executes and writes `owned-by-click` |
+| Writer globals                               | Scanner verdict              | Runtime result                                   |
+| -------------------------------------------- | ---------------------------- | ------------------------------------------------ |
+| `click.open_file` + `click.echo`             | clean, 0 findings, 0 notices | `.pth` line executes and writes `owned-by-click` |
 | `click.utils.open_file` + `click.utils.echo` | clean, 0 findings, 0 notices | `.pth` line executes and writes `owned-by-click` |
 
 Why the scanner missed it:
@@ -7656,7 +7656,7 @@ Blocking plan:
   `__init__`.
 - Resolve simple `self.method()` / `cls.method()` calls inside class methods
   back to the local class method, so `LazyFile.__getattr__ -> LazyFile.open ->
-  click._compat.open_stream -> builtins.open` becomes visible to the same
+click._compat.open_stream -> builtins.open` becomes visible to the same
   source-role detector added in Turn 134.
 - Keep the existing import-reference cap, source-size cap, graph-depth cap,
   visited-function cap, per-function call cap, and AST module caches.
@@ -8259,7 +8259,7 @@ Blocking plan:
   field expressions and can return arbitrary recovered objects for later
   invocation.
 - Add Rust unit coverage for `global_severity("string",
-  "Formatter.get_field")`.
+"Formatter.get_field")`.
 - Add a CPython oracle regression for the Turn 147 payload. The control payload
   only assembles the eval code string and remains clean; the active payload
   uses `string.Formatter.get_field` to recover `eval`, is flagged as malicious,
@@ -8357,7 +8357,7 @@ Blocking plan:
   name, so attacker-controlled target strings can recover blocked objects later
   in the pickle stream.
 - Add Rust unit coverage for `global_severity("unittest.mock",
-  "_get_target")`.
+"_get_target")`.
 - Add a CPython oracle regression for the Turn 149 payload. The control payload
   only assembles the eval code string and remains clean; the active payload
   uses `_get_target` to recover `eval` via a resolver partial, is flagged as
@@ -8941,7 +8941,7 @@ Why the scanner missed it:
 
 - `inspect.currentframe` is not in the dangerous global policy table and the
   `inspect` module is not wildcard-blocked.
-- The descriptor policy blocks descriptor *type* binders such as
+- The descriptor policy blocks descriptor _type_ binders such as
   `types.GetSetDescriptorType.__get__`, but not concrete bound descriptor
   methods such as `types.FrameType.f_builtins.__get__` and
   `types.FrameType.f_globals.__get__`.
@@ -9389,7 +9389,7 @@ Proof on CPython 3.12.12 with `_tkinter` available:
 - Active runtime after unpickle: marker exists and contains
   `owned-by-tkinter-misc-unbind`; `pickle.loads(active)` returns `None`.
 - Sibling proof: `tkinter.Misc._getconfigure(tcl, "exec", "/bin/sh", "-c",
-  command)` also scans clean (`len=218`, no findings) and creates a marker
+command)` also scans clean (`len=218`, no findings) and creates a marker
   containing `owned-by-tkinter-misc-getconfigure`.
 
 Why the scanner missed it:
@@ -9474,7 +9474,7 @@ Proof on CPython 3.12.12:
 - Recorded calls for `sysexec` include bare `Popen`, not
   `subprocess.Popen`:
   `("popen_opts.pop", "popen_opts.pop", "Popen", "proc.communicate",
-  "proc.wait", ...)`.
+"proc.wait", ...)`.
 - Control payload scanner result: `len=45`, `status=complete`,
   `verdict=clean`, `findings=[]`, `notices=[]`.
 - Control runtime: `pickle.loads(control)` returns a
@@ -9797,7 +9797,7 @@ Performance sanity:
 - `_analyze_module("tkinter")`: `0.0473s`.
 - `_find_sink_path("click.edit")`: `0.0532s`, path
   `click.edit -> click._termui_impl.Editor.edit ->
-  click._termui_impl.Editor.edit_files -> subprocess.Popen`.
+click._termui_impl.Editor.edit_files -> subprocess.Popen`.
 - `_find_sink_path("execnet.makegateway")`: `0.0372s`, still reaches
   `execmodel.subprocess.Popen`.
 - The logging startup-hook adversarial slice passed in `0.24s` after keeping the
@@ -9818,7 +9818,7 @@ Malicious pickle shape:
   `printf owned-by-six-moves-getoutput > /tmp/modelaudit_six_moves_six_moves_getoutput`.
 - Runtime resolution returns `subprocess.getoutput`, which calls
   `subprocess.getstatusoutput`, which calls `subprocess.check_output(...,
-  shell=True, ...)`.
+shell=True, ...)`.
 
 Proof on CPython 3.12.12 with `six==1.17.0` installed:
 
@@ -9829,7 +9829,7 @@ Proof on CPython 3.12.12 with `six==1.17.0` installed:
 - `_call_graph_entrypoints("six.moves.getoutput") == ()`.
 - `_find_sink_path("six.moves.getoutput") is None`.
 - `_call_graph_entrypoints("subprocess.getoutput") ==
-  ("subprocess.getoutput",)`.
+("subprocess.getoutput",)`.
 - `_find_sink_path("subprocess.getoutput")` reaches
   `subprocess.getstatusoutput` and `subprocess.check_output`.
 - Direct `subprocess.getoutput` pickle scans `malicious` with
@@ -9902,7 +9902,7 @@ Performance sanity:
 
 - `_find_sink_path("six.moves.getoutput")`: `0.0109s`, path
   `six.moves.getoutput -> subprocess.getstatusoutput ->
-  subprocess.check_output`.
+subprocess.check_output`.
 - `_find_sink_path("subprocess.getoutput")`: effectively `0.0000s` after the
   subprocess module analysis cache is warm.
 - Existing wrapper timings stayed in the same range:
@@ -9920,7 +9920,7 @@ Malicious pickle shape:
   `printf owned-by-botocore-vendored-six-moves-getoutput > MARKER`.
 - Runtime resolution returns `subprocess.getoutput`, which calls
   `subprocess.getstatusoutput`, which calls `subprocess.check_output(...,
-  shell=True, ...)`.
+shell=True, ...)`.
 
 Both pickle spellings work:
 
@@ -10010,11 +10010,11 @@ Performance sanity:
 
 - `_find_sink_path("six.moves.getoutput")`: `0.0105s`, path
   `six.moves.getoutput -> subprocess.getstatusoutput ->
-  subprocess.check_output`.
+subprocess.check_output`.
 - `_find_sink_path("botocore.vendored.six.moves.getoutput")`: effectively
   `0.0000s` after the subprocess module analysis cache is warm, path
   `botocore.vendored.six.moves.getoutput ->
-  subprocess.getstatusoutput -> subprocess.check_output`.
+subprocess.getstatusoutput -> subprocess.check_output`.
 - Existing wrapper timings stayed in the same range:
   `click.edit` at `0.0489s` and `execnet.makegateway` at `0.0409s`.
 
@@ -11436,7 +11436,7 @@ Why the scanner missed it:
   unresolved qualified name is a simple module attribute. It does not split a
   dotted pickle global and apply the fallback to the first missing segment.
 - The resolver can already see `pydantic._os -> pydantic.__getattr__ ->
-  importlib.import_module`, but it does not connect that intermediate result
+importlib.import_module`, but it does not connect that intermediate result
   to the remaining `.system` suffix.
 - `SETITEM` registry mutation again turns an otherwise clean lazy-import path
   into a dangerous object graph at unpickle time.
@@ -12574,7 +12574,7 @@ Why it bypasses:
 Likely source-level defense:
 
 - In `_calls_in_function`, recognize assignments where `getattr(obj, dynamic,
-  default)` has a resolvable callable default and the assigned name is later
+default)` has a resolvable callable default and the assigned name is later
   called.
 - Add the resolved default callable as a call edge when the default expression
   is a local class/member alias such as `cls.from_subprocess`.
@@ -13500,7 +13500,7 @@ Validation:
 - Focused import/call-graph regression file: `21 passed in 0.92s`.
 - Focused call-graph suite: `59 passed in 2.70s`.
 - Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
-  1.31s`.
+1.31s`.
 - `ruff format`: `392 files left unchanged`.
 - `ruff check --fix`: `All checks passed!`.
 - `mypy`: `Success: no issues found in 447 source files`.
@@ -13716,7 +13716,7 @@ Validation:
 - Focused import/call-graph regression file: `22 passed in 0.99s`.
 - Focused call-graph suite: `60 passed in 2.83s`.
 - Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
-  1.48s`.
+1.48s`.
 - `ruff format`: `392 files left unchanged`.
 - `ruff check --fix`: `All checks passed!`.
 - `mypy`: `Success: no issues found in 447 source files`.
@@ -13927,7 +13927,7 @@ Validation:
 - Focused import/call-graph regression file: `23 passed in 0.98s`.
 - Focused call-graph suite: `61 passed in 2.79s`.
 - Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
-  1.35s`.
+1.35s`.
 - `ruff format`: `392 files left unchanged`.
 - `ruff check --fix`: `All checks passed!`.
 - `mypy`: `Success: no issues found in 447 source files`.
@@ -14125,7 +14125,7 @@ Validation:
 - Focused import/call-graph regression file: `25 passed in 0.99s`.
 - Focused call-graph suite: `63 passed in 2.56s`.
 - Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
-  0.60s`.
+0.60s`.
 - `ruff format`: `392 files left unchanged`.
 - `ruff check --fix`: `All checks passed!`.
 - `mypy`: `Success: no issues found in 447 source files`.
@@ -14316,7 +14316,7 @@ Validation:
 - Focused import/call-graph regression file: `26 passed in 1.03s`.
 - Focused call-graph suite: `64 passed in 2.92s`.
 - Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
-  1.35s`.
+1.35s`.
 - `ruff format`: `392 files left unchanged`.
 - `ruff check --fix`: `All checks passed!`.
 - `mypy`: `Success: no issues found in 447 source files`.
@@ -14417,7 +14417,7 @@ Why it bypasses:
 - Native policy marks `string.Formatter.get_field` as dangerous, but
   `string.Formatter.vformat` is not a policy hit.
 - The Python call graph sees `Formatter.vformat -> Formatter._vformat ->
-  Formatter.get_field -> Formatter.get_value`, but this is not itself an RCE
+Formatter.get_field -> Formatter.get_value`, but this is not itself an RCE
   sink because the dangerous behavior depends on the attacker-controlled
   `kwargs` mapping object.
 - The native stack model already remembers `defaultdict(default_factory)`, but
@@ -14526,7 +14526,7 @@ Validation:
 - Focused import/call-graph regression file: `27 passed in 1.06s`.
 - Focused call-graph suite: `65 passed in 2.91s`.
 - Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
-  1.48s`.
+1.48s`.
 - `ruff format`: `392 files left unchanged`.
 - `ruff check --fix`: `All checks passed!`.
 - `mypy`: `Success: no issues found in 447 source files`.
@@ -14642,7 +14642,7 @@ Likely source-level defense:
 
 - Extend the Turn 238 formatter mapping-dispatch helper to also cover
   `string.Formatter._vformat(self, format_string, args, kwargs, used_args,
-  recursion_depth[, auto_arg_index])`.
+recursion_depth[, auto_arg_index])`.
 - For the current tracked source, if argument 2 is string-like and argument 4 is
   `StackValue::DefaultDict { default_factory }`, emit a zero-argument
   invocation of the factory.
@@ -14734,7 +14734,7 @@ Validation:
 - Focused import/call-graph regression file: `28 passed in 1.09s`.
 - Focused call-graph suite: `66 passed in 2.90s`.
 - Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
-  1.36s`.
+1.36s`.
 - `ruff format`: `392 files left unchanged`.
 - `ruff check --fix`: `All checks passed!`.
 - `mypy`: `Success: no issues found in 447 source files`.
@@ -14919,7 +14919,7 @@ Validation:
 - Focused import/call-graph regression file: `29 passed in 1.15s`.
 - Focused call-graph suite: `67 passed in 3.04s`.
 - Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
-  1.45s`.
+1.45s`.
 - `ruff format`: `392 files left unchanged`.
 - `ruff check --fix`: `All checks passed!`.
 - `mypy`: `Success: no issues found in 447 source files`.
@@ -15095,7 +15095,7 @@ Validation:
 - Focused import/call-graph regression file: `31 passed in 1.16s`.
 - Focused call-graph suite: `69 passed in 3.15s`.
 - Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
-  1.32s`.
+1.32s`.
 - `ruff format`: `392 files left unchanged`.
 - `ruff check --fix`: `All checks passed!`.
 - `mypy`: `Success: no issues found in 447 source files`.
@@ -15284,7 +15284,7 @@ Validation:
 - Focused import/call-graph regression file: `33 passed in 1.19s`.
 - Focused call-graph suite: `71 passed in 2.88s`.
 - Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
-  0.66s`.
+0.66s`.
 - `ruff format`: `1 file reformatted, 391 files left unchanged`.
 - `ruff check --fix`: `All checks passed!`.
 - `mypy`: `Success: no issues found in 447 source files`.
@@ -15472,7 +15472,7 @@ Validation:
 - Focused import/call-graph regression file: `40 passed in 1.37s`.
 - Focused call-graph suite: `78 passed in 3.30s`.
 - Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
-  1.32s`.
+1.32s`.
 - `ruff format`: `392 files left unchanged`.
 - `ruff check --fix`: `All checks passed!`.
 - `mypy`: `Success: no issues found in 447 source files`.
@@ -15697,7 +15697,7 @@ Validation:
 - Focused import/call-graph regression file: `44 passed in 1.46s`.
 - Focused call-graph suite: `82 passed in 3.06s`.
 - Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
-  0.67s`.
+0.67s`.
 - `ruff format`: `392 files left unchanged`.
 - `ruff check --fix`: `All checks passed!`.
 - `mypy`: `Success: no issues found in 447 source files`.
@@ -15921,7 +15921,7 @@ Validation:
 - Focused import/call-graph regression file: `49 passed in 1.68s`.
 - Focused call-graph suite: `87 passed in 3.60s`.
 - Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
-  1.34s`.
+1.34s`.
 - `ruff format`: `392 files left unchanged`.
 - `ruff check --fix`: `All checks passed!`.
 - `mypy`: `Success: no issues found in 447 source files`.
@@ -16117,7 +16117,7 @@ Validation:
 - Focused import/call-graph regression file: `52 passed in 1.86s`.
 - Focused call-graph suite: `90 passed in 3.56s`.
 - Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
-  1.41s`.
+1.41s`.
 - `ruff format`: `392 files left unchanged`.
 - `ruff check --fix`: `All checks passed!`.
 - `mypy`: `Success: no issues found in 447 source files`.
@@ -16825,8 +16825,7 @@ Validation:
 
 ## Turn 261 - Bypass via weakref and user mapping materializers
 
-Found another scanner-clean RCE-capable materializer family adjacent to Turn
-259. These clean constructors also consume arbitrary iterables during
+Found another scanner-clean RCE-capable materializer family adjacent to Turn 259. These clean constructors also consume arbitrary iterables during
 construction, but were not included in the previous source-model fix.
 
 The smallest representative is:
@@ -18821,7 +18820,7 @@ Likely source-level defense:
 - Add arity-aware entries for `heapq.nlargest(n, iterable)` and
   `heapq.nsmallest(n, iterable)`, where the consumed iterator is argument 1.
 - Keep this as a reducer-local table with `(module, name, arity,
-  consumed_argument_index)` rather than adding policy entries for every
+consumed_argument_index)` rather than adding policy entries for every
   aggregator package. This matches the finite call-graph source and keeps the
   hot path bounded.
 
@@ -19025,7 +19024,7 @@ Simplification note:
 
 - This is a different call-graph shape than eager iterable consumption:
   `(module, function, arity, callback_arg_index, callback_arg_count,
-  non_empty_iterable_arg_index)`.
+non_empty_iterable_arg_index)`.
 - A small exact callback-dispatch table can keep these finite callback surfaces
   out of package-wide policy blocks while preserving performance.
 
@@ -19061,7 +19060,7 @@ Implementation note:
 
 - Added `EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS`, a compact
   `(module, name, arity, callback_arg_index, callback_arg_count,
-  non_empty_iterable_arg_index)` table.
+non_empty_iterable_arg_index)` table.
 - Added `callback_dispatch_invocations(...)` alongside existing protocol,
   call-iterator, and defaultdict factory hidden-invocation modeling.
 - The first entries are `heapq.nlargest` and `heapq.nsmallest` with arity 3,
@@ -19242,7 +19241,7 @@ Simplification note:
 
 - This is a third finite call-graph shape:
   `(module, function, arity, callback_arg_index, callback_arg_count,
-  returns_lazy_iterable)`.
+returns_lazy_iterable)`.
 - If represented as a small exact table feeding the existing call-iterator stack
   value, tokenizer callbacks can share all existing consumer logic.
 
@@ -19414,7 +19413,7 @@ Likely source-level defense:
 
 - Extend callback-dispatch modeling with `re.sub` and `re.subn` rows:
   `(module, function, arity, callback_arg_index, callback_arg_count,
-  match_guard)`.
+match_guard)`.
 - For precision, gate the synthetic invocation on a callable replacement and a
   statically evident match when both pattern and input are literal strings or
   bytes.

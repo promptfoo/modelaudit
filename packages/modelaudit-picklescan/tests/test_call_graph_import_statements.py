@@ -858,6 +858,8 @@ def test_call_graph_models_getattr_default_callable_fallbacks() -> None:
 
 
 def test_call_graph_models_version_gated_typing_extensions_definitions() -> None:
+    pytest.importorskip("typing_extensions")
+
     function_name = "typing_extensions.get_type_hints"
     calls = _calls_for_function(function_name) or ()
     path = _find_sink_path(function_name)
@@ -5591,6 +5593,8 @@ if marker.read_text() != marker_content:
 
 
 def test_scan_bytes_blocks_typing_extensions_get_type_hints_annotation_rce(tmp_path: Path) -> None:
+    pytest.importorskip("typing_extensions")
+
     marker = tmp_path / "typing_extensions_marker"
     marker_content = "typing-ext-owned"
     payload = _typing_extensions_get_type_hints_payload(marker)
