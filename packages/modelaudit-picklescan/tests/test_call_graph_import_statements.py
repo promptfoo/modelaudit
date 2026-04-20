@@ -527,6 +527,17 @@ def _builtins_help_weakref_callback_payload(name: str, *, with_callback: bool = 
     return _global_call_payload("weakref", name, *arguments)
 
 
+def _builtins_help_weakmethod_callback_payload(*, with_callback: bool = True) -> bytes:
+    instance = _global_operand("collections", "UserList") + _args_tuple() + b"R"
+    bound_method = (
+        _global_operand("collections", "UserList.append.__get__")
+        + _args_tuple(instance, _global_operand("collections", "UserList"))
+        + b"R"
+    )
+    arguments = (bound_method, _global_operand("builtins", "help")) if with_callback else (bound_method,)
+    return _global_call_payload("weakref", "WeakMethod", *arguments)
+
+
 def _builtins_help_tokenize_readline_payload(name: str, *, consume: bool) -> bytes:
     parts = [
         b"\x80\x04",
@@ -4481,6 +4492,88 @@ def test_scan_bytes_keeps_weakref_without_callback_clean(name: str) -> None:
     payload = _builtins_help_weakref_callback_payload(name, with_callback=False)
 
     report = scan_bytes(payload, source=f"weakref-{name}-no-callback.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 1
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+
+def test_scan_bytes_blocks_weakmethod_lifetime_callback_rce(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "weakmethod_callback_marker"
+    marker_content = "pydoc-owned-by-weakmethod"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'OWNED'\n",
+        encoding="utf-8",
+    )
+    payload = _builtins_help_weakmethod_callback_payload()
+
+    report = scan_bytes(payload, source="weakmethod-callback-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 1
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if type(result).__name__ != "WeakMethod":
+    raise SystemExit(f"unexpected result {result!r}")
+if result() is not None:
+    raise SystemExit("weak method unexpectedly stayed alive")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+def test_scan_bytes_keeps_weakmethod_without_callback_clean() -> None:
+    payload = _builtins_help_weakmethod_callback_payload(with_callback=False)
+
+    report = scan_bytes(payload, source="weakmethod-no-callback.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
     assert not any(

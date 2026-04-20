@@ -138,6 +138,14 @@ const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(
     ("weakref", "ref", 2, 1, 1, CallbackDispatchGuard::Always),
     ("weakref", "proxy", 2, 1, 1, CallbackDispatchGuard::Always),
     (
+        "weakref",
+        "WeakMethod",
+        2,
+        1,
+        1,
+        CallbackDispatchGuard::Always,
+    ),
+    (
         "re",
         "sub",
         4,

