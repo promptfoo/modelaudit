@@ -1006,6 +1006,26 @@ def _numpy_savetxt_pth_payload(pth_path: Path, marker: Path, *, writer_module: s
     return b"".join(parts)
 
 
+def _dotenv_set_key_pth_payload(pth_path: Path, marker: Path, *, writer_module: str, include_write: bool) -> bytes:
+    fragments = [
+        "im",
+        "port pathlib;pathlib.Path(",
+        repr(str(marker)),
+        ").write_text('owned-by-dotenv')#",
+    ]
+    parts = [b"\x80\x04"]
+    parts += [_global_operand("builtins", "str.join")]
+    parts += [_text_operand(""), _tuple_payload_operands([_text_operand(fragment) for fragment in fragments])]
+    parts += [b"\x86R\x94"]
+    if include_write:
+        parts += [_global_operand(writer_module, "set_key")]
+        parts += [_tuple_payload_operands([_text_operand(str(pth_path)), b"h\x00", _text_operand("x")]), b"R"]
+    else:
+        parts += [b"h\x00"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
 def _pyyaml_unsafe_document(marker: Path, marker_content: str) -> str:
     source_tail = f"port pathlib\npathlib.Path({str(marker)!r}).write_text({marker_content!r})"
     return (
@@ -2733,6 +2753,70 @@ def test_scan_bytes_blocks_numpy_savetxt_fragmented_pth_rce(tmp_path: Path, writ
 
         site.addsitedir(str(tmp_path))
         assert marker.read_text() == "owned-by-numpy-savetxt"
+    finally:
+        sys.path[:] = original_sys_path
+
+
+@pytest.mark.skipif(not _module_available("dotenv"), reason="python-dotenv is unavailable")
+@pytest.mark.parametrize(
+    "writer_module",
+    [
+        "dotenv",
+        "dotenv.main",
+        pytest.param(
+            "dotenv.cli",
+            marks=pytest.mark.skipif(not _module_available("dotenv.cli"), reason="dotenv.cli is unavailable"),
+        ),
+    ],
+)
+def test_scan_bytes_blocks_dotenv_set_key_fragmented_pth_rce(tmp_path: Path, writer_module: str) -> None:
+    case_name = writer_module.replace(".", "_")
+    pth_path = tmp_path / f"{case_name}_set_key_exec.pth"
+    marker = tmp_path / f"{case_name}_set_key_marker"
+    control_payload = _dotenv_set_key_pth_payload(
+        pth_path,
+        marker,
+        writer_module=writer_module,
+        include_write=False,
+    )
+    payload = _dotenv_set_key_pth_payload(
+        pth_path,
+        marker,
+        writer_module=writer_module,
+        include_write=True,
+    )
+    original_sys_path = list(sys.path)
+    expected_line = f"import pathlib;pathlib.Path({str(marker)!r}).write_text('owned-by-dotenv')#"
+
+    try:
+        control_report = scan_bytes(control_payload, source=f"dotenv-set-key-{case_name}-control.pkl")
+        assert control_report.verdict == SafetyVerdict.CLEAN
+
+        assert not pth_path.exists()
+        assert not marker.exists()
+        control_result = pickle.loads(control_payload)
+        assert control_result == expected_line
+        assert not pth_path.exists()
+        assert not marker.exists()
+
+        site.addsitedir(str(tmp_path))
+        assert not marker.exists()
+        sys.path[:] = original_sys_path
+
+        report = scan_bytes(payload, source=f"dotenv-set-key-{case_name}-pth-rce.pkl")
+
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_global_finding(report, writer_module, "set_key")
+
+        assert not pth_path.exists()
+        assert not marker.exists()
+        result = pickle.loads(payload)
+        assert result == (True, expected_line, "x")
+        assert pth_path.read_text() == f"{expected_line}='x'\n"
+        assert not marker.exists()
+
+        site.addsitedir(str(tmp_path))
+        assert marker.read_text() == "owned-by-dotenv"
     finally:
         sys.path[:] = original_sys_path
 

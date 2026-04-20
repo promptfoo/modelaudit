@@ -218,6 +218,9 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("dill", "load_module_asdict"),
     ("dill", "load_session"),
     ("dill", "loads"),
+    ("dotenv", "set_key"),
+    ("dotenv.cli", "set_key"),
+    ("dotenv.main", "set_key"),
     ("faulthandler", "_fatal_error_c_thread"),
     ("faulthandler", "_read_null"),
     ("faulthandler", "_sigabrt"),
@@ -634,6 +637,10 @@ mod tests {
             global_severity("dataclasses", "_create_fn"),
             Some("critical")
         );
+        for module in ["dotenv", "dotenv.cli", "dotenv.main"] {
+            assert_eq!(global_severity(module, "set_key"), Some("critical"));
+            assert_eq!(global_severity(module, "unset_key"), None);
+        }
         assert_eq!(
             global_severity("tempfile", "NamedTemporaryFile"),
             Some("critical")

@@ -7320,3 +7320,92 @@ Blocking plan:
 Performance note: the block stays in the existing sorted exact-global table.
 It avoids YAML parsing, constructor simulation, string deobfuscation, loader
 argument tracking, or broad `yaml` wildcard blocking.
+
+## Turn 129 - Bypass via `python-dotenv` raw key startup-hook write
+
+Found a scanner-clean startup-hook RCE primitive using `python-dotenv`'s
+`set_key()` helper. The pickle uses `builtins.str.join` to assemble a `.pth`
+line only at runtime:
+
+```python
+import pathlib;pathlib.Path('/tmp/.../marker').write_text('owned-by-dotenv')#
+```
+
+It then calls `dotenv.set_key(target.pth, assembled_key, "x")`. `set_key()`
+writes dotenv keys verbatim, so the resulting `.pth` line is:
+
+```python
+import pathlib;pathlib.Path('/tmp/.../marker').write_text('owned-by-dotenv')#='x'
+```
+
+The `#` turns dotenv's appended assignment into a Python comment, and normal
+`site.addsitedir(target_dir)` executes the line.
+
+Proof on CPython 3.12.12 with `python-dotenv` installed:
+
+- Control scanner result: `len=170`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`, `errors=[]`.
+- Control coverage: `bytes_scanned=170`, `bytes_total=170`,
+  `opcode_count=16`, `raw_scan_complete=True`,
+  `opcode_scan_complete=True`.
+- Control import references: `builtins.str.join` with `is_dangerous=False`.
+- Control runtime: `pickle.loads(control)` returns the assembled `.pth` key;
+  no `.pth` file is created, and `site.addsitedir(target_dir)` does not create
+  the marker.
+- RCE scanner result for `dotenv.set_key`: `len=279`, `status=complete`,
+  `verdict=clean`, `is_clean=True`, `findings=[]`, `notices=[]`, `errors=[]`.
+- RCE coverage for `dotenv.set_key`: `bytes_scanned=279`,
+  `bytes_total=279`, `opcode_count=25`, `raw_scan_complete=True`,
+  `opcode_scan_complete=True`.
+- RCE import references for `dotenv.set_key`: `builtins.str.join` and
+  `dotenv.set_key`, both with `is_dangerous=False`.
+- RCE string heuristic matches for `dotenv.set_key`: none.
+- Before unpickle: no `.pth` file and no marker exists.
+- After `pickle.loads(payload)`: the `.pth` file exists and contains
+  `import pathlib;pathlib.Path('/tmp/.../marker').write_text('owned-by-dotenv')#='x'`;
+  the marker does not exist yet.
+- After normal `site.addsitedir(target_dir)`: the marker exists and contains
+  `owned-by-dotenv`.
+
+Sibling alias proof:
+
+| Writer global | Scanner verdict | Runtime result |
+| --- | --- | --- |
+| `dotenv.set_key` | clean, 0 findings, 0 notices | `.pth` line executes and writes `owned-by-dotenv-alias` |
+| `dotenv.main.set_key` | clean, 0 findings, 0 notices | `.pth` line executes and writes `owned-by-dotenv-alias` |
+| `dotenv.cli.set_key` | clean, 0 findings, 0 notices | `.pth` line executes and writes `owned-by-dotenv-alias` |
+
+Why the scanner missed it:
+
+- `dotenv` is not a wildcard-dangerous module.
+- None of `dotenv.set_key`, `dotenv.main.set_key`, or `dotenv.cli.set_key`
+  are exact dangerous globals.
+- The executable line is split into harmless-looking string fragments and
+  assembled by `builtins.str.join` only during unpickle.
+- The payload uses no blocked file APIs, no blocked `site` APIs, and no
+  suspicious magic-method names.
+- The payload has complete opcode coverage, no scan errors, no findings, no
+  notices, and no suspicious-string matches.
+
+Performance note: the focused next block should add exact dangerous-global
+entries for `dotenv.set_key`, `dotenv.main.set_key`, and `dotenv.cli.set_key`.
+This keeps detection to sorted-table lookups and avoids modeling dotenv syntax,
+key quoting, path targets, or broad `dotenv` wildcard blocking.
+
+## Turn 130 - Block `python-dotenv` raw key writer dispatch
+
+Blocking plan:
+
+- Add exact dangerous-global entries for `dotenv.set_key`,
+  `dotenv.main.set_key`, and `dotenv.cli.set_key`.
+- Add a CPython oracle regression for all three Turn 129 writer aliases. The
+  control payload only assembles the `.pth` key and remains clean; the active
+  payloads are malicious and still write executable `.pth` content that normal
+  `site.addsitedir()` runs.
+- Skip the regression when `python-dotenv` is unavailable, and skip the CLI
+  alias when `dotenv.cli` is not importable.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: three exact entries in the sorted policy table, with no
+dotenv syntax parsing, key quoting analysis, path modeling, or broad `dotenv`
+wildcard block.
