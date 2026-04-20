@@ -123,7 +123,10 @@ def test_call_graph_marks_parameter_controlled_tcl_dispatchers() -> None:
     unbind_path = _find_sink_path("tkinter.Misc._unbind")
     if unbind_path is not None:
         assert unbind_path == ("tkinter.Misc._unbind", "tkinter.Misc.tk.call")
-    assert _find_sink_path("tkinter.Misc._getconfigure") == (
+    getconfigure_path = _find_sink_path("tkinter.Misc._getconfigure")
+    if getconfigure_path is None and find_spec("_tkinter") is None:
+        pytest.skip("tkinter runtime/source is unavailable")
+    assert getconfigure_path == (
         "tkinter.Misc._getconfigure",
         "tkinter.Misc.tk.call",
     )
