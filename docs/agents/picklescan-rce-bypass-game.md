@@ -9907,3 +9907,113 @@ Performance sanity:
   subprocess module analysis cache is warm.
 - Existing wrapper timings stayed in the same range:
   `click.edit` at `0.0502s` and `execnet.makegateway` at `0.0426s`.
+
+## Turn 179 - Bypass via vendored `six.moves.getoutput`
+
+Found another scanner-clean RCE primitive through the same finite compatibility
+source, but hidden behind a vendored package path.
+
+Malicious pickle shape:
+
+- Import `botocore.vendored.six.moves.getoutput` with `STACK_GLOBAL`.
+- Call it with one attacker-controlled command string:
+  `printf owned-by-botocore-vendored-six-moves-getoutput > MARKER`.
+- Runtime resolution returns `subprocess.getoutput`, which calls
+  `subprocess.getstatusoutput`, which calls `subprocess.check_output(...,
+  shell=True, ...)`.
+
+Both pickle spellings work:
+
+- module/name `botocore.vendored.six.moves` / `getoutput`
+- module/name `botocore.vendored.six` / `moves.getoutput`
+
+Proof on CPython 3.12.12 with `botocore` installed:
+
+- `botocore.vendored.six.py` registers the alias as
+  `MovedAttribute("getoutput", "commands", "subprocess")`.
+- Runtime `botocore.vendored.six.moves.getoutput` resolves to
+  `<function getoutput>` with `__module__ == "subprocess"` and
+  `__name__ == "getoutput"`.
+- `_call_graph_entrypoints("botocore.vendored.six.moves.getoutput") == ()`.
+- `_find_sink_path("botocore.vendored.six.moves.getoutput") is None`.
+- Payload A scanner result: `len=158`, `status=complete`, `verdict=clean`,
+  `findings=[]`, `notices=[]`.
+- Payload A import reference:
+  `botocore.vendored.six.moves.getoutput` with `is_dangerous=False`.
+- Runtime before unpickle: marker absent.
+- Runtime after unpickle: marker exists and contains
+  `owned-by-botocore-vendored-six-moves-getoutput`;
+  `pickle.loads(payload)` returns `""`.
+- Payload B with module/name `botocore.vendored.six` / `moves.getoutput`
+  produced the same clean scan and marker write.
+- Control after Turn 178: top-level `six.moves.getoutput` now scans
+  `malicious` with `DANGEROUS_CALL_GRAPH`, proving this is an alias-family gap
+  rather than a missing lower-level primitive.
+
+Why the scanner missed it:
+
+- Turn 178 added one exact static alias:
+  `six.moves.getoutput -> subprocess.getoutput`.
+- Vendored `six` copies expose the same `_MovedItems` lazy module shape under
+  package-prefixed names, so the literal pickle global no longer matches the
+  exact alias key.
+- The call graph can find the source file for `botocore.vendored.six`, but the
+  import reference is a lazy synthetic submodule/attribute path. It does not
+  parse `_moved_attributes`, and it does not normalize package-prefixed
+  `*.six.moves.getoutput` aliases.
+
+Performance note: the next defensive turn should generalize the finite alias
+source without runtime imports. A suffix-normalized static rule for
+`.six.moves.getoutput`, or a bounded parser for `six.py`-style
+`MovedAttribute("getoutput", ..., "subprocess")`, would catch vendored copies
+while avoiding broad graph expansion. The direct normalized target should remain
+`subprocess.getoutput`, so the existing sink path and cache behavior are reused.
+
+## Turn 180 - Block vendored `six.moves.getoutput` aliases
+
+Implemented a focused generalization of the Turn 178 static alias block.
+
+The call graph now treats `six.moves.getoutput` as a static alias suffix:
+
+- `six.moves.getoutput -> subprocess.getoutput`
+- `*.six.moves.getoutput -> subprocess.getoutput`
+
+The suffix check requires a dotted package boundary, so a name like
+`notsix.moves.getoutput` is not normalized. This catches vendored compatibility
+copies such as `botocore.vendored.six.moves.getoutput` without importing
+arbitrary packages, inspecting live objects, or widening graph traversal.
+
+Regression coverage updated in
+`packages/modelaudit-picklescan/tests/test_call_graph_six.py`:
+
+- `_call_graph_entrypoints("botocore.vendored.six.moves.getoutput")` now
+  resolves to `subprocess.getoutput`.
+- `_find_sink_path("botocore.vendored.six.moves.getoutput")` now reaches
+  `subprocess.getstatusoutput` and `subprocess.check_output`.
+- Both vendored pickle spellings now scan `malicious` with
+  `DANGEROUS_CALL_GRAPH`:
+  module/name `botocore.vendored.six.moves`/`getoutput` and
+  `botocore.vendored.six`/`moves.getoutput`.
+- The test still proves the marker write when `botocore.vendored.six` is
+  installed; the scanner assertion does not depend on importing botocore.
+
+Focused validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_call_graph_six.py`
+  passed: `6 passed`.
+- `ruff format`, `ruff check --fix`, and `mypy` passed on the standard
+  ModelAudit paths.
+- Full non-slow/non-integration validation passed:
+  `3681 passed, 1022 skipped, 21 warnings in 48.76s`.
+
+Performance sanity:
+
+- `_find_sink_path("six.moves.getoutput")`: `0.0105s`, path
+  `six.moves.getoutput -> subprocess.getstatusoutput ->
+  subprocess.check_output`.
+- `_find_sink_path("botocore.vendored.six.moves.getoutput")`: effectively
+  `0.0000s` after the subprocess module analysis cache is warm, path
+  `botocore.vendored.six.moves.getoutput ->
+  subprocess.getstatusoutput -> subprocess.check_output`.
+- Existing wrapper timings stayed in the same range:
+  `click.edit` at `0.0489s` and `execnet.makegateway` at `0.0409s`.

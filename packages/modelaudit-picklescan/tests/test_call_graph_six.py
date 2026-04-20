@@ -14,13 +14,21 @@ from modelaudit_picklescan import PickleReport, SafetyVerdict, Severity, scan_by
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
 from modelaudit_picklescan.call_graph import _call_graph_entrypoints, _find_sink_path
 
+
+def _has_module(module: str) -> bool:
+    try:
+        return find_spec(module) is not None
+    except ModuleNotFoundError:
+        return False
+
+
 pytestmark = [
     pytest.mark.skipif(
-        find_spec(_RUST_EXTENSION_MODULE) is None,
+        not _has_module(_RUST_EXTENSION_MODULE),
         reason="Rust picklescan extension is not built",
     ),
     pytest.mark.skipif(
-        find_spec("six") is None,
+        not _has_module("six"),
         reason="six is unavailable",
     ),
 ]
@@ -80,10 +88,17 @@ def _has_critical_call_graph_finding(report: PickleReport, module: str, name: st
     )
 
 
-def test_call_graph_resolves_six_moves_getoutput_alias() -> None:
-    assert _call_graph_entrypoints("six.moves.getoutput") == ("subprocess.getoutput",)
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "six.moves.getoutput",
+        "botocore.vendored.six.moves.getoutput",
+    ],
+)
+def test_call_graph_resolves_six_moves_getoutput_alias(reference: str) -> None:
+    assert _call_graph_entrypoints(reference) == ("subprocess.getoutput",)
 
-    path = _find_sink_path("six.moves.getoutput")
+    path = _find_sink_path(reference)
     assert path is not None
     assert path[-2:] == ("subprocess.getstatusoutput", "subprocess.check_output")
 
@@ -93,6 +108,8 @@ def test_call_graph_resolves_six_moves_getoutput_alias() -> None:
     [
         ("six.moves", "getoutput"),
         ("six", "moves.getoutput"),
+        ("botocore.vendored.six.moves", "getoutput"),
+        ("botocore.vendored.six", "moves.getoutput"),
     ],
 )
 @pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
@@ -112,6 +129,9 @@ def test_scan_bytes_blocks_six_moves_getoutput_rce(module: str, name: str, tmp_p
     report = scan_bytes(payload, source="six-moves-getoutput-rce.pkl")
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_call_graph_finding(report, module, name, "subprocess.check_output")
+
+    if module.startswith("botocore.") and not _has_module("botocore.vendored.six"):
+        return
 
     assert not marker.exists()
     assert pickle.loads(payload) == ""

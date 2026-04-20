@@ -76,7 +76,7 @@ _SUBPROCESS_DISPATCH_SUFFIXES = (
     ".subprocess.check_output",
     ".subprocess.run",
 )
-_STATIC_IMPORT_REFERENCE_ALIASES = {
+_STATIC_IMPORT_REFERENCE_ALIAS_SUFFIXES = {
     "six.moves.getoutput": "subprocess.getoutput",
 }
 _SHORT_SINK_PRIORITY_TOKENS = (
@@ -361,7 +361,7 @@ def _call_graph_entrypoints(function_name: str) -> tuple[str, ...]:
 
 @lru_cache(maxsize=4096)
 def _resolve_function_target(function_name: str) -> str | None:
-    alias_target = _STATIC_IMPORT_REFERENCE_ALIASES.get(function_name)
+    alias_target = _static_import_reference_alias(function_name)
     if alias_target is not None and alias_target != function_name:
         return _resolve_function_target(alias_target)
 
@@ -378,6 +378,13 @@ def _resolve_function_target(function_name: str) -> str | None:
         alias_target = analysis.aliases.get(qualified_name)
         if alias_target is not None and alias_target != function_name:
             return _resolve_function_target(alias_target)
+    return None
+
+
+def _static_import_reference_alias(function_name: str) -> str | None:
+    for suffix, target in _STATIC_IMPORT_REFERENCE_ALIAS_SUFFIXES.items():
+        if function_name == suffix or function_name.endswith(f".{suffix}"):
+            return target
     return None
 
 
