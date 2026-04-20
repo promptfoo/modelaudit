@@ -1307,7 +1307,14 @@ impl<'a> ScanState<'a> {
             ("array", "array") if arguments.len() == 2 => {
                 arguments.get(1).and_then(Self::call_iterator_callable_ref)
             }
-            ("collections", "Counter" | "OrderedDict" | "UserList") if arguments.len() == 1 => {
+            ("collections", "Counter" | "OrderedDict" | "UserDict" | "UserList")
+                if arguments.len() == 1 =>
+            {
+                arguments.first().and_then(Self::call_iterator_callable_ref)
+            }
+            ("weakref", "WeakKeyDictionary" | "WeakSet" | "WeakValueDictionary")
+                if arguments.len() == 1 =>
+            {
                 arguments.first().and_then(Self::call_iterator_callable_ref)
             }
             _ => None,
