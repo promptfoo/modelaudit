@@ -1212,6 +1212,13 @@ impl<'a> ScanState<'a> {
         ) {
             return vec![Self::zero_arg_invocation(callable, op_name, position)];
         }
+        if let Some(callable) = Self::stdlib_eager_call_iterator_consumed_callable(
+            &callable_reference.module,
+            &callable_reference.name,
+            arguments,
+        ) {
+            return vec![Self::zero_arg_invocation(callable, op_name, position)];
+        }
         if let Some(callable) = Self::builtin_iterable_consumed_callable(
             &callable_reference.module,
             &callable_reference.name,
@@ -1285,6 +1292,22 @@ impl<'a> ScanState<'a> {
                 arguments.first().and_then(Self::call_iterator_callable_ref)
             }
             "combinations" | "combinations_with_replacement" if arguments.len() == 2 => {
+                arguments.first().and_then(Self::call_iterator_callable_ref)
+            }
+            _ => None,
+        }
+    }
+
+    fn stdlib_eager_call_iterator_consumed_callable<'b>(
+        module: &str,
+        name: &str,
+        arguments: &'b [StackValue],
+    ) -> Option<&'b GlobalRef> {
+        match (module, name) {
+            ("array", "array") if arguments.len() == 2 => {
+                arguments.get(1).and_then(Self::call_iterator_callable_ref)
+            }
+            ("collections", "Counter" | "OrderedDict" | "UserList") if arguments.len() == 1 => {
                 arguments.first().and_then(Self::call_iterator_callable_ref)
             }
             _ => None,
@@ -1536,6 +1559,9 @@ impl<'a> ScanState<'a> {
                 &callable_reference.name,
                 arguments,
             ),
+            "heapq" => {
+                Self::heapq_lazy_call_iterator_wrapper_callable(&callable_reference.name, arguments)
+            }
             _ => None,
         }?;
         Some(StackValue::CallIterator { callable })
@@ -1584,6 +1610,18 @@ impl<'a> ScanState<'a> {
             "chain.from_iterable" if arguments.len() == 1 => arguments
                 .first()
                 .and_then(Self::call_iterator_callable_or_tuple_item),
+            _ => None,
+        }
+    }
+
+    fn heapq_lazy_call_iterator_wrapper_callable(
+        name: &str,
+        arguments: &[StackValue],
+    ) -> Option<GlobalRef> {
+        match name {
+            "merge" if !arguments.is_empty() => {
+                arguments.iter().find_map(Self::call_iterator_callable)
+            }
             _ => None,
         }
     }
