@@ -19,8 +19,10 @@ _MAX_CALLS_PER_FUNCTION = 128
 _MAX_ASSIGNMENT_ALIASES = 128
 _MAX_FUNCTION_INSTANCE_ALIASES = 32
 _MAX_CLASS_INSTANCE_ALIASES = 128
+_MAX_INHERITED_CLASS_METHODS = 128
 _MAX_SHORT_SINK_DEPTH = 2
 _CONTROLLED_GETATTR_DISPATCH_SINK = "builtins.getattr.__call__"
+_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS = ("__setstate__",)
 
 _CLASS_ENTRYPOINT_METHODS = (
     "__getattribute__",
@@ -31,6 +33,7 @@ _CLASS_ENTRYPOINT_METHODS = (
     "__enter__",
     "__exit__",
     "__new__",
+    *_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS,
     "__init__",
 )
 _RCE_SINK_EXACT = frozenset(
@@ -470,7 +473,7 @@ def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
     is_package = source_path.name == "__init__.py"
     import_aliases = _collect_aliases(tree, module_name, is_package)
     local_defs = _collect_local_defs(tree)
-    local_class_entrypoints = _collect_local_class_entrypoints(tree, module_name)
+    local_class_entrypoints = _collect_local_class_entrypoints(tree, module_name, import_aliases, local_defs)
     local_class_targets = set(local_class_entrypoints)
     aliases = {
         **import_aliases,
@@ -539,19 +542,90 @@ def _collect_local_defs(tree: ast.Module) -> set[str]:
     return local_defs
 
 
-def _collect_local_class_entrypoints(tree: ast.Module, module_name: str) -> dict[str, tuple[str, ...]]:
+def _collect_local_class_entrypoints(
+    tree: ast.Module,
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+) -> dict[str, tuple[str, ...]]:
     class_entrypoints: dict[str, tuple[str, ...]] = {}
+    local_class_nodes = _local_class_nodes(tree)
     for statement in tree.body:
         if not isinstance(statement, ast.ClassDef):
             continue
         class_name = f"{module_name}.{statement.name}"
-        method_names = {
-            child.name for child in statement.body if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)
-        }
+        method_names = set(_class_method_nodes(statement))
+        inherited_method_names = set(
+            _inherited_local_class_methods(
+                statement,
+                module_name,
+                aliases,
+                local_defs,
+                local_class_nodes,
+            )
+        )
         class_entrypoints[class_name] = tuple(
-            f"{class_name}.{method_name}" for method_name in _CLASS_ENTRYPOINT_METHODS if method_name in method_names
+            f"{class_name}.{method_name}"
+            for method_name in _CLASS_ENTRYPOINT_METHODS
+            if method_name in method_names
+            or (method_name in inherited_method_names and method_name in _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS)
         )
     return class_entrypoints
+
+
+def _local_class_nodes(tree: ast.Module) -> dict[str, ast.ClassDef]:
+    return {statement.name: statement for statement in tree.body if isinstance(statement, ast.ClassDef)}
+
+
+def _class_method_nodes(class_node: ast.ClassDef) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    return {child.name: child for child in class_node.body if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)}
+
+
+def _inherited_local_class_methods(
+    class_node: ast.ClassDef,
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+    local_class_nodes: dict[str, ast.ClassDef],
+) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    inherited: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    direct_method_names = set(_class_method_nodes(class_node))
+    visited: set[str] = set()
+
+    def visit_base(base_node: ast.ClassDef) -> None:
+        if base_node.name in visited or len(inherited) >= _MAX_INHERITED_CLASS_METHODS:
+            return
+        visited.add(base_node.name)
+        for method_name, method_node in _class_method_nodes(base_node).items():
+            if method_name in direct_method_names or method_name in inherited:
+                continue
+            inherited[method_name] = method_node
+            if len(inherited) >= _MAX_INHERITED_CLASS_METHODS:
+                return
+        for nested_base in _class_base_targets(base_node, module_name, aliases, local_defs):
+            nested_base_node = _local_class_node_from_target(nested_base, module_name, local_class_nodes)
+            if nested_base_node is not None:
+                visit_base(nested_base_node)
+
+    for base in _class_base_targets(class_node, module_name, aliases, local_defs):
+        base_node = _local_class_node_from_target(base, module_name, local_class_nodes)
+        if base_node is not None:
+            visit_base(base_node)
+    return inherited
+
+
+def _local_class_node_from_target(
+    class_target: str,
+    module_name: str,
+    local_class_nodes: dict[str, ast.ClassDef],
+) -> ast.ClassDef | None:
+    prefix = f"{module_name}."
+    if not class_target.startswith(prefix):
+        return None
+    class_name = class_target[len(prefix) :]
+    if "." in class_name:
+        return None
+    return local_class_nodes.get(class_name)
 
 
 def _collect_assignment_aliases(
@@ -864,6 +938,7 @@ def _collect_function_calls(
     local_class_entrypoints: dict[str, tuple[str, ...]],
 ) -> tuple[dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]:
     calls_by_function: dict[str, tuple[str, ...]] = {}
+    local_class_nodes = _local_class_nodes(tree)
     for statement in tree.body:
         if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef):
             function_name = f"{module_name}.{statement.name}"
@@ -890,6 +965,26 @@ def _collect_function_calls(
                         local_class_entrypoints,
                         class_name=statement.name,
                     )
+            for method_name, method_node in _inherited_local_class_methods(
+                statement,
+                module_name,
+                aliases,
+                local_defs,
+                local_class_nodes,
+            ).items():
+                function_name = f"{module_name}.{statement.name}.{method_name}"
+                if function_name in calls_by_function:
+                    continue
+                calls_by_function[function_name] = _calls_in_function(
+                    method_node,
+                    module_name,
+                    is_package,
+                    aliases,
+                    local_defs,
+                    local_class_targets,
+                    local_class_entrypoints,
+                    class_name=statement.name,
+                )
     return calls_by_function, local_class_entrypoints
 
 

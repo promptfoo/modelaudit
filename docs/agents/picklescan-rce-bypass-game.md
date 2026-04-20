@@ -10612,3 +10612,148 @@ Measured after clearing `_find_sink_path` caches:
 - Existing wrapper timings stayed in range:
   `six.moves.getoutput` at `0.0000s`, `click.edit` at `0.0483s`, and
   `execnet.makegateway` at `0.0465s`.
+
+## Turn 191 - Bypass via pickle `BUILD` invoking inherited `__setstate__`
+
+Found and proved a scanner-clean RCE-capable pickle that executes attacker
+controlled Python source through a pickle lifecycle hook rather than through a
+direct callable global.
+
+The payload imports only:
+
+- `scipy.stats._distn_infrastructure.rv_continuous`
+
+It then uses `NEWOBJ` to allocate an instance without calling `__init__`, and
+`BUILD` to pass attacker-controlled state. During unpickle, CPython invokes the
+inherited `rv_generic.__setstate__` method:
+
+```python
+def __setstate__(self, state):
+    self.__dict__.update(state)
+    self._attach_methods()
+```
+
+For an `rv_continuous` instance, `self._attach_methods()` dispatches to the
+subclass implementation, which calls `_attach_argparser_methods()`. That method
+executes `self._parse_arg_template`:
+
+```python
+exec(self._parse_arg_template, ns)
+```
+
+The malicious state sets `_parse_arg_template` to source that avoids the
+scanner's suspicious string seeds but still executes during unpickle:
+
+```python
+open("<marker>", "w").write("owned-by-scipy-setstate-exec")
+def _parse_args(*args):
+    return (), 0, 1
+def _parse_args_stats(*args):
+    return (), 0, 1
+def _parse_args_rvs(*args):
+    return (), 0, 1, None
+```
+
+Proof:
+
+- Payload length: `393` bytes.
+- Scanner verdict: `clean`.
+- Finding count: `0`.
+- Import refs:
+  - `scipy.stats._distn_infrastructure.rv_continuous`, `is_dangerous=False`
+- Call-graph state:
+  - `_call_graph_entrypoints("scipy.stats._distn_infrastructure.rv_continuous") -> ("scipy.stats._distn_infrastructure.rv_continuous.__init__",)`
+  - `_find_sink_path("scipy.stats._distn_infrastructure.rv_continuous") -> None`
+  - `_find_sink_path("scipy.stats._distn_infrastructure.rv_generic.__setstate__") -> None`
+  - `_find_sink_path("scipy.stats._distn_infrastructure.rv_generic._attach_argparser_methods") -> ("scipy.stats._distn_infrastructure.rv_generic._attach_argparser_methods", "builtins.exec")`
+- Runtime after `pickle.loads(payload)`: marker exists and contains
+  `owned-by-scipy-setstate-exec`.
+
+Why the scanner missed it:
+
+- Native policy sees only the clean SciPy class global.
+- The Python class entrypoint list does not include pickle lifecycle methods
+  like `__setstate__`, even though `BUILD` invokes them during unpickle.
+- The inherited lifecycle method is not modeled for subclasses. The actual
+  runtime call is `rv_generic.__setstate__` bound to an `rv_continuous`
+  instance, so `self._attach_methods()` dispatches to
+  `rv_continuous._attach_methods`, then to the inherited exec sink. The static
+  graph currently analyzes `rv_generic.__setstate__` in the base-class context
+  and stops at the abstract base `_attach_methods`.
+- The malicious source string avoids raw `import`, `exec(`, `eval(`,
+  `compile(`, `os`, `subprocess`, and dunder seeds, so byte/string heuristics
+  do not compensate for the missed lifecycle edge.
+
+Performance note: the next defensive turn should fix this at the finite pickle
+object lifecycle source. Add `__setstate__` to class unpickle entrypoints for
+`BUILD`, including inherited implementations from explicit base classes, and
+analyze inherited methods in the subclass binding context so `self.method()`
+can resolve to subclass overrides. Keep this bounded to local source-resolved
+base classes and the existing call-graph depth/visited limits.
+
+## Turn 192 - Block inherited pickle `__setstate__` lifecycle paths
+
+Implemented a source-focused call-graph block for the Turn 191 SciPy
+`rv_continuous` `BUILD` bypass.
+
+The Python call graph now models locally resolvable inherited class methods:
+
+- Class entrypoints now include the pickle lifecycle method `__setstate__`.
+- If a class inherits `__setstate__` from a base class in the same source file,
+  the subclass gets a synthetic subclass-bound entrypoint.
+- Inherited local methods are also synthesized into `calls_by_function` for the
+  subclass. This means inherited method bodies still bind `self` to the actual
+  subclass while being analyzed.
+- The fix is bounded to explicit base classes resolvable in the same parsed
+  source file, with a cap on inherited methods per class.
+
+That closes the Turn 191 path:
+
+```text
+scipy.stats._distn_infrastructure.rv_continuous.__setstate__
+  -> scipy.stats._distn_infrastructure.rv_continuous._attach_methods
+  -> scipy.stats._distn_infrastructure.rv_continuous._attach_argparser_methods
+  -> builtins.exec
+```
+
+Regression coverage added to
+`packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py`:
+
+- The test constructs the same `NEWOBJ` + `BUILD` payload shape from Turn 191.
+- It asserts the first class entrypoint for
+  `scipy.stats._distn_infrastructure.rv_continuous` is the inherited,
+  subclass-bound `__setstate__`.
+- It asserts `_find_sink_path` for that lifecycle entrypoint reaches
+  `builtins.exec`.
+- The payload now scans `malicious` with `DANGEROUS_CALL_GRAPH`.
+- The runtime proof still executes under CPython and writes
+  `owned-by-scipy-setstate-exec`, confirming the scanner blocks a real
+  RCE-capable pickle.
+
+Focused validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_scipy_rv_continuous_setstate_rce`
+  passed: `1 passed`.
+- `ruff format`, `ruff check --fix`, and `mypy` passed on the standard
+  ModelAudit paths.
+- Full non-slow/non-integration validation passed:
+  `3705 passed, 1022 skipped, 21 warnings in 38.12s`.
+
+Performance note: inherited method synthesis is limited to base classes in the
+same source file and capped by `_MAX_INHERITED_CLASS_METHODS`. The runtime
+search still uses the existing call-graph depth, visited-function, and
+per-function call caps.
+Measured after clearing `_find_sink_path` caches:
+
+- `scipy.stats._distn_infrastructure.rv_continuous.__setstate__`: `0.0597s`,
+  path
+  `rv_continuous.__setstate__ -> rv_continuous._attach_methods -> rv_continuous._attach_argparser_methods -> builtins.exec`.
+- `scipy.stats._distn_infrastructure.rv_continuous._attach_argparser_methods`:
+  `0.0000s`, path `rv_continuous._attach_argparser_methods -> builtins.exec`.
+- `numpy._core.fromnumeric._wrapfunc`: `0.0076s`, path
+  `numpy._core.fromnumeric._wrapfunc -> builtins.getattr.__call__`.
+- `_pytest._py.path.LocalPath.sysexec`: `0.0348s`, path
+  `_pytest._py.path.LocalPath.sysexec -> subprocess.Popen`.
+- Existing wrapper timings stayed in range:
+  `six.moves.getoutput` at `0.0000s`, `click.edit` at `0.0498s`, and
+  `execnet.makegateway` at `0.0606s`.

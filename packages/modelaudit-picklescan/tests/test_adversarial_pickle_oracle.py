@@ -24,7 +24,7 @@ import pytest
 
 from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, Severity, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
-from modelaudit_picklescan.call_graph import _find_sink_path
+from modelaudit_picklescan.call_graph import _call_graph_entrypoints, _find_sink_path
 
 pytestmark = pytest.mark.skipif(
     find_spec(_RUST_EXTENSION_MODULE) is None,
@@ -1602,6 +1602,32 @@ def _numpy_wrapfunc_localpath_sysexec_payload(command: str, *, include_call: boo
         parts += [_text_operand("sysexec"), _text_operand("-c"), _text_operand(command), b"tR"]
     parts += [b"."]
     return b"".join(parts)
+
+
+def _scipy_rv_continuous_setstate_payload(marker: Path) -> bytes:
+    parse_arg_template = (
+        f"open({str(marker)!r},'w').write('owned-by-scipy-setstate-exec')\n"
+        "def _parse_args(*args):\n    return (), 0, 1\n"
+        "def _parse_args_stats(*args):\n    return (), 0, 1\n"
+        "def _parse_args_rvs(*args):\n    return (), 0, 1, None\n"
+    )
+    state = b"".join(
+        [
+            b"}",
+            _dict_setitem("_parse_arg_template", _text_operand(parse_arg_template)),
+            _dict_setitem("numargs", _int_operand(0)),
+            _dict_setitem("moment_type", _int_operand(0)),
+        ]
+    )
+    return b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("scipy.stats._distn_infrastructure", "rv_continuous"),
+            b")\x81",
+            state,
+            b"b.",
+        ]
+    )
 
 
 def _pyyaml_unsafe_document(marker: Path, marker_content: str) -> str:
@@ -4145,6 +4171,37 @@ def test_scan_bytes_blocks_numpy_wrapfunc_controlled_getattr_rce(tmp_path: Path)
     result = pickle.loads(payload)
     assert result == ""
     assert marker.read_text() == "owned-by-numpy-wrapfunc-localpath"
+
+
+@pytest.mark.skipif(not _module_available("scipy.stats._distn_infrastructure"), reason="SciPy stats is unavailable")
+def test_scan_bytes_blocks_scipy_rv_continuous_setstate_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "scipy_rv_continuous_setstate_marker"
+    payload = _scipy_rv_continuous_setstate_payload(marker)
+
+    assert _call_graph_entrypoints("scipy.stats._distn_infrastructure.rv_continuous")[:1] == (
+        "scipy.stats._distn_infrastructure.rv_continuous.__setstate__",
+    )
+    assert _find_sink_path("scipy.stats._distn_infrastructure.rv_continuous.__setstate__") == (
+        "scipy.stats._distn_infrastructure.rv_continuous.__setstate__",
+        "scipy.stats._distn_infrastructure.rv_continuous._attach_methods",
+        "scipy.stats._distn_infrastructure.rv_continuous._attach_argparser_methods",
+        "builtins.exec",
+    )
+
+    report = scan_bytes(payload, source="scipy-rv-continuous-setstate-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "scipy.stats._distn_infrastructure",
+        "rv_continuous",
+        "builtins.exec",
+    )
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert type(result).__name__ == "rv_continuous"
+    assert marker.read_text() == "owned-by-scipy-setstate-exec"
 
 
 @pytest.mark.skipif(not _module_available("yaml"), reason="PyYAML is unavailable")
