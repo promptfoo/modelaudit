@@ -24,6 +24,7 @@ import pytest
 
 from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, Severity, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
+from modelaudit_picklescan.call_graph import _find_sink_path
 
 pytestmark = pytest.mark.skipif(
     find_spec(_RUST_EXTENSION_MODULE) is None,
@@ -1587,6 +1588,18 @@ def _dotenv_run_command_payload(command: list[str], *, include_call: bool) -> by
         parts += [_global_operand("dotenv.cli", "run_command"), command_list, b"}", b"\x86R"]
     else:
         parts += [command_list, b"}", b"\x86"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _numpy_wrapfunc_localpath_sysexec_payload(command: str, *, include_call: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    if include_call:
+        parts += [_global_operand("numpy._core.fromnumeric", "_wrapfunc"), b"("]
+    parts += [_global_operand("_pytest._py.path", "LocalPath")]
+    parts += [_tuple_payload_operands([_text_operand("/bin/sh")]), b"R"]
+    if include_call:
+        parts += [_text_operand("sysexec"), _text_operand("-c"), _text_operand(command), b"tR"]
     parts += [b"."]
     return b"".join(parts)
 
@@ -4094,6 +4107,44 @@ def test_scan_bytes_blocks_dotenv_run_command_rce(tmp_path: Path) -> None:
     )
     assert result.returncode == 0
     assert marker.read_text() == "owned-by-dotenv-run-command"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
+@pytest.mark.skipif(not _module_available("numpy._core.fromnumeric"), reason="NumPy fromnumeric is unavailable")
+@pytest.mark.skipif(not _module_available("_pytest._py.path"), reason="pytest LocalPath is unavailable")
+def test_scan_bytes_blocks_numpy_wrapfunc_controlled_getattr_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "numpy_wrapfunc_getattr_marker"
+    command = f"printf owned-by-numpy-wrapfunc-localpath > {shlex.quote(str(marker))}"
+    control_payload = _numpy_wrapfunc_localpath_sysexec_payload(command, include_call=False)
+    payload = _numpy_wrapfunc_localpath_sysexec_payload(command, include_call=True)
+
+    control_report = scan_bytes(control_payload, source="numpy-wrapfunc-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert str(control_result) == "/bin/sh"
+    assert not marker.exists()
+
+    assert _find_sink_path("numpy._core.fromnumeric._wrapfunc") == (
+        "numpy._core.fromnumeric._wrapfunc",
+        "builtins.getattr.__call__",
+    )
+
+    report = scan_bytes(payload, source="numpy-wrapfunc-localpath-sysexec-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "numpy._core.fromnumeric",
+        "_wrapfunc",
+        "builtins.getattr.__call__",
+    )
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result == ""
+    assert marker.read_text() == "owned-by-numpy-wrapfunc-localpath"
 
 
 @pytest.mark.skipif(not _module_available("yaml"), reason="PyYAML is unavailable")

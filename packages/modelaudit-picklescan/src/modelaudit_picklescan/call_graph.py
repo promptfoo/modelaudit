@@ -20,6 +20,7 @@ _MAX_ASSIGNMENT_ALIASES = 128
 _MAX_FUNCTION_INSTANCE_ALIASES = 32
 _MAX_CLASS_INSTANCE_ALIASES = 128
 _MAX_SHORT_SINK_DEPTH = 2
+_CONTROLLED_GETATTR_DISPATCH_SINK = "builtins.getattr.__call__"
 
 _CLASS_ENTRYPOINT_METHODS = (
     "__getattribute__",
@@ -40,6 +41,7 @@ _RCE_SINK_EXACT = frozenset(
         "builtins.compile",
         "builtins.eval",
         "builtins.exec",
+        _CONTROLLED_GETATTR_DISPATCH_SINK,
         "dill.load",
         "dill.loads",
         "importlib.import_module",
@@ -921,7 +923,37 @@ def _calls_in_function(
     )
     parameter_controlled_names: set[str] | None = None
     tcl_command_controlled_names: set[str] | None = None
+    dynamic_getattr_callable_names: set[str] | None = None
+    may_use_getattr_dispatch = _may_use_getattr_dispatch(call_nodes, function_aliases)
     for node in call_nodes:
+        if may_use_getattr_dispatch:
+            if parameter_controlled_names is None:
+                parameter_controlled_names = _parameter_controlled_names(function_node)
+            if _is_controlled_direct_getattr_dispatch(
+                node,
+                module_name,
+                function_aliases,
+                local_defs,
+                parameter_controlled_names,
+                class_name=class_name,
+            ):
+                calls.append(_CONTROLLED_GETATTR_DISPATCH_SINK)
+                continue
+            if isinstance(node.func, ast.Name):
+                if dynamic_getattr_callable_names is None:
+                    dynamic_getattr_callable_names = _controlled_getattr_callable_names(
+                        function_node,
+                        module_name,
+                        function_aliases,
+                        local_defs,
+                        parameter_controlled_names,
+                        class_name=class_name,
+                    )
+                if node.func.id in dynamic_getattr_callable_names and _call_uses_parameter_controlled_argument(
+                    node, parameter_controlled_names
+                ):
+                    calls.append(_CONTROLLED_GETATTR_DISPATCH_SINK)
+                    continue
         resolved = _resolve_expr(node.func, module_name, function_aliases, local_defs, class_name)
         if resolved is not None:
             if _is_tcl_interpreter_dispatch_call(resolved):
@@ -952,6 +984,93 @@ def _calls_in_function(
                 continue
             calls.append(resolved)
     return tuple(calls)
+
+
+def _may_use_getattr_dispatch(call_nodes: tuple[ast.Call, ...], aliases: Mapping[str, str]) -> bool:
+    return any(_call_node_may_be_getattr_call(node, aliases) for node in call_nodes)
+
+
+def _call_node_may_be_getattr_call(call_node: ast.Call, aliases: Mapping[str, str]) -> bool:
+    func = call_node.func
+    if isinstance(func, ast.Name):
+        return func.id == "getattr" or aliases.get(func.id) == "builtins.getattr"
+    if isinstance(func, ast.Attribute):
+        return func.attr == "getattr"
+    return False
+
+
+def _is_controlled_direct_getattr_dispatch(
+    call_node: ast.Call,
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+    controlled_names: set[str],
+    *,
+    class_name: str | None,
+) -> bool:
+    if not isinstance(call_node.func, ast.Call):
+        return False
+    return _controlled_getattr_call(
+        call_node.func,
+        module_name,
+        aliases,
+        local_defs,
+        controlled_names,
+        class_name=class_name,
+    ) and _call_uses_parameter_controlled_argument(call_node, controlled_names)
+
+
+def _controlled_getattr_callable_names(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+    controlled_names: set[str],
+    *,
+    class_name: str | None,
+) -> set[str]:
+    callable_names: set[str] = set()
+    for node in ast.walk(function_node):
+        value: ast.AST | None
+        if isinstance(node, ast.Assign):
+            value = node.value
+            targets = set()
+            for target in node.targets:
+                targets.update(_assignment_target_names(target))
+        elif isinstance(node, ast.AnnAssign):
+            value = node.value
+            targets = _assignment_target_names(node.target)
+        else:
+            continue
+        if not isinstance(value, ast.Call):
+            continue
+        if _controlled_getattr_call(
+            value,
+            module_name,
+            aliases,
+            local_defs,
+            controlled_names,
+            class_name=class_name,
+        ):
+            callable_names.update(targets)
+    return callable_names
+
+
+def _controlled_getattr_call(
+    call_node: ast.Call,
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+    controlled_names: set[str],
+    *,
+    class_name: str | None,
+) -> bool:
+    resolved = _resolve_expr(call_node.func, module_name, aliases, local_defs, class_name)
+    if resolved not in {"getattr", "builtins.getattr"}:
+        return False
+    if len(call_node.args) < 2:
+        return False
+    return _expr_uses_names(call_node.args[1], controlled_names)
 
 
 def _collect_function_instance_aliases(

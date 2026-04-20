@@ -10490,3 +10490,125 @@ Performance sanity after clearing call-graph caches:
 - Existing wrapper timings stayed in the same range:
   `six.moves.getoutput` at `0.0131s`, `click.edit` at `0.0669s`, and
   `execnet.makegateway` at `0.0461s`.
+
+## Turn 189 - Bypass via controlled `getattr` method dispatch in NumPy
+
+Found and proved a scanner-clean RCE-capable pickle that hides the dangerous
+method behind a benign generic dispatcher:
+
+```python
+numpy._core.fromnumeric._wrapfunc(
+    _pytest._py.path.LocalPath("/bin/sh"),
+    "sysexec",
+    "-c",
+    "printf owned-by-numpy-wrapfunc-localpath > <marker>",
+)
+```
+
+The pickle imports only two globals:
+
+- `numpy._core.fromnumeric._wrapfunc`
+- `_pytest._py.path.LocalPath`
+
+The dangerous `_pytest._py.path.LocalPath.sysexec` method never appears as a
+pickle global. It is selected at runtime by `_wrapfunc`, whose source does:
+
+```python
+bound = getattr(obj, method, None)
+...
+return bound(*args, **kwds)
+```
+
+Proof:
+
+- Payload length: `219` bytes.
+- Scanner verdict: `clean`.
+- Finding count: `0`.
+- Import refs:
+  - `numpy._core.fromnumeric._wrapfunc`, `is_dangerous=False`
+  - `_pytest._py.path.LocalPath`, `is_dangerous=False`
+- Call-graph state:
+  - `_find_sink_path("numpy._core.fromnumeric._wrapfunc") -> None`
+  - `_calls_for_function("numpy._core.fromnumeric._wrapfunc") -> ("getattr", "numpy._core.fromnumeric._wrapit", "bound", "numpy._core.fromnumeric._wrapit")`
+  - `_find_sink_path("_pytest._py.path.LocalPath.sysexec") -> ("_pytest._py.path.LocalPath.sysexec", "subprocess.Popen")`
+- Runtime after `pickle.loads(payload)`: marker exists and contains
+  `owned-by-numpy-wrapfunc-localpath`.
+
+Why the scanner missed it:
+
+- Native policy sees only the clean dispatcher and clean object constructor.
+- The direct `LocalPath.sysexec` global is never imported, so the existing
+  Turn 188 call-graph regression for that method is not reached.
+- The Python call graph records `getattr` and a later call to local name
+  `bound`, but it does not connect a parameter-controlled
+  `bound = getattr(obj, method, None)` assignment to a parameter-controlled
+  `bound(*args, **kwds)` invocation.
+- This is source-adjacent and finite: packages can expose infinitely many
+  wrappers, but the dangerous shape is controlled dynamic callable dispatch.
+
+Performance note: the next defensive turn should add a bounded AST-local
+check in call-graph collection for controlled dynamic dispatch. Specifically,
+when a function assigns a local callable from `getattr(receiver, method, ...)`
+where the receiver or method is parameter-controlled, and later invokes that
+local with parameter-controlled arguments, record a dangerous dynamic-dispatch
+sink. Also handle the direct form `getattr(receiver, method)(...)`. This avoids
+enumerating packages like NumPy while keeping the work local to each analyzed
+function and reusing the existing parameter-control pass.
+
+## Turn 190 - Block controlled dynamic `getattr` dispatch
+
+Implemented a source-focused call-graph block for the Turn 189 NumPy
+`_wrapfunc` bypass.
+
+The Python call graph now treats controlled dynamic callable dispatch as an RCE
+sink:
+
+- Direct dispatch: `getattr(receiver, method)(*args, **kwargs)`.
+- Indirect dispatch:
+  `bound = getattr(receiver, method, default); bound(*args, **kwargs)`.
+- The lookup is considered controlled when the method-name expression is
+  parameter-controlled.
+- The invocation is considered RCE-capable when its arguments are
+  parameter-controlled.
+- The emitted sink is the synthetic source-level marker
+  `builtins.getattr.__call__`, avoiding a blanket rule that would mark every
+  simple `getattr(...)` call graph as an RCE sink.
+
+Regression coverage added to
+`packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py`:
+
+- The control pickle that only constructs
+  `_pytest._py.path.LocalPath("/bin/sh")` remains `clean`.
+- `_find_sink_path("numpy._core.fromnumeric._wrapfunc")` now returns
+  `("numpy._core.fromnumeric._wrapfunc", "builtins.getattr.__call__")`.
+- The Turn 189 payload using
+  `numpy._core.fromnumeric._wrapfunc(LocalPath("/bin/sh"), "sysexec", "-c", command)`
+  now scans `malicious` with `DANGEROUS_CALL_GRAPH`.
+- The runtime proof still executes under CPython and writes
+  `owned-by-numpy-wrapfunc-localpath`, confirming the scanner blocks a real
+  RCE-capable pickle rather than a synthetic near-match.
+
+Focused validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_numpy_wrapfunc_controlled_getattr_rce`
+  passed: `1 passed`.
+- `ruff format`, `ruff check --fix`, and `mypy` passed on the standard
+  ModelAudit paths.
+- Full non-slow/non-integration validation passed:
+  `3704 passed, 1022 skipped, 21 warnings in 37.44s`.
+
+Performance note: the fix uses the existing per-function call-node collection
+and existing parameter-control propagation. It first checks whether the
+function contains any `getattr` call syntax before doing the extra AST-local
+assignment pass, so functions without dynamic dispatch skip the new work.
+Measured after clearing `_find_sink_path` caches:
+
+- `numpy._core.fromnumeric._wrapfunc`: `0.0080s`, path
+  `numpy._core.fromnumeric._wrapfunc -> builtins.getattr.__call__`.
+- `numpy._core.fromnumeric._wrapit`: `0.0000s`, path
+  `numpy._core.fromnumeric._wrapit -> builtins.getattr.__call__`.
+- `_pytest._py.path.LocalPath.sysexec`: `0.0347s`, path
+  `_pytest._py.path.LocalPath.sysexec -> subprocess.Popen`.
+- Existing wrapper timings stayed in range:
+  `six.moves.getoutput` at `0.0000s`, `click.edit` at `0.0483s`, and
+  `execnet.makegateway` at `0.0465s`.
