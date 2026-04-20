@@ -53,6 +53,7 @@ const REDUCE_OPCODES: &[&str] = &["REDUCE", "NEWOBJ", "NEWOBJ_EX", "OBJ", "INST"
 
 #[derive(Clone, Copy)]
 enum CallbackDispatchGuard {
+    Always,
     NonEmptyIterable {
         arg_index: usize,
     },
@@ -134,6 +135,8 @@ const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(
             flags_arg_index: None,
         },
     ),
+    ("weakref", "ref", 2, 1, 1, CallbackDispatchGuard::Always),
+    ("weakref", "proxy", 2, 1, 1, CallbackDispatchGuard::Always),
     (
         "re",
         "sub",
@@ -1404,6 +1407,7 @@ impl<'a> ScanState<'a> {
         arguments: &[StackValue],
     ) -> bool {
         match guard {
+            CallbackDispatchGuard::Always => true,
             CallbackDispatchGuard::NonEmptyIterable { arg_index } => {
                 Self::is_definitely_non_empty_iterable_argument(arguments.get(arg_index))
             }
