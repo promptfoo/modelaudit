@@ -11227,3 +11227,150 @@ Performance note:
   `0.0107s`.
 - The added entrypoint publication reuses the existing inherited-method
   collection work; it does not add another source traversal pass.
+
+## Turn 199 - Bypass via mutable pydantic module `__getattr__` imports
+
+Found and proved a scanner-clean RCE-capable pickle that exploits a module
+global lookup path rather than a callable entrypoint.
+
+The payload imports only:
+
+- `pydantic._dynamic_imports`
+- `builtins.str.join`
+- `pydantic.Popen`
+
+The pickle first mutates pydantic's module-level dynamic import registry:
+
+```text
+pydantic._dynamic_imports["Popen"] = ("pydantic", "".join(["sub", "process"]))
+```
+
+The dangerous module string is assembled at runtime, so the raw pickle does not
+contain a full `subprocess` or `subprocess.Popen` literal. The payload then
+loads `pydantic.Popen` as a pickle global and calls it with:
+
+```text
+["/bin/sh", "-c", "printf pydantic-dynamic-import-owned > <marker>"]
+```
+
+At runtime, pickle global resolution imports `pydantic` and performs
+`getattr(pydantic, "Popen")`. Because `Popen` is not a real module global,
+CPython dispatches to `pydantic.__getattr__`. The poisoned `_dynamic_imports`
+entry makes `__getattr__` call `importlib.import_module("subprocess",
+package="pydantic")`, return `subprocess.Popen`, and the subsequent `REDUCE`
+invokes it.
+
+Proof:
+
+- Payload length: `241` bytes.
+- Scanner verdict: `clean`.
+- Finding count: `0`.
+- Import refs:
+  - `pydantic._dynamic_imports`, `is_dangerous=False`
+  - `builtins.str.join`, `is_dangerous=False`
+  - `pydantic.Popen`, `is_dangerous=False`
+- Call-graph state:
+  - `_call_graph_entrypoints("pydantic._dynamic_imports") -> ()`
+  - `_call_graph_entrypoints("pydantic.Popen") -> ()`
+  - `_find_sink_path("pydantic.Popen") -> None`
+  - `_call_graph_entrypoints("pydantic.__getattr__") -> ("pydantic.__getattr__",)`
+  - `_find_sink_path("pydantic.__getattr__") -> ("pydantic.__getattr__", "importlib.import_module")`
+- Runtime after `pickle.loads(payload)` in a subprocess:
+  - Returned object type: `Popen`.
+  - Process return code: `0`.
+  - Marker exists and contains `pydantic-dynamic-import-owned`.
+
+Why the scanner missed it:
+
+- Native policy sees only clean globals. The dangerous target is created by a
+  mutable module registry and a module attribute lookup, not by a literal
+  dangerous pickle global.
+- The Python call-graph pass analyzes imported references such as
+  `pydantic.Popen`, but it does not currently model module-level
+  `__getattr__` as an implicit fallback entrypoint during pickle global
+  resolution.
+- The sink path already exists when asked directly as `pydantic.__getattr__`;
+  it is just not connected to missing or dynamic module attributes.
+- `SETITEM` registry mutation is again important: without the attacker-added
+  `_dynamic_imports["Popen"]` entry, `pydantic.__getattr__` would not resolve
+  this name to `subprocess`.
+
+Performance note:
+
+- Full `scan_bytes(payload)` proof: `0.0033s`.
+- After clearing call-graph caches,
+  `_call_graph_entrypoints("pydantic.Popen")`: `0.0023s`, returning no
+  entrypoints.
+- `_find_sink_path("pydantic.__getattr__")` is effectively instant once the
+  small pydantic `__init__.py` module has been parsed.
+
+The next defensive turn should fix closest to the source by connecting missing
+module attributes to module-level `__getattr__` when the imported module
+defines it and the attribute is not otherwise statically resolved. A focused
+regression should keep this exact `_dynamic_imports` poisoning payload and
+assert that `pydantic.Popen` resolves through `pydantic.__getattr__` to
+`importlib.import_module`.
+
+## Turn 200 - Block module `__getattr__` dynamic import fallback
+
+Implemented a focused call-graph block for the Turn 199 pydantic dynamic
+import bypass.
+
+The resolver now connects missing module attributes to module-level
+`__getattr__` when all of these are true:
+
+- The requested pickle global is a simple module attribute, not a nested
+  qualified member.
+- The module analysis has no direct top-level definition, import, or
+  assignment for that attribute.
+- Explicit aliases and bounded wildcard reexports did not resolve it.
+- The module defines a callable `__getattr__` path.
+
+That preserves real data globals such as `pydantic._dynamic_imports`, but
+routes missing dynamic attributes such as `pydantic.Popen` through:
+
+```text
+pydantic.Popen
+  -> pydantic.__getattr__
+  -> importlib.import_module
+```
+
+The implementation reuses the lightweight module export summary already used
+for wildcard reexport handling, and stores direct module names on
+`_ModuleAnalysis` so the fallback does not require another parse of the same
+source.
+
+Regression coverage added to
+`packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py`:
+
+- The payload mutates `pydantic._dynamic_imports["Popen"]`.
+- The dangerous module name is still assembled from `"sub"` and `"process"`
+  fragments via `builtins.str.join`.
+- The test asserts `pydantic._dynamic_imports` stays unresolved as a call-graph
+  entrypoint because it is a real module global.
+- The test asserts `pydantic.Popen` now resolves to `pydantic.__getattr__`.
+- The test asserts `pydantic.Popen` reaches `importlib.import_module`.
+- The payload now scans `malicious` with `DANGEROUS_CALL_GRAPH`.
+- Runtime proof still runs in a child process and writes
+  `pydantic-dynamic-import-owned`.
+
+Focused validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_pydantic_dynamic_imports_module_getattr_rce packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_fsspec_registry_poisoning_inherited_constructor_rce packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_scipy_stats_norm_star_reexported_singleton_setstate_rce`
+  passed: `3 passed`.
+
+Full pre-commit validation:
+
+- `ruff format` passed after reformatting one test file.
+- `ruff check --fix` passed.
+- `mypy` passed: `Success: no issues found in 446 source files`.
+- Full non-slow/non-integration validation passed:
+  `3709 passed, 1022 skipped, 21 warnings in 40.54s`.
+
+Performance note:
+
+- `scan_bytes(payload)`: `malicious`, one finding, `0.0039s`.
+- After clearing call-graph caches,
+  `_call_graph_entrypoints("pydantic.Popen")`: `0.0023s`.
+- `_find_sink_path("pydantic.Popen")`: `0.0000s`, path
+  `("pydantic.Popen", "importlib.import_module")`.
