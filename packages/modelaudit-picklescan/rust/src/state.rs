@@ -1233,6 +1233,13 @@ impl<'a> ScanState<'a> {
         ) {
             return vec![Self::zero_arg_invocation(callable, op_name, position)];
         }
+        if let Some(callable) = Self::operator_sequence_search_consumed_callable(
+            &callable_reference.module,
+            &callable_reference.name,
+            arguments,
+        ) {
+            return vec![Self::zero_arg_invocation(callable, op_name, position)];
+        }
 
         if !Self::is_next_call_iterator_consumer(
             &callable_reference.module,
@@ -1400,6 +1407,20 @@ impl<'a> ScanState<'a> {
             }
             _ => None,
         }
+    }
+
+    fn operator_sequence_search_consumed_callable<'b>(
+        module: &str,
+        name: &str,
+        arguments: &'b [StackValue],
+    ) -> Option<&'b GlobalRef> {
+        if !matches!(module, "operator" | "_operator")
+            || !matches!(name, "contains" | "countOf" | "indexOf")
+            || arguments.len() != 2
+        {
+            return None;
+        }
+        arguments.first().and_then(Self::call_iterator_callable_ref)
     }
 
     fn builtin_iterable_consumer_arity_matches(name: &str, argument_count: usize) -> bool {

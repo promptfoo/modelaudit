@@ -378,6 +378,13 @@ def _builtins_help_call_iterator_method_descriptor_payload(
     return _builtins_help_call_iterator_stdlib_materializer_payload(module, name, *method_arg_operands)
 
 
+def _builtins_help_call_iterator_operator_payload(
+    name: str,
+    *arg_operands: bytes,
+) -> bytes:
+    return _builtins_help_call_iterator_stdlib_materializer_payload("operator", name, *arg_operands)
+
+
 def _builtins_help_call_iterator_heapq_merge_next_payload() -> bytes:
     return b"".join(
         [
@@ -2627,6 +2634,155 @@ sys.modules.pop("pydoc", None)
 result = pickle.loads(payload)
 if result is not None:
     raise SystemExit(f"expected None, got {result!r}")
+if marker.exists():
+    raise SystemExit("marker was written")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("payload", "values_literal", "expected_repr"),
+    [
+        (
+            _builtins_help_call_iterator_operator_payload("contains", b"h\x00", _unicode_operand("never")),
+            "['owned-value', 'stop']",
+            "False",
+        ),
+        (
+            _builtins_help_call_iterator_operator_payload("countOf", b"h\x00", _unicode_operand("never")),
+            "['owned-value', 'stop']",
+            "0",
+        ),
+        (
+            _builtins_help_call_iterator_operator_payload("indexOf", b"h\x00", _unicode_operand("owned-value")),
+            "['owned-value', 'stop']",
+            "0",
+        ),
+    ],
+)
+def test_scan_bytes_blocks_operator_sequence_search_call_iterator_consumption_rce(
+    tmp_path: Path,
+    payload: bytes,
+    values_literal: str,
+    expected_repr: str,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "operator_sequence_search_call_iterator_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        f"_values = {values_literal}\n"
+        "def help(*args, **kwargs):\n"
+        "    return _values.pop(0) if _values else 'stop'\n",
+        encoding="utf-8",
+    )
+
+    report = scan_bytes(payload, source="operator-sequence-search-call-iterator-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+expected_repr = sys.argv[5]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if repr(result) != expected_repr:
+    raise SystemExit(f"expected {expected_repr}, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, expected_repr],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+def test_scan_bytes_keeps_operator_length_hint_call_iterator_lazy(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "operator_length_hint_call_iterator_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "_values = ['owned-value', 'stop']\n"
+        "def help(*args, **kwargs):\n"
+        "    return _values.pop(0) if _values else 'stop'\n",
+        encoding="utf-8",
+    )
+    payload = _builtins_help_call_iterator_operator_payload("length_hint", b"h\x00")
+
+    report = scan_bytes(payload, source="operator-length-hint-call-iterator.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != 0:
+    raise SystemExit(f"expected 0, got {result!r}")
 if marker.exists():
     raise SystemExit("marker was written")
 """
