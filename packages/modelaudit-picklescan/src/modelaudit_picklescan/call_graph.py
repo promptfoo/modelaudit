@@ -1443,6 +1443,7 @@ def _calls_in_function(
     parameter_controlled_names: set[str] | None = None
     tcl_command_controlled_names: set[str] | None = None
     dynamic_getattr_callable_names: set[str] | None = None
+    getattr_default_callable_names: dict[str, str] | None = None
     may_use_getattr_dispatch = _may_use_getattr_dispatch(call_nodes, function_aliases)
     for node in call_nodes:
         if may_use_getattr_dispatch:
@@ -1472,6 +1473,30 @@ def _calls_in_function(
                     node, parameter_controlled_names
                 ):
                     calls.append(_CONTROLLED_GETATTR_DISPATCH_SINK)
+                    continue
+                if getattr_default_callable_names is None:
+                    getattr_default_callable_names = _getattr_default_callable_names(
+                        function_node,
+                        call_nodes,
+                        module_name,
+                        function_aliases,
+                        local_defs,
+                        class_name=class_name,
+                    )
+                fallback_target = getattr_default_callable_names.get(node.func.id)
+                if fallback_target is not None:
+                    calls.append(fallback_target)
+                    continue
+            elif isinstance(node.func, ast.Call):
+                fallback_target = _getattr_default_callable_target(
+                    node.func,
+                    module_name,
+                    function_aliases,
+                    local_defs,
+                    class_name=class_name,
+                )
+                if fallback_target is not None:
+                    calls.append(fallback_target)
                     continue
         resolved = _resolve_expr(node.func, module_name, function_aliases, local_defs, class_name)
         if resolved is not None:
@@ -1691,6 +1716,65 @@ def _controlled_getattr_call(
     if len(call_node.args) < 2:
         return False
     return _expr_uses_names(call_node.args[1], controlled_names)
+
+
+def _getattr_default_callable_names(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    call_nodes: tuple[ast.Call, ...],
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+    *,
+    class_name: str | None,
+) -> dict[str, str]:
+    called_names = {node.func.id for node in call_nodes if isinstance(node.func, ast.Name)}
+    if not called_names:
+        return {}
+
+    callable_names: dict[str, str] = {}
+    for node in ast.walk(function_node):
+        value: ast.AST | None
+        if isinstance(node, ast.Assign):
+            value = node.value
+            targets = set()
+            for target in node.targets:
+                targets.update(_assignment_target_names(target))
+        elif isinstance(node, ast.AnnAssign):
+            value = node.value
+            targets = _assignment_target_names(node.target)
+        else:
+            continue
+        if not isinstance(value, ast.Call):
+            continue
+        target_names = targets & called_names
+        if not target_names:
+            continue
+        fallback_target = _getattr_default_callable_target(
+            value,
+            module_name,
+            aliases,
+            local_defs,
+            class_name=class_name,
+        )
+        if fallback_target is None:
+            continue
+        for target_name in sorted(target_names):
+            callable_names[target_name] = fallback_target
+    return callable_names
+
+
+def _getattr_default_callable_target(
+    call_node: ast.Call,
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+    *,
+    class_name: str | None,
+) -> str | None:
+    resolved = _resolve_expr(call_node.func, module_name, aliases, local_defs, class_name)
+    if resolved not in {"getattr", "builtins.getattr"} or len(call_node.args) < 3:
+        return None
+    return _resolve_expr(call_node.args[2], module_name, aliases, local_defs, class_name)
 
 
 def _collect_function_instance_aliases(

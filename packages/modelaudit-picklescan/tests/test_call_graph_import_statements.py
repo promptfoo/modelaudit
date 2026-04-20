@@ -82,6 +82,17 @@ def test_call_graph_ignores_imports_inside_nested_functions_until_called() -> No
     assert _find_sink_path("site.enablerlcompleter") is None
 
 
+def test_call_graph_models_getattr_default_callable_fallbacks() -> None:
+    calls = _calls_for_function("platform._Processor.get") or ()
+
+    assert "platform._Processor.from_subprocess" in calls
+    assert _find_sink_path("platform._Processor.get") == (
+        "platform._Processor.get",
+        "platform._Processor.from_subprocess",
+        "subprocess.check_output",
+    )
+
+
 def test_call_graph_models_required_arg_imports_when_pickle_supplies_args() -> None:
     import_references = [
         {
@@ -176,6 +187,75 @@ if marker.read_text() != marker_content:
 """
     result = subprocess.run(
         [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), module_name, marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+def test_scan_bytes_blocks_platform_processor_get_dynamic_fallback_rce(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "processor_marker"
+    marker_content = "processor-owned"
+    (module_dir / "subprocess.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "DEVNULL = None\n"
+        "class CalledProcessError(Exception):\n"
+        "    pass\n"
+        "def check_output(*args, **kwargs):\n"
+        "    return 'shadow-processor'\n",
+        encoding="utf-8",
+    )
+    payload = _global_call_payload("platform", "_Processor.get")
+
+    report = scan_bytes(payload, source="platform-processor-get-import-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "platform",
+        "_Processor.get",
+        "subprocess.check_output",
+    )
+
+    import platform
+
+    if hasattr(platform._Processor, f"get_{sys.platform}"):  # type: ignore[attr-defined]
+        pytest.skip("platform._Processor.get does not use from_subprocess on this platform")
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("platform", None)
+sys.modules.pop("subprocess", None)
+result = pickle.loads(payload)
+if result != "shadow-processor":
+    raise SystemExit(f"expected shadow processor result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
         cwd=str(tmp_path.parent),
         env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
         check=False,

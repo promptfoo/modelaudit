@@ -12499,3 +12499,154 @@ Performance note:
   search fails, and only for the bounded unique import references analyzed by
   the existing call-graph pass.
 - The Turn 215 payload scans in `0.000107s` after the fix.
+
+## Turn 217 - Bypass via dynamic classmethod fallback import
+
+Found a fresh scanner-clean RCE bypass in `platform._Processor.get`.
+
+Payload shape:
+
+```text
+PROTO 4
+SHORT_BINUNICODE "platform"
+SHORT_BINUNICODE "_Processor.get"
+STACK_GLOBAL
+EMPTY_TUPLE
+REDUCE
+STOP
+```
+
+Scanner proof:
+
+```text
+payload_len 32
+scan verdict clean status complete findings 0 notices 0 scan_s 0.043815
+refs= (mappingproxy({'opcode': 'STACK_GLOBAL', 'module': 'platform',
+  'name': '_Processor.get', 'import_reference': 'platform._Processor.get',
+  'position': 28, 'is_dangerous': False}),)
+invocations= (mappingproxy({'opcode': 'REDUCE', 'module': 'platform',
+  'name': '_Processor.get', 'import_reference': 'platform._Processor.get',
+  'global_position': 28, 'opcode_position': 30,
+  'positional_arg_count': 0}),)
+calls= ('getattr', 'func')
+path= None
+cg= ()
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime stdout
+result shadow-processor
+marker_exists True
+marker_text processor-owned
+
+runtime stderr
+```
+
+The child proof inserted an attacker-controlled directory at the front of
+`sys.path`, removed `platform` and `subprocess` from `sys.modules`, then ran
+`pickle.loads(payload)`. The `platform._Processor.get` classmethod computed:
+
+```python
+func = getattr(cls, f"get_{sys.platform}", cls.from_subprocess)
+return func() or ""
+```
+
+On this platform there is no matching `get_darwin`/`get_linux` method, so the
+fallback `cls.from_subprocess` is invoked. That method performs a function-body
+`import subprocess`; the shadow `subprocess.py` wrote the marker at import time,
+defined `DEVNULL`, `CalledProcessError`, and `check_output()`, then returned
+`shadow-processor`.
+
+Why it bypasses:
+
+- Native policy does not list `platform._Processor.get`.
+- The call graph resolves `platform._Processor.get` but only records
+  `getattr` and the local variable call `func`.
+- It does not model a dynamic `getattr(..., default_callable)` result flowing
+  into an immediate call.
+- `platform._Processor.from_subprocess` is detected if referenced directly, but
+  the call graph does not connect the clean classmethod wrapper to that
+  dangerous fallback.
+
+Likely source-level defense:
+
+- In `_calls_in_function`, recognize assignments where `getattr(obj, dynamic,
+  default)` has a resolvable callable default and the assigned name is later
+  called.
+- Add the resolved default callable as a call edge when the default expression
+  is a local class/member alias such as `cls.from_subprocess`.
+- Keep the existing controlled-`getattr` sink behavior for attacker-controlled
+  attribute names, but treat this pattern as a concrete fallback edge rather
+  than a generic dangerous `getattr`.
+
+Performance note:
+
+- Payload size is only 32 bytes.
+- Cold scan was `0.043815s` due to source-analysis cache population.
+- Warm repeated scans remained clean with median `0.000066s`.
+
+## Turn 218 - Block dynamic `getattr` default-callable fallbacks
+
+Implemented the Turn 217 fix in the Python call graph rather than adding a
+one-off native policy entry for `platform._Processor.get`.
+
+Fix details:
+
+- `_calls_in_function()` now recognizes assignments of
+  `getattr(obj, dynamic_name, default_callable)` when the assigned local is
+  later called.
+- The default callable is resolved through the existing expression resolver, so
+  classmethod defaults such as `cls.from_subprocess` become concrete call edges
+  like `platform._Processor.from_subprocess`.
+- Direct `getattr(..., default_callable)()` calls are also modeled as concrete
+  fallback edges.
+- Existing controlled-`getattr` behavior is preserved: attacker-controlled
+  attribute-name dispatch still maps to the generic controlled getattr sink,
+  while this new path models the concrete fallback callable.
+
+Regression coverage:
+
+- `test_call_graph_models_getattr_default_callable_fallbacks` verifies
+  `platform._Processor.get` includes the
+  `platform._Processor.from_subprocess` edge and reaches
+  `subprocess.check_output`.
+- `test_scan_bytes_blocks_platform_processor_get_dynamic_fallback_rce` scans
+  the Turn 217 payload as malicious and executes it in a child interpreter with
+  attacker-controlled `subprocess.py` first on `sys.path`, proving marker write
+  during `pickle.loads`.
+
+Post-fix proof:
+
+```text
+payload_len 32
+verdict malicious status complete findings 1 duration_s 0.000076
+call_graph [{'module': 'platform', 'name': '_Processor.get',
+  'sink': 'subprocess.check_output',
+  'call_path': ('platform._Processor.get',
+                'platform._Processor.from_subprocess',
+                'subprocess.check_output')}]
+calls ('getattr', 'platform._Processor.from_subprocess')
+path ('platform._Processor.get', 'platform._Processor.from_subprocess',
+      'subprocess.check_output')
+warm_median 0.000100
+```
+
+Validation:
+
+- Focused import/call-graph regression set: `16 passed in 0.71s`.
+- Focused adversarial/noise guard set: `25 passed in 2.17s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3726 passed, 1022 skipped, 21 warnings in 57.94s`.
+
+Performance note:
+
+- The new helper only walks the already-bounded function AST when the function
+  contains a `getattr` call and the cached call-node list has local-name calls.
+- It records local-name-to-default-callable edges, not a broad package policy.
+- The old 32-byte payload now scans malicious with warm median `0.000100s`.
