@@ -1267,21 +1267,62 @@ impl<'a> ScanState<'a> {
         name: &str,
         arguments: &'b [StackValue],
     ) -> Option<&'b GlobalRef> {
-        if !matches!(module, "builtins" | "__builtin__" | "__builtins__")
-            || !Self::builtin_iterable_consumer_arity_matches(name, arguments.len())
-        {
+        if !matches!(module, "builtins" | "__builtin__" | "__builtins__") {
             return None;
         }
-        match arguments.first() {
-            Some(StackValue::CallIterator { callable }) => Some(callable),
-            _ => None,
+        if Self::builtin_iterable_consumer_arity_matches(name, arguments.len()) {
+            if let Some(StackValue::CallIterator { callable }) = arguments.first() {
+                return Some(callable);
+            }
         }
+        Self::builtin_join_consumed_callable(name, arguments)
     }
 
     fn builtin_iterable_consumer_arity_matches(name: &str, argument_count: usize) -> bool {
         match name {
             "all" | "any" | "max" | "min" | "sorted" => argument_count == 1,
+            "bytearray" | "bytes" => argument_count == 1,
             "sum" => (1..=2).contains(&argument_count),
+            _ => false,
+        }
+    }
+
+    fn builtin_join_consumed_callable<'b>(
+        name: &str,
+        arguments: &'b [StackValue],
+    ) -> Option<&'b GlobalRef> {
+        if arguments.len() != 2 {
+            return None;
+        }
+        let receiver = arguments.first();
+        let receiver_matches = match name {
+            "str.join" => Self::is_format_string_argument(receiver),
+            "bytes.join" => Self::is_bytes_like_argument(receiver),
+            "bytearray.join" => Self::is_constructed_builtin_instance(receiver, "bytearray"),
+            _ => false,
+        };
+        if !receiver_matches {
+            return None;
+        }
+        match arguments.get(1) {
+            Some(StackValue::CallIterator { callable }) => Some(callable),
+            _ => None,
+        }
+    }
+
+    fn is_bytes_like_argument(value: Option<&StackValue>) -> bool {
+        matches!(value, Some(StackValue::Bytes { .. }))
+            || Self::is_constructed_builtin_instance(value, "bytes")
+    }
+
+    fn is_constructed_builtin_instance(value: Option<&StackValue>, name: &str) -> bool {
+        match value {
+            Some(StackValue::Constructed(reference)) if !reference.malformed => {
+                matches!(
+                    reference.module.as_str(),
+                    "builtins" | "__builtin__" | "__builtins__"
+                ) && reference.name == name
+            }
             _ => false,
         }
     }

