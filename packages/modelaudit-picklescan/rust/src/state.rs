@@ -1226,6 +1226,13 @@ impl<'a> ScanState<'a> {
         ) {
             return vec![Self::zero_arg_invocation(callable, op_name, position)];
         }
+        if let Some(callable) = Self::method_descriptor_iterable_consumed_callable(
+            &callable_reference.module,
+            &callable_reference.name,
+            arguments,
+        ) {
+            return vec![Self::zero_arg_invocation(callable, op_name, position)];
+        }
 
         if !Self::is_next_call_iterator_consumer(
             &callable_reference.module,
@@ -1335,6 +1342,43 @@ impl<'a> ScanState<'a> {
             }
         }
         Self::builtin_join_consumed_callable(name, arguments)
+    }
+
+    fn method_descriptor_iterable_consumed_callable<'b>(
+        module: &str,
+        name: &str,
+        arguments: &'b [StackValue],
+    ) -> Option<&'b GlobalRef> {
+        match (module, name) {
+            ("builtins" | "__builtin__" | "__builtins__", "dict.fromkeys")
+                if (1..=2).contains(&arguments.len()) =>
+            {
+                arguments.first().and_then(Self::call_iterator_callable_ref)
+            }
+            (
+                "builtins" | "__builtin__" | "__builtins__",
+                "bytearray.__init__" | "bytearray.extend" | "dict.__init__" | "dict.update"
+                | "list.__init__" | "list.extend" | "set.__init__",
+            ) if arguments.len() == 2 => {
+                arguments.get(1).and_then(Self::call_iterator_callable_ref)
+            }
+            (
+                "builtins" | "__builtin__" | "__builtins__",
+                "set.intersection" | "set.union" | "set.update",
+            ) if arguments.len() >= 2 => arguments
+                .iter()
+                .skip(1)
+                .find_map(Self::call_iterator_callable_ref),
+            ("array", "array.extend") if arguments.len() == 2 => {
+                arguments.get(1).and_then(Self::call_iterator_callable_ref)
+            }
+            ("collections", "deque.__init__" | "deque.extend" | "deque.extendleft")
+                if arguments.len() == 2 =>
+            {
+                arguments.get(1).and_then(Self::call_iterator_callable_ref)
+            }
+            _ => None,
+        }
     }
 
     fn builtin_iterable_consumer_arity_matches(name: &str, argument_count: usize) -> bool {
