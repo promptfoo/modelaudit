@@ -1020,25 +1020,71 @@ impl<'a> ScanState<'a> {
         let Some(StackValue::Global(callable_reference)) = callable_value else {
             return Vec::new();
         };
-        if callable_reference.malformed
-            || callable_reference.module != "builtins"
-            || callable_reference.name != "format"
-        {
+        if callable_reference.malformed || callable_reference.module != "builtins" {
             return Vec::new();
         }
         let Some(arguments) = argument_values else {
             return Vec::new();
         };
+        match callable_reference.name.as_str() {
+            "format" => Self::builtins_format_invocations(arguments, op_name, position),
+            "str.format" => Self::str_format_invocations(arguments, op_name, position),
+            _ => Vec::new(),
+        }
+    }
+
+    fn builtins_format_invocations(
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
         if !(1..=2).contains(&arguments.len()) {
             return Vec::new();
         }
         let Some(StackValue::Constructed(receiver_reference)) = arguments.first() else {
             return Vec::new();
         };
-        if receiver_reference.malformed {
+        Self::format_invocation(receiver_reference, op_name, position)
+            .into_iter()
+            .collect()
+    }
+
+    fn str_format_invocations(
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if arguments.len() < 2 || !Self::is_format_string_argument(arguments.first()) {
             return Vec::new();
         }
-        vec![CallableInvocation {
+        arguments
+            .iter()
+            .skip(1)
+            .filter_map(|argument| match argument {
+                StackValue::Constructed(reference) => {
+                    Self::format_invocation(reference, op_name, position)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn is_format_string_argument(value: Option<&StackValue>) -> bool {
+        matches!(
+            value,
+            Some(StackValue::Text(_) | StackValue::TextSpan { .. })
+        )
+    }
+
+    fn format_invocation(
+        receiver_reference: &GlobalRef,
+        op_name: &'static str,
+        position: usize,
+    ) -> Option<CallableInvocation> {
+        if receiver_reference.malformed {
+            return None;
+        }
+        Some(CallableInvocation {
             reference: Self::constructed_protocol_method_reference(
                 receiver_reference,
                 "__format__",
@@ -1046,7 +1092,7 @@ impl<'a> ScanState<'a> {
             op_name,
             opcode_position: position,
             positional_arg_count: Some(1),
-        }]
+        })
     }
 
     fn call_iterator_consumption_invocations(
