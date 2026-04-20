@@ -387,6 +387,8 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("types", "CodeType"),
     ("types", "DynamicClassAttribute.__get__"),
     ("types", "FunctionType"),
+    ("types", "GetSetDescriptorType.__get__"),
+    ("types", "MemberDescriptorType.__get__"),
     ("types", "MethodType"),
     ("typing", "_eval_type"),
     ("typing", "get_type_hints"),
@@ -748,6 +750,14 @@ mod tests {
         assert_eq!(global_severity("types", "MethodType"), Some("critical"));
         assert_eq!(
             global_severity("types", "DynamicClassAttribute.__get__"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("types", "GetSetDescriptorType.__get__"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("types", "MemberDescriptorType.__get__"),
             Some("critical")
         );
         assert_eq!(global_severity("site", "addsitedir"), Some("critical"));

