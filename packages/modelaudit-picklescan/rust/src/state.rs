@@ -139,6 +139,14 @@ fn global_ref_details(
 
 type GlobalReferenceDedupeKey = (String, String, usize, &'static str, bool);
 
+#[derive(Clone)]
+struct CallableInvocation {
+    reference: GlobalRef,
+    op_name: &'static str,
+    opcode_position: usize,
+    positional_arg_count: Option<usize>,
+}
+
 pub(crate) struct ScanState<'a> {
     source: String,
     payload: &'a [u8],
@@ -154,6 +162,7 @@ pub(crate) struct ScanState<'a> {
     errors: Vec<ScanError>,
     protocols: Vec<i64>,
     import_references: Vec<Vec<(String, DetailValue)>>,
+    callable_invocations: Vec<Vec<(String, DetailValue)>>,
     opcode_count: usize,
     opcode_counts: HashMap<&'static str, usize>,
     global_count: usize,
@@ -204,6 +213,7 @@ impl<'a> ScanState<'a> {
             errors: Vec::new(),
             protocols: Vec::new(),
             import_references: Vec::new(),
+            callable_invocations: Vec::new(),
             opcode_count: 0,
             opcode_counts: HashMap::new(),
             global_count: 0,
@@ -663,7 +673,9 @@ impl<'a> ScanState<'a> {
                 });
             }
             name if REDUCE_OPCODES.contains(&name) => {
-                if let Some(callable_ref) = self.consume_callable_opcode(opcode, position) {
+                if let Some(invocation) = self.consume_callable_opcode(opcode, position) {
+                    self.push_callable_invocation(&invocation);
+                    let callable_ref = &invocation.reference;
                     if callable_ref.module == "copyreg.extension" {
                         self.add_finding(Finding {
                             message: format!(
@@ -871,18 +883,31 @@ impl<'a> ScanState<'a> {
         &mut self,
         opcode: &ParsedOpcode,
         position: usize,
-    ) -> Option<GlobalRef> {
-        let callable_value = match opcode.name {
-            "REDUCE" | "NEWOBJ" => self.consume_top_operands(2),
-            "NEWOBJ_EX" => self.consume_top_operands(3),
+    ) -> Option<CallableInvocation> {
+        let (callable_value, positional_arg_count) = match opcode.name {
+            "REDUCE" | "NEWOBJ" => {
+                let values = self.consume_top_operand_values(2)?;
+                (
+                    values.first().cloned(),
+                    Self::tuple_positional_arg_count(values.get(1)),
+                )
+            }
+            "NEWOBJ_EX" => {
+                let values = self.consume_top_operand_values(3)?;
+                (
+                    values.first().cloned(),
+                    Self::tuple_positional_arg_count(values.get(1)),
+                )
+            }
             "OBJ" => {
                 let values = self.pop_to_mark();
-                let callable_value = values.into_iter().next();
+                let positional_arg_count = values.len().checked_sub(1);
+                let callable_value = values.first().cloned();
                 self.push_constructed_result(callable_value.as_ref());
-                callable_value
+                (callable_value, positional_arg_count)
             }
             "INST" => {
-                let _ = self.pop_to_mark();
+                let values = self.pop_to_mark();
                 let (module, name) = opcode.arg.global_parts(self.payload);
                 let reference = GlobalRef {
                     module,
@@ -892,28 +917,50 @@ impl<'a> ScanState<'a> {
                 };
                 self.record_global_ref(&reference, opcode.name);
                 self.stack.push(StackValue::Constructed(reference.clone()));
-                Some(StackValue::Global(reference))
+                (Some(StackValue::Global(reference)), Some(values.len()))
             }
-            "BUILD" => self.consume_top_operands(2),
-            _ => None,
+            "BUILD" => (self.consume_top_operands(2), None),
+            _ => (None, None),
         };
 
         match callable_value {
             Some(StackValue::Global(reference) | StackValue::Constructed(reference))
                 if !reference.malformed =>
             {
-                Some(reference)
+                Some(CallableInvocation {
+                    reference,
+                    op_name: opcode.name,
+                    opcode_position: position,
+                    positional_arg_count,
+                })
             }
             Some(StackValue::Global(reference) | StackValue::Constructed(reference))
                 if reference.module == "copyreg.extension" =>
             {
-                Some(reference)
+                Some(CallableInvocation {
+                    reference,
+                    op_name: opcode.name,
+                    opcode_position: position,
+                    positional_arg_count,
+                })
             }
             _ => None,
         }
     }
 
+    fn tuple_positional_arg_count(value: Option<&StackValue>) -> Option<usize> {
+        match value {
+            Some(StackValue::Tuple(values)) => Some(values.len()),
+            _ => None,
+        }
+    }
+
     fn consume_top_operands(&mut self, operand_count: usize) -> Option<StackValue> {
+        self.consume_top_operand_values(operand_count)
+            .and_then(|values| values.into_iter().next())
+    }
+
+    fn consume_top_operand_values(&mut self, operand_count: usize) -> Option<Vec<StackValue>> {
         if self.stack.len() < operand_count {
             self.stack.push(StackValue::Other);
             return None;
@@ -925,9 +972,8 @@ impl<'a> ScanState<'a> {
             }
         }
         values.reverse();
-        let callable_value = values.into_iter().next();
-        self.push_constructed_result(callable_value.as_ref());
-        callable_value
+        self.push_constructed_result(values.first());
+        Some(values)
     }
 
     fn push_constructed_result(&mut self, callable_value: Option<&StackValue>) {
@@ -1573,6 +1619,46 @@ impl<'a> ScanState<'a> {
         });
     }
 
+    fn push_callable_invocation(&mut self, invocation: &CallableInvocation) {
+        if invocation.reference.malformed
+            || self.callable_invocations.len() >= MAX_IMPORT_REFERENCES
+        {
+            return;
+        }
+
+        let symbol = invocation.reference.symbol();
+        let mut details = vec![
+            (
+                "opcode".to_string(),
+                DetailValue::String(invocation.op_name.to_string()),
+            ),
+            (
+                "module".to_string(),
+                DetailValue::String(invocation.reference.module.clone()),
+            ),
+            (
+                "name".to_string(),
+                DetailValue::String(invocation.reference.name.clone()),
+            ),
+            ("import_reference".to_string(), DetailValue::String(symbol)),
+            (
+                "global_position".to_string(),
+                DetailValue::UInt(invocation.reference.position as u64),
+            ),
+            (
+                "opcode_position".to_string(),
+                DetailValue::UInt(invocation.opcode_position as u64),
+            ),
+        ];
+        if let Some(positional_arg_count) = invocation.positional_arg_count {
+            details.push((
+                "positional_arg_count".to_string(),
+                DetailValue::UInt(positional_arg_count as u64),
+            ));
+        }
+        self.callable_invocations.push(details);
+    }
+
     fn rebuild_seen_notice_keys(&mut self) {
         self.seen_notice_keys = self.notices.iter().map(Notice::dedupe_key).collect();
     }
@@ -2109,6 +2195,11 @@ impl<'a> ScanState<'a> {
             for reference in follow_on_scan.import_references {
                 self.push_import_reference(reference);
             }
+            for invocation in follow_on_scan.callable_invocations {
+                if self.callable_invocations.len() < MAX_IMPORT_REFERENCES {
+                    self.callable_invocations.push(invocation);
+                }
+            }
             if had_findings {
                 self.add_notice(Notice {
                     message: "Follow-on pickle stream detected after malformed padding".to_string(),
@@ -2246,6 +2337,11 @@ impl<'a> ScanState<'a> {
             import_references.append(DetailValue::Dict(reference.clone()).to_py_object(py)?)?;
         }
         metadata.set_item("import_references", import_references)?;
+        let callable_invocations = PyList::empty(py);
+        for invocation in &self.callable_invocations {
+            callable_invocations.append(DetailValue::Dict(invocation.clone()).to_py_object(py)?)?;
+        }
+        metadata.set_item("callable_invocations", callable_invocations)?;
         if !self.protocols.is_empty() {
             metadata.set_item("protocols", &self.protocols)?;
         }

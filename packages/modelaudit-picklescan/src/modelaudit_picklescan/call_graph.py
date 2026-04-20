@@ -175,9 +175,13 @@ class _ImportCallPath:
     call_path: tuple[str, ...]
 
 
-def find_dangerous_call_graphs(import_references: object) -> tuple[CallGraphFinding, ...]:
+def find_dangerous_call_graphs(
+    import_references: object,
+    callable_invocations: object | None = None,
+) -> tuple[CallGraphFinding, ...]:
     findings: list[CallGraphFinding] = []
     seen: set[tuple[str, str]] = set()
+    positional_arg_counts = _callable_invocation_positional_arg_counts(callable_invocations)
     for reference in _iter_import_references(import_references):
         module = str(reference.get("module", ""))
         name = str(reference.get("name", ""))
@@ -189,6 +193,14 @@ def find_dangerous_call_graphs(import_references: object) -> tuple[CallGraphFind
         if not entrypoints:
             continue
         sink_path = _first_matching_path(entrypoints, _find_sink_path)
+        if sink_path is None:
+            for positional_arg_count in positional_arg_counts.get((module, name), ()):
+                sink_path = _first_matching_path(
+                    entrypoints,
+                    _invoked_import_execution_path_callback(positional_arg_count),
+                )
+                if sink_path is not None:
+                    break
         if sink_path is None:
             continue
 
@@ -296,6 +308,15 @@ def _first_matching_path(
     return None
 
 
+def _invoked_import_execution_path_callback(
+    positional_arg_count: int,
+) -> Callable[[str], tuple[str, ...] | None]:
+    def path_for(entrypoint: str) -> tuple[str, ...] | None:
+        return _find_invoked_import_execution_path(entrypoint, positional_arg_count)
+
+    return path_for
+
+
 def _iter_import_references(import_references: object) -> tuple[dict[str, object], ...]:
     if not isinstance(import_references, list | tuple):
         return ()
@@ -313,6 +334,33 @@ def _iter_import_references(import_references: object) -> tuple[dict[str, object
         if len(normalized) >= _MAX_IMPORT_REFERENCES:
             break
     return tuple(normalized)
+
+
+def _callable_invocation_positional_arg_counts(
+    callable_invocations: object | None,
+) -> dict[tuple[str, str], tuple[int, ...]]:
+    if not isinstance(callable_invocations, list | tuple):
+        return {}
+
+    counts: dict[tuple[str, str], set[int]] = {}
+    for item in callable_invocations:
+        if not isinstance(item, Mapping):
+            continue
+        module = str(item.get("module", ""))
+        name = str(item.get("name", ""))
+        positional_arg_count = item.get("positional_arg_count")
+        if (
+            not module
+            or not name
+            or isinstance(positional_arg_count, bool)
+            or not isinstance(positional_arg_count, int)
+            or positional_arg_count < 0
+        ):
+            continue
+        counts.setdefault((module, name), set()).add(positional_arg_count)
+        if len(counts) >= _MAX_IMPORT_REFERENCES:
+            break
+    return {key: tuple(sorted(value, reverse=True)) for key, value in counts.items()}
 
 
 def has_unanalyzed_call_graph_import_references(import_references: object) -> bool:
@@ -335,6 +383,17 @@ def has_unanalyzed_call_graph_import_references(import_references: object) -> bo
 @lru_cache(maxsize=4096)
 def _find_sink_path(start: str) -> tuple[str, ...] | None:
     return _find_matching_call_path(start, _rce_sink)
+
+
+@lru_cache(maxsize=4096)
+def _find_invoked_import_execution_path(start: str, positional_arg_count: int) -> tuple[str, ...] | None:
+    resolved = _resolve_function_target(start)
+    if resolved is None:
+        return None
+    calls = _import_execution_calls_for_invocation(resolved, positional_arg_count)
+    if _IMPORT_EXECUTION_SINK not in calls:
+        return None
+    return (resolved, _IMPORT_EXECUTION_SINK)
 
 
 @lru_cache(maxsize=4096)
@@ -893,6 +952,30 @@ def _class_source_context_for_target(
 
 
 @lru_cache(maxsize=4096)
+def _source_function_context(
+    function_name: str,
+) -> tuple[str, bool, ast.FunctionDef | ast.AsyncFunctionDef] | None:
+    module_name, qualified_name = _split_source_qualified_name(function_name)
+    if module_name is None:
+        return None
+    source_path = _resolve_module_source(module_name)
+    if source_path is None:
+        return None
+    try:
+        if source_path.stat().st_size > _MAX_SOURCE_BYTES:
+            return None
+        source = source_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(source_path))
+    except Exception:
+        return None
+
+    function_node = _find_qualified_function_def(tree, qualified_name)
+    if function_node is None:
+        return None
+    return module_name, source_path.name == "__init__.py", function_node
+
+
+@lru_cache(maxsize=4096)
 def _source_class_context(class_name: str) -> _ClassSourceContext | None:
     module_name, qualified_name = _split_source_qualified_name(class_name)
     if module_name is None:
@@ -1237,6 +1320,33 @@ def _find_qualified_class_def(tree: ast.Module, qualified_name: str) -> ast.Clas
     return current
 
 
+def _find_qualified_function_def(
+    tree: ast.Module,
+    qualified_name: str,
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    parts = qualified_name.split(".")
+    nodes: Iterable[ast.AST] = tree.body
+    for index, part in enumerate(parts):
+        is_leaf = index == len(parts) - 1
+        if is_leaf:
+            return next(
+                (
+                    node
+                    for node in nodes
+                    if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name == part
+                ),
+                None,
+            )
+        parent = next(
+            (node for node in nodes if isinstance(node, ast.ClassDef) and node.name == part),
+            None,
+        )
+        if parent is None:
+            return None
+        nodes = parent.body
+    return None
+
+
 def _collect_function_calls(
     tree: ast.Module,
     module_name: str,
@@ -1403,7 +1513,25 @@ def _import_execution_calls(
 ) -> tuple[str, ...]:
     if _has_required_user_arguments(function_node):
         return ()
+    return _direct_import_execution_calls(function_node, module_name, is_package)
 
+
+@lru_cache(maxsize=4096)
+def _import_execution_calls_for_invocation(function_name: str, positional_arg_count: int) -> tuple[str, ...]:
+    context = _source_function_context(function_name)
+    if context is None:
+        return ()
+    module_name, is_package, function_node = context
+    if not _can_enter_function_with_positional_args(function_node, positional_arg_count):
+        return ()
+    return _direct_import_execution_calls(function_node, module_name, is_package)
+
+
+def _direct_import_execution_calls(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    module_name: str,
+    is_package: bool,
+) -> tuple[str, ...]:
     imports_user_code = False
 
     class _ExecutedImportVisitor(ast.NodeVisitor):
@@ -1439,14 +1567,38 @@ def _import_execution_calls(
 
 
 def _has_required_user_arguments(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    required_count, _maximum_count, has_required_keyword_only = _user_positional_argument_range(function_node)
+    if required_count:
+        return True
+    return has_required_keyword_only
+
+
+def _can_enter_function_with_positional_args(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    positional_arg_count: int,
+) -> bool:
+    required_count, maximum_count, has_required_keyword_only = _user_positional_argument_range(function_node)
+    if has_required_keyword_only or positional_arg_count < required_count:
+        return False
+    return maximum_count is None or positional_arg_count <= maximum_count
+
+
+def _user_positional_argument_range(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> tuple[int, int | None, bool]:
     positional_args = (*function_node.args.posonlyargs, *function_node.args.args)
     required_positional_args = positional_args[: max(len(positional_args) - len(function_node.args.defaults), 0)]
-    if any(argument.arg not in {"self", "cls"} for argument in required_positional_args):
-        return True
-    return any(
+    required_count = sum(1 for argument in required_positional_args if argument.arg not in {"self", "cls"})
+    maximum_count = (
+        None
+        if function_node.args.vararg is not None
+        else sum(1 for argument in positional_args if argument.arg not in {"self", "cls"})
+    )
+    has_required_keyword_only = any(
         argument.arg not in {"self", "cls"} and default is None
         for argument, default in zip(function_node.args.kwonlyargs, function_node.args.kw_defaults, strict=True)
     )
+    return required_count, maximum_count, has_required_keyword_only
 
 
 def _import_module_can_execute_user_code(module_name: str) -> bool:

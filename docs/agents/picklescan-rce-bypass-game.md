@@ -12349,3 +12349,153 @@ Performance note:
 - The import sink is stored as a fallback path while concrete sinks are
   searched first, so stronger paths are not obscured.
 - `base64.main` scan time stayed effectively unchanged at `0.000034s`.
+
+## Turn 215 - Bypass via required-arg direct import side effect
+
+Found a follow-on import-side-effect bypass in `_pyio._open_code_with_warning`.
+
+Payload shape:
+
+```text
+PROTO 4
+SHORT_BINUNICODE "_pyio"
+SHORT_BINUNICODE "_open_code_with_warning"
+STACK_GLOBAL
+SHORT_BINUNICODE "/tmp/.../target.py"
+TUPLE1
+REDUCE
+STOP
+```
+
+Scanner proof on the current branch:
+
+```text
+scan payload_len 110 verdict clean status complete findings 0 notices 0 scan_s 0.000049
+findings= []
+refs= (mappingproxy({'opcode': 'STACK_GLOBAL', 'module': '_pyio', 'name': '_open_code_with_warning', 'import_reference': '_pyio._open_code_with_warning', 'position': 34, 'is_dangerous': False}),)
+calls= ('warnings.warn', '_pyio.open')
+path= None
+cg= ()
+```
+
+Runtime proof:
+
+```text
+runtime rc= 0
+stdout=
+loads_result_type BufferedReader
+loads_result_closed False
+
+stderr=
+
+marker_exists True
+marker_text warnings-owned
+```
+
+The child proof pre-imported `_pyio`, inserted an attacker-controlled directory
+at the front of `sys.path`, removed `warnings` from `sys.modules`, then ran
+`pickle.loads(payload)`. `_pyio._open_code_with_warning(path)` entered its
+function body, imported attacker-controlled `warnings.py`, wrote the marker,
+called the stub `warnings.warn()`, and returned a live `BufferedReader` for the
+pickle-supplied path.
+
+Why it bypasses:
+
+- Turn 214 models directly executed function-body imports only for functions
+  with no required user-supplied arguments.
+- `_pyio._open_code_with_warning(path)` has a required `path` argument, so the
+  import side-effect edge is skipped even when the pickle supplies that
+  argument in the `REDUCE` tuple.
+- Native policy does not list `_pyio._open_code_with_warning`, and `_pyio` is
+  not wildcard-dangerous.
+- The call graph sees `warnings.warn` and `_pyio.open`, but neither is an RCE
+  sink in this path, and the direct `import warnings` statement is suppressed
+  by the arity guard.
+
+Simplification opportunity:
+
+- The next defensive turn should tie import-side-effect modeling to the pickle
+  call site, not only to the static function signature.
+- A focused fix could make the Rust metadata surface callable import references
+  with argument counts, then allow the Python call graph to model direct
+  imports when the pickle provides enough positional arguments for the target
+  function body to execute.
+- A simpler conservative source-level fix is to model direct imports for
+  required-arg functions too, but keep import execution as a fallback sink and
+  retain the previous precision guards for nested functions and stronger
+  concrete sinks.
+
+Performance note:
+
+- Payload size was 110 bytes, dominated by the temp path string.
+- Warm scan time was `0.000049s`.
+- Runtime proof is cheap: one shadow module import, one warning stub call, and
+  one normal file open.
+
+## Turn 216 - Block required-arg direct import side effects at the call site
+
+Implemented the Turn 215 fix closest to the source: the Rust scanner now
+surfaces bounded callable invocation metadata, including positional arg counts,
+and the Python call graph uses that call-site context only as a supplemental
+path for direct function-body import execution.
+
+Fix details:
+
+- Native metadata now includes `callable_invocations` entries with
+  `module`, `name`, `import_reference`, `global_position`, `opcode_position`,
+  `opcode`, and `positional_arg_count` when the REDUCE-like opcode exposes a
+  tuple arity.
+- `find_dangerous_call_graphs(import_references, callable_invocations)` keeps
+  the old single-argument API, still prefers concrete sinks, and only falls
+  back to arg-sensitive import execution when no stronger path exists.
+- Required-arg import execution now requires the pickle to supply enough
+  positional args for the target function body to enter, while rejecting too
+  few or too many args and functions with required keyword-only args.
+- The previous no-arg static behavior is preserved for no-required-arg helpers
+  such as `base64.main`, and `dill.dump` called with an empty tuple remains
+  clean.
+
+Regression coverage:
+
+- `test_call_graph_models_required_arg_imports_when_pickle_supplies_args`
+  proves `_pyio._open_code_with_warning` is not flagged without call-site arity
+  and is flagged when `positional_arg_count == 1`.
+- `test_scan_bytes_blocks_pyio_open_code_warning_import_side_effect_rce`
+  scans the Turn 215 payload as malicious, asserts the emitted
+  `callable_invocations` arity, checks a no-arg control is not flagged, and
+  executes the payload in a child interpreter with attacker-controlled
+  `warnings.py` to prove marker-write RCE during `pickle.loads`.
+
+Post-fix proof:
+
+```text
+payload_len 110
+verdict malicious status complete findings 1 duration_s 0.000107
+call_graph [{'module': '_pyio', 'name': '_open_code_with_warning',
+  'sink': 'builtins.__import__',
+  'call_path': ('_pyio._open_code_with_warning', 'builtins.__import__')}]
+invocations [{'opcode': 'REDUCE', 'module': '_pyio',
+  'name': '_open_code_with_warning', 'positional_arg_count': 1}]
+```
+
+Validation:
+
+- `cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml`:
+  `78 passed`.
+- Focused import/call-graph regression set: `16 passed in 0.80s`.
+- Focused adversarial/noise guard set: `23 passed in 1.95s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3724 passed, 1022 skipped, 21 warnings in 53.37s`.
+
+Performance note:
+
+- The extra native metadata is capped with the same high-water bound used for
+  import-reference reporting and is only a small detail dict per resolved
+  callable invocation.
+- The Python arg-sensitive source lookup runs only after normal call-graph sink
+  search fails, and only for the bounded unique import references analyzed by
+  the existing call-graph pass.
+- The Turn 215 payload scans in `0.000107s` after the fix.
