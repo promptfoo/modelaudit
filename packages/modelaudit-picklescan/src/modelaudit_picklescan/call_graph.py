@@ -134,6 +134,24 @@ class _ModuleAnalysis:
 
 
 @dataclass(frozen=True)
+class _ClassSourceContext:
+    module_name: str
+    class_node: ast.ClassDef
+    aliases: dict[str, str]
+    local_defs: set[str]
+    local_class_nodes: dict[str, ast.ClassDef]
+
+
+@dataclass(frozen=True)
+class _InheritedClassMethod:
+    name: str
+    node: ast.FunctionDef | ast.AsyncFunctionDef
+    module_name: str
+    aliases: dict[str, str]
+    local_defs: set[str]
+
+
+@dataclass(frozen=True)
 class _ImportCallPath:
     module: str
     name: str
@@ -556,7 +574,7 @@ def _collect_local_class_entrypoints(
         class_name = f"{module_name}.{statement.name}"
         method_names = set(_class_method_nodes(statement))
         inherited_method_names = set(
-            _inherited_local_class_methods(
+            _inherited_class_methods(
                 statement,
                 module_name,
                 aliases,
@@ -581,37 +599,111 @@ def _class_method_nodes(class_node: ast.ClassDef) -> dict[str, ast.FunctionDef |
     return {child.name: child for child in class_node.body if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)}
 
 
-def _inherited_local_class_methods(
+def _inherited_class_methods(
     class_node: ast.ClassDef,
     module_name: str,
     aliases: dict[str, str],
     local_defs: set[str],
     local_class_nodes: dict[str, ast.ClassDef],
-) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
-    inherited: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+) -> dict[str, _InheritedClassMethod]:
+    inherited: dict[str, _InheritedClassMethod] = {}
     direct_method_names = set(_class_method_nodes(class_node))
     visited: set[str] = set()
 
-    def visit_base(base_node: ast.ClassDef) -> None:
-        if base_node.name in visited or len(inherited) >= _MAX_INHERITED_CLASS_METHODS:
+    def visit_base(context: _ClassSourceContext) -> None:
+        base_key = f"{context.module_name}.{context.class_node.name}"
+        if base_key in visited or len(inherited) >= _MAX_INHERITED_CLASS_METHODS:
             return
-        visited.add(base_node.name)
-        for method_name, method_node in _class_method_nodes(base_node).items():
+        visited.add(base_key)
+        for method_name, method_node in _class_method_nodes(context.class_node).items():
             if method_name in direct_method_names or method_name in inherited:
                 continue
-            inherited[method_name] = method_node
+            inherited[method_name] = _InheritedClassMethod(
+                name=method_name,
+                node=method_node,
+                module_name=context.module_name,
+                aliases=context.aliases,
+                local_defs=context.local_defs,
+            )
             if len(inherited) >= _MAX_INHERITED_CLASS_METHODS:
                 return
-        for nested_base in _class_base_targets(base_node, module_name, aliases, local_defs):
-            nested_base_node = _local_class_node_from_target(nested_base, module_name, local_class_nodes)
-            if nested_base_node is not None:
-                visit_base(nested_base_node)
+        for nested_base in _class_base_targets(
+            context.class_node,
+            context.module_name,
+            context.aliases,
+            context.local_defs,
+        ):
+            nested_context = _class_source_context_for_target(
+                nested_base,
+                context.module_name,
+                context.aliases,
+                context.local_defs,
+                context.local_class_nodes,
+            )
+            if nested_context is not None:
+                visit_base(nested_context)
 
     for base in _class_base_targets(class_node, module_name, aliases, local_defs):
-        base_node = _local_class_node_from_target(base, module_name, local_class_nodes)
-        if base_node is not None:
-            visit_base(base_node)
+        base_context = _class_source_context_for_target(
+            base,
+            module_name,
+            aliases,
+            local_defs,
+            local_class_nodes,
+        )
+        if base_context is not None:
+            visit_base(base_context)
     return inherited
+
+
+def _class_source_context_for_target(
+    class_target: str,
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+    local_class_nodes: dict[str, ast.ClassDef],
+) -> _ClassSourceContext | None:
+    local_class_node = _local_class_node_from_target(class_target, module_name, local_class_nodes)
+    if local_class_node is not None:
+        return _ClassSourceContext(
+            module_name=module_name,
+            class_node=local_class_node,
+            aliases=aliases,
+            local_defs=local_defs,
+            local_class_nodes=local_class_nodes,
+        )
+    return _source_class_context(class_target)
+
+
+@lru_cache(maxsize=4096)
+def _source_class_context(class_name: str) -> _ClassSourceContext | None:
+    module_name, qualified_name = _split_source_qualified_name(class_name)
+    if module_name is None:
+        return None
+    source_path = _resolve_module_source(module_name)
+    if source_path is None:
+        return None
+    try:
+        if source_path.stat().st_size > _MAX_SOURCE_BYTES:
+            return None
+        source = source_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(source_path))
+    except Exception:
+        return None
+
+    class_node = _find_qualified_class_def(tree, qualified_name)
+    if class_node is None:
+        return None
+    is_package = source_path.name == "__init__.py"
+    aliases = _collect_aliases(tree, module_name, is_package)
+    local_defs = _collect_local_defs(tree)
+    return _ClassSourceContext(
+        module_name=module_name,
+        class_node=class_node,
+        aliases=aliases,
+        local_defs=local_defs,
+        local_class_nodes=_local_class_nodes(tree),
+    )
 
 
 def _local_class_node_from_target(
@@ -965,7 +1057,7 @@ def _collect_function_calls(
                         local_class_entrypoints,
                         class_name=statement.name,
                     )
-            for method_name, method_node in _inherited_local_class_methods(
+            for method_name, method in _inherited_class_methods(
                 statement,
                 module_name,
                 aliases,
@@ -975,11 +1067,16 @@ def _collect_function_calls(
                 function_name = f"{module_name}.{statement.name}.{method_name}"
                 if function_name in calls_by_function:
                     continue
+                inherited_aliases = {
+                    **aliases,
+                    **method.aliases,
+                    **{local_name: f"{method.module_name}.{local_name}" for local_name in method.local_defs},
+                }
                 calls_by_function[function_name] = _calls_in_function(
-                    method_node,
+                    method.node,
                     module_name,
                     is_package,
-                    aliases,
+                    inherited_aliases,
                     local_defs,
                     local_class_targets,
                     local_class_entrypoints,

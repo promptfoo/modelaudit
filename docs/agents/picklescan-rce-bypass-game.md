@@ -10757,3 +10757,159 @@ Measured after clearing `_find_sink_path` caches:
 - Existing wrapper timings stayed in range:
   `six.moves.getoutput` at `0.0000s`, `click.edit` at `0.0498s`, and
   `execnet.makegateway` at `0.0606s`.
+
+## Turn 193 - Bypass via cross-module inherited pickle `__setstate__`
+
+Found and proved a scanner-clean RCE-capable pickle that crosses the boundary
+left by the Turn 192 defense: inherited pickle lifecycle methods from a
+different source module.
+
+The payload imports only:
+
+- `scipy.stats._continuous_distns.norm_gen`
+
+That class is defined in `scipy.stats._continuous_distns` as a subclass of
+`rv_continuous`, imported from `scipy.stats._distn_infrastructure`:
+
+```python
+from ._distn_infrastructure import rv_continuous
+
+class norm_gen(rv_continuous):
+    ...
+```
+
+At runtime, its MRO is:
+
+```text
+norm_gen -> rv_continuous -> rv_generic -> object
+```
+
+The payload uses `NEWOBJ` to allocate a `norm_gen` instance without calling
+`__init__`, then uses `BUILD` with attacker-controlled state. CPython invokes
+the inherited `rv_generic.__setstate__`, which updates `self.__dict__` and
+calls `self._attach_methods()`. For a `norm_gen` instance, that resolves through
+the external base class to `rv_continuous._attach_methods`, then to
+`rv_continuous._attach_argparser_methods`, which executes
+`self._parse_arg_template` via `builtins.exec`.
+
+The malicious state again avoids suspicious string seeds while writing a marker:
+
+```python
+open("<marker>", "w").write("owned-by-scipy-cross-module-setstate")
+def _parse_args(*args):
+    return (), 0, 1
+def _parse_args_stats(*args):
+    return (), 0, 1
+def _parse_args_rvs(*args):
+    return (), 0, 1, None
+```
+
+Proof:
+
+- Payload length: `400` bytes.
+- Scanner verdict: `clean`.
+- Finding count: `0`.
+- Import refs:
+  - `scipy.stats._continuous_distns.norm_gen`, `is_dangerous=False`
+- Call-graph state:
+  - `_call_graph_entrypoints("scipy.stats._continuous_distns.norm_gen") -> ()`
+  - `_find_sink_path("scipy.stats._continuous_distns.norm_gen") -> None`
+  - `_find_sink_path("scipy.stats._continuous_distns.norm_gen.__setstate__") -> None`
+  - `_find_sink_path("scipy.stats._distn_infrastructure.rv_continuous.__setstate__") -> ("scipy.stats._distn_infrastructure.rv_continuous.__setstate__", "scipy.stats._distn_infrastructure.rv_continuous._attach_methods", "scipy.stats._distn_infrastructure.rv_continuous._attach_argparser_methods", "builtins.exec")`
+- Source sizes are within the current static-analysis cap:
+  - `_continuous_distns.py`: `409353` bytes
+  - `_distn_infrastructure.py`: `153570` bytes
+- Runtime after `pickle.loads(payload)`: marker exists and contains
+  `owned-by-scipy-cross-module-setstate`.
+
+Why the scanner missed it:
+
+- Native policy sees only the clean `norm_gen` class global.
+- The Turn 192 inherited-method synthesis is intentionally bounded to base
+  classes in the same parsed source file.
+- `norm_gen` inherits its pickle lifecycle method through an imported base
+  class in another source module, so the class has no modeled entrypoints.
+- The dangerous inherited chain is known if queried on
+  `rv_continuous.__setstate__`, but the scanner does not connect the imported
+  base-class lifecycle method back to the `norm_gen` pickle global.
+- The payload's source string still avoids raw `import`, `exec(`, `eval(`,
+  `compile(`, `os`, `subprocess`, and dunder seeds, so byte/string heuristics
+  do not compensate.
+
+Performance note: the next defensive turn should extend the inherited
+pickle-lifecycle modeling across explicit, source-resolved base classes from
+imports, not just same-file classes. Keep it bounded: only resolve explicit
+base classes, only synthesize pickle lifecycle entrypoints plus methods reached
+from those lifecycle paths, reuse the existing source-size cap, and keep the
+visited/depth limits in place.
+
+## Turn 194 - Block cross-module inherited pickle lifecycle paths
+
+Implemented a source-focused call-graph block for the Turn 193
+`scipy.stats._continuous_distns.norm_gen` bypass.
+
+The inherited method model now follows explicit source-resolved base classes
+across module boundaries:
+
+- Same-file base classes still use the already parsed local class nodes.
+- Imported base classes are resolved with `_split_source_qualified_name` and
+  `_resolve_module_source`, then parsed under the existing `_MAX_SOURCE_BYTES`
+  cap.
+- Inherited methods retain the base module's aliases and local definitions, so
+  helper calls inside base methods are still resolved in the source module that
+  defined them.
+- Inherited methods are still synthesized under the subclass name, so
+  `self.method()` dispatch is analyzed with `self` bound to the actual pickle
+  class.
+- Base traversal remains explicit and bounded by `_MAX_INHERITED_CLASS_METHODS`
+  plus the existing call-graph depth, visited-function, and per-function call
+  limits.
+
+That closes the Turn 193 path:
+
+```text
+scipy.stats._continuous_distns.norm_gen.__setstate__
+  -> scipy.stats._continuous_distns.norm_gen._attach_methods
+  -> scipy.stats._continuous_distns.norm_gen._attach_argparser_methods
+  -> builtins.exec
+```
+
+Regression coverage added to
+`packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py`:
+
+- The test constructs the same `NEWOBJ` + `BUILD` payload shape from Turn 193.
+- It asserts `norm_gen` now has an inherited, subclass-bound
+  `__setstate__` entrypoint.
+- It asserts `_find_sink_path` reaches `builtins.exec` through the synthesized
+  `norm_gen` method path.
+- The payload now scans `malicious` with `DANGEROUS_CALL_GRAPH`.
+- The runtime proof still executes under CPython and writes
+  `owned-by-scipy-cross-module-setstate`.
+
+Focused validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_scipy_norm_gen_cross_module_setstate_rce`
+  passed: `1 passed`.
+- The earlier same-module lifecycle regression also passed:
+  `test_scan_bytes_blocks_scipy_rv_continuous_setstate_rce`.
+- `ruff format`, `ruff check --fix`, and `mypy` passed on the standard
+  ModelAudit paths.
+- Full non-slow/non-integration validation passed:
+  `3706 passed, 1022 skipped, 21 warnings in 42.61s`.
+
+Performance note: the cold entrypoint analysis for the large
+`scipy.stats._continuous_distns` source is measurable but bounded and cached.
+Measured after clearing relevant caches:
+
+- `_call_graph_entrypoints("scipy.stats._continuous_distns.norm_gen")`:
+  `1.8591s`, entrypoint
+  `scipy.stats._continuous_distns.norm_gen.__setstate__`.
+- `_find_sink_path("scipy.stats._continuous_distns.norm_gen.__setstate__")`:
+  `0.0002s`, path
+  `norm_gen.__setstate__ -> norm_gen._attach_methods -> norm_gen._attach_argparser_methods -> builtins.exec`.
+- `_find_sink_path("scipy.stats._distn_infrastructure.rv_continuous.__setstate__")`:
+  `0.0610s`, path
+  `rv_continuous.__setstate__ -> rv_continuous._attach_methods -> rv_continuous._attach_argparser_methods -> builtins.exec`.
+- Existing wrapper timings stayed in range:
+  `numpy._core.fromnumeric._wrapfunc` at `0.0077s` and `click.edit` at
+  `0.0740s`.

@@ -1630,6 +1630,32 @@ def _scipy_rv_continuous_setstate_payload(marker: Path) -> bytes:
     )
 
 
+def _scipy_norm_gen_setstate_payload(marker: Path) -> bytes:
+    parse_arg_template = (
+        f"open({str(marker)!r},'w').write('owned-by-scipy-cross-module-setstate')\n"
+        "def _parse_args(*args):\n    return (), 0, 1\n"
+        "def _parse_args_stats(*args):\n    return (), 0, 1\n"
+        "def _parse_args_rvs(*args):\n    return (), 0, 1, None\n"
+    )
+    state = b"".join(
+        [
+            b"}",
+            _dict_setitem("_parse_arg_template", _text_operand(parse_arg_template)),
+            _dict_setitem("numargs", _int_operand(0)),
+            _dict_setitem("moment_type", _int_operand(0)),
+        ]
+    )
+    return b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("scipy.stats._continuous_distns", "norm_gen"),
+            b")\x81",
+            state,
+            b"b.",
+        ]
+    )
+
+
 def _pyyaml_unsafe_document(marker: Path, marker_content: str) -> str:
     source_tail = f"port pathlib\npathlib.Path({str(marker)!r}).write_text({marker_content!r})"
     return (
@@ -4202,6 +4228,37 @@ def test_scan_bytes_blocks_scipy_rv_continuous_setstate_rce(tmp_path: Path) -> N
     result = pickle.loads(payload)
     assert type(result).__name__ == "rv_continuous"
     assert marker.read_text() == "owned-by-scipy-setstate-exec"
+
+
+@pytest.mark.skipif(not _module_available("scipy.stats._continuous_distns"), reason="SciPy stats is unavailable")
+def test_scan_bytes_blocks_scipy_norm_gen_cross_module_setstate_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "scipy_norm_gen_cross_module_setstate_marker"
+    payload = _scipy_norm_gen_setstate_payload(marker)
+
+    assert _call_graph_entrypoints("scipy.stats._continuous_distns.norm_gen") == (
+        "scipy.stats._continuous_distns.norm_gen.__setstate__",
+    )
+    assert _find_sink_path("scipy.stats._continuous_distns.norm_gen.__setstate__") == (
+        "scipy.stats._continuous_distns.norm_gen.__setstate__",
+        "scipy.stats._continuous_distns.norm_gen._attach_methods",
+        "scipy.stats._continuous_distns.norm_gen._attach_argparser_methods",
+        "builtins.exec",
+    )
+
+    report = scan_bytes(payload, source="scipy-norm-gen-cross-module-setstate-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "scipy.stats._continuous_distns",
+        "norm_gen",
+        "builtins.exec",
+    )
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert type(result).__name__ == "norm_gen"
+    assert marker.read_text() == "owned-by-scipy-cross-module-setstate"
 
 
 @pytest.mark.skipif(not _module_available("yaml"), reason="PyYAML is unavailable")
