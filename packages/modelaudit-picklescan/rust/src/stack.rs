@@ -33,6 +33,9 @@ pub(crate) enum StackValue {
     },
     Global(GlobalRef),
     Constructed(GlobalRef),
+    CallIterator {
+        callable: GlobalRef,
+    },
     Tuple(Vec<StackValue>),
     Primitive {
         type_name: &'static str,
@@ -55,6 +58,9 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
     match value {
         Some(StackValue::Global(reference)) => format!("_GlobalRef({})", reference.symbol()),
         Some(StackValue::Constructed(reference)) => format!("constructed:{}", reference.symbol()),
+        Some(StackValue::CallIterator { callable }) => {
+            format!("call_iterator:{}", callable.symbol())
+        }
         Some(StackValue::TextSpan { start, end }) => {
             format!("str_span(len={})", end.saturating_sub(*start))
         }
@@ -96,6 +102,9 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
         StackValue::Bytes { start, end } => format!("bytes(len={})", end.saturating_sub(*start)),
         StackValue::Global(reference) => format!("global:{}", reference.symbol()),
         StackValue::Constructed(reference) => format!("constructed:{}", reference.symbol()),
+        StackValue::CallIterator { callable } => {
+            format!("call_iterator:{}", callable.symbol())
+        }
         StackValue::Tuple(values) => {
             let mut parts: Vec<String> = values
                 .iter()

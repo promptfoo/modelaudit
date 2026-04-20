@@ -952,6 +952,12 @@ impl<'a> ScanState<'a> {
             opcode.name,
             position,
         ));
+        invocations.extend(Self::call_iterator_consumption_invocations(
+            callable_value.as_ref(),
+            argument_values.as_deref(),
+            opcode.name,
+            position,
+        ));
         invocations
     }
 
@@ -1037,6 +1043,47 @@ impl<'a> ScanState<'a> {
         }]
     }
 
+    fn call_iterator_consumption_invocations(
+        callable_value: Option<&StackValue>,
+        argument_values: Option<&[StackValue]>,
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if !matches!(op_name, "REDUCE" | "OBJ") {
+            return Vec::new();
+        }
+        let Some(StackValue::Global(callable_reference)) = callable_value else {
+            return Vec::new();
+        };
+        if callable_reference.malformed
+            || !Self::is_eager_call_iterator_consumer(
+                &callable_reference.module,
+                &callable_reference.name,
+            )
+        {
+            return Vec::new();
+        }
+        let Some([StackValue::CallIterator { callable }]) = argument_values else {
+            return Vec::new();
+        };
+        vec![CallableInvocation {
+            reference: callable.clone(),
+            op_name,
+            opcode_position: position,
+            positional_arg_count: Some(0),
+        }]
+    }
+
+    fn is_eager_call_iterator_consumer(module: &str, name: &str) -> bool {
+        matches!(
+            (module, name),
+            (
+                "builtins" | "__builtin__" | "__builtins__",
+                "dict" | "frozenset" | "list" | "set" | "tuple"
+            ) | ("collections", "deque")
+        )
+    }
+
     fn constructed_callable_reference(reference: &GlobalRef) -> GlobalRef {
         Self::constructed_protocol_method_reference(reference, "__call__")
     }
@@ -1084,8 +1131,52 @@ impl<'a> ScanState<'a> {
             }
         }
         values.reverse();
-        self.push_constructed_result(values.first());
+        self.push_reducer_result(&values);
         Some(values)
+    }
+
+    fn push_reducer_result(&mut self, values: &[StackValue]) {
+        if let Some(call_iterator) = Self::call_iterator_result(values) {
+            self.stack.push(call_iterator);
+            return;
+        }
+        self.push_constructed_result(values.first());
+    }
+
+    fn call_iterator_result(values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed
+            || !matches!(
+                (
+                    callable_reference.module.as_str(),
+                    callable_reference.name.as_str()
+                ),
+                ("builtins" | "__builtin__" | "__builtins__", "iter")
+            )
+        {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        if arguments.len() != 2 {
+            return None;
+        }
+        let callable = match arguments.first() {
+            Some(StackValue::Global(reference)) if !reference.malformed => reference.clone(),
+            Some(StackValue::Constructed(reference)) if !reference.malformed => {
+                Self::constructed_callable_reference(reference)
+            }
+            Some(StackValue::Global(reference) | StackValue::Constructed(reference))
+                if reference.module == "copyreg.extension" =>
+            {
+                reference.clone()
+            }
+            _ => return None,
+        };
+        Some(StackValue::CallIterator { callable })
     }
 
     fn push_constructed_result(&mut self, callable_value: Option<&StackValue>) {

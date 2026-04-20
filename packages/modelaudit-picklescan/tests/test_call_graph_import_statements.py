@@ -58,6 +58,32 @@ def _sitebuiltins_helper_instance_call_payload() -> bytes:
     return b"".join([b"\x80\x04", _global_operand("_sitebuiltins", "_Helper"), b")R)R."])
 
 
+def _sitebuiltins_helper_call_iterator_payload(*, consume: bool) -> bytes:
+    parts = [
+        b"\x80\x04",
+        _global_operand("_sitebuiltins", "_Helper"),
+        b")R",
+        b"\x94",
+        b"0",
+        _global_operand("builtins", "iter"),
+        b"h\x00",
+        _unicode_operand("stop"),
+        b"\x86R",
+    ]
+    if consume:
+        parts.extend(
+            [
+                b"\x94",
+                b"0",
+                _global_operand("builtins", "list"),
+                b"h\x01",
+                b"\x85R",
+            ]
+        )
+    parts.append(b".")
+    return b"".join(parts)
+
+
 def _builtins_help_payload() -> bytes:
     return _global_call_payload("builtins", "help")
 
@@ -513,6 +539,77 @@ sys.modules.pop("pydoc", None)
 result = pickle.loads(payload)
 if result != "shadow-help":
     raise SystemExit(f"expected shadow help result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+def test_scan_bytes_blocks_iter_callable_sentinel_consumption_rce(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "iter_callable_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'stop'\n",
+        encoding="utf-8",
+    )
+
+    lazy_payload = _sitebuiltins_helper_call_iterator_payload(consume=False)
+    report = scan_bytes(lazy_payload, source="iter-callable-lazy.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+
+    payload = _sitebuiltins_helper_call_iterator_payload(consume=True)
+    report = scan_bytes(payload, source="iter-callable-list-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "_sitebuiltins"
+        and invocation.get("name") == "_Helper.__call__"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != []:
+    raise SystemExit(f"expected empty list result, got {result!r}")
 if not marker.exists():
     raise SystemExit("marker was not written")
 if marker.read_text() != marker_content:
