@@ -30,8 +30,8 @@ def _global_operand(module: str, name: str) -> bytes:
     return _short_binunicode(module.encode()) + _short_binunicode(name.encode()) + b"\x93"
 
 
-def _site_customization_payload(helper_name: str) -> bytes:
-    return b"".join([b"\x80\x04", _global_operand("site", helper_name), b")R."])
+def _global_call_payload(module: str, name: str) -> bytes:
+    return b"".join([b"\x80\x04", _global_operand(module, name), b")R."])
 
 
 def _has_critical_call_graph_finding(report: PickleReport, module: str, name: str, sink: str) -> bool:
@@ -46,11 +46,25 @@ def _has_critical_call_graph_finding(report: PickleReport, module: str, name: st
 
 
 @pytest.mark.parametrize("helper_name", ["execsitecustomize", "execusercustomize"])
-def test_call_graph_models_function_body_import_statements(helper_name: str) -> None:
+def test_call_graph_models_site_customization_import_statements(helper_name: str) -> None:
     function_name = f"site.{helper_name}"
 
     assert "builtins.__import__" in (_calls_for_function(function_name) or ())
     assert _find_sink_path(function_name) == (function_name, "builtins.__import__")
+
+
+def test_call_graph_models_direct_shadowable_function_body_imports() -> None:
+    calls = _calls_for_function("base64.main") or ()
+
+    assert "builtins.__import__" in calls
+    assert _find_sink_path("base64.main") == ("base64.main", "builtins.__import__")
+
+
+def test_call_graph_ignores_imports_inside_nested_functions_until_called() -> None:
+    calls = _calls_for_function("site.enablerlcompleter") or ()
+
+    assert "builtins.__import__" not in calls
+    assert _find_sink_path("site.enablerlcompleter") is None
 
 
 @pytest.mark.parametrize(
@@ -73,7 +87,7 @@ def test_scan_bytes_blocks_site_customization_import_execution_rce(
         f"from pathlib import Path\nPath({str(marker)!r}).write_text({marker_content!r})\n",
         encoding="utf-8",
     )
-    payload = _site_customization_payload(helper_name)
+    payload = _global_call_payload("site", helper_name)
 
     report = scan_bytes(payload, source=f"site-{helper_name}-import-rce.pkl")
 
@@ -106,6 +120,63 @@ if marker.read_text() != marker_content:
 """
     result = subprocess.run(
         [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), module_name, marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+def test_scan_bytes_blocks_base64_main_import_side_effect_rce(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "base64_getopt_marker"
+    marker_content = "getopt-owned"
+    (module_dir / "getopt.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "class error(Exception):\n"
+        "    pass\n"
+        "def getopt(args, shortopts):\n"
+        "    return [('-h', '')], []\n",
+        encoding="utf-8",
+    )
+    payload = _global_call_payload("base64", "main")
+
+    report = scan_bytes(payload, source="base64-main-import-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(report, "base64", "main", "builtins.__import__")
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("getopt", None)
+result = pickle.loads(payload)
+if result is not None:
+    raise SystemExit(f"expected None result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
         cwd=str(tmp_path.parent),
         env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
         check=False,

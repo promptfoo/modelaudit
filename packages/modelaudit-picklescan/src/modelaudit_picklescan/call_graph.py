@@ -25,7 +25,7 @@ _MAX_WILDCARD_REEXPORT_DEPTH = 4
 _MAX_SHORT_SINK_DEPTH = 2
 _CONTROLLED_GETATTR_DISPATCH_SINK = "builtins.getattr.__call__"
 _IMPORT_EXECUTION_SINK = "builtins.__import__"
-_IMPORT_EXECUTION_HOOK_MODULES = frozenset({"sitecustomize", "usercustomize"})
+_IMPORT_EXECUTION_SAFE_MODULES = frozenset(sys.builtin_module_names)
 _PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS = ("__new__", "__init__")
 _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS = ("__setstate__",)
 _INHERITED_CLASS_ENTRYPOINT_METHODS = (
@@ -350,6 +350,7 @@ def _find_file_write_path(start: str) -> tuple[str, ...] | None:
 def _find_matching_call_path(start: str, sink_for: Callable[[str], str | None]) -> tuple[str, ...] | None:
     queue: deque[tuple[str, tuple[str, ...]]] = deque([(start, (start,))])
     visited = {start}
+    import_execution_fallback_path: tuple[str, ...] | None = None
 
     while queue and len(visited) <= _MAX_VISITED_FUNCTIONS:
         function_name, path = queue.popleft()
@@ -374,6 +375,10 @@ def _find_matching_call_path(start: str, sink_for: Callable[[str], str | None]) 
                 # propagate it through wrappers whose arguments may be fixed safely.
                 if _is_tcl_interpreter_dispatch_call(sink) and len(path) > 1:
                     continue
+                if _is_import_execution_sink(sink):
+                    if len(path) == 1 and import_execution_fallback_path is None:
+                        import_execution_fallback_path = (*path, sink)
+                    continue
                 return (*path, sink)
 
         if sink_for is _rce_sink:
@@ -381,7 +386,7 @@ def _find_matching_call_path(start: str, sink_for: Callable[[str], str | None]) 
                 short_sink_path = _find_short_matching_call_path(call, sink_for)
                 if short_sink_path is not None:
                     sink = short_sink_path[-1]
-                    if _is_tcl_interpreter_dispatch_call(sink):
+                    if _is_tcl_interpreter_dispatch_call(sink) or _is_import_execution_sink(sink):
                         continue
                     return (*path, *short_sink_path)
 
@@ -393,7 +398,7 @@ def _find_matching_call_path(start: str, sink_for: Callable[[str], str | None]) 
                 continue
             visited.add(resolved)
             queue.append((resolved, (*path, resolved)))
-    return None
+    return import_execution_fallback_path
 
 
 def _short_sink_call_priority(call_name: str) -> int:
@@ -417,6 +422,8 @@ def _find_short_matching_call_path(start: str, sink_for: Callable[[str], str | N
         for call in calls[:_MAX_CALLS_PER_FUNCTION]:
             sink = sink_for(call)
             if sink is not None:
+                if _is_import_execution_sink(sink):
+                    continue
                 return (*path, sink)
             if depth >= _MAX_SHORT_SINK_DEPTH:
                 continue
@@ -1385,25 +1392,66 @@ def _calls_in_function(
                 calls.extend(class_entrypoints)
                 continue
             calls.append(resolved)
-    calls.extend(_import_execution_calls(function_node))
+    calls.extend(_import_execution_calls(function_node, module_name, is_package))
     return tuple(calls)
 
 
-def _import_execution_calls(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[str, ...]:
-    for node in ast.walk(function_node):
-        if isinstance(node, ast.Import) and any(_is_import_execution_hook_module(alias.name) for alias in node.names):
-            return (_IMPORT_EXECUTION_SINK,)
-        if (
-            isinstance(node, ast.ImportFrom)
-            and node.module != "__future__"
-            and _is_import_execution_hook_module(node.module or "")
-        ):
-            return (_IMPORT_EXECUTION_SINK,)
-    return ()
+def _import_execution_calls(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    module_name: str,
+    is_package: bool,
+) -> tuple[str, ...]:
+    if _has_required_user_arguments(function_node):
+        return ()
+
+    imports_user_code = False
+
+    class _ExecutedImportVisitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            if node is function_node:
+                self.generic_visit(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            if node is function_node:
+                self.generic_visit(node)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return None
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return None
+
+        def visit_Import(self, node: ast.Import) -> None:
+            nonlocal imports_user_code
+            imports_user_code = imports_user_code or any(
+                _import_module_can_execute_user_code(alias.name) for alias in node.names
+            )
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            nonlocal imports_user_code
+            if node.module == "__future__":
+                return
+            imported_module = _resolve_import_from_module(module_name, is_package, node.level, node.module)
+            imports_user_code = imports_user_code or _import_module_can_execute_user_code(imported_module)
+
+    _ExecutedImportVisitor().visit(function_node)
+    return (_IMPORT_EXECUTION_SINK,) if imports_user_code else ()
 
 
-def _is_import_execution_hook_module(module_name: str) -> bool:
-    return module_name.partition(".")[0] in _IMPORT_EXECUTION_HOOK_MODULES
+def _has_required_user_arguments(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    positional_args = (*function_node.args.posonlyargs, *function_node.args.args)
+    required_positional_args = positional_args[: max(len(positional_args) - len(function_node.args.defaults), 0)]
+    if any(argument.arg not in {"self", "cls"} for argument in required_positional_args):
+        return True
+    return any(
+        argument.arg not in {"self", "cls"} and default is None
+        for argument, default in zip(function_node.args.kwonlyargs, function_node.args.kw_defaults, strict=True)
+    )
+
+
+def _import_module_can_execute_user_code(module_name: str) -> bool:
+    top_level_module = module_name.partition(".")[0]
+    return bool(top_level_module) and top_level_module not in _IMPORT_EXECUTION_SAFE_MODULES
 
 
 def _may_use_getattr_dispatch(call_nodes: tuple[ast.Call, ...], aliases: Mapping[str, str]) -> bool:
@@ -1837,3 +1885,7 @@ def _is_tcl_interpreter_dispatch_call(call_name: str) -> bool:
 
 def _is_object_subprocess_dispatch_call(call_name: str) -> bool:
     return call_name.endswith(_SUBPROCESS_DISPATCH_SUFFIXES)
+
+
+def _is_import_execution_sink(call_name: str) -> bool:
+    return call_name == _IMPORT_EXECUTION_SINK

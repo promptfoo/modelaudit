@@ -12186,3 +12186,166 @@ Performance note:
 - The bypass payloads remained cheap to scan after the fix:
   `0.000040s` for `execsitecustomize` and `0.000027s` for
   `execusercustomize`.
+
+## Turn 213 - Bypass via base64.main function-body import
+
+Found another import-side-effect RCE-capable bypass: `base64.main`.
+
+Payload shape:
+
+```text
+PROTO 4
+SHORT_BINUNICODE "base64"
+SHORT_BINUNICODE "main"
+STACK_GLOBAL
+EMPTY_TUPLE
+REDUCE
+STOP
+```
+
+Scanner proof on the current branch:
+
+```text
+payload_len 20 verdict clean status complete findings 0 notices 0 scan_s 0.000029
+refs= (mappingproxy({'opcode': 'STACK_GLOBAL', 'module': 'base64', 'name': 'main', 'import_reference': 'base64.main', 'position': 16, 'is_dangerous': False}),)
+calls= ('getopt.getopt', 'print', 'print', 'sys.exit', 'print', 'builtins.open', 'func', 'func')
+path= None
+cg= ()
+```
+
+Runtime proof:
+
+```text
+rc= 0
+stdout=
+usage: -c [-h|-d|-e|-u] [file|-]
+        -h: print this help message and exit
+        -d, -u: decode
+        -e: encode (default)
+loads_result None
+
+stderr=
+
+marker_exists True
+marker_text getopt-owned
+```
+
+The child proof placed an attacker-controlled `getopt.py` first on `sys.path`,
+removed `getopt` from `sys.modules`, and then called `pickle.loads(payload)`.
+The shadow module wrote the marker at import time. Its `getopt()` stub returned
+`[("-h", "")], []`, so `base64.main()` printed help and returned normally after
+the import side effect.
+
+Why it bypasses:
+
+- Native policy lists several dangerous `base64` helpers, but not
+  `base64.main`; `base64` is not a wildcard-dangerous module.
+- The Python call graph records concrete `ast.Call` edges from `base64.main`
+  (`getopt.getopt`, `sys.exit`, `builtins.open`, etc.) but does not represent
+  the function-body `import sys, getopt` statement as an import-execution edge.
+- Turn 212 intentionally modeled only `sitecustomize` / `usercustomize` hook
+  imports after a generic import-statement sink caused too many false positives.
+  This bypass shows that the source primitive is broader than those two hooks:
+  any shadowable function-body import can execute attacker-controlled top-level
+  module code when `sys.path` is attacker-influenced.
+
+Simplification opportunity:
+
+- The next defensive turn should revisit import statements as a source-level
+  primitive rather than chasing individual helper names.
+- A possible precise rule is to model function-body imports of non-builtin,
+  `sys.path`-resolved modules as import-execution sinks, while preserving
+  existing more-specific sink priority and accounting for the previous benign
+  controls that failed under the fully generic version.
+- This should probably be a dedicated import-side-effect sink/rule so callers
+  can distinguish "executes top-level module import code" from direct command
+  execution sinks like `subprocess.Popen`.
+
+Performance note:
+
+- Payload size is 20 bytes with one import reference.
+- Warm scan time in the proof was `0.000029s`.
+- Runtime proof is also cheap: one shadow module import and a normal
+  `base64.main()` help return.
+
+## Turn 214 - Block direct function-body import side effects
+
+Implemented a source-level call-graph block for the Turn 213 `base64.main`
+bypass.
+
+The call graph now models directly executed function-body imports as
+`builtins.__import__` import-execution sinks when all of these hold:
+
+- The import appears in the current function body, not inside a nested
+  `def`/`async def`/`class`/`lambda`.
+- The imported top-level module is not a builtin module such as `sys`.
+- The function has no required user-supplied arguments, ignoring `self`/`cls`.
+
+Import-execution sinks are also treated as fallback RCE paths. Direct command,
+process, eval, importlib, and other concrete sinks still win when a wrapper
+also reaches a stronger sink. This preserves existing high-signal findings for
+`click.edit -> subprocess.Popen` and `execnet.makegateway -> subprocess.Popen`.
+
+Post-fix proof:
+
+```text
+[base64.main] verdict=malicious findings=1 scan_s=0.000034
+ calls= ('getopt.getopt', 'print', 'print', 'sys.exit', 'print', 'builtins.open', 'func', 'func', 'builtins.__import__')
+ path= ('base64.main', 'builtins.__import__')
+ rules= ['DANGEROUS_CALL_GRAPH']
+[site.execsitecustomize] verdict=malicious findings=1 scan_s=0.000041
+ calls= ('sys.excepthook', 'sys.exc_info', 'builtins.__import__')
+ path= ('site.execsitecustomize', 'builtins.__import__')
+ rules= ['DANGEROUS_CALL_GRAPH']
+[site.execusercustomize] verdict=malicious findings=1 scan_s=0.000033
+ calls= ('sys.excepthook', 'sys.exc_info', 'builtins.__import__')
+ path= ('site.execusercustomize', 'builtins.__import__')
+ rules= ['DANGEROUS_CALL_GRAPH']
+[site.enablerlcompleter] verdict=clean findings=0 scan_s=0.000010
+ calls= ('getattr', 'readline.parse_and_bind', 'readline.parse_and_bind', 'readline.read_init_file', 'readline.get_current_history_length', 'os.path.join', 'os.path.expanduser', 'readline.read_history_file', 'readline.write_history_file', 'atexit.register')
+ path= None
+ rules= []
+```
+
+Regression coverage updated in
+`packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py`:
+
+- Verifies `base64.main` gets a `builtins.__import__` call-graph edge and sink
+  path.
+- Verifies `base64.main` now scans `malicious` with
+  `DANGEROUS_CALL_GRAPH`.
+- Executes the payload in a child interpreter with attacker-controlled
+  `getopt.py` first on `sys.path`, proving marker write during
+  `pickle.loads`.
+- Verifies `site.execsitecustomize` and `site.execusercustomize` remain blocked.
+- Verifies imports inside `site.enablerlcompleter`'s nested hook function are
+  not modeled as immediate import execution when only `site.enablerlcompleter`
+  is invoked.
+
+Precision checks:
+
+- `dill.dump` remains clean when called without required args; Python would
+  raise before entering the function body, so its body imports are not treated
+  as executed for the no-argument pickle call.
+- Prior noisy controls from the broad import experiment still pass.
+- `click.edit` and `execnet.makegateway` keep their stronger
+  `subprocess.Popen` call-graph paths instead of being downgraded to generic
+  import-execution findings.
+
+Validation:
+
+- Focused regression/noise set passed: `17 passed in 1.07s`.
+- Call-graph priority set passed: `12 passed in 0.47s`.
+- `ruff format` passed: `392 files left unchanged`.
+- `ruff check --fix` passed: `All checks passed!`.
+- `mypy` passed: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation passed:
+  `3722 passed, 1022 skipped, 21 warnings in 45.42s`.
+
+Performance note:
+
+- The direct-import visitor runs on already-bounded analyzed function bodies,
+  skips nested definitions, and appends at most one synthetic import sink.
+- The import sink is stored as a fallback path while concrete sinks are
+  searched first, so stronger paths are not obscured.
+- `base64.main` scan time stayed effectively unchanged at `0.000034s`.
