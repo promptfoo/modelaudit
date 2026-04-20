@@ -168,6 +168,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can manufacture delayed `pkgutil.resolve_name` resolver partials
 - **security:** detect descriptor getter pickle call targets that can bind
   recovered function descriptors and expose builtin namespaces
+- **security:** detect wrapper and method descriptor getter pickle call targets
+  that can bind recovered slot wrappers for dynamic attribute access
 - **security:** detect pickle calls to PyYAML unsafe loaders that can execute
   attacker-controlled Python constructors
 - **security:** detect pickle calls to `codecs.open` and codec stream writes
