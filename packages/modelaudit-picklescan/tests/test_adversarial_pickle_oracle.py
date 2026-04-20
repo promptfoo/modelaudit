@@ -1428,6 +1428,34 @@ def _gc_referents_eval_payload(marker: Path, *, include_lookup: bool) -> tuple[b
     return b"".join(parts), code, referent_index
 
 
+def _frame_builtins_descriptor_eval_payload(marker: Path, *, include_lookup: bool) -> tuple[bytes, str]:
+    code = f"open({str(marker)!r},'w').write('owned-by-frame-f-builtins')"
+    code_fragments = [code[offset : offset + 3] for offset in range(0, len(code), 3)]
+
+    def join_fragments(fragments: list[str]) -> list[bytes]:
+        return [
+            _global_operand("builtins", "str.join"),
+            _text_operand(""),
+            _tuple_payload_operands([_text_operand(fragment) for fragment in fragments]),
+            b"\x86R",
+        ]
+
+    parts = [b"\x80\x04"]
+    if include_lookup:
+        parts += [_legacy_global_operand("inspect", "currentframe"), b")R\x940"]
+        parts += [_legacy_global_operand("types", "FrameType.f_builtins.__get__")]
+        parts += [b"h\x00\x85R\x940"]
+        parts += [_global_operand("builtins", "dict.get")]
+        parts += [b"h\x01"]
+        parts += join_fragments(["ev", "al"])
+        parts += [b"\x86R\x940"]
+    parts += join_fragments(code_fragments)
+    if include_lookup:
+        parts += [b"\x940h\x02h\x03\x85R"]
+    parts += [b"."]
+    return b"".join(parts), code
+
+
 def _site_os_system_payload(command: str, *, include_call: bool) -> bytes:
     parts = [b"\x80\x04"]
     if include_call:
@@ -3708,6 +3736,42 @@ def test_scan_bytes_blocks_gc_referents_builtin_eval_recovery_rce(tmp_path: Path
     result = pickle.loads(payload)
     assert result == len("owned-by-gc-referents")
     assert marker.read_text() == "owned-by-gc-referents"
+
+
+def test_scan_bytes_blocks_frame_builtins_descriptor_eval_recovery_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "frame_builtins_descriptor_eval_marker"
+    control_payload, expected_code = _frame_builtins_descriptor_eval_payload(marker, include_lookup=False)
+    payload, _ = _frame_builtins_descriptor_eval_payload(marker, include_lookup=True)
+
+    control_report = scan_bytes(control_payload, source="frame-builtins-descriptor-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert control_result == expected_code
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="frame-builtins-descriptor-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_global_finding(report, "inspect", "currentframe")
+    assert _has_critical_global_finding(report, "types", "FrameType.f_builtins.__get__")
+
+    for module, name in [
+        ("inspect", "currentframe"),
+        ("types", "FrameType.f_builtins.__get__"),
+        ("types", "FrameType.f_globals.__get__"),
+        ("types", "FrameType.f_locals.__get__"),
+    ]:
+        for global_payload in [_legacy_global_operand(module, name), _global_operand(module, name)]:
+            direct_report = scan_bytes(b"\x80\x04" + global_payload + b".", source=f"{module}-{name}-direct.pkl")
+            assert direct_report.verdict == SafetyVerdict.MALICIOUS
+            assert _has_critical_global_finding(direct_report, module, name)
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result == len("owned-by-frame-f-builtins")
+    assert marker.read_text() == "owned-by-frame-f-builtins"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="os.system proof uses POSIX shell redirection")

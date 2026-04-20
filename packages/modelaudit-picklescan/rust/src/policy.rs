@@ -303,6 +303,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("gc", "get_objects"),
     ("gc", "get_referents"),
     ("gc", "get_referrers"),
+    ("inspect", "currentframe"),
     ("inspect", "getmembers"),
     ("io", "FileIO"),
     ("io", "FileIO.write"),
@@ -408,6 +409,9 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("types", "ClassMethodDescriptorType.__get__"),
     ("types", "CodeType"),
     ("types", "DynamicClassAttribute.__get__"),
+    ("types", "FrameType.f_builtins.__get__"),
+    ("types", "FrameType.f_globals.__get__"),
+    ("types", "FrameType.f_locals.__get__"),
     ("types", "FunctionType"),
     ("types", "GetSetDescriptorType.__get__"),
     ("types", "MemberDescriptorType.__get__"),
@@ -565,6 +569,7 @@ mod tests {
         for name in ["get_objects", "get_referents", "get_referrers"] {
             assert_eq!(global_severity("gc", name), Some("critical"));
         }
+        assert_eq!(global_severity("inspect", "currentframe"), Some("critical"));
         assert_eq!(global_severity("inspect", "getmembers"), Some("critical"));
         assert_eq!(global_severity("itertools", "accumulate"), Some("critical"));
         assert_eq!(global_severity("itertools", "dropwhile"), Some("critical"));
@@ -797,6 +802,13 @@ mod tests {
             global_severity("types", "DynamicClassAttribute.__get__"),
             Some("critical")
         );
+        for name in [
+            "FrameType.f_builtins.__get__",
+            "FrameType.f_globals.__get__",
+            "FrameType.f_locals.__get__",
+        ] {
+            assert_eq!(global_severity("types", name), Some("critical"));
+        }
         assert_eq!(
             global_severity("types", "GetSetDescriptorType.__get__"),
             Some("critical")

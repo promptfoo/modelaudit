@@ -176,6 +176,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loaded process capabilities without direct imports
 - **security:** detect garbage collector object-graph globals that can recover
   hidden namespaces and loaded process capabilities
+- **security:** detect frame-introspection globals and frame namespace
+  descriptor getters used for dynamic builtin recovery
 - **security:** detect pickle calls to PyYAML unsafe loaders that can execute
   attacker-controlled Python constructors
 - **security:** detect pickle calls to `codecs.open` and codec stream writes

@@ -8882,3 +8882,107 @@ Blocking plan:
 Performance note: this remains a sorted Rust policy-table lookup over parsed
 pickle globals. It adds no runtime GC traversal, referent layout modeling,
 heap-index tracking, or package-specific call-graph expansion.
+
+## Turn 161 - Bypass via frame builtin descriptor recovery
+
+Found a scanner-clean RCE that bypasses the GC blocks by using Python frame
+introspection and a concrete frame descriptor. The payload calls clean
+`inspect.currentframe()` to obtain a live frame, then imports the already-bound
+descriptor method `types.FrameType.f_builtins.__get__` through legacy `GLOBAL`.
+Calling that bound descriptor getter on the frame returns the frame's builtin
+dictionary directly. The payload then recovers `eval` with `dict.get` and
+executes a fragmented source string.
+
+This avoids the Turn 156 namespace component blocks because the pickle never
+imports `__builtins__`, `__dict__`, or `__globals__`. It also avoids the
+descriptor-type blocks because the pickle never imports
+`types.GetSetDescriptorType.__get__`; it imports a concrete descriptor object's
+already-bound `__get__` method.
+
+Proof payload shape:
+
+```python
+frame = inspect.currentframe()
+builtins_dict = types.FrameType.f_builtins.__get__(frame)
+fn = dict.get(builtins_dict, "".join(["ev", "al"]))
+code = "".join(
+    [
+        "open('/tmp/.../marker','w').write('owned-by-frame-f-builtins')",
+    ]
+)
+fn(code)
+```
+
+The active pickle imports only:
+
+- `inspect.currentframe` via legacy `GLOBAL`
+- `types.FrameType.f_builtins.__get__` via legacy `GLOBAL`
+- `builtins.dict.get`
+- two `builtins.str.join` references
+
+Proof on CPython 3.12.12:
+
+- Control payload scanner result: `len=245`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control import references: one clean `builtins.str.join`.
+- Control runtime: `pickle.loads(control)` returns the assembled eval code
+  string and creates no marker.
+- Active payload scanner result: `len=382`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references: clean `inspect.currentframe`, clean
+  `types.FrameType.f_builtins.__get__`, clean `builtins.dict.get`, and two
+  clean `builtins.str.join` references, all with `is_dangerous=False`.
+- Active runtime before unpickle: marker absent.
+- Active runtime after unpickle: marker exists and contains
+  `owned-by-frame-f-builtins`; `pickle.loads(active)` returns the integer byte
+  count from `open(...).write(...)`.
+
+Why the scanner missed it:
+
+- `inspect.currentframe` is not in the dangerous global policy table and the
+  `inspect` module is not wildcard-blocked.
+- The descriptor policy blocks descriptor *type* binders such as
+  `types.GetSetDescriptorType.__get__`, but not concrete bound descriptor
+  methods such as `types.FrameType.f_builtins.__get__` and
+  `types.FrameType.f_globals.__get__`.
+- The namespace-source block only checks parsed global-name components such as
+  `__builtins__`, `__dict__`, and `__globals__`. Frame attributes use
+  `f_builtins`, `f_globals`, and `f_locals`, so the same namespaces are exposed
+  without those blocked component names.
+- The payload fragments `eval` and the source string with `str.join`, so the
+  suspicious-string scan sees only short harmless fragments.
+- The stack model treats `inspect.currentframe()` as opaque and does not know
+  that applying the frame descriptor getter to that object returns the builtin
+  namespace.
+
+Performance note: the next block should stay near frame introspection source
+primitives. Marking `inspect.currentframe` plus concrete frame namespace
+descriptor getters such as `types.FrameType.f_builtins.__get__`,
+`types.FrameType.f_globals.__get__`, and `types.FrameType.f_locals.__get__` as
+critical would cut off this family without runtime frame inspection, descriptor
+binding simulation, or stack provenance modeling.
+
+## Turn 162 - Block frame introspection namespace recovery
+
+Blocking plan:
+
+- Add `inspect.currentframe` to the finite dangerous-global policy table. A
+  live frame is a source primitive for the current execution namespace.
+- Add concrete frame namespace descriptor getters to the same table:
+  `types.FrameType.f_builtins.__get__`,
+  `types.FrameType.f_globals.__get__`, and
+  `types.FrameType.f_locals.__get__`.
+- Add Rust unit coverage for the frame source and all three descriptor getter
+  globals.
+- Add a CPython oracle regression for the Turn 161 payload. The control payload
+  only assembles the eval code string and remains clean; the active payload
+  imports `inspect.currentframe` and
+  `types.FrameType.f_builtins.__get__`, is flagged as malicious, and still
+  writes the marker if loaded.
+- Add direct legacy-`GLOBAL` and `STACK_GLOBAL` regressions for the frame
+  source and all three concrete descriptor getter globals.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: this remains a sorted Rust policy-table lookup over parsed
+pickle globals. It does not inspect frames, bind descriptors, model frame
+attribute layout, or add stack-provenance tracking.
