@@ -707,6 +707,27 @@ def _builtins_help_defaultdict_formatter_private_vformat_payload(*, lookup: bool
     return b"".join(parts)
 
 
+def _builtins_help_defaultdict_template_payload(method_name: str, template: str) -> bytes:
+    return b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("collections", "defaultdict"),
+            _global_operand("builtins", "help"),
+            b"\x85R",
+            b"\x94",
+            b"0",
+            _global_operand("string", "Template"),
+            _args_tuple(_unicode_operand(template)),
+            b"R",
+            b"\x94",
+            b"0",
+            _global_operand("string", method_name),
+            _args_tuple(b"h\x01", b"h\x00"),
+            b"R.",
+        ]
+    )
+
+
 def _ipaddress_format_payload() -> bytes:
     return b"".join(
         [
@@ -5040,6 +5061,88 @@ if marker.read_text() != marker_content:
     )
     assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
+
+
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+def test_scan_bytes_blocks_template_defaultdict_factory_rce(tmp_path: Path, method_name: str) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / f"{method_name.replace('.', '_')}_defaultdict_factory_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+    payload = _builtins_help_defaultdict_template_payload(method_name, "$missing")
+
+    report = scan_bytes(payload, source=f"string-{method_name}-defaultdict-factory-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != "factory-value":
+    raise SystemExit(f"expected factory value result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+@pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
+def test_scan_bytes_keeps_template_defaultdict_no_placeholder_clean(method_name: str) -> None:
+    payload = _builtins_help_defaultdict_template_payload(method_name, "plain text")
+
+    report = scan_bytes(payload, source=f"string-{method_name}-defaultdict-no-placeholder.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
 
 
 def test_scan_bytes_blocks_formatter_vformat_defaultdict_factory_rce(tmp_path: Path) -> None:

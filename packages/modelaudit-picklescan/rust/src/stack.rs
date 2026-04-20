@@ -57,6 +57,9 @@ pub(crate) enum StackValue {
     DefaultDict {
         default_factory: GlobalRef,
     },
+    StringTemplate {
+        template: String,
+    },
     RegexPattern {
         pattern: String,
         flags: Option<isize>,
@@ -104,6 +107,9 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
         ),
         Some(StackValue::DefaultDict { default_factory }) => {
             format!("defaultdict(factory={})", default_factory.symbol())
+        }
+        Some(StackValue::StringTemplate { template }) => {
+            format!("string_template:{template:?}")
         }
         Some(StackValue::RegexPattern { pattern, flags }) => {
             format!(
@@ -197,6 +203,7 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
         StackValue::DefaultDict { default_factory } => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
+        StackValue::StringTemplate { template } => format!("string_template:{template:?}"),
         StackValue::RegexPattern { pattern, flags } => {
             format!(
                 "regex_pattern:{pattern:?},flags={}",

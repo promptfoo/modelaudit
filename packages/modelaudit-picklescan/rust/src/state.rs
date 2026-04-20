@@ -1350,6 +1350,9 @@ impl<'a> ScanState<'a> {
             ("string", "Formatter._vformat") => {
                 Self::formatter_private_vformat_invocations(arguments, op_name, position)
             }
+            ("string", "Template.substitute" | "Template.safe_substitute") => {
+                Self::template_substitute_invocations(arguments, op_name, position)
+            }
             _ => Vec::new(),
         }
     }
@@ -1944,6 +1947,41 @@ impl<'a> ScanState<'a> {
         Self::defaultdict_mapping_lookup_invocations(arguments.get(3), op_name, position)
     }
 
+    fn template_substitute_invocations(
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if arguments.len() != 2 || !Self::string_template_may_lookup(arguments.first()) {
+            return Vec::new();
+        }
+        Self::defaultdict_mapping_lookup_invocations(arguments.get(1), op_name, position)
+    }
+
+    fn string_template_may_lookup(value: Option<&StackValue>) -> bool {
+        let Some(StackValue::StringTemplate { template }) = value else {
+            return false;
+        };
+        Self::template_literal_contains_placeholder(template)
+    }
+
+    fn template_literal_contains_placeholder(template: &str) -> bool {
+        let mut chars = template.chars().peekable();
+        while let Some(character) = chars.next() {
+            if character != '$' {
+                continue;
+            }
+            match chars.peek() {
+                Some('$') => {
+                    chars.next();
+                }
+                Some(_) => return true,
+                None => {}
+            }
+        }
+        false
+    }
+
     fn is_format_string_argument(value: Option<&StackValue>) -> bool {
         matches!(
             value,
@@ -2524,6 +2562,10 @@ impl<'a> ScanState<'a> {
             self.stack.push(defaultdict);
             return;
         }
+        if let Some(template) = self.string_template_result(values) {
+            self.stack.push(template);
+            return;
+        }
         if let Some(tuple_item) = Self::tuple_getitem_result(values) {
             self.stack.push(tuple_item);
             return;
@@ -2637,6 +2679,28 @@ impl<'a> ScanState<'a> {
             done: false,
             memo_index: None,
         }))
+    }
+
+    fn string_template_result(&self, values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed
+            || callable_reference.module != "string"
+            || callable_reference.name != "Template"
+        {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        if arguments.len() != 1 {
+            return None;
+        }
+        let template = arguments
+            .first()
+            .and_then(|value| stack_value_string(value, self.payload))?;
+        Some(StackValue::StringTemplate { template })
     }
 
     fn lazy_zero_arg_callback_iterable_result(values: &[StackValue]) -> Option<StackValue> {
