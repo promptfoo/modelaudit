@@ -673,9 +673,12 @@ impl<'a> ScanState<'a> {
                 });
             }
             name if REDUCE_OPCODES.contains(&name) => {
-                if let Some(invocation) = self.consume_callable_opcode(opcode, position) {
-                    self.push_callable_invocation(&invocation);
-                    let callable_ref = &invocation.reference;
+                let invocations = self.consume_callable_opcode(opcode, position);
+                for invocation in &invocations {
+                    self.push_callable_invocation(invocation);
+                }
+                if let Some(primary_invocation) = invocations.first() {
+                    let callable_ref = &primary_invocation.reference;
                     if callable_ref.module == "copyreg.extension" {
                         self.add_finding(Finding {
                             message: format!(
@@ -883,28 +886,35 @@ impl<'a> ScanState<'a> {
         &mut self,
         opcode: &ParsedOpcode,
         position: usize,
-    ) -> Option<CallableInvocation> {
-        let (callable_value, positional_arg_count) = match opcode.name {
+    ) -> Vec<CallableInvocation> {
+        let (callable_value, positional_arg_count, argument_values) = match opcode.name {
             "REDUCE" | "NEWOBJ" => {
-                let values = self.consume_top_operand_values(2)?;
+                let Some(values) = self.consume_top_operand_values(2) else {
+                    return Vec::new();
+                };
                 (
                     values.first().cloned(),
                     Self::tuple_positional_arg_count(values.get(1)),
+                    Self::tuple_argument_values(values.get(1)),
                 )
             }
             "NEWOBJ_EX" => {
-                let values = self.consume_top_operand_values(3)?;
+                let Some(values) = self.consume_top_operand_values(3) else {
+                    return Vec::new();
+                };
                 (
                     values.first().cloned(),
                     Self::tuple_positional_arg_count(values.get(1)),
+                    Self::tuple_argument_values(values.get(1)),
                 )
             }
             "OBJ" => {
                 let values = self.pop_to_mark();
                 let positional_arg_count = values.len().checked_sub(1);
                 let callable_value = values.first().cloned();
+                let argument_values = values.get(1..).map(|items| items.to_vec());
                 self.push_constructed_result(callable_value.as_ref());
-                (callable_value, positional_arg_count)
+                (callable_value, positional_arg_count, argument_values)
             }
             "INST" => {
                 let values = self.pop_to_mark();
@@ -917,29 +927,57 @@ impl<'a> ScanState<'a> {
                 };
                 self.record_global_ref(&reference, opcode.name);
                 self.stack.push(StackValue::Constructed(reference.clone()));
-                (Some(StackValue::Global(reference)), Some(values.len()))
+                (
+                    Some(StackValue::Global(reference)),
+                    Some(values.len()),
+                    Some(values),
+                )
             }
-            "BUILD" => (self.consume_top_operands(2), None),
-            _ => (None, None),
+            "BUILD" => (self.consume_top_operands(2), None, None),
+            _ => (None, None, None),
         };
 
+        let mut invocations = Vec::new();
+        if let Some(invocation) = Self::callable_invocation_for_value(
+            callable_value.as_ref(),
+            opcode.name,
+            position,
+            positional_arg_count,
+        ) {
+            invocations.push(invocation);
+        }
+        invocations.extend(Self::protocol_dispatch_invocations(
+            callable_value.as_ref(),
+            argument_values.as_deref(),
+            opcode.name,
+            position,
+        ));
+        invocations
+    }
+
+    fn callable_invocation_for_value(
+        callable_value: Option<&StackValue>,
+        op_name: &'static str,
+        position: usize,
+        positional_arg_count: Option<usize>,
+    ) -> Option<CallableInvocation> {
         match callable_value {
             Some(StackValue::Global(reference)) if !reference.malformed => {
                 Some(CallableInvocation {
-                    reference,
-                    op_name: opcode.name,
+                    reference: reference.clone(),
+                    op_name,
                     opcode_position: position,
                     positional_arg_count,
                 })
             }
             Some(StackValue::Constructed(reference)) if !reference.malformed => {
-                let reference = match opcode.name {
+                let reference = match op_name {
                     "REDUCE" | "OBJ" => Self::constructed_callable_reference(&reference),
-                    _ => reference,
+                    _ => reference.clone(),
                 };
                 Some(CallableInvocation {
                     reference,
-                    op_name: opcode.name,
+                    op_name,
                     opcode_position: position,
                     positional_arg_count,
                 })
@@ -948,8 +986,8 @@ impl<'a> ScanState<'a> {
                 if reference.module == "copyreg.extension" =>
             {
                 Some(CallableInvocation {
-                    reference,
-                    op_name: opcode.name,
+                    reference: reference.clone(),
+                    op_name,
                     opcode_position: position,
                     positional_arg_count,
                 })
@@ -958,12 +996,67 @@ impl<'a> ScanState<'a> {
         }
     }
 
+    fn protocol_dispatch_invocations(
+        callable_value: Option<&StackValue>,
+        argument_values: Option<&[StackValue]>,
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if !matches!(op_name, "REDUCE" | "OBJ") {
+            return Vec::new();
+        }
+        let Some(StackValue::Global(callable_reference)) = callable_value else {
+            return Vec::new();
+        };
+        if callable_reference.malformed
+            || callable_reference.module != "builtins"
+            || callable_reference.name != "format"
+        {
+            return Vec::new();
+        }
+        let Some(arguments) = argument_values else {
+            return Vec::new();
+        };
+        if !(1..=2).contains(&arguments.len()) {
+            return Vec::new();
+        }
+        let Some(StackValue::Constructed(receiver_reference)) = arguments.first() else {
+            return Vec::new();
+        };
+        if receiver_reference.malformed {
+            return Vec::new();
+        }
+        vec![CallableInvocation {
+            reference: Self::constructed_protocol_method_reference(
+                receiver_reference,
+                "__format__",
+            ),
+            op_name,
+            opcode_position: position,
+            positional_arg_count: Some(1),
+        }]
+    }
+
     fn constructed_callable_reference(reference: &GlobalRef) -> GlobalRef {
+        Self::constructed_protocol_method_reference(reference, "__call__")
+    }
+
+    fn constructed_protocol_method_reference(
+        reference: &GlobalRef,
+        method_name: &str,
+    ) -> GlobalRef {
         GlobalRef {
             module: reference.module.clone(),
-            name: format!("{}.__call__", reference.name),
+            name: format!("{}.{}", reference.name, method_name),
             position: reference.position,
             malformed: reference.malformed,
+        }
+    }
+
+    fn tuple_argument_values(value: Option<&StackValue>) -> Option<Vec<StackValue>> {
+        match value {
+            Some(StackValue::Tuple(values)) => Some(values.clone()),
+            _ => None,
         }
     }
 

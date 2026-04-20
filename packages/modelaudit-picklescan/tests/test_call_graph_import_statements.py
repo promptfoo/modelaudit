@@ -58,6 +58,21 @@ def _sitebuiltins_helper_instance_call_payload() -> bytes:
     return b"".join([b"\x80\x04", _global_operand("_sitebuiltins", "_Helper"), b")R)R."])
 
 
+def _ipaddress_format_payload() -> bytes:
+    return b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("ipaddress", "IPv4Address"),
+            _args_tuple(_unicode_operand("1.2.3.4")),
+            b"R",
+            b"\x94",
+            _global_operand("builtins", "format"),
+            _args_tuple(b"h\x00", _unicode_operand("b")),
+            b"R.",
+        ]
+    )
+
+
 def _typing_extensions_get_type_hints_payload(marker: Path) -> bytes:
     marker_content = "typing-ext-owned"
     annotation_expr = f"open({str(marker)!r},'w').write({marker_content!r})"
@@ -244,6 +259,51 @@ def test_call_graph_models_constructed_callable_instance_invocations() -> None:
     assert findings[0].call_path == ("_sitebuiltins._Helper.__call__", "builtins.__import__")
 
 
+def test_call_graph_models_builtin_format_protocol_dispatch_invocations() -> None:
+    import_references = [
+        {
+            "module": "ipaddress",
+            "name": "IPv4Address",
+            "import_reference": "ipaddress.IPv4Address",
+        },
+        {
+            "module": "builtins",
+            "name": "format",
+            "import_reference": "builtins.format",
+        },
+    ]
+    direct_invocations = [
+        {
+            "module": "ipaddress",
+            "name": "IPv4Address",
+            "positional_arg_count": 1,
+        },
+        {
+            "module": "builtins",
+            "name": "format",
+            "positional_arg_count": 2,
+        },
+    ]
+    protocol_invocations = [
+        *direct_invocations,
+        {
+            "module": "ipaddress",
+            "name": "IPv4Address.__format__",
+            "positional_arg_count": 1,
+        },
+    ]
+
+    assert find_dangerous_call_graphs(import_references, direct_invocations) == ()
+
+    findings = find_dangerous_call_graphs(import_references, protocol_invocations)
+
+    assert len(findings) == 1
+    assert findings[0].module == "ipaddress"
+    assert findings[0].name == "IPv4Address.__format__"
+    assert findings[0].sink == "builtins.__import__"
+    assert findings[0].call_path == ("ipaddress.IPv4Address.__format__", "builtins.__import__")
+
+
 @pytest.mark.parametrize(
     ("helper_name", "module_name", "marker_content"),
     [
@@ -356,6 +416,80 @@ sys.modules.pop("pydoc", None)
 result = pickle.loads(payload)
 if result != "shadow-help":
     raise SystemExit(f"expected shadow help result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+def test_scan_bytes_blocks_ipaddress_format_protocol_dispatch_import_rce(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "ipaddress_format_marker"
+    marker_content = "re-owned"
+    (module_dir / "re.py").write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "class Match:\n"
+        "    def groups(self):\n"
+        "        return ('', '', 'b')\n"
+        "class Pattern:\n"
+        "    def fullmatch(self, text):\n"
+        "        return Match() if text == 'b' else None\n"
+        "def compile(pattern):\n"
+        "    return Pattern()\n",
+        encoding="utf-8",
+    )
+    payload = _ipaddress_format_payload()
+
+    report = scan_bytes(payload, source="ipaddress-format-protocol-dispatch-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "ipaddress",
+        "IPv4Address.__format__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "ipaddress"
+        and invocation.get("name") == "IPv4Address.__format__"
+        and invocation.get("positional_arg_count") == 1
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("ipaddress", None)
+sys.modules.pop("re", None)
+result = pickle.loads(payload)
+if result != "00000001000000100000001100000100":
+    raise SystemExit(f"expected binary IPv4 result, got {result!r}")
 if not marker.exists():
     raise SystemExit("marker was not written")
 if marker.read_text() != marker_content:

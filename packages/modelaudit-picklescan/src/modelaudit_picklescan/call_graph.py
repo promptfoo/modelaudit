@@ -1106,10 +1106,40 @@ def _source_function_context(
     except Exception:
         return None
 
-    function_node = _find_qualified_function_def(_module_level_statements(tree), qualified_name)
+    module_statements = _module_level_statements(tree)
+    function_node = _find_qualified_function_def(module_statements, qualified_name)
     if function_node is None:
-        return None
+        return _inherited_source_function_context(module_statements, module_name, source_path, qualified_name)
     return module_name, source_path.name == "__init__.py", function_node
+
+
+def _inherited_source_function_context(
+    module_statements: Iterable[ast.stmt],
+    module_name: str,
+    source_path: Path,
+    qualified_name: str,
+) -> tuple[str, bool, ast.FunctionDef | ast.AsyncFunctionDef] | None:
+    class_qualified_name, _separator, method_name = qualified_name.rpartition(".")
+    if not class_qualified_name or not method_name:
+        return None
+    class_node = _find_qualified_class_def(module_statements, class_qualified_name)
+    if class_node is None:
+        return None
+    is_package = source_path.name == "__init__.py"
+    aliases = _collect_aliases(module_statements, module_name, is_package)
+    local_defs = _collect_local_defs(module_statements)
+    inherited_method = _inherited_class_methods(
+        class_node,
+        module_name,
+        aliases,
+        local_defs,
+        _local_class_nodes(module_statements),
+    ).get(method_name)
+    if inherited_method is None:
+        return None
+    inherited_source_path = _resolve_module_source(inherited_method.module_name)
+    inherited_is_package = inherited_source_path is not None and inherited_source_path.name == "__init__.py"
+    return inherited_method.module_name, inherited_is_package, inherited_method.node
 
 
 @lru_cache(maxsize=4096)
