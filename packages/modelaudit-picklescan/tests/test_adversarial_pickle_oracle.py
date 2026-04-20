@@ -1084,6 +1084,29 @@ def _click_open_file_echo_pth_payload(pth_path: Path, marker: Path, *, click_mod
     return b"".join(parts)
 
 
+def _click_lazy_file_echo_pth_payload(pth_path: Path, marker: Path, *, include_write: bool) -> bytes:
+    fragments = [
+        "im",
+        "port pathlib;pathlib.Path(",
+        repr(str(marker)),
+        ").write_text('owned-by-click-lazyfile')",
+    ]
+    parts = [b"\x80\x04"]
+    if include_write:
+        parts += [_global_operand("click.utils", "LazyFile")]
+        parts += [_tuple_payload_operands([_text_operand(str(pth_path)), _text_operand("w")]), b"R\x94"]
+    parts += [_global_operand("builtins", "str.join")]
+    parts += [_text_operand(""), _tuple_payload_operands([_text_operand(fragment) for fragment in fragments])]
+    parts += [b"\x86R\x94"]
+    if include_write:
+        parts += [_global_operand("click", "echo")]
+        parts += [b"h\x01h\x00\x86R"]
+    else:
+        parts += [b"h\x00"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
 def _dotenv_run_command_payload(command: list[str], *, include_call: bool) -> bytes:
     command_list = _list_payload_operands([_text_operand(part) for part in command])
     parts = [b"\x80\x04"]
@@ -2955,6 +2978,54 @@ def test_scan_bytes_blocks_click_open_file_echo_fragmented_pth_rce(tmp_path: Pat
 
         site.addsitedir(str(tmp_path))
         assert marker.read_text() == "owned-by-click"
+    finally:
+        sys.path[:] = original_sys_path
+
+
+@pytest.mark.skipif(not _module_available("click.utils"), reason="click.utils is unavailable")
+def test_scan_bytes_blocks_click_lazy_file_echo_fragmented_pth_rce(tmp_path: Path) -> None:
+    pth_path = tmp_path / "click_lazy_file_echo_exec.pth"
+    marker = tmp_path / "click_lazy_file_echo_marker"
+    control_payload = _click_lazy_file_echo_pth_payload(pth_path, marker, include_write=False)
+    payload = _click_lazy_file_echo_pth_payload(pth_path, marker, include_write=True)
+    original_sys_path = list(sys.path)
+    expected_line = f"import pathlib;pathlib.Path({str(marker)!r}).write_text('owned-by-click-lazyfile')"
+
+    try:
+        control_report = scan_bytes(control_payload, source="click-lazy-file-echo-control.pkl")
+        assert control_report.verdict == SafetyVerdict.CLEAN
+
+        assert not pth_path.exists()
+        assert not marker.exists()
+        control_result = pickle.loads(control_payload)
+        assert control_result == expected_line
+        assert not pth_path.exists()
+        assert not marker.exists()
+
+        site.addsitedir(str(tmp_path))
+        assert not marker.exists()
+        sys.path[:] = original_sys_path
+
+        report = scan_bytes(payload, source="click-lazy-file-echo-pth-rce.pkl")
+
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_call_graph_file_write_finding(
+            report,
+            "click.utils",
+            "LazyFile",
+            "click",
+            "echo",
+        )
+
+        assert not pth_path.exists()
+        assert not marker.exists()
+        result = pickle.loads(payload)
+        assert result is None
+        assert pth_path.read_text() == f"{expected_line}\n"
+        assert not marker.exists()
+
+        site.addsitedir(str(tmp_path))
+        assert marker.read_text() == "owned-by-click-lazyfile"
     finally:
         sys.path[:] = original_sys_path
 

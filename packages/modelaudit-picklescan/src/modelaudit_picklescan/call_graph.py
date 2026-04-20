@@ -17,6 +17,17 @@ _MAX_CALL_GRAPH_DEPTH = 4
 _MAX_VISITED_FUNCTIONS = 64
 _MAX_CALLS_PER_FUNCTION = 128
 
+_CLASS_ENTRYPOINT_METHODS = (
+    "__getattribute__",
+    "__getattr__",
+    "__call__",
+    "__iter__",
+    "__next__",
+    "__enter__",
+    "__exit__",
+    "__new__",
+    "__init__",
+)
 _RCE_SINK_EXACT = frozenset(
     {
         "asyncio.create_subprocess_exec",
@@ -84,6 +95,7 @@ class _ModuleAnalysis:
     source_path: str
     aliases: dict[str, str]
     calls_by_function: dict[str, tuple[str, ...]]
+    class_entrypoints: dict[str, tuple[str, ...]]
 
 
 @dataclass(frozen=True)
@@ -104,10 +116,13 @@ def find_dangerous_call_graphs(import_references: object) -> tuple[CallGraphFind
             continue
         seen.add((module, name))
 
-        resolved = _resolve_function_target(f"{module}.{name}")
-        if resolved is None:
+        entrypoints = _call_graph_entrypoints(f"{module}.{name}")
+        if not entrypoints:
             continue
-        sink_path = _find_sink_path(resolved)
+        sink_path = next(
+            (path for entrypoint in entrypoints if (path := _find_sink_path(entrypoint)) is not None),
+            None,
+        )
         if sink_path is None:
             continue
 
@@ -137,10 +152,13 @@ def find_startup_hook_write_call_graphs(import_references: object) -> tuple[Star
             continue
         seen.add((module, name))
 
-        resolved = _resolve_function_target(f"{module}.{name}")
-        if resolved is None:
+        entrypoints = _call_graph_entrypoints(f"{module}.{name}")
+        if not entrypoints:
             continue
-        open_path = _find_file_open_path(resolved)
+        open_path = next(
+            (path for entrypoint in entrypoints if (path := _find_file_open_path(entrypoint)) is not None),
+            None,
+        )
         if open_path is not None:
             openers.append(
                 _ImportCallPath(
@@ -150,7 +168,10 @@ def find_startup_hook_write_call_graphs(import_references: object) -> tuple[Star
                     call_path=open_path,
                 )
             )
-        write_path = _find_file_write_path(resolved)
+        write_path = next(
+            (path for entrypoint in entrypoints if (path := _find_file_write_path(entrypoint)) is not None),
+            None,
+        )
         if write_path is not None:
             writers.append(
                 _ImportCallPath(
@@ -254,6 +275,18 @@ def _calls_for_function(function_name: str) -> tuple[str, ...] | None:
 
 
 @lru_cache(maxsize=4096)
+def _call_graph_entrypoints(function_name: str) -> tuple[str, ...]:
+    resolved = _resolve_function_target(function_name)
+    if resolved is not None:
+        return (resolved,)
+
+    class_target = _resolve_class_target(function_name)
+    if class_target is None:
+        return ()
+    return _class_entrypoints(class_target)
+
+
+@lru_cache(maxsize=4096)
 def _resolve_function_target(function_name: str) -> str | None:
     module_name, qualified_name = _split_function_name(function_name)
     if module_name is None:
@@ -269,6 +302,34 @@ def _resolve_function_target(function_name: str) -> str | None:
         if alias_target is not None and alias_target != function_name:
             return _resolve_function_target(alias_target)
     return None
+
+
+@lru_cache(maxsize=4096)
+def _resolve_class_target(function_name: str) -> str | None:
+    module_name, qualified_name = _split_function_name(function_name)
+    if module_name is None:
+        return None
+    analysis = _analyze_module(module_name)
+    if analysis is None:
+        return None
+    full_name = f"{module_name}.{qualified_name}"
+    if full_name in analysis.class_entrypoints:
+        return full_name
+    if "." not in qualified_name:
+        alias_target = analysis.aliases.get(qualified_name)
+        if alias_target is not None and alias_target != function_name:
+            return _resolve_class_target(alias_target)
+    return None
+
+
+def _class_entrypoints(class_name: str) -> tuple[str, ...]:
+    module_name, qualified_name = _split_function_name(class_name)
+    if module_name is None:
+        return ()
+    analysis = _analyze_module(module_name)
+    if analysis is None:
+        return ()
+    return analysis.class_entrypoints.get(f"{module_name}.{qualified_name}", ())
 
 
 def _split_function_name(function_name: str) -> tuple[str | None, str]:
@@ -298,12 +359,13 @@ def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
     is_package = source_path.name == "__init__.py"
     aliases = _collect_aliases(tree, module_name, is_package)
     local_defs = _collect_local_defs(tree)
-    calls_by_function = _collect_function_calls(tree, module_name, aliases, local_defs)
+    calls_by_function, class_entrypoints = _collect_function_calls(tree, module_name, aliases, local_defs)
     return _ModuleAnalysis(
         module=module_name,
         source_path=str(source_path),
         aliases=aliases,
         calls_by_function=calls_by_function,
+        class_entrypoints=class_entrypoints,
     )
 
 
@@ -338,18 +400,33 @@ def _collect_function_calls(
     module_name: str,
     aliases: dict[str, str],
     local_defs: set[str],
-) -> dict[str, tuple[str, ...]]:
+) -> tuple[dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]:
     calls_by_function: dict[str, tuple[str, ...]] = {}
+    class_entrypoints: dict[str, tuple[str, ...]] = {}
     for statement in tree.body:
         if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef):
             function_name = f"{module_name}.{statement.name}"
             calls_by_function[function_name] = _calls_in_function(statement, module_name, aliases, local_defs)
         elif isinstance(statement, ast.ClassDef):
+            class_name = f"{module_name}.{statement.name}"
+            method_names: set[str] = set()
             for child in statement.body:
                 if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
                     function_name = f"{module_name}.{statement.name}.{child.name}"
-                    calls_by_function[function_name] = _calls_in_function(child, module_name, aliases, local_defs)
-    return calls_by_function
+                    method_names.add(child.name)
+                    calls_by_function[function_name] = _calls_in_function(
+                        child,
+                        module_name,
+                        aliases,
+                        local_defs,
+                        class_name=statement.name,
+                    )
+            class_entrypoints[class_name] = tuple(
+                f"{class_name}.{method_name}"
+                for method_name in _CLASS_ENTRYPOINT_METHODS
+                if method_name in method_names
+            )
+    return calls_by_function, class_entrypoints
 
 
 def _calls_in_function(
@@ -357,13 +434,15 @@ def _calls_in_function(
     module_name: str,
     aliases: dict[str, str],
     local_defs: set[str],
+    *,
+    class_name: str | None = None,
 ) -> tuple[str, ...]:
     calls: list[str] = []
     parameter_controlled_names: set[str] | None = None
     for node in ast.walk(function_node):
         if not isinstance(node, ast.Call):
             continue
-        resolved = _resolve_expr(node.func, module_name, aliases, local_defs)
+        resolved = _resolve_expr(node.func, module_name, aliases, local_defs, class_name)
         if resolved is not None:
             if _is_file_write_call(resolved):
                 if parameter_controlled_names is None:
@@ -442,8 +521,11 @@ def _resolve_expr(
     module_name: str,
     aliases: dict[str, str],
     local_defs: set[str],
+    class_name: str | None = None,
 ) -> str | None:
     if isinstance(expression, ast.Name):
+        if class_name is not None and expression.id in {"self", "cls"}:
+            return f"{module_name}.{class_name}"
         if expression.id in aliases:
             return aliases[expression.id]
         if expression.id in local_defs:
@@ -452,7 +534,7 @@ def _resolve_expr(
             return f"builtins.{expression.id}"
         return expression.id
     if isinstance(expression, ast.Attribute):
-        base = _resolve_expr(expression.value, module_name, aliases, local_defs)
+        base = _resolve_expr(expression.value, module_name, aliases, local_defs, class_name)
         if base is not None:
             return f"{base}.{expression.attr}"
     return None

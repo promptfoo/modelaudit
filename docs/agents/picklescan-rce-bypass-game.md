@@ -7582,3 +7582,91 @@ Performance note: the new role pass reuses the existing AST module cache,
 source-size cap, graph-depth cap, visited-function cap, and import-reference
 cap. It adds two cheap sink matchers and only pairs open/write roles from the
 already-discovered pickle imports, avoiding any broad package enumeration.
+
+## Turn 135 - Bypass via Click `LazyFile` constructor hiding the file opener
+
+Found a scanner-clean startup-hook RCE after the file open/write call-graph
+block. The new source-role detector follows imported functions and methods, but
+it does not map a pickled class global to constructor methods such as
+`Class.__init__`, `Class.__new__`, or later implicit methods reached through
+attribute dispatch.
+
+The payload calls:
+
+```python
+f = click.utils.LazyFile("/tmp/.../lazy_click.pth", "w")
+click.echo(assembled_line, f)
+```
+
+`LazyFile` stores the attacker-selected path. When `click.echo()` executes
+`file.write(out)`, `LazyFile.__getattr__("write")` calls `LazyFile.open()`,
+which reaches Click's `open_stream()` and then `builtins.open()` for that path.
+The write lands in the `.pth` file, and normal `site.addsitedir()` executes it.
+
+The executable line is still split and assembled only at unpickle time:
+
+```python
+import pathlib;pathlib.Path('/tmp/.../marker').write_text('owned-by-click-lazyfile')
+```
+
+Proof on CPython 3.12.12 with Click installed:
+
+- Control payload scanner result: `len=177`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`, `errors=[]`.
+- Active payload scanner result: `len=302`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`, `errors=[]`.
+- Active import references: `click.utils.LazyFile`, `builtins.str.join`, and
+  `click.echo`, all with `is_dangerous=False`.
+- Runtime before unpickle: no `.pth` file and no marker.
+- Control runtime: `pickle.loads(control)` returns the assembled line, creates
+  no `.pth` file, and `site.addsitedir()` creates no marker.
+- Active runtime: `pickle.loads(payload)` returns `None`, creates
+  `lazy_click.pth` containing the assembled line plus newline, and does not
+  create the marker yet.
+- After normal `site.addsitedir(target_dir)`: marker exists and contains
+  `owned-by-click-lazyfile`.
+
+Why the scanner missed it:
+
+- `click.utils.LazyFile` is a class global, not a function global, and the
+  Python call-graph pass currently resolves only callable function/method names
+  already present in `calls_by_function`.
+- The file opener is hidden behind constructor/object behavior:
+  `LazyFile.__getattr__ -> LazyFile.open -> open_stream -> builtins.open`.
+- The file writer is visible through `click.echo`, but the new file role
+  detector requires both an opener role and a writer role. Since the opener is
+  behind a class constructor/object method, no pair is reported.
+- The `.pth` source string is fragmented and assembled by `builtins.str.join`
+  only during unpickle, so string heuristics do not fire.
+
+Performance note: the next block should extend the existing bounded call-graph
+analysis to class globals by checking constructor/object methods for imported
+classes, rather than adding Click-specific entries. The finite source-side fix
+is to resolve `module.Class` to local `Class.__new__`, `Class.__init__`, and
+possibly simple self-method calls under the same depth/visited/source caps.
+
+## Turn 136 - Block class-global call graph entrypoints
+
+Blocking plan:
+
+- Extend the Python call-graph analyzer so a pickle import of `module.Class`
+  expands to bounded class entrypoints instead of being treated as opaque. The
+  entrypoint set covers object dispatch and construction methods such as
+  `__getattribute__`, `__getattr__`, `__call__`, `__iter__`, `__new__`, and
+  `__init__`.
+- Resolve simple `self.method()` / `cls.method()` calls inside class methods
+  back to the local class method, so `LazyFile.__getattr__ -> LazyFile.open ->
+  click._compat.open_stream -> builtins.open` becomes visible to the same
+  source-role detector added in Turn 134.
+- Keep the existing import-reference cap, source-size cap, graph-depth cap,
+  visited-function cap, per-function call cap, and AST module caches.
+- Add a CPython oracle regression for the Turn 135 payload. The control payload
+  only assembles the `.pth` line and remains clean; the active payload imports
+  `click.utils.LazyFile` plus `click.echo`, writes the `.pth` startup hook, and
+  `site.addsitedir()` executes it.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: class expansion is local to the already-discovered pickle
+import references. It does not enumerate packages or import candidate modules;
+it adds a small fixed method-name set per imported class and reuses the same
+bounded graph walk.
