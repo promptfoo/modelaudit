@@ -15,6 +15,7 @@ from .call_graph import (
     StartupHookWriteFinding,
     find_dangerous_call_graphs,
     find_startup_hook_write_call_graphs,
+    has_unanalyzed_call_graph_import_references,
 )
 from .options import ScanOptions
 from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdict, ScanError, ScanStatus, Severity
@@ -911,6 +912,7 @@ def _report_from_native_dict(raw_report: Mapping[str, Any]) -> PickleReport:
 
 def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     import_references = report.metadata.get("import_references")
+    call_graph_limit_exceeded = has_unanalyzed_call_graph_import_references(import_references)
     try:
         call_graph_findings = find_dangerous_call_graphs(import_references)
     except Exception:
@@ -919,7 +921,7 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         startup_hook_write_findings = find_startup_hook_write_call_graphs(import_references)
     except Exception:
         startup_hook_write_findings = ()
-    if not call_graph_findings and not startup_hook_write_findings:
+    if not call_graph_findings and not startup_hook_write_findings and not call_graph_limit_exceeded:
         return report
 
     existing_critical_globals = {
@@ -938,7 +940,12 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         if (finding.writer_module, finding.writer_name) not in existing_critical_globals
         and (finding.opener_module, finding.opener_name) not in existing_critical_globals
     )
-    additional_findings = (*rce_findings, *startup_findings)
+    limit_findings = (
+        (_call_graph_import_reference_limit_finding_to_report_finding(report),)
+        if call_graph_limit_exceeded and not rce_findings and not startup_findings
+        else ()
+    )
+    additional_findings = (*rce_findings, *startup_findings, *limit_findings)
     if not additional_findings:
         return report
 
@@ -952,6 +959,24 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         coverage=report.coverage,
         metadata=report.to_dict()["metadata"],
         duration_s=report.duration_s,
+    )
+
+
+def _call_graph_import_reference_limit_finding_to_report_finding(report: PickleReport) -> Finding:
+    return Finding(
+        message="Python call-graph analysis skipped import references beyond the unique-reference limit",
+        severity=Severity.CRITICAL,
+        location=report.source,
+        rule_code="DANGEROUS_CALL_GRAPH_LIMIT",
+        details={
+            "analysis": "python_call_graph_limit",
+            "max_unique_import_references": 32,
+            "analysis_incomplete": True,
+        },
+        why=(
+            "The pickle imports more unique globals than the bounded Python call-graph pass analyzes; "
+            "unanalyzed globals can hide call-graph-only RCE primitives."
+        ),
     )
 
 

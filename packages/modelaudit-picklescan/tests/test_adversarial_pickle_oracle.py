@@ -22,13 +22,14 @@ from pathlib import Path
 
 import pytest
 
-from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, Severity, scan_bytes
-from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
+from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, ScanStatus, Severity, scan_bytes
+from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE, _with_call_graph_findings
 from modelaudit_picklescan.call_graph import (
     _call_graph_entrypoints,
     _calls_for_function,
     _find_sink_path,
     find_dangerous_call_graphs,
+    has_unanalyzed_call_graph_import_references,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -405,6 +406,15 @@ def _has_critical_call_graph_finding(report: PickleReport, module: str, name: st
         and finding.details.get("module") == module
         and finding.details.get("name") == name
         and finding.details.get("sink") == sink
+        for finding in report.findings
+    )
+
+
+def _has_critical_call_graph_limit_finding(report: PickleReport) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.rule_code == "DANGEROUS_CALL_GRAPH_LIMIT"
+        and finding.details.get("analysis_incomplete") is True
         for finding in report.findings
     )
 
@@ -1815,6 +1825,22 @@ def _call_graph_poisoned_random_os_alias_prefix_payload(marker: Path, *, poison_
     if poison_after:
         return b"".join([b"\x80\x04", *rce_call, b"0", *poison, b"N."])
     return b"".join([b"\x80\x04", *poison, *rce_call, b"."])
+
+
+def _import_reference_limit_random_os_alias_prefix_payload(marker: Path, *, filler_count: int) -> bytes:
+    command = f"printf import-ref-limit-owned > {shlex.quote(str(marker))}"
+    parts = [b"\x80\x04"]
+    for _ in range(filler_count):
+        parts += [
+            _global_operand("collections", "Counter"),
+            b"0",
+        ]
+    parts += [
+        _global_operand("random", "_os.system"),
+        _tuple_payload_operands([_text_operand(command)]),
+        b"R.",
+    ]
+    return b"".join(parts)
 
 
 def _pkgutil_iter_importers_payload() -> bytes:
@@ -4662,6 +4688,68 @@ if not marker.exists():
     )
     assert result.returncode == 0, result.stderr
     assert marker.read_text() == "random-os-alias-owned"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
+def test_scan_bytes_blocks_import_reference_limit_padding_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "import_reference_limit_padding_marker"
+    control_payload = _import_reference_limit_random_os_alias_prefix_payload(marker, filler_count=31)
+    payload = _import_reference_limit_random_os_alias_prefix_payload(marker, filler_count=32)
+
+    control_report = scan_bytes(control_payload, source="import-reference-limit-control.pkl")
+    report = scan_bytes(payload, source="import-reference-limit-padding-rce.pkl")
+
+    assert control_report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(control_report, "random", "_os.system", "os.system")
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(report, "random", "_os.system", "os.system")
+    assert has_unanalyzed_call_graph_import_references(report.metadata["import_references"]) is False
+    assert any(
+        finding.module == "random" and finding.name == "_os.system" and finding.sink == "os.system"
+        for finding in find_dangerous_call_graphs(report.metadata["import_references"])
+    )
+
+    assert has_unanalyzed_call_graph_import_references(
+        tuple({"module": "unique", "name": f"ref_{index}"} for index in range(33))
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+payload = bytes.fromhex(sys.argv[2])
+result = pickle.loads(payload)
+if result != 0:
+    raise SystemExit(result)
+if not marker.exists():
+    raise SystemExit("marker was not written")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(marker), payload.hex()],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == "import-ref-limit-owned"
+
+
+def test_call_graph_import_reference_limit_fails_closed() -> None:
+    report = PickleReport(
+        source="unique-import-reference-limit.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={"import_references": tuple({"module": "unique", "name": f"ref_{index}"} for index in range(33))},
+    )
+
+    updated = _with_call_graph_findings(report)
+
+    assert updated.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_limit_finding(updated)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")

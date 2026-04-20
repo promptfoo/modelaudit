@@ -11912,3 +11912,139 @@ Performance note:
   a later simplification pass could avoid that more directly by making
   function-call collection ignore nested function/class bodies or by adding a
   recursion guard around class-target resolution.
+
+## Turn 209 - Bypass via pre-dedup import-reference call-graph limit
+
+Found a scanner-clean RCE-capable pickle by pushing a call-graph-only dangerous
+global just past the Python augmentation's 32-reference window.
+
+The payload imports and immediately pops 32 copies of the clean global
+`collections.Counter`, then invokes `random._os.system`:
+
+```text
+PROTO 4
+repeat 32 times:
+  SHORT_BINUNICODE "collections"
+  SHORT_BINUNICODE "Counter"
+  STACK_GLOBAL
+  POP
+SHORT_BINUNICODE "random"
+SHORT_BINUNICODE "_os.system"
+STACK_GLOBAL
+SHORT_BINUNICODE "printf import-ref-limit-owned > <marker>"
+TUPLE1
+REDUCE
+STOP
+```
+
+Focused proof:
+
+- No filler:
+  `refs=1`, `verdict=malicious`, one `DANGEROUS_CALL_GRAPH` finding for
+  `random._os.system -> os.system`, `scan_s=0.009706`.
+- 31 filler refs:
+  `refs=32`, `verdict=malicious`, one `DANGEROUS_CALL_GRAPH` finding for
+  `random._os.system -> os.system`, `scan_s=0.032808`.
+- 32 filler refs:
+  `refs=33`, `verdict=clean`, `0` findings, `0` notices. The last metadata
+  entry is still `random._os.system` with `is_dangerous=False`.
+- 64 filler refs:
+  `refs=65`, `verdict=clean`, `0` findings, `0` notices.
+- `_find_sink_path("random._os.system")` still returns
+  `("random._os.system", "os.system")`, proving the lower-level alias-to-sink
+  path is known when analyzed.
+- `find_dangerous_call_graphs(report.metadata["import_references"])` returns
+  `()`, because the dangerous reference is beyond the 32-entry slice.
+- Runtime child-process proof: `pickle.loads(payload)` returned `0` and wrote
+  marker text `import-ref-limit-owned`.
+
+Why this was missed:
+
+- Rust records import-reference metadata up to `MAX_IMPORT_REFERENCES = 10000`,
+  so the dangerous reference remains present in the report metadata.
+- The Python call graph has its own `_MAX_IMPORT_REFERENCES = 32` and
+  `_iter_import_references()` slices `import_references[:32]` before any
+  deduplication.
+- The 32 padding references are duplicate `collections.Counter` globals, but
+  duplicates still consume the pre-dedup slice. The call graph only sees the
+  first 32 clean entries and never evaluates the 33rd `random._os.system`.
+- Native policy sees `random._os.system` as a clean dotted imported-module
+  alias, so without Python call-graph augmentation the final verdict is clean.
+
+Performance note:
+
+- A cold scan of the 32-filler payload took `0.033754s` in the initial proof;
+  once `collections.Counter` analysis was cached, the same bypass shape scanned
+  in `0.000281s`.
+- This is a cheap bypass: it requires only 32 duplicate clean globals and does
+  not need thousands of imports or metadata truncation.
+- The next defensive turn should move the 32-reference bound after
+  deduplication and prioritize references that are consumed by callable
+  opcodes, or otherwise make the Rust engine surface an explicit fail-closed
+  signal when Python call-graph augmentation skips unanalyzed import references.
+  The minimal source fix is to dedupe `(module, name)` while iterating the full
+  bounded Rust metadata list, then apply the 32 unique-reference cap.
+
+## Turn 210 - Block pre-dedup import-reference padding
+
+Implemented the source-level bound fix for Turn 209.
+
+The Python call graph now deduplicates import references by `(module, name)`
+while iterating the full Rust-provided metadata list, then applies the
+32-reference analysis cap to unique references. Duplicate clean globals can no
+longer consume the entire call-graph budget before a later call-graph-only RCE
+global is analyzed.
+
+I also added a fail-closed guard for the remaining bounded-analysis case:
+
+- `has_unanalyzed_call_graph_import_references()` returns true when more than
+  32 distinct import references are present.
+- `_with_call_graph_findings()` adds a critical
+  `DANGEROUS_CALL_GRAPH_LIMIT` finding when the unique-reference limit is
+  exceeded and no RCE/startup-hook call-graph finding was produced.
+- That keeps worst-case analysis bounded without silently returning clean when
+  uninspected unique references could hide call-graph-only sinks.
+
+Regression coverage added to
+`packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py`:
+
+- Recreates the Turn 209 duplicate-padding payload:
+  32 popped `collections.Counter` globals followed by `random._os.system`.
+- Verifies the 31-filler control still scans `malicious`.
+- Verifies the 32-filler bypass now also scans `malicious` with
+  `DANGEROUS_CALL_GRAPH` for `random._os.system -> os.system`.
+- Verifies `find_dangerous_call_graphs(report.metadata["import_references"])`
+  now sees the dangerous global despite the raw metadata containing 33 entries.
+- Verifies duplicate padding does not trip the unique-reference fail-closed
+  guard.
+- Adds a synthetic 33-unique-reference report that fails closed with
+  `DANGEROUS_CALL_GRAPH_LIMIT`.
+- Runtime proof still executes the 32-filler payload in a child process and
+  writes marker text `import-ref-limit-owned`.
+
+Focused validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_import_reference_limit_padding_rce packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_call_graph_import_reference_limit_fails_closed packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_random_os_import_alias_prefix_rce`
+  passed: `3 passed in 1.39s`.
+
+Full pre-commit validation:
+
+- `ruff format` passed: `1 file reformatted, 390 files left unchanged`.
+- `ruff check --fix` passed.
+- `mypy` passed: `Success: no issues found in 446 source files`.
+- Full non-slow/non-integration validation passed:
+  `3715 passed, 1022 skipped, 21 warnings in 44.88s`.
+
+Performance note:
+
+- 31 duplicate fillers:
+  `refs=32`, `unique_over_limit=False`, `verdict=malicious`,
+  `scan_s=0.045557`, call graph finds `random._os.system -> os.system`.
+- 32 duplicate fillers:
+  `refs=33`, `unique_over_limit=False`, `verdict=malicious`,
+  `scan_s=0.000502`, call graph finds `random._os.system -> os.system`.
+- 64 duplicate fillers:
+  `refs=65`, `unique_over_limit=False`, `verdict=malicious`,
+  `scan_s=0.000774`, call graph finds `random._os.system -> os.system`.
+- Synthetic 33 unique refs set `unique_over_limit=True` and are handled by the
+  fail-closed finding rather than unbounded source analysis.

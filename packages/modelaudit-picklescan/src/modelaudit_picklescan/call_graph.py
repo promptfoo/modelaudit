@@ -298,10 +298,36 @@ def _iter_import_references(import_references: object) -> tuple[dict[str, object
     if not isinstance(import_references, list | tuple):
         return ()
     normalized: list[dict[str, object]] = []
-    for item in import_references[:_MAX_IMPORT_REFERENCES]:
-        if isinstance(item, Mapping):
-            normalized.append(dict(item))
+    seen: set[tuple[str, str]] = set()
+    for item in import_references:
+        if not isinstance(item, Mapping):
+            continue
+        module = str(item.get("module", ""))
+        name = str(item.get("name", ""))
+        if not module or not name or (module, name) in seen:
+            continue
+        seen.add((module, name))
+        normalized.append(dict(item))
+        if len(normalized) >= _MAX_IMPORT_REFERENCES:
+            break
     return tuple(normalized)
+
+
+def has_unanalyzed_call_graph_import_references(import_references: object) -> bool:
+    if not isinstance(import_references, list | tuple):
+        return False
+    seen: set[tuple[str, str]] = set()
+    for item in import_references:
+        if not isinstance(item, Mapping):
+            continue
+        module = str(item.get("module", ""))
+        name = str(item.get("name", ""))
+        if not module or not name:
+            continue
+        seen.add((module, name))
+        if len(seen) > _MAX_IMPORT_REFERENCES:
+            return True
+    return False
 
 
 @lru_cache(maxsize=4096)
