@@ -28,6 +28,10 @@ _IMPORT_EXECUTION_SINK = "builtins.__import__"
 _IMPORT_EXECUTION_SAFE_MODULES = frozenset(sys.builtin_module_names)
 _PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS = ("__new__", "__init__")
 _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS = ("__setstate__",)
+_PICKLE_ENTERED_IMPORT_EXECUTION_METHODS = (
+    *_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS,
+    *_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS,
+)
 _INHERITED_CLASS_ENTRYPOINT_METHODS = (
     *_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS,
     *_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS,
@@ -382,7 +386,11 @@ def has_unanalyzed_call_graph_import_references(import_references: object) -> bo
 
 @lru_cache(maxsize=4096)
 def _find_sink_path(start: str) -> tuple[str, ...] | None:
-    return _find_matching_call_path(start, _rce_sink)
+    return _find_matching_call_path(
+        start,
+        _rce_sink,
+        import_execution_fallback_allowed=_can_follow_import_execution_fallback(start, 0),
+    )
 
 
 @lru_cache(maxsize=4096)
@@ -390,10 +398,24 @@ def _find_invoked_import_execution_path(start: str, positional_arg_count: int) -
     resolved = _resolve_function_target(start)
     if resolved is None:
         return None
-    calls = _import_execution_calls_for_invocation(resolved, positional_arg_count)
-    if _IMPORT_EXECUTION_SINK not in calls:
+    context = _source_function_context(resolved)
+    if context is None:
         return None
-    return (resolved, _IMPORT_EXECUTION_SINK)
+    module_name, is_package, function_node = context
+    if not _is_pickle_entered_import_execution_entrypoint(resolved):
+        return None
+    if not _can_enter_function_with_positional_args(function_node, positional_arg_count):
+        return None
+    if _IMPORT_EXECUTION_SINK in _direct_import_execution_calls(function_node, module_name, is_package):
+        return (resolved, _IMPORT_EXECUTION_SINK)
+    path = _find_matching_call_path(
+        resolved,
+        _rce_sink,
+        import_execution_fallback_allowed=True,
+    )
+    if path is None or not _is_import_execution_sink(path[-1]):
+        return None
+    return path
 
 
 @lru_cache(maxsize=4096)
@@ -406,7 +428,12 @@ def _find_file_write_path(start: str) -> tuple[str, ...] | None:
     return _find_matching_call_path(start, _file_write_sink)
 
 
-def _find_matching_call_path(start: str, sink_for: Callable[[str], str | None]) -> tuple[str, ...] | None:
+def _find_matching_call_path(
+    start: str,
+    sink_for: Callable[[str], str | None],
+    *,
+    import_execution_fallback_allowed: bool = False,
+) -> tuple[str, ...] | None:
     queue: deque[tuple[str, tuple[str, ...]]] = deque([(start, (start,))])
     visited = {start}
     import_execution_fallback_path: tuple[str, ...] | None = None
@@ -435,7 +462,7 @@ def _find_matching_call_path(start: str, sink_for: Callable[[str], str | None]) 
                 if _is_tcl_interpreter_dispatch_call(sink) and len(path) > 1:
                     continue
                 if _is_import_execution_sink(sink):
-                    if len(path) == 1 and import_execution_fallback_path is None:
+                    if import_execution_fallback_allowed and import_execution_fallback_path is None:
                         import_execution_fallback_path = (*path, sink)
                     continue
                 return (*path, sink)
@@ -1624,17 +1651,6 @@ def _import_execution_calls(
     return _direct_import_execution_calls(function_node, module_name, is_package)
 
 
-@lru_cache(maxsize=4096)
-def _import_execution_calls_for_invocation(function_name: str, positional_arg_count: int) -> tuple[str, ...]:
-    context = _source_function_context(function_name)
-    if context is None:
-        return ()
-    module_name, is_package, function_node = context
-    if not _can_enter_function_with_positional_args(function_node, positional_arg_count):
-        return ()
-    return _direct_import_execution_calls(function_node, module_name, is_package)
-
-
 def _direct_import_execution_calls(
     function_node: ast.FunctionDef | ast.AsyncFunctionDef,
     module_name: str,
@@ -1679,6 +1695,34 @@ def _has_required_user_arguments(function_node: ast.FunctionDef | ast.AsyncFunct
     if required_count:
         return True
     return has_required_keyword_only
+
+
+@lru_cache(maxsize=4096)
+def _can_invoke_function_with_positional_args(function_name: str, positional_arg_count: int) -> bool:
+    resolved = _resolve_function_target(function_name)
+    if resolved is None:
+        return False
+    context = _source_function_context(resolved)
+    if context is None:
+        return False
+    _module_name, _is_package, function_node = context
+    return _can_enter_function_with_positional_args(function_node, positional_arg_count)
+
+
+@lru_cache(maxsize=4096)
+def _can_follow_import_execution_fallback(function_name: str, positional_arg_count: int) -> bool:
+    resolved = _resolve_function_target(function_name)
+    if resolved is None or not _is_pickle_entered_import_execution_entrypoint(resolved):
+        return False
+    return _can_invoke_function_with_positional_args(resolved, positional_arg_count)
+
+
+def _is_pickle_entered_import_execution_entrypoint(function_name: str) -> bool:
+    _module_name, qualified_name = _split_source_qualified_name(function_name)
+    class_name, _separator, method_name = qualified_name.rpartition(".")
+    if not class_name or method_name not in _CLASS_ENTRYPOINT_METHODS:
+        return True
+    return method_name in _PICKLE_ENTERED_IMPORT_EXECUTION_METHODS
 
 
 def _can_enter_function_with_positional_args(

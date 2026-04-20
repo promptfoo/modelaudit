@@ -123,6 +123,17 @@ def test_call_graph_models_direct_shadowable_function_body_imports() -> None:
     assert _find_sink_path("base64.main") == ("base64.main", "builtins.__import__")
 
 
+def test_call_graph_propagates_wrapper_import_execution_fallbacks() -> None:
+    calls = _calls_for_function("platform.mac_ver") or ()
+
+    assert "platform._mac_ver_xml" in calls
+    assert _find_sink_path("platform.mac_ver") == (
+        "platform.mac_ver",
+        "platform._mac_ver_xml",
+        "builtins.__import__",
+    )
+
+
 def test_call_graph_ignores_imports_inside_nested_functions_until_called() -> None:
     calls = _calls_for_function("site.enablerlcompleter") or ()
 
@@ -309,6 +320,93 @@ sys.modules.pop("subprocess", None)
 result = pickle.loads(payload)
 if result != "shadow-processor":
     raise SystemExit(f"expected shadow processor result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+def test_scan_bytes_blocks_platform_mac_ver_wrapper_import_rce(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "mac_ver_marker"
+    marker_content = "plistlib-owned"
+    (module_dir / "plistlib.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def load(file_obj):\n"
+        "    return {'ProductVersion': '13.37'}\n",
+        encoding="utf-8",
+    )
+    payload = _global_call_payload("platform", "mac_ver")
+
+    report = scan_bytes(payload, source="platform-mac-ver-plistlib-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(report, "platform", "mac_ver", "builtins.__import__")
+
+    assert not marker.exists()
+    child_code = """
+import builtins
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+system_version_plist = "/System/Library/CoreServices/SystemVersion.plist"
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+
+original_exists = __import__("os").path.exists
+original_open = builtins.open
+
+def fake_exists(path):
+    return str(path) == system_version_plist or original_exists(path)
+
+class FakePlistFile:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def read(self, *args):
+        return b""
+
+def fake_open(path, *args, **kwargs):
+    if str(path) == system_version_plist:
+        return FakePlistFile()
+    return original_open(path, *args, **kwargs)
+
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("platform", None)
+sys.modules.pop("plistlib", None)
+__import__("os").path.exists = fake_exists
+builtins.open = fake_open
+try:
+    result = pickle.loads(payload)
+finally:
+    __import__("os").path.exists = original_exists
+    builtins.open = original_open
+
+if result[0] != "13.37":
+    raise SystemExit(f"expected shadow plist result, got {result!r}")
 if not marker.exists():
     raise SystemExit("marker was not written")
 if marker.read_text() != marker_content:

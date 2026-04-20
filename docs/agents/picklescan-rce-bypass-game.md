@@ -12801,3 +12801,162 @@ Performance note:
   module is large and now more of its version-gated definitions are visible.
 - The traversal is still bounded by the existing 1 MB source cap and call/path
   limits, and it consolidates several previous direct-`tree.body` passes.
+
+## Turn 221 - Bypass via wrapper around macOS `plistlib` import
+
+Found another scanner-clean RCE-capable bypass in the Python call graph. The
+payload imports and invokes `platform.mac_ver()`. On macOS, that wrapper calls
+`platform._mac_ver_xml()`, which checks for
+`/System/Library/CoreServices/SystemVersion.plist` and then performs a
+function-body `import plistlib`. A shadow `plistlib.py` on `sys.path` executes
+during `pickle.loads`.
+
+Payload shape:
+
+```text
+STACK_GLOBAL platform mac_ver
+EMPTY_TUPLE
+REDUCE
+```
+
+Scanner proof:
+
+```text
+plist_exists True
+payload_len 25
+scan clean complete findings 0 elapsed 0.078614
+metadata import_refs (
+  {'module': 'platform', 'name': 'mac_ver', 'is_dangerous': False}
+)
+metadata invocations (
+  {'module': 'platform', 'name': 'mac_ver', 'positional_arg_count': 0}
+)
+
+ref platform.mac_ver
+entry ('platform.mac_ver',)
+calls ('platform._mac_ver_xml',)
+path None
+
+ref platform._mac_ver_xml
+entry ('platform._mac_ver_xml',)
+calls ('os.path.exists', 'builtins.open', 'plistlib.load', 'os.uname',
+       'builtins.__import__')
+path ('platform._mac_ver_xml', 'builtins.__import__')
+
+dangerous cg ()
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime stdout
+result ('13.37', ('', '', ''), 'arm64')
+marker_exists True
+marker_text plistlib-owned
+
+runtime stderr
+```
+
+The child proof inserted an attacker-controlled directory at the front of
+`sys.path`, removed `platform` and `plistlib` from `sys.modules`, and ran
+`pickle.loads(payload)`. The shadow `plistlib.py` wrote the marker at import
+time and returned a minimal `{"ProductVersion": "13.37"}` from `load()`.
+
+Why it bypasses:
+
+- Native policy does not list `platform.mac_ver`.
+- The call graph sees `platform.mac_ver -> platform._mac_ver_xml`.
+- `platform._mac_ver_xml` is detected if referenced directly because its
+  function-body import maps to `builtins.__import__`.
+- `_find_matching_call_path()` intentionally treats `builtins.__import__` as a
+  direct-entry fallback and does not propagate that sink through wrapper calls.
+  The wrapper therefore remains clean even though invoking it reaches a
+  shadowable import.
+
+Likely source-level defense:
+
+- Propagate direct import-execution sinks through concrete wrapper edges when
+  the wrapper invocation can enter the helper under the pickle-supplied arity.
+- Keep lower-priority ordering for `builtins.__import__` so more specific sinks
+  such as `subprocess.Popen` still win when present.
+- Preserve the existing arity gate for required-argument helpers; this
+  particular bypass is no-arg on both wrapper and helper.
+
+Performance note:
+
+- Payload size is only 25 bytes.
+- Cold scan was `0.078614s`, mostly first analysis of `platform`.
+- Warm scan median over 25 runs was `0.000048s` with max `0.000058s`.
+
+## Turn 222 - Defense for wrapper import-execution paths
+
+Implemented the source-level block for Turn 221. The call graph now keeps
+`builtins.__import__` as a lower-priority fallback, but it can propagate that
+fallback through concrete wrapper edges when pickle can actually enter the root
+function under the supplied arity. This blocks package-specific shadow imports
+at the function-body import primitive instead of adding another package name to
+a denylist.
+
+Fix details:
+
+- `_find_matching_call_path()` accepts an explicit
+  `import_execution_fallback_allowed` gate and can retain wrapper paths such as
+  `platform.mac_ver -> platform._mac_ver_xml -> builtins.__import__`.
+- Static zero-arg scans only enable that fallback when the root function can be
+  entered with zero positional args.
+- Callable invocation metadata enables the same fallback for required-argument
+  functions after checking the supplied positional arg count, while preserving
+  the direct root import path for cases such as `_pyio._open_code_with_warning`.
+- Class-method import fallbacks are limited to constructor/lifecycle methods
+  that pickle enters directly. This preserved the older startup-hook
+  `click.utils.LazyFile` + `click.echo` file-write finding instead of turning
+  a non-entered `LazyFile.__iter__` import into a generic call-graph RCE.
+- Removed the older direct-only invocation helper so invoked imports and wrapper
+  imports use the same bounded path search.
+
+Regression coverage:
+
+- `test_call_graph_propagates_wrapper_import_execution_fallbacks` verifies the
+  static path for `platform.mac_ver`.
+- `test_scan_bytes_blocks_platform_mac_ver_wrapper_import_rce` scans the
+  25-byte payload as malicious and proves runtime execution with a shadow
+  `plistlib.py` in a child process.
+- Re-ran the existing `_pyio._open_code_with_warning` and
+  `click.utils.LazyFile` regressions to guard the arity/class-entrypoint
+  boundaries.
+
+Post-fix proof:
+
+```text
+payload_len 25
+scan malicious complete findings 1
+call_graph [{'module': 'platform', 'name': 'mac_ver',
+  'sink': 'builtins.__import__',
+  'call_path': ('platform.mac_ver',
+                'platform._mac_ver_xml',
+                'builtins.__import__')}]
+calls ('platform._mac_ver_xml',)
+path ('platform.mac_ver', 'platform._mac_ver_xml', 'builtins.__import__')
+warm_median 0.000074
+warm_max 0.000202
+```
+
+Validation:
+
+- Focused import/call-graph regression file: `15 passed in 0.60s`.
+- Focused call-graph suite: `53 passed in 2.30s`.
+- Focused `click.utils.LazyFile` startup-hook regression: `1 passed in 0.61s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3730 passed, 1022 skipped, 21 warnings in 55.24s`.
+
+Performance note:
+
+- The fix adds one cached arity/source-context check before import-execution
+  fallback propagation.
+- The wrapper search remains bounded by the existing call count, depth, visited
+  function, and source-size caps.
+- Warm scan median for the fixed 25-byte payload was `0.000074s` over 50 runs.
