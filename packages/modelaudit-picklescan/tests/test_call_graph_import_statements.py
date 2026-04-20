@@ -2846,6 +2846,42 @@ if marker.exists():
         ),
         (
             _builtins_help_call_iterator_operator_payload(
+                "ior",
+                _constructed_call_operand("collections", "ChainMap"),
+                b"h\x00",
+            ),
+            "[('owned-key', 'owned-value'), 'stop']",
+            "ChainMap({'owned-key': 'owned-value'})",
+        ),
+        (
+            _builtins_help_call_iterator_operator_payload(
+                "ior",
+                _constructed_call_operand("collections", "defaultdict"),
+                b"h\x00",
+            ),
+            "[('owned-key', 'owned-value'), 'stop']",
+            "defaultdict(None, {'owned-key': 'owned-value'})",
+        ),
+        (
+            _builtins_help_call_iterator_operator_payload(
+                "ior",
+                _constructed_call_operand("collections", "OrderedDict"),
+                b"h\x00",
+            ),
+            "[('owned-key', 'owned-value'), 'stop']",
+            "OrderedDict({'owned-key': 'owned-value'})",
+        ),
+        (
+            _builtins_help_call_iterator_operator_payload(
+                "ior",
+                _constructed_call_operand("collections", "UserDict"),
+                b"h\x00",
+            ),
+            "[('owned-key', 'owned-value'), 'stop']",
+            "{'owned-key': 'owned-value'}",
+        ),
+        (
+            _builtins_help_call_iterator_operator_payload(
                 "setitem",
                 b"]",
                 _constructed_call_operand("builtins", "slice", b"N"),
@@ -3120,6 +3156,70 @@ except TypeError:
     pass
 else:
     raise SystemExit("expected TypeError")
+if marker.exists():
+    raise SystemExit("marker was written")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+
+
+def test_scan_bytes_keeps_operator_ior_counter_receiver_call_iterator_lazy(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "operator_ior_counter_receiver_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "_values = [('owned-key', 1), 'stop']\n"
+        "def help(*args, **kwargs):\n"
+        "    return _values.pop(0) if _values else 'stop'\n",
+        encoding="utf-8",
+    )
+    payload = _builtins_help_call_iterator_operator_payload(
+        "ior",
+        _constructed_call_operand("collections", "Counter"),
+        b"h\x00",
+    )
+
+    report = scan_bytes(payload, source="operator-ior-counter-receiver-call-iterator.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+try:
+    pickle.loads(payload)
+except AttributeError:
+    pass
+else:
+    raise SystemExit("expected AttributeError")
 if marker.exists():
     raise SystemExit("marker was written")
 """

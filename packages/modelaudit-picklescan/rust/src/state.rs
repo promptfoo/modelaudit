@@ -1454,7 +1454,7 @@ impl<'a> ScanState<'a> {
                 arguments.get(1).and_then(Self::call_iterator_callable_ref)
             }
             "ior" if arguments.len() == 2 => {
-                if !Self::is_builtin_container_argument(arguments.first(), "dict") {
+                if !Self::is_operator_mapping_update_receiver(arguments.first()) {
                     return None;
                 }
                 arguments.get(1).and_then(Self::call_iterator_callable_ref)
@@ -1555,6 +1555,14 @@ impl<'a> ScanState<'a> {
         Self::is_builtin_container_argument(value, "list")
             || Self::is_constructed_builtin_instance(value, "bytearray")
             || Self::is_constructed_stdlib_instance(value, "collections", "UserList")
+    }
+
+    fn is_operator_mapping_update_receiver(value: Option<&StackValue>) -> bool {
+        Self::is_builtin_container_argument(value, "dict")
+            || Self::is_constructed_stdlib_instance(value, "collections", "ChainMap")
+            || Self::is_constructed_stdlib_instance(value, "collections", "defaultdict")
+            || Self::is_constructed_stdlib_instance(value, "collections", "OrderedDict")
+            || Self::is_constructed_stdlib_instance(value, "collections", "UserDict")
     }
 
     fn is_next_call_iterator_consumer(module: &str, name: &str) -> bool {
