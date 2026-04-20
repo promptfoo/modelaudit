@@ -704,7 +704,11 @@ def _collect_import_aliases(nodes: Iterable[ast.AST], module_name: str, is_packa
     for statement in nodes:
         if isinstance(statement, ast.Import):
             for alias in statement.names:
-                aliases[alias.asname or alias.name.split(".")[0]] = alias.name
+                if alias.asname:
+                    aliases[alias.asname] = alias.name
+                else:
+                    local_name = alias.name.split(".")[0]
+                    aliases[local_name] = local_name
         elif isinstance(statement, ast.ImportFrom):
             if statement.module == "__future__":
                 continue

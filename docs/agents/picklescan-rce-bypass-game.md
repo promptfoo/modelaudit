@@ -11636,3 +11636,148 @@ Performance note:
 - `_find_sink_path("random._os.system")`: `0.0000s`, path
   `("random._os.system", "os.system")`.
 - `scan_bytes(payload)`: `malicious`, one finding, `0.0008s`.
+
+## Turn 205 - Bypass via dotted-import alias mis-modeling in `pkgutil`
+
+Found a scanner-clean RCE-capable import side-effect path through
+`pkgutil.iter_importers`.
+
+`pkgutil.py` imports all of these at module scope:
+
+```python
+import importlib
+import importlib.util
+import importlib.machinery
+```
+
+At runtime, the local name `importlib` still points at the top-level
+`importlib` package. The call graph currently overwrites that alias on each
+dotted import, so it models `pkgutil.iter_importers` as calling
+`importlib.machinery.import_module` instead of `importlib.import_module`.
+Because `importlib.machinery.import_module` is not a real sink, the path is
+missed.
+
+The payload uses `builtins.list` to force the generator body to run during
+unpickling:
+
+```text
+PROTO 4
+SHORT_BINUNICODE "builtins"
+SHORT_BINUNICODE "list"
+STACK_GLOBAL
+SHORT_BINUNICODE "pkgutil"
+SHORT_BINUNICODE "iter_importers"
+STACK_GLOBAL
+SHORT_BINUNICODE "evilpkg.submodule"
+TUPLE1
+REDUCE
+TUPLE1
+REDUCE
+STOP
+```
+
+`pkgutil.iter_importers("evilpkg.submodule")` imports the containing package
+`evilpkg` as a documented side effect. In the runtime proof, `evilpkg` was a
+temporary importable package whose `__init__.py` wrote a marker file; the
+pickle itself triggered that package code during `pickle.loads()`.
+
+Focused proof:
+
+- Payload length: `69` bytes.
+- `scan_bytes(payload)`: `clean`, `0` findings, `0.0208s`.
+- Import metadata:
+  `builtins.list` and `pkgutil.iter_importers`, both with `is_dangerous=False`.
+- `_call_graph_entrypoints("pkgutil.iter_importers")`:
+  `("pkgutil.iter_importers",)`.
+- `_find_sink_path("pkgutil.iter_importers")`: `None`.
+- `_calls_for_function("pkgutil.iter_importers")` includes
+  `importlib.machinery.import_module`, showing the mis-modeled alias.
+- `_find_sink_path("importlib.import_module")`: `("importlib.import_module",)`,
+  showing the intended sink is already known.
+- Runtime child-process proof: with a temporary `evilpkg` on `sys.path`,
+  `pickle.loads(payload)` returned a `list` and wrote marker content
+  `pkgutil-iter-importers-owned`.
+
+Why this was missed:
+
+- `_collect_import_aliases()` treats unaliased dotted imports like
+  `import importlib.machinery` as binding local name `importlib` to the full
+  dotted module. Python binds the local name to the top-level package instead.
+- The later dotted import overwrites the earlier correct `import importlib`
+  alias, so source calls to `importlib.import_module` are normalized to a
+  non-existent `importlib.machinery.import_module`.
+- Direct `pkgutil.resolve_name` is already blocked in the Rust table, but this
+  sibling generator path reaches the same import execution primitive without
+  using that blocked global.
+
+The next defensive turn should fix alias collection at the source: for
+unaliased `import package.submodule`, record the local binding as
+`package -> package`, while `import package.submodule as alias` should still
+record `alias -> package.submodule`. That finite import-semantics fix should
+restore `pkgutil.iter_importers -> importlib.import_module` and catch similar
+call-graph misses without adding another package-specific block.
+
+## Turn 206 - Block dotted-import alias mis-modeling
+
+Implemented the source-level import semantics fix from Turn 205.
+
+The call graph now distinguishes these two forms:
+
+```python
+import package.submodule
+import package.submodule as alias
+```
+
+For unaliased dotted imports, Python binds only the top-level package name in
+the local namespace, so `_collect_import_aliases()` now records
+`package -> package`. For aliased dotted imports, Python binds the alias to the
+requested dotted module, so `alias -> package.submodule` is preserved.
+
+That closes the Turn 205 path:
+
+```text
+pkgutil.iter_importers
+  -> importlib.import_module
+```
+
+Regression coverage added to
+`packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py`:
+
+- The payload imports only `builtins.list` and `pkgutil.iter_importers`.
+- It calls `pkgutil.iter_importers("evilpkg.submodule")`, then wraps the
+  generator in `list()` so the import side effect runs during unpickling.
+- The test creates a temporary `evilpkg` package whose `__init__.py` writes a
+  marker file.
+- `_calls_for_function("pkgutil.iter_importers")` now includes
+  `importlib.import_module` and no longer includes
+  `importlib.machinery.import_module`.
+- `_find_sink_path("pkgutil.iter_importers")` now returns
+  `("pkgutil.iter_importers", "importlib.import_module")`.
+- The payload scans `malicious` with a `DANGEROUS_CALL_GRAPH` finding whose
+  sink is `importlib.import_module`.
+- Runtime proof still executes in a child process and writes
+  `pkgutil-iter-importers-owned`.
+
+Focused validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_pkgutil_iter_importers_import_side_effect_rce packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_random_os_import_alias_prefix_rce packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_pydantic_dotted_getattr_alias_rce packages/modelaudit-picklescan/tests/test_call_graph_local_imports.py::test_call_graph_resolves_function_local_import_aliases`
+  passed: `4 passed`.
+
+Full pre-commit validation:
+
+- `ruff format` passed: `1 file reformatted, 390 files left unchanged`.
+- `ruff check --fix` passed.
+- `mypy` passed: `Success: no issues found in 446 source files`.
+- Full non-slow/non-integration validation passed:
+  `3712 passed, 1022 skipped, 21 warnings in 37.75s`.
+
+Performance note:
+
+- After clearing call-graph caches,
+  `_call_graph_entrypoints("pkgutil.iter_importers")`: `0.0183s`, returning
+  `("pkgutil.iter_importers",)`.
+- `_calls_for_function("pkgutil.iter_importers")` now returns
+  `("fullname.startswith", "ImportError", "fullname.rpartition", "importlib.import_module", "getattr", "pkgutil.get_importer")`.
+- `_find_sink_path("pkgutil.iter_importers")`: `0.0000s`, path
+  `("pkgutil.iter_importers", "importlib.import_module")`.
+- `scan_bytes(payload)`: `malicious`, one finding, `0.0008s`.

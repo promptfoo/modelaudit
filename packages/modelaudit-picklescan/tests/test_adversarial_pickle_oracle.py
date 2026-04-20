@@ -24,7 +24,7 @@ import pytest
 
 from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, Severity, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
-from modelaudit_picklescan.call_graph import _call_graph_entrypoints, _find_sink_path
+from modelaudit_picklescan.call_graph import _call_graph_entrypoints, _calls_for_function, _find_sink_path
 
 pytestmark = pytest.mark.skipif(
     find_spec(_RUST_EXTENSION_MODULE) is None,
@@ -1792,6 +1792,18 @@ def _random_os_alias_prefix_payload(marker: Path) -> bytes:
             _global_operand("random", "_os.system"),
             _tuple_payload_operands([_text_operand(command)]),
             b"R.",
+        ]
+    )
+
+
+def _pkgutil_iter_importers_payload() -> bytes:
+    return b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("builtins", "list"),
+            _global_operand("pkgutil", "iter_importers"),
+            _text_operand("evilpkg.submodule"),
+            b"\x85R\x85R.",
         ]
     )
 
@@ -4629,6 +4641,60 @@ if not marker.exists():
     )
     assert result.returncode == 0, result.stderr
     assert marker.read_text() == "random-os-alias-owned"
+
+
+def test_scan_bytes_blocks_pkgutil_iter_importers_import_side_effect_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "pkgutil_iter_importers_marker"
+    package_dir = tmp_path / "evilpkg"
+    package_dir.mkdir()
+    (package_dir / "__init__.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('pkgutil-iter-importers-owned')\n",
+        encoding="utf-8",
+    )
+    payload = _pkgutil_iter_importers_payload()
+
+    calls = _calls_for_function("pkgutil.iter_importers") or ()
+    assert "importlib.import_module" in calls
+    assert "importlib.machinery.import_module" not in calls
+    assert _find_sink_path("pkgutil.iter_importers") == (
+        "pkgutil.iter_importers",
+        "importlib.import_module",
+    )
+
+    report = scan_bytes(payload, source="pkgutil-iter-importers-import-side-effect-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "pkgutil",
+        "iter_importers",
+        "importlib.import_module",
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+result = pickle.loads(payload)
+if not isinstance(result, list):
+    raise SystemExit(f"expected list result, got {type(result).__name__}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(tmp_path), str(marker), payload.hex()],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == "pkgutil-iter-importers-owned"
 
 
 @pytest.mark.skipif(not _module_available("yaml"), reason="PyYAML is unavailable")
