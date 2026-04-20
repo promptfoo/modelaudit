@@ -1205,6 +1205,13 @@ impl<'a> ScanState<'a> {
         ) {
             return vec![Self::zero_arg_invocation(callable, op_name, position)];
         }
+        if let Some(callable) = Self::builtin_iterable_consumed_callable(
+            &callable_reference.module,
+            &callable_reference.name,
+            arguments,
+        ) {
+            return vec![Self::zero_arg_invocation(callable, op_name, position)];
+        }
 
         if !Self::is_next_call_iterator_consumer(
             &callable_reference.module,
@@ -1253,6 +1260,30 @@ impl<'a> ScanState<'a> {
 
     fn is_deque_call_iterator_consumer(module: &str, name: &str) -> bool {
         matches!((module, name), ("collections", "deque"))
+    }
+
+    fn builtin_iterable_consumed_callable<'b>(
+        module: &str,
+        name: &str,
+        arguments: &'b [StackValue],
+    ) -> Option<&'b GlobalRef> {
+        if !matches!(module, "builtins" | "__builtin__" | "__builtins__")
+            || !Self::builtin_iterable_consumer_arity_matches(name, arguments.len())
+        {
+            return None;
+        }
+        match arguments.first() {
+            Some(StackValue::CallIterator { callable }) => Some(callable),
+            _ => None,
+        }
+    }
+
+    fn builtin_iterable_consumer_arity_matches(name: &str, argument_count: usize) -> bool {
+        match name {
+            "all" | "any" | "max" | "min" | "sorted" => argument_count == 1,
+            "sum" => (1..=2).contains(&argument_count),
+            _ => false,
+        }
     }
 
     fn is_next_call_iterator_consumer(module: &str, name: &str) -> bool {

