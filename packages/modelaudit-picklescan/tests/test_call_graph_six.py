@@ -113,6 +113,20 @@ def _six_moves_cpickle_loads_payload(module: str, name: str, marker: Path) -> tu
     return payload, inner_payload, marker_content
 
 
+def _six_moves_builtins_eval_payload(module: str, name: str, marker: Path) -> tuple[bytes, str]:
+    marker_content = "owned-by-six-moves-builtins-eval"
+    expression = f"open({str(marker)!r}, 'w').write({marker_content!r})"
+    payload = b"".join(
+        [
+            b"\x80\x04",
+            _global_operand(module, name),
+            _tuple_payload_operands([_text_operand(expression)]),
+            b"R.",
+        ]
+    )
+    return payload, marker_content
+
+
 def _control_payload(command: str) -> bytes:
     return b"\x80\x04" + _text_operand(command) + b"."
 
@@ -157,6 +171,27 @@ def test_call_graph_resolves_six_moves_getoutput_alias(reference: str) -> None:
     ],
 )
 def test_call_graph_resolves_six_moves_cpickle_aliases(reference: str, sink: str) -> None:
+    assert _call_graph_entrypoints(reference) == (sink,)
+
+    path = _find_sink_path(reference)
+    assert path is not None
+    assert path[-1] == sink
+
+
+@pytest.mark.parametrize(
+    ("reference", "sink"),
+    [
+        ("six.moves.builtins.__import__", "builtins.__import__"),
+        ("six.moves.builtins.compile", "builtins.compile"),
+        ("six.moves.builtins.eval", "builtins.eval"),
+        ("six.moves.builtins.exec", "builtins.exec"),
+        ("botocore.vendored.six.moves.builtins.__import__", "builtins.__import__"),
+        ("botocore.vendored.six.moves.builtins.compile", "builtins.compile"),
+        ("botocore.vendored.six.moves.builtins.eval", "builtins.eval"),
+        ("botocore.vendored.six.moves.builtins.exec", "builtins.exec"),
+    ],
+)
+def test_call_graph_resolves_six_moves_builtins_dangerous_aliases(reference: str, sink: str) -> None:
     assert _call_graph_entrypoints(reference) == (sink,)
 
     path = _find_sink_path(reference)
@@ -234,4 +269,37 @@ def test_scan_bytes_blocks_six_moves_cpickle_loads_constructed_bytes_rce(
 
     assert not marker.exists()
     assert pickle.loads(payload) == 0
+    assert marker.read_text() == marker_content
+
+
+@pytest.mark.parametrize(
+    ("module", "name"),
+    [
+        ("six.moves.builtins", "eval"),
+        ("botocore.vendored.six.moves.builtins", "eval"),
+    ],
+)
+@pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
+def test_scan_bytes_blocks_six_moves_builtins_eval_rce(module: str, name: str, tmp_path: Path) -> None:
+    marker = tmp_path / f"{module.replace('.', '_')}_{name.replace('.', '_')}_rce_marker"
+    payload, marker_content = _six_moves_builtins_eval_payload(module, name, marker)
+    expression = f"open({str(marker)!r}, 'w').write({marker_content!r})"
+    control_payload = _control_payload(expression)
+
+    control_report = scan_bytes(control_payload, source="six-moves-builtins-eval-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    assert pickle.loads(control_payload) == expression
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="six-moves-builtins-eval-rce.pkl")
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(report, module, name, "builtins.eval")
+
+    if module.startswith("botocore.") and not _has_module("botocore.vendored.six"):
+        return
+
+    assert not marker.exists()
+    assert pickle.loads(payload) == len(marker_content)
     assert marker.read_text() == marker_content

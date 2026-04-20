@@ -10134,3 +10134,116 @@ Performance sanity:
 - Existing wrapper timings stayed in the same range:
   `six.moves.getoutput` at `0.0115s`, `click.edit` at `0.0552s`, and
   `execnet.makegateway` at `0.0457s`.
+
+## Turn 183 - Bypass via `six.moves.builtins.eval` synthetic submodule
+
+Found another scanner-clean RCE primitive through the `six.moves` lazy module
+alias family, this time to `builtins.eval`.
+
+Malicious pickle shape:
+
+- Import module/name `six.moves.builtins` / `eval` with `STACK_GLOBAL`.
+- Call it with one attacker-controlled expression:
+  `open(MARKER, "w").write("owned-by-six-moves-builtins-eval")`.
+- Runtime resolution returns the real `builtins.eval`, which evaluates the
+  expression and writes the marker.
+
+Proof on CPython 3.12.12 with `six==1.17.0` installed:
+
+- `six.py` registers `MovedModule("builtins", "__builtin__")`.
+- Runtime `six.moves.builtins.eval` resolves to `<built-in function eval>` with
+  `__module__ == "builtins"` and `__name__ == "eval"`.
+- `_call_graph_entrypoints("six.moves.builtins.eval") == ()`.
+- `_find_sink_path("six.moves.builtins.eval") is None`.
+- Active payload scanner result: `len=134`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import reference:
+  `six.moves.builtins.eval` with `is_dangerous=False`.
+- Runtime before unpickle: marker absent.
+- Runtime after unpickle: marker exists and contains
+  `owned-by-six-moves-builtins-eval`; `pickle.loads(payload)` returns `32`.
+
+Additional probe results:
+
+- Direct module/name `builtins` / `eval` scans `malicious` with
+  `DANGEROUS_CALL`, proving the lower-level primitive is already blocked.
+- Alternate spelling module/name `six.moves` / `builtins.eval` also scans
+  `malicious` with `DANGEROUS_CALL`.
+- Vendored module/name `botocore.vendored.six.moves.builtins` / `eval` scanned
+  `clean` and executed in the same way.
+- Vendored alternate spelling module/name `botocore.vendored.six.moves` /
+  `builtins.eval` scanned `malicious` with `DANGEROUS_CALL`.
+
+Why the scanner missed it:
+
+- The native dangerous-global matcher catches some dotted-name aliases when the
+  pickle module is `six.moves` and the name is `builtins.eval`.
+- It does not catch the pickle-resolvable synthetic submodule spelling where
+  the module is `six.moves.builtins` and the name is only `eval`.
+- The Python call graph is source-based and does not parse the `six.moves`
+  `MovedModule("builtins", ...)` table, so
+  `six.moves.builtins.eval` is not normalized to `builtins.eval`.
+- Turn 182 normalized `*.six.moves.cPickle.*` and `*.six.moves.getoutput`, but
+  not the `*.six.moves.builtins.*` moved-module family.
+
+Performance note: the next defensive turn should continue fixing at the finite
+alias source. A bounded static suffix normalization for
+`*.six.moves.builtins.eval -> builtins.eval` and nearby dangerous builtins such
+as `exec`, `compile`, and `__import__` would reuse existing sink detection with
+no stack emulation and no runtime imports. The vendored form should fall out of
+the same dotted-boundary suffix rule used for previous `six` fixes.
+
+## Turn 184 - Block `six.moves.builtins` dangerous builtin aliases
+
+Implemented a source-focused block for the Turn 183 synthetic-submodule bypass.
+
+The static import-reference alias suffix table now includes:
+
+- `*.six.moves.builtins.__import__ -> builtins.__import__`
+- `*.six.moves.builtins.compile -> builtins.compile`
+- `*.six.moves.builtins.eval -> builtins.eval`
+- `*.six.moves.builtins.exec -> builtins.exec`
+- existing `*.six.moves.cPickle.*` and `*.six.moves.getoutput` aliases
+
+This keeps the fix at the finite `six.moves` compatibility source. The scanner
+does not import `six`, parse live lazy modules, or emulate stack values; it
+normalizes known dangerous moved-module suffixes to existing sink names.
+
+Regression coverage updated in
+`packages/modelaudit-picklescan/tests/test_call_graph_six.py`:
+
+- `_call_graph_entrypoints("six.moves.builtins.eval")` now resolves to
+  `builtins.eval`.
+- `_find_sink_path("six.moves.builtins.eval")` now returns a path ending in
+  `builtins.eval`.
+- The same assertions cover vendored
+  `botocore.vendored.six.moves.builtins.eval`.
+- Sibling dangerous builtins `__import__`, `compile`, and `exec` are normalized
+  for both top-level and vendored `six`.
+- The Turn 183 payload that imports module/name `six.moves.builtins`/`eval` now
+  scans `malicious` with `DANGEROUS_CALL_GRAPH`.
+- The vendored synthetic-submodule spelling
+  `botocore.vendored.six.moves.builtins`/`eval` is also blocked.
+- The control pickle containing only the eval expression string remains `clean`.
+
+Focused validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_call_graph_six.py`
+  passed: `24 passed`.
+- `ruff format`, `ruff check --fix`, and `mypy` passed on the standard
+  ModelAudit paths.
+- Full non-slow/non-integration validation passed:
+  `3699 passed, 1022 skipped, 21 warnings in 39.65s`.
+
+Performance sanity:
+
+- `_find_sink_path("six.moves.builtins.eval")`: effectively `0.0000s`, path
+  `six.moves.builtins.eval -> builtins.eval`.
+- `_find_sink_path("botocore.vendored.six.moves.builtins.eval")`:
+  effectively `0.0000s`, path
+  `botocore.vendored.six.moves.builtins.eval -> builtins.eval`.
+- `_find_sink_path("six.moves.builtins.exec")`: effectively `0.0000s`, path
+  `six.moves.builtins.exec -> builtins.exec`.
+- Existing wrapper timings stayed in the same range:
+  `six.moves.getoutput` at `0.0106s`, `click.edit` at `0.0489s`, and
+  `execnet.makegateway` at `0.0422s`.

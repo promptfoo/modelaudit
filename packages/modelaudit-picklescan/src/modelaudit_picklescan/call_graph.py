@@ -77,6 +77,10 @@ _SUBPROCESS_DISPATCH_SUFFIXES = (
     ".subprocess.run",
 )
 _STATIC_IMPORT_REFERENCE_ALIAS_SUFFIXES = {
+    "six.moves.builtins.__import__": "builtins.__import__",
+    "six.moves.builtins.compile": "builtins.compile",
+    "six.moves.builtins.eval": "builtins.eval",
+    "six.moves.builtins.exec": "builtins.exec",
     "six.moves.cPickle.load": "pickle.load",
     "six.moves.cPickle.loads": "pickle.loads",
     "six.moves.getoutput": "subprocess.getoutput",
