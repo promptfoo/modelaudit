@@ -112,6 +112,9 @@ _SHORT_SINK_PRIORITY_TOKENS = (
     "fork_exec",
 )
 _SHORT_SINK_SECONDARY_PRIORITY_TOKENS = ("exec", "system", "run")
+_CALLABLE_SINGLETON_ALIASES = {
+    ("builtins", "help"): (("_sitebuiltins", "_Helper.__call__"),),
+}
 
 
 @dataclass(frozen=True)
@@ -382,12 +385,22 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
             continue
         module = str(item.get("module", ""))
         name = str(item.get("name", ""))
-        if not module or not name or (module, name) in seen:
+        if not module or not name:
             continue
-        seen.add((module, name))
-        normalized.append(dict(item))
-        if len(normalized) >= _MAX_IMPORT_REFERENCES:
-            break
+        for reference_module, reference_name in (
+            (module, name),
+            *_callable_singleton_aliases(module, name),
+        ):
+            if (reference_module, reference_name) in seen:
+                continue
+            seen.add((reference_module, reference_name))
+            reference = dict(item)
+            reference["module"] = reference_module
+            reference["name"] = reference_name
+            reference["import_reference"] = f"{reference_module}.{reference_name}"
+            normalized.append(reference)
+            if len(normalized) >= _MAX_IMPORT_REFERENCES:
+                return tuple(normalized)
     return tuple(normalized)
 
 
@@ -416,10 +429,15 @@ def _callable_invocation_positional_arg_counts(
             or positional_arg_count < 0
         ):
             continue
-        counts.setdefault((module, name), set()).add(positional_arg_count)
-        if len(counts) >= _MAX_IMPORT_REFERENCES:
-            break
+        for reference in ((module, name), *_callable_singleton_aliases(module, name)):
+            counts.setdefault(reference, set()).add(positional_arg_count)
+            if len(counts) >= _MAX_IMPORT_REFERENCES:
+                return {key: tuple(sorted(value, reverse=True)) for key, value in counts.items()}
     return {key: tuple(sorted(value, reverse=True)) for key, value in counts.items()}
+
+
+def _callable_singleton_aliases(module: str, name: str) -> tuple[tuple[str, str], ...]:
+    return _CALLABLE_SINGLETON_ALIASES.get((module, name), ())
 
 
 def has_unanalyzed_call_graph_import_references(import_references: object) -> bool:
