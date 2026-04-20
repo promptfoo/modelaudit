@@ -61,6 +61,14 @@ def _bytes_operand(data: bytes) -> bytes:
     return b"B" + len(data).to_bytes(4, "little") + data
 
 
+def _int_operand(value: int) -> bytes:
+    if 0 <= value <= 0xFF:
+        return b"K" + bytes([value])
+    if -0x80000000 <= value <= 0x7FFFFFFF:
+        return b"J" + value.to_bytes(4, "little", signed=True)
+    raise ValueError("test pickle helper only supports BININT1/BININT operands")
+
+
 def _binunicode8(data: bytes) -> bytes:
     return b"\x8d" + len(data).to_bytes(8, "little") + data
 
@@ -1348,6 +1356,40 @@ def _legacy_bound_getattribute_eval_payload(marker: Path, *, include_lookup: boo
         parts += [b"\x940h\x01h\x02\x85R"]
     parts += [b"."]
     return b"".join(parts), code
+
+
+def _subclasses_popen_payload(marker: Path, *, include_call: bool) -> tuple[bytes, int]:
+    popen_class: object = subprocess.Popen
+    popen_index = next(index for index, cls in enumerate(object.__subclasses__()) if cls is popen_class)
+    code = f"open({str(marker)!r},'w').write('owned-by-subclasses-popen')"
+    code_fragments = [code[offset : offset + 3] for offset in range(0, len(code), 3)]
+
+    def join_fragments(fragments: list[str]) -> bytes:
+        return b"".join(
+            [
+                _global_operand("builtins", "str.join"),
+                _text_operand(""),
+                _tuple_payload_operands([_text_operand(fragment) for fragment in fragments]),
+                b"\x86R",
+            ]
+        )
+
+    command = _tuple_payload_operands(
+        [
+            _text_operand(sys.executable),
+            _text_operand("-c"),
+            join_fragments(code_fragments),
+        ]
+    )
+    parts = [b"\x80\x04"]
+    if include_call:
+        parts += [_legacy_global_operand("builtins", "object.__subclasses__"), b")R\x940"]
+        parts += [_legacy_global_operand("operator", "getitem"), b"h\x00", _int_operand(popen_index), b"\x86R\x940"]
+        parts += [b"h\x01", command, b"\x85R"]
+    else:
+        parts += [command]
+    parts += [b"."]
+    return b"".join(parts), popen_index
 
 
 def _site_os_system_payload(command: str, *, include_call: bool) -> bytes:
@@ -3562,6 +3604,43 @@ def test_scan_bytes_blocks_legacy_global_bound_getattribute_eval_recovery_rce(tm
     result = pickle.loads(payload)
     assert result == len("owned-by-bound-function-getattribute")
     assert marker.read_text() == "owned-by-bound-function-getattribute"
+
+
+def test_scan_bytes_blocks_object_subclasses_popen_recovery_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "object_subclasses_popen_marker"
+    control_payload, _ = _subclasses_popen_payload(marker, include_call=False)
+    payload, popen_index = _subclasses_popen_payload(marker, include_call=True)
+
+    control_report = scan_bytes(control_payload, source="object-subclasses-popen-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert control_result[0] == sys.executable
+    assert control_result[1] == "-c"
+    assert "owned-by-subclasses-popen" in control_result[2]
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="object-subclasses-popen-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_global_finding(report, "builtins", "object.__subclasses__")
+
+    for global_payload in [
+        _legacy_global_operand("builtins", "object.__subclasses__"),
+        _global_operand("builtins", "object.__subclasses__"),
+        _legacy_global_operand("collections", "Counter.__subclasses__"),
+    ]:
+        direct_report = scan_bytes(b"\x80\x04" + global_payload + b".", source="object-subclasses-direct.pkl")
+        assert direct_report.verdict == SafetyVerdict.MALICIOUS
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert isinstance(result, subprocess.Popen)
+    popen_class: object = subprocess.Popen
+    assert object.__subclasses__()[popen_index] is popen_class
+    assert result.wait(timeout=5) == 0
+    assert marker.read_text() == "owned-by-subclasses-popen"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="os.system proof uses POSIX shell redirection")

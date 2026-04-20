@@ -11,6 +11,10 @@ fn direct_global_severity(module: &str, name: &str) -> Option<&'static str> {
         return Some("critical");
     }
 
+    if object_graph_source_method_is_dangerous(name) {
+        return Some("critical");
+    }
+
     if warning_globals(module).is_some_and(|warning_match| warning_match.matches(name)) {
         return Some("warning");
     }
@@ -117,6 +121,10 @@ fn namespace_global_is_dangerous(name: &str) -> bool {
 
 fn attribute_access_source_method_is_dangerous(name: &str) -> bool {
     name_contains_component(name, &["__getattribute__"])
+}
+
+fn object_graph_source_method_is_dangerous(name: &str) -> bool {
+    name_contains_component(name, &["__subclasses__"])
 }
 
 fn name_contains_component(name: &str, blocked_components: &[&str]) -> bool {
@@ -492,6 +500,7 @@ mod tests {
                 "__globals__",
                 "__globals__.get",
                 "object.__getattribute__",
+                "object.__subclasses__",
             ] {
                 assert_eq!(global_severity(module, name), Some("critical"));
             }
@@ -500,10 +509,12 @@ mod tests {
             ("statistics", "__getattribute__"),
             ("statistics", "mean.__getattribute__"),
             ("statistics", "mean.__globals__"),
+            ("collections", "Counter.__subclasses__"),
         ] {
             assert_eq!(global_severity(module, name), Some("critical"));
         }
         assert_eq!(global_severity("statistics", "mean.__name__"), None);
+        assert_eq!(global_severity("statistics", "mean.subclasses"), None);
         assert_eq!(global_severity("builtins", "filter"), Some("critical"));
         assert_eq!(global_severity("builtins", "hasattr"), Some("critical"));
         assert_eq!(global_severity("builtins", "map"), Some("critical"));

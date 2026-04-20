@@ -8685,3 +8685,89 @@ Blocking plan:
 Performance note: this stays in the Rust policy path and checks a tiny fixed
 set of parsed global-name components. It adds no imports, no object traversal,
 no descriptor binding, and no package-specific call-graph expansion.
+
+## Turn 157 - Bypass via `object.__subclasses__` recovering `subprocess.Popen`
+
+Found a scanner-clean RCE that bypasses the attribute/namespace source blocks
+by using the object graph as the capability source instead of a function or
+module namespace. The payload imports `builtins.object.__subclasses__`, calls it
+to enumerate live direct subclasses of `object`, then uses clean
+`operator.getitem` with the runtime index of `subprocess.Popen`. The pickle
+never imports `subprocess` or a `Popen` global, but it still recovers the class
+object and calls it with an attacker-controlled command.
+
+Proof payload shape:
+
+```python
+classes = object.__subclasses__()
+popen_cls = operator.getitem(classes, 246)
+popen_cls(("/usr/bin/touch", "/tmp/.../marker"))
+```
+
+The active pickle imports only:
+
+- `builtins.object.__subclasses__` via legacy `GLOBAL`
+- `operator.getitem` via legacy `GLOBAL`
+
+Proof on CPython 3.12.12 in the scanner test process, with `subprocess` already
+loaded by the host process:
+
+- Control payload scanner result: `len=67`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control import references: clean `builtins.object.__subclasses__` and clean
+  `operator.getitem`.
+- Control runtime: `pickle.loads(control)` returns `<class 'subprocess.Popen'>`
+  and creates no marker.
+- Active payload scanner result: `len=178`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references: only clean `builtins.object.__subclasses__` and
+  clean `operator.getitem`, both with `is_dangerous=False`.
+- Active runtime before unpickle: marker absent.
+- Active runtime after unpickle: `pickle.loads(active)` returns a
+  `subprocess.Popen` instance, the child exits with return code `0`, and the
+  marker is created.
+
+Why the scanner missed it:
+
+- `object.__subclasses__` is not in the dangerous global policy table and is
+  not covered by the new `__getattribute__` / namespace component blocks.
+- The payload does not import `subprocess`, `Popen`, `os`, `eval`, `exec`, a
+  builtin namespace, or a descriptor binder, so the existing source-primitive
+  blocks never fire.
+- The stack model treats `object.__subclasses__()` and `operator.getitem(...)`
+  as opaque values. It does not know that the result is a live class object
+  from the current Python process, nor that the selected class is the blocked
+  `subprocess.Popen` sink.
+- The proof has a host-process precondition: the target class must already be
+  loaded. That is still a dangerous source primitive for model-loading
+  processes because ML tooling commonly imports subprocess-capable libraries,
+  and the primitive can recover any live direct `object` subclass without a
+  corresponding pickle import reference.
+
+Performance note: the next block should stay close to the finite source
+primitive by marking `object.__subclasses__` as critical wherever it appears as
+a parsed global component. This avoids runtime subclass enumeration, stack
+object provenance, or package-specific class-index modeling.
+
+## Turn 158 - Block object subclass enumeration sources
+
+Blocking plan:
+
+- Add a finite parsed-global component check for `__subclasses__`. This catches
+  `builtins.object.__subclasses__` and other dotted class
+  `__subclasses__` references before pickle can enumerate live process classes.
+- Add Rust unit coverage for builtin `object.__subclasses__`, a dotted class
+  `Counter.__subclasses__` reference, and a benign near-match
+  `mean.subclasses`.
+- Add a CPython oracle regression for the Turn 157 payload. The control payload
+  only assembles the child-process command tuple and remains clean; the active
+  payload imports `builtins.object.__subclasses__`, recovers
+  `subprocess.Popen` through `operator.getitem`, is flagged as malicious, and
+  still creates the marker if loaded.
+- Add direct legacy-`GLOBAL` and `STACK_GLOBAL` regressions for
+  `builtins.object.__subclasses__`, plus a dotted-class legacy regression.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: this remains a tiny Rust component check over parsed global
+names. It does not enumerate subclasses, resolve class indexes, import target
+packages, or add object-provenance tracking to the pickle stack model.
