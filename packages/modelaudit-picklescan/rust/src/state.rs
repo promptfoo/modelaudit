@@ -1039,7 +1039,9 @@ impl<'a> ScanState<'a> {
             ("builtins", "str.format_map") => {
                 Self::str_format_map_invocations(arguments, op_name, position)
             }
-            ("operator", "mod") => Self::operator_mod_invocations(arguments, op_name, position),
+            ("operator", "mod" | "imod") => {
+                Self::operator_mod_invocations(arguments, op_name, position)
+            }
             ("string", "Formatter.vformat") => {
                 Self::formatter_vformat_invocations(arguments, op_name, position)
             }
@@ -1240,6 +1242,13 @@ impl<'a> ScanState<'a> {
         ) {
             return vec![Self::zero_arg_invocation(callable, op_name, position)];
         }
+        if let Some(callable) = Self::operator_protocol_consumed_callable(
+            &callable_reference.module,
+            &callable_reference.name,
+            arguments,
+        ) {
+            return vec![Self::zero_arg_invocation(callable, op_name, position)];
+        }
 
         if !Self::is_next_call_iterator_consumer(
             &callable_reference.module,
@@ -1423,6 +1432,39 @@ impl<'a> ScanState<'a> {
         arguments.first().and_then(Self::call_iterator_callable_ref)
     }
 
+    fn operator_protocol_consumed_callable<'b>(
+        module: &str,
+        name: &str,
+        arguments: &'b [StackValue],
+    ) -> Option<&'b GlobalRef> {
+        if !matches!(module, "operator" | "_operator") {
+            return None;
+        }
+        match name {
+            "iadd" | "iconcat" if arguments.len() == 2 => {
+                if !Self::is_builtin_container_argument(arguments.first(), "list") {
+                    return None;
+                }
+                arguments.get(1).and_then(Self::call_iterator_callable_ref)
+            }
+            "ior" if arguments.len() == 2 => {
+                if !Self::is_builtin_container_argument(arguments.first(), "dict") {
+                    return None;
+                }
+                arguments.get(1).and_then(Self::call_iterator_callable_ref)
+            }
+            "setitem" if arguments.len() == 3 => {
+                if !Self::is_builtin_container_argument(arguments.first(), "list")
+                    || !Self::is_constructed_builtin_instance(arguments.get(1), "slice")
+                {
+                    return None;
+                }
+                arguments.get(2).and_then(Self::call_iterator_callable_ref)
+            }
+            _ => None,
+        }
+    }
+
     fn builtin_iterable_consumer_arity_matches(name: &str, argument_count: usize) -> bool {
         match name {
             "all" | "any" | "max" | "min" | "sorted" => argument_count == 1,
@@ -1470,6 +1512,13 @@ impl<'a> ScanState<'a> {
             }
             _ => false,
         }
+    }
+
+    fn is_builtin_container_argument(value: Option<&StackValue>, name: &str) -> bool {
+        matches!(
+            value,
+            Some(StackValue::Primitive { type_name, .. }) if *type_name == name
+        ) || Self::is_constructed_builtin_instance(value, name)
     }
 
     fn is_next_call_iterator_consumer(module: &str, name: &str) -> bool {
