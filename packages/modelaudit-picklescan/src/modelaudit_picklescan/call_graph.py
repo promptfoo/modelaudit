@@ -16,6 +16,8 @@ _MAX_SOURCE_BYTES = 1024 * 1024
 _MAX_CALL_GRAPH_DEPTH = 4
 _MAX_VISITED_FUNCTIONS = 64
 _MAX_CALLS_PER_FUNCTION = 128
+_MAX_ASSIGNMENT_ALIASES = 128
+_MAX_SHORT_SINK_DEPTH = 2
 
 _CLASS_ENTRYPOINT_METHODS = (
     "__getattribute__",
@@ -66,6 +68,21 @@ _FILE_WRITE_METHODS = frozenset({"write", "writelines"})
 _BUILTIN_CALLS = frozenset({"__import__", "compile", "eval", "exec", "open"})
 _TCL_CALL_DISPATCH_SUFFIXES = (".tk.call", "._tk.call")
 _TCL_EVAL_DISPATCH_SUFFIXES = (".tk.eval", "._tk.eval")
+_SUBPROCESS_DISPATCH_SUFFIXES = (
+    ".subprocess.Popen",
+    ".subprocess.call",
+    ".subprocess.check_call",
+    ".subprocess.check_output",
+    ".subprocess.run",
+)
+_SHORT_SINK_PRIORITY_TOKENS = (
+    "subprocess",
+    "popen",
+    "spawn",
+    "create_io",
+    "fork_exec",
+)
+_SHORT_SINK_SECONDARY_PRIORITY_TOKENS = ("exec", "system", "run")
 
 
 @dataclass(frozen=True)
@@ -156,6 +173,8 @@ def find_startup_hook_write_call_graphs(import_references: object) -> tuple[Star
 
         entrypoints = _call_graph_entrypoints(f"{module}.{name}")
         if not entrypoints:
+            continue
+        if any(_find_sink_path(entrypoint) is not None for entrypoint in entrypoints):
             continue
         open_path = next(
             (path for entrypoint in entrypoints if (path := _find_file_open_path(entrypoint)) is not None),
@@ -249,7 +268,8 @@ def _find_matching_call_path(start: str, sink_for: Callable[[str], str | None]) 
         if calls is None:
             continue
 
-        for call in calls[:_MAX_CALLS_PER_FUNCTION]:
+        bounded_calls = calls[:_MAX_CALLS_PER_FUNCTION]
+        for call in bounded_calls:
             sink = sink_for(call)
             if sink is not None:
                 # Tcl dispatch risk depends on the local call argument shape; do not
@@ -257,6 +277,17 @@ def _find_matching_call_path(start: str, sink_for: Callable[[str], str | None]) 
                 if _is_tcl_interpreter_dispatch_call(sink) and len(path) > 1:
                     continue
                 return (*path, sink)
+
+        if sink_for is _rce_sink:
+            for call in sorted(bounded_calls, key=_short_sink_call_priority):
+                short_sink_path = _find_short_matching_call_path(call, sink_for)
+                if short_sink_path is not None:
+                    sink = short_sink_path[-1]
+                    if _is_tcl_interpreter_dispatch_call(sink):
+                        continue
+                    return (*path, *short_sink_path)
+
+        for call in bounded_calls:
             if len(path) > _MAX_CALL_GRAPH_DEPTH:
                 continue
             resolved = _resolve_function_target(call)
@@ -264,6 +295,38 @@ def _find_matching_call_path(start: str, sink_for: Callable[[str], str | None]) 
                 continue
             visited.add(resolved)
             queue.append((resolved, (*path, resolved)))
+    return None
+
+
+def _short_sink_call_priority(call_name: str) -> int:
+    tail = call_name.rpartition(".")[2].lower()
+    if any(token in tail for token in _SHORT_SINK_PRIORITY_TOKENS):
+        return 0
+    if any(token in tail for token in _SHORT_SINK_SECONDARY_PRIORITY_TOKENS):
+        return 1
+    return 2
+
+
+def _find_short_matching_call_path(start: str, sink_for: Callable[[str], str | None]) -> tuple[str, ...] | None:
+    queue: deque[tuple[str, tuple[str, ...], int]] = deque([(start, (start,), 0)])
+    visited = {start}
+
+    while queue and len(visited) <= _MAX_VISITED_FUNCTIONS:
+        function_name, path, depth = queue.popleft()
+        calls = _calls_for_function(function_name)
+        if calls is None:
+            continue
+        for call in calls[:_MAX_CALLS_PER_FUNCTION]:
+            sink = sink_for(call)
+            if sink is not None:
+                return (*path, sink)
+            if depth >= _MAX_SHORT_SINK_DEPTH:
+                continue
+            resolved = _resolve_function_target(call)
+            if resolved is None or resolved in visited:
+                continue
+            visited.add(resolved)
+            queue.append((resolved, (*path, resolved), depth + 1))
     return None
 
 
@@ -363,9 +426,29 @@ def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
         return None
 
     is_package = source_path.name == "__init__.py"
-    aliases = _collect_aliases(tree, module_name, is_package)
+    import_aliases = _collect_aliases(tree, module_name, is_package)
     local_defs = _collect_local_defs(tree)
-    calls_by_function, class_entrypoints = _collect_function_calls(tree, module_name, is_package, aliases, local_defs)
+    local_class_entrypoints = _collect_local_class_entrypoints(tree, module_name)
+    local_class_targets = set(local_class_entrypoints)
+    aliases = {
+        **import_aliases,
+        **_collect_assignment_aliases(
+            tree.body,
+            module_name,
+            import_aliases,
+            local_defs,
+            local_class_targets,
+        ),
+    }
+    calls_by_function, class_entrypoints = _collect_function_calls(
+        tree,
+        module_name,
+        is_package,
+        aliases,
+        local_defs,
+        local_class_targets,
+        local_class_entrypoints,
+    )
     return _ModuleAnalysis(
         module=module_name,
         source_path=str(source_path),
@@ -405,15 +488,123 @@ def _collect_local_defs(tree: ast.Module) -> set[str]:
     return local_defs
 
 
+def _collect_local_class_entrypoints(tree: ast.Module, module_name: str) -> dict[str, tuple[str, ...]]:
+    class_entrypoints: dict[str, tuple[str, ...]] = {}
+    for statement in tree.body:
+        if not isinstance(statement, ast.ClassDef):
+            continue
+        class_name = f"{module_name}.{statement.name}"
+        method_names = {
+            child.name for child in statement.body if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)
+        }
+        class_entrypoints[class_name] = tuple(
+            f"{class_name}.{method_name}" for method_name in _CLASS_ENTRYPOINT_METHODS if method_name in method_names
+        )
+    return class_entrypoints
+
+
+def _collect_assignment_aliases(
+    nodes: Iterable[ast.AST],
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+    local_class_targets: set[str],
+    *,
+    class_name: str | None = None,
+) -> dict[str, str]:
+    node_list = tuple(nodes)
+    assignment_aliases: dict[str, str] = {}
+
+    changed = True
+    while changed and len(assignment_aliases) < _MAX_ASSIGNMENT_ALIASES:
+        changed = False
+        scoped_aliases = {**aliases, **assignment_aliases}
+        for node in node_list:
+            resolved = _assignment_alias_value(
+                node,
+                module_name,
+                scoped_aliases,
+                local_defs,
+                local_class_targets,
+                class_name=class_name,
+            )
+            if resolved is None:
+                continue
+            for target_name in _assignment_alias_target_names(node):
+                if assignment_aliases.get(target_name) == resolved:
+                    continue
+                assignment_aliases[target_name] = resolved
+                changed = True
+                if len(assignment_aliases) >= _MAX_ASSIGNMENT_ALIASES:
+                    break
+    return assignment_aliases
+
+
+def _assignment_alias_value(
+    node: ast.AST,
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+    local_class_targets: set[str],
+    *,
+    class_name: str | None,
+) -> str | None:
+    value: ast.AST | None
+    if isinstance(node, ast.Assign | ast.AnnAssign):
+        value = node.value
+    else:
+        return None
+    if value is None:
+        return None
+
+    if isinstance(value, ast.Call):
+        call_target = _resolve_expr(value.func, module_name, aliases, local_defs, class_name)
+        if call_target in local_class_targets:
+            return call_target
+        return None
+
+    resolved = _resolve_expr(value, module_name, aliases, local_defs, class_name)
+    if resolved is None:
+        return None
+    if _is_local_class_member_alias(resolved, local_class_targets):
+        return resolved
+    if (
+        _rce_sink(resolved) is not None
+        or _file_open_sink(resolved) is not None
+        or _file_write_sink(resolved) is not None
+    ):
+        return resolved
+    return None
+
+
+def _assignment_alias_target_names(node: ast.AST) -> set[str]:
+    if isinstance(node, ast.Assign):
+        targets: set[str] = set()
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                targets.add(target.id)
+        return targets
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return {node.target.id}
+    return set()
+
+
+def _is_local_class_member_alias(resolved: str, local_class_targets: set[str]) -> bool:
+    return any(
+        resolved == class_target or resolved.startswith(f"{class_target}.") for class_target in local_class_targets
+    )
+
+
 def _collect_function_calls(
     tree: ast.Module,
     module_name: str,
     is_package: bool,
     aliases: dict[str, str],
     local_defs: set[str],
+    local_class_targets: set[str],
+    local_class_entrypoints: dict[str, tuple[str, ...]],
 ) -> tuple[dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]:
     calls_by_function: dict[str, tuple[str, ...]] = {}
-    class_entrypoints: dict[str, tuple[str, ...]] = {}
     for statement in tree.body:
         if isinstance(statement, ast.FunctionDef | ast.AsyncFunctionDef):
             function_name = f"{module_name}.{statement.name}"
@@ -423,28 +614,24 @@ def _collect_function_calls(
                 is_package,
                 aliases,
                 local_defs,
+                local_class_targets,
+                local_class_entrypoints,
             )
         elif isinstance(statement, ast.ClassDef):
-            class_name = f"{module_name}.{statement.name}"
-            method_names: set[str] = set()
             for child in statement.body:
                 if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
                     function_name = f"{module_name}.{statement.name}.{child.name}"
-                    method_names.add(child.name)
                     calls_by_function[function_name] = _calls_in_function(
                         child,
                         module_name,
                         is_package,
                         aliases,
                         local_defs,
+                        local_class_targets,
+                        local_class_entrypoints,
                         class_name=statement.name,
                     )
-            class_entrypoints[class_name] = tuple(
-                f"{class_name}.{method_name}"
-                for method_name in _CLASS_ENTRYPOINT_METHODS
-                if method_name in method_names
-            )
-    return calls_by_function, class_entrypoints
+    return calls_by_function, local_class_entrypoints
 
 
 def _calls_in_function(
@@ -453,6 +640,8 @@ def _calls_in_function(
     is_package: bool,
     aliases: dict[str, str],
     local_defs: set[str],
+    local_class_targets: set[str],
+    local_class_entrypoints: dict[str, tuple[str, ...]],
     *,
     class_name: str | None = None,
 ) -> tuple[str, ...]:
@@ -463,9 +652,7 @@ def _calls_in_function(
     }
     parameter_controlled_names: set[str] | None = None
     tcl_command_controlled_names: set[str] | None = None
-    for node in ast.walk(function_node):
-        if not isinstance(node, ast.Call):
-            continue
+    for node in _iter_call_nodes(function_node):
         resolved = _resolve_expr(node.func, module_name, function_aliases, local_defs, class_name)
         if resolved is not None:
             if _is_tcl_interpreter_dispatch_call(resolved):
@@ -485,7 +672,28 @@ def _calls_in_function(
                     parameter_controlled_names = _parameter_controlled_names(function_node)
                 if not _call_uses_parameter_controlled_argument(node, parameter_controlled_names):
                     continue
+            if _is_object_subprocess_dispatch_call(resolved):
+                if parameter_controlled_names is None:
+                    parameter_controlled_names = _parameter_controlled_names(function_node)
+                if not _call_uses_parameter_controlled_argument(node, parameter_controlled_names):
+                    continue
+            class_entrypoints = local_class_entrypoints.get(resolved, ())
+            if class_entrypoints:
+                calls.extend(class_entrypoints)
+                continue
             calls.append(resolved)
+    return tuple(calls)
+
+
+def _iter_call_nodes(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[ast.Call, ...]:
+    calls: list[ast.Call] = []
+
+    class _CallVisitor(ast.NodeVisitor):
+        def visit_Call(self, node: ast.Call) -> None:
+            calls.append(node)
+            self.generic_visit(node)
+
+    _CallVisitor().visit(function_node)
     return tuple(calls)
 
 
@@ -691,6 +899,8 @@ def _rce_sink(call_name: str) -> str | None:
         return call_name
     if _is_tcl_interpreter_dispatch_call(call_name):
         return call_name
+    if _is_object_subprocess_dispatch_call(call_name):
+        return call_name
     return None
 
 
@@ -712,3 +922,7 @@ def _is_file_write_call(call_name: str) -> bool:
 
 def _is_tcl_interpreter_dispatch_call(call_name: str) -> bool:
     return call_name.endswith(_TCL_CALL_DISPATCH_SUFFIXES) or call_name.endswith(_TCL_EVAL_DISPATCH_SUFFIXES)
+
+
+def _is_object_subprocess_dispatch_call(call_name: str) -> bool:
+    return call_name.endswith(_SUBPROCESS_DISPATCH_SUFFIXES)

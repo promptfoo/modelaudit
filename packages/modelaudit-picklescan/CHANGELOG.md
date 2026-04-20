@@ -48,6 +48,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pipes`.
 - Detect high-level `tkinter.Misc` pickle call targets that can forward
   attacker-controlled commands into Tcl interpreter dispatch.
+- Resolve module-level bound-method aliases and same-module constructor call
+  paths in pickle call-graph analysis so process-dispatch wrappers are blocked.
 - Resolve function-local import aliases in pickle call-graph analysis so
   wrappers that import RCE sinks inside function bodies are blocked.
 - Detect `typing._eval_type` pickle call targets that can evaluate

@@ -9542,3 +9542,134 @@ scanner already resolved from pickle import references. The extra work is one
 local alias map per analyzed function and does not import candidate packages,
 execute descriptors, expand the global denylist, or enumerate third-party
 packages. It blocks the source pattern rather than `_pytest` specifically.
+
+## Turn 173 - Bypass via module-level bound method and object-attribute process dispatch
+
+Found a scanner-clean RCE primitive in `execnet.makegateway`.
+
+`execnet.__init__` re-exports `makegateway` from `execnet.multi`, where it is a
+module-level bound method:
+
+```python
+default_group = Group()
+makegateway = default_group.makegateway
+```
+
+Calling it with a `popen` spec reaches process creation:
+
+```python
+def makegateway(self, spec=None):
+    ...
+    io = gateway_io.create_io(spec, execmodel=self.execmodel)
+    gw = gateway_bootstrap.bootstrap(io, spec)
+
+def create_io(spec, execmodel):
+    if spec.popen:
+        args = popen_args(spec)
+        return Popen2IOMaster(args, execmodel)
+
+class Popen2IOMaster(Popen2IO):
+    def __init__(self, args, execmodel):
+        PIPE = execmodel.subprocess.PIPE
+        self.popen = p = execmodel.subprocess.Popen(args, stdout=PIPE, stdin=PIPE)
+```
+
+Malicious pickle shape:
+
+- Import clean `execnet.makegateway`.
+- Call it with spec:
+  `popen//python=/bin/sh -c 'printf owned-by-execnet-makegateway > MARKER #'`.
+- `execnet.gateway_io.popen_args()` shell-splits the attacker-controlled
+  `python=` value before appending its normal `-u -c <bootstrap>` arguments, so
+  `/bin/sh -c ...` executes during unpickling.
+
+Proof on CPython 3.12.12 with `execnet==2.1.2` installed:
+
+- Direct probe: `execnet.makegateway` scans clean.
+- Call graph probe:
+  `_call_graph_entrypoints("execnet.makegateway") == ()` and
+  `_find_sink_path("execnet.makegateway") is None`.
+- Lower-level probe:
+  `execnet.multi.Group.makegateway`, `execnet.gateway_io.create_io`, and
+  `execnet.gateway_io.Popen2IOMaster` also scan clean and have no sink path.
+- Control payload scanner result: `len=147`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control runtime: `pickle.loads(control)` returns the spec string and does not
+  create the marker.
+- Active payload scanner result: `len=173`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references: clean `execnet.makegateway` with
+  `is_dangerous=False`.
+- Active runtime before unpickle: marker absent.
+- Active runtime after unpickle: marker exists and contains
+  `owned-by-execnet-makegateway`; `pickle.loads(active)` returned an
+  `execnet` `Gateway` object.
+
+Why the scanner missed it:
+
+- `_resolve_function_target("execnet.makegateway")` returns `None` because the
+  exported object is not a source `FunctionDef` or `ClassDef`; it is a
+  module-level assignment to a bound method object.
+- `_collect_aliases()` handles import aliases but not assignment aliases such as
+  `makegateway = default_group.makegateway`.
+- Even when probing the lower-level method directly, the call graph reaches
+  `execnet.gateway_io.Popen2IOMaster.__init__` but cannot resolve
+  `execmodel.subprocess.Popen` to `subprocess.Popen`. This is an object-attribute
+  process dispatcher, not an import or local name.
+- The payload imports no blocked primitive such as `subprocess`, `os`, `popen`,
+  `_posixsubprocess`, `exec`, `eval`, `getattr`, frame/object graph helpers, file
+  writers, or magic-method strings. The only imported global is
+  `execnet.makegateway`.
+
+Performance note: the next defensive turn should still block closest to the
+source. Two bounded source improvements would cover this family without
+enumerating packages: resolve module-level callable assignment aliases to
+function/class entrypoints, and add a small argument-controlled process-dispatch
+sink for calls ending in `.subprocess.Popen` when the base object is an
+execution-model parameter. A direct `execnet` table entry is a useful regression
+backstop, but the durable fix is to model these source shapes.
+
+## Turn 174 - Block bound-method aliases and object subprocess dispatch
+
+Blocking plan implemented:
+
+- Extend module analysis with bounded module-level assignment aliases. This
+  resolves source shapes like `default_group = Group()` and
+  `makegateway = default_group.makegateway` to the real method entrypoint
+  `execnet.multi.Group.makegateway`.
+- Preserve performance by keeping assignment alias collection at module scope
+  only. Function-local imports remain supported, but function-scope assignment
+  aliases were intentionally left out after they made large modules such as
+  `tkinter` expensive to analyze.
+- Expand same-module constructor calls during call extraction. A call like
+  `Popen2IOMaster(args, execmodel)` is recorded as
+  `execnet.gateway_io.Popen2IOMaster.__init__`, so the BFS can traverse the
+  constructor without trying to expand every class call dynamically.
+- Add an argument-controlled object-subprocess sink for calls ending in
+  `.subprocess.Popen`, `.subprocess.call`, `.subprocess.check_call`,
+  `.subprocess.check_output`, or `.subprocess.run`. This catches
+  `execmodel.subprocess.Popen(args, ...)` only when the call uses
+  parameter-controlled arguments.
+- Add a bounded two-hop short-sink prepass for RCE analysis, prioritized toward
+  process-shaped calls such as `create_io`, `popen`, `spawn`, and `fork_exec`.
+  This lets `execnet.multi.Group.makegateway` find the
+  `create_io -> Popen2IOMaster.__init__ -> execmodel.subprocess.Popen` path
+  without first exploring unrelated gateway bootstrap branches.
+- Skip startup-hook file-write analysis for entrypoints that already have an
+  RCE sink path. This prevents expensive duplicate analysis after a critical RCE
+  finding is already known.
+- Add a focused regression for the Turn 173 payload:
+  `execnet.makegateway("popen//python=/bin/sh -c ...")`.
+- Add the new focused test file to the reduced Python-version allowlist and add
+  root plus standalone picklescan changelog entries.
+
+Validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_call_graph_execnet.py packages/modelaudit-picklescan/tests/test_call_graph_local_imports.py packages/modelaudit-picklescan/tests/test_call_graph_tkinter.py`
+  passed (`8 passed`).
+
+Performance note: `tkinter` module analysis returned to roughly `0.04s` after
+keeping assignment aliases module-scoped, and `_find_sink_path("execnet.makegateway")`
+resolved in milliseconds. The block remains source-focused: no live imports,
+no descriptor execution, no blanket `execnet` wildcard, and no package-specific
+Rust policy entry.
