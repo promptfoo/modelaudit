@@ -1020,16 +1020,28 @@ impl<'a> ScanState<'a> {
         let Some(StackValue::Global(callable_reference)) = callable_value else {
             return Vec::new();
         };
-        if callable_reference.malformed || callable_reference.module != "builtins" {
+        if callable_reference.malformed {
             return Vec::new();
         }
         let Some(arguments) = argument_values else {
             return Vec::new();
         };
-        match callable_reference.name.as_str() {
-            "format" => Self::builtins_format_invocations(arguments, op_name, position),
-            "str.format" => Self::str_format_invocations(arguments, op_name, position),
-            "str.format_map" => Self::str_format_map_invocations(arguments, op_name, position),
+        match (
+            callable_reference.module.as_str(),
+            callable_reference.name.as_str(),
+        ) {
+            ("builtins", "format") => {
+                Self::builtins_format_invocations(arguments, op_name, position)
+            }
+            ("builtins", "str.format") => {
+                Self::str_format_invocations(arguments, op_name, position)
+            }
+            ("builtins", "str.format_map") => {
+                Self::str_format_map_invocations(arguments, op_name, position)
+            }
+            ("string", "Formatter.vformat") => {
+                Self::formatter_vformat_invocations(arguments, op_name, position)
+            }
             _ => Vec::new(),
         }
     }
@@ -1079,6 +1091,24 @@ impl<'a> ScanState<'a> {
             return Vec::new();
         }
         let Some(StackValue::DefaultDict { default_factory }) = arguments.get(1) else {
+            return Vec::new();
+        };
+        vec![Self::zero_arg_invocation(
+            default_factory,
+            op_name,
+            position,
+        )]
+    }
+
+    fn formatter_vformat_invocations(
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if arguments.len() != 4 || !Self::is_format_string_argument(arguments.get(1)) {
+            return Vec::new();
+        }
+        let Some(StackValue::DefaultDict { default_factory }) = arguments.get(3) else {
             return Vec::new();
         };
         vec![Self::zero_arg_invocation(
