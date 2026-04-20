@@ -8986,3 +8986,108 @@ Blocking plan:
 Performance note: this remains a sorted Rust policy-table lookup over parsed
 pickle globals. It does not inspect frames, bind descriptors, model frame
 attribute layout, or add stack-provenance tracking.
+
+## Turn 163 - Bypass via `.__call__` suffixes on blocked frame sources
+
+Found a scanner-clean RCE that bypasses the Turn 162 exact frame-source block
+by importing the bound `__call__` wrapper of each dangerous object instead of
+the dangerous object itself. CPython's pickle dotted-global resolver accepts
+names such as `inspect.currentframe.__call__` and
+`types.FrameType.f_builtins.__get__.__call__`; those globals are callable
+method-wrapper objects, but the policy only blocks the shorter exact names.
+
+Proof payload shape:
+
+```python
+frame = inspect.currentframe.__call__()
+builtins_dict = types.FrameType.f_builtins.__get__.__call__(frame)
+fn = dict.get(builtins_dict, "".join(["ev", "al"]))
+code = "".join(
+    [
+        "open('/tmp/.../marker','w').write('owned-by-call-suffix')",
+    ]
+)
+fn(code)
+```
+
+The active pickle imports only:
+
+- `inspect.currentframe.__call__` via legacy `GLOBAL`
+- `types.FrameType.f_builtins.__get__.__call__` via legacy `GLOBAL`
+- `builtins.dict.get`
+- two `builtins.str.join` references
+
+Proof on CPython 3.12.12:
+
+- Control payload scanner result: `len=213`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control import references: one clean `builtins.str.join`.
+- Control runtime: `pickle.loads(control)` returns the assembled eval code
+  string and creates no marker.
+- Active payload scanner result: `len=369`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references: clean `inspect.currentframe.__call__`, clean
+  `types.FrameType.f_builtins.__get__.__call__`, clean `builtins.dict.get`,
+  and two clean `builtins.str.join` references, all with
+  `is_dangerous=False`.
+- Active runtime before unpickle: marker absent.
+- Active runtime after unpickle: marker exists and contains
+  `owned-by-call-suffix`; `pickle.loads(active)` returns `20`, the byte count
+  from the marker write.
+
+Why the scanner missed it:
+
+- `direct_global_severity()` checks exact policy-table entries before the
+  wildcard module table, but the frame-source entries are exact names:
+  `inspect.currentframe` and `types.FrameType.f_builtins.__get__`.
+- A trailing `.__call__` changes the parsed pickle global name enough that the
+  sorted policy-table lookup misses it, while CPython still resolves an
+  equivalent callable method-wrapper.
+- `dotted_global_tail_severity()` only reinterprets components inside the
+  pickle global name itself. It does not combine the imported module with a
+  prefix of the dotted name and therefore never checks the dangerous candidate
+  `inspect.currentframe` inside `inspect` +
+  `currentframe.__call__`.
+- The Python call-graph pass receives `inspect.currentframe.__call__` as the
+  import reference, not `inspect.currentframe`, so it does not analyze the
+  blocked frame source either.
+- The payload fragments `eval` and the source string with `str.join`, so the
+  suspicious-string scan sees only short harmless fragments.
+
+Performance note: the next block should normalize parsed globals by stripping
+one or more trailing `.__call__` components and rechecking the same finite
+policy table, or equivalently teach `dotted_global_tail_severity()` to evaluate
+`<module>.<prefix>` candidates before the suffix. This stays at sorted-string
+lookup cost and avoids descriptor binding, frame inspection, or stack-value
+provenance.
+
+## Turn 164 - Block callable aliases of dangerous globals
+
+Blocking plan implemented:
+
+- Normalize parsed pickle globals with one or more trailing `.__call__`
+  components by stripping those suffixes and rechecking the same finite global
+  policy. This catches aliases such as `inspect.currentframe.__call__` and
+  `types.FrameType.f_builtins.__get__.__call__` without broadening the module
+  blocklist.
+- Keep the check source-proximal: it runs over the already parsed
+  `(module, name)` strings and uses the existing constant policy logic. It does
+  not import modules, bind descriptors, inspect frames, or model stack values.
+- Add Rust unit coverage for direct callable aliases, repeated
+  `.__call__.__call__` aliases, dotted-tail aliases such as
+  `site.logging.config.dictConfig.__call__`, and benign near-matches like
+  `statistics.mean.__name__.__call__` plus `os.path.__call__`.
+- Add a CPython oracle regression for the Turn 163 payload. The control payload
+  only assembles the eval source string and remains clean; the active payload
+  imports `inspect.currentframe.__call__` and
+  `types.FrameType.f_builtins.__get__.__call__`, is flagged as malicious, and
+  still writes the marker if loaded.
+- Add direct legacy-`GLOBAL` and `STACK_GLOBAL` regressions for callable aliases
+  of `inspect.currentframe` and the concrete frame namespace descriptor
+  getters.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: this is a short suffix-stripping loop plus the existing
+constant string checks. It scales with the number of trailing `.__call__`
+suffixes in a single parsed global name and adds no runtime Python
+introspection or package-specific expansion.

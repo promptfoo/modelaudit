@@ -3,6 +3,22 @@ pub(crate) fn global_severity(module: &str, name: &str) -> Option<&'static str> 
 }
 
 fn direct_global_severity(module: &str, name: &str) -> Option<&'static str> {
+    direct_global_severity_without_callable_alias(module, name)
+        .or_else(|| callable_global_alias_severity(module, name))
+}
+
+fn callable_global_alias_severity(module: &str, name: &str) -> Option<&'static str> {
+    let mut candidate = name;
+    while let Some(stripped) = candidate.strip_suffix(".__call__") {
+        candidate = stripped;
+        if let Some(severity) = direct_global_severity_without_callable_alias(module, candidate) {
+            return Some(severity);
+        }
+    }
+    None
+}
+
+fn direct_global_severity_without_callable_alias(module: &str, name: &str) -> Option<&'static str> {
     if (module == "os" && name == "path") || module == "os.path" {
         return None;
     }
@@ -497,6 +513,10 @@ mod tests {
             global_severity("site", "logging.config.dictConfig"),
             Some("critical")
         );
+        assert_eq!(
+            global_severity("site", "logging.config.dictConfig.__call__"),
+            Some("critical")
+        );
         for module in BUILTIN_MODULES {
             for name in [
                 "__dict__",
@@ -521,7 +541,12 @@ mod tests {
             assert_eq!(global_severity(module, name), Some("critical"));
         }
         assert_eq!(global_severity("statistics", "mean.__name__"), None);
+        assert_eq!(
+            global_severity("statistics", "mean.__name__.__call__"),
+            None
+        );
         assert_eq!(global_severity("statistics", "mean.subclasses"), None);
+        assert_eq!(global_severity("os.path", "__call__"), None);
         assert_eq!(global_severity("builtins", "filter"), Some("critical"));
         assert_eq!(global_severity("builtins", "hasattr"), Some("critical"));
         assert_eq!(global_severity("builtins", "map"), Some("critical"));
@@ -570,6 +595,14 @@ mod tests {
             assert_eq!(global_severity("gc", name), Some("critical"));
         }
         assert_eq!(global_severity("inspect", "currentframe"), Some("critical"));
+        assert_eq!(
+            global_severity("inspect", "currentframe.__call__"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("inspect", "currentframe.__call__.__call__"),
+            Some("critical")
+        );
         assert_eq!(global_severity("inspect", "getmembers"), Some("critical"));
         assert_eq!(global_severity("itertools", "accumulate"), Some("critical"));
         assert_eq!(global_severity("itertools", "dropwhile"), Some("critical"));
@@ -808,6 +841,14 @@ mod tests {
             "FrameType.f_locals.__get__",
         ] {
             assert_eq!(global_severity("types", name), Some("critical"));
+            assert_eq!(
+                global_severity("types", &format!("{name}.__call__")),
+                Some("critical")
+            );
+            assert_eq!(
+                global_severity("types", &format!("{name}.__call__.__call__")),
+                Some("critical")
+            );
         }
         assert_eq!(
             global_severity("types", "GetSetDescriptorType.__get__"),
