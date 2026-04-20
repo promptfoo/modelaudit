@@ -437,7 +437,26 @@ def _resolve_function_target(function_name: str) -> str | None:
         module_getattr_target = _resolve_module_getattr_target(module_name, qualified_name, analysis)
         if module_getattr_target is not None:
             return module_getattr_target
+    else:
+        dotted_module_getattr_target = _resolve_dotted_module_getattr_target(module_name, qualified_name, analysis)
+        if dotted_module_getattr_target is not None:
+            return dotted_module_getattr_target
     return None
+
+
+def _resolve_dotted_module_getattr_target(
+    module_name: str,
+    qualified_name: str,
+    analysis: _ModuleAnalysis,
+) -> str | None:
+    first_component, _separator, _remaining = qualified_name.partition(".")
+    if not first_component or first_component in analysis.direct_names:
+        return None
+    if analysis.aliases.get(first_component) is not None:
+        return None
+    if _resolve_wildcard_reexport_alias(module_name, first_component) is not None:
+        return None
+    return _resolve_module_getattr_target(module_name, first_component, analysis)
 
 
 def _resolve_module_getattr_target(

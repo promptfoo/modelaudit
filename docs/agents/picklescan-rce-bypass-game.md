@@ -11374,3 +11374,146 @@ Performance note:
   `_call_graph_entrypoints("pydantic.Popen")`: `0.0023s`.
 - `_find_sink_path("pydantic.Popen")`: `0.0000s`, path
   `("pydantic.Popen", "importlib.import_module")`.
+
+## Turn 201 - Bypass via dotted pydantic `__getattr__` alias traversal
+
+Found and proved a scanner-clean RCE-capable pickle that bypasses the Turn 200
+simple module-`__getattr__` fallback by using pickle's dotted global
+resolution.
+
+The payload imports only:
+
+- `pydantic._dynamic_imports`
+- `pydantic._os.system`
+
+The pickle first mutates pydantic's dynamic import registry:
+
+```text
+pydantic._dynamic_imports["_os"] = ("pydantic", "random")
+```
+
+Then it loads the dotted pickle global `pydantic._os.system` and calls it with:
+
+```text
+"printf pydantic-dotted-os-alias-owned > <marker>"
+```
+
+At runtime, pickle global resolution imports `pydantic` and resolves the dotted
+name segment by segment. The first missing segment, `_os`, dispatches to
+`pydantic.__getattr__`. The poisoned dynamic import entry makes pydantic import
+the standard `random` module and return `random._os`, which is the real `os`
+module. Dotted resolution then reads `.system` from that returned module, and
+the subsequent `REDUCE` invokes `os.system`.
+
+This avoids the existing native dotted-tail checks because the pickle import is
+`pydantic._os.system`, not `os.system`. It also avoids the Turn 200
+module-`__getattr__` fallback because the unresolved attribute is the first
+component of a dotted pickle global, not the whole requested module attribute.
+
+Proof:
+
+- Payload length: `195` bytes.
+- Scanner verdict: `clean`.
+- Finding count: `0`.
+- Import refs:
+  - `pydantic._dynamic_imports`, `is_dangerous=False`
+  - `pydantic._os.system`, `is_dangerous=False`
+- Call-graph state:
+  - `_call_graph_entrypoints("pydantic._os.system") -> ()`
+  - `_find_sink_path("pydantic._os.system") -> None`
+  - `_call_graph_entrypoints("pydantic._os") -> ("pydantic.__getattr__",)`
+  - `_find_sink_path("pydantic._os") -> ("pydantic._os", "importlib.import_module")`
+  - `_find_sink_path("pydantic.__getattr__") -> ("pydantic.__getattr__", "importlib.import_module")`
+- Runtime after `pickle.loads(payload)` in a subprocess:
+  - Returned result: `0`.
+  - Marker exists and contains `pydantic-dotted-os-alias-owned`.
+
+Why the scanner missed it:
+
+- Native policy does not recognize `pydantic._os.system` as an alias of
+  `os.system`.
+- The Python resolver only applies the module-`__getattr__` fallback when the
+  unresolved qualified name is a simple module attribute. It does not split a
+  dotted pickle global and apply the fallback to the first missing segment.
+- The resolver can already see `pydantic._os -> pydantic.__getattr__ ->
+  importlib.import_module`, but it does not connect that intermediate result
+  to the remaining `.system` suffix.
+- `SETITEM` registry mutation again turns an otherwise clean lazy-import path
+  into a dangerous object graph at unpickle time.
+
+Performance note:
+
+- Full `scan_bytes(payload)` proof: `0.0032s`.
+- After clearing call-graph caches,
+  `_call_graph_entrypoints("pydantic._os.system")`: `0.0014s`, returning no
+  entrypoints.
+- `_call_graph_entrypoints("pydantic._os")`: `0.0008s`, resolving through
+  `pydantic.__getattr__`.
+- Sink lookup for both `pydantic._os` and `pydantic.__getattr__` was
+  effectively instant after parsing pydantic's small `__init__.py`.
+
+The next defensive turn should extend the Turn 200 fallback to dotted pickle
+globals. A bounded approach is to inspect the first component of a dotted
+qualified name when the full name is unresolved: if that first component would
+resolve through module-level `__getattr__` to an import-capable path, report the
+original dotted global as reaching that sink. That catches this source-level
+primitive without trying to enumerate every object returned by the lazy import.
+
+## Turn 202 - Block dotted module `__getattr__` alias traversal
+
+Implemented a focused call-graph block for the Turn 201 dotted pydantic
+`__getattr__` bypass.
+
+The resolver now handles unresolved dotted module globals by inspecting the
+first qualified-name component after the full name fails to resolve. If that
+first component is not a real direct module export, explicit alias, or bounded
+wildcard reexport, and the module defines `__getattr__`, the original dotted
+pickle global is connected to the module `__getattr__` path.
+
+That closes the Turn 201 path:
+
+```text
+pydantic._os.system
+  -> pydantic.__getattr__
+  -> importlib.import_module
+```
+
+The model intentionally stops at the lazy import sink rather than trying to
+enumerate attributes of the object returned by `__getattr__`; that keeps the
+defense close to the finite source mechanism and avoids package-specific
+knowledge about `random._os`.
+
+Regression coverage added to
+`packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py`:
+
+- The payload mutates `pydantic._dynamic_imports["_os"]`.
+- The payload loads and calls the dotted global `pydantic._os.system`.
+- The test asserts `pydantic._dynamic_imports` stays unresolved as a
+  call-graph entrypoint because it is a real module global.
+- The test asserts `pydantic._os.system` now resolves to
+  `pydantic.__getattr__`.
+- The test asserts `pydantic._os.system` reaches `importlib.import_module`.
+- The payload now scans `malicious` with `DANGEROUS_CALL_GRAPH`.
+- Runtime proof still runs in a child process and writes
+  `pydantic-dotted-os-alias-owned`.
+
+Focused validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_pydantic_dotted_getattr_alias_rce packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_pydantic_dynamic_imports_module_getattr_rce packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_scipy_stats_norm_star_reexported_singleton_setstate_rce`
+  passed: `3 passed`.
+
+Full pre-commit validation:
+
+- `ruff format` passed: `391 files left unchanged`.
+- `ruff check --fix` passed.
+- `mypy` passed: `Success: no issues found in 446 source files`.
+- Full non-slow/non-integration validation passed:
+  `3710 passed, 1022 skipped, 21 warnings in 41.97s`.
+
+Performance note:
+
+- `scan_bytes(payload)`: `malicious`, one finding, `0.0036s`.
+- After clearing call-graph caches,
+  `_call_graph_entrypoints("pydantic._os.system")`: `0.0023s`.
+- `_find_sink_path("pydantic._os.system")`: `0.0000s`, path
+  `("pydantic._os.system", "importlib.import_module")`.
