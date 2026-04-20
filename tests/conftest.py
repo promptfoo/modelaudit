@@ -178,6 +178,7 @@ def pytest_runtest_setup(item):
             "test_dill_joblib_enhanced.py",  # Dill/joblib pickle routing regression tests
             "test_pickle_context_filtering.py",  # Pickle context filtering regression tests
             "test_xdist_status.py",  # xdist worker progress reporting tests
+            "test_release_workflow.py",  # release workflow regression tests
         ]
 
         # Check if this is an allowed test file
