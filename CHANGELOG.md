@@ -142,6 +142,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** detect pickle calls to `argparse.FileType` and high-level
   logging stream dispatch methods that can write attacker-controlled startup
   hooks
+- **security:** detect pickle calls to NumPy text writers that can write
+  attacker-controlled startup hooks
 - **security:** detect pickle calls to `codecs.open` and codec stream writes
   that can write attacker-controlled startup hooks
 - **security:** detect pickle calls to durable tempfile creation and CSV

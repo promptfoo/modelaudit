@@ -275,6 +275,13 @@ def _build_adversarial_cases() -> list[AdversarialCase]:
 ADVERSARIAL_CASES = _build_adversarial_cases()
 
 
+def _module_available(module_name: str) -> bool:
+    try:
+        return find_spec(module_name) is not None
+    except ModuleNotFoundError:
+        return False
+
+
 def _calls_subprocess_run_under_cpython(payload: bytes, monkeypatch: pytest.MonkeyPatch) -> bool:
     calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
@@ -963,6 +970,26 @@ def _restore_root_logger(root_logger: logging.Logger, handlers: list[logging.Han
             handler.close()
     root_logger.handlers[:] = handlers
     root_logger.setLevel(level)
+
+
+def _numpy_savetxt_pth_payload(pth_path: Path, marker: Path, *, writer_module: str, include_write: bool) -> bytes:
+    fragments = [
+        "im",
+        "port pathlib;pathlib.Path(",
+        repr(str(marker)),
+        ").write_text('owned-by-numpy-savetxt')",
+    ]
+    parts = [b"\x80\x04"]
+    parts += [_short_binunicode(b"builtins"), _short_binunicode(b"str.join"), b"\x93"]
+    parts += [_text_operand(""), _tuple_payload_operands([_text_operand(fragment) for fragment in fragments])]
+    parts += [b"\x86R\x94"]
+    if include_write:
+        parts += [_short_binunicode(writer_module.encode()), _short_binunicode(b"savetxt"), b"\x93"]
+        parts += [_text_operand(str(pth_path)), b"]h\x00a", _text_operand("%s"), b"\x87R"]
+    else:
+        parts += [b"h\x00"]
+    parts += [b"."]
+    return b"".join(parts)
 
 
 def _codecs_open_write_payload(marker: Path, *, include_write: bool) -> bytes:
@@ -2594,6 +2621,73 @@ def test_scan_bytes_blocks_logging_stream_handler_fragmented_pth_rce(
         assert marker.read_text() == "owned-by-logging-stream"
     finally:
         _restore_root_logger(root_logger, original_handlers, original_level)
+        sys.path[:] = original_sys_path
+
+
+@pytest.mark.skipif(not _module_available("numpy"), reason="numpy is unavailable")
+@pytest.mark.parametrize(
+    "writer_module",
+    [
+        "numpy",
+        pytest.param(
+            "numpy.lib._npyio_impl",
+            marks=pytest.mark.skipif(
+                not _module_available("numpy.lib._npyio_impl"),
+                reason="numpy.lib._npyio_impl is unavailable",
+            ),
+        ),
+    ],
+)
+def test_scan_bytes_blocks_numpy_savetxt_fragmented_pth_rce(tmp_path: Path, writer_module: str) -> None:
+    case_name = writer_module.replace(".", "_")
+    pth_path = tmp_path / f"{case_name}_savetxt_exec.pth"
+    marker = tmp_path / f"{case_name}_savetxt_marker"
+    control_payload = _numpy_savetxt_pth_payload(
+        pth_path,
+        marker,
+        writer_module=writer_module,
+        include_write=False,
+    )
+    payload = _numpy_savetxt_pth_payload(
+        pth_path,
+        marker,
+        writer_module=writer_module,
+        include_write=True,
+    )
+    original_sys_path = list(sys.path)
+
+    try:
+        control_report = scan_bytes(control_payload, source=f"numpy-savetxt-{case_name}-control.pkl")
+        assert control_report.verdict == SafetyVerdict.CLEAN
+
+        assert not pth_path.exists()
+        assert not marker.exists()
+        control_result = pickle.loads(control_payload)
+        assert control_result == f"import pathlib;pathlib.Path({str(marker)!r}).write_text('owned-by-numpy-savetxt')"
+        assert not pth_path.exists()
+        assert not marker.exists()
+
+        site.addsitedir(str(tmp_path))
+        assert not marker.exists()
+        sys.path[:] = original_sys_path
+
+        report = scan_bytes(payload, source=f"numpy-savetxt-{case_name}-pth-rce.pkl")
+
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_global_finding(report, writer_module, "savetxt")
+
+        assert not pth_path.exists()
+        assert not marker.exists()
+        result = pickle.loads(payload)
+        assert result is None
+        assert pth_path.read_text() == (
+            f"import pathlib;pathlib.Path({str(marker)!r}).write_text('owned-by-numpy-savetxt')\n"
+        )
+        assert not marker.exists()
+
+        site.addsitedir(str(tmp_path))
+        assert marker.read_text() == "owned-by-numpy-savetxt"
+    finally:
         sys.path[:] = original_sys_path
 
 
