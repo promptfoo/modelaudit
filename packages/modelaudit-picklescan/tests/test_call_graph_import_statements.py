@@ -411,22 +411,36 @@ def _builtins_help_heapq_key_callback_payload(name: str, iterable_operand: bytes
     return _global_call_payload("heapq", name, b"K\x01", iterable_operand, _global_operand("builtins", "help"))
 
 
-def _builtins_help_re_sub_payload(name: str, pattern: str, value: str) -> bytes:
+def _builtins_help_re_sub_payload(
+    name: str,
+    pattern: str,
+    value: str,
+    *extra_arg_operands: bytes,
+) -> bytes:
     return _global_call_payload(
         "re",
         name,
         _unicode_operand(pattern),
         _global_operand("builtins", "help"),
         _unicode_operand(value),
+        *extra_arg_operands,
     )
 
 
-def _builtins_help_re_pattern_sub_payload(name: str, pattern: str, value: str) -> bytes:
+def _builtins_help_re_pattern_sub_payload(
+    name: str,
+    pattern: str,
+    value: str,
+    compile_flags_operand: bytes | None = None,
+) -> bytes:
+    compile_arguments: tuple[bytes, ...] = (_unicode_operand(pattern),)
+    if compile_flags_operand is not None:
+        compile_arguments = (_unicode_operand(pattern), compile_flags_operand)
     return b"".join(
         [
             b"\x80\x04",
             _global_operand("re", "compile"),
-            _args_tuple(_unicode_operand(pattern)),
+            _args_tuple(*compile_arguments),
             b"R",
             b"\x94",
             b"0",
@@ -437,14 +451,21 @@ def _builtins_help_re_pattern_sub_payload(name: str, pattern: str, value: str) -
     )
 
 
-def _builtins_help_re_scanner_payload(pattern: str, value: str) -> bytes:
+def _builtins_help_re_scanner_payload(
+    pattern: str,
+    value: str,
+    flags_operand: bytes | None = None,
+) -> bytes:
     rule = _args_tuple(_unicode_operand(pattern), _global_operand("builtins", "help"))
     lexicon = _args_tuple(rule)
+    scanner_arguments: tuple[bytes, ...] = (lexicon,)
+    if flags_operand is not None:
+        scanner_arguments = (lexicon, flags_operand)
     return b"".join(
         [
             b"\x80\x04",
             _global_operand("re", "Scanner"),
-            _args_tuple(lexicon),
+            _args_tuple(*scanner_arguments),
             b"R",
             b"\x94",
             b"0",
@@ -3676,7 +3697,21 @@ if marker.exists():
 
 
 @pytest.mark.parametrize("name", ["sub", "subn"])
-def test_scan_bytes_blocks_re_sub_replacement_callback_rce(tmp_path: Path, name: str) -> None:
+@pytest.mark.parametrize(
+    ("pattern", "value", "extra_arg_operands"),
+    [
+        ("x", "x", ()),
+        (".", "x", ()),
+        (".", "\n", (b"K\x00", b"K\x10")),
+    ],
+)
+def test_scan_bytes_blocks_re_sub_replacement_callback_rce(
+    tmp_path: Path,
+    name: str,
+    pattern: str,
+    value: str,
+    extra_arg_operands: tuple[bytes, ...],
+) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
     marker = tmp_path / "re_sub_replacement_callback_marker"
@@ -3688,7 +3723,7 @@ def test_scan_bytes_blocks_re_sub_replacement_callback_rce(tmp_path: Path, name:
         "    return 'OWNED'\n",
         encoding="utf-8",
     )
-    payload = _builtins_help_re_sub_payload(name, "x", "x")
+    payload = _builtins_help_re_sub_payload(name, pattern, value, *extra_arg_operands)
 
     report = scan_bytes(payload, source=f"re-{name}-replacement-callback-rce.pkl")
 
@@ -3745,7 +3780,21 @@ if marker.read_text() != marker_content:
 
 
 @pytest.mark.parametrize("name", ["sub", "subn"])
-def test_scan_bytes_keeps_re_sub_no_match_callback_lazy(tmp_path: Path, name: str) -> None:
+@pytest.mark.parametrize(
+    ("pattern", "value", "expected_value"),
+    [
+        ("z", "x", "x"),
+        (".", "", ""),
+        (".", "\n", "\n"),
+    ],
+)
+def test_scan_bytes_keeps_re_sub_no_match_callback_lazy(
+    tmp_path: Path,
+    name: str,
+    pattern: str,
+    value: str,
+    expected_value: str,
+) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
     marker = tmp_path / "re_sub_no_match_callback_marker"
@@ -3757,7 +3806,7 @@ def test_scan_bytes_keeps_re_sub_no_match_callback_lazy(tmp_path: Path, name: st
         "    return 'OWNED'\n",
         encoding="utf-8",
     )
-    payload = _builtins_help_re_sub_payload(name, "z", "x")
+    payload = _builtins_help_re_sub_payload(name, pattern, value)
 
     report = scan_bytes(payload, source=f"re-{name}-no-match-callback.pkl")
 
@@ -3778,20 +3827,21 @@ module_dir = Path(sys.argv[1])
 marker = Path(sys.argv[2])
 payload = bytes.fromhex(sys.argv[3])
 name = sys.argv[4]
+expected_value = sys.argv[5]
 
 if marker.exists():
     raise SystemExit("marker already exists before pickle execution")
 sys.path.insert(0, str(module_dir))
 sys.modules.pop("pydoc", None)
 result = pickle.loads(payload)
-expected = "x" if name == "sub" else ("x", 0)
+expected = expected_value if name == "sub" else (expected_value, 0)
 if result != expected:
     raise SystemExit(f"unexpected result {result!r}")
 if marker.exists():
     raise SystemExit("marker was written")
 """
     result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), name],
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), name, expected_value],
         cwd=str(tmp_path.parent),
         env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
         check=False,
@@ -3804,7 +3854,21 @@ if marker.exists():
 
 
 @pytest.mark.parametrize("name", ["sub", "subn"])
-def test_scan_bytes_blocks_re_pattern_sub_replacement_callback_rce(tmp_path: Path, name: str) -> None:
+@pytest.mark.parametrize(
+    ("pattern", "value", "compile_flags_operand"),
+    [
+        ("x", "x", None),
+        (".", "x", None),
+        (".", "\n", b"K\x10"),
+    ],
+)
+def test_scan_bytes_blocks_re_pattern_sub_replacement_callback_rce(
+    tmp_path: Path,
+    name: str,
+    pattern: str,
+    value: str,
+    compile_flags_operand: bytes | None,
+) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
     marker = tmp_path / "re_pattern_sub_replacement_callback_marker"
@@ -3816,7 +3880,7 @@ def test_scan_bytes_blocks_re_pattern_sub_replacement_callback_rce(tmp_path: Pat
         "    return 'OWNED'\n",
         encoding="utf-8",
     )
-    payload = _builtins_help_re_pattern_sub_payload(name, "x", "x")
+    payload = _builtins_help_re_pattern_sub_payload(name, pattern, value, compile_flags_operand)
 
     report = scan_bytes(payload, source=f"re-pattern-{name}-replacement-callback-rce.pkl")
 
@@ -3873,7 +3937,21 @@ if marker.read_text() != marker_content:
 
 
 @pytest.mark.parametrize("name", ["sub", "subn"])
-def test_scan_bytes_keeps_re_pattern_sub_no_match_callback_lazy(tmp_path: Path, name: str) -> None:
+@pytest.mark.parametrize(
+    ("pattern", "value", "expected_value"),
+    [
+        ("z", "x", "x"),
+        (".", "", ""),
+        (".", "\n", "\n"),
+    ],
+)
+def test_scan_bytes_keeps_re_pattern_sub_no_match_callback_lazy(
+    tmp_path: Path,
+    name: str,
+    pattern: str,
+    value: str,
+    expected_value: str,
+) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
     marker = tmp_path / "re_pattern_sub_no_match_callback_marker"
@@ -3885,7 +3963,7 @@ def test_scan_bytes_keeps_re_pattern_sub_no_match_callback_lazy(tmp_path: Path, 
         "    return 'OWNED'\n",
         encoding="utf-8",
     )
-    payload = _builtins_help_re_pattern_sub_payload(name, "z", "x")
+    payload = _builtins_help_re_pattern_sub_payload(name, pattern, value)
 
     report = scan_bytes(payload, source=f"re-pattern-{name}-no-match-callback.pkl")
 
@@ -3906,20 +3984,21 @@ module_dir = Path(sys.argv[1])
 marker = Path(sys.argv[2])
 payload = bytes.fromhex(sys.argv[3])
 name = sys.argv[4]
+expected_value = sys.argv[5]
 
 if marker.exists():
     raise SystemExit("marker already exists before pickle execution")
 sys.path.insert(0, str(module_dir))
 sys.modules.pop("pydoc", None)
 result = pickle.loads(payload)
-expected = "x" if name == "sub" else ("x", 0)
+expected = expected_value if name == "sub" else (expected_value, 0)
 if result != expected:
     raise SystemExit(f"unexpected result {result!r}")
 if marker.exists():
     raise SystemExit("marker was written")
 """
     result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), name],
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), name, expected_value],
         cwd=str(tmp_path.parent),
         env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
         check=False,
@@ -3931,7 +4010,21 @@ if marker.exists():
     assert not marker.exists()
 
 
-def test_scan_bytes_blocks_re_scanner_action_callback_rce(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("pattern", "value", "flags_operand", "expected_result"),
+    [
+        ("x", "x", None, (["TOKEN:x"], "")),
+        (".", "x", None, (["TOKEN:x"], "")),
+        (".", "\n", b"K\x10", (["TOKEN:\n"], "")),
+    ],
+)
+def test_scan_bytes_blocks_re_scanner_action_callback_rce(
+    tmp_path: Path,
+    pattern: str,
+    value: str,
+    flags_operand: bytes | None,
+    expected_result: tuple[list[str], str],
+) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
     marker = tmp_path / "re_scanner_action_callback_marker"
@@ -3943,7 +4036,7 @@ def test_scan_bytes_blocks_re_scanner_action_callback_rce(tmp_path: Path) -> Non
         "    return 'TOKEN:' + args[-1]\n",
         encoding="utf-8",
     )
-    payload = _builtins_help_re_scanner_payload("x", "x")
+    payload = _builtins_help_re_scanner_payload(pattern, value, flags_operand)
 
     report = scan_bytes(payload, source="re-scanner-action-callback-rce.pkl")
 
@@ -3971,13 +4064,15 @@ module_dir = Path(sys.argv[1])
 marker = Path(sys.argv[2])
 payload = bytes.fromhex(sys.argv[3])
 marker_content = sys.argv[4]
+expected_token = sys.argv[5]
+expected_remainder = sys.argv[6]
 
 if marker.exists():
     raise SystemExit("marker already exists before pickle execution")
 sys.path.insert(0, str(module_dir))
 sys.modules.pop("pydoc", None)
 result = pickle.loads(payload)
-if result != (["TOKEN:x"], ""):
+if result != ([expected_token], expected_remainder):
     raise SystemExit(f"unexpected result {result!r}")
 if not marker.exists():
     raise SystemExit("marker was not written")
@@ -3985,7 +4080,17 @@ if marker.read_text() != marker_content:
     raise SystemExit("marker content mismatch")
 """
     result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            str(module_dir),
+            str(marker),
+            payload.hex(),
+            marker_content,
+            expected_result[0][0],
+            expected_result[1],
+        ],
         cwd=str(tmp_path.parent),
         env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
         check=False,
@@ -3997,7 +4102,20 @@ if marker.read_text() != marker_content:
     assert marker.read_text() == marker_content
 
 
-def test_scan_bytes_keeps_re_scanner_no_match_action_callback_lazy(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("pattern", "value", "expected_result"),
+    [
+        ("z", "x", ([], "x")),
+        (".", "", ([], "")),
+        (".", "\n", ([], "\n")),
+    ],
+)
+def test_scan_bytes_keeps_re_scanner_no_match_action_callback_lazy(
+    tmp_path: Path,
+    pattern: str,
+    value: str,
+    expected_result: tuple[list[str], str],
+) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
     marker = tmp_path / "re_scanner_no_match_action_callback_marker"
@@ -4009,7 +4127,7 @@ def test_scan_bytes_keeps_re_scanner_no_match_action_callback_lazy(tmp_path: Pat
         "    return 'TOKEN:' + args[-1]\n",
         encoding="utf-8",
     )
-    payload = _builtins_help_re_scanner_payload("z", "x")
+    payload = _builtins_help_re_scanner_payload(pattern, value)
 
     report = scan_bytes(payload, source="re-scanner-no-match-callback.pkl")
 
@@ -4029,19 +4147,20 @@ from pathlib import Path
 module_dir = Path(sys.argv[1])
 marker = Path(sys.argv[2])
 payload = bytes.fromhex(sys.argv[3])
+expected_remainder = sys.argv[4]
 
 if marker.exists():
     raise SystemExit("marker already exists before pickle execution")
 sys.path.insert(0, str(module_dir))
 sys.modules.pop("pydoc", None)
 result = pickle.loads(payload)
-if result != ([], "x"):
+if result != ([], expected_remainder):
     raise SystemExit(f"unexpected result {result!r}")
 if marker.exists():
     raise SystemExit("marker was written")
 """
     result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), expected_result[1]],
         cwd=str(tmp_path.parent),
         env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
         check=False,

@@ -59,8 +59,25 @@ enum CallbackDispatchGuard {
     LiteralRegexMatch {
         pattern_arg_index: usize,
         input_arg_index: usize,
+        flags_arg_index: Option<usize>,
     },
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegexLiteralInputMatch {
+    Matches,
+    DoesNotMatch,
+    Unknown,
+}
+
+struct RegexPatternSpec {
+    pattern: String,
+    flags: Option<isize>,
+}
+
+const REGEX_FLAG_IGNORECASE: isize = 2;
+const REGEX_FLAG_MULTILINE: isize = 8;
+const REGEX_FLAG_DOTALL: isize = 16;
 
 const EXACT_ARITY_STDLIB_EAGER_ITERABLE_CONSUMERS: &[(&str, &str, usize, usize)] = &[
     ("array", "array", 2, 1),
@@ -114,6 +131,7 @@ const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(
         CallbackDispatchGuard::LiteralRegexMatch {
             pattern_arg_index: 0,
             input_arg_index: 2,
+            flags_arg_index: None,
         },
     ),
     (
@@ -125,6 +143,7 @@ const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(
         CallbackDispatchGuard::LiteralRegexMatch {
             pattern_arg_index: 0,
             input_arg_index: 2,
+            flags_arg_index: None,
         },
     ),
     (
@@ -136,6 +155,7 @@ const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(
         CallbackDispatchGuard::LiteralRegexMatch {
             pattern_arg_index: 0,
             input_arg_index: 2,
+            flags_arg_index: Some(4),
         },
     ),
     (
@@ -147,6 +167,7 @@ const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(
         CallbackDispatchGuard::LiteralRegexMatch {
             pattern_arg_index: 0,
             input_arg_index: 2,
+            flags_arg_index: None,
         },
     ),
     (
@@ -158,6 +179,7 @@ const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(
         CallbackDispatchGuard::LiteralRegexMatch {
             pattern_arg_index: 0,
             input_arg_index: 2,
+            flags_arg_index: None,
         },
     ),
     (
@@ -169,6 +191,7 @@ const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(
         CallbackDispatchGuard::LiteralRegexMatch {
             pattern_arg_index: 0,
             input_arg_index: 2,
+            flags_arg_index: Some(4),
         },
     ),
     (
@@ -180,6 +203,7 @@ const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(
         CallbackDispatchGuard::LiteralRegexMatch {
             pattern_arg_index: 0,
             input_arg_index: 2,
+            flags_arg_index: None,
         },
     ),
     (
@@ -191,6 +215,7 @@ const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(
         CallbackDispatchGuard::LiteralRegexMatch {
             pattern_arg_index: 0,
             input_arg_index: 2,
+            flags_arg_index: None,
         },
     ),
     (
@@ -202,6 +227,7 @@ const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(
         CallbackDispatchGuard::LiteralRegexMatch {
             pattern_arg_index: 0,
             input_arg_index: 2,
+            flags_arg_index: None,
         },
     ),
     (
@@ -213,6 +239,7 @@ const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(
         CallbackDispatchGuard::LiteralRegexMatch {
             pattern_arg_index: 0,
             input_arg_index: 2,
+            flags_arg_index: None,
         },
     ),
 ];
@@ -1368,9 +1395,11 @@ impl<'a> ScanState<'a> {
             CallbackDispatchGuard::LiteralRegexMatch {
                 pattern_arg_index,
                 input_arg_index,
+                flags_arg_index,
             } => self.literal_regex_pattern_matches_argument(
                 arguments.get(pattern_arg_index),
                 arguments.get(input_arg_index),
+                flags_arg_index.and_then(|arg_index| arguments.get(arg_index)),
             ),
         }
     }
@@ -1379,15 +1408,19 @@ impl<'a> ScanState<'a> {
         &self,
         pattern_value: Option<&StackValue>,
         input_value: Option<&StackValue>,
+        flags_value: Option<&StackValue>,
     ) -> bool {
-        let Some(pattern) = self.regex_pattern_from_value(pattern_value) else {
+        let Some(mut pattern) = self.regex_pattern_from_value(pattern_value) else {
             return false;
         };
+        if flags_value.is_some() {
+            pattern.flags = flags_value.and_then(Self::stack_value_integer);
+        }
         let Some(input) = input_value.and_then(|value| stack_value_string(value, self.payload))
         else {
             return false;
         };
-        Self::literal_regex_pattern_matches_text(&pattern, &input)
+        Self::regex_pattern_matches_literal_input(&pattern.pattern, &input, pattern.flags)
     }
 
     fn regex_scanner_scan_invocation(
@@ -1401,7 +1434,7 @@ impl<'a> ScanState<'a> {
         if module != "re" || name != "Scanner.scan" || arguments.len() != 2 {
             return None;
         }
-        let Some(StackValue::RegexScanner { rules }) = arguments.first() else {
+        let Some(StackValue::RegexScanner { rules, flags }) = arguments.first() else {
             return None;
         };
         let input = arguments
@@ -1409,29 +1442,279 @@ impl<'a> ScanState<'a> {
             .and_then(|value| stack_value_string(value, self.payload))?;
         rules
             .iter()
-            .find(|rule| Self::literal_regex_pattern_matches_text(&rule.pattern, &input))
+            .find(|rule| Self::regex_pattern_matches_literal_input(&rule.pattern, &input, *flags))
             .map(|rule| Self::callable_invocation(rule.action.clone(), op_name, position, Some(2)))
     }
 
-    fn regex_pattern_from_value(&self, value: Option<&StackValue>) -> Option<String> {
+    fn regex_pattern_from_value(&self, value: Option<&StackValue>) -> Option<RegexPatternSpec> {
         match value {
-            Some(StackValue::RegexPattern { pattern }) => Some(pattern.clone()),
-            Some(value) => stack_value_string(value, self.payload),
+            Some(StackValue::RegexPattern { pattern, flags }) => Some(RegexPatternSpec {
+                pattern: pattern.clone(),
+                flags: *flags,
+            }),
+            Some(value) => {
+                stack_value_string(value, self.payload).map(|pattern| RegexPatternSpec {
+                    pattern,
+                    flags: Some(0),
+                })
+            }
             None => None,
         }
     }
 
+    fn is_regex_metacharacter(character: char) -> bool {
+        matches!(
+            character,
+            '.' | '^' | '$' | '*' | '+' | '?' | '{' | '}' | '[' | ']' | '\\' | '|' | '(' | ')'
+        )
+    }
+
     fn is_plain_regex_literal(pattern: &str) -> bool {
-        !pattern.chars().any(|character| {
-            matches!(
-                character,
-                '.' | '^' | '$' | '*' | '+' | '?' | '{' | '}' | '[' | ']' | '\\' | '|' | '(' | ')'
-            )
+        !pattern.chars().any(Self::is_regex_metacharacter)
+    }
+
+    fn regex_flags_may_enable(flags: Option<isize>, flag: isize) -> bool {
+        flags.map_or(true, |bits| bits & flag != 0)
+    }
+
+    fn regex_any_line_matches(input: &str, predicate: impl Fn(&str) -> bool) -> bool {
+        input.split('\n').any(predicate)
+    }
+
+    fn plain_regex_literal_matches_literal_input(
+        pattern: &str,
+        input: &str,
+        flags: Option<isize>,
+    ) -> bool {
+        pattern.is_empty()
+            || input.contains(pattern)
+            || (Self::regex_flags_may_enable(flags, REGEX_FLAG_IGNORECASE)
+                && input.to_lowercase().contains(&pattern.to_lowercase()))
+    }
+
+    fn regex_pattern_matches_literal_input(
+        pattern: &str,
+        input: &str,
+        flags: Option<isize>,
+    ) -> bool {
+        !matches!(
+            Self::classify_regex_pattern_literal_input(pattern, input, flags),
+            RegexLiteralInputMatch::DoesNotMatch
+        )
+    }
+
+    fn classify_regex_pattern_literal_input(
+        pattern: &str,
+        input: &str,
+        flags: Option<isize>,
+    ) -> RegexLiteralInputMatch {
+        if let Some(match_result) =
+            Self::simple_regex_alternative_matches_literal_input(pattern, input, flags)
+        {
+            return match_result;
+        }
+        if let Some(match_result) =
+            Self::simple_regex_anchor_matches_literal_input(pattern, input, flags)
+        {
+            return match_result;
+        }
+        if let Some(match_result) =
+            Self::simple_regex_char_class_matches_literal_input(pattern, input, flags)
+        {
+            return match_result;
+        }
+        if let Some(match_result) =
+            Self::simple_regex_dot_matches_literal_input(pattern, input, flags)
+        {
+            return match_result;
+        }
+        if let Some(match_result) =
+            Self::simple_regex_single_char_quantifier_matches_literal_input(pattern, input, flags)
+        {
+            return match_result;
+        }
+        if Self::is_plain_regex_literal(pattern) {
+            return if Self::plain_regex_literal_matches_literal_input(pattern, input, flags) {
+                RegexLiteralInputMatch::Matches
+            } else {
+                RegexLiteralInputMatch::DoesNotMatch
+            };
+        }
+        RegexLiteralInputMatch::Unknown
+    }
+
+    fn simple_regex_alternative_matches_literal_input(
+        pattern: &str,
+        input: &str,
+        flags: Option<isize>,
+    ) -> Option<RegexLiteralInputMatch> {
+        if !pattern.contains('|') {
+            return None;
+        }
+        if pattern.contains('\\') || pattern.contains('(') || pattern.contains(')') {
+            return Some(RegexLiteralInputMatch::Unknown);
+        }
+        let mut saw_unknown = false;
+        for branch in pattern.split('|') {
+            match Self::classify_regex_pattern_literal_input(branch, input, flags) {
+                RegexLiteralInputMatch::Matches => return Some(RegexLiteralInputMatch::Matches),
+                RegexLiteralInputMatch::DoesNotMatch => {}
+                RegexLiteralInputMatch::Unknown => saw_unknown = true,
+            }
+        }
+        Some(if saw_unknown {
+            RegexLiteralInputMatch::Unknown
+        } else {
+            RegexLiteralInputMatch::DoesNotMatch
         })
     }
 
-    fn literal_regex_pattern_matches_text(pattern: &str, input: &str) -> bool {
-        Self::is_plain_regex_literal(pattern) && (pattern.is_empty() || input.contains(pattern))
+    fn simple_regex_anchor_matches_literal_input(
+        pattern: &str,
+        input: &str,
+        flags: Option<isize>,
+    ) -> Option<RegexLiteralInputMatch> {
+        if let Some(inner) = pattern
+            .strip_prefix('^')
+            .and_then(|remaining| remaining.strip_suffix('$'))
+        {
+            if Self::is_plain_regex_literal(inner) {
+                let matches = input == inner
+                    || input
+                        .strip_suffix('\n')
+                        .is_some_and(|without_final_newline| without_final_newline == inner)
+                    || (Self::regex_flags_may_enable(flags, REGEX_FLAG_MULTILINE)
+                        && Self::regex_any_line_matches(input, |line| line == inner));
+                return Some(if matches {
+                    RegexLiteralInputMatch::Matches
+                } else {
+                    RegexLiteralInputMatch::DoesNotMatch
+                });
+            }
+        }
+        if let Some(inner) = pattern.strip_prefix('^') {
+            if Self::is_plain_regex_literal(inner) {
+                let matches = input.starts_with(inner)
+                    || (Self::regex_flags_may_enable(flags, REGEX_FLAG_MULTILINE)
+                        && Self::regex_any_line_matches(input, |line| line.starts_with(inner)));
+                return Some(if matches {
+                    RegexLiteralInputMatch::Matches
+                } else {
+                    RegexLiteralInputMatch::DoesNotMatch
+                });
+            }
+        }
+        if let Some(inner) = pattern.strip_suffix('$') {
+            if Self::is_plain_regex_literal(inner) {
+                let matches = input.ends_with(inner)
+                    || input
+                        .strip_suffix('\n')
+                        .is_some_and(|without_final_newline| {
+                            without_final_newline.ends_with(inner)
+                        })
+                    || (Self::regex_flags_may_enable(flags, REGEX_FLAG_MULTILINE)
+                        && Self::regex_any_line_matches(input, |line| line.ends_with(inner)));
+                return Some(if matches {
+                    RegexLiteralInputMatch::Matches
+                } else {
+                    RegexLiteralInputMatch::DoesNotMatch
+                });
+            }
+        }
+        None
+    }
+
+    fn simple_regex_char_class_matches_literal_input(
+        pattern: &str,
+        input: &str,
+        flags: Option<isize>,
+    ) -> Option<RegexLiteralInputMatch> {
+        let inner = pattern.strip_prefix('[')?.strip_suffix(']')?;
+        let (negated, characters) = inner
+            .strip_prefix('^')
+            .map_or((false, inner), |characters| (true, characters));
+        if characters.is_empty()
+            || characters
+                .chars()
+                .any(|character| matches!(character, '[' | ']' | '\\' | '-'))
+        {
+            return Some(RegexLiteralInputMatch::Unknown);
+        }
+        let matches = input.chars().any(|character| {
+            let contains = characters.chars().any(|candidate| {
+                candidate == character
+                    || (Self::regex_flags_may_enable(flags, REGEX_FLAG_IGNORECASE)
+                        && candidate.to_lowercase().to_string()
+                            == character.to_lowercase().to_string())
+            });
+            if negated {
+                !contains
+            } else {
+                contains
+            }
+        });
+        Some(if matches {
+            RegexLiteralInputMatch::Matches
+        } else {
+            RegexLiteralInputMatch::DoesNotMatch
+        })
+    }
+
+    fn simple_regex_dot_matches_literal_input(
+        pattern: &str,
+        input: &str,
+        flags: Option<isize>,
+    ) -> Option<RegexLiteralInputMatch> {
+        match pattern {
+            "." | ".+" | ".+?" => Some(Self::dot_regex_atom_matches_literal_input(input, flags)),
+            ".*" | ".*?" | ".?" | ".??" => Some(RegexLiteralInputMatch::Matches),
+            _ => None,
+        }
+    }
+
+    fn dot_regex_atom_matches_literal_input(
+        input: &str,
+        flags: Option<isize>,
+    ) -> RegexLiteralInputMatch {
+        if input.chars().any(|character| {
+            character != '\n' || Self::regex_flags_may_enable(flags, REGEX_FLAG_DOTALL)
+        }) {
+            RegexLiteralInputMatch::Matches
+        } else {
+            RegexLiteralInputMatch::DoesNotMatch
+        }
+    }
+
+    fn simple_regex_single_char_quantifier_matches_literal_input(
+        pattern: &str,
+        input: &str,
+        flags: Option<isize>,
+    ) -> Option<RegexLiteralInputMatch> {
+        let mut characters = pattern.chars();
+        let atom = characters.next()?;
+        let quantifier = characters.next()?;
+        if characters.next().is_some()
+            || Self::is_regex_metacharacter(atom)
+            || !matches!(quantifier, '*' | '+' | '?')
+        {
+            return None;
+        }
+        Some(match quantifier {
+            '*' | '?' => RegexLiteralInputMatch::Matches,
+            '+' => {
+                if input.chars().any(|character| {
+                    character == atom
+                        || (Self::regex_flags_may_enable(flags, REGEX_FLAG_IGNORECASE)
+                            && atom.to_lowercase().to_string()
+                                == character.to_lowercase().to_string())
+                }) {
+                    RegexLiteralInputMatch::Matches
+                } else {
+                    RegexLiteralInputMatch::DoesNotMatch
+                }
+            }
+            _ => RegexLiteralInputMatch::Unknown,
+        })
     }
 
     fn builtins_format_invocations(
@@ -2154,7 +2437,8 @@ impl<'a> ScanState<'a> {
         let pattern = arguments
             .first()
             .and_then(|value| stack_value_string(value, self.payload))?;
-        Some(StackValue::RegexPattern { pattern })
+        let flags = arguments.get(1).map_or(Some(0), Self::stack_value_integer);
+        Some(StackValue::RegexPattern { pattern, flags })
     }
 
     fn regex_scanner_result(values: &[StackValue]) -> Option<StackValue> {
@@ -2176,8 +2460,10 @@ impl<'a> ScanState<'a> {
         let Some(StackValue::RegexScannerLexicon { rules }) = arguments.first() else {
             return None;
         };
+        let flags = arguments.get(1).map_or(Some(0), Self::stack_value_integer);
         Some(StackValue::RegexScanner {
             rules: rules.clone(),
+            flags,
         })
     }
 

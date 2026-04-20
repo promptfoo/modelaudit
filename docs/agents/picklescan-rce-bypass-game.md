@@ -19897,3 +19897,188 @@ format unchanged; lint clean; mypy clean across 447 files
 PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
 3870 passed, 1022 skipped, 21 warnings in 48.87s
 ```
+
+## Turn 289 - Bypass via regex metachar callback guard gap
+
+Offensive turn after the Turn 288 `re.Scanner` defense. The new regex callback
+guards only prove matches for plain literal patterns. Regex metacharacters can
+make the same callback source fire at runtime while staying invisible to the
+call graph.
+
+Representative payload:
+
+```python
+re.sub(".", builtins.help, "x")
+```
+
+The `.` pattern definitely matches the one-character string, so the replacement
+callback executes during unpickling. Because `.` is not a plain literal, the
+scanner records only the outer `re.sub(...)` call and never synthesizes the
+hidden `builtins.help(match)` invocation.
+
+Proof:
+
+```text
+payload_len 39
+payload_hex 80048c0272658c0373756293288c012e8c086275696c74696e738c0468656c70938c017874522e
+
+0: PROTO              4
+11: STACK_GLOBAL       # re.sub
+13: SHORT_BINUNICODE   # pattern "."
+32: STACK_GLOBAL       # builtins.help replacement callback
+33: SHORT_BINUNICODE   # input "x"
+36: TUPLE              # (".", help, "x")
+37: REDUCE             # re.sub(".", help, "x"), invokes help(match)
+38: STOP
+```
+
+Scanner proof:
+
+```text
+scan clean findings 0 errors ()
+imports [
+  ('re', 'sub', 11, False),
+  ('builtins', 'help', 32, False),
+]
+invocations [
+  ('re', 'sub', 3, None),
+]
+```
+
+Runtime proof:
+
+```text
+runtime_rc 0
+runtime_type str
+runtime_result 'OWNED'
+marker_exists True
+marker_text owned-by-re-sub-dot-help-rce
+```
+
+Boundary and siblings:
+
+```text
+re.sub(".", builtins.help, "")
+scan clean findings 0
+runtime_result ''
+marker_exists False
+
+re.Pattern.sub(re.compile("."), builtins.help, "x")
+scan clean findings 0
+runtime_result 'OWNED'
+marker_exists True
+
+re.Scanner(((".", builtins.help),)).scan("x")
+scan clean findings 0
+runtime_result (['TOKEN:x'], '')
+marker_exists True
+```
+
+Why it bypasses:
+
+- The finite call graph rows are present for `re.sub`, `re.Pattern.sub`, and
+  `re.Scanner.scan`.
+- The shared guard still delegates to `literal_regex_pattern_matches_text()`,
+  which returns true only for a pattern with no regex metacharacters.
+- `.` is outside that plain-literal subset but is still a definite match for
+  any non-empty literal input, so the replacement/action callback is invoked by
+  CPython and skipped by the scanner.
+
+Simplification opportunity:
+
+- Replace the plain-literal guard with one shared
+  `regex_pattern_matches_literal_input(pattern, input)` helper and use it for
+  top-level substitutions, compiled pattern substitutions, and scanner rules.
+- Start with bounded definite-match cases rather than package-specific blocks:
+  empty patterns, plain literals, `.`, simple anchors like `^literal` and
+  `literal$`, single-character classes such as `[x]`, and simple alternatives
+  such as `x|y`.
+- If the callback is dangerous and the literal input is non-empty but the regex
+  is outside the bounded recognizer, consider a fail-closed "regex callback may
+  execute" invocation instead of silently treating the callback as lazy. That is
+  closer to the source: finite regex callback sinks, infinite packages.
+
+Performance note:
+
+- The representative payload is 39 bytes.
+- Warm scan timing over 1000 clean bypass scans was median `0.000038s`, p95
+  `0.000039s`, and max `0.000151s`.
+
+## Turn 290 - Defense for regex metachar callback dispatch
+
+Defensive turn for the Turn 289 bypass. The fix keeps the source-level call
+graph rows and strengthens the shared regex/input guard instead of adding
+another package-specific policy block.
+
+Implementation:
+
+- Replaced the plain-literal-only regex callback guard with
+  `regex_pattern_matches_literal_input()`.
+- The helper still proves common no-match cases, but treats unrecognized regex
+  forms conservatively as possible matches so callback dispatch does not
+  disappear for metacharacter payloads.
+- Added bounded source recognizers for plain literals, simple alternatives,
+  simple anchors, simple character classes, `.`, `.*`, `.+`, `.?`, and
+  single-character `*`, `+`, `?` quantifiers.
+- Tracked `re` flags on top-level substitutions, compiled pattern receivers,
+  and `re.Scanner` receivers so `DOTALL`, `MULTILINE`, and `IGNORECASE` do not
+  create another hidden callback edge.
+- Reused the same helper for top-level `re.sub`/`re.subn`, compiled
+  `re.Pattern.sub`/`subn`, and `re.Scanner.scan`.
+
+Regression coverage:
+
+- `re.sub(".", builtins.help, "x")` is malicious and records
+  `builtins.help(match)`.
+- `re.Pattern.sub(re.compile("."), builtins.help, "x")` is malicious with the
+  same replacement callback edge.
+- `re.Scanner(((".", builtins.help),)).scan("x")` is malicious and records
+  `builtins.help(scanner, token)`.
+- DOTALL variants like `re.sub(".", builtins.help, "\n", 0, re.S)`,
+  `re.Pattern.sub(re.compile(".", re.S), builtins.help, "\n")`, and
+  `re.Scanner(((".", builtins.help),), re.S).scan("\n")` are malicious.
+- Empty-input no-match boundaries such as `re.sub(".", builtins.help, "")` and
+  no-flag newline boundaries such as `re.sub(".", builtins.help, "\n")` remain
+  clean.
+
+Post-fix proof:
+
+```text
+re.sub dot match malicious 1 [('re', 'sub', 3, None), ('builtins', 'help', 1, None)]
+re.sub dot empty clean 0 [('re', 'sub', 3, None)]
+re.sub dot newline no flags clean 0 [('re', 'sub', 3, None)]
+re.sub dot newline dotall malicious 1 [('re', 'sub', 5, None), ('builtins', 'help', 1, None)]
+Pattern.sub dot match malicious 1 [('re', 'compile', 1, None), ('re', 'Pattern.sub', 3, None), ('builtins', 'help', 1, None)]
+Pattern.sub dot newline dotall malicious 1 [('re', 'compile', 2, None), ('re', 'Pattern.sub', 3, None), ('builtins', 'help', 1, None)]
+Scanner dot match malicious 1 [('re', 'Scanner.scan', 2, None), ('builtins', 'help', 2, None)]
+Scanner dot newline dotall malicious 1 [('re', 'Scanner.scan', 2, None), ('builtins', 'help', 2, None)]
+```
+
+Performance note:
+
+- Warm scan timing over 1000 post-fix runs of the 39-byte `re.sub(".")`
+  payload was median `0.000088s`, p95 `0.000093s`, and max `0.000167s`.
+- The recognizer is bounded string/character matching; it does not compile or
+  execute regexes during scanning.
+
+Validation:
+
+```text
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+78 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest <six regex callback tests> -q
+30 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+175 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+213 passed
+
+ruff format/check, mypy
+format unchanged; lint clean; mypy clean across 447 files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3890 passed, 1022 skipped, 21 warnings in 38.97s
+```

@@ -52,12 +52,14 @@ pub(crate) enum StackValue {
     },
     RegexPattern {
         pattern: String,
+        flags: Option<isize>,
     },
     RegexScannerLexicon {
         rules: Vec<RegexScannerRule>,
     },
     RegexScanner {
         rules: Vec<RegexScannerRule>,
+        flags: Option<isize>,
     },
     Tuple(Vec<StackValue>),
     Primitive {
@@ -95,12 +97,21 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
         Some(StackValue::DefaultDict { default_factory }) => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
-        Some(StackValue::RegexPattern { pattern }) => format!("regex_pattern:{pattern:?}"),
+        Some(StackValue::RegexPattern { pattern, flags }) => {
+            format!(
+                "regex_pattern:{pattern:?},flags={}",
+                regex_flags_preview(*flags)
+            )
+        }
         Some(StackValue::RegexScannerLexicon { rules }) => {
             format!("regex_scanner_lexicon(rules={})", rules.len())
         }
-        Some(StackValue::RegexScanner { rules }) => {
-            format!("regex_scanner(rules={})", rules.len())
+        Some(StackValue::RegexScanner { rules, flags }) => {
+            format!(
+                "regex_scanner(rules={}, flags={})",
+                rules.len(),
+                regex_flags_preview(*flags)
+            )
         }
         Some(StackValue::TextSpan { start, end }) => {
             format!("str_span(len={})", end.saturating_sub(*start))
@@ -170,11 +181,22 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
         StackValue::DefaultDict { default_factory } => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
-        StackValue::RegexPattern { pattern } => format!("regex_pattern:{pattern:?}"),
+        StackValue::RegexPattern { pattern, flags } => {
+            format!(
+                "regex_pattern:{pattern:?},flags={}",
+                regex_flags_preview(*flags)
+            )
+        }
         StackValue::RegexScannerLexicon { rules } => {
             format!("regex_scanner_lexicon(rules={})", rules.len())
         }
-        StackValue::RegexScanner { rules } => format!("regex_scanner(rules={})", rules.len()),
+        StackValue::RegexScanner { rules, flags } => {
+            format!(
+                "regex_scanner(rules={}, flags={})",
+                rules.len(),
+                regex_flags_preview(*flags)
+            )
+        }
         StackValue::Tuple(values) => {
             let mut parts: Vec<String> = values
                 .iter()
@@ -189,6 +211,10 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
         StackValue::Primitive { type_name, repr } => format!("{type_name}:{repr}"),
         StackValue::Other => "object".to_string(),
     }
+}
+
+fn regex_flags_preview(flags: Option<isize>) -> String {
+    flags.map_or_else(|| "unknown".to_string(), |value| value.to_string())
 }
 
 pub(crate) fn stack_value_string(value: &StackValue, payload: &[u8]) -> Option<String> {
