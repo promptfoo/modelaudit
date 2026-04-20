@@ -24,7 +24,12 @@ _MAX_WILDCARD_IMPORTS = 16
 _MAX_WILDCARD_REEXPORT_DEPTH = 4
 _MAX_SHORT_SINK_DEPTH = 2
 _CONTROLLED_GETATTR_DISPATCH_SINK = "builtins.getattr.__call__"
+_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS = ("__new__", "__init__")
 _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS = ("__setstate__",)
+_INHERITED_CLASS_ENTRYPOINT_METHODS = (
+    *_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS,
+    *_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS,
+)
 
 _CLASS_ENTRYPOINT_METHODS = (
     "__getattribute__",
@@ -675,7 +680,7 @@ def _collect_local_class_entrypoints(
             f"{class_name}.{method_name}"
             for method_name in _CLASS_ENTRYPOINT_METHODS
             if method_name in method_names
-            or (method_name in inherited_method_names and method_name in _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS)
+            or (method_name in inherited_method_names and method_name in _INHERITED_CLASS_ENTRYPOINT_METHODS)
         )
     return class_entrypoints
 

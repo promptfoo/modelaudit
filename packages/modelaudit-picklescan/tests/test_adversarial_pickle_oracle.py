@@ -1679,6 +1679,55 @@ def _scipy_stats_norm_singleton_setstate_payload(marker: Path) -> bytes:
     )
 
 
+def _fsspec_registry_poisoning_payload(marker: Path, cache_dir: Path) -> bytes:
+    def join_fragments(fragments: list[str]) -> bytes:
+        return b"".join(
+            [
+                _global_operand("builtins", "str.join"),
+                _tuple_payload_operands(
+                    [
+                        _text_operand(""),
+                        _list_payload_operands([_text_operand(fragment) for fragment in fragments]),
+                    ]
+                ),
+                b"R",
+            ]
+        )
+
+    registry_value = b"}" + _dict_setitem("class", join_fragments(["sub", "process", ".P", "open"]))
+    command = f"printf fsspec-registry-owned > {shlex.quote(str(marker))}"
+    target_options = b"}" + _dict_setitem(
+        "args",
+        _list_payload_operands(
+            [
+                _text_operand("/bin/sh"),
+                _text_operand("-c"),
+                _text_operand(command),
+            ]
+        ),
+    )
+    return b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("fsspec.registry", "known_implementations"),
+            _dict_setitem("pwn197", registry_value),
+            b"0",
+            _global_operand("fsspec.implementations.cached", "WholeFileCacheFileSystem"),
+            _tuple_payload_operands(
+                [
+                    _text_operand("pwn197"),
+                    _text_operand(str(cache_dir)),
+                    _int_operand(10),
+                    b"\x89",
+                    b"\x89",
+                    target_options,
+                ]
+            ),
+            b"R.",
+        ]
+    )
+
+
 def _pyyaml_unsafe_document(marker: Path, marker_content: str) -> str:
     source_tail = f"port pathlib\npathlib.Path({str(marker)!r}).write_text({marker_content!r})"
     return (
@@ -4258,7 +4307,7 @@ def test_scan_bytes_blocks_scipy_norm_gen_cross_module_setstate_rce(tmp_path: Pa
     marker = tmp_path / "scipy_norm_gen_cross_module_setstate_marker"
     payload = _scipy_norm_gen_setstate_payload(marker)
 
-    assert _call_graph_entrypoints("scipy.stats._continuous_distns.norm_gen") == (
+    assert _call_graph_entrypoints("scipy.stats._continuous_distns.norm_gen")[:1] == (
         "scipy.stats._continuous_distns.norm_gen.__setstate__",
     )
     assert _find_sink_path("scipy.stats._continuous_distns.norm_gen.__setstate__") == (
@@ -4289,7 +4338,7 @@ def test_scan_bytes_blocks_scipy_stats_norm_star_reexported_singleton_setstate_r
     marker = tmp_path / "scipy_stats_norm_singleton_setstate_marker"
     payload = _scipy_stats_norm_singleton_setstate_payload(marker)
 
-    assert _call_graph_entrypoints("scipy.stats.norm") == ("scipy.stats._continuous_distns.norm_gen.__setstate__",)
+    assert _call_graph_entrypoints("scipy.stats.norm")[:1] == ("scipy.stats._continuous_distns.norm_gen.__setstate__",)
     assert _find_sink_path("scipy.stats._continuous_distns.norm_gen.__setstate__") == (
         "scipy.stats._continuous_distns.norm_gen.__setstate__",
         "scipy.stats._continuous_distns.norm_gen._attach_methods",
@@ -4317,6 +4366,64 @@ def test_scan_bytes_blocks_scipy_stats_norm_star_reexported_singleton_setstate_r
     )
     assert result.returncode == 0
     assert marker.read_text() == "owned-by-scipy-stats-norm-singleton"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
+@pytest.mark.skipif(not _module_available("fsspec.implementations.cached"), reason="fsspec cached FS is unavailable")
+def test_scan_bytes_blocks_fsspec_registry_poisoning_inherited_constructor_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "fsspec_registry_poisoning_marker"
+    cache_dir = tmp_path / "cache"
+    payload = _fsspec_registry_poisoning_payload(marker, cache_dir)
+    class_ref = "fsspec.implementations.cached.WholeFileCacheFileSystem"
+
+    assert _call_graph_entrypoints(class_ref) == (f"{class_ref}.__init__",)
+    assert _find_sink_path(f"{class_ref}.__init__") == (
+        f"{class_ref}.__init__",
+        "fsspec.filesystem",
+        "fsspec.registry.get_filesystem_class",
+        "fsspec.registry._import_class",
+        "importlib.import_module",
+    )
+
+    report = scan_bytes(payload, source="fsspec-registry-poisoning-inherited-constructor-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "fsspec.implementations.cached",
+        "WholeFileCacheFileSystem",
+        "importlib.import_module",
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+import time
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+payload = bytes.fromhex(sys.argv[2])
+try:
+    pickle.loads(payload)
+except Exception:
+    pass
+for _ in range(100):
+    if marker.exists():
+        break
+    time.sleep(0.02)
+if not marker.exists():
+    raise SystemExit("marker was not written")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(marker), payload.hex()],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == "fsspec-registry-owned"
 
 
 @pytest.mark.skipif(not _module_available("yaml"), reason="PyYAML is unavailable")

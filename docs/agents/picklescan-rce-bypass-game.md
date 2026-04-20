@@ -11075,3 +11075,155 @@ the relevant caches:
   `_call_graph_entrypoints("scipy.stats._continuous_distns.norm")` and
   `_call_graph_entrypoints("scipy.stats._continuous_distns.norm_gen")` both
   returned in `0.0000s`.
+
+## Turn 197 - Bypass via fsspec registry poisoning under inherited constructor
+
+Found and proved a scanner-clean RCE-capable pickle that hits a finite
+call-graph modeling gap rather than another package-specific surface.
+
+The payload imports only:
+
+- `fsspec.registry.known_implementations`
+- `builtins.str.join`
+- `fsspec.implementations.cached.WholeFileCacheFileSystem`
+
+The pickle first mutates fsspec's process-global protocol registry:
+
+```text
+known_implementations["pwn197"] = {
+    "class": "".join(["sub", "process", ".P", "open"])
+}
+```
+
+The dangerous class string is assembled at runtime so the raw pickle contains
+no full `subprocess.Popen` literal. The payload then invokes
+`WholeFileCacheFileSystem` with positional constructor arguments:
+
+```text
+target_protocol="pwn197"
+target_options={
+    "args": ["/bin/sh", "-c", "printf fsspec-registry-owned > <marker>"]
+}
+```
+
+At runtime, `WholeFileCacheFileSystem` inherits
+`CachingFileSystem.__init__`, which calls `fsspec.filesystem()`.
+`fsspec.filesystem()` resolves the attacker-poisoned registry entry through
+`get_filesystem_class()`, imports `subprocess.Popen`, and instantiates it with
+the attacker-controlled `args` keyword. The subprocess writes the marker before
+fsspec later raises while trying to treat the returned `Popen` object as a
+filesystem.
+
+Proof:
+
+- Payload length: `383` bytes.
+- Scanner verdict: `clean`.
+- Finding count: `0`.
+- Import refs:
+  - `fsspec.registry.known_implementations`, `is_dangerous=False`
+  - `builtins.str.join`, `is_dangerous=False`
+  - `fsspec.implementations.cached.WholeFileCacheFileSystem`,
+    `is_dangerous=False`
+- Call-graph state:
+  - `_call_graph_entrypoints("fsspec.implementations.cached.WholeFileCacheFileSystem") -> ()`
+  - `_find_sink_path("fsspec.implementations.cached.WholeFileCacheFileSystem.__init__") -> ("fsspec.implementations.cached.WholeFileCacheFileSystem.__init__", "fsspec.filesystem", "fsspec.registry.get_filesystem_class", "fsspec.registry._import_class", "importlib.import_module")`
+- Runtime after `pickle.loads(payload)` in a subprocess:
+  - `pickle.loads` raised
+    `AttributeError: type object 'Popen' has no attribute 'async_impl'`
+    after process launch.
+  - Marker exists and contains `fsspec-registry-owned`.
+
+Why the scanner missed it:
+
+- The native scanner treats all three imported globals as clean.
+- `SETITEM` mutates a process-global package registry, but that registry
+  write is not modeled as a later import/call target.
+- `WholeFileCacheFileSystem` does not define `__init__` locally, so
+  `_call_graph_entrypoints()` returns no constructor entrypoint for the class.
+- The inherited `CachingFileSystem.__init__` path is already visible to the
+  resolver when asked directly, and reaches `importlib.import_module`, but the
+  class entrypoint model currently exposes inherited pickle lifecycle methods
+  only for `__setstate__`.
+
+Performance note:
+
+- Full `scan_bytes(payload)` proof: `0.0196s`.
+- Cold `_call_graph_entrypoints("fsspec.implementations.cached.WholeFileCacheFileSystem")`:
+  `0.0000s`, returning no entrypoints.
+- Direct cold `_find_sink_path("fsspec.implementations.cached.WholeFileCacheFileSystem.__init__")`:
+  `0.0087s`.
+
+The next defensive turn should fix closest to the source by exposing inherited
+class entrypoints for pickle-invoked constructors/callables, especially
+`__init__`, instead of adding package-specific fsspec rules. A focused
+regression can keep this exact registry-poisoning payload and assert that the
+class resolves to its inherited `__init__` path reaching `importlib.import_module`.
+
+## Turn 198 - Block inherited constructor call-graph paths
+
+Implemented a focused call-graph block for the Turn 197 fsspec registry
+poisoning bypass.
+
+The fix exposes inherited constructor entrypoints for class globals:
+
+- `__new__`
+- `__init__`
+
+The scanner already synthesized inherited method bodies into
+`calls_by_function`; the missing piece was that class entrypoint resolution
+only published inherited pickle lifecycle methods for `__setstate__`. The new
+model keeps lifecycle ordering first where applicable, but also exposes
+inherited constructors so a pickle `REDUCE`/`NEWOBJ` call to a subclass can be
+checked against base-class initialization code.
+
+That closes the Turn 197 path:
+
+```text
+fsspec.implementations.cached.WholeFileCacheFileSystem
+  -> fsspec.implementations.cached.WholeFileCacheFileSystem.__init__
+  -> fsspec.filesystem
+  -> fsspec.registry.get_filesystem_class
+  -> fsspec.registry._import_class
+  -> importlib.import_module
+```
+
+Regression coverage added to
+`packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py`:
+
+- The payload mutates `fsspec.registry.known_implementations["pwn197"]`.
+- The dangerous `subprocess.Popen` class string is still assembled from
+  harmless fragments via `builtins.str.join`.
+- The payload invokes
+  `fsspec.implementations.cached.WholeFileCacheFileSystem`.
+- The test asserts class entrypoint resolution now returns inherited
+  `WholeFileCacheFileSystem.__init__`.
+- The test asserts the sink path reaches `importlib.import_module`.
+- The payload now scans `malicious` with `DANGEROUS_CALL_GRAPH`.
+- Runtime proof still runs in a child process and writes
+  `fsspec-registry-owned`, while the expected fsspec `AttributeError` is
+  contained in that child process.
+
+Focused validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_fsspec_registry_poisoning_inherited_constructor_rce packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_scipy_norm_gen_cross_module_setstate_rce packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_scipy_stats_norm_star_reexported_singleton_setstate_rce`
+  passed: `3 passed`.
+
+Full pre-commit validation:
+
+- `ruff format` passed after reformatting one test file.
+- `ruff check --fix` passed.
+- `mypy` passed: `Success: no issues found in 446 source files`.
+- Full non-slow/non-integration validation passed:
+  `3708 passed, 1022 skipped, 21 warnings in 39.13s`.
+
+Performance note:
+
+- `scan_bytes(payload)`: `malicious`, one finding, `0.0323s`.
+- After clearing call-graph caches,
+  `_call_graph_entrypoints("fsspec.implementations.cached.WholeFileCacheFileSystem")`:
+  `0.0188s`.
+- After clearing call-graph caches,
+  `_find_sink_path("fsspec.implementations.cached.WholeFileCacheFileSystem.__init__")`:
+  `0.0107s`.
+- The added entrypoint publication reuses the existing inherited-method
+  collection work; it does not add another source traversal pass.
