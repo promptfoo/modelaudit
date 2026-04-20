@@ -9091,3 +9091,125 @@ Performance note: this is a short suffix-stripping loop plus the existing
 constant string checks. It scales with the number of trailing `.__call__`
 suffixes in a single parsed global name and adds no runtime Python
 introspection or package-specific expansion.
+
+## Turn 165 - Bypass via `__get__.__self__` aliases of blocked frame sources
+
+Found a scanner-clean RCE that bypasses the Turn 164 callable-alias
+normalization by recovering blocked objects through bound wrapper provenance
+instead of through `.__call__`. CPython exposes the original object behind a
+bound wrapper as `__self__`, so a pickle can import
+`inspect.currentframe.__get__.__self__` and get the blocked
+`inspect.currentframe` function back without naming the exact blocked global.
+
+The same trick recovers the concrete frame namespace descriptor getter:
+`types.FrameType.f_builtins.__get__.__self__` is the original
+`f_builtins` getset descriptor, and adding `.__get__` again yields the same
+bound descriptor getter as the blocked
+`types.FrameType.f_builtins.__get__`.
+
+Proof payload shape:
+
+```python
+frame = inspect.currentframe.__get__.__self__()
+builtins_dict = types.FrameType.f_builtins.__get__.__self__.__get__(frame)
+fn = dict.get(builtins_dict, "".join(["ev", "al"]))
+code = "".join(
+    [
+        "open('/tmp/.../marker','w').write('owned-by-get-self')",
+    ]
+)
+fn(code)
+```
+
+The active pickle imports only:
+
+- `inspect.currentframe.__get__.__self__` via legacy `GLOBAL`
+- `types.FrameType.f_builtins.__get__.__self__.__get__` via legacy `GLOBAL`
+- `builtins.dict.get`
+- two `builtins.str.join` references
+
+Proof on CPython 3.12.12:
+
+- Direct probe: `inspect.currentframe` and `inspect.currentframe.__call__` are
+  now malicious, but `inspect.currentframe.__get__` and
+  `inspect.currentframe.__get__.__self__` are clean.
+- Direct probe: `types.FrameType.f_builtins.__get__` and
+  `types.FrameType.f_builtins.__get__.__call__` are now malicious, but
+  `types.FrameType.f_builtins.__get__.__self__` and
+  `types.FrameType.f_builtins.__get__.__self__.__get__` are clean.
+- Control payload scanner result: `len=208`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control import references: one clean `builtins.str.join`.
+- Control runtime: `pickle.loads(control)` returns the assembled eval code
+  string and creates no marker.
+- Active payload scanner result: `len=380`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references: clean `inspect.currentframe.__get__.__self__`,
+  clean `types.FrameType.f_builtins.__get__.__self__.__get__`, clean
+  `builtins.dict.get`, and two clean `builtins.str.join` references, all with
+  `is_dangerous=False`.
+- Active runtime before unpickle: marker absent.
+- Active runtime after unpickle: marker exists and contains
+  `owned-by-get-self`; `pickle.loads(active)` returns `17`, the byte count from
+  the marker write.
+
+Why the scanner missed it:
+
+- The new callable-alias normalization strips only trailing `.__call__`
+  components. This payload does not use `.__call__` globals.
+- The dangerous exact globals are still only
+  `inspect.currentframe` and `types.FrameType.f_builtins.__get__`; inserting
+  `.__get__.__self__` after the function name or inserting
+  `.__self__` before the final descriptor `.__get__` changes the parsed global
+  string while CPython resolves back to the same dangerous object.
+- The existing component checks cover `__getattribute__`, `__subclasses__`,
+  `__builtins__`, `__dict__`, and `__globals__`, but not wrapper provenance via
+  `__self__`.
+- `dotted_global_tail_severity()` still evaluates only splits inside the
+  pickle name, not `<module>.<prefix>` candidates such as
+  `inspect.currentframe` inside `inspect` +
+  `currentframe.__get__.__self__`.
+- The payload fragments `eval` and the source string with `str.join`, so the
+  suspicious-string scan sees only short harmless fragments.
+
+Performance note: the next block can remain a cheap parsed-string
+normalization. Recheck the finite policy table after stripping trailing
+`.__get__.__self__` suffixes, and collapse trailing
+`.__get__.__self__.__get__` to `.__get__` before rechecking. That cuts off this
+wrapper-provenance family without importing modules, inspecting live wrapper
+objects, binding descriptors, or adding stack provenance.
+
+## Turn 166 - Block wrapper provenance aliases of dangerous globals
+
+Blocking plan implemented:
+
+- Extend the parsed-global alias normalizer from only trailing `.__call__` to
+  the wrapper/provenance suffixes `.__call__`, `.__get__`, and `.__self__`.
+  The normalizer iteratively strips these suffixes and rechecks the same finite
+  dangerous-global policy after each strip.
+- This catches the Turn 165 aliases because
+  `inspect.currentframe.__get__.__self__` normalizes to
+  `inspect.currentframe`, while
+  `types.FrameType.f_builtins.__get__.__self__.__get__` normalizes back to
+  `types.FrameType.f_builtins.__get__`.
+- Keep benign near-matches clean: stripping wrapper suffixes from names such as
+  `statistics.mean.__get__.__self__` or `os.path.__get__.__self__` does not
+  reach a dangerous canonical global.
+- Add Rust unit coverage for direct `.__get__`, `.__self__`, mixed
+  `.__get__.__self__`, and combined `.__get__.__self__.__call__` aliases for
+  frame source primitives, plus benign near-matches.
+- Add a CPython oracle regression for the Turn 165 payload. The control payload
+  only assembles the eval source string and remains clean; the active payload
+  imports `inspect.currentframe.__get__.__self__` and
+  `types.FrameType.f_builtins.__get__.__self__.__get__`, is flagged as
+  malicious, and still writes the marker if loaded.
+- Add direct legacy-`GLOBAL` and `STACK_GLOBAL` regressions for wrapper
+  provenance aliases of `inspect.currentframe` and the concrete frame namespace
+  descriptor getters.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: this is still a bounded string normalization over already
+parsed pickle globals. Each loop iteration removes one trailing wrapper suffix,
+so the cost is proportional to the number of alias suffixes in that single
+global name and adds no imports, descriptor binding, frame inspection, or
+stack-provenance modeling.
