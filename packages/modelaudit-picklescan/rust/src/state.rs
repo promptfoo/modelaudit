@@ -1390,6 +1390,10 @@ impl<'a> ScanState<'a> {
             self.stack.push(call_iterator);
             return;
         }
+        if let Some(call_iterator) = Self::lazy_call_iterator_wrapper_result(values) {
+            self.stack.push(call_iterator);
+            return;
+        }
         if let Some(defaultdict) = Self::defaultdict_result(values) {
             self.stack.push(defaultdict);
             return;
@@ -1420,6 +1424,41 @@ impl<'a> ScanState<'a> {
         }
         let callable = Self::callable_reference_from_value(arguments.first())?;
         Some(StackValue::CallIterator { callable })
+    }
+
+    fn lazy_call_iterator_wrapper_result(values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed
+            || !matches!(
+                callable_reference.module.as_str(),
+                "builtins" | "__builtin__" | "__builtins__"
+            )
+        {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        let callable = match callable_reference.name.as_str() {
+            "iter" if arguments.len() == 1 => {
+                arguments.first().and_then(Self::call_iterator_callable)
+            }
+            "enumerate" if (1..=2).contains(&arguments.len()) => {
+                arguments.first().and_then(Self::call_iterator_callable)
+            }
+            "zip" => arguments.iter().find_map(Self::call_iterator_callable),
+            _ => None,
+        }?;
+        Some(StackValue::CallIterator { callable })
+    }
+
+    fn call_iterator_callable(value: &StackValue) -> Option<GlobalRef> {
+        match value {
+            StackValue::CallIterator { callable } => Some(callable.clone()),
+            _ => None,
+        }
     }
 
     fn defaultdict_result(values: &[StackValue]) -> Option<StackValue> {
