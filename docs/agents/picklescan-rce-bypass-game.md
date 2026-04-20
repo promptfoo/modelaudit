@@ -7935,3 +7935,124 @@ Performance note: the new path is a small nested loop over global-name dot
 components and uses the existing policy tables. It adds no package enumeration
 and no runtime module inspection; the common undotted global path returns before
 allocating suffix candidates.
+
+## Turn 143 - Bypass via inherited `pathlib` writer alias plus module namespace lookup
+
+Found a scanner-clean startup-hook RCE that combines two finite primitive
+gaps left after the dotted-global tail fix:
+
+- inherited class-method aliases for already-blocked file writer methods
+- non-builtin module namespace dictionary lookup for already-blocked module
+  functions
+
+The payload writes a `.pth` file through `pathlib.PosixPath.write_text`, then
+recovers `site.addsitedir` from `site.__dict__.get` with the key assembled at
+unpickle time:
+
+```python
+pth = pathlib.PosixPath("/tmp/.../posixpath_site_dict_exec.pth")
+line = "".join(
+    [
+        "im",
+        "port pathlib;pathlib.Path('/tmp/.../marker')",
+        ".write_text('owned-by-posixpath-site-dict')\n",
+    ]
+)
+pathlib.PosixPath.write_text(pth, line)
+lookup = site.__dict__.get
+addsitedir = lookup("".join(["add", "sitedir"]))
+addsitedir("/tmp/...")
+```
+
+The active pickle imports only:
+
+- `pathlib.PosixPath`
+- `builtins.str.join`
+- `pathlib.PosixPath.write_text`
+- `site.__dict__.get`
+- `builtins.str.join`
+
+Proof on CPython 3.12.12:
+
+- Control payload scanner result: `len=189`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control import references: one clean `builtins.str.join`.
+- Control runtime: `pickle.loads(control)` returns the assembled `.pth` line
+  string, creates no `.pth`, and creates no marker.
+- Active payload scanner result: `len=478`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references: `pathlib.PosixPath`, `builtins.str.join`,
+  `pathlib.PosixPath.write_text`, `site.__dict__.get`, and
+  `builtins.str.join`, all with `is_dangerous=False`.
+- Active runtime before unpickle: no `.pth` file and no marker.
+- Active runtime after unpickle: `posixpath_site_dict_exec.pth` exists with
+  the assembled startup-hook line, marker exists, and marker contains
+  `owned-by-posixpath-site-dict`; `pickle.loads(active)` returns `None` from
+  `site.addsitedir`.
+
+Why the scanner missed it:
+
+- The exact dangerous-global table blocks `pathlib.Path.write_text`, but not
+  inherited concrete subclass aliases such as `pathlib.PosixPath.write_text`.
+  CPython resolves the latter to the same method implementation.
+- The class-global call-graph expansion sees `pathlib.PosixPath` construction
+  but not an imported inherited method descriptor name such as
+  `PosixPath.write_text`; there is no local function body under that qualified
+  name to inspect.
+- The builtin namespace recovery block is intentionally scoped to
+  `builtins.__dict__`. Other module dictionaries remain clean, so
+  `site.__dict__.get` can recover `site.addsitedir` without importing the
+  blocked `site.addsitedir` global.
+- The dotted-tail policy does not fire because neither `PosixPath.write_text`
+  nor `__dict__.get` has a dotted suffix that matches an existing dangerous
+  module/name pair.
+- The `.pth` line and the `addsitedir` key are fragmented with `str.join`, so
+  suspicious-string checks do not see a contiguous `import` statement or
+  `site.addsitedir` name.
+
+Performance note: the next block should stay close to source primitives rather
+than adding this exact payload. Two bounded fixes would cover the class of bug:
+
+- normalize known `pathlib.Path` concrete subclass method aliases
+  (`PosixPath.*`, `WindowsPath.*`, and platform-specific concrete path classes)
+  to the already-blocked `Path.open`, `Path.write_text`, and
+  `Path.write_bytes` source primitives
+- treat module namespace dictionary accessors such as `module.__dict__`,
+  `module.__dict__.get`, and `module.__dict__.__getitem__` as dynamic global
+  recovery primitives when the module has exact dangerous globals, while
+  preserving the existing `os.path` carveout and avoiding broad `dict.get`
+  blocking
+
+Both checks are finite policy checks over parsed global operands and existing
+dangerous-global tables. They require no imports, no package enumeration, and
+no additional call-graph traversal.
+
+## Turn 144 - Block concrete `pathlib` writers and module namespace recovery
+
+Blocking plan:
+
+- Add a narrow `pathlib` alias policy for concrete path classes that inherit
+  the already-blocked `Path.open`, `Path.write_text`, and `Path.write_bytes`
+  source primitives. The covered class names are `PosixPath` and `WindowsPath`;
+  pure path classes are not included because they do not perform filesystem
+  writes.
+- Treat module namespace dictionary accessors as critical when the apparent
+  module already has exact dangerous globals in the Rust policy table. This
+  covers `site.__dict__.get -> site.addsitedir` and similar dynamic recovery
+  paths without making every `dict.get` or every module dictionary globally
+  dangerous.
+- Keep wildcard-dangerous modules handled by the existing wildcard branch and
+  keep the existing `os.path` carveout intact.
+- Add a CPython oracle regression for the Turn 143 payload. The control payload
+  only assembles the `.pth` line and remains clean; the active payload imports
+  `pathlib.PosixPath.write_text` plus `site.__dict__.get`, is flagged as
+  malicious, and still executes the startup hook if loaded.
+- Add Rust unit coverage for `pathlib.PosixPath.*`,
+  `pathlib.WindowsPath.*`, `site.__dict__`, `site.__dict__.get`, and
+  `pathlib.__dict__.get`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: the new checks are constant-time/prefix checks plus one
+binary search over the already sorted dangerous-global table to decide whether
+a module has exact dangerous globals. They add no imports, no package
+enumeration, no source parsing, and no call-graph traversal.

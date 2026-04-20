@@ -19,6 +19,12 @@ fn direct_global_severity(module: &str, name: &str) -> Option<&'static str> {
         };
     }
 
+    if pathlib_concrete_path_alias_is_dangerous(module, name)
+        || module_namespace_dict_is_dangerous(module, name)
+    {
+        return Some("critical");
+    }
+
     if dangerous_global_is_listed(module, name) {
         return Some("critical");
     }
@@ -89,6 +95,28 @@ fn warning_globals(module: &str) -> Option<WarningGlobalMatch> {
 
 fn builtin_global_is_dangerous(name: &str) -> bool {
     BUILTIN_DANGEROUS_NAMES.contains(&name) || name == "__dict__" || name.starts_with("__dict__.")
+}
+
+fn pathlib_concrete_path_alias_is_dangerous(module: &str, name: &str) -> bool {
+    if module != "pathlib" {
+        return false;
+    }
+    let Some((class_name, method_name)) = name.split_once('.') else {
+        return false;
+    };
+    matches!(class_name, "PosixPath" | "WindowsPath")
+        && matches!(method_name, "open" | "write_bytes" | "write_text")
+}
+
+fn module_namespace_dict_is_dangerous(module: &str, name: &str) -> bool {
+    (name == "__dict__" || name.starts_with("__dict__."))
+        && module_has_listed_dangerous_global(module)
+}
+
+fn module_has_listed_dangerous_global(module: &str) -> bool {
+    DANGEROUS_GLOBALS
+        .binary_search_by(|&(candidate_module, _)| candidate_module.cmp(module))
+        .is_ok()
 }
 
 const BUILTIN_MODULES: &[&str] = &["builtins", "__builtin__", "__builtins__"];
@@ -563,6 +591,18 @@ mod tests {
             Some("critical")
         );
         for name in ["Path.open", "Path.write_bytes", "Path.write_text"] {
+            assert_eq!(global_severity("pathlib", name), Some("critical"));
+        }
+        for class_name in ["PosixPath", "WindowsPath"] {
+            for method_name in ["open", "write_bytes", "write_text"] {
+                assert_eq!(
+                    global_severity("pathlib", &format!("{class_name}.{method_name}")),
+                    Some("critical")
+                );
+            }
+        }
+        for name in ["__dict__", "__dict__.get", "__dict__.__getitem__"] {
+            assert_eq!(global_severity("site", name), Some("critical"));
             assert_eq!(global_severity("pathlib", name), Some("critical"));
         }
         for (module, name) in [

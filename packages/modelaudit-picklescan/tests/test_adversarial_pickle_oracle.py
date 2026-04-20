@@ -1165,6 +1165,35 @@ def _site_os_system_payload(command: str, *, include_call: bool) -> bytes:
     return b"".join(parts)
 
 
+def _posixpath_site_dict_pth_payload(
+    pth_path: Path, marker: Path, site_dir: Path, *, include_write: bool
+) -> tuple[bytes, str]:
+    expected_line = f"import pathlib;pathlib.Path({str(marker)!r}).write_text('owned-by-posixpath-site-dict')\n"
+    fragments = ["im"]
+    fragments.extend(expected_line[offset : offset + 24] for offset in range(2, len(expected_line), 24))
+    parts = [b"\x80\x04"]
+    if include_write:
+        parts += [_global_operand("pathlib", "PosixPath")]
+        parts += [_tuple_payload_operands([_text_operand(str(pth_path))]), b"R\x94"]
+    parts += [_global_operand("builtins", "str.join")]
+    parts += [_text_operand(""), _tuple_payload_operands([_text_operand(fragment) for fragment in fragments])]
+    parts += [b"\x86R\x94"]
+    if include_write:
+        parts += [b"0"]
+        parts += [_global_operand("pathlib", "PosixPath.write_text")]
+        parts += [b"h\x00h\x01\x86R0"]
+        parts += [_global_operand("site", "__dict__.get"), b"\x94"]
+        parts += [_global_operand("builtins", "str.join")]
+        parts += [_text_operand(""), _tuple_payload_operands([_text_operand("add"), _text_operand("sitedir")])]
+        parts += [b"\x86R\x94"]
+        parts += [b"h\x02h\x03\x85R\x94"]
+        parts += [b"h\x04", _text_operand(str(site_dir)), b"\x85R"]
+    else:
+        parts += [b"h\x00"]
+    parts += [b"."]
+    return b"".join(parts), expected_line
+
+
 def _dotenv_run_command_payload(command: list[str], *, include_call: bool) -> bytes:
     command_list = _list_payload_operands([_text_operand(part) for part in command])
     parts = [b"\x80\x04"]
@@ -3183,6 +3212,50 @@ def test_scan_bytes_blocks_dotted_global_os_system_alias_rce(tmp_path: Path) -> 
     result = pickle.loads(payload)
     assert result == 0
     assert marker.read_text() == "owned-by-site-os-system"
+
+
+def test_scan_bytes_blocks_posixpath_writer_and_site_dict_lookup_pth_rce(tmp_path: Path) -> None:
+    pth_path = tmp_path / "posixpath_site_dict_exec.pth"
+    marker = tmp_path / "posixpath_site_dict_marker"
+    control_payload, expected_line = _posixpath_site_dict_pth_payload(
+        pth_path,
+        marker,
+        tmp_path,
+        include_write=False,
+    )
+    payload, _ = _posixpath_site_dict_pth_payload(
+        pth_path,
+        marker,
+        tmp_path,
+        include_write=True,
+    )
+    original_sys_path = list(sys.path)
+
+    try:
+        control_report = scan_bytes(control_payload, source="posixpath-site-dict-control.pkl")
+        assert control_report.verdict == SafetyVerdict.CLEAN
+
+        assert not pth_path.exists()
+        assert not marker.exists()
+        control_result = pickle.loads(control_payload)
+        assert control_result == expected_line
+        assert not pth_path.exists()
+        assert not marker.exists()
+
+        report = scan_bytes(payload, source="posixpath-site-dict-pth-rce.pkl")
+
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_global_finding(report, "pathlib", "PosixPath.write_text")
+        assert _has_critical_global_finding(report, "site", "__dict__.get")
+
+        assert not pth_path.exists()
+        assert not marker.exists()
+        result = pickle.loads(payload)
+        assert result is None
+        assert pth_path.read_text() == expected_line
+        assert marker.read_text() == "owned-by-posixpath-site-dict"
+    finally:
+        sys.path[:] = original_sys_path
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="dotenv.cli.run_command uses POSIX os.execvpe in this proof")
