@@ -9345,3 +9345,105 @@ Performance note: this stays a bounded string-only pass over already parsed
 pickle globals. The new work is one loop over dotted name components and the
 existing constant policy lookups; it adds no imports, attribute resolution,
 descriptor binding, frame inspection, or stack-value provenance.
+
+## Turn 169 - Bypass via high-level `tkinter` Tcl command dispatch
+
+Found a scanner-clean RCE that shifts from global aliasing into the Python call
+graph. The current policy blocks the low-level C entrypoints
+`_tkinter.TkappType.call` and `_tkinter.TkappType.eval`, but public Python
+helpers in `tkinter.Misc` still forward attacker-controlled arguments into the
+same Tcl interpreter through `self.tk.call(...)`.
+
+Representative payload shape:
+
+```python
+tcl = tkinter.Tcl()
+tkinter.Misc._unbind(
+    tcl,
+    ("exec", "/bin/sh", "-c", "printf owned-by-tkinter-misc-unbind > /tmp/.../marker"),
+)
+```
+
+The pickle imports only:
+
+- `tkinter.Tcl`
+- `tkinter.Misc._unbind`
+
+Proof on CPython 3.12.12 with `_tkinter` available:
+
+- Direct probe: `_tkinter.TkappType.call` and `_tkinter.TkappType.eval` are
+  malicious, but `tkinter.Tcl`, `tkinter.Misc._unbind`,
+  `tkinter.Misc._getconfigure`, and `tkinter.Misc._getconfigure1` are clean.
+- Call-graph probe:
+  `tkinter.Misc._unbind -> tkinter.Misc.tk.call` has no sink path, and
+  `tkinter.Misc._getconfigure -> tkinter.Misc.tk.call` also has no sink path.
+- Control payload scanner result: `len=155`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control runtime: `pickle.loads(control)` returns the command tuple and does
+  not create the marker.
+- Active `_unbind` payload scanner result: `len=202`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references: clean `tkinter.Tcl` and clean
+  `tkinter.Misc._unbind`, both with `is_dangerous=False`.
+- Active runtime before unpickle: marker absent.
+- Active runtime after unpickle: marker exists and contains
+  `owned-by-tkinter-misc-unbind`; `pickle.loads(active)` returns `None`.
+- Sibling proof: `tkinter.Misc._getconfigure(tcl, "exec", "/bin/sh", "-c",
+  command)` also scans clean (`len=218`, no findings) and creates a marker
+  containing `owned-by-tkinter-misc-getconfigure`.
+
+Why the scanner missed it:
+
+- The Rust policy blocks the concrete low-level `_tkinter` call/eval globals,
+  but the active pickle never imports `_tkinter`.
+- The Python call graph sees `tkinter.Misc.tk.call`, which is just an attribute
+  call in source form, not one of the current exact RCE sinks such as
+  `subprocess.run`, `os.system`, or `builtins.exec`.
+- `_unbind` passes the attacker-controlled `what` tuple through splatted args
+  to `self.tk.call(*what, "")`. With `what[0] == "exec"`, Tcl executes a
+  process during unpickling.
+- `_getconfigure` and `_getconfigure1` expose the same primitive through
+  `self.tk.call(*args)`.
+- The payload needs no blocked Python primitives such as `os.system`,
+  `subprocess`, `eval`, `exec(`, `getattr`, frame access, object graph access,
+  file-write globals, or suspicious magic-method strings.
+
+Performance note: the next block should be call-graph-source focused rather
+than package enumeration. Add an embedded-interpreter sink for resolved calls
+ending in `.tk.call` / `._tk.call` / `.tk.eval` / `._tk.eval` when the enclosing
+function forwards parameter-controlled arguments, and add focused direct-policy
+coverage for the few public `tkinter.Misc` dispatchers that splat arbitrary
+arguments into Tcl (`_unbind`, `_getconfigure`, `_getconfigure1`). This keeps
+the hot path as bounded source analysis plus static table checks; it does not
+require importing Tk, creating interpreters, resolving live descriptors, or
+blanket-blocking all of `tkinter`.
+
+## Turn 170 - Block high-level `tkinter` Tcl dispatch call graphs
+
+Blocking plan implemented:
+
+- Extend the bounded Python call graph with a Tcl interpreter dispatch sink for
+  resolved calls ending in `.tk.call`, `._tk.call`, `.tk.eval`, or `._tk.eval`.
+- Keep the sink argument-aware. For `.tk.call(...)`, flag only when the Tcl
+  command position can be parameter-controlled, such as `self.tk.call(*args)`,
+  `self.tk.call(*what, "")`, or `self.tk.call(what + (...))`. Fixed widget
+  dispatch shapes such as `self.tk.call((self._w, "delete") + args)` stay
+  outside the RCE sink.
+- Treat `.tk.eval(...)` as dangerous when its script argument is
+  parameter-controlled.
+- Add focused regressions for the Turn 169 payloads:
+  `tkinter.Misc._unbind(tcl, ("exec", "/bin/sh", "-c", command))` and
+  `tkinter.Misc._getconfigure(tcl, "exec", "/bin/sh", "-c", command)`.
+- Add direct call-graph assertions for `_unbind`, `_getconfigure`, and
+  `_getconfigure1`.
+- Add benign near-match assertions for fixed widget dispatchers (`_configure`,
+  `grid_bbox`, `Canvas.delete`). `grid_bbox` is important because it eventually
+  splats a parameter-influenced local tuple, but that tuple's Tcl command head
+  remains the fixed string `grid`.
+- Add root and standalone picklescan changelog entries.
+
+Performance note: this remains a source-only, bounded AST pass. The extra work
+runs only for already-resolved call expressions whose names end in a small Tcl
+dispatch suffix set, then checks the first Tcl command expression with existing
+parameter-control propagation. It adds no module imports, no live Tcl/Tk
+interpreter creation, no descriptor binding, and no blanket `tkinter` wildcard.

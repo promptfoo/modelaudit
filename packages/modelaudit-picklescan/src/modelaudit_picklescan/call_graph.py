@@ -64,6 +64,8 @@ _FILE_OPEN_SINK_EXACT = frozenset(
 )
 _FILE_WRITE_METHODS = frozenset({"write", "writelines"})
 _BUILTIN_CALLS = frozenset({"__import__", "compile", "eval", "exec", "open"})
+_TCL_CALL_DISPATCH_SUFFIXES = (".tk.call", "._tk.call")
+_TCL_EVAL_DISPATCH_SUFFIXES = (".tk.eval", "._tk.eval")
 
 
 @dataclass(frozen=True)
@@ -250,6 +252,10 @@ def _find_matching_call_path(start: str, sink_for: Callable[[str], str | None]) 
         for call in calls[:_MAX_CALLS_PER_FUNCTION]:
             sink = sink_for(call)
             if sink is not None:
+                # Tcl dispatch risk depends on the local call argument shape; do not
+                # propagate it through wrappers whose arguments may be fixed safely.
+                if _is_tcl_interpreter_dispatch_call(sink) and len(path) > 1:
+                    continue
                 return (*path, sink)
             if len(path) > _MAX_CALL_GRAPH_DEPTH:
                 continue
@@ -439,11 +445,24 @@ def _calls_in_function(
 ) -> tuple[str, ...]:
     calls: list[str] = []
     parameter_controlled_names: set[str] | None = None
+    tcl_command_controlled_names: set[str] | None = None
     for node in ast.walk(function_node):
         if not isinstance(node, ast.Call):
             continue
         resolved = _resolve_expr(node.func, module_name, aliases, local_defs, class_name)
         if resolved is not None:
+            if _is_tcl_interpreter_dispatch_call(resolved):
+                if parameter_controlled_names is None:
+                    parameter_controlled_names = _parameter_controlled_names(function_node)
+                if tcl_command_controlled_names is None:
+                    tcl_command_controlled_names = _parameter_controlled_tcl_command_names(function_node)
+                if not _tcl_dispatch_uses_parameter_controlled_command(
+                    node,
+                    resolved,
+                    parameter_controlled_names,
+                    tcl_command_controlled_names,
+                ):
+                    continue
             if _is_file_write_call(resolved):
                 if parameter_controlled_names is None:
                     parameter_controlled_names = _parameter_controlled_names(function_node)
@@ -454,19 +473,7 @@ def _calls_in_function(
 
 
 def _parameter_controlled_names(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
-    controlled = {
-        arg.arg
-        for arg in (
-            *function_node.args.posonlyargs,
-            *function_node.args.args,
-            *function_node.args.kwonlyargs,
-        )
-        if arg.arg not in {"self", "cls"}
-    }
-    if function_node.args.vararg is not None:
-        controlled.add(function_node.args.vararg.arg)
-    if function_node.args.kwarg is not None:
-        controlled.add(function_node.args.kwarg.arg)
+    controlled = _initial_parameter_controlled_names(function_node)
 
     changed = True
     while changed:
@@ -495,6 +502,54 @@ def _parameter_controlled_names(function_node: ast.FunctionDef | ast.AsyncFuncti
     return controlled
 
 
+def _initial_parameter_controlled_names(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    controlled = {
+        arg.arg
+        for arg in (
+            *function_node.args.posonlyargs,
+            *function_node.args.args,
+            *function_node.args.kwonlyargs,
+        )
+        if arg.arg not in {"self", "cls"}
+    }
+    if function_node.args.vararg is not None:
+        controlled.add(function_node.args.vararg.arg)
+    if function_node.args.kwarg is not None:
+        controlled.add(function_node.args.kwarg.arg)
+
+    return controlled
+
+
+def _parameter_controlled_tcl_command_names(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    controlled = _initial_parameter_controlled_names(function_node)
+
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(function_node):
+            target_names: set[str]
+            if isinstance(node, ast.Assign):
+                if not _tcl_call_command_uses_names(node.value, controlled):
+                    continue
+                target_names = set()
+                for target in node.targets:
+                    target_names.update(_assignment_target_names(target))
+            elif isinstance(node, ast.AnnAssign):
+                if node.value is None or not _tcl_call_command_uses_names(node.value, controlled):
+                    continue
+                target_names = _assignment_target_names(node.target)
+            elif isinstance(node, ast.For | ast.AsyncFor):
+                if not _tcl_call_command_uses_names(node.iter, controlled):
+                    continue
+                target_names = _assignment_target_names(node.target)
+            else:
+                continue
+            before = len(controlled)
+            controlled.update(target_names)
+            changed = changed or len(controlled) != before
+    return controlled
+
+
 def _assignment_target_names(target: ast.AST) -> set[str]:
     if isinstance(target, ast.Name):
         return {target.id}
@@ -510,6 +565,41 @@ def _call_uses_parameter_controlled_argument(call_node: ast.Call, controlled_nam
     return any(_expr_uses_names(argument, controlled_names) for argument in call_node.args) or any(
         _expr_uses_names(keyword.value, controlled_names) for keyword in call_node.keywords
     )
+
+
+def _tcl_dispatch_uses_parameter_controlled_command(
+    call_node: ast.Call,
+    call_name: str,
+    controlled_names: set[str],
+    command_controlled_names: set[str],
+) -> bool:
+    if call_name.endswith(_TCL_EVAL_DISPATCH_SUFFIXES):
+        return _call_uses_parameter_controlled_argument(call_node, controlled_names)
+    if not call_node.args:
+        return False
+    return _tcl_call_command_uses_names(call_node.args[0], command_controlled_names)
+
+
+def _tcl_call_command_uses_names(expression: ast.AST, names: set[str]) -> bool:
+    if isinstance(expression, ast.Starred):
+        return _expr_uses_names(expression.value, names)
+    if isinstance(expression, ast.Tuple | ast.List):
+        if not expression.elts:
+            return False
+        return _tcl_call_command_uses_names(expression.elts[0], names)
+    if isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Add):
+        return _tcl_call_command_uses_names(expression.left, names)
+    if isinstance(expression, ast.Call) and _is_flatten_call(expression):
+        return bool(expression.args) and _tcl_call_command_uses_names(expression.args[0], names)
+    return _expr_uses_names(expression, names)
+
+
+def _is_flatten_call(expression: ast.Call) -> bool:
+    if isinstance(expression.func, ast.Name):
+        return expression.func.id == "_flatten"
+    if isinstance(expression.func, ast.Attribute):
+        return expression.func.attr == "_flatten"
+    return False
 
 
 def _expr_uses_names(expression: ast.AST, names: set[str]) -> bool:
@@ -582,6 +672,8 @@ def _rce_sink(call_name: str) -> str | None:
         return call_name
     if call_name.startswith(_RCE_SINK_PREFIXES):
         return call_name
+    if _is_tcl_interpreter_dispatch_call(call_name):
+        return call_name
     return None
 
 
@@ -599,3 +691,7 @@ def _file_write_sink(call_name: str) -> str | None:
 
 def _is_file_write_call(call_name: str) -> bool:
     return call_name.rpartition(".")[2] in _FILE_WRITE_METHODS
+
+
+def _is_tcl_interpreter_dispatch_call(call_name: str) -> bool:
+    return call_name.endswith(_TCL_CALL_DISPATCH_SUFFIXES) or call_name.endswith(_TCL_EVAL_DISPATCH_SUFFIXES)

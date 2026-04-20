@@ -46,6 +46,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Detect `pipes.Template` pickle call targets that can execute
   attacker-controlled shell pipelines on Python versions that still provide
   `pipes`.
+- Detect high-level `tkinter.Misc` pickle call targets that can forward
+  attacker-controlled commands into Tcl interpreter dispatch.
 - Detect `typing._eval_type` pickle call targets that can evaluate
   attacker-controlled `ForwardRef` expressions.
 - Detect `dataclasses._create_fn` pickle call targets that can execute
