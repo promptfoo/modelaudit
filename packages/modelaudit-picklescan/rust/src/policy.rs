@@ -363,6 +363,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("site", "addpackage"),
     ("site", "addsitedir"),
     ("site", "main"),
+    ("string", "Formatter.get_field"),
     ("tarfile", "open"),
     ("tempfile", "NamedTemporaryFile"),
     ("test.support.script_helper", "assert_python_ok"),
@@ -746,6 +747,10 @@ mod tests {
         );
         assert_eq!(global_severity("site", "addsitedir"), Some("critical"));
         assert_eq!(global_severity("site", "addpackage"), Some("critical"));
+        assert_eq!(
+            global_severity("string", "Formatter.get_field"),
+            Some("critical")
+        );
         assert_eq!(global_severity("custom", "load"), None);
     }
 

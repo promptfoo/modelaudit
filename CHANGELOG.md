@@ -162,6 +162,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   namespace dictionary recovery for modules with blocked globals
 - **security:** detect module namespace and `__builtins__` access used for
   dynamic builtin recovery
+- **security:** detect `string.Formatter.get_field` pickle call targets that
+  can traverse attacker-controlled field expressions into callable objects
 - **security:** detect pickle calls to PyYAML unsafe loaders that can execute
   attacker-controlled Python constructors
 - **security:** detect pickle calls to `codecs.open` and codec stream writes

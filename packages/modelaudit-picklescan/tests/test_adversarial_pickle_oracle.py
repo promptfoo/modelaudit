@@ -1182,6 +1182,50 @@ def _module_dict_builtins_eval_payload(marker: Path, *, include_lookup: bool) ->
     return b"".join(parts), code
 
 
+def _string_formatter_get_field_eval_payload(marker: Path, *, include_lookup: bool) -> tuple[bytes, str]:
+    code = f"open({str(marker)!r},'w').write('owned-by-formatter-get-field')"
+    code_fragments = [code[offset : offset + 19] for offset in range(0, len(code), 19)]
+    field_fragments = [
+        "0.",
+        "_",
+        "_",
+        "globals",
+        "_",
+        "_",
+        "[",
+        "_",
+        "_",
+        "builtins",
+        "_",
+        "_",
+        "][",
+        "ev",
+        "al",
+        "]",
+    ]
+
+    def join_fragments(fragments: list[str]) -> list[bytes]:
+        return [
+            _global_operand("builtins", "str.join"),
+            _text_operand(""),
+            _tuple_payload_operands([_text_operand(fragment) for fragment in fragments]),
+            b"\x86R",
+        ]
+
+    parts = [b"\x80\x04"]
+    if include_lookup:
+        parts += [_global_operand("string", "Formatter"), b")R\x940"]
+        parts += [_global_operand("string", "Formatter.get_field"), b"(", b"h\x00"]
+        parts += join_fragments(field_fragments)
+        parts += [_tuple_payload_operands([_global_operand("statistics", "mean")]), b"}tR\x940"]
+        parts += [_global_operand("operator", "getitem"), b"h\x01K\x00\x86R\x940"]
+    parts += join_fragments(code_fragments)
+    if include_lookup:
+        parts += [b"\x940h\x02h\x03\x85R"]
+    parts += [b"."]
+    return b"".join(parts), code
+
+
 def _site_os_system_payload(command: str, *, include_call: bool) -> bytes:
     parts = [b"\x80\x04"]
     if include_call:
@@ -3243,6 +3287,30 @@ def test_scan_bytes_blocks_module_dict_fragmented_builtins_eval_recovery_rce(tmp
     result = pickle.loads(payload)
     assert result == len("owned-by-fragmented-module-builtins")
     assert marker.read_text() == "owned-by-fragmented-module-builtins"
+
+
+def test_scan_bytes_blocks_string_formatter_get_field_eval_recovery_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "formatter_get_field_eval_marker"
+    control_payload, expected_code = _string_formatter_get_field_eval_payload(marker, include_lookup=False)
+    payload, _ = _string_formatter_get_field_eval_payload(marker, include_lookup=True)
+
+    control_report = scan_bytes(control_payload, source="formatter-get-field-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert control_result == expected_code
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="formatter-get-field-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_global_finding(report, "string", "Formatter.get_field")
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result == len("owned-by-formatter-get-field")
+    assert marker.read_text() == "owned-by-formatter-get-field"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="os.system proof uses POSIX shell redirection")
