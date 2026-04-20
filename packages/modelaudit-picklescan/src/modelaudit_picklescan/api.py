@@ -913,9 +913,12 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     import_references = report.metadata.get("import_references")
     try:
         call_graph_findings = find_dangerous_call_graphs(import_references)
+    except Exception:
+        call_graph_findings = ()
+    try:
         startup_hook_write_findings = find_startup_hook_write_call_graphs(import_references)
     except Exception:
-        return report
+        startup_hook_write_findings = ()
     if not call_graph_findings and not startup_hook_write_findings:
         return report
 

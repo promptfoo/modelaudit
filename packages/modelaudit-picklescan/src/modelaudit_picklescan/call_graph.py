@@ -183,13 +183,10 @@ def find_dangerous_call_graphs(import_references: object) -> tuple[CallGraphFind
             continue
         seen.add((module, name))
 
-        entrypoints = _call_graph_entrypoints(f"{module}.{name}")
+        entrypoints = _safe_call_graph_entrypoints(f"{module}.{name}")
         if not entrypoints:
             continue
-        sink_path = next(
-            (path for entrypoint in entrypoints if (path := _find_sink_path(entrypoint)) is not None),
-            None,
-        )
+        sink_path = _first_matching_path(entrypoints, _find_sink_path)
         if sink_path is None:
             continue
 
@@ -219,15 +216,12 @@ def find_startup_hook_write_call_graphs(import_references: object) -> tuple[Star
             continue
         seen.add((module, name))
 
-        entrypoints = _call_graph_entrypoints(f"{module}.{name}")
+        entrypoints = _safe_call_graph_entrypoints(f"{module}.{name}")
         if not entrypoints:
             continue
-        if any(_find_sink_path(entrypoint) is not None for entrypoint in entrypoints):
+        if _first_matching_path(entrypoints, _find_sink_path) is not None:
             continue
-        open_path = next(
-            (path for entrypoint in entrypoints if (path := _find_file_open_path(entrypoint)) is not None),
-            None,
-        )
+        open_path = _first_matching_path(entrypoints, _find_file_open_path)
         if open_path is not None:
             openers.append(
                 _ImportCallPath(
@@ -237,10 +231,7 @@ def find_startup_hook_write_call_graphs(import_references: object) -> tuple[Star
                     call_path=open_path,
                 )
             )
-        write_path = next(
-            (path for entrypoint in entrypoints if (path := _find_file_write_path(entrypoint)) is not None),
-            None,
-        )
+        write_path = _first_matching_path(entrypoints, _find_file_write_path)
         if write_path is not None:
             writers.append(
                 _ImportCallPath(
@@ -279,6 +270,28 @@ def find_startup_hook_write_call_graphs(import_references: object) -> tuple[Star
             if len(findings) >= _MAX_IMPORT_REFERENCES:
                 return tuple(findings)
     return tuple(findings)
+
+
+@lru_cache(maxsize=4096)
+def _safe_call_graph_entrypoints(function_name: str) -> tuple[str, ...]:
+    try:
+        return _call_graph_entrypoints(function_name)
+    except Exception:
+        return ()
+
+
+def _first_matching_path(
+    entrypoints: Iterable[str],
+    path_for: Callable[[str], tuple[str, ...] | None],
+) -> tuple[str, ...] | None:
+    for entrypoint in entrypoints:
+        try:
+            path = path_for(entrypoint)
+        except Exception:
+            continue
+        if path is not None:
+            return path
+    return None
 
 
 def _iter_import_references(import_references: object) -> tuple[dict[str, object], ...]:

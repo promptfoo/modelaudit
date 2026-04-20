@@ -24,7 +24,12 @@ import pytest
 
 from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, Severity, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
-from modelaudit_picklescan.call_graph import _call_graph_entrypoints, _calls_for_function, _find_sink_path
+from modelaudit_picklescan.call_graph import (
+    _call_graph_entrypoints,
+    _calls_for_function,
+    _find_sink_path,
+    find_dangerous_call_graphs,
+)
 
 pytestmark = pytest.mark.skipif(
     find_spec(_RUST_EXTENSION_MODULE) is None,
@@ -1794,6 +1799,22 @@ def _random_os_alias_prefix_payload(marker: Path) -> bytes:
             b"R.",
         ]
     )
+
+
+def _call_graph_poisoned_random_os_alias_prefix_payload(marker: Path, *, poison_after: bool = False) -> bytes:
+    command = f"printf call-graph-poison-owned > {shlex.quote(str(marker))}"
+    poison = [
+        _global_operand("xml.sax.saxutils", "escape"),
+        b"0",
+    ]
+    rce_call = [
+        _global_operand("random", "_os.system"),
+        _tuple_payload_operands([_text_operand(command)]),
+        b"R",
+    ]
+    if poison_after:
+        return b"".join([b"\x80\x04", *rce_call, b"0", *poison, b"N."])
+    return b"".join([b"\x80\x04", *poison, *rce_call, b"."])
 
 
 def _pkgutil_iter_importers_payload() -> bytes:
@@ -4641,6 +4662,59 @@ if not marker.exists():
     )
     assert result.returncode == 0, result.stderr
     assert marker.read_text() == "random-os-alias-owned"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
+def test_scan_bytes_blocks_call_graph_exception_poisoning_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "call_graph_exception_poisoning_marker"
+    payload = _call_graph_poisoned_random_os_alias_prefix_payload(marker)
+    poison_after_payload = _call_graph_poisoned_random_os_alias_prefix_payload(marker, poison_after=True)
+
+    findings = find_dangerous_call_graphs(
+        (
+            {"module": "xml.sax.saxutils", "name": "escape"},
+            {"module": "random", "name": "_os.system"},
+        )
+    )
+    assert any(
+        finding.module == "random" and finding.name == "_os.system" and finding.sink == "os.system"
+        for finding in findings
+    )
+
+    report = scan_bytes(payload, source="call-graph-exception-poisoning-before-rce.pkl")
+    poison_after_report = scan_bytes(
+        poison_after_payload,
+        source="call-graph-exception-poisoning-after-rce.pkl",
+    )
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(report, "random", "_os.system", "os.system")
+    assert poison_after_report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(poison_after_report, "random", "_os.system", "os.system")
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+payload = bytes.fromhex(sys.argv[2])
+result = pickle.loads(payload)
+if result != 0:
+    raise SystemExit(result)
+if not marker.exists():
+    raise SystemExit("marker was not written")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(marker), payload.hex()],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == "call-graph-poison-owned"
 
 
 def test_scan_bytes_blocks_pkgutil_iter_importers_import_side_effect_rce(tmp_path: Path) -> None:
