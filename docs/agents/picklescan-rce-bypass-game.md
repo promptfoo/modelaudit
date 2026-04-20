@@ -7851,3 +7851,87 @@ Blocking plan:
 Performance note: this is a constant-time name-prefix rule inside the existing
 builtin-module branch of the Rust policy check. It adds no dataflow analysis,
 no Python imports, no package enumeration, and no extra call-graph traversal.
+
+## Turn 141 - Bypass via dotted global alias to `os.system`
+
+Found a scanner-clean RCE in CPython's dotted global resolution path. For
+protocol 4 `STACK_GLOBAL`, `pickle.Unpickler.find_class(module, name)` imports
+`module` and then resolves dotted components inside `name` as attributes. The
+scanner currently evaluates only the apparent `(module, name)` pair, so a
+benign-looking module that imports a dangerous module can expose the dangerous
+primitive under a clean import reference.
+
+The payload imports and calls `site.os.system`:
+
+```python
+site.os.system("printf owned-by-site-os-system > /tmp/.../site_os_system_marker")
+```
+
+`site` imports `os`, so CPython resolves the dotted name to the same builtin
+function as `os.system`. The scanner treats the import reference as
+`module="site"`, `name="os.system"` and does not match the wildcard `os`
+module policy or the Python call-graph sink list.
+
+Proof on CPython 3.12.12:
+
+- Control payload scanner result: `len=121`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control import references: none. It only returns the command tuple.
+- Control runtime: `pickle.loads(control)` returns the command tuple and
+  creates no marker.
+- Active payload scanner result: `len=140`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references: `site.os.system` with `is_dangerous=False`.
+- Active runtime before unpickle: marker absent.
+- Active runtime after unpickle: marker exists and contains
+  `owned-by-site-os-system`; `pickle.loads(active)` returns `0` from
+  `os.system`.
+
+Why the scanner missed it:
+
+- The Rust policy checks the declared pickle module separately from the global
+  name. `site` is not wildcard-dangerous, and the exact dangerous globals only
+  include `site.addpackage`, `site.addsitedir`, and `site.main`.
+- The dangerous suffix `os.system` is present in the global name, but policy
+  matching does not canonicalize or classify dotted global-name tails.
+- The Python call-graph analysis only follows import references to local Python
+  source entrypoints. Here the dangerous function is reached by CPython's
+  dotted attribute resolution before the function is ever called, so there is
+  no Python wrapper source to inspect.
+- The command string contains no contiguous scanner-triggering code pattern;
+  it is just a shell `printf` redirection argument to the resolved function.
+
+Performance note: the next block should stay near the pickle primitive by
+classifying dotted global-name tails against the same finite dangerous
+primitives already in policy. For example, any global name whose dotted suffix
+is `os.system`, `os.popen`, `subprocess.Popen`, `builtins.eval`, or another
+known source primitive should fail closed regardless of the apparent imported
+module. This is a bounded string/suffix check over the already parsed global
+operand, not a package enumeration or module import pass.
+
+## Turn 142 - Block dotted global-name tails for source primitives
+
+Blocking plan:
+
+- Split each dotted pickle global name into candidate suffix module/name pairs
+  and run those suffixes through the same direct Rust policy predicates used for
+  normal globals.
+- Keep the check purely syntactic and bounded by the number of dot components
+  in the already parsed global operand. It performs no imports, no attribute
+  resolution, and no Python call-graph traversal.
+- Reuse the existing direct policy branch so suffixes such as `os.system`,
+  `logging.config.dictConfig`, `subprocess.Popen`, and builtin dangerous names
+  inherit the same severity as their direct import forms.
+- Add a CPython oracle regression for the Turn 141 payload. The control payload
+  only carries the command tuple and remains clean; the active payload imports
+  `site.os.system`, is flagged as malicious, and still writes the marker if
+  loaded.
+- Add Rust unit coverage for `site.os.system`, a nested `prefix.os.system`
+  suffix, and a multi-component exact policy suffix such as
+  `logging.config.dictConfig`.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: the new path is a small nested loop over global-name dot
+components and uses the existing policy tables. It adds no package enumeration
+and no runtime module inspection; the common undotted global path returns before
+allocating suffix candidates.

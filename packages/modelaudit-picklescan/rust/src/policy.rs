@@ -1,4 +1,8 @@
 pub(crate) fn global_severity(module: &str, name: &str) -> Option<&'static str> {
+    direct_global_severity(module, name).or_else(|| dotted_global_tail_severity(name))
+}
+
+fn direct_global_severity(module: &str, name: &str) -> Option<&'static str> {
     if (module == "os" && name == "path") || module == "os.path" {
         return None;
     }
@@ -26,6 +30,24 @@ pub(crate) fn global_severity(module: &str, name: &str) -> Option<&'static str> 
         return Some("critical");
     }
 
+    None
+}
+
+fn dotted_global_tail_severity(name: &str) -> Option<&'static str> {
+    if !name.contains('.') {
+        return None;
+    }
+
+    let parts = name.split('.').collect::<Vec<_>>();
+    for start in 0..parts.len().saturating_sub(1) {
+        for split in start + 1..parts.len() {
+            let candidate_module = parts[start..split].join(".");
+            let candidate_name = parts[split..].join(".");
+            if let Some(severity) = direct_global_severity(&candidate_module, &candidate_name) {
+                return Some(severity);
+            }
+        }
+    }
     None
 }
 
@@ -411,6 +433,15 @@ mod tests {
         assert_eq!(global_severity("pipes", "Template.copy"), Some("critical"));
         assert_eq!(global_severity("pipes", "Template.open"), Some("critical"));
         assert_eq!(global_severity("operator", "call"), Some("critical"));
+        assert_eq!(global_severity("site", "os.system"), Some("critical"));
+        assert_eq!(
+            global_severity("sysconfig", "prefix.os.system"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("site", "logging.config.dictConfig"),
+            Some("critical")
+        );
         for module in BUILTIN_MODULES {
             for name in ["__dict__", "__dict__.get", "__dict__.__getitem__"] {
                 assert_eq!(global_severity(module, name), Some("critical"));

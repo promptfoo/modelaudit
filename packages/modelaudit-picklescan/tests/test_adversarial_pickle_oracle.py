@@ -1154,6 +1154,17 @@ def _builtin_dict_get_eval_payload(marker: Path, *, include_lookup: bool) -> tup
     return b"".join(parts), code
 
 
+def _site_os_system_payload(command: str, *, include_call: bool) -> bytes:
+    parts = [b"\x80\x04"]
+    if include_call:
+        parts += [_global_operand("site", "os.system")]
+        parts += [_tuple_payload_operands([_text_operand(command)]), b"R"]
+    else:
+        parts += [_tuple_payload_operands([_text_operand(command)])]
+    parts += [b"."]
+    return b"".join(parts)
+
+
 def _dotenv_run_command_payload(command: list[str], *, include_call: bool) -> bytes:
     command_list = _list_payload_operands([_text_operand(part) for part in command])
     parts = [b"\x80\x04"]
@@ -3146,6 +3157,32 @@ def test_scan_bytes_blocks_builtin_dict_lookup_eval_recovery_rce(tmp_path: Path)
     result = pickle.loads(payload)
     assert result == len("owned-by-dict-get")
     assert marker.read_text() == "owned-by-dict-get"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="os.system proof uses POSIX shell redirection")
+def test_scan_bytes_blocks_dotted_global_os_system_alias_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "site_os_system_marker"
+    command = f"printf owned-by-site-os-system > {shlex.quote(str(marker))}"
+    control_payload = _site_os_system_payload(command, include_call=False)
+    payload = _site_os_system_payload(command, include_call=True)
+
+    control_report = scan_bytes(control_payload, source="site-os-system-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert control_result == (command,)
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="site-os-system-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_global_finding(report, "site", "os.system")
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result == 0
+    assert marker.read_text() == "owned-by-site-os-system"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="dotenv.cli.run_command uses POSIX os.execvpe in this proof")
