@@ -31,7 +31,7 @@ use crate::report::{
 use crate::stack::{
     collapse_tuple_values, operand_preview, pytorch_storage_key, resolve_global_operand,
     stack_value_from_integer_arg, stack_value_from_text_arg, stack_value_preview,
-    stack_value_string, GlobalRef, RegexScannerRule, StackValue,
+    stack_value_string, FutureCallbacks, GlobalRef, RegexScannerRule, StackValue,
 };
 use crate::strings::{is_repeated_single_byte, suspicious_string_matches};
 
@@ -838,13 +838,22 @@ impl<'a> ScanState<'a> {
             "PUT" | "BINPUT" | "LONG_BINPUT" => {
                 if let Some(value) = self.stack.last().cloned() {
                     if let Some(index) = opcode.arg.as_i64() {
+                        let value = Self::with_memo_index(value, index);
+                        if let Some(top) = self.stack.last_mut() {
+                            *top = value.clone();
+                        }
                         self.memo.insert(index, value);
                     }
                 }
             }
             "MEMOIZE" => {
                 if let Some(value) = self.stack.last().cloned() {
-                    self.memo.insert(self.memo.len() as i64, value);
+                    let index = self.memo.len() as i64;
+                    let value = Self::with_memo_index(value, index);
+                    if let Some(top) = self.stack.last_mut() {
+                        *top = value.clone();
+                    }
+                    self.memo.insert(index, value);
                 }
             }
             "GET" | "BINGET" | "LONG_BINGET" => {
@@ -1219,6 +1228,12 @@ impl<'a> ScanState<'a> {
             opcode.name,
             position,
         ));
+        invocations.extend(self.future_callback_invocations(
+            callable_value.as_ref(),
+            argument_values.as_deref(),
+            opcode.name,
+            position,
+        ));
         invocations.extend(Self::call_iterator_consumption_invocations(
             callable_value.as_ref(),
             argument_values.as_deref(),
@@ -1402,6 +1417,103 @@ impl<'a> ScanState<'a> {
                 flags_arg_index.and_then(|arg_index| arguments.get(arg_index)),
             ),
         }
+    }
+
+    fn future_callback_invocations(
+        &mut self,
+        callable_value: Option<&StackValue>,
+        argument_values: Option<&[StackValue]>,
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if !matches!(op_name, "REDUCE" | "OBJ") {
+            return Vec::new();
+        }
+        let Some(StackValue::Global(callable_reference)) = callable_value else {
+            return Vec::new();
+        };
+        if callable_reference.malformed {
+            return Vec::new();
+        }
+        let Some(arguments) = argument_values else {
+            return Vec::new();
+        };
+        if Self::is_concurrent_future_symbol(callable_reference, "Future.add_done_callback")
+            && arguments.len() == 2
+        {
+            return self.future_add_done_callback_invocations(arguments, op_name, position);
+        }
+        if Self::is_concurrent_future_completion_method(callable_reference, arguments.len()) {
+            return self.future_completion_invocations(arguments, op_name, position);
+        }
+        Vec::new()
+    }
+
+    fn future_add_done_callback_invocations(
+        &mut self,
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        let Some(StackValue::FutureCallbacks(receiver)) = arguments.first() else {
+            return Vec::new();
+        };
+        let Some(callback) = Self::callable_reference_from_value(arguments.get(1)) else {
+            return Vec::new();
+        };
+        if receiver.done {
+            return vec![Self::callable_invocation(
+                callback,
+                op_name,
+                position,
+                Some(1),
+            )];
+        }
+        if let Some(memo_index) = receiver.memo_index {
+            self.memoized_future_add_callback(memo_index, callback);
+        }
+        Vec::new()
+    }
+
+    fn future_completion_invocations(
+        &mut self,
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        let Some(StackValue::FutureCallbacks(receiver)) = arguments.first() else {
+            return Vec::new();
+        };
+        let callbacks = receiver.callbacks.clone();
+        if let Some(memo_index) = receiver.memo_index {
+            self.memoized_future_mark_done(memo_index);
+        }
+        callbacks
+            .into_iter()
+            .map(|callback| Self::callable_invocation(callback, op_name, position, Some(1)))
+            .collect()
+    }
+
+    fn is_concurrent_future_symbol(reference: &GlobalRef, name: &str) -> bool {
+        matches!(
+            reference.module.as_str(),
+            "concurrent.futures" | "concurrent.futures._base"
+        ) && reference.name == name
+    }
+
+    fn is_concurrent_future_completion_method(reference: &GlobalRef, arity: usize) -> bool {
+        matches!(
+            (reference.module.as_str(), reference.name.as_str(), arity),
+            (
+                "concurrent.futures" | "concurrent.futures._base",
+                "Future.set_result" | "Future.set_exception",
+                2
+            ) | (
+                "concurrent.futures" | "concurrent.futures._base",
+                "Future.cancel",
+                1
+            )
+        )
     }
 
     fn literal_regex_pattern_matches_argument(
@@ -2336,6 +2448,28 @@ impl<'a> ScanState<'a> {
         }
     }
 
+    fn with_memo_index(value: StackValue, index: i64) -> StackValue {
+        match value {
+            StackValue::FutureCallbacks(mut callbacks) => {
+                callbacks.memo_index = Some(index);
+                StackValue::FutureCallbacks(callbacks)
+            }
+            value => value,
+        }
+    }
+
+    fn memoized_future_add_callback(&mut self, memo_index: i64, callback: GlobalRef) {
+        if let Some(StackValue::FutureCallbacks(callbacks)) = self.memo.get_mut(&memo_index) {
+            callbacks.callbacks.push(callback);
+        }
+    }
+
+    fn memoized_future_mark_done(&mut self, memo_index: i64) {
+        if let Some(StackValue::FutureCallbacks(callbacks)) = self.memo.get_mut(&memo_index) {
+            callbacks.done = true;
+        }
+    }
+
     fn consume_top_operands(&mut self, operand_count: usize) -> Option<StackValue> {
         self.consume_top_operand_values(operand_count)
             .and_then(|values| values.into_iter().next())
@@ -2388,6 +2522,10 @@ impl<'a> ScanState<'a> {
         }
         if let Some(regex_scanner) = Self::regex_scanner_result(values) {
             self.stack.push(regex_scanner);
+            return;
+        }
+        if let Some(future) = Self::future_callbacks_result(values) {
+            self.stack.push(future);
             return;
         }
         self.push_constructed_result(values.first());
@@ -2465,6 +2603,28 @@ impl<'a> ScanState<'a> {
             rules: rules.clone(),
             flags,
         })
+    }
+
+    fn future_callbacks_result(values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed
+            || !Self::is_concurrent_future_symbol(callable_reference, "Future")
+        {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        if !arguments.is_empty() {
+            return None;
+        }
+        Some(StackValue::FutureCallbacks(FutureCallbacks {
+            callbacks: Vec::new(),
+            done: false,
+            memo_index: None,
+        }))
     }
 
     fn lazy_zero_arg_callback_iterable_result(values: &[StackValue]) -> Option<StackValue> {

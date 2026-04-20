@@ -27,6 +27,13 @@ pub(crate) struct RegexScannerRule {
 }
 
 #[derive(Clone)]
+pub(crate) struct FutureCallbacks {
+    pub(crate) callbacks: Vec<GlobalRef>,
+    pub(crate) done: bool,
+    pub(crate) memo_index: Option<i64>,
+}
+
+#[derive(Clone)]
 pub(crate) enum StackValue {
     Mark,
     Text(String),
@@ -61,6 +68,7 @@ pub(crate) enum StackValue {
         rules: Vec<RegexScannerRule>,
         flags: Option<isize>,
     },
+    FutureCallbacks(FutureCallbacks),
     Tuple(Vec<StackValue>),
     Primitive {
         type_name: &'static str,
@@ -113,6 +121,14 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
                 regex_flags_preview(*flags)
             )
         }
+        Some(StackValue::FutureCallbacks(callbacks)) => format!(
+            "future_callbacks(callbacks={}, done={}, memo={})",
+            callbacks.callbacks.len(),
+            callbacks.done,
+            callbacks
+                .memo_index
+                .map_or_else(|| "none".to_string(), |index| index.to_string())
+        ),
         Some(StackValue::TextSpan { start, end }) => {
             format!("str_span(len={})", end.saturating_sub(*start))
         }
@@ -197,6 +213,14 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
                 regex_flags_preview(*flags)
             )
         }
+        StackValue::FutureCallbacks(callbacks) => format!(
+            "future_callbacks(callbacks={}, done={}, memo={})",
+            callbacks.callbacks.len(),
+            callbacks.done,
+            callbacks
+                .memo_index
+                .map_or_else(|| "none".to_string(), |index| index.to_string())
+        ),
         StackValue::Tuple(values) => {
             let mut parts: Vec<String> = values
                 .iter()
