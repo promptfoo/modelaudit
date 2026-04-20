@@ -1042,6 +1042,9 @@ impl<'a> ScanState<'a> {
             ("string", "Formatter.vformat") => {
                 Self::formatter_vformat_invocations(arguments, op_name, position)
             }
+            ("string", "Formatter._vformat") => {
+                Self::formatter_private_vformat_invocations(arguments, op_name, position)
+            }
             _ => Vec::new(),
         }
     }
@@ -1105,7 +1108,26 @@ impl<'a> ScanState<'a> {
         op_name: &'static str,
         position: usize,
     ) -> Vec<CallableInvocation> {
-        if arguments.len() != 4 || !Self::is_format_string_argument(arguments.get(1)) {
+        Self::formatter_defaultdict_kwargs_invocations(arguments, &[4], op_name, position)
+    }
+
+    fn formatter_private_vformat_invocations(
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        Self::formatter_defaultdict_kwargs_invocations(arguments, &[6, 7], op_name, position)
+    }
+
+    fn formatter_defaultdict_kwargs_invocations(
+        arguments: &[StackValue],
+        expected_arg_counts: &[usize],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if !expected_arg_counts.contains(&arguments.len())
+            || !Self::is_format_string_argument(arguments.get(1))
+        {
             return Vec::new();
         }
         let Some(StackValue::DefaultDict { default_factory }) = arguments.get(3) else {
