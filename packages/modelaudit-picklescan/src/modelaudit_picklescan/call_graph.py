@@ -17,6 +17,7 @@ _MAX_CALL_GRAPH_DEPTH = 4
 _MAX_VISITED_FUNCTIONS = 64
 _MAX_CALLS_PER_FUNCTION = 128
 _MAX_ASSIGNMENT_ALIASES = 128
+_MAX_FUNCTION_INSTANCE_ALIASES = 32
 _MAX_SHORT_SINK_DEPTH = 2
 
 _CLASS_ENTRYPOINT_METHODS = (
@@ -646,13 +647,25 @@ def _calls_in_function(
     class_name: str | None = None,
 ) -> tuple[str, ...]:
     calls: list[str] = []
+    call_nodes = _iter_call_nodes(function_node)
     function_aliases = {
         **aliases,
         **_collect_import_aliases(ast.walk(function_node), module_name, is_package),
     }
+    function_aliases.update(
+        _collect_function_instance_aliases(
+            function_node,
+            call_nodes,
+            module_name,
+            function_aliases,
+            local_defs,
+            local_class_targets,
+            class_name=class_name,
+        )
+    )
     parameter_controlled_names: set[str] | None = None
     tcl_command_controlled_names: set[str] | None = None
-    for node in _iter_call_nodes(function_node):
+    for node in call_nodes:
         resolved = _resolve_expr(node.func, module_name, function_aliases, local_defs, class_name)
         if resolved is not None:
             if _is_tcl_interpreter_dispatch_call(resolved):
@@ -683,6 +696,109 @@ def _calls_in_function(
                 continue
             calls.append(resolved)
     return tuple(calls)
+
+
+def _collect_function_instance_aliases(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    call_nodes: tuple[ast.Call, ...],
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+    local_class_targets: set[str],
+    *,
+    class_name: str | None,
+) -> dict[str, str]:
+    receiver_names = _method_call_receiver_names(call_nodes)
+    if not receiver_names:
+        return {}
+
+    assignment_candidates = tuple(
+        (node, target_names)
+        for node in ast.walk(function_node)
+        if isinstance(node, ast.Assign | ast.AnnAssign)
+        and (target_names := _assignment_alias_target_names(node) & receiver_names)
+    )
+    if not assignment_candidates:
+        return {}
+
+    instance_aliases: dict[str, str] = {}
+    controlled_names = _parameter_controlled_names(function_node)
+    for node, target_names in assignment_candidates:
+        if not _function_instance_alias_is_parameter_controlled(node, target_names, call_nodes, controlled_names):
+            continue
+        resolved = _function_instance_alias_value(
+            node,
+            module_name,
+            {**aliases, **instance_aliases},
+            local_defs,
+            local_class_targets,
+            class_name=class_name,
+        )
+        if resolved is None:
+            continue
+        for target_name in sorted(target_names):
+            if instance_aliases.get(target_name) == resolved:
+                continue
+            instance_aliases[target_name] = resolved
+            if len(instance_aliases) >= _MAX_FUNCTION_INSTANCE_ALIASES:
+                return instance_aliases
+    return instance_aliases
+
+
+def _method_call_receiver_names(call_nodes: tuple[ast.Call, ...]) -> set[str]:
+    names: set[str] = set()
+    for call_node in call_nodes:
+        if isinstance(call_node.func, ast.Attribute) and isinstance(call_node.func.value, ast.Name):
+            names.add(call_node.func.value.id)
+    return names
+
+
+def _function_instance_alias_is_parameter_controlled(
+    node: ast.AST,
+    target_names: set[str],
+    call_nodes: tuple[ast.Call, ...],
+    controlled_names: set[str],
+) -> bool:
+    value: ast.AST | None
+    if isinstance(node, ast.Assign | ast.AnnAssign):
+        value = node.value
+    else:
+        return False
+    if isinstance(value, ast.Call) and _call_uses_parameter_controlled_argument(value, controlled_names):
+        return True
+
+    return any(
+        isinstance(call_node.func, ast.Attribute)
+        and isinstance(call_node.func.value, ast.Name)
+        and call_node.func.value.id in target_names
+        and _call_uses_parameter_controlled_argument(call_node, controlled_names)
+        for call_node in call_nodes
+    )
+
+
+def _function_instance_alias_value(
+    node: ast.AST,
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+    local_class_targets: set[str],
+    *,
+    class_name: str | None,
+) -> str | None:
+    value: ast.AST | None
+    if isinstance(node, ast.Assign | ast.AnnAssign):
+        value = node.value
+    else:
+        return None
+    if not isinstance(value, ast.Call):
+        return None
+
+    call_target = _resolve_expr(value.func, module_name, aliases, local_defs, class_name)
+    if call_target in local_class_targets:
+        return call_target
+    if call_target is None or call_target.startswith(f"{module_name}."):
+        return None
+    return _resolve_class_target(call_target)
 
 
 def _iter_call_nodes(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[ast.Call, ...]:

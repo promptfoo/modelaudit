@@ -9673,3 +9673,135 @@ keeping assignment aliases module-scoped, and `_find_sink_path("execnet.makegate
 resolved in milliseconds. The block remains source-focused: no live imports,
 no descriptor execution, no blanket `execnet` wildcard, and no package-specific
 Rust policy entry.
+
+## Turn 175 - Bypass via function-scope instance alias to editor subprocess
+
+Found a scanner-clean RCE primitive in `click.edit`.
+
+The public wrapper constructs an editor object inside the function, then calls
+through the local instance:
+
+```python
+def edit(text=None, editor=None, env=None, require_save=True, ...):
+    from ._termui_impl import Editor
+
+    ed = Editor(editor=editor, env=env, require_save=require_save, ...)
+    return ed.edit(text)
+```
+
+The lower-level `Editor.edit()` path is dangerous and already visible if probed
+directly:
+
+```python
+def edit_files(self, filenames):
+    import subprocess
+    editor = self.get_editor()
+    c = subprocess.Popen(args=f"{editor} {exc_filename}", env=environ, shell=True)
+```
+
+Malicious pickle shape:
+
+- Import clean `click.edit`.
+- Call it with positional args:
+  `("seed", "/bin/sh -c 'printf owned-by-click-edit > MARKER #'", None, False)`.
+- `click.edit()` creates a temporary editor file, calls the attacker-controlled
+  editor command with `shell=True`, and returns the edited seed text.
+
+Proof on CPython 3.12.12 with `click==8.3.2` installed:
+
+- Direct probe: `click.edit` scans clean.
+- Call graph probe:
+  `_call_graph_entrypoints("click.edit") == ("click.termui.edit",)`.
+- `_find_sink_path("click.edit") is None`.
+- `_calls_for_function("click.edit")` records
+  `("click._termui_impl.Editor", "ed.edit", "isinstance", "ed.edit_files")`;
+  the local `ed` instance is not resolved to `click._termui_impl.Editor`.
+- Lower-level probe:
+  `_find_sink_path("click._termui_impl.Editor.edit")` reaches
+  `subprocess.Popen`.
+- Control payload scanner result: `len=127`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control runtime: `pickle.loads(control)` returns the editor string and does
+  not create the marker.
+- Active payload scanner result: `len=152`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references: clean `click.edit` with `is_dangerous=False`.
+- Active runtime before unpickle: marker absent.
+- Active runtime after unpickle: marker exists and contains
+  `owned-by-click-edit`; `pickle.loads(active)` returns `"seed\n"`.
+
+Why the scanner missed it:
+
+- The Turn 174 defensive block intentionally kept assignment alias collection at
+  module scope for performance. It does not model function-scope assignments
+  such as `ed = Editor(...)`.
+- `_calls_in_function()` can see `ed.edit` and `ed.edit_files`, but it cannot map
+  `ed` back to the local class instance `click._termui_impl.Editor`.
+- The actual sink is not imported by the pickle. The only imported global is
+  `click.edit`; the payload contains no blocked primitive names such as
+  `subprocess`, `os`, `popen`, `_posixsubprocess`, `exec`, `eval`, `getattr`,
+  frame/object graph helpers, file writers, or magic-method strings.
+- The lower-level method is already detected, which confirms this is a wrapper
+  source-shape miss rather than a missing primitive.
+
+Performance note: the next defensive turn should not re-enable broad
+function-scope assignment alias collection across all functions; that made large
+modules expensive in Turn 174. A tighter source fix is to model function-local
+class instance aliases only when the RHS is a known local/imported class call and
+only carry method calls on that alias, with a small per-function cap. For this
+payload, `ed = Editor(...)` would allow `ed.edit(text)` to resolve to
+`click._termui_impl.Editor.edit` and then to the already-detected
+`subprocess.Popen` sink.
+
+## Turn 176 - Block function-local class instance alias call graphs
+
+Implemented a source-focused block for the Turn 175 `click.edit` bypass.
+
+The call graph now performs a bounded per-function alias pass for class
+instances:
+
+- First collect receiver names that are actually used in method calls inside the
+  function, such as `ed` in `ed.edit(...)`.
+- Inspect only assignments to those receiver names.
+- Record an alias only when the RHS is a statically resolved class constructor,
+  either a local class or an imported class with known class entrypoints.
+- Keep only aliases whose constructor call or method call is fed by
+  entrypoint-controlled parameters.
+- Use a single candidate pass, not a fixed-point local assignment graph.
+- Cap this per function with `_MAX_FUNCTION_INSTANCE_ALIASES = 32`.
+
+This deliberately avoids broad function-scope assignment collection. The scanner
+does not try to remember arbitrary local values, sink aliases, file handles, or
+non-called temporaries; it only carries parameter-fed constructor aliases that
+can resolve a method call to an existing class method in the Python call graph.
+
+Regression coverage added in
+`packages/modelaudit-picklescan/tests/test_call_graph_click.py`:
+
+- `_calls_for_function("click.edit")` now includes
+  `click._termui_impl.Editor.edit`.
+- `_find_sink_path("click.edit")` now reaches
+  `click._termui_impl.Editor.edit_files` and `subprocess.Popen`.
+- The Turn 175 pickle that imports only `click.edit` and passes an
+  attacker-controlled editor command now scans `malicious` with
+  `DANGEROUS_CALL_GRAPH`, before the test executes it to prove the marker write.
+- The control pickle containing only the editor string still scans `clean`.
+
+Focused validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_call_graph_click.py packages/modelaudit-picklescan/tests/test_call_graph_execnet.py packages/modelaudit-picklescan/tests/test_call_graph_local_imports.py packages/modelaudit-picklescan/tests/test_call_graph_tkinter.py`
+  passed: `10 passed`.
+
+Performance sanity:
+
+- `_analyze_module("tkinter")`: `0.0473s`.
+- `_find_sink_path("click.edit")`: `0.0532s`, path
+  `click.edit -> click._termui_impl.Editor.edit ->
+  click._termui_impl.Editor.edit_files -> subprocess.Popen`.
+- `_find_sink_path("execnet.makegateway")`: `0.0372s`, still reaches
+  `execmodel.subprocess.Popen`.
+- The logging startup-hook adversarial slice passed in `0.24s` after keeping the
+  local instance alias pass single-shot and parameter-gated.
+- The full adversarial oracle passed: `499 passed, 1 skipped` in `1.31s`.
+- Full validation passed:
+  `3675 passed, 1022 skipped, 21 warnings in 55.29s`.
