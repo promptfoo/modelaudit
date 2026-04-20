@@ -1039,6 +1039,7 @@ impl<'a> ScanState<'a> {
             ("builtins", "str.format_map") => {
                 Self::str_format_map_invocations(arguments, op_name, position)
             }
+            ("operator", "mod") => Self::operator_mod_invocations(arguments, op_name, position),
             ("string", "Formatter.vformat") => {
                 Self::formatter_vformat_invocations(arguments, op_name, position)
             }
@@ -1093,7 +1094,26 @@ impl<'a> ScanState<'a> {
         if arguments.len() != 2 || !Self::is_format_string_argument(arguments.first()) {
             return Vec::new();
         }
-        let Some(StackValue::DefaultDict { default_factory }) = arguments.get(1) else {
+        Self::defaultdict_mapping_lookup_invocations(arguments.get(1), op_name, position)
+    }
+
+    fn operator_mod_invocations(
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if arguments.len() != 2 || !Self::is_format_string_argument(arguments.first()) {
+            return Vec::new();
+        }
+        Self::defaultdict_mapping_lookup_invocations(arguments.get(1), op_name, position)
+    }
+
+    fn defaultdict_mapping_lookup_invocations(
+        mapping: Option<&StackValue>,
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        let Some(StackValue::DefaultDict { default_factory }) = mapping else {
             return Vec::new();
         };
         vec![Self::zero_arg_invocation(
@@ -1130,14 +1150,7 @@ impl<'a> ScanState<'a> {
         {
             return Vec::new();
         }
-        let Some(StackValue::DefaultDict { default_factory }) = arguments.get(3) else {
-            return Vec::new();
-        };
-        vec![Self::zero_arg_invocation(
-            default_factory,
-            op_name,
-            position,
-        )]
+        Self::defaultdict_mapping_lookup_invocations(arguments.get(3), op_name, position)
     }
 
     fn is_format_string_argument(value: Option<&StackValue>) -> bool {
@@ -1406,7 +1419,8 @@ impl<'a> ScanState<'a> {
                     malformed: true,
                 };
                 self.add_finding(Finding {
-                    message: "Malformed STACK_GLOBAL operands prevent reliable callable resolution".to_string(),
+                    message: "Malformed STACK_GLOBAL operands prevent reliable callable resolution"
+                        .to_string(),
                     severity: "critical",
                     location: Some(format!("{} (pos {})", self.source, position)),
                     rule_code: Some("MALFORMED_STACK_GLOBAL"),

@@ -135,6 +135,27 @@ def _builtins_help_defaultdict_format_map_payload(*, lookup: bool) -> bytes:
     return b"".join(parts)
 
 
+def _builtins_help_defaultdict_operator_mod_payload(*, lookup: bool) -> bytes:
+    parts = [
+        b"\x80\x04",
+        _global_operand("collections", "defaultdict"),
+        _global_operand("builtins", "help"),
+        b"\x85R",
+    ]
+    if lookup:
+        parts.extend(
+            [
+                b"\x94",
+                b"0",
+                _global_operand("operator", "mod"),
+                _args_tuple(_unicode_operand("%(x)s"), b"h\x00"),
+                b"R",
+            ]
+        )
+    parts.append(b".")
+    return b"".join(parts)
+
+
 def _builtins_help_defaultdict_formatter_vformat_payload(*, lookup: bool) -> bytes:
     parts = [
         b"\x80\x04",
@@ -877,6 +898,77 @@ def test_scan_bytes_blocks_format_map_defaultdict_factory_rce(tmp_path: Path) ->
 
     payload = _builtins_help_defaultdict_format_map_payload(lookup=True)
     report = scan_bytes(payload, source="format-map-defaultdict-factory-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != "factory-value":
+    raise SystemExit(f"expected factory value result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+def test_scan_bytes_blocks_operator_mod_defaultdict_factory_rce(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "operator_mod_defaultdict_factory_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+
+    factory_only_payload = _builtins_help_defaultdict_operator_mod_payload(lookup=False)
+    report = scan_bytes(factory_only_payload, source="operator-mod-defaultdict-factory-only.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+
+    payload = _builtins_help_defaultdict_operator_mod_payload(lookup=True)
+    report = scan_bytes(payload, source="operator-mod-defaultdict-factory-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_call_graph_finding(

