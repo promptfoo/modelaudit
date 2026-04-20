@@ -1205,6 +1205,13 @@ impl<'a> ScanState<'a> {
         ) {
             return vec![Self::zero_arg_invocation(callable, op_name, position)];
         }
+        if let Some(callable) = Self::itertools_eager_call_iterator_consumed_callable(
+            &callable_reference.module,
+            &callable_reference.name,
+            arguments,
+        ) {
+            return vec![Self::zero_arg_invocation(callable, op_name, position)];
+        }
         if let Some(callable) = Self::builtin_iterable_consumed_callable(
             &callable_reference.module,
             &callable_reference.name,
@@ -1260,6 +1267,28 @@ impl<'a> ScanState<'a> {
 
     fn is_deque_call_iterator_consumer(module: &str, name: &str) -> bool {
         matches!((module, name), ("collections", "deque"))
+    }
+
+    fn itertools_eager_call_iterator_consumed_callable<'b>(
+        module: &str,
+        name: &str,
+        arguments: &'b [StackValue],
+    ) -> Option<&'b GlobalRef> {
+        if module != "itertools" {
+            return None;
+        }
+        match name {
+            "product" if !arguments.is_empty() => {
+                arguments.iter().find_map(Self::call_iterator_callable_ref)
+            }
+            "permutations" if (1..=2).contains(&arguments.len()) => {
+                arguments.first().and_then(Self::call_iterator_callable_ref)
+            }
+            "combinations" | "combinations_with_replacement" if arguments.len() == 2 => {
+                arguments.first().and_then(Self::call_iterator_callable_ref)
+            }
+            _ => None,
+        }
     }
 
     fn builtin_iterable_consumed_callable<'b>(
@@ -1446,8 +1475,16 @@ impl<'a> ScanState<'a> {
             self.stack.push(call_iterator);
             return;
         }
+        if let Some(call_iterator_tuple) = Self::call_iterator_tuple_wrapper_result(values) {
+            self.stack.push(call_iterator_tuple);
+            return;
+        }
         if let Some(defaultdict) = Self::defaultdict_result(values) {
             self.stack.push(defaultdict);
+            return;
+        }
+        if let Some(tuple_item) = Self::tuple_getitem_result(values) {
+            self.stack.push(tuple_item);
             return;
         }
         self.push_constructed_result(values.first());
@@ -1525,9 +1562,24 @@ impl<'a> ScanState<'a> {
         arguments: &[StackValue],
     ) -> Option<GlobalRef> {
         match name {
+            "batched" if (2..=3).contains(&arguments.len()) => {
+                arguments.first().and_then(Self::call_iterator_callable)
+            }
             "chain" => arguments.iter().find_map(Self::call_iterator_callable),
+            "compress" if arguments.len() == 2 => {
+                arguments.iter().find_map(Self::call_iterator_callable)
+            }
+            "cycle" if arguments.len() == 1 => {
+                arguments.first().and_then(Self::call_iterator_callable)
+            }
             "islice" if (2..=4).contains(&arguments.len()) => {
                 arguments.first().and_then(Self::call_iterator_callable)
+            }
+            "pairwise" if arguments.len() == 1 => {
+                arguments.first().and_then(Self::call_iterator_callable)
+            }
+            "zip_longest" if !arguments.is_empty() => {
+                arguments.iter().find_map(Self::call_iterator_callable)
             }
             "chain.from_iterable" if arguments.len() == 1 => arguments
                 .first()
@@ -1539,6 +1591,15 @@ impl<'a> ScanState<'a> {
     fn call_iterator_callable(value: &StackValue) -> Option<GlobalRef> {
         match value {
             StackValue::CallIterator { callable } => Some(callable.clone()),
+            StackValue::CallIteratorTuple { callable, .. } => Some(callable.clone()),
+            _ => None,
+        }
+    }
+
+    fn call_iterator_callable_ref(value: &StackValue) -> Option<&GlobalRef> {
+        match value {
+            StackValue::CallIterator { callable }
+            | StackValue::CallIteratorTuple { callable, .. } => Some(callable),
             _ => None,
         }
     }
@@ -1548,6 +1609,100 @@ impl<'a> ScanState<'a> {
             StackValue::Tuple(items) => items.iter().find_map(Self::call_iterator_callable),
             _ => None,
         })
+    }
+
+    fn call_iterator_tuple_wrapper_result(values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed
+            || callable_reference.module != "itertools"
+            || callable_reference.name != "tee"
+        {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        if !(1..=2).contains(&arguments.len()) {
+            return None;
+        }
+        let callable = arguments.first().and_then(Self::call_iterator_callable)?;
+        Some(StackValue::CallIteratorTuple {
+            callable,
+            item_count: Self::tee_item_count(arguments),
+        })
+    }
+
+    fn tee_item_count(arguments: &[StackValue]) -> Option<usize> {
+        let Some(count_value) = arguments.get(1) else {
+            return Some(2);
+        };
+        Self::stack_value_nonnegative_index(count_value)
+    }
+
+    fn tuple_getitem_result(values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed
+            || callable_reference.module != "operator"
+            || callable_reference.name != "getitem"
+        {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        let [container, index_value] = arguments.as_slice() else {
+            return None;
+        };
+        match container {
+            StackValue::Tuple(items) => {
+                let index = Self::stack_value_tuple_index(index_value, items.len())?;
+                items.get(index).cloned()
+            }
+            StackValue::CallIteratorTuple {
+                callable,
+                item_count,
+            } => {
+                let index = Self::stack_value_nonnegative_index(index_value)?;
+                if item_count.is_none_or(|count| index < count) {
+                    Some(StackValue::CallIterator {
+                        callable: callable.clone(),
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn stack_value_tuple_index(value: &StackValue, len: usize) -> Option<usize> {
+        let index = Self::stack_value_integer(value)?;
+        let len = isize::try_from(len).ok()?;
+        let adjusted = if index < 0 { len + index } else { index };
+        if (0..len).contains(&adjusted) {
+            usize::try_from(adjusted).ok()
+        } else {
+            None
+        }
+    }
+
+    fn stack_value_nonnegative_index(value: &StackValue) -> Option<usize> {
+        let index = Self::stack_value_integer(value)?;
+        usize::try_from(index).ok()
+    }
+
+    fn stack_value_integer(value: &StackValue) -> Option<isize> {
+        match value {
+            StackValue::Primitive {
+                type_name: "int",
+                repr,
+            } => repr.parse().ok(),
+            _ => None,
+        }
     }
 
     fn defaultdict_result(values: &[StackValue]) -> Option<StackValue> {

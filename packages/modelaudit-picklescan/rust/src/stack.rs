@@ -37,6 +37,10 @@ pub(crate) enum StackValue {
     CallIterator {
         callable: GlobalRef,
     },
+    CallIteratorTuple {
+        callable: GlobalRef,
+        item_count: Option<usize>,
+    },
     DefaultDict {
         default_factory: GlobalRef,
     },
@@ -65,6 +69,14 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
         Some(StackValue::CallIterator { callable }) => {
             format!("call_iterator:{}", callable.symbol())
         }
+        Some(StackValue::CallIteratorTuple {
+            callable,
+            item_count,
+        }) => format!(
+            "call_iterator_tuple(callable={}, len={})",
+            callable.symbol(),
+            item_count.map_or_else(|| "unknown".to_string(), |count| count.to_string())
+        ),
         Some(StackValue::DefaultDict { default_factory }) => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
@@ -125,6 +137,14 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
         StackValue::CallIterator { callable } => {
             format!("call_iterator:{}", callable.symbol())
         }
+        StackValue::CallIteratorTuple {
+            callable,
+            item_count,
+        } => format!(
+            "call_iterator_tuple(callable={}, len={})",
+            callable.symbol(),
+            item_count.map_or_else(|| "unknown".to_string(), |count| count.to_string())
+        ),
         StackValue::DefaultDict { default_factory } => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
