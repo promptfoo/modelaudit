@@ -7670,3 +7670,87 @@ Performance note: class expansion is local to the already-discovered pickle
 import references. It does not enumerate packages or import candidate modules;
 it adds a small fixed method-name set per imported class and reuses the same
 bounded graph walk.
+
+## Turn 137 - Bypass via public `io.FileIO` C-level file writer alias
+
+Found a scanner-clean startup-hook RCE below the Python AST call-graph layer.
+The scanner blocks `_io.FileIO`, `_io.open`, `builtins.open`, `os.open`, and
+`os.write`, but the public `io.FileIO` alias and its C-level methods are
+currently treated as clean import references.
+
+The payload opens a `.pth` file and writes a fragmented byte string:
+
+```python
+f = io.FileIO("/tmp/.../io_fileio_exec.pth", "w")
+data = b"".join(
+    [
+        b"im",
+        b"port pathlib;...",
+        b"...",
+    ]
+)
+io.FileIO.write(f, data)
+io.FileIO.close(f)
+```
+
+The written startup-hook line is:
+
+```python
+import pathlib;pathlib.Path('/tmp/.../marker').write_text('owned-by-io-fileio')
+```
+
+Proof on CPython 3.12.12:
+
+- Control payload scanner result: `len=175`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`, `errors=[]`.
+- Control import references: `builtins.bytes.join` with `is_dangerous=False`.
+- Active payload scanner result: `len=322`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`, `errors=[]`.
+- Active import references: `io.FileIO`, `builtins.bytes.join`,
+  `io.FileIO.write`, and `io.FileIO.close`, all with `is_dangerous=False`.
+- Runtime before unpickle: no `.pth` file and no marker.
+- Control runtime: `pickle.loads(control)` returns the assembled bytes, creates
+  no `.pth` file, and `site.addsitedir()` creates no marker.
+- Active runtime: `pickle.loads(payload)` returns `None`, creates
+  `io_fileio_exec.pth` containing the assembled line plus newline, and does not
+  create the marker yet.
+- After normal `site.addsitedir(target_dir)`: marker exists and contains
+  `owned-by-io-fileio`.
+
+Why the scanner missed it:
+
+- `io.FileIO` is a public alias for the blocked `_io.FileIO` C type, but the
+  exact dangerous-global table covers `_io.FileIO` and not `io.FileIO`.
+- `io.FileIO.write` and `io.FileIO.close` are C-level method descriptors, so
+  the Python AST call-graph pass has no source file to inspect and cannot infer
+  open/write roles.
+- The existing call-graph file-open/file-write pairing only sees Python source
+  wrappers; it does not normalize public aliases to their lower-level C
+  primitives.
+- The `.pth` content is assembled with `builtins.bytes.join` only during
+  unpickle, so the scanner sees harmless byte fragments rather than a
+  contiguous startup-hook line.
+
+Performance note: the next block can stay close to the source by normalizing
+public `io` aliases to the already-blocked `_io` file primitives, rather than
+adding package-specific writer entries. This should be an exact alias-table
+extension, not a broad module wildcard or expensive C introspection pass.
+
+## Turn 138 - Block public `io` aliases for C file writer primitives
+
+Blocking plan:
+
+- Add exact dangerous-global entries for the public `io.FileIO`,
+  `io.FileIO.write`, and `io.TextIOWrapper.write` aliases beside the existing
+  `_io.FileIO`, `_io.FileIO.write`, and `_io.TextIOWrapper.write` primitives.
+- Keep `io` itself out of the wildcard module list. This remains an alias-table
+  normalization for a finite set of file-write source primitives.
+- Add a CPython oracle regression for the Turn 137 payload. The control payload
+  only assembles the `.pth` bytes and remains clean; the active payload imports
+  `io.FileIO`, `io.FileIO.write`, and `io.FileIO.close`, writes the fragmented
+  startup hook, and `site.addsitedir()` executes it.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: this is a constant-size exact lookup addition in the Rust
+policy table. It adds no Python source parsing, no C introspection, and no
+package enumeration.

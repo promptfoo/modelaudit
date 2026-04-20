@@ -234,6 +234,9 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("functools", "reduce"),
     ("functools", "singledispatch"),
     ("inspect", "getmembers"),
+    ("io", "FileIO"),
+    ("io", "FileIO.write"),
+    ("io", "TextIOWrapper.write"),
     ("io", "open"),
     ("itertools", "accumulate"),
     ("itertools", "dropwhile"),
@@ -511,7 +514,9 @@ mod tests {
         ] {
             assert_eq!(global_severity("mailbox", name), Some("critical"));
         }
-        assert_eq!(global_severity("io", "open"), Some("critical"));
+        for name in ["FileIO", "FileIO.write", "TextIOWrapper.write", "open"] {
+            assert_eq!(global_severity("io", name), Some("critical"));
+        }
         assert_eq!(global_severity("numpy", "savetxt"), Some("critical"));
         assert_eq!(
             global_severity("numpy.lib._npyio_impl", "savetxt"),

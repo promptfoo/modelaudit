@@ -152,6 +152,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and file-write wrappers that can create executable startup hooks
 - **security:** resolve pickle-imported Python class globals through bounded
   constructor and object-method call graph entrypoints
+- **security:** detect public `io.FileIO` and `io.TextIOWrapper.write` aliases
+  for blocked `_io` file-writing primitives
 - **security:** detect pickle calls to PyYAML unsafe loaders that can execute
   attacker-controlled Python constructors
 - **security:** detect pickle calls to `codecs.open` and codec stream writes

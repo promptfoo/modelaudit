@@ -1107,6 +1107,33 @@ def _click_lazy_file_echo_pth_payload(pth_path: Path, marker: Path, *, include_w
     return b"".join(parts)
 
 
+def _io_fileio_pth_payload(pth_path: Path, _marker: Path, *, include_write: bool) -> tuple[bytes, bytes]:
+    expected_text = (
+        "import os,pathlib;pathlib.Path(os.environ['MODELAUDIT_PICKLESCAN_MARKER']).write_text('owned-by-io-fileio')\n"
+    )
+    expected_line = expected_text.encode()
+    fragments = ["im"]
+    fragments.extend(expected_text[offset : offset + 24] for offset in range(2, len(expected_text), 24))
+    parts = [b"\x80\x04"]
+    if include_write:
+        parts += [_global_operand("io", "FileIO")]
+        parts += [_tuple_payload_operands([_text_operand(str(pth_path)), _text_operand("w")]), b"R\x94"]
+    parts += [_global_operand("builtins", "str.join")]
+    parts += [_text_operand(""), _tuple_payload_operands([_text_operand(fragment) for fragment in fragments])]
+    parts += [b"\x86R\x940"]
+    joined_ref = b"h\x01" if include_write else b"h\x00"
+    parts += [_global_operand("builtins", "str.encode")]
+    parts += [joined_ref + b"\x85R"]
+    if include_write:
+        parts += [b"\x940"]
+        parts += [_global_operand("io", "FileIO.write")]
+        parts += [b"h\x00h\x02\x86R00"]
+        parts += [_global_operand("io", "FileIO.close")]
+        parts += [b"h\x00\x85R"]
+    parts += [b"."]
+    return b"".join(parts), expected_line
+
+
 def _dotenv_run_command_payload(command: list[str], *, include_call: bool) -> bytes:
     command_list = _list_payload_operands([_text_operand(part) for part in command])
     parts = [b"\x80\x04"]
@@ -3026,6 +3053,48 @@ def test_scan_bytes_blocks_click_lazy_file_echo_fragmented_pth_rce(tmp_path: Pat
 
         site.addsitedir(str(tmp_path))
         assert marker.read_text() == "owned-by-click-lazyfile"
+    finally:
+        sys.path[:] = original_sys_path
+
+
+def test_scan_bytes_blocks_io_fileio_fragmented_pth_rce(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pth_path = tmp_path / "io_fileio_exec.pth"
+    marker = tmp_path / "io_fileio_marker"
+    control_payload, expected_line = _io_fileio_pth_payload(pth_path, marker, include_write=False)
+    payload, _ = _io_fileio_pth_payload(pth_path, marker, include_write=True)
+    original_sys_path = list(sys.path)
+    monkeypatch.setenv("MODELAUDIT_PICKLESCAN_MARKER", str(marker))
+
+    try:
+        control_report = scan_bytes(control_payload, source="io-fileio-control.pkl")
+        assert control_report.verdict == SafetyVerdict.CLEAN
+
+        assert not pth_path.exists()
+        assert not marker.exists()
+        control_result = pickle.loads(control_payload)
+        assert control_result == expected_line
+        assert not pth_path.exists()
+        assert not marker.exists()
+
+        site.addsitedir(str(tmp_path))
+        assert not marker.exists()
+        sys.path[:] = original_sys_path
+
+        report = scan_bytes(payload, source="io-fileio-pth-rce.pkl")
+
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_global_finding(report, "io", "FileIO")
+        assert _has_critical_global_finding(report, "io", "FileIO.write")
+
+        assert not pth_path.exists()
+        assert not marker.exists()
+        result = pickle.loads(payload)
+        assert result is None
+        assert pth_path.read_bytes() == expected_line
+        assert not marker.exists()
+
+        site.addsitedir(str(tmp_path))
+        assert marker.read_text() == "owned-by-io-fileio"
     finally:
         sys.path[:] = original_sys_path
 
