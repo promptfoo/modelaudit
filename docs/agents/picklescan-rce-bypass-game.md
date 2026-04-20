@@ -7494,3 +7494,91 @@ by the Rust scanner, caps source reads at 1 MB, caps graph depth and visited
 functions, and caches module analyses. It avoids broad package wildcard blocks
 while moving this class of fixes closer to the finite dangerous source
 primitives.
+
+## Turn 133 - Bypass via Click file wrappers writing startup hooks
+
+Found a scanner-clean startup-hook RCE primitive after the Python call-graph
+block. The current call-graph source set covers process/eval/import/deserializer
+RCE primitives, but not file-open/file-write sources that become RCE when the
+target is a `.pth` startup hook.
+
+The pickle uses `builtins.str.join` to assemble this line only at runtime:
+
+```python
+import pathlib;pathlib.Path('/tmp/.../marker').write_text('owned-by-click')
+```
+
+It then calls:
+
+```python
+f = click.open_file("/tmp/.../click.pth", "w")
+click.echo(assembled_line, f)
+```
+
+`click.open_file()` opens the attacker-selected path and `click.echo()` writes
+the line plus a newline and flushes it. Normal `site.addsitedir(target_dir)`
+then executes the `.pth` line.
+
+Proof on CPython 3.12.12 with Click installed:
+
+- `click.open_file` + `click.echo` scanner result: `len=289`,
+  `status=complete`, `verdict=clean`, `is_clean=True`, `findings=[]`,
+  `notices=[]`, `errors=[]`.
+- `click.open_file` + `click.echo` coverage: `bytes_scanned=289`,
+  `bytes_total=289`, `opcode_count=30`, `raw_scan_complete=True`,
+  `opcode_scan_complete=True`.
+- `click.open_file` + `click.echo` import references: `click.open_file`,
+  `builtins.str.join`, and `click.echo`, all with `is_dangerous=False`.
+- `click.open_file` + `click.echo` string heuristic matches: none.
+- Runtime for `click.open_file` + `click.echo`: `pickle.loads(payload)` returns
+  `None`, writes the `.pth` file, and does not create the marker yet.
+- After normal `site.addsitedir(target_dir)`: marker exists and contains
+  `owned-by-click`.
+
+Sibling alias proof:
+
+| Writer globals | Scanner verdict | Runtime result |
+| --- | --- | --- |
+| `click.open_file` + `click.echo` | clean, 0 findings, 0 notices | `.pth` line executes and writes `owned-by-click` |
+| `click.utils.open_file` + `click.utils.echo` | clean, 0 findings, 0 notices | `.pth` line executes and writes `owned-by-click` |
+
+Why the scanner missed it:
+
+- `click` is not a wildcard-dangerous module.
+- None of `click.open_file`, `click.echo`, `click.utils.open_file`, or
+  `click.utils.echo` are exact dangerous globals.
+- The new Python call-graph pass reports no finding for these import references
+  because `open` and file `write` are not currently modeled as RCE source
+  primitives.
+- The executable `.pth` line is split into harmless-looking string fragments
+  and assembled by `builtins.str.join` only during unpickle.
+- The payload has complete opcode coverage, no scan errors, no findings, no
+  notices, and no suspicious-string matches.
+
+Performance note: the next block should extend the source-focused call-graph
+approach to startup-hook write chains instead of memorizing Click. The finite
+source side is file-open/file-write wrappers whose pickle-controlled path can
+target Python startup hook locations, but the fix must stay bounded and avoid
+flagging every benign file read/write wrapper.
+
+## Turn 134 - Block call-graph file open/write startup-hook chains
+
+Blocking plan:
+
+- Extend the bounded Python call-graph pass with source roles for file open and
+  file write primitives. A finding now requires both roles to appear among the
+  pickle import references, so `click.open_file` reaches `builtins.open` and
+  `click.echo` reaches file-like `.write` before the scanner reports the chain.
+- Keep the rule source-oriented: the block is not a Click exact-global entry
+  and also covers the sibling `click.utils.open_file` plus `click.utils.echo`
+  alias path.
+- Add CPython oracle regressions for both Click import paths. The control
+  payload only assembles the executable `.pth` line and remains clean; the
+  active payload opens the target `.pth`, writes the runtime-assembled startup
+  hook, and `site.addsitedir()` executes it.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: the new role pass reuses the existing AST module cache,
+source-size cap, graph-depth cap, visited-function cap, and import-reference
+cap. It adds two cheap sink matchers and only pairs open/write roles from the
+already-discovered pickle imports, avoiding any broad package enumeration.

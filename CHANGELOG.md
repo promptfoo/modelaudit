@@ -148,6 +148,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write attacker-controlled startup hooks
 - **security:** detect pickle globals whose Python call graph reaches known
   RCE-capable source primitives such as `os.execvpe`
+- **security:** detect pickle globals whose Python call graph pairs file-open
+  and file-write wrappers that can create executable startup hooks
 - **security:** detect pickle calls to PyYAML unsafe loaders that can execute
   attacker-controlled Python constructors
 - **security:** detect pickle calls to `codecs.open` and codec stream writes

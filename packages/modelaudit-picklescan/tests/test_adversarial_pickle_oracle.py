@@ -392,6 +392,26 @@ def _has_critical_call_graph_finding(report: PickleReport, module: str, name: st
     )
 
 
+def _has_critical_call_graph_file_write_finding(
+    report: PickleReport,
+    opener_module: str,
+    opener_name: str,
+    writer_module: str,
+    writer_name: str,
+) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.rule_code == "DANGEROUS_CALL_GRAPH_FILE_WRITE"
+        and finding.details.get("opener_module") == opener_module
+        and finding.details.get("opener_name") == opener_name
+        and finding.details.get("module") == writer_module
+        and finding.details.get("name") == writer_name
+        and finding.details.get("open_sink") == "builtins.open"
+        and str(finding.details.get("write_sink", "")).endswith(".write")
+        for finding in report.findings
+    )
+
+
 def _has_critical_builtins_staticmethod_finding(report: PickleReport) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -1035,6 +1055,29 @@ def _dotenv_set_key_pth_payload(pth_path: Path, marker: Path, *, writer_module: 
     if include_write:
         parts += [_global_operand(writer_module, "set_key")]
         parts += [_tuple_payload_operands([_text_operand(str(pth_path)), b"h\x00", _text_operand("x")]), b"R"]
+    else:
+        parts += [b"h\x00"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _click_open_file_echo_pth_payload(pth_path: Path, marker: Path, *, click_module: str, include_write: bool) -> bytes:
+    fragments = [
+        "im",
+        "port pathlib;pathlib.Path(",
+        repr(str(marker)),
+        ").write_text('owned-by-click')",
+    ]
+    parts = [b"\x80\x04"]
+    if include_write:
+        parts += [_global_operand(click_module, "open_file")]
+        parts += [_tuple_payload_operands([_text_operand(str(pth_path)), _text_operand("w")]), b"R\x94"]
+    parts += [_global_operand("builtins", "str.join")]
+    parts += [_text_operand(""), _tuple_payload_operands([_text_operand(fragment) for fragment in fragments])]
+    parts += [b"\x86R\x94"]
+    if include_write:
+        parts += [_global_operand(click_module, "echo")]
+        parts += [b"h\x01h\x00\x86R"]
     else:
         parts += [b"h\x00"]
     parts += [b"."]
@@ -2843,6 +2886,75 @@ def test_scan_bytes_blocks_dotenv_set_key_fragmented_pth_rce(tmp_path: Path, wri
 
         site.addsitedir(str(tmp_path))
         assert marker.read_text() == "owned-by-dotenv"
+    finally:
+        sys.path[:] = original_sys_path
+
+
+@pytest.mark.skipif(not _module_available("click"), reason="Click is unavailable")
+@pytest.mark.parametrize(
+    "click_module",
+    [
+        "click",
+        pytest.param(
+            "click.utils",
+            marks=pytest.mark.skipif(not _module_available("click.utils"), reason="click.utils is unavailable"),
+        ),
+    ],
+)
+def test_scan_bytes_blocks_click_open_file_echo_fragmented_pth_rce(tmp_path: Path, click_module: str) -> None:
+    case_name = click_module.replace(".", "_")
+    pth_path = tmp_path / f"{case_name}_echo_exec.pth"
+    marker = tmp_path / f"{case_name}_echo_marker"
+    control_payload = _click_open_file_echo_pth_payload(
+        pth_path,
+        marker,
+        click_module=click_module,
+        include_write=False,
+    )
+    payload = _click_open_file_echo_pth_payload(
+        pth_path,
+        marker,
+        click_module=click_module,
+        include_write=True,
+    )
+    original_sys_path = list(sys.path)
+    expected_line = f"import pathlib;pathlib.Path({str(marker)!r}).write_text('owned-by-click')"
+
+    try:
+        control_report = scan_bytes(control_payload, source=f"click-echo-{case_name}-control.pkl")
+        assert control_report.verdict == SafetyVerdict.CLEAN
+
+        assert not pth_path.exists()
+        assert not marker.exists()
+        control_result = pickle.loads(control_payload)
+        assert control_result == expected_line
+        assert not pth_path.exists()
+        assert not marker.exists()
+
+        site.addsitedir(str(tmp_path))
+        assert not marker.exists()
+        sys.path[:] = original_sys_path
+
+        report = scan_bytes(payload, source=f"click-echo-{case_name}-pth-rce.pkl")
+
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert _has_critical_call_graph_file_write_finding(
+            report,
+            click_module,
+            "open_file",
+            click_module,
+            "echo",
+        )
+
+        assert not pth_path.exists()
+        assert not marker.exists()
+        result = pickle.loads(payload)
+        assert result is None
+        assert pth_path.read_text() == f"{expected_line}\n"
+        assert not marker.exists()
+
+        site.addsitedir(str(tmp_path))
+        assert marker.read_text() == "owned-by-click"
     finally:
         sys.path[:] = original_sys_path
 

@@ -6,7 +6,7 @@ import ast
 import os
 import sys
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -44,6 +44,14 @@ _RCE_SINK_EXACT = frozenset(
     }
 )
 _RCE_SINK_PREFIXES = ("os.exec", "os.posix_spawn", "os.spawn", "os.system", "os.popen")
+_FILE_OPEN_SINK_EXACT = frozenset(
+    {
+        "builtins.open",
+        "codecs.open",
+        "io.open",
+    }
+)
+_FILE_WRITE_METHODS = frozenset({"write", "writelines"})
 _BUILTIN_CALLS = frozenset({"__import__", "compile", "eval", "exec", "open"})
 
 
@@ -57,11 +65,33 @@ class CallGraphFinding:
 
 
 @dataclass(frozen=True)
+class StartupHookWriteFinding:
+    opener_module: str
+    opener_name: str
+    writer_module: str
+    writer_name: str
+    opener_import_reference: str
+    writer_import_reference: str
+    open_sink: str
+    write_sink: str
+    opener_call_path: tuple[str, ...]
+    writer_call_path: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class _ModuleAnalysis:
     module: str
     source_path: str
     aliases: dict[str, str]
     calls_by_function: dict[str, tuple[str, ...]]
+
+
+@dataclass(frozen=True)
+class _ImportCallPath:
+    module: str
+    name: str
+    import_reference: str
+    call_path: tuple[str, ...]
 
 
 def find_dangerous_call_graphs(import_references: object) -> tuple[CallGraphFinding, ...]:
@@ -96,6 +126,71 @@ def find_dangerous_call_graphs(import_references: object) -> tuple[CallGraphFind
     return tuple(findings)
 
 
+def find_startup_hook_write_call_graphs(import_references: object) -> tuple[StartupHookWriteFinding, ...]:
+    openers: list[_ImportCallPath] = []
+    writers: list[_ImportCallPath] = []
+    seen: set[tuple[str, str]] = set()
+    for reference in _iter_import_references(import_references):
+        module = str(reference.get("module", ""))
+        name = str(reference.get("name", ""))
+        if not module or not name or (module, name) in seen:
+            continue
+        seen.add((module, name))
+
+        resolved = _resolve_function_target(f"{module}.{name}")
+        if resolved is None:
+            continue
+        open_path = _find_file_open_path(resolved)
+        if open_path is not None:
+            openers.append(
+                _ImportCallPath(
+                    module=module,
+                    name=name,
+                    import_reference=f"{module}.{name}",
+                    call_path=open_path,
+                )
+            )
+        write_path = _find_file_write_path(resolved)
+        if write_path is not None:
+            writers.append(
+                _ImportCallPath(
+                    module=module,
+                    name=name,
+                    import_reference=f"{module}.{name}",
+                    call_path=write_path,
+                )
+            )
+
+    if not openers or not writers:
+        return ()
+
+    findings: list[StartupHookWriteFinding] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for opener in openers:
+        for writer in writers:
+            pair = (opener.import_reference, writer.import_reference)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            findings.append(
+                StartupHookWriteFinding(
+                    opener_module=opener.module,
+                    opener_name=opener.name,
+                    writer_module=writer.module,
+                    writer_name=writer.name,
+                    opener_import_reference=opener.import_reference,
+                    writer_import_reference=writer.import_reference,
+                    open_sink=opener.call_path[-1],
+                    write_sink=writer.call_path[-1],
+                    opener_call_path=opener.call_path,
+                    writer_call_path=writer.call_path,
+                )
+            )
+            if len(findings) >= _MAX_IMPORT_REFERENCES:
+                return tuple(findings)
+    return tuple(findings)
+
+
 def _iter_import_references(import_references: object) -> tuple[dict[str, object], ...]:
     if not isinstance(import_references, list | tuple):
         return ()
@@ -108,6 +203,20 @@ def _iter_import_references(import_references: object) -> tuple[dict[str, object
 
 @lru_cache(maxsize=4096)
 def _find_sink_path(start: str) -> tuple[str, ...] | None:
+    return _find_matching_call_path(start, _rce_sink)
+
+
+@lru_cache(maxsize=4096)
+def _find_file_open_path(start: str) -> tuple[str, ...] | None:
+    return _find_matching_call_path(start, _file_open_sink)
+
+
+@lru_cache(maxsize=4096)
+def _find_file_write_path(start: str) -> tuple[str, ...] | None:
+    return _find_matching_call_path(start, _file_write_sink)
+
+
+def _find_matching_call_path(start: str, sink_for: Callable[[str], str | None]) -> tuple[str, ...] | None:
     queue: deque[tuple[str, tuple[str, ...]]] = deque([(start, (start,))])
     visited = {start}
 
@@ -118,7 +227,7 @@ def _find_sink_path(start: str) -> tuple[str, ...] | None:
             continue
 
         for call in calls[:_MAX_CALLS_PER_FUNCTION]:
-            sink = _rce_sink(call)
+            sink = sink_for(call)
             if sink is not None:
                 return (*path, sink)
             if len(path) > _MAX_CALL_GRAPH_DEPTH:
@@ -250,13 +359,82 @@ def _calls_in_function(
     local_defs: set[str],
 ) -> tuple[str, ...]:
     calls: list[str] = []
+    parameter_controlled_names: set[str] | None = None
     for node in ast.walk(function_node):
         if not isinstance(node, ast.Call):
             continue
         resolved = _resolve_expr(node.func, module_name, aliases, local_defs)
         if resolved is not None:
+            if _is_file_write_call(resolved):
+                if parameter_controlled_names is None:
+                    parameter_controlled_names = _parameter_controlled_names(function_node)
+                if not _call_uses_parameter_controlled_argument(node, parameter_controlled_names):
+                    continue
             calls.append(resolved)
     return tuple(calls)
+
+
+def _parameter_controlled_names(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    controlled = {
+        arg.arg
+        for arg in (
+            *function_node.args.posonlyargs,
+            *function_node.args.args,
+            *function_node.args.kwonlyargs,
+        )
+        if arg.arg not in {"self", "cls"}
+    }
+    if function_node.args.vararg is not None:
+        controlled.add(function_node.args.vararg.arg)
+    if function_node.args.kwarg is not None:
+        controlled.add(function_node.args.kwarg.arg)
+
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(function_node):
+            target_names: set[str]
+            if isinstance(node, ast.Assign):
+                if not _expr_uses_names(node.value, controlled):
+                    continue
+                target_names = set()
+                for target in node.targets:
+                    target_names.update(_assignment_target_names(target))
+            elif isinstance(node, ast.AnnAssign):
+                if node.value is None or not _expr_uses_names(node.value, controlled):
+                    continue
+                target_names = _assignment_target_names(node.target)
+            elif isinstance(node, ast.For | ast.AsyncFor):
+                if not _expr_uses_names(node.iter, controlled):
+                    continue
+                target_names = _assignment_target_names(node.target)
+            else:
+                continue
+            before = len(controlled)
+            controlled.update(target_names)
+            changed = changed or len(controlled) != before
+    return controlled
+
+
+def _assignment_target_names(target: ast.AST) -> set[str]:
+    if isinstance(target, ast.Name):
+        return {target.id}
+    if isinstance(target, ast.Tuple | ast.List):
+        names: set[str] = set()
+        for element in target.elts:
+            names.update(_assignment_target_names(element))
+        return names
+    return set()
+
+
+def _call_uses_parameter_controlled_argument(call_node: ast.Call, controlled_names: set[str]) -> bool:
+    return any(_expr_uses_names(argument, controlled_names) for argument in call_node.args) or any(
+        _expr_uses_names(keyword.value, controlled_names) for keyword in call_node.keywords
+    )
+
+
+def _expr_uses_names(expression: ast.AST, names: set[str]) -> bool:
+    return any(isinstance(node, ast.Name) and node.id in names for node in ast.walk(expression))
 
 
 def _resolve_expr(
@@ -323,3 +501,19 @@ def _rce_sink(call_name: str) -> str | None:
     if call_name.startswith(_RCE_SINK_PREFIXES):
         return call_name
     return None
+
+
+def _file_open_sink(call_name: str) -> str | None:
+    if call_name in _FILE_OPEN_SINK_EXACT:
+        return call_name
+    return None
+
+
+def _file_write_sink(call_name: str) -> str | None:
+    if _is_file_write_call(call_name):
+        return call_name
+    return None
+
+
+def _is_file_write_call(call_name: str) -> bool:
+    return call_name.rpartition(".")[2] in _FILE_WRITE_METHODS
