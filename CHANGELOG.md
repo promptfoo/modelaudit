@@ -160,6 +160,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   source primitives such as `os.system`
 - **security:** detect concrete `pathlib` path writer aliases and module
   namespace dictionary recovery for modules with blocked globals
+- **security:** detect module namespace and `__builtins__` access used for
+  dynamic builtin recovery
 - **security:** detect pickle calls to PyYAML unsafe loaders that can execute
   attacker-controlled Python constructors
 - **security:** detect pickle calls to `codecs.open` and codec stream writes

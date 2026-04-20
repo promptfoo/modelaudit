@@ -19,8 +19,7 @@ fn direct_global_severity(module: &str, name: &str) -> Option<&'static str> {
         };
     }
 
-    if pathlib_concrete_path_alias_is_dangerous(module, name)
-        || module_namespace_dict_is_dangerous(module, name)
+    if pathlib_concrete_path_alias_is_dangerous(module, name) || namespace_global_is_dangerous(name)
     {
         return Some("critical");
     }
@@ -94,7 +93,7 @@ fn warning_globals(module: &str) -> Option<WarningGlobalMatch> {
 }
 
 fn builtin_global_is_dangerous(name: &str) -> bool {
-    BUILTIN_DANGEROUS_NAMES.contains(&name) || name == "__dict__" || name.starts_with("__dict__.")
+    BUILTIN_DANGEROUS_NAMES.contains(&name) || namespace_global_is_dangerous(name)
 }
 
 fn pathlib_concrete_path_alias_is_dangerous(module: &str, name: &str) -> bool {
@@ -108,15 +107,11 @@ fn pathlib_concrete_path_alias_is_dangerous(module: &str, name: &str) -> bool {
         && matches!(method_name, "open" | "write_bytes" | "write_text")
 }
 
-fn module_namespace_dict_is_dangerous(module: &str, name: &str) -> bool {
-    (name == "__dict__" || name.starts_with("__dict__."))
-        && module_has_listed_dangerous_global(module)
-}
-
-fn module_has_listed_dangerous_global(module: &str) -> bool {
-    DANGEROUS_GLOBALS
-        .binary_search_by(|&(candidate_module, _)| candidate_module.cmp(module))
-        .is_ok()
+fn namespace_global_is_dangerous(name: &str) -> bool {
+    name == "__dict__"
+        || name.starts_with("__dict__.")
+        || name == "__builtins__"
+        || name.starts_with("__builtins__.")
 }
 
 const BUILTIN_MODULES: &[&str] = &["builtins", "__builtin__", "__builtins__"];
@@ -471,7 +466,13 @@ mod tests {
             Some("critical")
         );
         for module in BUILTIN_MODULES {
-            for name in ["__dict__", "__dict__.get", "__dict__.__getitem__"] {
+            for name in [
+                "__dict__",
+                "__dict__.get",
+                "__dict__.__getitem__",
+                "__builtins__",
+                "__builtins__.get",
+            ] {
                 assert_eq!(global_severity(module, name), Some("critical"));
             }
         }
@@ -601,10 +602,18 @@ mod tests {
                 );
             }
         }
-        for name in ["__dict__", "__dict__.get", "__dict__.__getitem__"] {
+        for name in [
+            "__dict__",
+            "__dict__.get",
+            "__dict__.__getitem__",
+            "__builtins__",
+            "__builtins__.get",
+        ] {
             assert_eq!(global_severity("site", name), Some("critical"));
             assert_eq!(global_severity("pathlib", name), Some("critical"));
+            assert_eq!(global_severity("sysconfig", name), Some("critical"));
         }
+        assert_eq!(global_severity("os.path", "__dict__"), None);
         for (module, name) in [
             ("unittest", "TestLoader.discover"),
             ("unittest", "defaultTestLoader.discover"),

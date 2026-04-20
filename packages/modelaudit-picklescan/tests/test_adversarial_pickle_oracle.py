@@ -1154,6 +1154,34 @@ def _builtin_dict_get_eval_payload(marker: Path, *, include_lookup: bool) -> tup
     return b"".join(parts), code
 
 
+def _module_dict_builtins_eval_payload(marker: Path, *, include_lookup: bool) -> tuple[bytes, str]:
+    code = f"open({str(marker)!r},'w').write('owned-by-fragmented-module-builtins')"
+    code_fragments = [code[offset : offset + 18] for offset in range(0, len(code), 18)]
+    parts = [b"\x80\x04"]
+    if include_lookup:
+        parts += [_global_operand("sysconfig", "__dict__"), b"\x940"]
+        parts += [_global_operand("builtins", "str.join")]
+        parts += [
+            _text_operand(""),
+            _tuple_payload_operands([_text_operand(fragment) for fragment in ["_", "_", "builtins", "_", "_"]]),
+        ]
+        parts += [b"\x86R\x940"]
+        parts += [_global_operand("builtins", "dict.get")]
+        parts += [b"h\x00h\x01\x86R\x940"]
+        parts += [_global_operand("builtins", "str.join")]
+        parts += [_text_operand(""), _tuple_payload_operands([_text_operand("ev"), _text_operand("al")])]
+        parts += [b"\x86R\x940"]
+        parts += [_global_operand("builtins", "dict.get")]
+        parts += [b"h\x02h\x03\x86R\x940"]
+    parts += [_global_operand("builtins", "str.join")]
+    parts += [_text_operand(""), _tuple_payload_operands([_text_operand(fragment) for fragment in code_fragments])]
+    parts += [b"\x86R"]
+    if include_lookup:
+        parts += [b"\x940h\x04h\x05\x85R"]
+    parts += [b"."]
+    return b"".join(parts), code
+
+
 def _site_os_system_payload(command: str, *, include_call: bool) -> bytes:
     parts = [b"\x80\x04"]
     if include_call:
@@ -3186,6 +3214,35 @@ def test_scan_bytes_blocks_builtin_dict_lookup_eval_recovery_rce(tmp_path: Path)
     result = pickle.loads(payload)
     assert result == len("owned-by-dict-get")
     assert marker.read_text() == "owned-by-dict-get"
+
+
+def test_scan_bytes_blocks_module_dict_fragmented_builtins_eval_recovery_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "fragmented_module_builtins_marker"
+    control_payload, expected_code = _module_dict_builtins_eval_payload(marker, include_lookup=False)
+    payload, _ = _module_dict_builtins_eval_payload(marker, include_lookup=True)
+
+    control_report = scan_bytes(control_payload, source="module-dict-builtins-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert control_result == expected_code
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="module-dict-builtins-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_global_finding(report, "sysconfig", "__dict__")
+
+    direct_payload = b"\x80\x04" + _global_operand("sysconfig", "__builtins__") + b"."
+    direct_report = scan_bytes(direct_payload, source="module-builtins-direct.pkl")
+    assert direct_report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_global_finding(direct_report, "sysconfig", "__builtins__")
+
+    assert not marker.exists()
+    result = pickle.loads(payload)
+    assert result == len("owned-by-fragmented-module-builtins")
+    assert marker.read_text() == "owned-by-fragmented-module-builtins"
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="os.system proof uses POSIX shell redirection")

