@@ -182,6 +182,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   used to invoke hidden RCE source primitives
 - **security:** detect wrapper `__get__` and `__self__` aliases of blocked
   pickle globals used to recover hidden RCE source primitives
+- **security:** detect attribute aliases under blocked pickle global prefixes
+  used to recover hidden RCE source primitives
 - **security:** detect pickle calls to PyYAML unsafe loaders that can execute
   attacker-controlled Python constructors
 - **security:** detect pickle calls to `codecs.open` and codec stream writes

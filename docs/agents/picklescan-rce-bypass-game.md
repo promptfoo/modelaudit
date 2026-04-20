@@ -9213,3 +9213,135 @@ parsed pickle globals. Each loop iteration removes one trailing wrapper suffix,
 so the cost is proportional to the number of alias suffixes in that single
 global name and adds no imports, descriptor binding, frame inspection, or
 stack-provenance modeling.
+
+## Turn 167 - Bypass via arbitrary method-wrapper `__self__` aliases
+
+Found a scanner-clean RCE that bypasses the Turn 166 suffix normalizer by using
+a different bound method-wrapper. The policy now strips trailing `.__call__`,
+`.__get__`, and `.__self__` components, but CPython exposes many other bound
+method-wrappers on functions and descriptor wrappers. Those wrappers also have
+`__self__`, which points back to the blocked object.
+
+The representative payload uses `__repr__` only as a clean wrapper selector:
+`inspect.currentframe.__repr__.__self__` resolves back to the blocked
+`inspect.currentframe` function, and
+`types.FrameType.f_builtins.__get__.__repr__.__self__` resolves back to the
+blocked `types.FrameType.f_builtins.__get__` method-wrapper.
+
+Proof payload shape:
+
+```python
+frame = inspect.currentframe.__repr__.__self__()
+builtins_dict = types.FrameType.f_builtins.__get__.__repr__.__self__(frame)
+fn = dict.get(builtins_dict, "".join(["ev", "al"]))
+code = "".join(
+    [
+        "open('/tmp/.../marker','w').write('owned-by-repr-self')",
+    ]
+)
+fn(code)
+```
+
+The active pickle imports only:
+
+- `inspect.currentframe.__repr__.__self__` via legacy `GLOBAL`
+- `types.FrameType.f_builtins.__get__.__repr__.__self__` via legacy `GLOBAL`
+- `builtins.dict.get`
+- two `builtins.str.join` references
+
+Proof on CPython 3.12.12:
+
+- Direct probe: `inspect.currentframe`, `inspect.currentframe.__get__`, and
+  `inspect.currentframe.__get__.__self__` are now malicious, but
+  `inspect.currentframe.__repr__`, `inspect.currentframe.__repr__.__self__`,
+  `inspect.currentframe.__str__.__self__`, and
+  `inspect.currentframe.__reduce__.__self__` are clean.
+- Direct probe: `types.FrameType.f_builtins.__get__` and
+  `types.FrameType.f_builtins.__get__.__self__` are now malicious, but
+  `types.FrameType.f_builtins.__get__.__repr__`,
+  `types.FrameType.f_builtins.__get__.__repr__.__self__`, and
+  `types.FrameType.f_builtins.__get__.__str__.__self__` are clean.
+- The same direct probe shape is clean for
+  `types.FrameType.f_globals.__get__.__repr__.__self__` and
+  `types.FrameType.f_locals.__get__.__repr__.__self__`.
+- Control payload scanner result: `len=209`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control import references: one clean `builtins.str.join`.
+- Control runtime: `pickle.loads(control)` returns the assembled eval code
+  string and creates no marker.
+- Active payload scanner result: `len=383`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references: clean `inspect.currentframe.__repr__.__self__`,
+  clean `types.FrameType.f_builtins.__get__.__repr__.__self__`, clean
+  `builtins.dict.get`, and two clean `builtins.str.join` references, all with
+  `is_dangerous=False`.
+- Active runtime before unpickle: marker absent.
+- Active runtime after unpickle: marker exists and contains
+  `owned-by-repr-self`; `pickle.loads(active)` returns `18`, the byte count
+  from the marker write.
+
+Why the scanner missed it:
+
+- Turn 166 strips a finite suffix set. After stripping the trailing
+  `.__self__`, `inspect.currentframe.__repr__.__self__` becomes
+  `inspect.currentframe.__repr__`, which is not a blocked exact global.
+- CPython's dotted global resolver resolves the full attribute path before the
+  scanner's stack model sees a value, so the scanner never sees that
+  `.__repr__.__self__` has recovered `inspect.currentframe`.
+- The same applies to the descriptor path: stripping `.__self__` leaves
+  `types.FrameType.f_builtins.__get__.__repr__`, not the blocked
+  `types.FrameType.f_builtins.__get__`.
+- The current policy does not evaluate whether any prefix of the imported
+  `(module, name)` pair is already a dangerous canonical global. It only checks
+  the full name, the finite suffix-normalized names, and dotted-tail splits
+  inside `name` without prepending the original module.
+- The payload fragments `eval` and the source string with `str.join`, so the
+  suspicious-string scan sees only short harmless fragments.
+
+Performance note: the next block should move from enumerating wrapper suffixes
+to canonical-prefix detection over parsed globals. For each dotted name, check
+whether any same-module prefix is already dangerous, e.g. treat
+`inspect.currentframe.<anything>` as dangerous because `inspect.currentframe`
+is dangerous, and treat
+`types.FrameType.f_builtins.__get__.<anything>` as dangerous because the
+canonical descriptor getter is dangerous. This is a small bounded loop over
+name components with existing constant policy lookups, and avoids importing
+modules, resolving attributes, or modeling wrapper object provenance.
+
+## Turn 168 - Block aliases under dangerous global prefixes
+
+Blocking plan implemented:
+
+- Add same-module dangerous-prefix inheritance for parsed pickle globals. After
+  exact and wrapper-normalized checks, split a dotted global name into prefixes
+  and flag the full import if any prefix is already a dangerous global.
+- This catches the Turn 167 aliases because
+  `inspect.currentframe.__repr__.__self__` has the dangerous prefix
+  `inspect.currentframe`, and
+  `types.FrameType.f_builtins.__get__.__repr__.__self__` has the dangerous
+  prefix `types.FrameType.f_builtins.__get__`.
+- Keep the existing dotted-tail resolver behavior: once it resolves a tail such
+  as `logging.config.dictConfig.__repr__.__self__` to module
+  `logging.config`, the same prefix check flags it through dangerous
+  `dictConfig`.
+- Keep benign near-matches clean. Prefix inheritance only fires when a prefix
+  already reaches the finite dangerous-global policy, so names such as
+  `statistics.mean.__repr__.__self__` and `os.path.__repr__.__self__` stay
+  clean.
+- Add Rust unit coverage for arbitrary attributes under `inspect.currentframe`,
+  frame namespace descriptor getters, and dotted-tail dangerous globals, plus
+  benign prefix near-matches.
+- Add a CPython oracle regression for the Turn 167 payload. The control payload
+  only assembles the eval source string and remains clean; the active payload
+  imports `inspect.currentframe.__repr__.__self__` and
+  `types.FrameType.f_builtins.__get__.__repr__.__self__`, is flagged as
+  malicious, and still writes the marker if loaded.
+- Add direct legacy-`GLOBAL` and `STACK_GLOBAL` regressions for representative
+  arbitrary method-wrapper aliases of `inspect.currentframe` and the concrete
+  frame namespace descriptor getters.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: this stays a bounded string-only pass over already parsed
+pickle globals. The new work is one loop over dotted name components and the
+existing constant policy lookups; it adds no imports, attribute resolution,
+descriptor binding, frame inspection, or stack-value provenance.

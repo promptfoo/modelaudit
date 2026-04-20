@@ -5,6 +5,7 @@ pub(crate) fn global_severity(module: &str, name: &str) -> Option<&'static str> 
 fn direct_global_severity(module: &str, name: &str) -> Option<&'static str> {
     direct_global_severity_without_wrapper_alias(module, name)
         .or_else(|| wrapper_global_alias_severity(module, name))
+        .or_else(|| dangerous_global_prefix_severity(module, name))
 }
 
 fn wrapper_global_alias_severity(module: &str, name: &str) -> Option<&'static str> {
@@ -22,6 +23,19 @@ fn strip_wrapper_global_suffix(name: &str) -> Option<&str> {
     for suffix in [".__call__", ".__get__", ".__self__"] {
         if let Some(stripped) = name.strip_suffix(suffix) {
             return Some(stripped);
+        }
+    }
+    None
+}
+
+fn dangerous_global_prefix_severity(module: &str, name: &str) -> Option<&'static str> {
+    let parts = name.split('.').collect::<Vec<_>>();
+    for split in 1..parts.len() {
+        let candidate = parts[..split].join(".");
+        if let Some(severity) = direct_global_severity_without_wrapper_alias(module, &candidate)
+            .or_else(|| wrapper_global_alias_severity(module, &candidate))
+        {
+            return Some(severity);
         }
     }
     None
@@ -530,6 +544,10 @@ mod tests {
             global_severity("site", "logging.config.dictConfig.__get__.__self__"),
             Some("critical")
         );
+        assert_eq!(
+            global_severity("site", "logging.config.dictConfig.__repr__.__self__"),
+            Some("critical")
+        );
         for module in BUILTIN_MODULES {
             for name in [
                 "__dict__",
@@ -560,11 +578,16 @@ mod tests {
         );
         assert_eq!(global_severity("statistics", "mean.__get__"), None);
         assert_eq!(global_severity("statistics", "mean.__get__.__self__"), None);
+        assert_eq!(
+            global_severity("statistics", "mean.__repr__.__self__"),
+            None
+        );
         assert_eq!(global_severity("statistics", "mean.__self__"), None);
         assert_eq!(global_severity("statistics", "mean.subclasses"), None);
         assert_eq!(global_severity("os.path", "__call__"), None);
         assert_eq!(global_severity("os.path", "__get__"), None);
         assert_eq!(global_severity("os.path", "__get__.__self__"), None);
+        assert_eq!(global_severity("os.path", "__repr__.__self__"), None);
         assert_eq!(global_severity("builtins", "filter"), Some("critical"));
         assert_eq!(global_severity("builtins", "hasattr"), Some("critical"));
         assert_eq!(global_severity("builtins", "map"), Some("critical"));
@@ -631,6 +654,22 @@ mod tests {
         );
         assert_eq!(
             global_severity("inspect", "currentframe.__get__.__self__.__call__"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("inspect", "currentframe.__repr__"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("inspect", "currentframe.__repr__.__self__"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("inspect", "currentframe.__str__.__self__"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("inspect", "currentframe.__reduce__.__self__"),
             Some("critical")
         );
         assert_eq!(global_severity("inspect", "getmembers"), Some("critical"));
@@ -889,6 +928,18 @@ mod tests {
             );
             assert_eq!(
                 global_severity("types", &format!("{name}.__self__.__get__.__call__")),
+                Some("critical")
+            );
+            assert_eq!(
+                global_severity("types", &format!("{name}.__repr__")),
+                Some("critical")
+            );
+            assert_eq!(
+                global_severity("types", &format!("{name}.__repr__.__self__")),
+                Some("critical")
+            );
+            assert_eq!(
+                global_severity("types", &format!("{name}.__str__.__self__")),
                 Some("critical")
             );
         }
