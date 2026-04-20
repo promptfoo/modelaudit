@@ -1029,6 +1029,7 @@ impl<'a> ScanState<'a> {
         match callable_reference.name.as_str() {
             "format" => Self::builtins_format_invocations(arguments, op_name, position),
             "str.format" => Self::str_format_invocations(arguments, op_name, position),
+            "str.format_map" => Self::str_format_map_invocations(arguments, op_name, position),
             _ => Vec::new(),
         }
     }
@@ -1067,6 +1068,24 @@ impl<'a> ScanState<'a> {
                 _ => None,
             })
             .collect()
+    }
+
+    fn str_format_map_invocations(
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if arguments.len() != 2 || !Self::is_format_string_argument(arguments.first()) {
+            return Vec::new();
+        }
+        let Some(StackValue::DefaultDict { default_factory }) = arguments.get(1) else {
+            return Vec::new();
+        };
+        vec![Self::zero_arg_invocation(
+            default_factory,
+            op_name,
+            position,
+        )]
     }
 
     fn is_format_string_argument(value: Option<&StackValue>) -> bool {
@@ -1157,12 +1176,24 @@ impl<'a> ScanState<'a> {
         let Some([StackValue::DefaultDict { default_factory }, _]) = argument_values else {
             return Vec::new();
         };
-        vec![CallableInvocation {
-            reference: default_factory.clone(),
+        vec![Self::zero_arg_invocation(
+            default_factory,
+            op_name,
+            position,
+        )]
+    }
+
+    fn zero_arg_invocation(
+        reference: &GlobalRef,
+        op_name: &'static str,
+        position: usize,
+    ) -> CallableInvocation {
+        CallableInvocation {
+            reference: reference.clone(),
             op_name,
             opcode_position: position,
             positional_arg_count: Some(0),
-        }]
+        }
     }
 
     fn constructed_callable_reference(reference: &GlobalRef) -> GlobalRef {

