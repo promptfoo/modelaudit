@@ -12048,3 +12048,141 @@ Performance note:
   `scan_s=0.000774`, call graph finds `random._os.system -> os.system`.
 - Synthetic 33 unique refs set `unique_over_limit=True` and are handled by the
   fail-closed finding rather than unbounded source analysis.
+
+## Turn 211 - Bypass via site customization import helpers
+
+Found another source-level RCE-capable bypass: `site.execsitecustomize` and
+`site.execusercustomize`.
+
+Payload shape:
+
+```text
+PROTO 4
+SHORT_BINUNICODE "site"
+SHORT_BINUNICODE "execsitecustomize"  # or "execusercustomize"
+STACK_GLOBAL
+EMPTY_TUPLE
+REDUCE
+STOP
+```
+
+Scanner proof on the current branch:
+
+```text
+[execsitecustomize] payload_len=31 verdict=clean status=complete findings=0 notices=0 scan_s=0.000039
+ refs= (mappingproxy({'opcode': 'STACK_GLOBAL', 'module': 'site', 'name': 'execsitecustomize', 'import_reference': 'site.execsitecustomize', 'position': 27, 'is_dangerous': False}),)
+ entry_calls= ('sys.excepthook', 'sys.exc_info')
+ call_graph_findings= ()
+[execusercustomize] payload_len=31 verdict=clean status=complete findings=0 notices=0 scan_s=0.000016
+ refs= (mappingproxy({'opcode': 'STACK_GLOBAL', 'module': 'site', 'name': 'execusercustomize', 'import_reference': 'site.execusercustomize', 'position': 27, 'is_dangerous': False}),)
+ entry_calls= ('sys.excepthook', 'sys.exc_info')
+ call_graph_findings= ()
+```
+
+Runtime proof:
+
+```text
+[runtime execsitecustomize] rc=0
+loads_result None
+marker_exists True
+marker_text sitecustomize-owned
+[runtime execusercustomize] rc=0
+loads_result None
+marker_exists True
+marker_text usercustomize-owned
+```
+
+Why it bypasses:
+
+- Native policy already blocks `site.addpackage`, `site.addsitedir`, and
+  `site.main`, but it does not list `site.execsitecustomize` or
+  `site.execusercustomize`.
+- The Python call graph records `ast.Call` edges, so it sees only the exception
+  handling calls inside these helpers: `sys.excepthook` and `sys.exc_info`.
+- The dangerous action is an import statement in the function body:
+  `import sitecustomize` or `import usercustomize`. Those imports execute
+  attacker-controlled module top-level code if the loading process has an
+  attacker-controlled `sys.path` entry.
+- This is the same source primitive as previous import-side-effect bugs, but the
+  current model misses it because import statements are not represented as
+  executable call-graph edges.
+
+Simplification opportunity:
+
+- Fix closest to the source by teaching the Python call graph to model
+  `ast.Import` and relevant `ast.ImportFrom` statements inside invoked functions
+  as import-execution edges, rather than adding package-specific entries forever.
+- The minimal defensive turn can add sorted `DANGEROUS_GLOBALS` entries for
+  `site.execsitecustomize` and `site.execusercustomize`, but that is less
+  complete than making function-body imports visible as a bounded sink class.
+- Performance should stay cheap: the bypass uses one import reference and a
+  31-byte payload. The proof scan was under `0.00004s` once caches were warm.
+
+## Turn 212 - Block site customization import helpers in the call graph
+
+Implemented the Turn 211 fix in the Python call-graph layer rather than adding
+native policy entries for `site.execsitecustomize` and `site.execusercustomize`.
+
+The call graph now treats function-body imports of Python customization hook
+modules as an import-execution edge:
+
+- `import sitecustomize`
+- `import usercustomize`
+- `from sitecustomize import ...`
+- `from usercustomize import ...`
+
+Those edges resolve to the existing `builtins.__import__` RCE sink, so the
+standard `DANGEROUS_CALL_GRAPH` reporting path blocks the bypass.
+
+Post-fix proof:
+
+```text
+[execsitecustomize] verdict=malicious findings=1 scan_s=0.000040
+ calls= ('sys.excepthook', 'sys.exc_info', 'builtins.__import__')
+ path= ('site.execsitecustomize', 'builtins.__import__')
+ rule_codes= ['DANGEROUS_CALL_GRAPH']
+[execusercustomize] verdict=malicious findings=1 scan_s=0.000027
+ calls= ('sys.excepthook', 'sys.exc_info', 'builtins.__import__')
+ path= ('site.execusercustomize', 'builtins.__import__')
+ rule_codes= ['DANGEROUS_CALL_GRAPH']
+```
+
+Regression coverage added in
+`packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py`:
+
+- Verifies both `site` helpers expose `builtins.__import__` in
+  `_calls_for_function()`.
+- Verifies `_find_sink_path()` reaches `builtins.__import__`.
+- Scans both 31-byte payloads and expects `malicious` with
+  `DANGEROUS_CALL_GRAPH`.
+- Executes each payload in a child interpreter with an attacker-controlled
+  `sys.path` entry and verifies `sitecustomize.py` / `usercustomize.py`
+  writes the marker during `pickle.loads`.
+
+Precision note:
+
+- A fully generic "all import statements are RCE sinks" pass was too broad and
+  made benign control payloads malicious.
+- The final version models this source primitive narrowly for customization
+  hook imports, and appends the synthetic import edge after concrete call edges
+  so more specific sinks like `subprocess.Popen` still win.
+
+Validation:
+
+- Focused regression passed:
+  `4 passed in 0.08s`.
+- Focused plus adjacent regressions passed:
+  `13 passed in 1.67s`.
+- `ruff format` passed: `392 files left unchanged`.
+- `ruff check --fix` passed: `All checks passed!`.
+- `mypy` passed: `Success: no issues found in 447 source files`.
+- Full non-slow/non-integration validation passed:
+  `3719 passed, 1022 skipped, 21 warnings in 57.24s`.
+
+Performance note:
+
+- The block adds one bounded `ast.walk()` per analyzed function body and returns
+  at most one synthetic import sink edge.
+- The bypass payloads remained cheap to scan after the fix:
+  `0.000040s` for `execsitecustomize` and `0.000027s` for
+  `execusercustomize`.

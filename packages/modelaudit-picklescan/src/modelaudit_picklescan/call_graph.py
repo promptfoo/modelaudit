@@ -24,6 +24,8 @@ _MAX_WILDCARD_IMPORTS = 16
 _MAX_WILDCARD_REEXPORT_DEPTH = 4
 _MAX_SHORT_SINK_DEPTH = 2
 _CONTROLLED_GETATTR_DISPATCH_SINK = "builtins.getattr.__call__"
+_IMPORT_EXECUTION_SINK = "builtins.__import__"
+_IMPORT_EXECUTION_HOOK_MODULES = frozenset({"sitecustomize", "usercustomize"})
 _PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS = ("__new__", "__init__")
 _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS = ("__setstate__",)
 _INHERITED_CLASS_ENTRYPOINT_METHODS = (
@@ -47,7 +49,7 @@ _RCE_SINK_EXACT = frozenset(
     {
         "asyncio.create_subprocess_exec",
         "asyncio.create_subprocess_shell",
-        "builtins.__import__",
+        _IMPORT_EXECUTION_SINK,
         "builtins.compile",
         "builtins.eval",
         "builtins.exec",
@@ -1383,7 +1385,25 @@ def _calls_in_function(
                 calls.extend(class_entrypoints)
                 continue
             calls.append(resolved)
+    calls.extend(_import_execution_calls(function_node))
     return tuple(calls)
+
+
+def _import_execution_calls(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[str, ...]:
+    for node in ast.walk(function_node):
+        if isinstance(node, ast.Import) and any(_is_import_execution_hook_module(alias.name) for alias in node.names):
+            return (_IMPORT_EXECUTION_SINK,)
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module != "__future__"
+            and _is_import_execution_hook_module(node.module or "")
+        ):
+            return (_IMPORT_EXECUTION_SINK,)
+    return ()
+
+
+def _is_import_execution_hook_module(module_name: str) -> bool:
+    return module_name.partition(".")[0] in _IMPORT_EXECUTION_HOOK_MODULES
 
 
 def _may_use_getattr_dispatch(call_nodes: tuple[ast.Call, ...], aliases: Mapping[str, str]) -> bool:
