@@ -75,6 +75,11 @@ const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(&str, &str, usize, usize, usiz
     ("heapq", "nsmallest", 3, 2, 1, 1),
 ];
 
+const EXACT_ARITY_LAZY_ZERO_ARG_CALLBACK_ITERABLES: &[(&str, &str, usize, usize)] = &[
+    ("tokenize", "generate_tokens", 1, 0),
+    ("tokenize", "tokenize", 1, 0),
+];
+
 const EXACT_ARITY_ITERABLE_DESCRIPTOR_CONSUMERS: &[(&str, &str, usize, usize)] = &[
     ("array", "array.extend", 2, 1),
     ("builtins", "bytearray.__init__", 2, 1),
@@ -1805,6 +1810,10 @@ impl<'a> ScanState<'a> {
             self.stack.push(call_iterator);
             return;
         }
+        if let Some(call_iterator) = Self::lazy_zero_arg_callback_iterable_result(values) {
+            self.stack.push(call_iterator);
+            return;
+        }
         if let Some(call_iterator) = Self::lazy_call_iterator_wrapper_result(values) {
             self.stack.push(call_iterator);
             return;
@@ -1846,6 +1855,30 @@ impl<'a> ScanState<'a> {
             return None;
         }
         let callable = Self::callable_reference_from_value(arguments.first())?;
+        Some(StackValue::CallIterator { callable })
+    }
+
+    fn lazy_zero_arg_callback_iterable_result(values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        let Some((_, _, _, callback_arg_index)) = EXACT_ARITY_LAZY_ZERO_ARG_CALLBACK_ITERABLES
+            .iter()
+            .find(|(consumer_module, consumer_name, arity, _)| {
+                Self::consumer_module_matches(&callable_reference.module, consumer_module)
+                    && *consumer_name == callable_reference.name
+                    && *arity == arguments.len()
+            })
+        else {
+            return None;
+        };
+        let callable = Self::callable_reference_from_value(arguments.get(*callback_arg_index))?;
         Some(StackValue::CallIterator { callable })
     }
 

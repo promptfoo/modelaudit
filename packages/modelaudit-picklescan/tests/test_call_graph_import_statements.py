@@ -411,6 +411,27 @@ def _builtins_help_heapq_key_callback_payload(name: str, iterable_operand: bytes
     return _global_call_payload("heapq", name, b"K\x01", iterable_operand, _global_operand("builtins", "help"))
 
 
+def _builtins_help_tokenize_readline_payload(name: str, *, consume: bool) -> bytes:
+    parts = [
+        b"\x80\x04",
+        _global_operand("tokenize", name),
+        _global_operand("builtins", "help"),
+        b"\x85R",
+    ]
+    if consume:
+        parts.extend(
+            [
+                b"\x94",
+                b"0",
+                _global_operand("builtins", "list"),
+                b"h\x00",
+                b"\x85R",
+            ]
+        )
+    parts.append(b".")
+    return b"".join(parts)
+
+
 def _sitebuiltins_helper_defaultdict_payload(*, lookup: bool) -> bytes:
     parts = [
         b"\x80\x04",
@@ -3594,6 +3615,167 @@ sys.modules.pop("pydoc", None)
 result = pickle.loads(payload)
 if result != []:
     raise SystemExit(f"unexpected result {result!r}")
+if marker.exists():
+    raise SystemExit("marker was written")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    ("name", "line_values_literal", "fallback_literal", "expected_len"),
+    [
+        ("tokenize", "[b'x = 1\\n', b'']", "b''", 6),
+        ("generate_tokens", "['x = 1\\n', '']", "''", 5),
+    ],
+)
+def test_scan_bytes_blocks_tokenize_readline_callback_rce(
+    tmp_path: Path,
+    name: str,
+    line_values_literal: str,
+    fallback_literal: str,
+    expected_len: int,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "tokenize_readline_callback_marker"
+    marker_content = f"pydoc-owned-by-{name}"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        f"_lines = {line_values_literal}\n"
+        "def help(*args, **kwargs):\n"
+        f"    return _lines.pop(0) if _lines else {fallback_literal}\n",
+        encoding="utf-8",
+    )
+    payload = _builtins_help_tokenize_readline_payload(name, consume=True)
+
+    report = scan_bytes(payload, source=f"tokenize-{name}-readline-callback-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+expected_len = int(sys.argv[5])
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if not isinstance(result, list):
+    raise SystemExit(f"unexpected result type {type(result)!r}")
+if len(result) != expected_len:
+    raise SystemExit(f"unexpected token count {len(result)!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            str(module_dir),
+            str(marker),
+            payload.hex(),
+            marker_content,
+            str(expected_len),
+        ],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+@pytest.mark.parametrize(
+    ("name", "line_values_literal", "fallback_literal"),
+    [
+        ("tokenize", "[b'x = 1\\n', b'']", "b''"),
+        ("generate_tokens", "['x = 1\\n', '']", "''"),
+    ],
+)
+def test_scan_bytes_keeps_tokenize_readline_callback_lazy(
+    tmp_path: Path,
+    name: str,
+    line_values_literal: str,
+    fallback_literal: str,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "tokenize_readline_lazy_marker"
+    marker_content = f"pydoc-owned-by-{name}"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        f"_lines = {line_values_literal}\n"
+        "def help(*args, **kwargs):\n"
+        f"    return _lines.pop(0) if _lines else {fallback_literal}\n",
+        encoding="utf-8",
+    )
+    payload = _builtins_help_tokenize_readline_payload(name, consume=False)
+
+    report = scan_bytes(payload, source=f"tokenize-{name}-readline-lazy.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if type(result).__name__ != "generator":
+    raise SystemExit(f"unexpected result type {type(result)!r}")
 if marker.exists():
     raise SystemExit("marker was written")
 """

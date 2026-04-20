@@ -19137,3 +19137,191 @@ format unchanged; lint clean; mypy clean across 447 files
 PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
 3856 passed, 1022 skipped, 21 warnings in 51.38s
 ```
+
+## Turn 281 - Bypass via `tokenize` lazy readline callback
+
+Offensive turn after the Turn 280 defense. The scanner now has a reusable
+callback-dispatch table for eager callback calls like `heapq.nlargest(...,
+key)`, but `tokenize` exposes a lazy callback wrapper: `tokenize.tokenize` and
+`tokenize.generate_tokens` store a `readline` callable and invoke it only when
+the returned generator is consumed.
+
+Representative payload:
+
+```python
+list(tokenize.tokenize(builtins.help))
+```
+
+The shadow `pydoc.py` writes a marker at import time and defines `help()` to
+return bytes lines for `tokenize.tokenize`. The generator construction itself is
+lazy; `list(...)` forces iteration and calls `help()` as `readline`.
+
+```text
+payload_len 66
+payload_hex 80048c08746f6b656e697a658c08746f6b656e697a65938c086275696c74696e738c0468656c7093855294308c086275696c74696e738c046c69737493680085522e
+
+0: PROTO              4
+22: STACK_GLOBAL       # tokenize.tokenize
+39: STACK_GLOBAL       # builtins.help readline callback
+41: REDUCE             # tokenize.tokenize(help), returns lazy generator
+42: MEMOIZE            # memo[0] = tokenizer generator
+60: STACK_GLOBAL       # builtins.list
+64: REDUCE             # list(generator), invokes readline()
+65: STOP
+```
+
+Scanner proof:
+
+```text
+scan clean findings 0 errors ()
+imports [
+  ('tokenize', 'tokenize', 22, False),
+  ('builtins', 'help', 39, False),
+  ('builtins', 'list', 60, False),
+]
+invocations [
+  ('tokenize', 'tokenize', 1, 41),
+  ('builtins', 'list', 1, 64),
+]
+```
+
+Runtime proof:
+
+```text
+runtime_rc 0
+runtime_type list
+runtime_len 6
+runtime_first TokenInfo(type=67 (ENCODING), string='utf-8', start=(0, 0), end=(0, 0), line='')
+marker_exists True
+marker_text owned-by-tokenize-readline
+```
+
+Sibling clean bypass:
+
+```text
+list(tokenize.generate_tokens(builtins.help))
+payload_len 73
+scan clean findings 0
+runtime list 5 True owned-by-generate-tokens
+```
+
+Lazy construction boundary:
+
+```text
+tokenize.tokenize(builtins.help)
+payload_len 43
+scan clean findings 0
+runtime generator False
+```
+
+Why it bypasses:
+
+- `builtins.help` is a clean import and its dangerous `_Helper.__call__` path is
+  only visible when the scanner records an invocation of the callable object.
+- The native stack model records `tokenize.tokenize(help)` as a constructed
+  `tokenize.tokenize` result, not as a lazy callback iterator.
+- Existing lazy wrapper propagation only follows iterables that wrap an existing
+  tracked call iterator, such as `iter(callable, sentinel)` or `heapq.merge`.
+- When `list(...)` consumes the tokenizer generator, CPython calls the stored
+  `readline` callback with zero arguments, but metadata only records the outer
+  `tokenize.tokenize(...)` and `list(...)` reducers.
+
+Likely source-level defense:
+
+- Model `tokenize.tokenize(readline)` and
+  `tokenize.generate_tokens(readline)` as lazy zero-argument callback iterables
+  when `readline` is a callable reference.
+- Reuse the existing `StackValue::CallIterator` shape if possible: it already
+  means "lazy iterable that invokes this callable with zero args when drained,"
+  which matches tokenizer `readline`.
+- Keep construction-only payloads clean; only existing consumers such as
+  `list`, `tuple`, `next`, `deque`, `sum`, and other eager consumer paths should
+  emit the hidden callback invocation when they drain the tokenizer generator.
+
+Simplification note:
+
+- This is a third finite call-graph shape:
+  `(module, function, arity, callback_arg_index, callback_arg_count,
+  returns_lazy_iterable)`.
+- If represented as a small exact table feeding the existing call-iterator stack
+  value, tokenizer callbacks can share all existing consumer logic.
+
+Performance note:
+
+- The representative payload is 66 bytes.
+- Warm scan timing over 1000 runs was median `0.000054s`, p95 `0.000059s`,
+  and max `0.000156s`.
+
+## Turn 282 - Defense for `tokenize` lazy readline callbacks
+
+Defensive turn for the Turn 281 bypass. The source-level fix treats
+`tokenize.tokenize(readline)` and `tokenize.generate_tokens(readline)` as lazy
+zero-argument callback iterables when `readline` is a callable reference.
+
+Implementation:
+
+- Added an exact call-graph table:
+  `(module, function, arity, callback_arg_index)`.
+- Reused `StackValue::CallIterator` as the internal representation, so all
+  existing drain sites (`list`, `tuple`, `next`, `deque`, stdlib materializers,
+  descriptor consumers, etc.) share the same hidden zero-arg invocation logic.
+- Kept the lazy construction boundary intact: `tokenize.tokenize(help)` alone
+  records the outer reducer but does not synthesize a `help()` invocation until
+  another reducer drains the generator.
+
+Regression coverage:
+
+- `list(tokenize.tokenize(builtins.help))` is malicious and records a zero-arg
+  `builtins.help` invocation.
+- `list(tokenize.generate_tokens(builtins.help))` is malicious and records the
+  same hidden callback invocation.
+- Construction-only forms for both tokenizer functions remain clean and do not
+  import the shadow `pydoc.py` at runtime.
+
+Post-fix proof for the representative payload:
+
+```text
+payload_len 66
+scan malicious findings 1 errors ()
+invocations [
+  ('tokenize', 'tokenize', 1, 41),
+  ('builtins', 'list', 1, 64),
+  ('builtins', 'help', 0, 64),
+]
+lazy_scan clean findings 0
+runtime_rc 0
+runtime_type list
+runtime_len 6
+marker_exists True
+marker_text owned-by-tokenize-readline
+```
+
+Performance note:
+
+- Warm scan timing over 1000 post-fix runs was median `0.000117s`, p95
+  `0.000120s`, and max `0.000688s`.
+- The extra work is one exact-table lookup during reducer-result modeling; the
+  shared consumer logic avoids adding package-specific checks to every drain
+  path.
+
+Validation:
+
+```text
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+78 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py::test_scan_bytes_blocks_tokenize_readline_callback_rce packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py::test_scan_bytes_keeps_tokenize_readline_callback_lazy -q
+4 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+145 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+183 passed
+
+ruff format/check, mypy
+format unchanged; lint clean; mypy clean across 447 files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3860 passed, 1022 skipped, 21 warnings in 54.10s
+```
