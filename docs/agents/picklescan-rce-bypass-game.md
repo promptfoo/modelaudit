@@ -10247,3 +10247,122 @@ Performance sanity:
 - Existing wrapper timings stayed in the same range:
   `six.moves.getoutput` at `0.0106s`, `click.edit` at `0.0489s`, and
   `execnet.makegateway` at `0.0422s`.
+
+## Turn 185 - Bypass via `botocore.credentials.ProcessProvider._retrieve_credentials_using`
+
+Found a scanner-clean RCE path through Botocore's credential process provider.
+This is a stronger call-graph miss than the package-alias cases because the
+pickle never imports `subprocess.Popen`; it imports a Botocore method whose
+instance default reaches `Popen` through `self._popen`.
+
+Malicious pickle shape:
+
+- Import module/name `botocore.credentials` /
+  `ProcessProvider._retrieve_credentials_using` with `STACK_GLOBAL`.
+- Construct `botocore.credentials.ProcessProvider("default", dict)`.
+- The constructor default sets `self._popen` to `subprocess.Popen` at runtime.
+- Call `_retrieve_credentials_using(instance, credential_process)`.
+- Use a credential process command of the form
+  `/bin/sh -c "touch MARKER; printf '%s' '{...valid credential JSON...}'"`.
+
+Proof on CPython 3.12.12 with `botocore==1.42.84` installed:
+
+- Payload length: `312` bytes.
+- `shlex.split(command)` resolves to:
+  `['/bin/sh', '-c', 'touch /tmp/modelaudit_botocore_process_provider_turn185; printf ...']`.
+- `_call_graph_entrypoints("botocore.credentials.ProcessProvider._retrieve_credentials_using")`
+  returns only
+  `("botocore.credentials.ProcessProvider._retrieve_credentials_using",)`.
+- `_find_sink_path("botocore.credentials.ProcessProvider._retrieve_credentials_using")`
+  returns `None`.
+- `_calls_for_function(...)` sees
+  `botocore.credentials.ProcessProvider._popen`, but does not resolve that
+  instance attribute to the constructor default `subprocess.Popen`.
+- `_call_graph_entrypoints("botocore.credentials.ProcessProvider")` returns
+  only `("botocore.credentials.ProcessProvider.__init__",)`.
+- `_find_sink_path("botocore.credentials.ProcessProvider")` returns `None`.
+- Active payload scanner result: `status=complete`, `verdict=clean`,
+  `findings=[]`, `notices=[]`.
+- Active import references:
+  `botocore.credentials.ProcessProvider._retrieve_credentials_using`,
+  `botocore.credentials.ProcessProvider`, and `builtins.dict`; all have
+  `is_dangerous=False`.
+- Runtime before unpickle: marker absent.
+- Runtime after unpickle: marker exists.
+- `pickle.loads(payload)` returns a valid credentials dict:
+  `{"access_key": "A", "secret_key": "S", "token": None, "expiry_time": None, "account_id": "1"}`.
+
+Why the scanner missed it:
+
+- Native import-reference policy does not treat Botocore credential helpers as
+  dangerous, and the pickle does not contain a direct `subprocess` global.
+- The Python call graph sees `self._popen(...)` as
+  `botocore.credentials.ProcessProvider._popen`.
+- It does not connect constructor default parameters to instance attributes
+  across methods: `__init__(..., popen=subprocess.Popen)` assigns
+  `self._popen = popen`, and `_retrieve_credentials_using` later calls it.
+- This is a finite call-graph source problem, not an infinite package-name
+  problem: default-parameter function aliases stored on `self` should be
+  resolved when later methods call that attribute.
+
+Performance note: the defensive turn should avoid importing Botocore or
+executing defaults. A bounded AST pass can record class-local assignments of
+constructor parameters whose defaults resolve to known sinks, such as
+`self._popen = popen` where `popen` defaults to `subprocess.Popen`, then resolve
+same-class calls to `self._popen(...)` as that sink. This keeps the work in the
+existing per-module source analysis and should be cheap if capped to class
+methods and known sink defaults.
+
+## Turn 186 - Block constructor-default instance sink aliases
+
+Implemented a call-graph fix for the Turn 185 Botocore credential process
+provider bypass.
+
+The module source analysis now records a bounded set of class instance aliases
+created by constructor defaults:
+
+- It inspects each class `__init__` without importing the package.
+- It resolves parameters whose default expression is already a known RCE,
+  file-open, or file-write sink.
+- It records simple assignments like `self._popen = popen` as
+  `Class._popen -> subprocess.Popen` when `popen` defaults to that sink.
+- Dotted class-attribute aliases can then resolve through the same alias path
+  as module imports.
+
+Regression coverage added in
+`packages/modelaudit-picklescan/tests/test_call_graph_instance_defaults.py`:
+
+- `_calls_for_function("botocore.credentials.ProcessProvider._retrieve_credentials_using")`
+  still observes `botocore.credentials.ProcessProvider._popen`.
+- `_find_sink_path(...)` now reaches `subprocess.Popen`.
+- The Turn 185 payload that calls
+  `ProcessProvider._retrieve_credentials_using(instance, credential_process)`
+  now scans `malicious` with `DANGEROUS_CALL_GRAPH`.
+- A control pickle that only constructs `ProcessProvider("default", dict)`
+  remains `clean`.
+- Runtime proof still shows the malicious pickle executes the credential
+  process and writes the marker before returning a valid credentials dict.
+
+Performance note: this stays in the existing cached per-module AST pass. The
+new scan is capped by `_MAX_CLASS_INSTANCE_ALIASES`, limited to class
+constructors, and only records defaults that already resolve to known sinks, so
+it avoids package imports and avoids broad data-flow over arbitrary instance
+state.
+
+Focused validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_call_graph_instance_defaults.py`
+  passed: `2 passed`.
+- `ruff format`, `ruff check --fix`, and `mypy` passed on the standard
+  ModelAudit paths.
+- Full non-slow/non-integration validation passed:
+  `3701 passed, 1022 skipped, 21 warnings in 38.47s`.
+
+Performance sanity after clearing call-graph caches:
+
+- `_find_sink_path("botocore.credentials.ProcessProvider._retrieve_credentials_using")`:
+  `0.1130s`, path
+  `botocore.credentials.ProcessProvider._retrieve_credentials_using -> subprocess.Popen`.
+- Existing wrapper timings stayed in the same range:
+  `six.moves.getoutput` at `0.0104s`, `click.edit` at `0.0604s`, and
+  `execnet.makegateway` at `0.0425s`.

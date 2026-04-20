@@ -177,6 +177,7 @@ def pytest_runtest_setup(item):
             "test_large_pickle_corpus_qa.py",  # large PickleScan Rust corpus QA harness tests
             "test_call_graph_click.py",  # standalone picklescan Click editor call-graph RCE regressions
             "test_call_graph_execnet.py",  # standalone picklescan execnet call-graph RCE regressions
+            "test_call_graph_instance_defaults.py",  # standalone picklescan constructor-default alias RCE regressions
             "test_call_graph_local_imports.py",  # standalone picklescan function-local import RCE regressions
             "test_call_graph_six.py",  # standalone picklescan six.moves alias RCE regressions
             "test_call_graph_tkinter.py",  # standalone picklescan Tcl call-graph RCE regressions

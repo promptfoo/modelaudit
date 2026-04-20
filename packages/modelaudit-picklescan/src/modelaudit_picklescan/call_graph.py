@@ -18,6 +18,7 @@ _MAX_VISITED_FUNCTIONS = 64
 _MAX_CALLS_PER_FUNCTION = 128
 _MAX_ASSIGNMENT_ALIASES = 128
 _MAX_FUNCTION_INSTANCE_ALIASES = 32
+_MAX_CLASS_INSTANCE_ALIASES = 128
 _MAX_SHORT_SINK_DEPTH = 2
 
 _CLASS_ENTRYPOINT_METHODS = (
@@ -389,10 +390,9 @@ def _resolve_function_target(function_name: str) -> str | None:
     full_name = f"{module_name}.{qualified_name}"
     if full_name in analysis.calls_by_function:
         return full_name
-    if "." not in qualified_name:
-        alias_target = analysis.aliases.get(qualified_name)
-        if alias_target is not None and alias_target != function_name:
-            return _resolve_alias_function_target(alias_target)
+    alias_target = analysis.aliases.get(qualified_name)
+    if alias_target is not None and alias_target != function_name:
+        return _resolve_alias_function_target(alias_target)
     return None
 
 
@@ -480,6 +480,15 @@ def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
             local_class_targets,
         ),
     }
+    aliases.update(
+        _collect_class_instance_default_aliases(
+            tree,
+            module_name,
+            aliases,
+            local_defs,
+            local_class_targets,
+        )
+    )
     calls_by_function, class_entrypoints = _collect_function_calls(
         tree,
         module_name,
@@ -633,6 +642,107 @@ def _is_local_class_member_alias(resolved: str, local_class_targets: set[str]) -
     return any(
         resolved == class_target or resolved.startswith(f"{class_target}.") for class_target in local_class_targets
     )
+
+
+def _collect_class_instance_default_aliases(
+    tree: ast.Module,
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+    local_class_targets: set[str],
+) -> dict[str, str]:
+    instance_aliases: dict[str, str] = {}
+    for statement in tree.body:
+        if not isinstance(statement, ast.ClassDef):
+            continue
+        init_node = next(
+            (
+                child
+                for child in statement.body
+                if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef) and child.name == "__init__"
+            ),
+            None,
+        )
+        if init_node is None:
+            continue
+        default_aliases = _parameter_default_sink_aliases(
+            init_node,
+            module_name,
+            aliases,
+            local_defs,
+            local_class_targets,
+        )
+        if not default_aliases:
+            continue
+        for node in ast.walk(init_node):
+            if not isinstance(node, ast.Assign | ast.AnnAssign):
+                continue
+            value = node.value
+            if not isinstance(value, ast.Name):
+                continue
+            resolved = default_aliases.get(value.id)
+            if resolved is None:
+                continue
+            for target_name in sorted(_self_attribute_assignment_target_names(node)):
+                instance_aliases[f"{statement.name}.{target_name}"] = resolved
+                if len(instance_aliases) >= _MAX_CLASS_INSTANCE_ALIASES:
+                    return instance_aliases
+    return instance_aliases
+
+
+def _parameter_default_sink_aliases(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+    local_class_targets: set[str],
+) -> dict[str, str]:
+    default_aliases: dict[str, str] = {}
+    positional_args = (*function_node.args.posonlyargs, *function_node.args.args)
+    positional_defaults = function_node.args.defaults
+    if positional_defaults:
+        for arg, default in zip(positional_args[-len(positional_defaults) :], positional_defaults, strict=True):
+            if arg.arg in {"self", "cls"}:
+                continue
+            resolved = _sink_alias_default_target(default, module_name, aliases, local_defs, local_class_targets)
+            if resolved is not None:
+                default_aliases[arg.arg] = resolved
+    for arg, keyword_default in zip(function_node.args.kwonlyargs, function_node.args.kw_defaults, strict=True):
+        if keyword_default is None or arg.arg in {"self", "cls"}:
+            continue
+        resolved = _sink_alias_default_target(keyword_default, module_name, aliases, local_defs, local_class_targets)
+        if resolved is not None:
+            default_aliases[arg.arg] = resolved
+    return default_aliases
+
+
+def _sink_alias_default_target(
+    default: ast.AST,
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+    local_class_targets: set[str],
+) -> str | None:
+    resolved = _resolve_expr(default, module_name, aliases, local_defs)
+    if resolved is None or _is_local_class_member_alias(resolved, local_class_targets):
+        return None
+    alias_target = _static_import_reference_alias(resolved) or resolved
+    if (
+        _rce_sink(alias_target) is not None
+        or _file_open_sink(alias_target) is not None
+        or _file_write_sink(alias_target) is not None
+    ):
+        return alias_target
+    return None
+
+
+def _self_attribute_assignment_target_names(node: ast.Assign | ast.AnnAssign) -> set[str]:
+    targets: list[ast.AST] = list(node.targets) if isinstance(node, ast.Assign) else [node.target]
+    names: set[str] = set()
+    for target in targets:
+        if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "self":
+            names.add(target.attr)
+    return names
 
 
 def _collect_function_calls(

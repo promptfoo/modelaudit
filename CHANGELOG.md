@@ -81,6 +81,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** resolve dangerous `six.moves` compatibility aliases, including
   vendored `six` copies, in pickle call-graph analysis so subprocess, pickle
   deserializer, and builtin execution wrappers are blocked
+- **security:** resolve constructor-default sink aliases assigned to instance
+  attributes in pickle call-graph analysis so wrappers like Botocore credential
+  process providers are blocked
 - **security:** resolve parameter-fed function-local class instance aliases in
   pickle call-graph analysis so wrapper functions like `click.edit` are blocked
 - **security:** resolve function-local import aliases in pickle call-graph
