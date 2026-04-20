@@ -7409,3 +7409,88 @@ Blocking plan:
 Performance note: three exact entries in the sorted policy table, with no
 dotenv syntax parsing, key quoting analysis, path modeling, or broad `dotenv`
 wildcard block.
+
+## Turn 131 - Bypass via `python-dotenv` command exec wrapper
+
+Found a scanner-clean immediate process-execution primitive from the Python
+call graph: `dotenv.cli.run_command(command, env)` copies `os.environ`, merges
+the provided env dict, and on POSIX calls `os.execvpe(command[0], args=command,
+env=cmd_env)`. The pickle stream only imports `dotenv.cli.run_command`; the
+lower-level `os.execvpe` call happens inside the imported Python function.
+
+The proof payload calls:
+
+```python
+dotenv.cli.run_command(
+    ["/bin/sh", "-c", "printf owned-by-dotenv-run-command > /tmp/.../marker"],
+    {},
+)
+```
+
+Because `os.execvpe()` replaces the current process, the runtime proof executes
+`pickle.loads(payload)` in a child Python process. The child is replaced by
+`/bin/sh`, writes the marker, and exits cleanly; the parent process remains
+available to verify the result.
+
+Proof on CPython 3.12.12 with `python-dotenv` installed:
+
+- Scanner result: `len=172`, `status=complete`, `verdict=clean`,
+  `is_clean=True`, `findings=[]`, `notices=[]`, `errors=[]`.
+- Coverage: `bytes_scanned=172`, `bytes_total=172`, `opcode_count=13`,
+  `raw_scan_complete=True`, `opcode_scan_complete=True`.
+- Import references: `dotenv.cli.run_command` with `is_dangerous=False`.
+- String heuristic matches: none.
+- Before unpickle: no marker exists.
+- Runtime: parent starts a child Python process that runs `pickle.loads(payload)`.
+- Child result: return code `0`, empty stdout/stderr.
+- After child exit: marker exists and contains `owned-by-dotenv-run-command`.
+
+Call-graph evidence:
+
+- AST call-graph scan over the installed environment parsed 3,715 Python files
+  and 48,417 functions.
+- It found `dotenv.cli.run_command -> os.execvpe`.
+- The same graph explained Turn 129 as
+  `dotenv.main.set_key -> dotenv.main.rewrite -> builtins.open`,
+  `tempfile.NamedTemporaryFile`, `os.replace`, plus local `dest.write`.
+
+Why the scanner missed it:
+
+- `dotenv` is not a wildcard-dangerous module.
+- `dotenv.cli.run_command` is not an exact dangerous global.
+- The pickle contains no `os`, `subprocess`, `Popen`, `execvpe`, or shell API
+  import reference; those are reached transitively after CPython imports
+  `dotenv.cli`.
+- The command string uses `/bin/sh -c printf ...` and does not trip the current
+  suspicious-string heuristics.
+- The payload has complete opcode coverage, no scan errors, no findings, no
+  notices, and no suspicious-string matches.
+
+Performance note: the focused next block can add one exact dangerous-global
+entry for `dotenv.cli.run_command`. Longer term, the call-graph miner is a
+useful way to generate candidate exact entries offline, but doing transitive
+Python call-graph analysis inside the pickle scanner hot path would be too
+expensive and environment-dependent.
+
+## Turn 132 - Block Python wrapper globals that reach RCE source primitives
+
+Blocking plan:
+
+- Add a bounded static Python call-graph pass over pickle import references.
+  It resolves module files from `sys.path` without importing attacker-named
+  modules, parses AST, follows local and imported Python function calls, and
+  flags wrappers that reach known RCE source primitives such as `os.execvpe`.
+- Add a CPython oracle regression for the Turn 131 command wrapper. The control
+  payload carries the same command list and env dict but does not call the
+  wrapper, so it remains clean and does not create the marker.
+- Run the active payload in a child Python process because on POSIX
+  `dotenv.cli.run_command` reaches `os.execvpe()` and replaces the interpreter.
+- Skip the regression when `dotenv.cli` is unavailable or on Windows, where the
+  proof path uses a different subprocess branch.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: the pass is bounded to the import references already surfaced
+by the Rust scanner, caps source reads at 1 MB, caps graph depth and visited
+functions, and caches module analyses. It avoids broad package wildcard blocks
+while moving this class of fixes closer to the finite dangerous source
+primitives.

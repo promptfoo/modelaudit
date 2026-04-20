@@ -10,6 +10,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
+from .call_graph import CallGraphFinding, find_dangerous_call_graphs
 from .options import ScanOptions
 from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdict, ScanError, ScanStatus, Severity
 
@@ -862,7 +863,7 @@ def _scan_pickle_payload_native(
         )
         if not isinstance(raw_report, Mapping):
             raise TypeError(f"Rust scanner returned {type(raw_report).__name__}, expected mapping")
-        return _report_from_native_dict(raw_report)
+        return _with_call_graph_findings(_report_from_native_dict(raw_report))
     except Exception as error:
         return _engine_error_report(
             source=source,
@@ -900,6 +901,64 @@ def _report_from_native_dict(raw_report: Mapping[str, Any]) -> PickleReport:
         ),
         metadata=dict(_mapping(raw_report.get("metadata", {}))),
         duration_s=float(raw_report.get("duration_s", 0.0)),
+    )
+
+
+def _with_call_graph_findings(report: PickleReport) -> PickleReport:
+    import_references = report.metadata.get("import_references")
+    try:
+        call_graph_findings = find_dangerous_call_graphs(import_references)
+    except Exception:
+        return report
+    if not call_graph_findings:
+        return report
+
+    existing_critical_globals = {
+        (str(finding.details.get("module", "")), str(finding.details.get("name", "")))
+        for finding in report.findings
+        if finding.severity == Severity.CRITICAL
+    }
+    additional_findings = tuple(
+        _call_graph_finding_to_report_finding(report, finding)
+        for finding in call_graph_findings
+        if (finding.module, finding.name) not in existing_critical_globals
+    )
+    if not additional_findings:
+        return report
+
+    return PickleReport(
+        source=report.source,
+        status=report.status,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(*report.findings, *additional_findings),
+        notices=report.notices,
+        errors=report.errors,
+        coverage=report.coverage,
+        metadata=report.to_dict()["metadata"],
+        duration_s=report.duration_s,
+    )
+
+
+def _call_graph_finding_to_report_finding(report: PickleReport, finding: CallGraphFinding) -> Finding:
+    return Finding(
+        message=(
+            f"Pickle global '{finding.import_reference}' reaches dangerous Python "
+            f"primitive '{finding.sink}' through the installed call graph"
+        ),
+        severity=Severity.CRITICAL,
+        location=report.source,
+        rule_code="DANGEROUS_CALL_GRAPH",
+        details={
+            "module": finding.module,
+            "name": finding.name,
+            "import_reference": finding.import_reference,
+            "sink": finding.sink,
+            "call_path": list(finding.call_path),
+            "analysis": "python_call_graph",
+        },
+        why=(
+            "The pickle imports a Python wrapper whose source code reaches a known RCE-capable primitive when invoked."
+        ),
     )
 
 

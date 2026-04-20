@@ -381,6 +381,17 @@ def _has_critical_global_finding(report: PickleReport, module: str, name: str) -
     )
 
 
+def _has_critical_call_graph_finding(report: PickleReport, module: str, name: str, sink: str) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.details.get("module") == module
+        and finding.details.get("name") == name
+        and finding.details.get("sink") == sink
+        for finding in report.findings
+    )
+
+
 def _has_critical_builtins_staticmethod_finding(report: PickleReport) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -858,6 +869,10 @@ def _tuple_payload_operands(operands: list[bytes]) -> bytes:
     return b"(" + b"".join(operands) + b"t"
 
 
+def _list_payload_operands(operands: list[bytes]) -> bytes:
+    return b"(" + b"".join(operands) + b"l"
+
+
 def _global_operand(module: str, name: str) -> bytes:
     return _short_binunicode(module.encode()) + _short_binunicode(name.encode()) + b"\x93"
 
@@ -1022,6 +1037,17 @@ def _dotenv_set_key_pth_payload(pth_path: Path, marker: Path, *, writer_module: 
         parts += [_tuple_payload_operands([_text_operand(str(pth_path)), b"h\x00", _text_operand("x")]), b"R"]
     else:
         parts += [b"h\x00"]
+    parts += [b"."]
+    return b"".join(parts)
+
+
+def _dotenv_run_command_payload(command: list[str], *, include_call: bool) -> bytes:
+    command_list = _list_payload_operands([_text_operand(part) for part in command])
+    parts = [b"\x80\x04"]
+    if include_call:
+        parts += [_global_operand("dotenv.cli", "run_command"), command_list, b"}", b"\x86R"]
+    else:
+        parts += [command_list, b"}", b"\x86"]
     parts += [b"."]
     return b"".join(parts)
 
@@ -2819,6 +2845,44 @@ def test_scan_bytes_blocks_dotenv_set_key_fragmented_pth_rce(tmp_path: Path, wri
         assert marker.read_text() == "owned-by-dotenv"
     finally:
         sys.path[:] = original_sys_path
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="dotenv.cli.run_command uses POSIX os.execvpe in this proof")
+@pytest.mark.skipif(not _module_available("dotenv.cli"), reason="dotenv.cli is unavailable")
+def test_scan_bytes_blocks_dotenv_run_command_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "dotenv_run_command_marker"
+    command = [
+        "/bin/sh",
+        "-c",
+        f"printf owned-by-dotenv-run-command > {shlex.quote(str(marker))}",
+    ]
+    control_payload = _dotenv_run_command_payload(command, include_call=False)
+    payload = _dotenv_run_command_payload(command, include_call=True)
+
+    control_report = scan_bytes(control_payload, source="dotenv-run-command-control.pkl")
+    assert control_report.verdict == SafetyVerdict.CLEAN
+
+    assert not marker.exists()
+    control_result = pickle.loads(control_payload)
+    assert control_result == (command, {})
+    assert not marker.exists()
+
+    report = scan_bytes(payload, source="dotenv-run-command-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(report, "dotenv.cli", "run_command", "os.execvpe")
+
+    assert not marker.exists()
+    child_code = f"import pickle; pickle.loads({payload!r})"
+    result = subprocess.run(
+        [sys.executable, "-c", child_code],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    assert result.returncode == 0
+    assert marker.read_text() == "owned-by-dotenv-run-command"
 
 
 @pytest.mark.skipif(not _module_available("yaml"), reason="PyYAML is unavailable")
