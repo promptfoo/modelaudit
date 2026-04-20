@@ -19325,3 +19325,188 @@ format unchanged; lint clean; mypy clean across 447 files
 PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
 3860 passed, 1022 skipped, 21 warnings in 54.10s
 ```
+
+## Turn 283 - Bypass via `re.sub` replacement callback dispatch
+
+Offensive turn after the Turn 282 defense. The scanner now handles tokenizer
+readline callbacks by reusing `CallIterator`, but `re.sub` and `re.subn` expose
+another finite callback-dispatch shape: if the replacement argument is callable
+and the pattern matches, the regex engine invokes `repl(match)`.
+
+Representative payload:
+
+```python
+re.sub("x", builtins.help, "x")
+```
+
+The shadow `pydoc.py` writes a marker at import time and defines `help()` to
+return a replacement string. Unpickling calls `builtins.help(match)` from inside
+the regex replacement path, which imports attacker-controlled `pydoc.py`.
+
+```text
+payload_len 39
+payload_hex 80048c0272658c0373756293288c01788c086275696c74696e738c0468656c70938c017874522e
+
+0: PROTO              4
+11: STACK_GLOBAL       # re.sub
+13: SHORT_BINUNICODE   # pattern "x"
+32: STACK_GLOBAL       # builtins.help replacement callback
+33: SHORT_BINUNICODE   # input "x"
+36: TUPLE              # ("x", help, "x")
+37: REDUCE             # re.sub("x", help, "x"), invokes help(match)
+38: STOP
+```
+
+Scanner proof:
+
+```text
+scan clean findings 0 errors ()
+imports [
+  ('re', 'sub', 11, False),
+  ('builtins', 'help', 32, False),
+]
+invocations [
+  ('re', 'sub', 3, 37),
+]
+```
+
+Runtime proof:
+
+```text
+runtime_rc 0
+runtime_type str
+runtime_result 'OWNED'
+marker_exists True
+marker_text owned-by-re-sub
+```
+
+Sibling clean bypass:
+
+```text
+re.subn("x", builtins.help, "x")
+payload_len 40
+scan clean findings 0
+runtime tuple ('OWNED-subn', 1) True owned-by-re-subn
+```
+
+Callback boundary:
+
+```text
+re.sub("z", builtins.help, "x")
+scan clean findings 0
+runtime_result 'x'
+marker_exists False
+```
+
+Why it bypasses:
+
+- `re.sub` and `re.subn` are clean imports and not covered by the policy table.
+- `builtins.help` is a clean import until the scanner records an actual
+  invocation of the callable singleton.
+- The native stack model records only the outer `re.sub(...)` reducer call. It
+  does not synthesize the inner replacement-callback invocation that CPython
+  performs when the regex matches.
+- The existing callback-dispatch table currently covers `heapq` key callbacks
+  with a non-empty iterable guard, but it has no equivalent row for regex
+  replacement callbacks with a definitely-matching pattern/input guard.
+
+Likely source-level defense:
+
+- Extend callback-dispatch modeling with `re.sub` and `re.subn` rows:
+  `(module, function, arity, callback_arg_index, callback_arg_count,
+  match_guard)`.
+- For precision, gate the synthetic invocation on a callable replacement and a
+  statically evident match when both pattern and input are literal strings or
+  bytes.
+- Keep the no-match boundary clean when a literal pattern cannot match a
+  literal input, since CPython does not invoke the replacement callback there.
+
+Simplification note:
+
+- This fits the same finite call-graph family as `heapq` key callbacks:
+  "function argument at slot N is invoked by a clean-looking dispatcher."
+- The table needs a pluggable guard (`non_empty_iterable`, `literal_regex_match`,
+  etc.) rather than package-specific policy entries.
+
+Performance note:
+
+- The representative payload is 39 bytes.
+- Warm scan timing over 1000 runs was median `0.000038s`, p95 `0.000039s`,
+  and max `0.000114s`.
+
+## Turn 284 - Defense for `re.sub` replacement callbacks
+
+Defensive turn for the Turn 283 bypass. The fix extends the existing
+callback-dispatch model instead of adding a package-level blocklist entry:
+`re.sub` and `re.subn` now synthesize a replacement-callback invocation when the
+scanner can prove that a literal pattern matches a literal input.
+
+Implementation:
+
+- Generalized the callback-dispatch table guard from a hard-coded non-empty
+  iterable index into a small guard enum.
+- Kept the existing `heapq` key-callback rows on the `non_empty_iterable` guard.
+- Added `re.sub` and `re.subn` rows for arities 3, 4, and 5 with callback slot
+  1, callback arity 1, and a `literal_regex_match` guard over pattern slot 0
+  and input slot 2.
+- The regex guard is deliberately conservative: it only treats plain literal
+  patterns as definitely matching when the literal pattern is empty or is a
+  substring of the literal input. It avoids a Rust regex dependency and keeps
+  complex regex semantics out of the hot path.
+
+Regression coverage:
+
+- `re.sub("x", builtins.help, "x")` is malicious and records
+  `builtins.help(match)` as a one-argument callback invocation.
+- `re.subn("x", builtins.help, "x")` is malicious with the same hidden
+  callback invocation.
+- No-match literal cases such as `re.sub("z", builtins.help, "x")` and
+  `re.subn("z", builtins.help, "x")` remain clean and do not import shadow
+  `pydoc.py` at runtime.
+
+Post-fix proof for the representative payload:
+
+```text
+payload_len 39
+scan malicious findings 1 errors ()
+invocations [
+  ('re', 'sub', 3, 37),
+  ('builtins', 'help', 1, 37),
+]
+no_match_scan clean findings 0
+subn_scan malicious findings 1
+runtime_rc 0
+runtime_type str
+runtime_result 'OWNED'
+marker_exists True
+marker_text owned-by-re-sub
+```
+
+Performance note:
+
+- Warm scan timing over 1000 post-fix runs was median `0.000090s`, p95
+  `0.000096s`, and max `0.001101s`.
+- The extra work runs only after exact module/name/arity matching and uses
+  existing tracked stack literals, so non-callback reducer paths stay unchanged.
+
+Validation:
+
+```text
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
+78 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py::test_scan_bytes_blocks_re_sub_replacement_callback_rce packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py::test_scan_bytes_keeps_re_sub_no_match_callback_lazy -q
+4 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py -q
+149 passed
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest packages/modelaudit-picklescan/tests/test_call_graph_*.py -q
+187 passed
+
+ruff format/check, mypy
+format unchanged; lint clean; mypy clean across 447 files
+
+PROMPTFOO_DISABLE_TELEMETRY=1 pytest -n auto -m "not slow and not integration" --maxfail=1
+3864 passed, 1022 skipped, 21 warnings in 53.58s
+```

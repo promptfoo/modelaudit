@@ -30,8 +30,8 @@ use crate::report::{
 };
 use crate::stack::{
     collapse_tuple_values, operand_preview, pytorch_storage_key, resolve_global_operand,
-    stack_value_from_integer_arg, stack_value_from_text_arg, stack_value_preview, GlobalRef,
-    StackValue,
+    stack_value_from_integer_arg, stack_value_from_text_arg, stack_value_preview,
+    stack_value_string, GlobalRef, StackValue,
 };
 use crate::strings::{is_repeated_single_byte, suspicious_string_matches};
 
@@ -50,6 +50,17 @@ const STACK_GLOBAL_STRING_OPCODES: &[&str] = &[
     "UNICODE",
 ];
 const REDUCE_OPCODES: &[&str] = &["REDUCE", "NEWOBJ", "NEWOBJ_EX", "OBJ", "INST", "BUILD"];
+
+#[derive(Clone, Copy)]
+enum CallbackDispatchGuard {
+    NonEmptyIterable {
+        arg_index: usize,
+    },
+    LiteralRegexMatch {
+        pattern_arg_index: usize,
+        input_arg_index: usize,
+    },
+}
 
 const EXACT_ARITY_STDLIB_EAGER_ITERABLE_CONSUMERS: &[(&str, &str, usize, usize)] = &[
     ("array", "array", 2, 1),
@@ -70,9 +81,96 @@ const EXACT_ARITY_STDLIB_EAGER_ITERABLE_CONSUMERS: &[(&str, &str, usize, usize)]
     ("weakref", "WeakValueDictionary", 1, 0),
 ];
 
-const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(&str, &str, usize, usize, usize, usize)] = &[
-    ("heapq", "nlargest", 3, 2, 1, 1),
-    ("heapq", "nsmallest", 3, 2, 1, 1),
+const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(
+    &str,
+    &str,
+    usize,
+    usize,
+    usize,
+    CallbackDispatchGuard,
+)] = &[
+    (
+        "heapq",
+        "nlargest",
+        3,
+        2,
+        1,
+        CallbackDispatchGuard::NonEmptyIterable { arg_index: 1 },
+    ),
+    (
+        "heapq",
+        "nsmallest",
+        3,
+        2,
+        1,
+        CallbackDispatchGuard::NonEmptyIterable { arg_index: 1 },
+    ),
+    (
+        "re",
+        "sub",
+        3,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+        },
+    ),
+    (
+        "re",
+        "sub",
+        4,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+        },
+    ),
+    (
+        "re",
+        "sub",
+        5,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+        },
+    ),
+    (
+        "re",
+        "subn",
+        3,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+        },
+    ),
+    (
+        "re",
+        "subn",
+        4,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+        },
+    ),
+    (
+        "re",
+        "subn",
+        5,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+        },
+    ),
 ];
 
 const EXACT_ARITY_LAZY_ZERO_ARG_CALLBACK_ITERABLES: &[(&str, &str, usize, usize)] = &[
@@ -1012,7 +1110,7 @@ impl<'a> ScanState<'a> {
             opcode.name,
             position,
         ));
-        invocations.extend(Self::callback_dispatch_invocations(
+        invocations.extend(self.callback_dispatch_invocations(
             callable_value.as_ref(),
             argument_values.as_deref(),
             opcode.name,
@@ -1119,6 +1217,7 @@ impl<'a> ScanState<'a> {
     }
 
     fn callback_dispatch_invocations(
+        &self,
         callable_value: Option<&StackValue>,
         argument_values: Option<&[StackValue]>,
         op_name: &'static str,
@@ -1136,7 +1235,7 @@ impl<'a> ScanState<'a> {
         let Some(arguments) = argument_values else {
             return Vec::new();
         };
-        let Some((_, _, _, callback_arg_index, callback_arg_count, non_empty_iterable_arg_index)) =
+        let Some((_, _, _, callback_arg_index, callback_arg_count, guard)) =
             EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS.iter().find(
                 |(consumer_module, consumer_name, arity, _, _, _)| {
                     Self::consumer_module_matches(&callable_reference.module, consumer_module)
@@ -1147,9 +1246,7 @@ impl<'a> ScanState<'a> {
         else {
             return Vec::new();
         };
-        if !Self::is_definitely_non_empty_iterable_argument(
-            arguments.get(*non_empty_iterable_arg_index),
-        ) {
+        if !self.callback_dispatch_guard_is_satisfied(*guard, arguments) {
             return Vec::new();
         }
         let Some(reference) =
@@ -1163,6 +1260,53 @@ impl<'a> ScanState<'a> {
             position,
             Some(*callback_arg_count),
         )]
+    }
+
+    fn callback_dispatch_guard_is_satisfied(
+        &self,
+        guard: CallbackDispatchGuard,
+        arguments: &[StackValue],
+    ) -> bool {
+        match guard {
+            CallbackDispatchGuard::NonEmptyIterable { arg_index } => {
+                Self::is_definitely_non_empty_iterable_argument(arguments.get(arg_index))
+            }
+            CallbackDispatchGuard::LiteralRegexMatch {
+                pattern_arg_index,
+                input_arg_index,
+            } => self.literal_regex_pattern_matches_argument(
+                arguments.get(pattern_arg_index),
+                arguments.get(input_arg_index),
+            ),
+        }
+    }
+
+    fn literal_regex_pattern_matches_argument(
+        &self,
+        pattern_value: Option<&StackValue>,
+        input_value: Option<&StackValue>,
+    ) -> bool {
+        let Some(pattern) = pattern_value.and_then(|value| stack_value_string(value, self.payload))
+        else {
+            return false;
+        };
+        let Some(input) = input_value.and_then(|value| stack_value_string(value, self.payload))
+        else {
+            return false;
+        };
+        if !Self::is_plain_regex_literal(&pattern) {
+            return false;
+        }
+        pattern.is_empty() || input.as_str().contains(pattern.as_str())
+    }
+
+    fn is_plain_regex_literal(pattern: &str) -> bool {
+        !pattern.chars().any(|character| {
+            matches!(
+                character,
+                '.' | '^' | '$' | '*' | '+' | '?' | '{' | '}' | '[' | ']' | '\\' | '|' | '(' | ')'
+            )
+        })
     }
 
     fn builtins_format_invocations(
