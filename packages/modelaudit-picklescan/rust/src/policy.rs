@@ -404,6 +404,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("unittest.loader", "defaultTestLoader.loadTestsFromNames"),
     ("unittest.mock", "MagicMock"),
     ("unittest.mock", "Mock"),
+    ("unittest.mock", "_get_target"),
     ("unittest.mock", "_patch.__enter__"),
     ("unittest.mock", "_patch.start"),
     ("unittest.mock", "patch"),
@@ -628,6 +629,10 @@ mod tests {
         assert_eq!(global_severity("unittest.mock", "Mock"), Some("critical"));
         assert_eq!(
             global_severity("unittest.mock", "MagicMock"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("unittest.mock", "_get_target"),
             Some("critical")
         );
         for name in [

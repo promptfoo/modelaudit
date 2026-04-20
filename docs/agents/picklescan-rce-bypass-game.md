@@ -8269,3 +8269,103 @@ Blocking plan:
 Performance note: this is a single sorted-table policy lookup over an already
 parsed global operand. It adds no imports, no package enumeration, no source
 reads, and no extra call-graph traversal.
+
+## Turn 149 - Bypass via `unittest.mock._get_target` resolver partial
+
+Found a scanner-clean RCE that bypasses the direct `pkgutil.resolve_name` block
+by importing a stdlib helper that manufactures a resolver partial. The helper
+`unittest.mock._get_target(target)` splits a patch target string and returns:
+
+```python
+(functools.partial(pkgutil.resolve_name, target_prefix), attribute_name)
+```
+
+If the target prefix uses `pkgutil.resolve_name`'s colon form, the returned
+partial resolves the object before the final dot. A pickle can therefore pass
+`"builtins:eval.x"` to `_get_target`, extract tuple element zero, call the
+returned partial, and receive `eval` without importing `pkgutil.resolve_name`
+or `builtins.eval`.
+
+The payload builds both the resolver target and eval code at unpickle time:
+
+```python
+target = "".join(["builtins:ev", "al", ".x"])
+getter, _ = unittest.mock._get_target(target)
+fn = getter()
+code = "".join(
+    [
+        "open('/tmp/.../marker','w').write('owned-by-mock-get-target')",
+    ]
+)
+fn(code)
+```
+
+The active pickle imports only:
+
+- `unittest.mock._get_target`
+- `builtins.str.join`
+- `operator.getitem`
+- `builtins.str.join`
+
+Proof on CPython 3.12.12:
+
+- Control payload scanner result: `len=157`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Control import references: one clean `builtins.str.join`.
+- Control runtime: `pickle.loads(control)` returns the assembled eval code
+  string and creates no marker.
+- Active payload scanner result: `len=279`, `status=complete`,
+  `verdict=clean`, `findings=[]`, `notices=[]`.
+- Active import references: `unittest.mock._get_target`,
+  two `builtins.str.join` references, and `operator.getitem`, all with
+  `is_dangerous=False`.
+- Active runtime before unpickle: marker absent.
+- Active runtime after unpickle: marker exists and contains
+  `owned-by-mock-get-target`; `pickle.loads(active)` returns the integer byte
+  count from `open(...).write(...)`.
+
+Why the scanner missed it:
+
+- Direct `pkgutil.resolve_name` is in the dangerous-global table, but the
+  pickle never imports it. It imports `_get_target`, which returns a partial
+  wrapping `pkgutil.resolve_name`.
+- The Python call-graph pass records calls by callee expression. In
+  `_get_target`, the relevant call expression is `partial(...)`, while the
+  dangerous resolver is an argument to that call. The analysis does not model
+  returned partials or argument callables as future call targets.
+- The target string is fragmented as `["builtins:ev", "al", ".x"]`, so no
+  literal contains contiguous `eval` or a blocked global name.
+- The scanner stack model treats the partial returned by `_get_target` as an
+  unknown constructed value after `operator.getitem`, so the later `REDUCE`
+  call of that partial has no dangerous callable reference to classify.
+
+Performance note: the next block should stay at the resolver source primitive.
+The immediate low-cost fix is a constant dangerous-global policy entry for
+`unittest.mock._get_target`, since its only purpose is to create a delayed
+`pkgutil.resolve_name` target resolver for patch machinery. A broader follow-up
+could teach the call graph to recognize `functools.partial` calls whose first
+argument is already a dangerous resolver, but that is not required to block
+this bypass and would need careful false-positive review.
+
+## Turn 150 - Block mock target resolver partials
+
+Blocking plan:
+
+- Add `unittest.mock._get_target` to the finite dangerous-global policy table.
+  The helper is a delayed resolver factory: it returns
+  `functools.partial(pkgutil.resolve_name, target_prefix)` plus an attribute
+  name, so attacker-controlled target strings can recover blocked objects later
+  in the pickle stream.
+- Add Rust unit coverage for `global_severity("unittest.mock",
+  "_get_target")`.
+- Add a CPython oracle regression for the Turn 149 payload. The control payload
+  only assembles the eval code string and remains clean; the active payload
+  uses `_get_target` to recover `eval` via a resolver partial, is flagged as
+  malicious, and still writes the marker if loaded.
+- Add a direct `_get_target` global-reference regression so the source
+  primitive is caught before any call modeling is needed.
+- Add a changelog entry under `[Unreleased]`.
+
+Performance note: this is another sorted-table policy lookup over a parsed
+global operand. It adds no imports, no source reads, no resolver execution, and
+no call-graph expansion.
