@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use crate::opcode::ArgValue;
 
 const MAX_TRACKED_TUPLE_ITEMS: usize = 16;
+const MAX_TRACKED_TUPLE_DEPTH: usize = 2;
 const MAX_STACK_BYTES_PREVIEW: usize = 4096;
 
 #[derive(Clone)]
@@ -84,13 +85,26 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
 
 pub(crate) fn collapse_tuple_values(values: Vec<StackValue>) -> StackValue {
     if values.len() > MAX_TRACKED_TUPLE_ITEMS
-        || values
-            .iter()
-            .any(|value| matches!(value, StackValue::Tuple(_)))
+        || tuple_depth_for_values(&values) > MAX_TRACKED_TUPLE_DEPTH
     {
         StackValue::Other
     } else {
         StackValue::Tuple(values)
+    }
+}
+
+fn tuple_depth_for_values(values: &[StackValue]) -> usize {
+    1 + values
+        .iter()
+        .map(stack_value_tuple_depth)
+        .max()
+        .unwrap_or(0)
+}
+
+fn stack_value_tuple_depth(value: &StackValue) -> usize {
+    match value {
+        StackValue::Tuple(values) => tuple_depth_for_values(values),
+        _ => 0,
     }
 }
 

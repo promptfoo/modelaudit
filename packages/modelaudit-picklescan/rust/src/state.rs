@@ -1482,18 +1482,33 @@ impl<'a> ScanState<'a> {
         let Some(StackValue::Global(callable_reference)) = values.first() else {
             return None;
         };
-        if callable_reference.malformed
-            || !matches!(
-                callable_reference.module.as_str(),
-                "builtins" | "__builtin__" | "__builtins__"
-            )
-        {
+        if callable_reference.malformed {
             return None;
         }
         let Some(StackValue::Tuple(arguments)) = values.get(1) else {
             return None;
         };
-        let callable = match callable_reference.name.as_str() {
+        let callable = match callable_reference.module.as_str() {
+            "builtins" | "__builtin__" | "__builtins__" => {
+                Self::builtins_lazy_call_iterator_wrapper_callable(
+                    &callable_reference.name,
+                    arguments,
+                )
+            }
+            "itertools" => Self::itertools_lazy_call_iterator_wrapper_callable(
+                &callable_reference.name,
+                arguments,
+            ),
+            _ => None,
+        }?;
+        Some(StackValue::CallIterator { callable })
+    }
+
+    fn builtins_lazy_call_iterator_wrapper_callable(
+        name: &str,
+        arguments: &[StackValue],
+    ) -> Option<GlobalRef> {
+        match name {
             "iter" if arguments.len() == 1 => {
                 arguments.first().and_then(Self::call_iterator_callable)
             }
@@ -1502,8 +1517,23 @@ impl<'a> ScanState<'a> {
             }
             "zip" => arguments.iter().find_map(Self::call_iterator_callable),
             _ => None,
-        }?;
-        Some(StackValue::CallIterator { callable })
+        }
+    }
+
+    fn itertools_lazy_call_iterator_wrapper_callable(
+        name: &str,
+        arguments: &[StackValue],
+    ) -> Option<GlobalRef> {
+        match name {
+            "chain" => arguments.iter().find_map(Self::call_iterator_callable),
+            "islice" if (2..=4).contains(&arguments.len()) => {
+                arguments.first().and_then(Self::call_iterator_callable)
+            }
+            "chain.from_iterable" if arguments.len() == 1 => arguments
+                .first()
+                .and_then(Self::call_iterator_callable_or_tuple_item),
+            _ => None,
+        }
     }
 
     fn call_iterator_callable(value: &StackValue) -> Option<GlobalRef> {
@@ -1511,6 +1541,13 @@ impl<'a> ScanState<'a> {
             StackValue::CallIterator { callable } => Some(callable.clone()),
             _ => None,
         }
+    }
+
+    fn call_iterator_callable_or_tuple_item(value: &StackValue) -> Option<GlobalRef> {
+        Self::call_iterator_callable(value).or_else(|| match value {
+            StackValue::Tuple(items) => items.iter().find_map(Self::call_iterator_callable),
+            _ => None,
+        })
     }
 
     fn defaultdict_result(values: &[StackValue]) -> Option<StackValue> {
