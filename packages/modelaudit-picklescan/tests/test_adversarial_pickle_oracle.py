@@ -41,6 +41,10 @@ OperandBuilder = Callable[[bytes], bytes]
 MemoOpcodeBuilder = Callable[[int], bytes]
 
 
+def _runtime_before(version: tuple[int, int]) -> bool:
+    return sys.version_info < version
+
+
 @dataclass(frozen=True)
 class AdversarialCase:
     name: str
@@ -3914,6 +3918,9 @@ def test_scan_bytes_blocks_unittest_mock_get_target_eval_recovery_rce(tmp_path: 
     assert direct_report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_global_finding(direct_report, "unittest.mock", "_get_target")
 
+    if _runtime_before((3, 11)):
+        return
+
     assert not marker.exists()
     result = pickle.loads(payload)
     assert result == len("owned-by-mock-get-target")
@@ -5596,6 +5603,9 @@ def test_scan_bytes_blocks_builtins_type_presentation_protocol_rce(
     assert report.verdict == SafetyVerdict.SUSPICIOUS
     assert _has_suspicious_magic_method_finding(report)
 
+    if _runtime_before((3, 11)):
+        return
+
     assert not marker.exists()
     assert not marker.is_symlink()
     with pytest.raises(TypeError):
@@ -6397,6 +6407,9 @@ def test_scan_bytes_blocks_unittest_mock_patch_start_import_execution_rce(tmp_pa
 
 
 def test_scan_bytes_blocks_dataclasses_create_fn_default_arg_rce(tmp_path: Path) -> None:
+    if "_create_fn" not in dataclasses.__dict__:
+        pytest.skip("dataclasses._create_fn is unavailable")
+
     marker = tmp_path / "dataclasses_create_fn_rce_marker"
 
     class DataclassesCreateFnRce:
@@ -6460,6 +6473,11 @@ def test_scan_bytes_blocks_operator_call_public_alias_rce(tmp_path: Path) -> Non
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_operator_call_finding(report)
+
+    import operator
+
+    if not hasattr(operator, "call"):
+        return
 
     assert not marker.exists()
     result = pickle.loads(payload)

@@ -146,6 +146,14 @@ const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(
         CallbackDispatchGuard::Always,
     ),
     (
+        "tokenize",
+        "tokenize",
+        1,
+        0,
+        0,
+        CallbackDispatchGuard::Always,
+    ),
+    (
         "re",
         "sub",
         4,
@@ -255,10 +263,8 @@ const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(
     ),
 ];
 
-const EXACT_ARITY_LAZY_ZERO_ARG_CALLBACK_ITERABLES: &[(&str, &str, usize, usize)] = &[
-    ("tokenize", "generate_tokens", 1, 0),
-    ("tokenize", "tokenize", 1, 0),
-];
+const EXACT_ARITY_LAZY_ZERO_ARG_CALLBACK_ITERABLES: &[(&str, &str, usize, usize)] =
+    &[("tokenize", "generate_tokens", 1, 0)];
 
 const EXACT_ARITY_ITERABLE_DESCRIPTOR_CONSUMERS: &[(&str, &str, usize, usize)] = &[
     ("array", "array.extend", 2, 1),

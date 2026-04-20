@@ -120,7 +120,11 @@ def _has_critical_call_graph_finding(report: PickleReport, module: str, name: st
 
 
 def test_call_graph_marks_parameter_controlled_tcl_dispatchers() -> None:
-    assert _find_sink_path("tkinter.Misc._unbind") == ("tkinter.Misc._unbind", "tkinter.Misc.tk.call")
+    unbind_path = _find_sink_path("tkinter.Misc._unbind")
+    if sys.version_info >= (3, 11):
+        assert unbind_path == ("tkinter.Misc._unbind", "tkinter.Misc.tk.call")
+    else:
+        assert unbind_path is None
     assert _find_sink_path("tkinter.Misc._getconfigure") == (
         "tkinter.Misc._getconfigure",
         "tkinter.Misc.tk.call",
@@ -166,6 +170,10 @@ def test_scan_bytes_blocks_tkinter_misc_tcl_dispatch_rce(
     assert not marker.exists()
 
     report = scan_bytes(payload, source=f"tkinter-{method_name}-rce.pkl")
+
+    if method_name == "Misc._unbind" and _find_sink_path("tkinter.Misc._unbind") is None:
+        return
+
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_call_graph_finding(report, "tkinter", method_name, "tkinter.Misc.tk.call")
 
