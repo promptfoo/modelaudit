@@ -1784,6 +1784,18 @@ def _pydantic_dotted_getattr_alias_payload(marker: Path) -> bytes:
     )
 
 
+def _random_os_alias_prefix_payload(marker: Path) -> bytes:
+    command = f"printf random-os-alias-owned > {shlex.quote(str(marker))}"
+    return b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("random", "_os.system"),
+            _tuple_payload_operands([_text_operand(command)]),
+            b"R.",
+        ]
+    )
+
+
 def _pyyaml_unsafe_document(marker: Path, marker_content: str) -> str:
     source_tail = f"port pathlib\npathlib.Path({str(marker)!r}).write_text({marker_content!r})"
     return (
@@ -4577,6 +4589,46 @@ if not marker.exists():
     )
     assert result.returncode == 0, result.stderr
     assert marker.read_text() == "pydantic-dotted-os-alias-owned"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="proof uses POSIX shell")
+def test_scan_bytes_blocks_random_os_import_alias_prefix_rce(tmp_path: Path) -> None:
+    marker = tmp_path / "random_os_alias_prefix_marker"
+    payload = _random_os_alias_prefix_payload(marker)
+
+    assert _call_graph_entrypoints("random._os") == ()
+    assert _call_graph_entrypoints("random._os.system") == ("os.system",)
+    assert _find_sink_path("random._os.system") == ("random._os.system", "os.system")
+    assert _find_sink_path("os.system") == ("os.system",)
+
+    report = scan_bytes(payload, source="random-os-alias-prefix-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(report, "random", "_os.system", "os.system")
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+marker = Path(sys.argv[1])
+payload = bytes.fromhex(sys.argv[2])
+result = pickle.loads(payload)
+if result != 0:
+    raise SystemExit(result)
+if not marker.exists():
+    raise SystemExit("marker was not written")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(marker), payload.hex()],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == "random-os-alias-owned"
 
 
 @pytest.mark.skipif(not _module_available("yaml"), reason="PyYAML is unavailable")

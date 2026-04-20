@@ -438,10 +438,30 @@ def _resolve_function_target(function_name: str) -> str | None:
         if module_getattr_target is not None:
             return module_getattr_target
     else:
+        dotted_alias_target = _resolve_dotted_alias_prefix(module_name, qualified_name, analysis)
+        if dotted_alias_target is not None:
+            return _resolve_alias_function_target(dotted_alias_target)
         dotted_module_getattr_target = _resolve_dotted_module_getattr_target(module_name, qualified_name, analysis)
         if dotted_module_getattr_target is not None:
             return dotted_module_getattr_target
     return None
+
+
+def _resolve_dotted_alias_prefix(
+    module_name: str,
+    qualified_name: str,
+    analysis: _ModuleAnalysis,
+) -> str | None:
+    first_component, _separator, remaining = qualified_name.partition(".")
+    if not first_component or not remaining:
+        return None
+    alias_target = analysis.aliases.get(first_component)
+    if alias_target is None:
+        return None
+    resolved = f"{alias_target}.{remaining}"
+    if resolved == f"{module_name}.{qualified_name}":
+        return None
+    return resolved
 
 
 def _resolve_dotted_module_getattr_target(
@@ -566,6 +586,10 @@ def _resolve_class_target(function_name: str) -> str | None:
         wildcard_target = _resolve_wildcard_reexport_alias(module_name, qualified_name)
         if wildcard_target is not None and wildcard_target != function_name:
             return _resolve_class_target(wildcard_target)
+    else:
+        dotted_alias_target = _resolve_dotted_alias_prefix(module_name, qualified_name, analysis)
+        if dotted_alias_target is not None:
+            return _resolve_class_target(dotted_alias_target)
     return None
 
 

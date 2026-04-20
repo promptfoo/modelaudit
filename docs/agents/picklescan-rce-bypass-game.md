@@ -11517,3 +11517,122 @@ Performance note:
   `_call_graph_entrypoints("pydantic._os.system")`: `0.0023s`.
 - `_find_sink_path("pydantic._os.system")`: `0.0000s`, path
   `("pydantic._os.system", "importlib.import_module")`.
+
+## Turn 203 - Bypass via stdlib imported-module alias prefix
+
+Found another source-level RCE bypass using a direct import alias inside a
+stdlib module:
+
+```text
+random._os.system
+  -> random module global `_os`
+  -> os module
+  -> os.system(...)
+```
+
+`random.py` imports `os as _os`. A pickle can resolve the global
+`random._os.system` and then invoke it with `REDUCE`; Python returns the real
+`os.system` callable. The scanner reports the import reference as
+`module=random`, `name=_os.system`, `is_dangerous=False`, so the payload scans
+clean even though unpickling executes a shell command.
+
+Proof payload shape:
+
+```text
+PROTO 4
+SHORT_BINUNICODE "random"
+SHORT_BINUNICODE "_os.system"
+STACK_GLOBAL
+SHORT_BINUNICODE "printf random-os-alias-owned > <tmp>/owned.txt"
+TUPLE1
+REDUCE
+STOP
+```
+
+Focused proof:
+
+- Payload length: `129` bytes.
+- `scan_bytes(payload)`: `clean`, `0` findings, `0.0105s`.
+- Import metadata:
+  `{"opcode": "STACK_GLOBAL", "module": "random", "name": "_os.system", "import_reference": "random._os.system", "is_dangerous": False}`.
+- `_call_graph_entrypoints("random._os.system")`: `()`, `0.0091s`.
+- `_find_sink_path("random._os.system")`: `None`.
+- `_find_sink_path("os.system")`: `("os.system",)`, showing the sink is known
+  once the alias is normalized.
+- Runtime child-process proof: `pickle.loads(payload)` returned `0` and wrote
+  marker content `random-os-alias-owned`.
+
+Why this was missed:
+
+- The Rust policy reasons over the literal pickle global `random._os.system`.
+  It does not normalize dotted names through module import aliases before
+  checking dangerous tails.
+- The Python call graph checks only exact aliases like `random._os`, not alias
+  prefixes inside a dotted global. Because `_os` is a real module global, the
+  module `__getattr__` fallback from Turn 202 correctly does not apply.
+- This is a broad primitive: any module-level alias to a dangerous module can
+  expose infinitely many dangerous dotted globals unless the alias prefix is
+  resolved close to the source.
+
+The next defensive turn should add bounded alias-prefix normalization in the
+call graph. When an unresolved dotted qualified name has a first component that
+is an import alias or assignment alias, resolve that component once and append
+the remaining suffix, e.g. `random._os.system -> os.system`, then reuse the
+existing sink lookup. This keeps the defense finite and performance-friendly:
+no package-specific blocklist and no enumeration of arbitrary object
+attributes.
+
+## Turn 204 - Block dotted import-alias prefixes in the call graph
+
+Implemented bounded alias-prefix normalization for unresolved dotted pickle
+globals.
+
+The resolver now checks the first component of a dotted qualified name against
+the module's collected import/assignment aliases before falling back to
+module-level `__getattr__` modeling. If the first component is an alias, the
+remaining suffix is appended to the alias target and passed back through the
+existing function/class target resolution.
+
+That closes the Turn 203 path:
+
+```text
+random._os.system
+  -> random alias `_os`
+  -> os.system
+```
+
+Regression coverage added to
+`packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py`:
+
+- The payload imports and calls only the pickle global `random._os.system`.
+- `_call_graph_entrypoints("random._os")` remains unresolved, because importing
+  the module alias alone is not callable RCE.
+- `_call_graph_entrypoints("random._os.system")` now returns `("os.system",)`.
+- `_find_sink_path("random._os.system")` now returns
+  `("random._os.system", "os.system")`.
+- The payload scans `malicious` with a `DANGEROUS_CALL_GRAPH` finding whose
+  sink is `os.system`.
+- Runtime proof still executes in a child process and writes
+  `random-os-alias-owned`.
+
+Focused validation:
+
+- `PROMPTFOO_DISABLE_TELEMETRY=1 /Users/mdangelo/.local/bin/uv run pytest packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_random_os_import_alias_prefix_rce packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_pydantic_dotted_getattr_alias_rce packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_pydantic_dynamic_imports_module_getattr_rce packages/modelaudit-picklescan/tests/test_adversarial_pickle_oracle.py::test_scan_bytes_blocks_scipy_stats_norm_star_reexported_singleton_setstate_rce`
+  passed: `4 passed`.
+
+Full pre-commit validation:
+
+- `ruff format` passed: `391 files left unchanged`.
+- `ruff check --fix` passed.
+- `mypy` passed: `Success: no issues found in 446 source files`.
+- Full non-slow/non-integration validation passed:
+  `3711 passed, 1022 skipped, 21 warnings in 39.55s`.
+
+Performance note:
+
+- After clearing call-graph caches,
+  `_call_graph_entrypoints("random._os.system")`: `0.0095s`, returning
+  `("os.system",)`.
+- `_find_sink_path("random._os.system")`: `0.0000s`, path
+  `("random._os.system", "os.system")`.
+- `scan_bytes(payload)`: `malicious`, one finding, `0.0008s`.
