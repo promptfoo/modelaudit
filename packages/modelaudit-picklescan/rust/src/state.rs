@@ -384,6 +384,7 @@ fn global_ref_details(
 }
 
 type GlobalReferenceDedupeKey = (String, String, usize, &'static str, bool);
+type CallableInvocationDedupeKey = (String, String, Option<usize>);
 
 #[derive(Clone)]
 struct CallableInvocation {
@@ -409,6 +410,7 @@ pub(crate) struct ScanState<'a> {
     protocols: Vec<i64>,
     import_references: Vec<Vec<(String, DetailValue)>>,
     callable_invocations: Vec<Vec<(String, DetailValue)>>,
+    callable_invocation_keys: HashSet<CallableInvocationDedupeKey>,
     opcode_count: usize,
     opcode_counts: HashMap<&'static str, usize>,
     global_count: usize,
@@ -460,6 +462,7 @@ impl<'a> ScanState<'a> {
             protocols: Vec::new(),
             import_references: Vec::new(),
             callable_invocations: Vec::new(),
+            callable_invocation_keys: HashSet::new(),
             opcode_count: 0,
             opcode_counts: HashMap::new(),
             global_count: 0,
@@ -3619,11 +3622,21 @@ impl<'a> ScanState<'a> {
     }
 
     fn push_callable_invocation(&mut self, invocation: &CallableInvocation) {
-        if invocation.reference.malformed
+        if invocation.reference.malformed {
+            return;
+        }
+
+        let dedupe_key = (
+            invocation.reference.module.clone(),
+            invocation.reference.name.clone(),
+            invocation.positional_arg_count,
+        );
+        if self.callable_invocation_keys.contains(&dedupe_key)
             || self.callable_invocations.len() >= MAX_IMPORT_REFERENCES
         {
             return;
         }
+        self.callable_invocation_keys.insert(dedupe_key);
 
         let symbol = invocation.reference.symbol();
         let mut details = vec![
@@ -4195,7 +4208,9 @@ impl<'a> ScanState<'a> {
                 self.push_import_reference(reference);
             }
             for invocation in follow_on_scan.callable_invocations {
-                if self.callable_invocations.len() < MAX_IMPORT_REFERENCES {
+                if self.callable_invocations.len() < MAX_IMPORT_REFERENCES
+                    && self.remember_callable_invocation_details(&invocation)
+                {
                     self.callable_invocations.push(invocation);
                 }
             }
@@ -4220,6 +4235,17 @@ impl<'a> ScanState<'a> {
                 return;
             }
         }
+    }
+
+    fn remember_callable_invocation_details(&mut self, details: &[(String, DetailValue)]) -> bool {
+        let module = detail_string(details, "module").unwrap_or_default();
+        let name = detail_string(details, "name").unwrap_or_default();
+        if module.is_empty() || name.is_empty() {
+            return false;
+        }
+        let positional_arg_count = detail_usize(details, "positional_arg_count");
+        self.callable_invocation_keys
+            .insert((module, name, positional_arg_count))
     }
 
     fn coalesce_redundant_global_findings(&mut self) {

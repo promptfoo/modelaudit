@@ -813,6 +813,174 @@ def _has_critical_call_graph_finding_with_sink_prefix(
     )
 
 
+def test_scan_bytes_retains_late_invocation_after_duplicate_metadata_budget() -> None:
+    parts = [b"\x80\x04"]
+    for _ in range(10_000):
+        parts.extend([_global_operand("builtins", "bool"), b")R0"])
+    parts.extend([_global_operand("builtins", "help"), _args_tuple(_unicode_operand("os")), b"R."])
+
+    report = scan_bytes(b"".join(parts), source="duplicate-invocation-budget-help-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    callable_invocations = report.metadata.get("callable_invocations", [])
+    assert (
+        sum(
+            invocation.get("module") == "builtins" and invocation.get("name") == "bool"
+            for invocation in callable_invocations
+        )
+        == 1
+    )
+    assert any(
+        invocation.get("module") == "builtins" and invocation.get("name") == "help"
+        for invocation in callable_invocations
+    )
+
+
+def test_scan_bytes_retains_callable_aliases_at_import_reference_limit() -> None:
+    benign_builtins = [
+        "abs",
+        "all",
+        "any",
+        "ascii",
+        "bin",
+        "callable",
+        "chr",
+        "divmod",
+        "enumerate",
+        "filter",
+        "float",
+        "format",
+        "frozenset",
+        "hash",
+        "hex",
+        "id",
+        "int",
+        "isinstance",
+        "issubclass",
+        "iter",
+        "len",
+        "list",
+        "map",
+        "max",
+        "min",
+        "next",
+        "oct",
+        "ord",
+        "pow",
+        "repr",
+        "round",
+    ]
+    parts = [b"\x80\x04"]
+    for name in benign_builtins:
+        parts.extend([_global_operand("builtins", name), b"0"])
+    parts.extend([_global_operand("builtins", "help"), _args_tuple(_unicode_operand("os")), b"R."])
+
+    report = scan_bytes(b"".join(parts), source="import-reference-limit-help-alias-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+
+
+@pytest.mark.parametrize("function_name", ["harmless_nested_def", "harmless_lambda"])
+def test_scan_bytes_ignores_uninvoked_nested_function_body_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    function_name: str,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "nested_body_marker"
+    command = f"{sys.executable} -c \"from pathlib import Path; Path({str(marker)!r}).write_text('owned')\""
+    module_name = "modelaudit_fp_probe_nested_body"
+    (module_dir / f"{module_name}.py").write_text(
+        "import os\n\n"
+        "def harmless_nested_def(value):\n"
+        "    def inner():\n"
+        "        os.system(value)\n"
+        "    return value\n\n"
+        "def harmless_lambda(value):\n"
+        "    inner = lambda: os.system(value)\n"
+        "    return value\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(module_dir))
+    payload = _global_call_payload(module_name, function_name, _unicode_operand(command))
+
+    report = scan_bytes(payload, source=f"{function_name}-nested-body-clean.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not _has_critical_call_graph_finding(report, module_name, function_name, "os.system")
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+expected = sys.argv[4]
+
+sys.path.insert(0, str(module_dir))
+result = pickle.loads(payload)
+if result != expected:
+    raise SystemExit(f"unexpected result: {result!r}")
+if marker.exists():
+    raise SystemExit("nested body unexpectedly executed")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), command],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("function_name", ["nested_default_executes", "lambda_default_executes"])
+def test_scan_bytes_preserves_nested_signature_execution_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    function_name: str,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_probe_nested_signature"
+    (module_dir / f"{module_name}.py").write_text(
+        "import os\n\n"
+        "def nested_default_executes(value):\n"
+        "    def inner(result=os.system(value)):\n"
+        "        return result\n"
+        "    return value\n\n"
+        "def lambda_default_executes(value):\n"
+        "    inner = lambda result=os.system(value): result\n"
+        "    return value\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(module_dir))
+
+    report = scan_bytes(
+        _global_call_payload(module_name, function_name, _unicode_operand("echo nested-signature")),
+        source=f"{function_name}-nested-signature-rce.pkl",
+    )
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(report, module_name, function_name, "os.system")
+
+
 @pytest.mark.parametrize("helper_name", ["execsitecustomize", "execusercustomize"])
 def test_call_graph_models_site_customization_import_statements(helper_name: str) -> None:
     function_name = f"site.{helper_name}"

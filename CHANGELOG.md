@@ -90,6 +90,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pickle call-graph analysis so wrapper functions like `click.edit` are blocked
 - **security:** resolve function-local import aliases in pickle call-graph
   analysis so wrappers that import RCE sinks inside function bodies are blocked
+- **security:** preserve callable invocation aliases when import-reference
+  metadata is crowded, while ignoring uninvoked nested function and lambda
+  bodies during pickle call-graph analysis
 - **security:** detect `typing._eval_type` pickle call targets that can
   evaluate attacker-controlled `ForwardRef` expressions
 - **security:** detect `dataclasses._create_fn` pickle call targets that can
