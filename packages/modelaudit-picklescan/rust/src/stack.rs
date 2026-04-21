@@ -71,14 +71,21 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
 }
 
 pub(crate) fn collapse_tuple_values(values: Vec<StackValue>) -> StackValue {
-    if values.len() > MAX_TRACKED_TUPLE_ITEMS
-        || values
-            .iter()
-            .any(|value| matches!(value, StackValue::Tuple(_)))
-    {
+    if values.len() > MAX_TRACKED_TUPLE_ITEMS {
         StackValue::Other
     } else {
-        StackValue::Tuple(values)
+        StackValue::Tuple(
+            values
+                .into_iter()
+                .map(|value| {
+                    if matches!(value, StackValue::Tuple(_)) {
+                        StackValue::Other
+                    } else {
+                        value
+                    }
+                })
+                .collect(),
+        )
     }
 }
 

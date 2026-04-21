@@ -151,6 +151,14 @@ def _copyreg_dispatch_table_setitem_payload() -> bytes:
     return b"\x80\x04cbuiltins\ndict.__setitem__\nccopyreg\ndispatch_table\ncdecimal\nDecimal\ncbuiltins\nstr\n\x87R."
 
 
+def _copyreg_dispatch_table_operator_setitem_payload() -> bytes:
+    return b"\x80\x04coperator\nsetitem\nccopyreg\ndispatch_table\ncdecimal\nDecimal\ncbuiltins\nstr\n\x87R."
+
+
+def _copyreg_dispatch_table_operator_ior_payload() -> bytes:
+    return b"\x80\x04coperator\nior\nccopyreg\ndispatch_table\n}cdecimal\nDecimal\ncbuiltins\nstr\ns\x86R."
+
+
 def _copyreg_dispatch_table_setdefault_payload() -> bytes:
     return b"\x80\x04cbuiltins\ndict.setdefault\nccopyreg\ndispatch_table\ncdecimal\nDecimal\ncbuiltins\nstr\n\x87R."
 
@@ -167,6 +175,10 @@ def _copyreg_dispatch_table_delitem_union_payload() -> bytes:
     return (
         b"\x80\x04cbuiltins\ndict.__delitem__\nccopyreg\ndispatch_table\n" + _global(b"types", b"UnionType") + b"\x86R."
     )
+
+
+def _copyreg_dispatch_table_operator_delitem_union_payload() -> bytes:
+    return b"\x80\x04coperator\ndelitem\nccopyreg\ndispatch_table\n" + _global(b"types", b"UnionType") + b"\x86R."
 
 
 def _copyreg_dispatch_table_popitem_payload() -> bytes:
@@ -217,6 +229,30 @@ def _logging_root_handlers_list_pop_payload() -> bytes:
 
 def _logging_root_handlers_list_delitem_payload() -> bytes:
     return b"\x80\x04cbuiltins\nlist.__delitem__\nclogging\nroot.handlers\nK\x00\x86R."
+
+
+def _local_list_append_payload() -> bytes:
+    return b"\x80\x04cbuiltins\nlist.append\n]K\x01\x86R."
+
+
+def _local_list_clear_payload() -> bytes:
+    return b"\x80\x04cbuiltins\nlist.clear\n]K\x01a\x85R."
+
+
+def _local_dict_setitem_payload() -> bytes:
+    return b"\x80\x04cbuiltins\ndict.__setitem__\n}K\x01K\x02\x87R."
+
+
+def _local_dict_update_payload() -> bytes:
+    return b"\x80\x04cbuiltins\ndict.update\n}}K\x01K\x02s\x86R."
+
+
+def _local_operator_setitem_payload() -> bytes:
+    return b"\x80\x04coperator\nsetitem\n}K\x01K\x02\x87R."
+
+
+def _local_operator_ior_payload() -> bytes:
+    return b"\x80\x04coperator\nior\n}}K\x01K\x02s\x86R."
 
 
 def _site_addsitedir_payload(site_dir: Path) -> bytes:
@@ -2608,6 +2644,8 @@ def test_scan_bytes_detects_argparse_filetype_constructed_callable(tmp_path: Pat
         (_copyreg_pickle_payload(), "copyreg.pickle"),
         (_copyreg_dispatch_table_update_payload(), "builtins.dict.update"),
         (_copyreg_dispatch_table_setitem_payload(), "builtins.dict.__setitem__"),
+        (_copyreg_dispatch_table_operator_setitem_payload(), "operator.setitem"),
+        (_copyreg_dispatch_table_operator_ior_payload(), "operator.ior"),
         (_copyreg_dispatch_table_setdefault_payload(), "builtins.dict.setdefault"),
         (_copyreg_dispatch_table_ior_payload(), "builtins.dict.__ior__"),
     ],
@@ -2638,10 +2676,32 @@ def test_scan_bytes_detects_copyreg_dispatch_table_poisoning(payload: bytes, exp
 
 
 @pytest.mark.parametrize(
+    "payload",
+    [
+        _local_dict_setitem_payload(),
+        _local_dict_update_payload(),
+        _local_list_append_payload(),
+        _local_list_clear_payload(),
+        _local_operator_setitem_payload(),
+        _local_operator_ior_payload(),
+    ],
+)
+def test_scan_bytes_allows_local_container_mutations(payload: bytes) -> None:
+    pickle.loads(payload)
+
+    report = scan_bytes(payload, source="local-container-mutation.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+@pytest.mark.parametrize(
     ("payload", "expected_reference"),
     [
         (_copyreg_dispatch_table_pop_union_payload(), "builtins.dict.pop"),
         (_copyreg_dispatch_table_delitem_union_payload(), "builtins.dict.__delitem__"),
+        (_copyreg_dispatch_table_operator_delitem_union_payload(), "operator.delitem"),
     ],
 )
 def test_scan_bytes_detects_copyreg_dispatch_table_reducer_deletion(
@@ -2824,26 +2884,6 @@ def test_scan_bytes_allows_benign_dill_text_literal() -> None:
         (b"cwarnings\nsimplefilter\n(tR.", "warnings.simplefilter"),
         (b"cwebbrowser\nopen\n(tR.", "webbrowser.open"),
         (b"czipfile\nZipFile\n(tR.", "zipfile.ZipFile"),
-        (b"cbuiltins\ndict.__delitem__\n(tR.", "builtins.dict.__delitem__"),
-        (b"cbuiltins\ndict.__ior__\n(tR.", "builtins.dict.__ior__"),
-        (b"cbuiltins\ndict.__setitem__\n(tR.", "builtins.dict.__setitem__"),
-        (b"cbuiltins\ndict.clear\n(tR.", "builtins.dict.clear"),
-        (b"cbuiltins\ndict.pop\n(tR.", "builtins.dict.pop"),
-        (b"cbuiltins\ndict.popitem\n(tR.", "builtins.dict.popitem"),
-        (b"cbuiltins\ndict.setdefault\n(tR.", "builtins.dict.setdefault"),
-        (b"cbuiltins\ndict.update\n(tR.", "builtins.dict.update"),
-        (b"cbuiltins\nlist.__delitem__\n(tR.", "builtins.list.__delitem__"),
-        (b"cbuiltins\nlist.__iadd__\n(tR.", "builtins.list.__iadd__"),
-        (b"cbuiltins\nlist.__imul__\n(tR.", "builtins.list.__imul__"),
-        (b"cbuiltins\nlist.__setitem__\n(tR.", "builtins.list.__setitem__"),
-        (b"cbuiltins\nlist.append\n(tR.", "builtins.list.append"),
-        (b"cbuiltins\nlist.clear\n(tR.", "builtins.list.clear"),
-        (b"cbuiltins\nlist.extend\n(tR.", "builtins.list.extend"),
-        (b"cbuiltins\nlist.insert\n(tR.", "builtins.list.insert"),
-        (b"cbuiltins\nlist.pop\n(tR.", "builtins.list.pop"),
-        (b"cbuiltins\nlist.remove\n(tR.", "builtins.list.remove"),
-        (b"cbuiltins\nlist.reverse\n(tR.", "builtins.list.reverse"),
-        (b"cbuiltins\nlist.sort\n(tR.", "builtins.list.sort"),
         (b"cbuiltins\nglobals\n(tR.", "builtins.globals"),
         (b"csmtplib\nSMTP\n(tR.", "smtplib.SMTP"),
         (b"chttplib\nHTTPConnection\n(tR.", "httplib.HTTPConnection"),

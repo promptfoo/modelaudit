@@ -90,14 +90,6 @@ const BUILTIN_DANGEROUS_NAMES: &[&str] = &[
     "breakpoint",
     "compile",
     "delattr",
-    "dict.__delitem__",
-    "dict.__ior__",
-    "dict.__setitem__",
-    "dict.clear",
-    "dict.pop",
-    "dict.popitem",
-    "dict.setdefault",
-    "dict.update",
     "dir",
     "eval",
     "exec",
@@ -106,18 +98,6 @@ const BUILTIN_DANGEROUS_NAMES: &[&str] = &[
     "getattr",
     "globals",
     "input",
-    "list.__delitem__",
-    "list.__iadd__",
-    "list.__imul__",
-    "list.__setitem__",
-    "list.append",
-    "list.clear",
-    "list.extend",
-    "list.insert",
-    "list.pop",
-    "list.remove",
-    "list.reverse",
-    "list.sort",
     "locals",
     "open",
     "quit",
@@ -373,56 +353,10 @@ mod tests {
             Some("critical")
         );
         assert_eq!(global_severity("copyreg", "pickle"), Some("critical"));
-        assert_eq!(
-            global_severity("builtins", "dict.__setitem__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("builtins", "dict.__delitem__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("builtins", "dict.__ior__"),
-            Some("critical")
-        );
-        assert_eq!(global_severity("builtins", "dict.clear"), Some("critical"));
-        assert_eq!(global_severity("builtins", "dict.pop"), Some("critical"));
-        assert_eq!(
-            global_severity("builtins", "dict.popitem"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("builtins", "dict.setdefault"),
-            Some("critical")
-        );
-        assert_eq!(global_severity("builtins", "dict.update"), Some("critical"));
-        assert_eq!(
-            global_severity("builtins", "list.__delitem__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("builtins", "list.__iadd__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("builtins", "list.__imul__"),
-            Some("critical")
-        );
-        assert_eq!(
-            global_severity("builtins", "list.__setitem__"),
-            Some("critical")
-        );
-        assert_eq!(global_severity("builtins", "list.append"), Some("critical"));
-        assert_eq!(global_severity("builtins", "list.clear"), Some("critical"));
-        assert_eq!(global_severity("builtins", "list.extend"), Some("critical"));
-        assert_eq!(global_severity("builtins", "list.insert"), Some("critical"));
-        assert_eq!(global_severity("builtins", "list.pop"), Some("critical"));
-        assert_eq!(global_severity("builtins", "list.remove"), Some("critical"));
-        assert_eq!(
-            global_severity("builtins", "list.reverse"),
-            Some("critical")
-        );
-        assert_eq!(global_severity("builtins", "list.sort"), Some("critical"));
+        assert_eq!(global_severity("builtins", "dict.__setitem__"), None);
+        assert_eq!(global_severity("builtins", "dict.update"), None);
+        assert_eq!(global_severity("builtins", "list.append"), None);
+        assert_eq!(global_severity("builtins", "list.clear"), None);
         assert_eq!(global_severity("io", "open"), Some("critical"));
         assert_eq!(global_severity("logging", "FileHandler"), Some("critical"));
         assert_eq!(

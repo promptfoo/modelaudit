@@ -51,6 +51,11 @@ const STACK_GLOBAL_STRING_OPCODES: &[&str] = &[
 ];
 const REDUCE_OPCODES: &[&str] = &["REDUCE", "NEWOBJ", "NEWOBJ_EX", "OBJ", "INST", "BUILD"];
 
+struct CallableInvocation {
+    reference: GlobalRef,
+    args: Vec<StackValue>,
+}
+
 enum LimitError {
     OpcodeBudgetExceeded,
     Timeout,
@@ -663,7 +668,8 @@ impl<'a> ScanState<'a> {
                 });
             }
             name if REDUCE_OPCODES.contains(&name) => {
-                if let Some(callable_ref) = self.consume_callable_opcode(opcode, position) {
+                if let Some(invocation) = self.consume_callable_opcode(opcode, position) {
+                    let callable_ref = &invocation.reference;
                     if callable_ref.module == "copyreg.extension" {
                         self.add_finding(Finding {
                             message: format!(
@@ -723,6 +729,42 @@ impl<'a> ScanState<'a> {
                             ],
                             why: Some(
                                 "__main__ references depend on arbitrary application code and become executable when consumed by REDUCE-like opcodes.",
+                            ),
+                        });
+                    } else if let Some(mutation_target) =
+                        sensitive_mutator_invocation_target(callable_ref, &invocation.args)
+                    {
+                        self.add_finding(Finding {
+                            message: format!(
+                                "Found {} opcode mutating process-global state: {}",
+                                opcode.name,
+                                callable_ref.symbol()
+                            ),
+                            severity: "critical",
+                            location: Some(format!("{} (pos {})", self.source, position)),
+                            rule_code: Some("DANGEROUS_CALL"),
+                            details: vec![
+                                ("opcode".to_string(), DetailValue::String(opcode.name.to_string())),
+                                (
+                                    "module".to_string(),
+                                    DetailValue::String(callable_ref.module.clone()),
+                                ),
+                                ("name".to_string(), DetailValue::String(callable_ref.name.clone())),
+                                (
+                                    "import_reference".to_string(),
+                                    DetailValue::String(callable_ref.symbol()),
+                                ),
+                                (
+                                    "global_position".to_string(),
+                                    DetailValue::UInt(callable_ref.position as u64),
+                                ),
+                                (
+                                    "mutation_target".to_string(),
+                                    DetailValue::String(mutation_target.to_string()),
+                                ),
+                            ],
+                            why: Some(
+                                "This pickle opcode mutates process-global registries or diagnostic policy during deserialization.",
                             ),
                         });
                     } else if let Some(severity) =
@@ -871,18 +913,29 @@ impl<'a> ScanState<'a> {
         &mut self,
         opcode: &ParsedOpcode,
         position: usize,
-    ) -> Option<GlobalRef> {
-        let callable_value = match opcode.name {
-            "REDUCE" | "NEWOBJ" => self.consume_top_operands(2),
-            "NEWOBJ_EX" => self.consume_top_operands(3),
+    ) -> Option<CallableInvocation> {
+        let (callable_value, args) = match opcode.name {
+            "REDUCE" | "NEWOBJ" => {
+                let operands = self.consume_top_operands(2)?;
+                let callable_value = operands.first().cloned();
+                let args = tuple_arguments(operands.get(1));
+                (callable_value, args)
+            }
+            "NEWOBJ_EX" => {
+                let operands = self.consume_top_operands(3)?;
+                let callable_value = operands.first().cloned();
+                let args = tuple_arguments(operands.get(1));
+                (callable_value, args)
+            }
             "OBJ" => {
                 let values = self.pop_to_mark();
-                let callable_value = values.into_iter().next();
+                let callable_value = values.first().cloned();
                 self.push_constructed_result(callable_value.as_ref());
-                callable_value
+                let args = values.into_iter().skip(1).collect();
+                (callable_value, args)
             }
             "INST" => {
-                let _ = self.pop_to_mark();
+                let args = self.pop_to_mark();
                 let (module, name) = opcode.arg.global_parts(self.payload);
                 let reference = GlobalRef {
                     module,
@@ -892,13 +945,18 @@ impl<'a> ScanState<'a> {
                 };
                 self.record_global_ref(&reference, opcode.name);
                 self.stack.push(StackValue::Constructed(reference.clone()));
-                Some(StackValue::Global(reference))
+                (Some(StackValue::Global(reference)), args)
             }
-            "BUILD" => self.consume_top_operands(2),
-            _ => None,
+            "BUILD" => {
+                let operands = self.consume_top_operands(2)?;
+                let callable_value = operands.first().cloned();
+                let args = operands.into_iter().skip(1).collect();
+                (callable_value, args)
+            }
+            _ => return None,
         };
 
-        match callable_value {
+        let reference = match callable_value {
             Some(StackValue::Global(reference) | StackValue::Constructed(reference))
                 if !reference.malformed =>
             {
@@ -910,10 +968,11 @@ impl<'a> ScanState<'a> {
                 Some(reference)
             }
             _ => None,
-        }
+        }?;
+        Some(CallableInvocation { reference, args })
     }
 
-    fn consume_top_operands(&mut self, operand_count: usize) -> Option<StackValue> {
+    fn consume_top_operands(&mut self, operand_count: usize) -> Option<Vec<StackValue>> {
         if self.stack.len() < operand_count {
             self.stack.push(StackValue::Other);
             return None;
@@ -925,9 +984,8 @@ impl<'a> ScanState<'a> {
             }
         }
         values.reverse();
-        let callable_value = values.into_iter().next();
-        self.push_constructed_result(callable_value.as_ref());
-        callable_value
+        self.push_constructed_result(values.first());
+        Some(values)
     }
 
     fn push_constructed_result(&mut self, callable_value: Option<&StackValue>) {
@@ -2255,6 +2313,68 @@ impl<'a> ScanState<'a> {
         report.set_item("metadata", metadata)?;
         report.set_item("duration_s", duration_s)?;
         Ok(report.unbind())
+    }
+}
+
+fn tuple_arguments(value: Option<&StackValue>) -> Vec<StackValue> {
+    match value {
+        Some(StackValue::Tuple(values)) => values.clone(),
+        _ => Vec::new(),
+    }
+}
+
+fn sensitive_mutator_invocation_target(
+    callable_ref: &GlobalRef,
+    args: &[StackValue],
+) -> Option<&'static str> {
+    if !is_container_mutator_callable(callable_ref) {
+        return None;
+    }
+    args.first().and_then(sensitive_mutation_target)
+}
+
+fn is_container_mutator_callable(callable_ref: &GlobalRef) -> bool {
+    match callable_ref.module.as_str() {
+        "builtins" | "__builtin__" | "__builtins__" => matches!(
+            callable_ref.name.as_str(),
+            "dict.__delitem__"
+                | "dict.__ior__"
+                | "dict.__setitem__"
+                | "dict.clear"
+                | "dict.pop"
+                | "dict.popitem"
+                | "dict.setdefault"
+                | "dict.update"
+                | "list.__delitem__"
+                | "list.__iadd__"
+                | "list.__imul__"
+                | "list.__setitem__"
+                | "list.append"
+                | "list.clear"
+                | "list.extend"
+                | "list.insert"
+                | "list.pop"
+                | "list.remove"
+                | "list.reverse"
+                | "list.sort"
+        ),
+        "operator" | "_operator" => matches!(
+            callable_ref.name.as_str(),
+            "delitem" | "iadd" | "ior" | "setitem"
+        ),
+        _ => false,
+    }
+}
+
+fn sensitive_mutation_target(value: &StackValue) -> Option<&'static str> {
+    let (StackValue::Global(reference) | StackValue::Constructed(reference)) = value else {
+        return None;
+    };
+    match (reference.module.as_str(), reference.name.as_str()) {
+        ("copyreg", "dispatch_table") => Some("copyreg.dispatch_table"),
+        ("logging", "root.handlers") => Some("logging.root.handlers"),
+        ("warnings", "filters") => Some("warnings.filters"),
+        _ => None,
     }
 }
 
