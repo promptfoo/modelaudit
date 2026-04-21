@@ -3,6 +3,7 @@ use std::borrow::Cow;
 use crate::opcode::ArgValue;
 
 const MAX_TRACKED_TUPLE_ITEMS: usize = 16;
+const MAX_TRACKED_TUPLE_DEPTH: usize = 2;
 const MAX_STACK_BYTES_PREVIEW: usize = 4096;
 
 #[derive(Clone)]
@@ -20,6 +21,19 @@ impl GlobalRef {
 }
 
 #[derive(Clone)]
+pub(crate) struct RegexScannerRule {
+    pub(crate) pattern: String,
+    pub(crate) action: GlobalRef,
+}
+
+#[derive(Clone)]
+pub(crate) struct FutureCallbacks {
+    pub(crate) callbacks: Vec<GlobalRef>,
+    pub(crate) done: bool,
+    pub(crate) memo_index: Option<i64>,
+}
+
+#[derive(Clone)]
 pub(crate) enum StackValue {
     Mark,
     Text(String),
@@ -33,6 +47,39 @@ pub(crate) enum StackValue {
     },
     Global(GlobalRef),
     Constructed(GlobalRef),
+    CallIterator {
+        callable: GlobalRef,
+    },
+    CallIteratorTuple {
+        callable: GlobalRef,
+        item_count: Option<usize>,
+    },
+    DefaultDict {
+        default_factory: GlobalRef,
+    },
+    TrackedDict {
+        keys: Vec<String>,
+        memo_index: Option<i64>,
+    },
+    MappingWrapper {
+        reference: GlobalRef,
+        mappings: Vec<StackValue>,
+    },
+    StringTemplate {
+        template: String,
+    },
+    RegexPattern {
+        pattern: String,
+        flags: Option<isize>,
+    },
+    RegexScannerLexicon {
+        rules: Vec<RegexScannerRule>,
+    },
+    RegexScanner {
+        rules: Vec<RegexScannerRule>,
+        flags: Option<isize>,
+    },
+    FutureCallbacks(FutureCallbacks),
     Tuple(Vec<StackValue>),
     Primitive {
         type_name: &'static str,
@@ -55,6 +102,57 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
     match value {
         Some(StackValue::Global(reference)) => format!("_GlobalRef({})", reference.symbol()),
         Some(StackValue::Constructed(reference)) => format!("constructed:{}", reference.symbol()),
+        Some(StackValue::CallIterator { callable }) => {
+            format!("call_iterator:{}", callable.symbol())
+        }
+        Some(StackValue::CallIteratorTuple {
+            callable,
+            item_count,
+        }) => format!(
+            "call_iterator_tuple(callable={}, len={})",
+            callable.symbol(),
+            item_count.map_or_else(|| "unknown".to_string(), |count| count.to_string())
+        ),
+        Some(StackValue::DefaultDict { default_factory }) => {
+            format!("defaultdict(factory={})", default_factory.symbol())
+        }
+        Some(StackValue::TrackedDict { keys, .. }) if keys.is_empty() => "dict:{}".to_string(),
+        Some(StackValue::TrackedDict { keys, .. }) => format!("dict(keys={})", keys.len()),
+        Some(StackValue::MappingWrapper {
+            reference,
+            mappings,
+        }) => format!(
+            "mapping_wrapper:{}(mappings={})",
+            reference.symbol(),
+            mappings.len()
+        ),
+        Some(StackValue::StringTemplate { template }) => {
+            format!("string_template:{template:?}")
+        }
+        Some(StackValue::RegexPattern { pattern, flags }) => {
+            format!(
+                "regex_pattern:{pattern:?},flags={}",
+                regex_flags_preview(*flags)
+            )
+        }
+        Some(StackValue::RegexScannerLexicon { rules }) => {
+            format!("regex_scanner_lexicon(rules={})", rules.len())
+        }
+        Some(StackValue::RegexScanner { rules, flags }) => {
+            format!(
+                "regex_scanner(rules={}, flags={})",
+                rules.len(),
+                regex_flags_preview(*flags)
+            )
+        }
+        Some(StackValue::FutureCallbacks(callbacks)) => format!(
+            "future_callbacks(callbacks={}, done={}, memo={})",
+            callbacks.callbacks.len(),
+            callbacks.done,
+            callbacks
+                .memo_index
+                .map_or_else(|| "none".to_string(), |index| index.to_string())
+        ),
         Some(StackValue::TextSpan { start, end }) => {
             format!("str_span(len={})", end.saturating_sub(*start))
         }
@@ -71,21 +169,27 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
 }
 
 pub(crate) fn collapse_tuple_values(values: Vec<StackValue>) -> StackValue {
-    if values.len() > MAX_TRACKED_TUPLE_ITEMS {
+    if values.len() > MAX_TRACKED_TUPLE_ITEMS
+        || tuple_depth_for_values(&values) > MAX_TRACKED_TUPLE_DEPTH
+    {
         StackValue::Other
     } else {
-        StackValue::Tuple(
-            values
-                .into_iter()
-                .map(|value| {
-                    if matches!(value, StackValue::Tuple(_)) {
-                        StackValue::Other
-                    } else {
-                        value
-                    }
-                })
-                .collect(),
-        )
+        StackValue::Tuple(values)
+    }
+}
+
+fn tuple_depth_for_values(values: &[StackValue]) -> usize {
+    1 + values
+        .iter()
+        .map(stack_value_tuple_depth)
+        .max()
+        .unwrap_or(0)
+}
+
+fn stack_value_tuple_depth(value: &StackValue) -> usize {
+    match value {
+        StackValue::Tuple(values) => tuple_depth_for_values(values),
+        _ => 0,
     }
 }
 
@@ -103,6 +207,55 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
         StackValue::Bytes { start, end } => format!("bytes(len={})", end.saturating_sub(*start)),
         StackValue::Global(reference) => format!("global:{}", reference.symbol()),
         StackValue::Constructed(reference) => format!("constructed:{}", reference.symbol()),
+        StackValue::CallIterator { callable } => {
+            format!("call_iterator:{}", callable.symbol())
+        }
+        StackValue::CallIteratorTuple {
+            callable,
+            item_count,
+        } => format!(
+            "call_iterator_tuple(callable={}, len={})",
+            callable.symbol(),
+            item_count.map_or_else(|| "unknown".to_string(), |count| count.to_string())
+        ),
+        StackValue::DefaultDict { default_factory } => {
+            format!("defaultdict(factory={})", default_factory.symbol())
+        }
+        StackValue::TrackedDict { keys, .. } if keys.is_empty() => "dict:{}".to_string(),
+        StackValue::TrackedDict { keys, .. } => format!("dict(keys={})", keys.len()),
+        StackValue::MappingWrapper {
+            reference,
+            mappings,
+        } => format!(
+            "mapping_wrapper:{}(mappings={})",
+            reference.symbol(),
+            mappings.len()
+        ),
+        StackValue::StringTemplate { template } => format!("string_template:{template:?}"),
+        StackValue::RegexPattern { pattern, flags } => {
+            format!(
+                "regex_pattern:{pattern:?},flags={}",
+                regex_flags_preview(*flags)
+            )
+        }
+        StackValue::RegexScannerLexicon { rules } => {
+            format!("regex_scanner_lexicon(rules={})", rules.len())
+        }
+        StackValue::RegexScanner { rules, flags } => {
+            format!(
+                "regex_scanner(rules={}, flags={})",
+                rules.len(),
+                regex_flags_preview(*flags)
+            )
+        }
+        StackValue::FutureCallbacks(callbacks) => format!(
+            "future_callbacks(callbacks={}, done={}, memo={})",
+            callbacks.callbacks.len(),
+            callbacks.done,
+            callbacks
+                .memo_index
+                .map_or_else(|| "none".to_string(), |index| index.to_string())
+        ),
         StackValue::Tuple(values) => {
             let mut parts: Vec<String> = values
                 .iter()
@@ -117,6 +270,10 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
         StackValue::Primitive { type_name, repr } => format!("{type_name}:{repr}"),
         StackValue::Other => "object".to_string(),
     }
+}
+
+fn regex_flags_preview(flags: Option<isize>) -> String {
+    flags.map_or_else(|| "unknown".to_string(), |value| value.to_string())
 }
 
 pub(crate) fn stack_value_string(value: &StackValue, payload: &[u8]) -> Option<String> {

@@ -193,6 +193,10 @@ def _warnings_filters_list_clear_payload() -> bytes:
     return b"\x80\x04cbuiltins\nlist.clear\ncwarnings\nfilters\n\x85R."
 
 
+def _warnings_filters_operator_imul_payload() -> bytes:
+    return b"\x80\x04coperator\nimul\ncwarnings\nfilters\nK\x00\x86R."
+
+
 def _warning_ignore_filter_tuple_payload() -> bytes:
     return b"(" + _short_binunicode(b"ignore") + b"Ncbuiltins\nWarning\nNK\x00t"
 
@@ -253,6 +257,10 @@ def _local_operator_setitem_payload() -> bytes:
 
 def _local_operator_ior_payload() -> bytes:
     return b"\x80\x04coperator\nior\n}}K\x01K\x02s\x86R."
+
+
+def _local_operator_imul_payload() -> bytes:
+    return b"\x80\x04coperator\nimul\n]K\x01aK\x00\x86R."
 
 
 def _site_addsitedir_payload(site_dir: Path) -> bytes:
@@ -665,6 +673,32 @@ def test_scan_bytes_escalates_copyreg_extension_reduce() -> None:
         and finding.details.get("opaque_extension") is True
         for finding in report.findings
     )
+
+
+def test_scan_bytes_blocks_operator_setitem_copyreg_dispatch_table_poisoning() -> None:
+    payload = b"\x80\x02coperator\nsetitem\nccopyreg\ndispatch_table\ncdecimal\nDecimal\ncbuiltins\nstr\n\x87R."
+    original_dispatch_table = dict(copyreg.dispatch_table)
+
+    try:
+        copyreg.dispatch_table.pop(decimal.Decimal, None)
+
+        report = scan_bytes(payload, source="operator-setitem-copyreg-dispatch-table.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert decimal.Decimal not in copyreg.dispatch_table
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == "operator.setitem"
+            for finding in report.findings
+        )
+
+        assert pickle.loads(payload) is None
+        assert copyreg.dispatch_table.get(decimal.Decimal) is str
+    finally:
+        copyreg.dispatch_table.clear()
+        copyreg.dispatch_table.update(original_dispatch_table)
 
 
 @pytest.mark.parametrize(
@@ -1989,7 +2023,7 @@ def test_scan_bytes_detects_pathlib_mutating_dotted_method_reduce(tmp_path: Path
         for finding in report.findings
     )
     assert any(
-        ref["import_reference"] == expected_reference and ref["is_dangerous"] is True
+        ref["import_reference"] == expected_reference and ref["is_dangerous"] is False
         for ref in report.metadata["import_references"]
     )
     pickle.loads(payload)
@@ -2278,6 +2312,32 @@ def test_scan_bytes_detects_warnings_filters_list_clear_policy_erasure() -> None
             for finding in report.findings
         )
         assert pickle.loads(payload) is None
+        assert warnings.filters == []
+    finally:
+        mutable_filters = cast(list[object], warnings.filters)
+        mutable_filters[:] = original_filters
+
+
+def test_scan_bytes_detects_warnings_filters_operator_imul_policy_erasure() -> None:
+    payload = _warnings_filters_operator_imul_payload()
+    original_filters = list(warnings.filters)
+
+    try:
+        warnings.resetwarnings()
+        warnings.simplefilter("error")
+        report = scan_bytes(payload, source="warnings-filters-operator-imul.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert warnings.filters[0][0] == "error"
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == "operator.imul"
+            and finding.details.get("mutation_target") == "warnings.filters"
+            for finding in report.findings
+        )
+        assert pickle.loads(payload) == []
         assert warnings.filters == []
     finally:
         mutable_filters = cast(list[object], warnings.filters)
@@ -2684,6 +2744,7 @@ def test_scan_bytes_detects_copyreg_dispatch_table_poisoning(payload: bytes, exp
         _local_list_clear_payload(),
         _local_operator_setitem_payload(),
         _local_operator_ior_payload(),
+        _local_operator_imul_payload(),
     ],
 )
 def test_scan_bytes_allows_local_container_mutations(payload: bytes) -> None:

@@ -74,6 +74,169 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **security:** detect `mailcap.findmatch` pickle call targets that can execute
+  attacker-controlled mailcap `test` commands on Python versions that still
+  provide `mailcap`
+- **security:** detect `setuptools._distutils.spawn.spawn` pickle call targets
+  that can execute attacker-controlled subprocess command lists when
+  `setuptools` is installed
+- **security:** detect `pipes.Template` pickle call targets that can execute
+  attacker-controlled shell pipelines on Python versions that still provide
+  `pipes`
+- **security:** resolve module-level bound-method aliases and same-module
+  constructor call paths in pickle call-graph analysis so process-dispatch
+  wrappers are blocked
+- **security:** resolve dangerous `six.moves` compatibility aliases, including
+  vendored `six` copies, in pickle call-graph analysis so subprocess, pickle
+  deserializer, and builtin execution wrappers are blocked
+- **security:** resolve constructor-default sink aliases assigned to instance
+  attributes in pickle call-graph analysis so wrappers like Botocore credential
+  process providers are blocked
+- **security:** resolve sink defaults forwarded through `super().__init__` in
+  pickle call-graph analysis so async credential process wrappers are blocked
+- **security:** resolve parameter-fed function-local class instance aliases in
+  pickle call-graph analysis so wrapper functions like `click.edit` are blocked
+- **security:** resolve function-local import aliases in pickle call-graph
+  analysis so wrappers that import RCE sinks inside function bodies are blocked
+- **security:** preserve callable invocation aliases when import-reference
+  metadata is crowded, while ignoring uninvoked nested function and lambda
+  bodies during pickle call-graph analysis
+- **security:** detect `typing._eval_type` pickle call targets that can
+  evaluate attacker-controlled `ForwardRef` expressions
+- **security:** detect `dataclasses._create_fn` pickle call targets that can
+  execute attacker-controlled generated Python source
+- **security:** detect `typing.get_type_hints` pickle call targets that can
+  evaluate attacker-controlled annotation strings
+- **security:** detect public `operator.call` pickle call targets that can
+  invoke attacker-controlled callables
+- **security:** detect `builtins.map` pickle call targets that can lazily
+  invoke attacker-controlled callables when iterated
+- **security:** detect `itertools.starmap` pickle call targets that can lazily
+  invoke attacker-controlled callables when iterated
+- **security:** detect `builtins.filter` pickle call targets that can lazily
+  invoke attacker-controlled callables when iterated
+- **security:** detect `types.MethodType` pickle call targets that can
+  synthesize attacker-controlled bound methods for later invocation
+- **security:** detect `types.DynamicClassAttribute.__get__` pickle call
+  targets that can invoke attacker-controlled descriptor getters
+- **security:** detect `functools.cached_property.__get__` pickle call targets
+  that can invoke attacker-controlled cached-property getters
+- **security:** detect `functools.cmp_to_key` pickle call targets that can
+  invoke attacker-controlled comparators during rich comparison
+- **security:** detect `logging.Filterer.filter` pickle call targets that can
+  invoke attacker-controlled logging filter callbacks
+- **security:** detect `inspect.getmembers` pickle call targets that can
+  invoke attacker-controlled descriptors during introspection
+- **security:** detect `builtins.hasattr` pickle call targets that can invoke
+  attacker-controlled descriptors during attribute-existence checks
+- **security:** detect `__del__` finalizer string seeds that can execute
+  attacker-controlled methods when pickle-built objects are dropped
+- **security:** detect `__eq__` rich-comparison string seeds that can execute
+  attacker-controlled methods during equality checks
+- **security:** detect `__lt__`, `__le__`, `__gt__`, `__ge__`, and `__ne__`
+  rich-comparison string seeds that can execute attacker-controlled methods
+  during ordering checks
+- **security:** detect `__contains__` membership string seeds that can execute
+  attacker-controlled methods during containment checks
+- **security:** detect `__setitem__` item-assignment string seeds that can
+  execute attacker-controlled methods during item mutation
+- **security:** detect `__getitem__` and `__delitem__` item-protocol string
+  seeds that can execute attacker-controlled methods during item access
+- **security:** detect binary arithmetic and bitwise dunder string seeds that
+  can execute attacker-controlled methods during operator dispatch
+- **security:** detect reflected and in-place binary operator dunder string
+  seeds that can execute attacker-controlled methods during operator dispatch
+- **security:** detect unary operator dunder string seeds that can execute
+  attacker-controlled methods during operator dispatch
+- **security:** detect context-manager entry dunder string seeds and
+  `contextlib.ExitStack.enter_context` pickle call targets that can invoke
+  attacker-controlled `__enter__` methods
+- **security:** detect iteration protocol dunder string seeds that can execute
+  attacker-controlled methods during builtin iteration dispatch
+- **security:** detect numeric rounding protocol dunder string seeds that can
+  execute attacker-controlled methods during rounding helper dispatch
+- **security:** detect descriptor setup and numeric coercion dunder string
+  seeds that can execute attacker-controlled methods during class creation
+- **security:** detect presentation and size protocol dunder string seeds that
+  can execute attacker-controlled methods during common builtin dispatch
+- **security:** detect PathLike `__fspath__` dunder string seeds that can
+  route attacker-controlled paths into file APIs during pickle loading
+- **security:** detect direct pickle calls to stdlib file-write sinks such as
+  `pathlib.Path.write_text`, `io.open`, and `_io.FileIO`
+- **security:** detect pickle calls to logging file handlers and emit/handle
+  dispatch methods that can write attacker-controlled startup hooks
+- **security:** detect pickle calls to `argparse.FileType` and high-level
+  logging stream dispatch methods that can write attacker-controlled startup
+  hooks
+- **security:** detect pickle calls to NumPy text writers that can write
+  attacker-controlled startup hooks
+- **security:** detect pickle calls to `python-dotenv` key writers that can
+  write attacker-controlled startup hooks
+- **security:** detect pickle globals whose Python call graph reaches known
+  RCE-capable source primitives such as `os.execvpe`
+- **security:** detect pickle globals whose Python call graph pairs file-open
+  and file-write wrappers that can create executable startup hooks
+- **security:** resolve pickle-imported Python class globals through bounded
+  constructor and object-method call graph entrypoints
+- **security:** detect public `io.FileIO` and `io.TextIOWrapper.write` aliases
+  for blocked `_io` file-writing primitives
+- **security:** detect builtin namespace dictionary access that can recover
+  blocked primitives through mapping lookups
+- **security:** detect dotted pickle global aliases that resolve to blocked
+  source primitives such as `os.system`
+- **security:** detect concrete `pathlib` path writer aliases and module
+  namespace dictionary recovery for modules with blocked globals
+- **security:** detect module namespace and `__builtins__` access used for
+  dynamic builtin recovery
+- **security:** detect `string.Formatter.get_field` pickle call targets that
+  can traverse attacker-controlled field expressions into callable objects
+- **security:** detect `unittest.mock._get_target` pickle call targets that
+  can manufacture delayed `pkgutil.resolve_name` resolver partials
+- **security:** detect descriptor getter pickle call targets that can bind
+  recovered function descriptors and expose builtin namespaces
+- **security:** detect wrapper and method descriptor getter pickle call targets
+  that can bind recovered slot wrappers for dynamic attribute access
+- **security:** detect global references to attribute-access and function
+  namespace source methods used for dynamic builtin recovery
+- **security:** detect object subclass enumeration globals that can recover
+  loaded process capabilities without direct imports
+- **security:** detect garbage collector object-graph globals that can recover
+  hidden namespaces and loaded process capabilities
+- **security:** detect frame-introspection globals and frame namespace
+  descriptor getters used for dynamic builtin recovery
+- **security:** detect callable `__call__` aliases of blocked pickle globals
+  used to invoke hidden RCE source primitives
+- **security:** detect wrapper `__get__` and `__self__` aliases of blocked
+  pickle globals used to recover hidden RCE source primitives
+- **security:** detect attribute aliases under blocked pickle global prefixes
+  used to recover hidden RCE source primitives
+- **security:** detect pickle calls to PyYAML unsafe loaders that can execute
+  attacker-controlled Python constructors
+- **security:** detect pickle calls to `codecs.open` and codec stream writes
+  that can write attacker-controlled startup hooks
+- **security:** detect pickle calls to durable tempfile creation and CSV
+  `DictWriter` row dispatch that can write attacker-controlled startup hooks
+- **security:** detect pickle calls to mailbox single-file `add` dispatch
+  methods that can write attacker-controlled startup hooks
+- **security:** detect pickle calls to `_tkinter` Tcl interpreter dispatch
+  methods that can execute local commands
+- **security:** detect high-level `tkinter.Misc` pickle call targets that can
+  forward attacker-controlled commands into Tcl interpreter dispatch
+- **security:** detect pickle calls to `_xxsubinterpreters.run_string` that
+  can execute attacker-controlled Python source
+- **security:** detect `builtins.staticmethod` pickle call targets that can
+  synthesize callable descriptors for later invocation
+- **security:** detect `builtins.property.__get__` pickle call targets that
+  can invoke attacker-controlled property getters during descriptor access
+- **security:** detect `builtins.classmethod.__get__` pickle call targets that
+  can synthesize attacker-controlled bound methods during descriptor access
+- **security:** detect `_functools.partial` pickle call targets that can
+  synthesize private-alias partial callables for later invocation
+- **security:** detect `_functools.reduce` pickle call targets that can invoke
+  attacker-controlled reducer callables through the private CPython alias
+- **security:** detect `functools.cache`, `functools.lru_cache`, and
+  `functools.singledispatch` pickle call targets that can synthesize callable
+  wrappers around attacker-controlled functions for later invocation
 - **cli:** add scanner selection with `--scanners`, `--exclude-scanner`, and `--list-scanners` wired into core routing, nested dispatch, remote prefilters, and scan metadata; selection-suppressed preferred scanners emit a stderr warning and populate `scanner_selection.suppressed_preferred_scanner_ids`, and unknown scanner names suggest the closest match
 - **pickle:** replace the standalone pickle scanner's package-engine selector with the Rust-only runtime and explicit native-extension errors
 - **pickle:** scan PyTorch ZIP checkpoint pickle members directly in the standalone pickle scanner
@@ -102,7 +265,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **pickle:** detect stdlib filesystem probe and process-state callables such as `pathlib` metadata methods, `decimal.setcontext`, and `gc.disable` during pickle scans, while keeping local container mutations clean and covering public `operator.setitem` registry poisoning.
+- **pickle:** detect stdlib filesystem probe and process-state callables such as `pathlib` metadata methods, `decimal.setcontext`, and `gc.disable` during pickle scans, while keeping local container mutations clean and covering public `operator.setitem` registry poisoning plus target-aware `operator.imul` warning-filter mutation.
+- **pickle:** detect public `operator.setitem` pickle calls, keep callable
+  invocation aliases ahead of import-reference budget exhaustion, dedupe repeated
+  invocation metadata before the reporting cap, preserve literal mapping-key
+  shadowing through `ChainMap`, block deeply wrapped `defaultdict` factories,
+  and avoid outer-function call-graph false positives from nested function and
+  lambda bodies.
 - **security:** prevent HuggingFace whitelist provenance from downgrading active payload, CVE, traversal, executable, operational-error, or incomplete-coverage findings. Exemptions now cover S1xx code-execution primitives (`S101`–`S115`) and HIGH-severity S3xx network primitives (`S301`/`S304`/`S305`/`S310`), and the keyword fallback uses word-boundary matching so substrings like "executable" inside "ExecuTorch" no longer over-suppress legitimate downgrades.
 - **security:** scan generic ZIP/TAR/NPZ Python members and ZIP/TAR/NPZ executable members, including wildcard imports and callable rebindings while failing closed on malformed Python source. Findings carry accurate rule codes per risk category (`S101` for `os.system`/`os.popen`, `S103` for `subprocess.*`, `S104` for `eval`/`exec`, `S106` for `__import__`, `S107` for `importlib.import_module`, `S213` for `pickle.load`/`pickle.loads`) instead of a single catch-all, the ZIP path now honors `max_mar_python_analysis_bytes` for non-MAR Python members, and source bytes are parsed directly so PEP 263 encoding declarations are respected.
 - **security:** bound PyTorch ZIP JIT/network member reads (default 32 MiB per-member cap, configurable via `max_jit_scan_member_bytes`) and mark oversized or unreadable member coverage inconclusive. Oversize and read-failure events are aggregated into a single summary INFO check per kind (with per-member detail in `details["entries"]`) so adversarial archives cannot flood the checks list, duplicate-name entries are de-duplicated by `ZipInfo` identity rather than filename so the second of two same-name members is still analyzed, directory entries are skipped explicitly, and pickle members continue through the bounded JIT/network pass so padded payloads remain covered beyond the pickle scanner raw window.

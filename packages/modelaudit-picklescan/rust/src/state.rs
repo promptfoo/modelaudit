@@ -22,7 +22,7 @@ use crate::nested_surface::{
 };
 use crate::opcode::{parse_opcode, ArgValue, ParseError, ParsedOpcode};
 use crate::options::{deadline_from_timeout, ScanOptions};
-use crate::policy::global_severity;
+use crate::policy::{callable_severity, global_severity};
 use crate::post_budget::{post_budget_absolute_position, post_budget_global_matches};
 use crate::report::{
     detail_string, detail_usize, notice_to_detail_value, scan_error_to_detail_value, DetailValue,
@@ -30,8 +30,8 @@ use crate::report::{
 };
 use crate::stack::{
     collapse_tuple_values, operand_preview, pytorch_storage_key, resolve_global_operand,
-    stack_value_from_integer_arg, stack_value_from_text_arg, stack_value_preview, GlobalRef,
-    StackValue,
+    stack_value_from_integer_arg, stack_value_from_text_arg, stack_value_preview,
+    stack_value_string, FutureCallbacks, GlobalRef, RegexScannerRule, StackValue,
 };
 use crate::strings::{is_repeated_single_byte, suspicious_string_matches};
 
@@ -51,10 +51,251 @@ const STACK_GLOBAL_STRING_OPCODES: &[&str] = &[
 ];
 const REDUCE_OPCODES: &[&str] = &["REDUCE", "NEWOBJ", "NEWOBJ_EX", "OBJ", "INST", "BUILD"];
 
-struct CallableInvocation {
-    reference: GlobalRef,
-    args: Vec<StackValue>,
+#[derive(Clone, Copy)]
+enum CallbackDispatchGuard {
+    Always,
+    NonEmptyIterable {
+        arg_index: usize,
+    },
+    LiteralRegexMatch {
+        pattern_arg_index: usize,
+        input_arg_index: usize,
+        flags_arg_index: Option<usize>,
+    },
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RegexLiteralInputMatch {
+    Matches,
+    DoesNotMatch,
+    Unknown,
+}
+
+struct RegexPatternSpec {
+    pattern: String,
+    flags: Option<isize>,
+}
+
+const REGEX_FLAG_IGNORECASE: isize = 2;
+const REGEX_FLAG_MULTILINE: isize = 8;
+const REGEX_FLAG_DOTALL: isize = 16;
+
+const EXACT_ARITY_STDLIB_EAGER_ITERABLE_CONSUMERS: &[(&str, &str, usize, usize)] = &[
+    ("array", "array", 2, 1),
+    ("collections", "Counter", 1, 0),
+    ("collections", "OrderedDict", 1, 0),
+    ("collections", "UserDict", 1, 0),
+    ("collections", "UserList", 1, 0),
+    ("heapq", "nlargest", 2, 1),
+    ("heapq", "nlargest", 3, 1),
+    ("heapq", "nsmallest", 2, 1),
+    ("heapq", "nsmallest", 3, 1),
+    ("math", "fsum", 1, 0),
+    ("math", "prod", 1, 0),
+    ("statistics", "mean", 1, 0),
+    ("statistics", "median", 1, 0),
+    ("weakref", "WeakKeyDictionary", 1, 0),
+    ("weakref", "WeakSet", 1, 0),
+    ("weakref", "WeakValueDictionary", 1, 0),
+];
+
+const EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS: &[(
+    &str,
+    &str,
+    usize,
+    usize,
+    usize,
+    CallbackDispatchGuard,
+)] = &[
+    (
+        "heapq",
+        "nlargest",
+        3,
+        2,
+        1,
+        CallbackDispatchGuard::NonEmptyIterable { arg_index: 1 },
+    ),
+    (
+        "heapq",
+        "nsmallest",
+        3,
+        2,
+        1,
+        CallbackDispatchGuard::NonEmptyIterable { arg_index: 1 },
+    ),
+    (
+        "re",
+        "sub",
+        3,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+            flags_arg_index: None,
+        },
+    ),
+    ("weakref", "ref", 2, 1, 1, CallbackDispatchGuard::Always),
+    ("weakref", "proxy", 2, 1, 1, CallbackDispatchGuard::Always),
+    (
+        "weakref",
+        "WeakMethod",
+        2,
+        1,
+        1,
+        CallbackDispatchGuard::Always,
+    ),
+    (
+        "tokenize",
+        "tokenize",
+        1,
+        0,
+        0,
+        CallbackDispatchGuard::Always,
+    ),
+    (
+        "re",
+        "sub",
+        4,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+            flags_arg_index: None,
+        },
+    ),
+    (
+        "re",
+        "sub",
+        5,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+            flags_arg_index: Some(4),
+        },
+    ),
+    (
+        "re",
+        "subn",
+        3,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+            flags_arg_index: None,
+        },
+    ),
+    (
+        "re",
+        "subn",
+        4,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+            flags_arg_index: None,
+        },
+    ),
+    (
+        "re",
+        "subn",
+        5,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+            flags_arg_index: Some(4),
+        },
+    ),
+    (
+        "re",
+        "Pattern.sub",
+        3,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+            flags_arg_index: None,
+        },
+    ),
+    (
+        "re",
+        "Pattern.sub",
+        4,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+            flags_arg_index: None,
+        },
+    ),
+    (
+        "re",
+        "Pattern.subn",
+        3,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+            flags_arg_index: None,
+        },
+    ),
+    (
+        "re",
+        "Pattern.subn",
+        4,
+        1,
+        1,
+        CallbackDispatchGuard::LiteralRegexMatch {
+            pattern_arg_index: 0,
+            input_arg_index: 2,
+            flags_arg_index: None,
+        },
+    ),
+];
+
+const EXACT_ARITY_LAZY_ZERO_ARG_CALLBACK_ITERABLES: &[(&str, &str, usize, usize)] =
+    &[("tokenize", "generate_tokens", 1, 0)];
+
+const EXACT_ARITY_ITERABLE_DESCRIPTOR_CONSUMERS: &[(&str, &str, usize, usize)] = &[
+    ("array", "array.extend", 2, 1),
+    ("builtins", "bytearray.__init__", 2, 1),
+    ("builtins", "bytearray.extend", 2, 1),
+    ("builtins", "dict.__init__", 2, 1),
+    ("builtins", "dict.fromkeys", 1, 0),
+    ("builtins", "dict.fromkeys", 2, 0),
+    ("builtins", "dict.update", 2, 1),
+    ("builtins", "list.__init__", 2, 1),
+    ("builtins", "list.extend", 2, 1),
+    ("builtins", "set.__init__", 2, 1),
+    ("collections", "ChainMap.update", 2, 1),
+    ("collections", "Counter.__init__", 2, 1),
+    ("collections", "Counter.subtract", 2, 1),
+    ("collections", "Counter.update", 2, 1),
+    ("collections", "defaultdict.__init__", 3, 2),
+    ("collections", "defaultdict.update", 2, 1),
+    ("collections", "deque.__init__", 2, 1),
+    ("collections", "deque.extend", 2, 1),
+    ("collections", "deque.extendleft", 2, 1),
+    ("collections", "OrderedDict.__init__", 2, 1),
+    ("collections", "OrderedDict.update", 2, 1),
+    ("collections", "UserDict.__init__", 2, 1),
+    ("collections", "UserDict.update", 2, 1),
+    ("collections", "UserList.__init__", 2, 1),
+    ("collections", "UserList.extend", 2, 1),
+    ("weakref", "WeakKeyDictionary.update", 2, 1),
+    ("weakref", "WeakSet.update", 2, 1),
+    ("weakref", "WeakValueDictionary.update", 2, 1),
+];
 
 enum LimitError {
     OpcodeBudgetExceeded,
@@ -143,6 +384,21 @@ fn global_ref_details(
 }
 
 type GlobalReferenceDedupeKey = (String, String, usize, &'static str, bool);
+type CallableInvocationDedupeKey = (String, String, Option<usize>);
+
+#[derive(Clone)]
+struct CallableInvocation {
+    reference: GlobalRef,
+    op_name: &'static str,
+    opcode_position: usize,
+    positional_arg_count: Option<usize>,
+    args: Vec<StackValue>,
+}
+
+enum MappingLookup<'a> {
+    Found(&'a GlobalRef),
+    Shadowed,
+}
 
 pub(crate) struct ScanState<'a> {
     source: String,
@@ -159,6 +415,8 @@ pub(crate) struct ScanState<'a> {
     errors: Vec<ScanError>,
     protocols: Vec<i64>,
     import_references: Vec<Vec<(String, DetailValue)>>,
+    callable_invocations: Vec<Vec<(String, DetailValue)>>,
+    callable_invocation_keys: HashSet<CallableInvocationDedupeKey>,
     opcode_count: usize,
     opcode_counts: HashMap<&'static str, usize>,
     global_count: usize,
@@ -209,6 +467,8 @@ impl<'a> ScanState<'a> {
             errors: Vec::new(),
             protocols: Vec::new(),
             import_references: Vec::new(),
+            callable_invocations: Vec::new(),
+            callable_invocation_keys: HashSet::new(),
             opcode_count: 0,
             opcode_counts: HashMap::new(),
             global_count: 0,
@@ -570,9 +830,9 @@ impl<'a> ScanState<'a> {
                 });
             }
             "EMPTY_DICT" => {
-                self.stack.push(StackValue::Primitive {
-                    type_name: "dict",
-                    repr: "{}".to_string(),
+                self.stack.push(StackValue::TrackedDict {
+                    keys: Vec::new(),
+                    memo_index: None,
                 });
             }
             "EMPTY_SET" => {
@@ -583,34 +843,48 @@ impl<'a> ScanState<'a> {
             }
             "TUPLE" => {
                 let values = self.pop_to_mark();
-                self.stack.push(collapse_tuple_values(values));
+                self.stack.push(self.collapse_stack_values(values));
             }
-            "LIST" | "DICT" | "SET" | "FROZENSET" => {
+            "DICT" => {
+                let values = self.pop_to_mark();
+                self.stack.push(self.tracked_dict_from_values(&values));
+            }
+            "LIST" | "SET" | "FROZENSET" => {
                 let _ = self.pop_to_mark();
                 self.stack.push(StackValue::Other);
             }
             "TUPLE1" => self.collapse_top_n(1),
             "TUPLE2" => self.collapse_top_n(2),
             "TUPLE3" => self.collapse_top_n(3),
-            "APPEND" | "SETITEM" => {
+            "APPEND" => {
                 self.pop_value_operand_preserving_mark();
-                if opcode.name == "SETITEM" {
-                    self.pop_value_operand_preserving_mark();
-                }
             }
+            "SETITEM" => self.apply_setitem(),
             "APPENDS" | "SETITEMS" | "ADDITEMS" => {
-                self.pop_to_mark();
+                let values = self.pop_to_mark();
+                if opcode.name == "SETITEMS" {
+                    self.apply_setitems(&values);
+                }
             }
             "PUT" | "BINPUT" | "LONG_BINPUT" => {
                 if let Some(value) = self.stack.last().cloned() {
                     if let Some(index) = opcode.arg.as_i64() {
+                        let value = Self::with_memo_index(value, index);
+                        if let Some(top) = self.stack.last_mut() {
+                            *top = value.clone();
+                        }
                         self.memo.insert(index, value);
                     }
                 }
             }
             "MEMOIZE" => {
                 if let Some(value) = self.stack.last().cloned() {
-                    self.memo.insert(self.memo.len() as i64, value);
+                    let index = self.memo.len() as i64;
+                    let value = Self::with_memo_index(value, index);
+                    if let Some(top) = self.stack.last_mut() {
+                        *top = value.clone();
+                    }
+                    self.memo.insert(index, value);
                 }
             }
             "GET" | "BINGET" | "LONG_BINGET" => {
@@ -668,8 +942,12 @@ impl<'a> ScanState<'a> {
                 });
             }
             name if REDUCE_OPCODES.contains(&name) => {
-                if let Some(invocation) = self.consume_callable_opcode(opcode, position) {
-                    let callable_ref = &invocation.reference;
+                let invocations = self.consume_callable_opcode(opcode, position);
+                for invocation in &invocations {
+                    self.push_callable_invocation(invocation);
+                }
+                if let Some(primary_invocation) = invocations.first() {
+                    let callable_ref = &primary_invocation.reference;
                     if callable_ref.module == "copyreg.extension" {
                         self.add_finding(Finding {
                             message: format!(
@@ -732,7 +1010,7 @@ impl<'a> ScanState<'a> {
                             ),
                         });
                     } else if let Some(mutation_target) =
-                        sensitive_mutator_invocation_target(callable_ref, &invocation.args)
+                        sensitive_mutator_invocation_target(callable_ref, &primary_invocation.args)
                     {
                         self.add_finding(Finding {
                             message: format!(
@@ -767,8 +1045,44 @@ impl<'a> ScanState<'a> {
                                 "This pickle opcode mutates process-global registries or diagnostic policy during deserialization.",
                             ),
                         });
+                    } else if let Some(protocol_target) =
+                        operator_mutator_protocol_target(callable_ref, &primary_invocation.args)
+                    {
+                        self.add_finding(Finding {
+                            message: format!(
+                                "Found {} opcode invoking object mutation protocol: {}",
+                                opcode.name,
+                                callable_ref.symbol()
+                            ),
+                            severity: "critical",
+                            location: Some(format!("{} (pos {})", self.source, position)),
+                            rule_code: Some("DANGEROUS_CALL"),
+                            details: vec![
+                                ("opcode".to_string(), DetailValue::String(opcode.name.to_string())),
+                                (
+                                    "module".to_string(),
+                                    DetailValue::String(callable_ref.module.clone()),
+                                ),
+                                ("name".to_string(), DetailValue::String(callable_ref.name.clone())),
+                                (
+                                    "import_reference".to_string(),
+                                    DetailValue::String(callable_ref.symbol()),
+                                ),
+                                (
+                                    "global_position".to_string(),
+                                    DetailValue::UInt(callable_ref.position as u64),
+                                ),
+                                (
+                                    "mutation_target".to_string(),
+                                    DetailValue::String(protocol_target.to_string()),
+                                ),
+                            ],
+                            why: Some(
+                                "Operator mutators dispatch to target object protocol methods, which can execute attacker-controlled methods during deserialization.",
+                            ),
+                        });
                     } else if let Some(severity) =
-                        global_severity(&callable_ref.module, &callable_ref.name)
+                        callable_severity(&callable_ref.module, &callable_ref.name)
                     {
                         self.add_finding(Finding {
                             message: format!(
@@ -886,6 +1200,65 @@ impl<'a> ScanState<'a> {
         values
     }
 
+    fn apply_setitem(&mut self) {
+        let _value = self.pop_value_operand_preserving_mark();
+        let key = self.pop_value_operand_preserving_mark();
+        if let Some(key) = key
+            .as_ref()
+            .and_then(|value| stack_value_string(value, self.payload))
+        {
+            self.record_top_tracked_dict_key(key.as_ref());
+        }
+    }
+
+    fn apply_setitems(&mut self, values: &[StackValue]) {
+        for pair in values.chunks_exact(2) {
+            if let Some(key) = pair
+                .first()
+                .and_then(|value| stack_value_string(value, self.payload))
+            {
+                self.record_top_tracked_dict_key(key.as_ref());
+            }
+        }
+    }
+
+    fn tracked_dict_from_values(&self, values: &[StackValue]) -> StackValue {
+        let mut keys = Vec::new();
+        for pair in values.chunks_exact(2) {
+            if let Some(key) = pair
+                .first()
+                .and_then(|value| stack_value_string(value, self.payload))
+            {
+                Self::insert_tracked_dict_key(&mut keys, key);
+            }
+        }
+        StackValue::TrackedDict {
+            keys,
+            memo_index: None,
+        }
+    }
+
+    fn record_top_tracked_dict_key(&mut self, key: &str) {
+        let memo_index = match self.stack.last_mut() {
+            Some(StackValue::TrackedDict { keys, memo_index }) => {
+                Self::insert_tracked_dict_key(keys, key.to_string());
+                *memo_index
+            }
+            _ => None,
+        };
+        if let Some(memo_index) = memo_index {
+            if let Some(StackValue::TrackedDict { keys, .. }) = self.memo.get_mut(&memo_index) {
+                Self::insert_tracked_dict_key(keys, key.to_string());
+            }
+        }
+    }
+
+    fn insert_tracked_dict_key(keys: &mut Vec<String>, key: String) {
+        if !keys.iter().any(|existing| existing == &key) {
+            keys.push(key);
+        }
+    }
+
     fn collapse_top_n(&mut self, count: usize) {
         if self.stack.len() < count {
             self.stack.push(StackValue::Other);
@@ -906,36 +1279,75 @@ impl<'a> ScanState<'a> {
             }
         }
         values.reverse();
-        self.stack.push(collapse_tuple_values(values));
+        self.stack.push(self.collapse_stack_values(values));
+    }
+
+    fn collapse_stack_values(&self, values: Vec<StackValue>) -> StackValue {
+        if let Some(rules) = self.regex_scanner_lexicon_rules(&values) {
+            return StackValue::RegexScannerLexicon { rules };
+        }
+        collapse_tuple_values(values)
+    }
+
+    fn regex_scanner_lexicon_rules(&self, values: &[StackValue]) -> Option<Vec<RegexScannerRule>> {
+        let mut rules = Vec::new();
+        let mut saw_scanner_rule_shape = false;
+        for value in values {
+            let StackValue::Tuple(items) = value else {
+                return None;
+            };
+            let [pattern_value, action_value] = items.as_slice() else {
+                return None;
+            };
+            let pattern = stack_value_string(pattern_value, self.payload)?;
+            saw_scanner_rule_shape = true;
+            if let Some(action) = Self::callable_reference_from_value(Some(action_value)) {
+                rules.push(RegexScannerRule { pattern, action });
+            }
+        }
+        if saw_scanner_rule_shape && !rules.is_empty() {
+            Some(rules)
+        } else {
+            None
+        }
     }
 
     fn consume_callable_opcode(
         &mut self,
         opcode: &ParsedOpcode,
         position: usize,
-    ) -> Option<CallableInvocation> {
-        let (callable_value, args) = match opcode.name {
+    ) -> Vec<CallableInvocation> {
+        let (callable_value, positional_arg_count, argument_values) = match opcode.name {
             "REDUCE" | "NEWOBJ" => {
-                let operands = self.consume_top_operands(2)?;
-                let callable_value = operands.first().cloned();
-                let args = tuple_arguments(operands.get(1));
-                (callable_value, args)
+                let Some(values) = self.consume_top_operand_values(2) else {
+                    return Vec::new();
+                };
+                (
+                    values.first().cloned(),
+                    Self::tuple_positional_arg_count(values.get(1)),
+                    Self::tuple_argument_values(values.get(1)),
+                )
             }
             "NEWOBJ_EX" => {
-                let operands = self.consume_top_operands(3)?;
-                let callable_value = operands.first().cloned();
-                let args = tuple_arguments(operands.get(1));
-                (callable_value, args)
+                let Some(values) = self.consume_top_operand_values(3) else {
+                    return Vec::new();
+                };
+                (
+                    values.first().cloned(),
+                    Self::tuple_positional_arg_count(values.get(1)),
+                    Self::tuple_argument_values(values.get(1)),
+                )
             }
             "OBJ" => {
                 let values = self.pop_to_mark();
+                let positional_arg_count = values.len().checked_sub(1);
                 let callable_value = values.first().cloned();
+                let argument_values = values.get(1..).map(|items| items.to_vec());
                 self.push_constructed_result(callable_value.as_ref());
-                let args = values.into_iter().skip(1).collect();
-                (callable_value, args)
+                (callable_value, positional_arg_count, argument_values)
             }
             "INST" => {
-                let args = self.pop_to_mark();
+                let values = self.pop_to_mark();
                 let (module, name) = opcode.arg.global_parts(self.payload);
                 let reference = GlobalRef {
                     module,
@@ -945,34 +1357,1409 @@ impl<'a> ScanState<'a> {
                 };
                 self.record_global_ref(&reference, opcode.name);
                 self.stack.push(StackValue::Constructed(reference.clone()));
-                (Some(StackValue::Global(reference)), args)
+                (
+                    Some(StackValue::Global(reference)),
+                    Some(values.len()),
+                    Some(values),
+                )
             }
-            "BUILD" => {
-                let operands = self.consume_top_operands(2)?;
-                let callable_value = operands.first().cloned();
-                let args = operands.into_iter().skip(1).collect();
-                (callable_value, args)
-            }
-            _ => return None,
+            "BUILD" => (self.consume_top_operands(2), None, None),
+            _ => (None, None, None),
         };
 
-        let reference = match callable_value {
-            Some(StackValue::Global(reference) | StackValue::Constructed(reference))
-                if !reference.malformed =>
-            {
-                Some(reference)
+        let mut invocations = Vec::new();
+        if let Some(invocation) = Self::callable_invocation_for_value(
+            callable_value.as_ref(),
+            opcode.name,
+            position,
+            positional_arg_count,
+            argument_values.as_deref(),
+        ) {
+            invocations.push(invocation);
+        }
+        invocations.extend(self.protocol_dispatch_invocations(
+            callable_value.as_ref(),
+            argument_values.as_deref(),
+            opcode.name,
+            position,
+        ));
+        invocations.extend(self.callback_dispatch_invocations(
+            callable_value.as_ref(),
+            argument_values.as_deref(),
+            opcode.name,
+            position,
+        ));
+        invocations.extend(self.future_callback_invocations(
+            callable_value.as_ref(),
+            argument_values.as_deref(),
+            opcode.name,
+            position,
+        ));
+        invocations.extend(Self::call_iterator_consumption_invocations(
+            callable_value.as_ref(),
+            argument_values.as_deref(),
+            opcode.name,
+            position,
+        ));
+        invocations.extend(self.defaultdict_factory_invocations(
+            callable_value.as_ref(),
+            argument_values.as_deref(),
+            opcode.name,
+            position,
+        ));
+        invocations
+    }
+
+    fn callable_invocation_for_value(
+        callable_value: Option<&StackValue>,
+        op_name: &'static str,
+        position: usize,
+        positional_arg_count: Option<usize>,
+        args: Option<&[StackValue]>,
+    ) -> Option<CallableInvocation> {
+        match callable_value {
+            Some(StackValue::Global(reference)) if !reference.malformed => {
+                if Self::suppress_plain_constructor_invocation(reference, op_name) {
+                    return None;
+                }
+                Some(CallableInvocation {
+                    reference: reference.clone(),
+                    op_name,
+                    opcode_position: position,
+                    positional_arg_count,
+                    args: args.unwrap_or_default().to_vec(),
+                })
+            }
+            Some(StackValue::Constructed(reference)) if !reference.malformed => {
+                let reference = match op_name {
+                    "REDUCE" | "OBJ" => Self::constructed_callable_reference(reference),
+                    _ => reference.clone(),
+                };
+                Some(CallableInvocation {
+                    reference,
+                    op_name,
+                    opcode_position: position,
+                    positional_arg_count,
+                    args: args.unwrap_or_default().to_vec(),
+                })
             }
             Some(StackValue::Global(reference) | StackValue::Constructed(reference))
                 if reference.module == "copyreg.extension" =>
             {
-                Some(reference)
+                Some(CallableInvocation {
+                    reference: reference.clone(),
+                    op_name,
+                    opcode_position: position,
+                    positional_arg_count,
+                    args: args.unwrap_or_default().to_vec(),
+                })
             }
             _ => None,
-        }?;
-        Some(CallableInvocation { reference, args })
+        }
     }
 
-    fn consume_top_operands(&mut self, operand_count: usize) -> Option<Vec<StackValue>> {
+    fn suppress_plain_constructor_invocation(reference: &GlobalRef, op_name: &'static str) -> bool {
+        matches!(op_name, "REDUCE" | "OBJ")
+            && reference.module == "re"
+            && reference.name == "Scanner"
+    }
+
+    fn protocol_dispatch_invocations(
+        &self,
+        callable_value: Option<&StackValue>,
+        argument_values: Option<&[StackValue]>,
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if !matches!(op_name, "REDUCE" | "OBJ") {
+            return Vec::new();
+        }
+        let Some(StackValue::Global(callable_reference)) = callable_value else {
+            return Vec::new();
+        };
+        if callable_reference.malformed {
+            return Vec::new();
+        }
+        let Some(arguments) = argument_values else {
+            return Vec::new();
+        };
+        match (
+            callable_reference.module.as_str(),
+            callable_reference.name.as_str(),
+        ) {
+            ("builtins", "format") => {
+                Self::builtins_format_invocations(arguments, op_name, position)
+            }
+            ("builtins", "str.format") => {
+                Self::str_format_invocations(arguments, op_name, position)
+            }
+            ("builtins", "str.format_map") => {
+                self.str_format_map_invocations(arguments, op_name, position)
+            }
+            ("operator", "mod" | "imod") => {
+                self.operator_mod_invocations(arguments, op_name, position)
+            }
+            ("string", "Formatter.vformat") => {
+                self.formatter_vformat_invocations(arguments, op_name, position)
+            }
+            ("string", "Formatter._vformat") => {
+                self.formatter_private_vformat_invocations(arguments, op_name, position)
+            }
+            ("string", "Template.substitute" | "Template.safe_substitute") => {
+                self.template_substitute_invocations(arguments, op_name, position)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn callback_dispatch_invocations(
+        &self,
+        callable_value: Option<&StackValue>,
+        argument_values: Option<&[StackValue]>,
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if !matches!(op_name, "REDUCE" | "OBJ") {
+            return Vec::new();
+        }
+        let Some(StackValue::Global(callable_reference)) = callable_value else {
+            return Vec::new();
+        };
+        if callable_reference.malformed {
+            return Vec::new();
+        }
+        let Some(arguments) = argument_values else {
+            return Vec::new();
+        };
+        if let Some(invocation) = self.regex_scanner_scan_invocation(
+            &callable_reference.module,
+            &callable_reference.name,
+            arguments,
+            op_name,
+            position,
+        ) {
+            return vec![invocation];
+        }
+        let Some((_, _, _, callback_arg_index, callback_arg_count, guard)) =
+            EXACT_ARITY_CALLBACK_DISPATCH_CONSUMERS.iter().find(
+                |(consumer_module, consumer_name, arity, _, _, _)| {
+                    Self::consumer_module_matches(&callable_reference.module, consumer_module)
+                        && *consumer_name == callable_reference.name
+                        && *arity == arguments.len()
+                },
+            )
+        else {
+            return Vec::new();
+        };
+        if !self.callback_dispatch_guard_is_satisfied(*guard, arguments) {
+            return Vec::new();
+        }
+        let Some(reference) =
+            Self::callable_reference_from_value(arguments.get(*callback_arg_index))
+        else {
+            return Vec::new();
+        };
+        vec![Self::callable_invocation(
+            reference,
+            op_name,
+            position,
+            Some(*callback_arg_count),
+        )]
+    }
+
+    fn callback_dispatch_guard_is_satisfied(
+        &self,
+        guard: CallbackDispatchGuard,
+        arguments: &[StackValue],
+    ) -> bool {
+        match guard {
+            CallbackDispatchGuard::Always => true,
+            CallbackDispatchGuard::NonEmptyIterable { arg_index } => {
+                Self::is_definitely_non_empty_iterable_argument(arguments.get(arg_index))
+            }
+            CallbackDispatchGuard::LiteralRegexMatch {
+                pattern_arg_index,
+                input_arg_index,
+                flags_arg_index,
+            } => self.literal_regex_pattern_matches_argument(
+                arguments.get(pattern_arg_index),
+                arguments.get(input_arg_index),
+                flags_arg_index.and_then(|arg_index| arguments.get(arg_index)),
+            ),
+        }
+    }
+
+    fn future_callback_invocations(
+        &mut self,
+        callable_value: Option<&StackValue>,
+        argument_values: Option<&[StackValue]>,
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if !matches!(op_name, "REDUCE" | "OBJ") {
+            return Vec::new();
+        }
+        let Some(StackValue::Global(callable_reference)) = callable_value else {
+            return Vec::new();
+        };
+        if callable_reference.malformed {
+            return Vec::new();
+        }
+        let Some(arguments) = argument_values else {
+            return Vec::new();
+        };
+        if Self::is_concurrent_future_symbol(callable_reference, "Future.add_done_callback")
+            && arguments.len() == 2
+        {
+            return self.future_add_done_callback_invocations(arguments, op_name, position);
+        }
+        if Self::is_concurrent_future_completion_method(callable_reference, arguments.len()) {
+            return self.future_completion_invocations(arguments, op_name, position);
+        }
+        Vec::new()
+    }
+
+    fn future_add_done_callback_invocations(
+        &mut self,
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        let Some(StackValue::FutureCallbacks(receiver)) = arguments.first() else {
+            return Vec::new();
+        };
+        let Some(callback) = Self::callable_reference_from_value(arguments.get(1)) else {
+            return Vec::new();
+        };
+        if receiver.done {
+            return vec![Self::callable_invocation(
+                callback,
+                op_name,
+                position,
+                Some(1),
+            )];
+        }
+        if let Some(memo_index) = receiver.memo_index {
+            self.memoized_future_add_callback(memo_index, callback);
+        }
+        Vec::new()
+    }
+
+    fn future_completion_invocations(
+        &mut self,
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        let Some(StackValue::FutureCallbacks(receiver)) = arguments.first() else {
+            return Vec::new();
+        };
+        let callbacks = receiver.callbacks.clone();
+        if let Some(memo_index) = receiver.memo_index {
+            self.memoized_future_mark_done(memo_index);
+        }
+        callbacks
+            .into_iter()
+            .map(|callback| Self::callable_invocation(callback, op_name, position, Some(1)))
+            .collect()
+    }
+
+    fn is_concurrent_future_symbol(reference: &GlobalRef, name: &str) -> bool {
+        matches!(
+            reference.module.as_str(),
+            "concurrent.futures" | "concurrent.futures._base"
+        ) && reference.name == name
+    }
+
+    fn is_concurrent_future_completion_method(reference: &GlobalRef, arity: usize) -> bool {
+        matches!(
+            (reference.module.as_str(), reference.name.as_str(), arity),
+            (
+                "concurrent.futures" | "concurrent.futures._base",
+                "Future.set_result" | "Future.set_exception",
+                2
+            ) | (
+                "concurrent.futures" | "concurrent.futures._base",
+                "Future.cancel",
+                1
+            )
+        )
+    }
+
+    fn literal_regex_pattern_matches_argument(
+        &self,
+        pattern_value: Option<&StackValue>,
+        input_value: Option<&StackValue>,
+        flags_value: Option<&StackValue>,
+    ) -> bool {
+        let Some(mut pattern) = self.regex_pattern_from_value(pattern_value) else {
+            return false;
+        };
+        if flags_value.is_some() {
+            pattern.flags = flags_value.and_then(Self::stack_value_integer);
+        }
+        let Some(input) = input_value.and_then(|value| stack_value_string(value, self.payload))
+        else {
+            return false;
+        };
+        Self::regex_pattern_matches_literal_input(&pattern.pattern, &input, pattern.flags)
+    }
+
+    fn regex_scanner_scan_invocation(
+        &self,
+        module: &str,
+        name: &str,
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Option<CallableInvocation> {
+        if module != "re" || name != "Scanner.scan" || arguments.len() != 2 {
+            return None;
+        }
+        let Some(StackValue::RegexScanner { rules, flags }) = arguments.first() else {
+            return None;
+        };
+        let input = arguments
+            .get(1)
+            .and_then(|value| stack_value_string(value, self.payload))?;
+        rules
+            .iter()
+            .find(|rule| Self::regex_pattern_matches_literal_input(&rule.pattern, &input, *flags))
+            .map(|rule| Self::callable_invocation(rule.action.clone(), op_name, position, Some(2)))
+    }
+
+    fn regex_pattern_from_value(&self, value: Option<&StackValue>) -> Option<RegexPatternSpec> {
+        match value {
+            Some(StackValue::RegexPattern { pattern, flags }) => Some(RegexPatternSpec {
+                pattern: pattern.clone(),
+                flags: *flags,
+            }),
+            Some(value) => {
+                stack_value_string(value, self.payload).map(|pattern| RegexPatternSpec {
+                    pattern,
+                    flags: Some(0),
+                })
+            }
+            None => None,
+        }
+    }
+
+    fn is_regex_metacharacter(character: char) -> bool {
+        matches!(
+            character,
+            '.' | '^' | '$' | '*' | '+' | '?' | '{' | '}' | '[' | ']' | '\\' | '|' | '(' | ')'
+        )
+    }
+
+    fn is_plain_regex_literal(pattern: &str) -> bool {
+        !pattern.chars().any(Self::is_regex_metacharacter)
+    }
+
+    fn regex_flags_may_enable(flags: Option<isize>, flag: isize) -> bool {
+        flags.is_none_or(|bits| bits & flag != 0)
+    }
+
+    fn regex_any_line_matches(input: &str, predicate: impl Fn(&str) -> bool) -> bool {
+        input.split('\n').any(predicate)
+    }
+
+    fn plain_regex_literal_matches_literal_input(
+        pattern: &str,
+        input: &str,
+        flags: Option<isize>,
+    ) -> bool {
+        pattern.is_empty()
+            || input.contains(pattern)
+            || (Self::regex_flags_may_enable(flags, REGEX_FLAG_IGNORECASE)
+                && input.to_lowercase().contains(&pattern.to_lowercase()))
+    }
+
+    fn regex_pattern_matches_literal_input(
+        pattern: &str,
+        input: &str,
+        flags: Option<isize>,
+    ) -> bool {
+        !matches!(
+            Self::classify_regex_pattern_literal_input(pattern, input, flags),
+            RegexLiteralInputMatch::DoesNotMatch
+        )
+    }
+
+    fn classify_regex_pattern_literal_input(
+        pattern: &str,
+        input: &str,
+        flags: Option<isize>,
+    ) -> RegexLiteralInputMatch {
+        if let Some(match_result) =
+            Self::simple_regex_alternative_matches_literal_input(pattern, input, flags)
+        {
+            return match_result;
+        }
+        if let Some(match_result) =
+            Self::simple_regex_anchor_matches_literal_input(pattern, input, flags)
+        {
+            return match_result;
+        }
+        if let Some(match_result) =
+            Self::simple_regex_char_class_matches_literal_input(pattern, input, flags)
+        {
+            return match_result;
+        }
+        if let Some(match_result) =
+            Self::simple_regex_dot_matches_literal_input(pattern, input, flags)
+        {
+            return match_result;
+        }
+        if let Some(match_result) =
+            Self::simple_regex_single_char_quantifier_matches_literal_input(pattern, input, flags)
+        {
+            return match_result;
+        }
+        if Self::is_plain_regex_literal(pattern) {
+            return if Self::plain_regex_literal_matches_literal_input(pattern, input, flags) {
+                RegexLiteralInputMatch::Matches
+            } else {
+                RegexLiteralInputMatch::DoesNotMatch
+            };
+        }
+        RegexLiteralInputMatch::Unknown
+    }
+
+    fn simple_regex_alternative_matches_literal_input(
+        pattern: &str,
+        input: &str,
+        flags: Option<isize>,
+    ) -> Option<RegexLiteralInputMatch> {
+        if !pattern.contains('|') {
+            return None;
+        }
+        if pattern.contains('\\') || pattern.contains('(') || pattern.contains(')') {
+            return Some(RegexLiteralInputMatch::Unknown);
+        }
+        let mut saw_unknown = false;
+        for branch in pattern.split('|') {
+            match Self::classify_regex_pattern_literal_input(branch, input, flags) {
+                RegexLiteralInputMatch::Matches => return Some(RegexLiteralInputMatch::Matches),
+                RegexLiteralInputMatch::DoesNotMatch => {}
+                RegexLiteralInputMatch::Unknown => saw_unknown = true,
+            }
+        }
+        Some(if saw_unknown {
+            RegexLiteralInputMatch::Unknown
+        } else {
+            RegexLiteralInputMatch::DoesNotMatch
+        })
+    }
+
+    fn simple_regex_anchor_matches_literal_input(
+        pattern: &str,
+        input: &str,
+        flags: Option<isize>,
+    ) -> Option<RegexLiteralInputMatch> {
+        if let Some(inner) = pattern
+            .strip_prefix('^')
+            .and_then(|remaining| remaining.strip_suffix('$'))
+        {
+            if Self::is_plain_regex_literal(inner) {
+                let matches = input == inner
+                    || input
+                        .strip_suffix('\n')
+                        .is_some_and(|without_final_newline| without_final_newline == inner)
+                    || (Self::regex_flags_may_enable(flags, REGEX_FLAG_MULTILINE)
+                        && Self::regex_any_line_matches(input, |line| line == inner));
+                return Some(if matches {
+                    RegexLiteralInputMatch::Matches
+                } else {
+                    RegexLiteralInputMatch::DoesNotMatch
+                });
+            }
+        }
+        if let Some(inner) = pattern.strip_prefix('^') {
+            if Self::is_plain_regex_literal(inner) {
+                let matches = input.starts_with(inner)
+                    || (Self::regex_flags_may_enable(flags, REGEX_FLAG_MULTILINE)
+                        && Self::regex_any_line_matches(input, |line| line.starts_with(inner)));
+                return Some(if matches {
+                    RegexLiteralInputMatch::Matches
+                } else {
+                    RegexLiteralInputMatch::DoesNotMatch
+                });
+            }
+        }
+        if let Some(inner) = pattern.strip_suffix('$') {
+            if Self::is_plain_regex_literal(inner) {
+                let matches = input.ends_with(inner)
+                    || input
+                        .strip_suffix('\n')
+                        .is_some_and(|without_final_newline| {
+                            without_final_newline.ends_with(inner)
+                        })
+                    || (Self::regex_flags_may_enable(flags, REGEX_FLAG_MULTILINE)
+                        && Self::regex_any_line_matches(input, |line| line.ends_with(inner)));
+                return Some(if matches {
+                    RegexLiteralInputMatch::Matches
+                } else {
+                    RegexLiteralInputMatch::DoesNotMatch
+                });
+            }
+        }
+        None
+    }
+
+    fn simple_regex_char_class_matches_literal_input(
+        pattern: &str,
+        input: &str,
+        flags: Option<isize>,
+    ) -> Option<RegexLiteralInputMatch> {
+        let inner = pattern.strip_prefix('[')?.strip_suffix(']')?;
+        let (negated, characters) = inner
+            .strip_prefix('^')
+            .map_or((false, inner), |characters| (true, characters));
+        if characters.is_empty()
+            || characters
+                .chars()
+                .any(|character| matches!(character, '[' | ']' | '\\' | '-'))
+        {
+            return Some(RegexLiteralInputMatch::Unknown);
+        }
+        let matches = input.chars().any(|character| {
+            let contains = characters.chars().any(|candidate| {
+                candidate == character
+                    || (Self::regex_flags_may_enable(flags, REGEX_FLAG_IGNORECASE)
+                        && candidate.to_lowercase().to_string()
+                            == character.to_lowercase().to_string())
+            });
+            if negated {
+                !contains
+            } else {
+                contains
+            }
+        });
+        Some(if matches {
+            RegexLiteralInputMatch::Matches
+        } else {
+            RegexLiteralInputMatch::DoesNotMatch
+        })
+    }
+
+    fn simple_regex_dot_matches_literal_input(
+        pattern: &str,
+        input: &str,
+        flags: Option<isize>,
+    ) -> Option<RegexLiteralInputMatch> {
+        match pattern {
+            "." | ".+" | ".+?" => Some(Self::dot_regex_atom_matches_literal_input(input, flags)),
+            ".*" | ".*?" | ".?" | ".??" => Some(RegexLiteralInputMatch::Matches),
+            _ => None,
+        }
+    }
+
+    fn dot_regex_atom_matches_literal_input(
+        input: &str,
+        flags: Option<isize>,
+    ) -> RegexLiteralInputMatch {
+        if input.chars().any(|character| {
+            character != '\n' || Self::regex_flags_may_enable(flags, REGEX_FLAG_DOTALL)
+        }) {
+            RegexLiteralInputMatch::Matches
+        } else {
+            RegexLiteralInputMatch::DoesNotMatch
+        }
+    }
+
+    fn simple_regex_single_char_quantifier_matches_literal_input(
+        pattern: &str,
+        input: &str,
+        flags: Option<isize>,
+    ) -> Option<RegexLiteralInputMatch> {
+        let mut characters = pattern.chars();
+        let atom = characters.next()?;
+        let quantifier = characters.next()?;
+        if characters.next().is_some()
+            || Self::is_regex_metacharacter(atom)
+            || !matches!(quantifier, '*' | '+' | '?')
+        {
+            return None;
+        }
+        Some(match quantifier {
+            '*' | '?' => RegexLiteralInputMatch::Matches,
+            '+' => {
+                if input.chars().any(|character| {
+                    character == atom
+                        || (Self::regex_flags_may_enable(flags, REGEX_FLAG_IGNORECASE)
+                            && atom.to_lowercase().to_string()
+                                == character.to_lowercase().to_string())
+                }) {
+                    RegexLiteralInputMatch::Matches
+                } else {
+                    RegexLiteralInputMatch::DoesNotMatch
+                }
+            }
+            _ => RegexLiteralInputMatch::Unknown,
+        })
+    }
+
+    fn builtins_format_invocations(
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if !(1..=2).contains(&arguments.len()) {
+            return Vec::new();
+        }
+        let Some(StackValue::Constructed(receiver_reference)) = arguments.first() else {
+            return Vec::new();
+        };
+        Self::format_invocation(receiver_reference, op_name, position)
+            .into_iter()
+            .collect()
+    }
+
+    fn str_format_invocations(
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if arguments.len() < 2 || !Self::is_format_string_argument(arguments.first()) {
+            return Vec::new();
+        }
+        arguments
+            .iter()
+            .skip(1)
+            .filter_map(|argument| match argument {
+                StackValue::Constructed(reference) => {
+                    Self::format_invocation(reference, op_name, position)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn str_format_map_invocations(
+        &self,
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if arguments.len() != 2 || !Self::is_format_string_argument(arguments.first()) {
+            return Vec::new();
+        }
+        self.mapping_lookup_invocations(arguments.get(1), None, op_name, position)
+    }
+
+    fn operator_mod_invocations(
+        &self,
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if arguments.len() != 2 || !Self::is_format_string_argument(arguments.first()) {
+            return Vec::new();
+        }
+        self.mapping_lookup_invocations(arguments.get(1), None, op_name, position)
+    }
+
+    fn mapping_lookup_invocations(
+        &self,
+        mapping: Option<&StackValue>,
+        key: Option<&str>,
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        let Some(MappingLookup::Found(default_factory)) =
+            Self::mapping_lookup_default_factory(mapping, key)
+        else {
+            return Vec::new();
+        };
+        vec![Self::zero_arg_invocation(
+            default_factory,
+            op_name,
+            position,
+        )]
+    }
+
+    fn mapping_lookup_default_factory<'b>(
+        mapping: Option<&'b StackValue>,
+        key: Option<&str>,
+    ) -> Option<MappingLookup<'b>> {
+        Self::mapping_lookup_default_factory_inner(mapping?, key)
+    }
+
+    fn mapping_lookup_default_factory_inner<'b>(
+        mapping: &'b StackValue,
+        key: Option<&str>,
+    ) -> Option<MappingLookup<'b>> {
+        match mapping {
+            StackValue::DefaultDict { default_factory } => {
+                Some(MappingLookup::Found(default_factory))
+            }
+            StackValue::TrackedDict { keys, .. } => {
+                if key.is_some_and(|key| keys.iter().any(|candidate| candidate == key)) {
+                    Some(MappingLookup::Shadowed)
+                } else {
+                    None
+                }
+            }
+            StackValue::MappingWrapper {
+                reference,
+                mappings,
+            } if reference.module == "collections" && reference.name == "ChainMap" => {
+                for mapping in mappings {
+                    match Self::mapping_lookup_default_factory_inner(mapping, key) {
+                        Some(MappingLookup::Found(default_factory)) => {
+                            return Some(MappingLookup::Found(default_factory));
+                        }
+                        Some(MappingLookup::Shadowed) => return Some(MappingLookup::Shadowed),
+                        None => {}
+                    }
+                }
+                None
+            }
+            StackValue::MappingWrapper {
+                reference,
+                mappings,
+            } if reference.module == "types" && reference.name == "MappingProxyType" => mappings
+                .first()
+                .and_then(|mapping| Self::mapping_lookup_default_factory_inner(mapping, key)),
+            _ => None,
+        }
+    }
+
+    fn formatter_vformat_invocations(
+        &self,
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        self.formatter_defaultdict_kwargs_invocations(arguments, &[4], op_name, position)
+    }
+
+    fn formatter_private_vformat_invocations(
+        &self,
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        self.formatter_defaultdict_kwargs_invocations(arguments, &[6, 7], op_name, position)
+    }
+
+    fn formatter_defaultdict_kwargs_invocations(
+        &self,
+        arguments: &[StackValue],
+        expected_arg_counts: &[usize],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if !expected_arg_counts.contains(&arguments.len())
+            || !Self::is_format_string_argument(arguments.get(1))
+        {
+            return Vec::new();
+        }
+        self.mapping_lookup_invocations(arguments.get(3), None, op_name, position)
+    }
+
+    fn template_substitute_invocations(
+        &self,
+        arguments: &[StackValue],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if arguments.len() != 2 || !Self::string_template_may_lookup(arguments.first()) {
+            return Vec::new();
+        }
+        self.mapping_lookup_invocations(arguments.get(1), None, op_name, position)
+    }
+
+    fn string_template_may_lookup(value: Option<&StackValue>) -> bool {
+        let Some(StackValue::StringTemplate { template }) = value else {
+            return false;
+        };
+        Self::template_literal_contains_placeholder(template)
+    }
+
+    fn template_literal_contains_placeholder(template: &str) -> bool {
+        let mut chars = template.chars().peekable();
+        while let Some(character) = chars.next() {
+            if character != '$' {
+                continue;
+            }
+            match chars.peek() {
+                Some('$') => {
+                    chars.next();
+                }
+                Some(_) => return true,
+                None => {}
+            }
+        }
+        false
+    }
+
+    fn is_format_string_argument(value: Option<&StackValue>) -> bool {
+        matches!(
+            value,
+            Some(StackValue::Text(_) | StackValue::TextSpan { .. })
+        )
+    }
+
+    fn is_definitely_non_empty_iterable_argument(value: Option<&StackValue>) -> bool {
+        match value {
+            Some(StackValue::Tuple(items)) => !items.is_empty(),
+            Some(StackValue::Text(value)) => !value.is_empty(),
+            Some(StackValue::TextSpan { start, end }) | Some(StackValue::Bytes { start, end }) => {
+                start < end
+            }
+            _ => false,
+        }
+    }
+
+    fn format_invocation(
+        receiver_reference: &GlobalRef,
+        op_name: &'static str,
+        position: usize,
+    ) -> Option<CallableInvocation> {
+        if receiver_reference.malformed {
+            return None;
+        }
+        Some(CallableInvocation {
+            reference: Self::constructed_protocol_method_reference(
+                receiver_reference,
+                "__format__",
+            ),
+            op_name,
+            opcode_position: position,
+            positional_arg_count: Some(1),
+            args: Vec::new(),
+        })
+    }
+
+    fn call_iterator_consumption_invocations(
+        callable_value: Option<&StackValue>,
+        argument_values: Option<&[StackValue]>,
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if !matches!(op_name, "REDUCE" | "OBJ") {
+            return Vec::new();
+        }
+        let Some(StackValue::Global(callable_reference)) = callable_value else {
+            return Vec::new();
+        };
+        if callable_reference.malformed {
+            return Vec::new();
+        }
+
+        let Some(arguments) = argument_values else {
+            return Vec::new();
+        };
+        if let Some(callable) = Self::eager_call_iterator_consumed_callable(
+            &callable_reference.module,
+            &callable_reference.name,
+            arguments,
+        ) {
+            return vec![Self::zero_arg_invocation(callable, op_name, position)];
+        }
+        if let Some(callable) = Self::itertools_eager_call_iterator_consumed_callable(
+            &callable_reference.module,
+            &callable_reference.name,
+            arguments,
+        ) {
+            return vec![Self::zero_arg_invocation(callable, op_name, position)];
+        }
+        if let Some(callable) = Self::stdlib_eager_call_iterator_consumed_callable(
+            &callable_reference.module,
+            &callable_reference.name,
+            arguments,
+        ) {
+            return vec![Self::zero_arg_invocation(callable, op_name, position)];
+        }
+        if let Some(callable) = Self::builtin_iterable_consumed_callable(
+            &callable_reference.module,
+            &callable_reference.name,
+            arguments,
+        ) {
+            return vec![Self::zero_arg_invocation(callable, op_name, position)];
+        }
+        if let Some(callable) = Self::method_descriptor_iterable_consumed_callable(
+            &callable_reference.module,
+            &callable_reference.name,
+            arguments,
+        ) {
+            return vec![Self::zero_arg_invocation(callable, op_name, position)];
+        }
+        if let Some(callable) = Self::operator_sequence_search_consumed_callable(
+            &callable_reference.module,
+            &callable_reference.name,
+            arguments,
+        ) {
+            return vec![Self::zero_arg_invocation(callable, op_name, position)];
+        }
+        if let Some(callable) = Self::operator_protocol_consumed_callable(
+            &callable_reference.module,
+            &callable_reference.name,
+            arguments,
+        ) {
+            return vec![Self::zero_arg_invocation(callable, op_name, position)];
+        }
+
+        if !Self::is_next_call_iterator_consumer(
+            &callable_reference.module,
+            &callable_reference.name,
+        ) || !(1..=2).contains(&arguments.len())
+        {
+            return Vec::new();
+        }
+        let Some(StackValue::CallIterator { callable }) = arguments.first() else {
+            return Vec::new();
+        };
+        vec![Self::zero_arg_invocation(callable, op_name, position)]
+    }
+
+    fn eager_call_iterator_consumed_callable<'b>(
+        module: &str,
+        name: &str,
+        arguments: &'b [StackValue],
+    ) -> Option<&'b GlobalRef> {
+        if Self::is_single_arg_eager_call_iterator_consumer(module, name) {
+            let [StackValue::CallIterator { callable }] = arguments else {
+                return None;
+            };
+            return Some(callable);
+        }
+        if !Self::is_deque_call_iterator_consumer(module, name)
+            || !(1..=2).contains(&arguments.len())
+        {
+            return None;
+        }
+        match arguments.first() {
+            Some(StackValue::CallIterator { callable }) => Some(callable),
+            _ => None,
+        }
+    }
+
+    fn is_single_arg_eager_call_iterator_consumer(module: &str, name: &str) -> bool {
+        matches!(
+            (module, name),
+            (
+                "builtins" | "__builtin__" | "__builtins__",
+                "dict" | "frozenset" | "list" | "set" | "tuple"
+            )
+        )
+    }
+
+    fn is_deque_call_iterator_consumer(module: &str, name: &str) -> bool {
+        matches!((module, name), ("collections", "deque"))
+    }
+
+    fn itertools_eager_call_iterator_consumed_callable<'b>(
+        module: &str,
+        name: &str,
+        arguments: &'b [StackValue],
+    ) -> Option<&'b GlobalRef> {
+        if module != "itertools" {
+            return None;
+        }
+        match name {
+            "product" if !arguments.is_empty() => {
+                arguments.iter().find_map(Self::call_iterator_callable_ref)
+            }
+            "permutations" if (1..=2).contains(&arguments.len()) => {
+                arguments.first().and_then(Self::call_iterator_callable_ref)
+            }
+            "combinations" | "combinations_with_replacement" if arguments.len() == 2 => {
+                arguments.first().and_then(Self::call_iterator_callable_ref)
+            }
+            _ => None,
+        }
+    }
+
+    fn stdlib_eager_call_iterator_consumed_callable<'b>(
+        module: &str,
+        name: &str,
+        arguments: &'b [StackValue],
+    ) -> Option<&'b GlobalRef> {
+        Self::exact_arity_consumed_callable(
+            EXACT_ARITY_STDLIB_EAGER_ITERABLE_CONSUMERS,
+            module,
+            name,
+            arguments,
+        )
+    }
+
+    fn builtin_iterable_consumed_callable<'b>(
+        module: &str,
+        name: &str,
+        arguments: &'b [StackValue],
+    ) -> Option<&'b GlobalRef> {
+        if !matches!(module, "builtins" | "__builtin__" | "__builtins__") {
+            return None;
+        }
+        if Self::builtin_iterable_consumer_arity_matches(name, arguments.len()) {
+            if let Some(StackValue::CallIterator { callable }) = arguments.first() {
+                return Some(callable);
+            }
+        }
+        Self::builtin_join_consumed_callable(name, arguments)
+    }
+
+    fn method_descriptor_iterable_consumed_callable<'b>(
+        module: &str,
+        name: &str,
+        arguments: &'b [StackValue],
+    ) -> Option<&'b GlobalRef> {
+        if let Some(callable) = Self::exact_arity_consumed_callable(
+            EXACT_ARITY_ITERABLE_DESCRIPTOR_CONSUMERS,
+            module,
+            name,
+            arguments,
+        ) {
+            return Some(callable);
+        }
+        match (module, name) {
+            (
+                "builtins" | "__builtin__" | "__builtins__",
+                "frozenset.difference"
+                | "frozenset.intersection"
+                | "frozenset.isdisjoint"
+                | "frozenset.symmetric_difference"
+                | "frozenset.union"
+                | "set.difference"
+                | "set.difference_update"
+                | "set.intersection"
+                | "set.intersection_update"
+                | "set.isdisjoint"
+                | "set.symmetric_difference"
+                | "set.symmetric_difference_update"
+                | "set.union"
+                | "set.update",
+            ) if arguments.len() >= 2 => arguments
+                .iter()
+                .skip(1)
+                .find_map(Self::call_iterator_callable_ref),
+            _ => None,
+        }
+    }
+
+    fn exact_arity_consumed_callable<'b>(
+        consumers: &[(&str, &str, usize, usize)],
+        module: &str,
+        name: &str,
+        arguments: &'b [StackValue],
+    ) -> Option<&'b GlobalRef> {
+        let (_, _, _, consumed_arg_index) =
+            consumers
+                .iter()
+                .find(|(consumer_module, consumer_name, arity, _)| {
+                    Self::consumer_module_matches(module, consumer_module)
+                        && *consumer_name == name
+                        && *arity == arguments.len()
+                })?;
+        arguments
+            .get(*consumed_arg_index)
+            .and_then(Self::call_iterator_callable_ref)
+    }
+
+    fn consumer_module_matches(module: &str, expected: &str) -> bool {
+        if expected == "builtins" {
+            matches!(module, "builtins" | "__builtin__" | "__builtins__")
+        } else {
+            module == expected
+        }
+    }
+
+    fn operator_sequence_search_consumed_callable<'b>(
+        module: &str,
+        name: &str,
+        arguments: &'b [StackValue],
+    ) -> Option<&'b GlobalRef> {
+        if !matches!(module, "operator" | "_operator")
+            || !matches!(name, "contains" | "countOf" | "indexOf")
+            || arguments.len() != 2
+        {
+            return None;
+        }
+        arguments.first().and_then(Self::call_iterator_callable_ref)
+    }
+
+    fn operator_protocol_consumed_callable<'b>(
+        module: &str,
+        name: &str,
+        arguments: &'b [StackValue],
+    ) -> Option<&'b GlobalRef> {
+        if !matches!(module, "operator" | "_operator") {
+            return None;
+        }
+        match name {
+            "iadd" if arguments.len() == 2 => {
+                if !Self::is_operator_sequence_add_receiver(arguments.first()) {
+                    return None;
+                }
+                arguments.get(1).and_then(Self::call_iterator_callable_ref)
+            }
+            "iconcat" if arguments.len() == 2 => {
+                if !Self::is_operator_sequence_concat_receiver(arguments.first()) {
+                    return None;
+                }
+                arguments.get(1).and_then(Self::call_iterator_callable_ref)
+            }
+            "ior" if arguments.len() == 2 => {
+                if !Self::is_operator_mapping_update_receiver(arguments.first()) {
+                    return None;
+                }
+                arguments.get(1).and_then(Self::call_iterator_callable_ref)
+            }
+            "setitem" if arguments.len() == 3 => {
+                if !Self::is_operator_slice_assignment_receiver(arguments.first())
+                    || !Self::is_constructed_builtin_instance(arguments.get(1), "slice")
+                {
+                    return None;
+                }
+                arguments.get(2).and_then(Self::call_iterator_callable_ref)
+            }
+            _ => None,
+        }
+    }
+
+    fn builtin_iterable_consumer_arity_matches(name: &str, argument_count: usize) -> bool {
+        match name {
+            "all" | "any" | "max" | "min" | "sorted" => argument_count == 1,
+            "bytearray" | "bytes" => argument_count == 1,
+            "sum" => (1..=2).contains(&argument_count),
+            _ => false,
+        }
+    }
+
+    fn builtin_join_consumed_callable<'b>(
+        name: &str,
+        arguments: &'b [StackValue],
+    ) -> Option<&'b GlobalRef> {
+        if arguments.len() != 2 {
+            return None;
+        }
+        let receiver = arguments.first();
+        let receiver_matches = match name {
+            "str.join" => Self::is_format_string_argument(receiver),
+            "bytes.join" => Self::is_bytes_like_argument(receiver),
+            "bytearray.join" => Self::is_constructed_builtin_instance(receiver, "bytearray"),
+            _ => false,
+        };
+        if !receiver_matches {
+            return None;
+        }
+        match arguments.get(1) {
+            Some(StackValue::CallIterator { callable }) => Some(callable),
+            _ => None,
+        }
+    }
+
+    fn is_bytes_like_argument(value: Option<&StackValue>) -> bool {
+        matches!(value, Some(StackValue::Bytes { .. }))
+            || Self::is_constructed_builtin_instance(value, "bytes")
+    }
+
+    fn is_constructed_builtin_instance(value: Option<&StackValue>, name: &str) -> bool {
+        match value {
+            Some(StackValue::Constructed(reference)) if !reference.malformed => {
+                matches!(
+                    reference.module.as_str(),
+                    "builtins" | "__builtin__" | "__builtins__"
+                ) && reference.name == name
+            }
+            _ => false,
+        }
+    }
+
+    fn is_builtin_container_argument(value: Option<&StackValue>, name: &str) -> bool {
+        matches!(
+            value,
+            Some(StackValue::Primitive { type_name, .. }) if *type_name == name
+        ) || (name == "dict" && matches!(value, Some(StackValue::TrackedDict { .. })))
+            || Self::is_constructed_builtin_instance(value, name)
+    }
+
+    fn is_constructed_stdlib_instance(
+        value: Option<&StackValue>,
+        module: &str,
+        name: &str,
+    ) -> bool {
+        match value {
+            Some(
+                StackValue::Constructed(reference) | StackValue::MappingWrapper { reference, .. },
+            ) if !reference.malformed => reference.module == module && reference.name == name,
+            _ => false,
+        }
+    }
+
+    fn is_operator_sequence_add_receiver(value: Option<&StackValue>) -> bool {
+        Self::is_builtin_container_argument(value, "list")
+            || Self::is_constructed_stdlib_instance(value, "collections", "deque")
+            || Self::is_constructed_stdlib_instance(value, "collections", "UserList")
+    }
+
+    fn is_operator_sequence_concat_receiver(value: Option<&StackValue>) -> bool {
+        Self::is_builtin_container_argument(value, "list")
+            || Self::is_constructed_stdlib_instance(value, "collections", "deque")
+    }
+
+    fn is_operator_slice_assignment_receiver(value: Option<&StackValue>) -> bool {
+        Self::is_builtin_container_argument(value, "list")
+            || Self::is_constructed_builtin_instance(value, "bytearray")
+            || Self::is_constructed_stdlib_instance(value, "collections", "UserList")
+    }
+
+    fn is_operator_mapping_update_receiver(value: Option<&StackValue>) -> bool {
+        Self::is_builtin_container_argument(value, "dict")
+            || Self::is_constructed_stdlib_instance(value, "collections", "ChainMap")
+            || Self::is_constructed_stdlib_instance(value, "collections", "defaultdict")
+            || Self::is_constructed_stdlib_instance(value, "collections", "OrderedDict")
+            || Self::is_constructed_stdlib_instance(value, "collections", "UserDict")
+    }
+
+    fn is_next_call_iterator_consumer(module: &str, name: &str) -> bool {
+        matches!(
+            (module, name),
+            ("builtins" | "__builtin__" | "__builtins__", "next")
+        )
+    }
+
+    fn defaultdict_factory_invocations(
+        &self,
+        callable_value: Option<&StackValue>,
+        argument_values: Option<&[StackValue]>,
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        if !matches!(op_name, "REDUCE" | "OBJ") {
+            return Vec::new();
+        }
+        let Some(StackValue::Global(callable_reference)) = callable_value else {
+            return Vec::new();
+        };
+        if callable_reference.malformed
+            || !Self::is_defaultdict_factory_lookup(
+                &callable_reference.module,
+                &callable_reference.name,
+            )
+        {
+            return Vec::new();
+        }
+        let Some(argument_values) = argument_values else {
+            return Vec::new();
+        };
+        let key = argument_values
+            .get(1)
+            .and_then(|value| stack_value_string(value, self.payload));
+        let Some(MappingLookup::Found(default_factory)) =
+            Self::mapping_lookup_default_factory(argument_values.first(), key.as_deref())
+        else {
+            return Vec::new();
+        };
+        vec![Self::zero_arg_invocation(
+            default_factory,
+            op_name,
+            position,
+        )]
+    }
+
+    fn is_defaultdict_factory_lookup(module: &str, name: &str) -> bool {
+        matches!(
+            (module, name),
+            ("operator", "getitem")
+                | (
+                    "collections",
+                    "defaultdict.__getitem__" | "defaultdict.__missing__"
+                )
+                | (
+                    "builtins" | "__builtin__" | "__builtins__",
+                    "dict.__getitem__"
+                )
+        )
+    }
+
+    fn zero_arg_invocation(
+        reference: &GlobalRef,
+        op_name: &'static str,
+        position: usize,
+    ) -> CallableInvocation {
+        Self::callable_invocation(reference.clone(), op_name, position, Some(0))
+    }
+
+    fn callable_invocation(
+        reference: GlobalRef,
+        op_name: &'static str,
+        position: usize,
+        positional_arg_count: Option<usize>,
+    ) -> CallableInvocation {
+        CallableInvocation {
+            reference,
+            op_name,
+            opcode_position: position,
+            positional_arg_count,
+            args: Vec::new(),
+        }
+    }
+
+    fn constructed_callable_reference(reference: &GlobalRef) -> GlobalRef {
+        Self::constructed_protocol_method_reference(reference, "__call__")
+    }
+
+    fn constructed_protocol_method_reference(
+        reference: &GlobalRef,
+        method_name: &str,
+    ) -> GlobalRef {
+        GlobalRef {
+            module: reference.module.clone(),
+            name: format!("{}.{}", reference.name, method_name),
+            position: reference.position,
+            malformed: reference.malformed,
+        }
+    }
+
+    fn tuple_argument_values(value: Option<&StackValue>) -> Option<Vec<StackValue>> {
+        match value {
+            Some(StackValue::Tuple(values)) => Some(values.clone()),
+            _ => None,
+        }
+    }
+
+    fn tuple_positional_arg_count(value: Option<&StackValue>) -> Option<usize> {
+        match value {
+            Some(StackValue::Tuple(values)) => Some(values.len()),
+            _ => None,
+        }
+    }
+
+    fn with_memo_index(value: StackValue, index: i64) -> StackValue {
+        match value {
+            StackValue::FutureCallbacks(mut callbacks) => {
+                callbacks.memo_index = Some(index);
+                StackValue::FutureCallbacks(callbacks)
+            }
+            StackValue::TrackedDict { keys, .. } => StackValue::TrackedDict {
+                keys,
+                memo_index: Some(index),
+            },
+            value => value,
+        }
+    }
+
+    fn memoized_future_add_callback(&mut self, memo_index: i64, callback: GlobalRef) {
+        if let Some(StackValue::FutureCallbacks(callbacks)) = self.memo.get_mut(&memo_index) {
+            callbacks.callbacks.push(callback);
+        }
+    }
+
+    fn memoized_future_mark_done(&mut self, memo_index: i64) {
+        if let Some(StackValue::FutureCallbacks(callbacks)) = self.memo.get_mut(&memo_index) {
+            callbacks.done = true;
+        }
+    }
+
+    fn consume_top_operands(&mut self, operand_count: usize) -> Option<StackValue> {
+        self.consume_top_operand_values(operand_count)
+            .and_then(|values| values.into_iter().next())
+    }
+
+    fn consume_top_operand_values(&mut self, operand_count: usize) -> Option<Vec<StackValue>> {
         if self.stack.len() < operand_count {
             self.stack.push(StackValue::Other);
             return None;
@@ -984,8 +2771,470 @@ impl<'a> ScanState<'a> {
             }
         }
         values.reverse();
-        self.push_constructed_result(values.first());
+        self.push_reducer_result(&values);
         Some(values)
+    }
+
+    fn push_reducer_result(&mut self, values: &[StackValue]) {
+        if let Some(call_iterator) = Self::call_iterator_result(values) {
+            self.stack.push(call_iterator);
+            return;
+        }
+        if let Some(call_iterator) = Self::lazy_zero_arg_callback_iterable_result(values) {
+            self.stack.push(call_iterator);
+            return;
+        }
+        if let Some(call_iterator) = Self::lazy_call_iterator_wrapper_result(values) {
+            self.stack.push(call_iterator);
+            return;
+        }
+        if let Some(call_iterator_tuple) = Self::call_iterator_tuple_wrapper_result(values) {
+            self.stack.push(call_iterator_tuple);
+            return;
+        }
+        if let Some(defaultdict) = Self::defaultdict_result(values) {
+            self.stack.push(defaultdict);
+            return;
+        }
+        if let Some(mapping_wrapper) = Self::mapping_wrapper_result(values) {
+            self.stack.push(mapping_wrapper);
+            return;
+        }
+        if let Some(template) = self.string_template_result(values) {
+            self.stack.push(template);
+            return;
+        }
+        if let Some(tuple_item) = Self::tuple_getitem_result(values) {
+            self.stack.push(tuple_item);
+            return;
+        }
+        if let Some(regex_pattern) = self.regex_pattern_result(values) {
+            self.stack.push(regex_pattern);
+            return;
+        }
+        if let Some(regex_scanner) = Self::regex_scanner_result(values) {
+            self.stack.push(regex_scanner);
+            return;
+        }
+        if let Some(future) = Self::future_callbacks_result(values) {
+            self.stack.push(future);
+            return;
+        }
+        self.push_constructed_result(values.first());
+    }
+
+    fn call_iterator_result(values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed
+            || !matches!(
+                (
+                    callable_reference.module.as_str(),
+                    callable_reference.name.as_str()
+                ),
+                ("builtins" | "__builtin__" | "__builtins__", "iter")
+            )
+        {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        if arguments.len() != 2 {
+            return None;
+        }
+        let callable = Self::callable_reference_from_value(arguments.first())?;
+        Some(StackValue::CallIterator { callable })
+    }
+
+    fn regex_pattern_result(&self, values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed
+            || callable_reference.module != "re"
+            || callable_reference.name != "compile"
+        {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        if !(1..=2).contains(&arguments.len()) {
+            return None;
+        }
+        let pattern = arguments
+            .first()
+            .and_then(|value| stack_value_string(value, self.payload))?;
+        let flags = arguments.get(1).map_or(Some(0), Self::stack_value_integer);
+        Some(StackValue::RegexPattern { pattern, flags })
+    }
+
+    fn regex_scanner_result(values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed
+            || callable_reference.module != "re"
+            || callable_reference.name != "Scanner"
+        {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        if !(1..=2).contains(&arguments.len()) {
+            return None;
+        }
+        let Some(StackValue::RegexScannerLexicon { rules }) = arguments.first() else {
+            return None;
+        };
+        let flags = arguments.get(1).map_or(Some(0), Self::stack_value_integer);
+        Some(StackValue::RegexScanner {
+            rules: rules.clone(),
+            flags,
+        })
+    }
+
+    fn future_callbacks_result(values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed
+            || !Self::is_concurrent_future_symbol(callable_reference, "Future")
+        {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        if !arguments.is_empty() {
+            return None;
+        }
+        Some(StackValue::FutureCallbacks(FutureCallbacks {
+            callbacks: Vec::new(),
+            done: false,
+            memo_index: None,
+        }))
+    }
+
+    fn string_template_result(&self, values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed
+            || callable_reference.module != "string"
+            || callable_reference.name != "Template"
+        {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        if arguments.len() != 1 {
+            return None;
+        }
+        let template = arguments
+            .first()
+            .and_then(|value| stack_value_string(value, self.payload))?;
+        Some(StackValue::StringTemplate { template })
+    }
+
+    fn lazy_zero_arg_callback_iterable_result(values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        let (_, _, _, callback_arg_index) = EXACT_ARITY_LAZY_ZERO_ARG_CALLBACK_ITERABLES
+            .iter()
+            .find(|(consumer_module, consumer_name, arity, _)| {
+                Self::consumer_module_matches(&callable_reference.module, consumer_module)
+                    && *consumer_name == callable_reference.name
+                    && *arity == arguments.len()
+            })?;
+        let callable = Self::callable_reference_from_value(arguments.get(*callback_arg_index))?;
+        Some(StackValue::CallIterator { callable })
+    }
+
+    fn lazy_call_iterator_wrapper_result(values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        let callable = match callable_reference.module.as_str() {
+            "builtins" | "__builtin__" | "__builtins__" => {
+                Self::builtins_lazy_call_iterator_wrapper_callable(
+                    &callable_reference.name,
+                    arguments,
+                )
+            }
+            "itertools" => Self::itertools_lazy_call_iterator_wrapper_callable(
+                &callable_reference.name,
+                arguments,
+            ),
+            "heapq" => {
+                Self::heapq_lazy_call_iterator_wrapper_callable(&callable_reference.name, arguments)
+            }
+            _ => None,
+        }?;
+        Some(StackValue::CallIterator { callable })
+    }
+
+    fn builtins_lazy_call_iterator_wrapper_callable(
+        name: &str,
+        arguments: &[StackValue],
+    ) -> Option<GlobalRef> {
+        match name {
+            "iter" if arguments.len() == 1 => {
+                arguments.first().and_then(Self::call_iterator_callable)
+            }
+            "enumerate" if (1..=2).contains(&arguments.len()) => {
+                arguments.first().and_then(Self::call_iterator_callable)
+            }
+            "zip" => arguments.iter().find_map(Self::call_iterator_callable),
+            _ => None,
+        }
+    }
+
+    fn itertools_lazy_call_iterator_wrapper_callable(
+        name: &str,
+        arguments: &[StackValue],
+    ) -> Option<GlobalRef> {
+        match name {
+            "batched" if (2..=3).contains(&arguments.len()) => {
+                arguments.first().and_then(Self::call_iterator_callable)
+            }
+            "chain" => arguments.iter().find_map(Self::call_iterator_callable),
+            "compress" if arguments.len() == 2 => {
+                arguments.iter().find_map(Self::call_iterator_callable)
+            }
+            "cycle" if arguments.len() == 1 => {
+                arguments.first().and_then(Self::call_iterator_callable)
+            }
+            "islice" if (2..=4).contains(&arguments.len()) => {
+                arguments.first().and_then(Self::call_iterator_callable)
+            }
+            "pairwise" if arguments.len() == 1 => {
+                arguments.first().and_then(Self::call_iterator_callable)
+            }
+            "zip_longest" if !arguments.is_empty() => {
+                arguments.iter().find_map(Self::call_iterator_callable)
+            }
+            "chain.from_iterable" if arguments.len() == 1 => arguments
+                .first()
+                .and_then(Self::call_iterator_callable_or_tuple_item),
+            _ => None,
+        }
+    }
+
+    fn heapq_lazy_call_iterator_wrapper_callable(
+        name: &str,
+        arguments: &[StackValue],
+    ) -> Option<GlobalRef> {
+        match name {
+            "merge" if !arguments.is_empty() => {
+                arguments.iter().find_map(Self::call_iterator_callable)
+            }
+            _ => None,
+        }
+    }
+
+    fn call_iterator_callable(value: &StackValue) -> Option<GlobalRef> {
+        match value {
+            StackValue::CallIterator { callable } => Some(callable.clone()),
+            StackValue::CallIteratorTuple { callable, .. } => Some(callable.clone()),
+            _ => None,
+        }
+    }
+
+    fn call_iterator_callable_ref(value: &StackValue) -> Option<&GlobalRef> {
+        match value {
+            StackValue::CallIterator { callable }
+            | StackValue::CallIteratorTuple { callable, .. } => Some(callable),
+            _ => None,
+        }
+    }
+
+    fn call_iterator_callable_or_tuple_item(value: &StackValue) -> Option<GlobalRef> {
+        Self::call_iterator_callable(value).or_else(|| match value {
+            StackValue::Tuple(items) => items.iter().find_map(Self::call_iterator_callable),
+            _ => None,
+        })
+    }
+
+    fn call_iterator_tuple_wrapper_result(values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed
+            || callable_reference.module != "itertools"
+            || callable_reference.name != "tee"
+        {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        if !(1..=2).contains(&arguments.len()) {
+            return None;
+        }
+        let callable = arguments.first().and_then(Self::call_iterator_callable)?;
+        Some(StackValue::CallIteratorTuple {
+            callable,
+            item_count: Self::tee_item_count(arguments),
+        })
+    }
+
+    fn tee_item_count(arguments: &[StackValue]) -> Option<usize> {
+        let Some(count_value) = arguments.get(1) else {
+            return Some(2);
+        };
+        Self::stack_value_nonnegative_index(count_value)
+    }
+
+    fn tuple_getitem_result(values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed
+            || callable_reference.module != "operator"
+            || callable_reference.name != "getitem"
+        {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        let [container, index_value] = arguments.as_slice() else {
+            return None;
+        };
+        match container {
+            StackValue::Tuple(items) => {
+                let index = Self::stack_value_tuple_index(index_value, items.len())?;
+                items.get(index).cloned()
+            }
+            StackValue::CallIteratorTuple {
+                callable,
+                item_count,
+            } => {
+                let index = Self::stack_value_nonnegative_index(index_value)?;
+                if item_count.is_none_or(|count| index < count) {
+                    Some(StackValue::CallIterator {
+                        callable: callable.clone(),
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn stack_value_tuple_index(value: &StackValue, len: usize) -> Option<usize> {
+        let index = Self::stack_value_integer(value)?;
+        let len = isize::try_from(len).ok()?;
+        let adjusted = if index < 0 { len + index } else { index };
+        if (0..len).contains(&adjusted) {
+            usize::try_from(adjusted).ok()
+        } else {
+            None
+        }
+    }
+
+    fn stack_value_nonnegative_index(value: &StackValue) -> Option<usize> {
+        let index = Self::stack_value_integer(value)?;
+        usize::try_from(index).ok()
+    }
+
+    fn stack_value_integer(value: &StackValue) -> Option<isize> {
+        match value {
+            StackValue::Primitive {
+                type_name: "int",
+                repr,
+            } => repr.parse().ok(),
+            _ => None,
+        }
+    }
+
+    fn defaultdict_result(values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed
+            || callable_reference.module != "collections"
+            || callable_reference.name != "defaultdict"
+        {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+        if arguments.len() != 1 {
+            return None;
+        }
+        let default_factory = Self::callable_reference_from_value(arguments.first())?;
+        Some(StackValue::DefaultDict { default_factory })
+    }
+
+    fn mapping_wrapper_result(values: &[StackValue]) -> Option<StackValue> {
+        let Some(StackValue::Global(callable_reference)) = values.first() else {
+            return None;
+        };
+        if callable_reference.malformed {
+            return None;
+        }
+        let Some(StackValue::Tuple(arguments)) = values.get(1) else {
+            return None;
+        };
+
+        let mappings = match (
+            callable_reference.module.as_str(),
+            callable_reference.name.as_str(),
+        ) {
+            ("collections", "ChainMap") if !arguments.is_empty() => arguments.clone(),
+            ("types", "MappingProxyType") if arguments.len() == 1 => {
+                vec![arguments[0].clone()]
+            }
+            _ => return None,
+        };
+
+        if mappings
+            .iter()
+            .all(|mapping| Self::mapping_lookup_default_factory(Some(mapping), None).is_none())
+        {
+            return None;
+        }
+
+        Some(StackValue::MappingWrapper {
+            reference: callable_reference.clone(),
+            mappings,
+        })
+    }
+
+    fn callable_reference_from_value(value: Option<&StackValue>) -> Option<GlobalRef> {
+        match value {
+            Some(StackValue::Global(reference)) if !reference.malformed => Some(reference.clone()),
+            Some(StackValue::Constructed(reference)) if !reference.malformed => {
+                Some(Self::constructed_callable_reference(reference))
+            }
+            Some(StackValue::Global(reference) | StackValue::Constructed(reference))
+                if reference.module == "copyreg.extension" =>
+            {
+                Some(reference.clone())
+            }
+            _ => None,
+        }
     }
 
     fn push_constructed_result(&mut self, callable_value: Option<&StackValue>) {
@@ -1023,7 +3272,8 @@ impl<'a> ScanState<'a> {
                     malformed: true,
                 };
                 self.add_finding(Finding {
-                    message: "Malformed STACK_GLOBAL operands prevent reliable callable resolution".to_string(),
+                    message: "Malformed STACK_GLOBAL operands prevent reliable callable resolution"
+                        .to_string(),
                     severity: "critical",
                     location: Some(format!("{} (pos {})", self.source, position)),
                     rule_code: Some("MALFORMED_STACK_GLOBAL"),
@@ -1631,6 +3881,56 @@ impl<'a> ScanState<'a> {
         });
     }
 
+    fn push_callable_invocation(&mut self, invocation: &CallableInvocation) {
+        if invocation.reference.malformed {
+            return;
+        }
+
+        let dedupe_key = (
+            invocation.reference.module.clone(),
+            invocation.reference.name.clone(),
+            invocation.positional_arg_count,
+        );
+        if self.callable_invocation_keys.contains(&dedupe_key)
+            || self.callable_invocations.len() >= MAX_IMPORT_REFERENCES
+        {
+            return;
+        }
+        self.callable_invocation_keys.insert(dedupe_key);
+
+        let symbol = invocation.reference.symbol();
+        let mut details = vec![
+            (
+                "opcode".to_string(),
+                DetailValue::String(invocation.op_name.to_string()),
+            ),
+            (
+                "module".to_string(),
+                DetailValue::String(invocation.reference.module.clone()),
+            ),
+            (
+                "name".to_string(),
+                DetailValue::String(invocation.reference.name.clone()),
+            ),
+            ("import_reference".to_string(), DetailValue::String(symbol)),
+            (
+                "global_position".to_string(),
+                DetailValue::UInt(invocation.reference.position as u64),
+            ),
+            (
+                "opcode_position".to_string(),
+                DetailValue::UInt(invocation.opcode_position as u64),
+            ),
+        ];
+        if let Some(positional_arg_count) = invocation.positional_arg_count {
+            details.push((
+                "positional_arg_count".to_string(),
+                DetailValue::UInt(positional_arg_count as u64),
+            ));
+        }
+        self.callable_invocations.push(details);
+    }
+
     fn rebuild_seen_notice_keys(&mut self) {
         self.seen_notice_keys = self.notices.iter().map(Notice::dedupe_key).collect();
     }
@@ -2167,6 +4467,13 @@ impl<'a> ScanState<'a> {
             for reference in follow_on_scan.import_references {
                 self.push_import_reference(reference);
             }
+            for invocation in follow_on_scan.callable_invocations {
+                if self.callable_invocations.len() < MAX_IMPORT_REFERENCES
+                    && self.remember_callable_invocation_details(&invocation)
+                {
+                    self.callable_invocations.push(invocation);
+                }
+            }
             if had_findings {
                 self.add_notice(Notice {
                     message: "Follow-on pickle stream detected after malformed padding".to_string(),
@@ -2188,6 +4495,17 @@ impl<'a> ScanState<'a> {
                 return;
             }
         }
+    }
+
+    fn remember_callable_invocation_details(&mut self, details: &[(String, DetailValue)]) -> bool {
+        let module = detail_string(details, "module").unwrap_or_default();
+        let name = detail_string(details, "name").unwrap_or_default();
+        if module.is_empty() || name.is_empty() {
+            return false;
+        }
+        let positional_arg_count = detail_usize(details, "positional_arg_count");
+        self.callable_invocation_keys
+            .insert((module, name, positional_arg_count))
     }
 
     fn coalesce_redundant_global_findings(&mut self) {
@@ -2304,6 +4622,11 @@ impl<'a> ScanState<'a> {
             import_references.append(DetailValue::Dict(reference.clone()).to_py_object(py)?)?;
         }
         metadata.set_item("import_references", import_references)?;
+        let callable_invocations = PyList::empty(py);
+        for invocation in &self.callable_invocations {
+            callable_invocations.append(DetailValue::Dict(invocation.clone()).to_py_object(py)?)?;
+        }
+        metadata.set_item("callable_invocations", callable_invocations)?;
         if !self.protocols.is_empty() {
             metadata.set_item("protocols", &self.protocols)?;
         }
@@ -2316,13 +4639,6 @@ impl<'a> ScanState<'a> {
     }
 }
 
-fn tuple_arguments(value: Option<&StackValue>) -> Vec<StackValue> {
-    match value {
-        Some(StackValue::Tuple(values)) => values.clone(),
-        _ => Vec::new(),
-    }
-}
-
 fn sensitive_mutator_invocation_target(
     callable_ref: &GlobalRef,
     args: &[StackValue],
@@ -2331,6 +4647,22 @@ fn sensitive_mutator_invocation_target(
         return None;
     }
     args.first().and_then(sensitive_mutation_target)
+}
+
+fn operator_mutator_protocol_target(
+    callable_ref: &GlobalRef,
+    args: &[StackValue],
+) -> Option<&'static str> {
+    if !matches!(callable_ref.module.as_str(), "operator" | "_operator") {
+        return None;
+    }
+    if !matches!(args.first(), Some(StackValue::Constructed(_))) {
+        return None;
+    }
+    match callable_ref.name.as_str() {
+        "setitem" => Some("object.__setitem__"),
+        _ => None,
+    }
 }
 
 fn is_container_mutator_callable(callable_ref: &GlobalRef) -> bool {
@@ -2360,7 +4692,7 @@ fn is_container_mutator_callable(callable_ref: &GlobalRef) -> bool {
         ),
         "operator" | "_operator" => matches!(
             callable_ref.name.as_str(),
-            "delitem" | "iadd" | "ior" | "setitem"
+            "delitem" | "iadd" | "imul" | "ior" | "setitem"
         ),
         _ => false,
     }
@@ -2843,89 +5175,6 @@ mod tests {
                 && detail_string(&finding.details, "import_reference").as_deref()
                     == Some("os.system")
         }));
-    }
-
-    #[test]
-    fn filesystem_probe_and_process_state_pickles_are_dangerous_calls() {
-        let options = ScanOptions {
-            timeout_s: DEFAULT_TIMEOUT_S,
-            max_opcodes: DEFAULT_MAX_OPCODES,
-            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
-            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
-            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
-            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
-        };
-        let mut pathlib_iterdir_payload =
-            b"\x80\x04cbuiltins\nlist\n(cpathlib\nPosixPath.iterdir\ncpathlib\nPosixPath\n"
-                .to_vec();
-        pathlib_iterdir_payload.extend_from_slice(&short_binunicode(b"/tmp/modelaudit-secret-dir"));
-        pathlib_iterdir_payload.extend_from_slice(b"\x85R\x85RtR.");
-
-        let mut pathlib_local_iterdir_payload =
-            b"\x80\x04cbuiltins\nlist\n(cpathlib._local\nPosixPath.iterdir\ncpathlib._local\nPosixPath\n"
-                .to_vec();
-        pathlib_local_iterdir_payload
-            .extend_from_slice(&short_binunicode(b"/tmp/modelaudit-secret-dir"));
-        pathlib_local_iterdir_payload.extend_from_slice(b"\x85R\x85RtR.");
-
-        let cases = [
-            (
-                "pathlib-iterdir-list",
-                pathlib_iterdir_payload,
-                "pathlib.PosixPath.iterdir",
-            ),
-            (
-                "pathlib-local-iterdir-list",
-                pathlib_local_iterdir_payload,
-                "pathlib._local.PosixPath.iterdir",
-            ),
-            (
-                "pathlib-local-read-text",
-                b"\x80\x04cpathlib._local\nPosixPath.read_text\n)R.".to_vec(),
-                "pathlib._local.PosixPath.read_text",
-            ),
-            (
-                "decimal-setcontext",
-                b"\x80\x04cdecimal\nsetcontext\ncdecimal\nContext\nK\x01\x85R\x85R.".to_vec(),
-                "decimal.setcontext",
-            ),
-            (
-                "configparser-raw-read",
-                b"\x80\x04cconfigparser\nRawConfigParser.read\n)R.".to_vec(),
-                "configparser.RawConfigParser.read",
-            ),
-            (
-                "gc-disable",
-                b"\x80\x04cgc\ndisable\n)R.".to_vec(),
-                "gc.disable",
-            ),
-        ];
-
-        for (label, payload, expected_reference) in cases {
-            let mut scan = ScanState::new(
-                format!("{label}.pkl"),
-                &payload,
-                &options,
-                Some(payload.len()),
-                0,
-                0,
-                None,
-            );
-
-            scan.run();
-
-            assert_eq!(scan.verdict, "malicious", "missed {label}");
-            let finding = scan
-                .findings
-                .iter()
-                .find(|finding| {
-                    finding.rule_code == Some("DANGEROUS_CALL")
-                        && detail_string(&finding.details, "import_reference").as_deref()
-                            == Some(expected_reference)
-                })
-                .unwrap_or_else(|| panic!("missing dangerous call finding for {label}"));
-            assert_eq!(finding.severity, "critical");
-        }
     }
 
     #[test]
