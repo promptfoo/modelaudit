@@ -53,7 +53,7 @@ These are installed only when the corresponding extra is requested.
 | onnx            | `onnx`        | Apache-2.0   | <https://onnx.ai/>                           |
 | py7zr           | `sevenzip`    | LGPL-2.1+    | <https://github.com/miurahr/py7zr>           |
 | pybcj           | `sevenzip`    | LGPL-2.1+    | <https://github.com/miurahr/pybcj>           |
-| py-ubjson       | `xgboost`     | Apache-2.0   | <https://github.com/Iber/py-ubjson>          |
+| py-ubjson       | `xgboost`     | Apache-2.0   | <https://github.com/Iotic-Labs/py-ubjson>    |
 | pyppmd          | `sevenzip`    | LGPL-2.1+    | <https://github.com/miurahr/pyppmd>          |
 | safetensors     | `safetensors` | Apache-2.0   | <https://github.com/huggingface/safetensors> |
 | scikit-learn    | `joblib`      | BSD-3-Clause | <https://scikit-learn.org/>                  |

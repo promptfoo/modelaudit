@@ -130,7 +130,9 @@ Use the least disruptive path.
 ### A published version is broken (e.g. unresolvable deps)
 
 - **Yank** the affected version on PyPI. PyPI has no CLI/API for yanks — it must be done in the web UI:
-  1. https://pypi.org/manage/project/<name>/releases/
+  1. Open the PyPI releases page for the affected package, such as
+     <https://pypi.org/manage/project/modelaudit/releases/> or
+     <https://pypi.org/manage/project/modelaudit-picklescan/releases/>.
   2. Click the version → Options → **Yank**
   3. Provide a short reason (shown in the PyPI simple index).
   - Yanked versions remain installable if a user pins the exact version, but pip/uv resolvers skip them by default. Prefer yank + follow-up patch over deletion.

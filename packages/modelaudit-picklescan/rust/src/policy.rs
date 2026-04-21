@@ -2,6 +2,21 @@ pub(crate) fn global_severity(module: &str, name: &str) -> Option<&'static str> 
     direct_global_severity(module, name).or_else(|| dotted_global_tail_severity(name))
 }
 
+pub(crate) fn callable_severity(module: &str, name: &str) -> Option<&'static str> {
+    global_severity(module, name).or_else(|| pathlib_callable_severity(module, name))
+}
+
+fn pathlib_callable_severity(module: &str, name: &str) -> Option<&'static str> {
+    let mut candidate = name;
+    loop {
+        if pathlib_concrete_path_alias_is_dangerous(module, candidate) {
+            return Some("critical");
+        }
+        let stripped = strip_wrapper_global_suffix(candidate)?;
+        candidate = stripped;
+    }
+}
+
 fn direct_global_severity(module: &str, name: &str) -> Option<&'static str> {
     direct_global_severity_without_wrapper_alias(module, name)
         .or_else(|| wrapper_global_alias_severity(module, name))
@@ -58,8 +73,7 @@ fn direct_global_severity_without_wrapper_alias(module: &str, name: &str) -> Opt
         return Some("warning");
     }
 
-    if pathlib_concrete_path_alias_is_dangerous(module, name) || namespace_global_is_dangerous(name)
-    {
+    if namespace_global_is_dangerous(name) {
         return Some("critical");
     }
 
@@ -69,6 +83,10 @@ fn direct_global_severity_without_wrapper_alias(module: &str, name: &str) -> Opt
         } else {
             None
         };
+    }
+
+    if operator_container_mutator_is_target_aware(module, name) {
+        return None;
     }
 
     if dangerous_global_is_listed(module, name) {
@@ -140,18 +158,23 @@ fn warning_globals(module: &str) -> Option<WarningGlobalMatch> {
 }
 
 fn builtin_global_is_dangerous(name: &str) -> bool {
-    BUILTIN_DANGEROUS_NAMES.contains(&name) || namespace_global_is_dangerous(name)
+    BUILTIN_DANGEROUS_NAMES.binary_search(&name).is_ok() || namespace_global_is_dangerous(name)
+}
+
+fn operator_container_mutator_is_target_aware(module: &str, name: &str) -> bool {
+    matches!(module, "operator" | "_operator")
+        && matches!(name, "delitem" | "iadd" | "imul" | "ior" | "setitem")
 }
 
 fn pathlib_concrete_path_alias_is_dangerous(module: &str, name: &str) -> bool {
-    if module != "pathlib" {
+    if !PATHLIB_MODULES.contains(&module) {
         return false;
     }
-    let Some((class_name, method_name)) = name.split_once('.') else {
+    let Some((class_name, method_name)) = name.rsplit_once('.') else {
         return false;
     };
-    matches!(class_name, "PosixPath" | "WindowsPath")
-        && matches!(method_name, "open" | "write_bytes" | "write_text")
+    PATHLIB_CONCRETE_PATH_CLASSES.contains(&class_name)
+        && PATHLIB_FILESYSTEM_ACCESS_METHODS.contains(&method_name)
 }
 
 fn namespace_global_is_dangerous(name: &str) -> bool {
@@ -198,6 +221,34 @@ const BUILTIN_DANGEROUS_NAMES: &[&str] = &[
     "setattr",
     "staticmethod",
     "vars",
+];
+const PATHLIB_MODULES: &[&str] = &["pathlib", "pathlib._local"];
+const PATHLIB_CONCRETE_PATH_CLASSES: &[&str] = &["Path", "PosixPath", "WindowsPath"];
+const PATHLIB_FILESYSTEM_ACCESS_METHODS: &[&str] = &[
+    "chmod",
+    "exists",
+    "glob",
+    "hardlink_to",
+    "is_dir",
+    "is_file",
+    "iterdir",
+    "lchmod",
+    "lstat",
+    "mkdir",
+    "open",
+    "read_bytes",
+    "read_text",
+    "readlink",
+    "rename",
+    "replace",
+    "rglob",
+    "rmdir",
+    "stat",
+    "symlink_to",
+    "touch",
+    "unlink",
+    "write_bytes",
+    "write_text",
 ];
 const DANGEROUS_WILDCARD_MODULES: &[&str] = &[
     "_ctypes",
@@ -293,11 +344,13 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("_tkinter", "TkappType.call"),
     ("_tkinter", "TkappType.eval"),
     ("_xxsubinterpreters", "run_string"),
+    ("aifc", "open"),
     ("argparse", "FileType"),
     ("atexit", "register"),
     ("base64", "b64decode"),
     ("base64", "b64encode"),
     ("base64", "decode"),
+    ("bz2", "open"),
     ("codecs", "StreamReaderWriter.write"),
     ("codecs", "decode"),
     ("codecs", "encode"),
@@ -309,16 +362,21 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("concurrent.futures", "ThreadPoolExecutor.map"),
     ("concurrent.futures", "ThreadPoolExecutor.shutdown"),
     ("concurrent.futures", "ThreadPoolExecutor.submit"),
+    ("configparser", "ConfigParser.read"),
+    ("configparser", "RawConfigParser.read"),
     ("contextlib", "ExitStack.__exit__"),
     ("contextlib", "ExitStack.callback"),
     ("contextlib", "ExitStack.close"),
     ("contextlib", "ExitStack.enter_context"),
     ("contextvars", "Context.run"),
     ("copyreg", "add_extension"),
+    ("copyreg", "pickle"),
     ("copyreg", "remove_extension"),
     ("csv", "DictWriter.writerow"),
     ("csv", "DictWriter.writerows"),
     ("dataclasses", "_create_fn"),
+    ("dbm", "open"),
+    ("decimal", "setcontext"),
     ("dill", "load"),
     ("dill", "load_module"),
     ("dill", "load_module_asdict"),
@@ -333,15 +391,18 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("faulthandler", "_sigfpe"),
     ("faulthandler", "_sigsegv"),
     ("faulthandler", "_stack_overflow"),
+    ("faulthandler", "disable"),
     ("functools", "cache"),
     ("functools", "cached_property.__get__"),
     ("functools", "cmp_to_key"),
     ("functools", "lru_cache"),
     ("functools", "reduce"),
     ("functools", "singledispatch"),
+    ("gc", "disable"),
     ("gc", "get_objects"),
     ("gc", "get_referents"),
     ("gc", "get_referrers"),
+    ("gzip", "open"),
     ("inspect", "currentframe"),
     ("inspect", "getmembers"),
     ("io", "FileIO"),
@@ -374,8 +435,10 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("logging", "Logger.warning"),
     ("logging", "StreamHandler"),
     ("logging", "StreamHandler.emit"),
+    ("logging", "captureWarnings"),
     ("logging", "critical"),
     ("logging", "debug"),
+    ("logging", "disable"),
     ("logging", "error"),
     ("logging", "exception"),
     ("logging", "info"),
@@ -388,8 +451,10 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("logging.handlers", "RotatingFileHandler"),
     ("logging.handlers", "TimedRotatingFileHandler"),
     ("logging.handlers", "WatchedFileHandler"),
+    ("lzma", "open"),
     ("mailbox", "Babyl.add"),
     ("mailbox", "MMDF.add"),
+    ("mailbox", "Maildir"),
     ("mailbox", "_singlefileMailbox.add"),
     ("mailbox", "mbox.add"),
     ("mailcap", "findmatch"),
@@ -402,10 +467,6 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("operator", "call"),
     ("operator", "itemgetter"),
     ("operator", "methodcaller"),
-    ("operator", "setitem"),
-    ("pathlib", "Path.open"),
-    ("pathlib", "Path.write_bytes"),
-    ("pathlib", "Path.write_text"),
     ("pip", "main"),
     ("pip._internal", "main"),
     ("pip._internal.cli.main", "main"),
@@ -426,8 +487,12 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("site", "addsitedir"),
     ("site", "main"),
     ("string", "Formatter.get_field"),
+    ("sunau", "open"),
     ("tarfile", "open"),
     ("tempfile", "NamedTemporaryFile"),
+    ("tempfile", "TemporaryDirectory"),
+    ("tempfile", "mkdtemp"),
+    ("tempfile", "mkstemp"),
     ("test.support.script_helper", "assert_python_ok"),
     ("torch", "compile"),
     ("torch", "load"),
@@ -488,6 +553,10 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("uuid", "_netstat_getnode"),
     ("uuid", "_popen"),
     ("uuid", "getnode"),
+    ("warnings", "filterwarnings"),
+    ("warnings", "resetwarnings"),
+    ("warnings", "simplefilter"),
+    ("wave", "open"),
     ("weakref", "finalize"),
     ("yaml", "CLoader"),
     ("yaml", "CUnsafeLoader"),
@@ -517,6 +586,16 @@ mod tests {
     }
 
     #[test]
+    fn builtin_dangerous_names_are_sorted_for_binary_search() {
+        for pair in BUILTIN_DANGEROUS_NAMES.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "BUILTIN_DANGEROUS_NAMES must stay sorted"
+            );
+        }
+    }
+
+    #[test]
     fn dangerous_global_lookup_uses_sorted_table() {
         assert_eq!(global_severity("joblib", "load"), Some("critical"));
         assert_eq!(global_severity("mailcap", "findmatch"), Some("critical"));
@@ -528,7 +607,7 @@ mod tests {
         assert_eq!(global_severity("pipes", "Template.copy"), Some("critical"));
         assert_eq!(global_severity("pipes", "Template.open"), Some("critical"));
         assert_eq!(global_severity("operator", "call"), Some("critical"));
-        assert_eq!(global_severity("operator", "setitem"), Some("critical"));
+        assert_eq!(global_severity("operator", "setitem"), None);
         assert_eq!(global_severity("site", "os.system"), Some("critical"));
         assert_eq!(
             global_severity("sysconfig", "prefix.os.system"),
@@ -746,12 +825,17 @@ mod tests {
             Some("critical")
         );
         for name in ["Path.open", "Path.write_bytes", "Path.write_text"] {
-            assert_eq!(global_severity("pathlib", name), Some("critical"));
+            assert_eq!(global_severity("pathlib", name), None);
+            assert_eq!(callable_severity("pathlib", name), Some("critical"));
         }
         for class_name in ["PosixPath", "WindowsPath"] {
             for method_name in ["open", "write_bytes", "write_text"] {
                 assert_eq!(
                     global_severity("pathlib", &format!("{class_name}.{method_name}")),
+                    None
+                );
+                assert_eq!(
+                    callable_severity("pathlib", &format!("{class_name}.{method_name}")),
                     Some("critical")
                 );
             }
@@ -800,6 +884,63 @@ mod tests {
             global_severity("copyreg", "add_extension"),
             Some("critical")
         );
+        assert_eq!(global_severity("copyreg", "pickle"), Some("critical"));
+        assert_eq!(global_severity("builtins", "dict.__setitem__"), None);
+        assert_eq!(global_severity("builtins", "dict.update"), None);
+        assert_eq!(global_severity("builtins", "list.append"), None);
+        assert_eq!(global_severity("builtins", "list.clear"), None);
+        assert_eq!(global_severity("operator", "setitem"), None);
+        assert_eq!(global_severity("operator", "imul"), None);
+        assert_eq!(global_severity("_operator", "setitem"), None);
+        assert_eq!(global_severity("_operator", "imul"), None);
+        assert_eq!(global_severity("operator", "call"), Some("critical"));
+        assert_eq!(global_severity("io", "open"), Some("critical"));
+        assert_eq!(global_severity("logging", "FileHandler"), Some("critical"));
+        assert_eq!(
+            global_severity("logging.handlers", "RotatingFileHandler"),
+            Some("critical")
+        );
+        assert_eq!(global_severity("dbm", "open"), Some("critical"));
+        assert_eq!(global_severity("mailbox", "Maildir"), Some("critical"));
+        assert_eq!(global_severity("argparse", "FileType"), Some("critical"));
+        assert_eq!(global_severity("codecs", "open"), Some("critical"));
+        assert_eq!(global_severity("gzip", "open"), Some("critical"));
+        assert_eq!(global_severity("bz2", "open"), Some("critical"));
+        assert_eq!(global_severity("lzma", "open"), Some("critical"));
+        assert_eq!(global_severity("wave", "open"), Some("critical"));
+        assert_eq!(global_severity("aifc", "open"), Some("critical"));
+        assert_eq!(global_severity("sunau", "open"), Some("critical"));
+        assert_eq!(global_severity("decimal", "setcontext"), Some("critical"));
+        assert_eq!(global_severity("gc", "disable"), Some("critical"));
+        assert_eq!(global_severity("logging", "disable"), Some("critical"));
+        assert_eq!(
+            global_severity("logging", "captureWarnings"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("warnings", "simplefilter"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("warnings", "filterwarnings"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("warnings", "resetwarnings"),
+            Some("critical")
+        );
+        assert_eq!(global_severity("faulthandler", "disable"), Some("critical"));
+        assert_eq!(
+            global_severity("configparser", "ConfigParser.read"),
+            Some("critical")
+        );
+        assert_eq!(
+            global_severity("configparser", "RawConfigParser.read"),
+            Some("critical")
+        );
+        assert_eq!(global_severity("site", "addpackage"), Some("critical"));
+        assert_eq!(global_severity("site", "addsitedir"), Some("critical"));
+        assert_eq!(global_severity("site", "main"), Some("critical"));
         assert_eq!(
             global_severity("csv", "DictWriter.writerow"),
             Some("critical")
@@ -968,6 +1109,10 @@ mod tests {
             Some("critical")
         );
         assert_eq!(global_severity("custom", "load"), None);
+        assert_eq!(global_severity("configparser", "ConfigParser"), None);
+        assert_eq!(global_severity("configparser", "ConfigParser.get"), None);
+        assert_eq!(global_severity("logging", "getLogger"), None);
+        assert_eq!(global_severity("tempfile", "gettempdir"), None);
     }
 
     #[test]
@@ -976,5 +1121,70 @@ mod tests {
         assert_eq!(global_severity("functools", "partial"), Some("warning"));
         assert_eq!(global_severity("functools", "reduce"), Some("critical"));
         assert_eq!(global_severity("linecache", "clearcache"), None);
+    }
+
+    #[test]
+    fn pathlib_filesystem_access_methods_are_dangerous_without_wildcarding_pathlib() {
+        assert_eq!(
+            callable_severity("pathlib", "PosixPath.touch"),
+            Some("critical")
+        );
+        assert_eq!(
+            callable_severity("pathlib", "PosixPath.read_text"),
+            Some("critical")
+        );
+        assert_eq!(
+            callable_severity("pathlib", "WindowsPath.read_bytes"),
+            Some("critical")
+        );
+        assert_eq!(
+            callable_severity("pathlib", "PosixPath.iterdir"),
+            Some("critical")
+        );
+        assert_eq!(
+            callable_severity("pathlib._local", "PosixPath.iterdir"),
+            Some("critical")
+        );
+        assert_eq!(
+            callable_severity("pathlib._local", "PosixPath.read_text"),
+            Some("critical")
+        );
+        assert_eq!(callable_severity("pathlib", "Path.glob"), Some("critical"));
+        assert_eq!(callable_severity("pathlib", "Path.rglob"), Some("critical"));
+        assert_eq!(callable_severity("pathlib", "Path.stat"), Some("critical"));
+        assert_eq!(
+            callable_severity("pathlib", "Path.readlink"),
+            Some("critical")
+        );
+        assert_eq!(
+            callable_severity("pathlib", "Path.exists"),
+            Some("critical")
+        );
+        assert_eq!(
+            callable_severity("pathlib", "Path.is_file"),
+            Some("critical")
+        );
+        assert_eq!(
+            callable_severity("pathlib", "Path.is_dir"),
+            Some("critical")
+        );
+        assert_eq!(
+            callable_severity("pathlib", "WindowsPath.write_text"),
+            Some("critical")
+        );
+        assert_eq!(callable_severity("pathlib", "Path.open"), Some("critical"));
+        assert_eq!(global_severity("pathlib", "Path.touch"), None);
+        assert_eq!(
+            global_severity("pathlib._local", "PosixPath.read_text"),
+            None
+        );
+        assert_eq!(global_severity("pathlib", "PosixPath"), None);
+        assert_eq!(callable_severity("pathlib", "PurePosixPath.touch"), None);
+        assert_eq!(callable_severity("pathlib", "PosixPath.as_posix"), None);
+        assert_eq!(
+            callable_severity("pathlib._local", "PosixPath.as_posix"),
+            None
+        );
+        assert_eq!(callable_severity("pathlib.extra", "PosixPath.touch"), None);
     }
 }

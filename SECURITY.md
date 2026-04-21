@@ -94,7 +94,7 @@ If a fix requires longer than the default window, we will negotiate an extension
 
 ## When we issue CVEs
 
-We request CVE IDs through [GitHub's CVE Numbering Authority (CNA)](https://docs.github.com/en/code-security/security-advisories/working-with-repository-security-advisories/about-github-security-advisories-for-repositories) program. Not every security fix warrants a CVE.
+We request CVE IDs through [GitHub's CVE Numbering Authority (CNA)](https://docs.github.com/code-security/security-advisories/repository-security-advisories/about-repository-security-advisories) program. Not every security fix warrants a CVE.
 
 **CVE issued:**
 

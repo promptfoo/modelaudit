@@ -22,7 +22,7 @@ use crate::nested_surface::{
 };
 use crate::opcode::{parse_opcode, ArgValue, ParseError, ParsedOpcode};
 use crate::options::{deadline_from_timeout, ScanOptions};
-use crate::policy::global_severity;
+use crate::policy::{callable_severity, global_severity};
 use crate::post_budget::{post_budget_absolute_position, post_budget_global_matches};
 use crate::report::{
     detail_string, detail_usize, notice_to_detail_value, scan_error_to_detail_value, DetailValue,
@@ -392,6 +392,7 @@ struct CallableInvocation {
     op_name: &'static str,
     opcode_position: usize,
     positional_arg_count: Option<usize>,
+    args: Vec<StackValue>,
 }
 
 enum MappingLookup<'a> {
@@ -1008,8 +1009,80 @@ impl<'a> ScanState<'a> {
                                 "__main__ references depend on arbitrary application code and become executable when consumed by REDUCE-like opcodes.",
                             ),
                         });
+                    } else if let Some(mutation_target) =
+                        sensitive_mutator_invocation_target(callable_ref, &primary_invocation.args)
+                    {
+                        self.add_finding(Finding {
+                            message: format!(
+                                "Found {} opcode mutating process-global state: {}",
+                                opcode.name,
+                                callable_ref.symbol()
+                            ),
+                            severity: "critical",
+                            location: Some(format!("{} (pos {})", self.source, position)),
+                            rule_code: Some("DANGEROUS_CALL"),
+                            details: vec![
+                                ("opcode".to_string(), DetailValue::String(opcode.name.to_string())),
+                                (
+                                    "module".to_string(),
+                                    DetailValue::String(callable_ref.module.clone()),
+                                ),
+                                ("name".to_string(), DetailValue::String(callable_ref.name.clone())),
+                                (
+                                    "import_reference".to_string(),
+                                    DetailValue::String(callable_ref.symbol()),
+                                ),
+                                (
+                                    "global_position".to_string(),
+                                    DetailValue::UInt(callable_ref.position as u64),
+                                ),
+                                (
+                                    "mutation_target".to_string(),
+                                    DetailValue::String(mutation_target.to_string()),
+                                ),
+                            ],
+                            why: Some(
+                                "This pickle opcode mutates process-global registries or diagnostic policy during deserialization.",
+                            ),
+                        });
+                    } else if let Some(protocol_target) =
+                        operator_mutator_protocol_target(callable_ref, &primary_invocation.args)
+                    {
+                        self.add_finding(Finding {
+                            message: format!(
+                                "Found {} opcode invoking object mutation protocol: {}",
+                                opcode.name,
+                                callable_ref.symbol()
+                            ),
+                            severity: "critical",
+                            location: Some(format!("{} (pos {})", self.source, position)),
+                            rule_code: Some("DANGEROUS_CALL"),
+                            details: vec![
+                                ("opcode".to_string(), DetailValue::String(opcode.name.to_string())),
+                                (
+                                    "module".to_string(),
+                                    DetailValue::String(callable_ref.module.clone()),
+                                ),
+                                ("name".to_string(), DetailValue::String(callable_ref.name.clone())),
+                                (
+                                    "import_reference".to_string(),
+                                    DetailValue::String(callable_ref.symbol()),
+                                ),
+                                (
+                                    "global_position".to_string(),
+                                    DetailValue::UInt(callable_ref.position as u64),
+                                ),
+                                (
+                                    "mutation_target".to_string(),
+                                    DetailValue::String(protocol_target.to_string()),
+                                ),
+                            ],
+                            why: Some(
+                                "Operator mutators dispatch to target object protocol methods, which can execute attacker-controlled methods during deserialization.",
+                            ),
+                        });
                     } else if let Some(severity) =
-                        global_severity(&callable_ref.module, &callable_ref.name)
+                        callable_severity(&callable_ref.module, &callable_ref.name)
                     {
                         self.add_finding(Finding {
                             message: format!(
@@ -1300,6 +1373,7 @@ impl<'a> ScanState<'a> {
             opcode.name,
             position,
             positional_arg_count,
+            argument_values.as_deref(),
         ) {
             invocations.push(invocation);
         }
@@ -1341,6 +1415,7 @@ impl<'a> ScanState<'a> {
         op_name: &'static str,
         position: usize,
         positional_arg_count: Option<usize>,
+        args: Option<&[StackValue]>,
     ) -> Option<CallableInvocation> {
         match callable_value {
             Some(StackValue::Global(reference)) if !reference.malformed => {
@@ -1352,6 +1427,7 @@ impl<'a> ScanState<'a> {
                     op_name,
                     opcode_position: position,
                     positional_arg_count,
+                    args: args.unwrap_or_default().to_vec(),
                 })
             }
             Some(StackValue::Constructed(reference)) if !reference.malformed => {
@@ -1364,6 +1440,7 @@ impl<'a> ScanState<'a> {
                     op_name,
                     opcode_position: position,
                     positional_arg_count,
+                    args: args.unwrap_or_default().to_vec(),
                 })
             }
             Some(StackValue::Global(reference) | StackValue::Constructed(reference))
@@ -1374,6 +1451,7 @@ impl<'a> ScanState<'a> {
                     op_name,
                     opcode_position: position,
                     positional_arg_count,
+                    args: args.unwrap_or_default().to_vec(),
                 })
             }
             _ => None,
@@ -2150,6 +2228,7 @@ impl<'a> ScanState<'a> {
             op_name,
             opcode_position: position,
             positional_arg_count: Some(1),
+            args: Vec::new(),
         })
     }
 
@@ -2615,6 +2694,7 @@ impl<'a> ScanState<'a> {
             op_name,
             opcode_position: position,
             positional_arg_count,
+            args: Vec::new(),
         }
     }
 
@@ -4556,6 +4636,77 @@ impl<'a> ScanState<'a> {
         report.set_item("metadata", metadata)?;
         report.set_item("duration_s", duration_s)?;
         Ok(report.unbind())
+    }
+}
+
+fn sensitive_mutator_invocation_target(
+    callable_ref: &GlobalRef,
+    args: &[StackValue],
+) -> Option<&'static str> {
+    if !is_container_mutator_callable(callable_ref) {
+        return None;
+    }
+    args.first().and_then(sensitive_mutation_target)
+}
+
+fn operator_mutator_protocol_target(
+    callable_ref: &GlobalRef,
+    args: &[StackValue],
+) -> Option<&'static str> {
+    if !matches!(callable_ref.module.as_str(), "operator" | "_operator") {
+        return None;
+    }
+    if !matches!(args.first(), Some(StackValue::Constructed(_))) {
+        return None;
+    }
+    match callable_ref.name.as_str() {
+        "setitem" => Some("object.__setitem__"),
+        _ => None,
+    }
+}
+
+fn is_container_mutator_callable(callable_ref: &GlobalRef) -> bool {
+    match callable_ref.module.as_str() {
+        "builtins" | "__builtin__" | "__builtins__" => matches!(
+            callable_ref.name.as_str(),
+            "dict.__delitem__"
+                | "dict.__ior__"
+                | "dict.__setitem__"
+                | "dict.clear"
+                | "dict.pop"
+                | "dict.popitem"
+                | "dict.setdefault"
+                | "dict.update"
+                | "list.__delitem__"
+                | "list.__iadd__"
+                | "list.__imul__"
+                | "list.__setitem__"
+                | "list.append"
+                | "list.clear"
+                | "list.extend"
+                | "list.insert"
+                | "list.pop"
+                | "list.remove"
+                | "list.reverse"
+                | "list.sort"
+        ),
+        "operator" | "_operator" => matches!(
+            callable_ref.name.as_str(),
+            "delitem" | "iadd" | "imul" | "ior" | "setitem"
+        ),
+        _ => false,
+    }
+}
+
+fn sensitive_mutation_target(value: &StackValue) -> Option<&'static str> {
+    let (StackValue::Global(reference) | StackValue::Constructed(reference)) = value else {
+        return None;
+    };
+    match (reference.module.as_str(), reference.name.as_str()) {
+        ("copyreg", "dispatch_table") => Some("copyreg.dispatch_table"),
+        ("logging", "root.handlers") => Some("logging.root.handlers"),
+        ("warnings", "filters") => Some("warnings.filters"),
+        _ => None,
     }
 }
 

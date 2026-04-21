@@ -4,6 +4,9 @@
       "pattern": "^https://github.com/.*/(pull|issues)/[0-9]+$"
     },
     {
+      "pattern": "^https://github.com/promptfoo/modelaudit/(commit|compare|releases/tag)/"
+    },
+    {
       "pattern": "^https://claude.ai"
     }
   ],
