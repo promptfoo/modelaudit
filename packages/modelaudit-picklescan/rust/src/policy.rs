@@ -402,6 +402,7 @@ const DANGEROUS_GLOBALS: &[(&str, &str)] = &[
     ("operator", "call"),
     ("operator", "itemgetter"),
     ("operator", "methodcaller"),
+    ("operator", "setitem"),
     ("pathlib", "Path.open"),
     ("pathlib", "Path.write_bytes"),
     ("pathlib", "Path.write_text"),
@@ -527,6 +528,7 @@ mod tests {
         assert_eq!(global_severity("pipes", "Template.copy"), Some("critical"));
         assert_eq!(global_severity("pipes", "Template.open"), Some("critical"));
         assert_eq!(global_severity("operator", "call"), Some("critical"));
+        assert_eq!(global_severity("operator", "setitem"), Some("critical"));
         assert_eq!(global_severity("site", "os.system"), Some("critical"));
         assert_eq!(
             global_severity("sysconfig", "prefix.os.system"),

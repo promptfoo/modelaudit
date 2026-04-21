@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from modelaudit_picklescan import PickleReport, SafetyVerdict, Severity, scan_bytes
+from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, Severity, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
 from modelaudit_picklescan.call_graph import (
     _call_graph_entrypoints,
@@ -615,6 +615,41 @@ def _builtins_help_payload() -> bytes:
     return _global_call_payload("builtins", "help")
 
 
+def _builtins_help_payload_after_import_prefix(import_names: list[str]) -> bytes:
+    parts = [b"\x80\x04"]
+    for name in import_names:
+        parts.extend([_global_operand("builtins", name), b"0"])
+    parts.extend(
+        [
+            _global_operand("builtins", "help"),
+            _args_tuple(_unicode_operand("os")),
+            b"R.",
+        ]
+    )
+    return b"".join(parts)
+
+
+def _duplicate_callable_invocation_budget_payload(repetitions: int) -> bytes:
+    parts = [b"\x80\x04"]
+    bool_invocation = b"".join(
+        [
+            _global_operand("builtins", "bool"),
+            _args_tuple(_unicode_operand("safe")),
+            b"R0",
+        ]
+    )
+    for _ in range(repetitions):
+        parts.append(bool_invocation)
+    parts.extend(
+        [
+            _global_operand("builtins", "help"),
+            _args_tuple(_unicode_operand("os")),
+            b"R.",
+        ]
+    )
+    return b"".join(parts)
+
+
 def _builtins_help_defaultdict_format_map_payload(*, lookup: bool) -> bytes:
     parts = [
         b"\x80\x04",
@@ -766,6 +801,68 @@ def _mapping_wrapper_getitem_payload(
             ]
         )
     parts.append(b".")
+    return b"".join(parts)
+
+
+def _chainmap_shadowed_defaultdict_getitem_payload() -> bytes:
+    return b"".join(
+        [
+            b"\x80\x04",
+            b"}",
+            b"\x94",
+            _unicode_operand("present"),
+            _unicode_operand("safe"),
+            b"s",
+            b"0",
+            _global_operand("collections", "defaultdict"),
+            _global_operand("builtins", "help"),
+            b"\x85R",
+            b"\x94",
+            b"0",
+            _global_operand("collections", "ChainMap"),
+            b"h\x00",
+            b"h\x01",
+            b"\x86R",
+            b"\x94",
+            b"0",
+            _global_operand("operator", "getitem"),
+            b"h\x02",
+            _unicode_operand("present"),
+            b"\x86R.",
+        ]
+    )
+
+
+def _deep_mapping_proxy_defaultdict_getitem_payload(depth: int) -> bytes:
+    if not 1 <= depth <= 255:
+        raise ValueError("depth must fit one-byte memo references")
+
+    parts = [
+        b"\x80\x04",
+        _global_operand("collections", "defaultdict"),
+        _global_operand("builtins", "help"),
+        b"\x85R",
+        b"\x94",
+    ]
+    for memo_index in range(depth):
+        parts.extend(
+            [
+                b"0",
+                _global_operand("types", "MappingProxyType"),
+                b"h" + bytes([memo_index]),
+                b"\x85R",
+                b"\x94",
+            ]
+        )
+    parts.extend(
+        [
+            b"0",
+            _global_operand("operator", "getitem"),
+            b"h" + bytes([depth]),
+            _unicode_operand("missing"),
+            b"\x86R.",
+        ]
+    )
     return b"".join(parts)
 
 
@@ -1299,6 +1396,95 @@ if marker.read_text() != marker_content:
     )
     assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
+
+
+def test_scan_bytes_keeps_callable_invocation_aliases_at_import_reference_budget() -> None:
+    safe_import_names = [
+        "abs",
+        "all",
+        "any",
+        "ascii",
+        "bin",
+        "bool",
+        "bytearray",
+        "bytes",
+        "callable",
+        "chr",
+        "complex",
+        "divmod",
+        "enumerate",
+        "float",
+        "format",
+        "frozenset",
+        "hash",
+        "hex",
+        "id",
+        "int",
+        "isinstance",
+        "issubclass",
+        "iter",
+        "len",
+        "list",
+        "max",
+        "min",
+        "next",
+        "object",
+        "oct",
+        "ord",
+    ]
+    payload = _builtins_help_payload_after_import_prefix(safe_import_names)
+
+    report = scan_bytes(payload, source="builtins-help-at-call-graph-reference-budget.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+
+
+def test_scan_bytes_dedupes_callable_invocations_before_metadata_cap() -> None:
+    payload = _duplicate_callable_invocation_budget_payload(repetitions=10_000)
+
+    report = scan_bytes(
+        payload,
+        source="duplicate-callable-invocation-budget.pkl",
+        options=ScanOptions(max_opcodes=200_000),
+    )
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 1
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+
+def test_scan_bytes_ignores_nested_function_body_sink_when_outer_function_is_imported(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_nested_fp_{tmp_path.name.replace('-', '_')}"
+    (tmp_path / f"{module_name}.py").write_text(
+        "def harmless(value):\n    def inner():\n        import os\n        os.system(value)\n    return value\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = b"".join([b"\x80\x04", _global_operand(module_name, "harmless"), b"."])
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
 
 
 def test_scan_bytes_blocks_iter_callable_sentinel_consumption_rce(tmp_path: Path) -> None:
@@ -5128,6 +5314,125 @@ def test_scan_bytes_keeps_mapping_wrapper_plain_dict_lookup_clean(
     report = scan_bytes(payload, source=f"{wrapper_module}-{wrapper_name}-plain-dict-wrapper-lookup.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
+
+
+def test_scan_bytes_keeps_chainmap_shadowed_defaultdict_lookup_clean(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "chainmap_shadowed_defaultdict_marker"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('pydoc-owned')\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+    payload = _chainmap_shadowed_defaultdict_getitem_payload()
+
+    report = scan_bytes(payload, source="chainmap-shadowed-defaultdict-lookup.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != "safe":
+    raise SystemExit(f"expected shadowed ChainMap value, got {result!r}")
+if marker.exists():
+    raise SystemExit("default factory unexpectedly imported pydoc")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+
+
+def test_scan_bytes_blocks_deep_mapping_proxy_defaultdict_factory_rce(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "deep_mapping_proxy_defaultdict_marker"
+    marker_content = "pydoc-owned-deep-wrapper"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+    payload = _deep_mapping_proxy_defaultdict_getitem_payload(depth=5)
+
+    report = scan_bytes(payload, source="deep-mapping-proxy-defaultdict-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != "factory-value":
+    raise SystemExit(f"expected factory value result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
 
 
 def test_scan_bytes_blocks_format_map_defaultdict_factory_rce(tmp_path: Path) -> None:

@@ -341,8 +341,8 @@ def _iter_call_graph_references(
     normalized: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
     for item in (
-        *_iter_import_references(import_references),
         *_iter_callable_invocation_references(callable_invocations),
+        *_iter_import_references(import_references),
     ):
         module = str(item.get("module", ""))
         name = str(item.get("name", ""))
@@ -2119,11 +2119,25 @@ def _iter_call_nodes(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> t
     calls: list[ast.Call] = []
 
     class _CallVisitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            return None
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            return None
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return None
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            return None
+
         def visit_Call(self, node: ast.Call) -> None:
             calls.append(node)
             self.generic_visit(node)
 
-    _CallVisitor().visit(function_node)
+    visitor = _CallVisitor()
+    for statement in function_node.body:
+        visitor.visit(statement)
     return tuple(calls)
 
 

@@ -39,7 +39,6 @@ const MIN_SUSPICIOUS_LITERAL_SCAN_WINDOW_CHARS: usize = 8192;
 const SUSPICIOUS_LITERAL_SCAN_OVERLAP_CHARS: usize = 4096;
 const TIME_CHECK_INTERVAL_OPCODES: usize = 4096;
 const MAX_IMPORT_REFERENCES: usize = 10_000;
-const MAX_MAPPING_WRAPPER_UNWRAP_DEPTH: usize = 4;
 
 const STACK_GLOBAL_STRING_OPCODES: &[&str] = &[
     "BINSTRING",
@@ -385,6 +384,7 @@ fn global_ref_details(
 }
 
 type GlobalReferenceDedupeKey = (String, String, usize, &'static str, bool);
+type CallableInvocationDedupeKey = (String, String, Option<usize>);
 
 #[derive(Clone)]
 struct CallableInvocation {
@@ -392,6 +392,11 @@ struct CallableInvocation {
     op_name: &'static str,
     opcode_position: usize,
     positional_arg_count: Option<usize>,
+}
+
+enum MappingLookup<'a> {
+    Found(&'a GlobalRef),
+    Shadowed,
 }
 
 pub(crate) struct ScanState<'a> {
@@ -431,6 +436,7 @@ pub(crate) struct ScanState<'a> {
     seen_finding_keys: HashSet<FindingDedupeKey>,
     seen_notice_keys: HashSet<NoticeDedupeKey>,
     seen_global_reference_keys: HashSet<GlobalReferenceDedupeKey>,
+    seen_callable_invocation_keys: HashSet<CallableInvocationDedupeKey>,
     import_references_truncated: bool,
 }
 
@@ -482,6 +488,7 @@ impl<'a> ScanState<'a> {
             seen_finding_keys: HashSet::new(),
             seen_notice_keys: HashSet::new(),
             seen_global_reference_keys: HashSet::new(),
+            seen_callable_invocation_keys: HashSet::new(),
             import_references_truncated: false,
         }
     }
@@ -822,9 +829,9 @@ impl<'a> ScanState<'a> {
                 });
             }
             "EMPTY_DICT" => {
-                self.stack.push(StackValue::Primitive {
-                    type_name: "dict",
-                    repr: "{}".to_string(),
+                self.stack.push(StackValue::TrackedDict {
+                    keys: Vec::new(),
+                    memo_index: None,
                 });
             }
             "EMPTY_SET" => {
@@ -837,21 +844,26 @@ impl<'a> ScanState<'a> {
                 let values = self.pop_to_mark();
                 self.stack.push(self.collapse_stack_values(values));
             }
-            "LIST" | "DICT" | "SET" | "FROZENSET" => {
+            "DICT" => {
+                let values = self.pop_to_mark();
+                self.stack.push(self.tracked_dict_from_values(&values));
+            }
+            "LIST" | "SET" | "FROZENSET" => {
                 let _ = self.pop_to_mark();
                 self.stack.push(StackValue::Other);
             }
             "TUPLE1" => self.collapse_top_n(1),
             "TUPLE2" => self.collapse_top_n(2),
             "TUPLE3" => self.collapse_top_n(3),
-            "APPEND" | "SETITEM" => {
+            "APPEND" => {
                 self.pop_value_operand_preserving_mark();
-                if opcode.name == "SETITEM" {
-                    self.pop_value_operand_preserving_mark();
-                }
             }
+            "SETITEM" => self.apply_setitem(),
             "APPENDS" | "SETITEMS" | "ADDITEMS" => {
-                self.pop_to_mark();
+                let values = self.pop_to_mark();
+                if opcode.name == "SETITEMS" {
+                    self.apply_setitems(&values);
+                }
             }
             "PUT" | "BINPUT" | "LONG_BINPUT" => {
                 if let Some(value) = self.stack.last().cloned() {
@@ -1115,6 +1127,65 @@ impl<'a> ScanState<'a> {
         values
     }
 
+    fn apply_setitem(&mut self) {
+        let _value = self.pop_value_operand_preserving_mark();
+        let key = self.pop_value_operand_preserving_mark();
+        if let Some(key) = key
+            .as_ref()
+            .and_then(|value| stack_value_string(value, self.payload))
+        {
+            self.record_top_tracked_dict_key(key.as_ref());
+        }
+    }
+
+    fn apply_setitems(&mut self, values: &[StackValue]) {
+        for pair in values.chunks_exact(2) {
+            if let Some(key) = pair
+                .first()
+                .and_then(|value| stack_value_string(value, self.payload))
+            {
+                self.record_top_tracked_dict_key(key.as_ref());
+            }
+        }
+    }
+
+    fn tracked_dict_from_values(&self, values: &[StackValue]) -> StackValue {
+        let mut keys = Vec::new();
+        for pair in values.chunks_exact(2) {
+            if let Some(key) = pair
+                .first()
+                .and_then(|value| stack_value_string(value, self.payload))
+            {
+                Self::insert_tracked_dict_key(&mut keys, key);
+            }
+        }
+        StackValue::TrackedDict {
+            keys,
+            memo_index: None,
+        }
+    }
+
+    fn record_top_tracked_dict_key(&mut self, key: &str) {
+        let memo_index = match self.stack.last_mut() {
+            Some(StackValue::TrackedDict { keys, memo_index }) => {
+                Self::insert_tracked_dict_key(keys, key.to_string());
+                *memo_index
+            }
+            _ => None,
+        };
+        if let Some(memo_index) = memo_index {
+            if let Some(StackValue::TrackedDict { keys, .. }) = self.memo.get_mut(&memo_index) {
+                Self::insert_tracked_dict_key(keys, key.to_string());
+            }
+        }
+    }
+
+    fn insert_tracked_dict_key(keys: &mut Vec<String>, key: String) {
+        if !keys.iter().any(|existing| existing == &key) {
+            keys.push(key);
+        }
+    }
+
     fn collapse_top_n(&mut self, count: usize) {
         if self.stack.len() < count {
             self.stack.push(StackValue::Other);
@@ -1232,7 +1303,7 @@ impl<'a> ScanState<'a> {
         ) {
             invocations.push(invocation);
         }
-        invocations.extend(Self::protocol_dispatch_invocations(
+        invocations.extend(self.protocol_dispatch_invocations(
             callable_value.as_ref(),
             argument_values.as_deref(),
             opcode.name,
@@ -1256,7 +1327,7 @@ impl<'a> ScanState<'a> {
             opcode.name,
             position,
         ));
-        invocations.extend(Self::defaultdict_factory_invocations(
+        invocations.extend(self.defaultdict_factory_invocations(
             callable_value.as_ref(),
             argument_values.as_deref(),
             opcode.name,
@@ -1316,6 +1387,7 @@ impl<'a> ScanState<'a> {
     }
 
     fn protocol_dispatch_invocations(
+        &self,
         callable_value: Option<&StackValue>,
         argument_values: Option<&[StackValue]>,
         op_name: &'static str,
@@ -1344,19 +1416,19 @@ impl<'a> ScanState<'a> {
                 Self::str_format_invocations(arguments, op_name, position)
             }
             ("builtins", "str.format_map") => {
-                Self::str_format_map_invocations(arguments, op_name, position)
+                self.str_format_map_invocations(arguments, op_name, position)
             }
             ("operator", "mod" | "imod") => {
-                Self::operator_mod_invocations(arguments, op_name, position)
+                self.operator_mod_invocations(arguments, op_name, position)
             }
             ("string", "Formatter.vformat") => {
-                Self::formatter_vformat_invocations(arguments, op_name, position)
+                self.formatter_vformat_invocations(arguments, op_name, position)
             }
             ("string", "Formatter._vformat") => {
-                Self::formatter_private_vformat_invocations(arguments, op_name, position)
+                self.formatter_private_vformat_invocations(arguments, op_name, position)
             }
             ("string", "Template.substitute" | "Template.safe_substitute") => {
-                Self::template_substitute_invocations(arguments, op_name, position)
+                self.template_substitute_invocations(arguments, op_name, position)
             }
             _ => Vec::new(),
         }
@@ -1886,6 +1958,7 @@ impl<'a> ScanState<'a> {
     }
 
     fn str_format_map_invocations(
+        &self,
         arguments: &[StackValue],
         op_name: &'static str,
         position: usize,
@@ -1893,10 +1966,11 @@ impl<'a> ScanState<'a> {
         if arguments.len() != 2 || !Self::is_format_string_argument(arguments.first()) {
             return Vec::new();
         }
-        Self::mapping_lookup_invocations(arguments.get(1), op_name, position)
+        self.mapping_lookup_invocations(arguments.get(1), None, op_name, position)
     }
 
     fn operator_mod_invocations(
+        &self,
         arguments: &[StackValue],
         op_name: &'static str,
         position: usize,
@@ -1904,15 +1978,19 @@ impl<'a> ScanState<'a> {
         if arguments.len() != 2 || !Self::is_format_string_argument(arguments.first()) {
             return Vec::new();
         }
-        Self::mapping_lookup_invocations(arguments.get(1), op_name, position)
+        self.mapping_lookup_invocations(arguments.get(1), None, op_name, position)
     }
 
     fn mapping_lookup_invocations(
+        &self,
         mapping: Option<&StackValue>,
+        key: Option<&str>,
         op_name: &'static str,
         position: usize,
     ) -> Vec<CallableInvocation> {
-        let Some(default_factory) = Self::mapping_default_factory(mapping, 0) else {
+        let Some(MappingLookup::Found(default_factory)) =
+            Self::mapping_lookup_default_factory(mapping, key)
+        else {
             return Vec::new();
         };
         vec![Self::zero_arg_invocation(
@@ -1922,37 +2000,73 @@ impl<'a> ScanState<'a> {
         )]
     }
 
-    fn mapping_default_factory(mapping: Option<&StackValue>, depth: usize) -> Option<&GlobalRef> {
-        match mapping? {
-            StackValue::DefaultDict { default_factory } => Some(default_factory),
-            StackValue::MappingWrapper { mappings, .. }
-                if depth < MAX_MAPPING_WRAPPER_UNWRAP_DEPTH =>
-            {
-                mappings
-                    .iter()
-                    .find_map(|mapping| Self::mapping_default_factory(Some(mapping), depth + 1))
+    fn mapping_lookup_default_factory<'b>(
+        mapping: Option<&'b StackValue>,
+        key: Option<&str>,
+    ) -> Option<MappingLookup<'b>> {
+        Self::mapping_lookup_default_factory_inner(mapping?, key)
+    }
+
+    fn mapping_lookup_default_factory_inner<'b>(
+        mapping: &'b StackValue,
+        key: Option<&str>,
+    ) -> Option<MappingLookup<'b>> {
+        match mapping {
+            StackValue::DefaultDict { default_factory } => {
+                Some(MappingLookup::Found(default_factory))
             }
+            StackValue::TrackedDict { keys, .. } => {
+                if key.is_some_and(|key| keys.iter().any(|candidate| candidate == key)) {
+                    Some(MappingLookup::Shadowed)
+                } else {
+                    None
+                }
+            }
+            StackValue::MappingWrapper {
+                reference,
+                mappings,
+            } if reference.module == "collections" && reference.name == "ChainMap" => {
+                for mapping in mappings {
+                    match Self::mapping_lookup_default_factory_inner(mapping, key) {
+                        Some(MappingLookup::Found(default_factory)) => {
+                            return Some(MappingLookup::Found(default_factory));
+                        }
+                        Some(MappingLookup::Shadowed) => return Some(MappingLookup::Shadowed),
+                        None => {}
+                    }
+                }
+                None
+            }
+            StackValue::MappingWrapper {
+                reference,
+                mappings,
+            } if reference.module == "types" && reference.name == "MappingProxyType" => mappings
+                .first()
+                .and_then(|mapping| Self::mapping_lookup_default_factory_inner(mapping, key)),
             _ => None,
         }
     }
 
     fn formatter_vformat_invocations(
+        &self,
         arguments: &[StackValue],
         op_name: &'static str,
         position: usize,
     ) -> Vec<CallableInvocation> {
-        Self::formatter_defaultdict_kwargs_invocations(arguments, &[4], op_name, position)
+        self.formatter_defaultdict_kwargs_invocations(arguments, &[4], op_name, position)
     }
 
     fn formatter_private_vformat_invocations(
+        &self,
         arguments: &[StackValue],
         op_name: &'static str,
         position: usize,
     ) -> Vec<CallableInvocation> {
-        Self::formatter_defaultdict_kwargs_invocations(arguments, &[6, 7], op_name, position)
+        self.formatter_defaultdict_kwargs_invocations(arguments, &[6, 7], op_name, position)
     }
 
     fn formatter_defaultdict_kwargs_invocations(
+        &self,
         arguments: &[StackValue],
         expected_arg_counts: &[usize],
         op_name: &'static str,
@@ -1963,10 +2077,11 @@ impl<'a> ScanState<'a> {
         {
             return Vec::new();
         }
-        Self::mapping_lookup_invocations(arguments.get(3), op_name, position)
+        self.mapping_lookup_invocations(arguments.get(3), None, op_name, position)
     }
 
     fn template_substitute_invocations(
+        &self,
         arguments: &[StackValue],
         op_name: &'static str,
         position: usize,
@@ -1974,7 +2089,7 @@ impl<'a> ScanState<'a> {
         if arguments.len() != 2 || !Self::string_template_may_lookup(arguments.first()) {
             return Vec::new();
         }
-        Self::mapping_lookup_invocations(arguments.get(1), op_name, position)
+        self.mapping_lookup_invocations(arguments.get(1), None, op_name, position)
     }
 
     fn string_template_may_lookup(value: Option<&StackValue>) -> bool {
@@ -2378,7 +2493,8 @@ impl<'a> ScanState<'a> {
         matches!(
             value,
             Some(StackValue::Primitive { type_name, .. }) if *type_name == name
-        ) || Self::is_constructed_builtin_instance(value, name)
+        ) || (name == "dict" && matches!(value, Some(StackValue::TrackedDict { .. })))
+            || Self::is_constructed_builtin_instance(value, name)
     }
 
     fn is_constructed_stdlib_instance(
@@ -2427,6 +2543,7 @@ impl<'a> ScanState<'a> {
     }
 
     fn defaultdict_factory_invocations(
+        &self,
         callable_value: Option<&StackValue>,
         argument_values: Option<&[StackValue]>,
         op_name: &'static str,
@@ -2449,7 +2566,11 @@ impl<'a> ScanState<'a> {
         let Some(argument_values) = argument_values else {
             return Vec::new();
         };
-        let Some(default_factory) = Self::mapping_default_factory(argument_values.first(), 0)
+        let key = argument_values
+            .get(1)
+            .and_then(|value| stack_value_string(value, self.payload));
+        let Some(MappingLookup::Found(default_factory)) =
+            Self::mapping_lookup_default_factory(argument_values.first(), key.as_deref())
         else {
             return Vec::new();
         };
@@ -2533,6 +2654,10 @@ impl<'a> ScanState<'a> {
                 callbacks.memo_index = Some(index);
                 StackValue::FutureCallbacks(callbacks)
             }
+            StackValue::TrackedDict { keys, .. } => StackValue::TrackedDict {
+                keys,
+                memo_index: Some(index),
+            },
             value => value,
         }
     }
@@ -3006,7 +3131,7 @@ impl<'a> ScanState<'a> {
 
         if mappings
             .iter()
-            .all(|mapping| Self::mapping_default_factory(Some(mapping), 0).is_none())
+            .all(|mapping| Self::mapping_lookup_default_factory(Some(mapping), None).is_none())
         {
             return None;
         }
@@ -3677,13 +3802,22 @@ impl<'a> ScanState<'a> {
     }
 
     fn push_callable_invocation(&mut self, invocation: &CallableInvocation) {
-        if invocation.reference.malformed
+        if invocation.reference.malformed {
+            return;
+        }
+
+        let symbol = invocation.reference.symbol();
+        let key = (
+            symbol.clone(),
+            invocation.op_name.to_string(),
+            invocation.positional_arg_count,
+        );
+        if !self.seen_callable_invocation_keys.insert(key)
             || self.callable_invocations.len() >= MAX_IMPORT_REFERENCES
         {
             return;
         }
 
-        let symbol = invocation.reference.symbol();
         let mut details = vec![
             (
                 "opcode".to_string(),
@@ -3714,6 +3848,27 @@ impl<'a> ScanState<'a> {
             ));
         }
         self.callable_invocations.push(details);
+    }
+
+    fn push_callable_invocation_details(&mut self, details: Vec<(String, DetailValue)>) {
+        let key = Self::callable_invocation_details_key(&details);
+        if key
+            .as_ref()
+            .is_some_and(|key| !self.seen_callable_invocation_keys.insert(key.clone()))
+            || self.callable_invocations.len() >= MAX_IMPORT_REFERENCES
+        {
+            return;
+        }
+        self.callable_invocations.push(details);
+    }
+
+    fn callable_invocation_details_key(
+        details: &[(String, DetailValue)],
+    ) -> Option<CallableInvocationDedupeKey> {
+        let import_reference = detail_string(details, "import_reference")?;
+        let opcode = detail_string(details, "opcode").unwrap_or_default();
+        let positional_arg_count = detail_usize(details, "positional_arg_count");
+        Some((import_reference, opcode, positional_arg_count))
     }
 
     fn rebuild_seen_notice_keys(&mut self) {
@@ -4253,9 +4408,7 @@ impl<'a> ScanState<'a> {
                 self.push_import_reference(reference);
             }
             for invocation in follow_on_scan.callable_invocations {
-                if self.callable_invocations.len() < MAX_IMPORT_REFERENCES {
-                    self.callable_invocations.push(invocation);
-                }
+                self.push_callable_invocation_details(invocation);
             }
             if had_findings {
                 self.add_notice(Notice {
