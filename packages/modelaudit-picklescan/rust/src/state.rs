@@ -415,6 +415,7 @@ pub(crate) struct ScanState<'a> {
     protocols: Vec<i64>,
     import_references: Vec<Vec<(String, DetailValue)>>,
     callable_invocations: Vec<Vec<(String, DetailValue)>>,
+    callable_invocation_keys: HashSet<CallableInvocationDedupeKey>,
     opcode_count: usize,
     opcode_counts: HashMap<&'static str, usize>,
     global_count: usize,
@@ -436,7 +437,6 @@ pub(crate) struct ScanState<'a> {
     seen_finding_keys: HashSet<FindingDedupeKey>,
     seen_notice_keys: HashSet<NoticeDedupeKey>,
     seen_global_reference_keys: HashSet<GlobalReferenceDedupeKey>,
-    seen_callable_invocation_keys: HashSet<CallableInvocationDedupeKey>,
     import_references_truncated: bool,
 }
 
@@ -467,6 +467,7 @@ impl<'a> ScanState<'a> {
             protocols: Vec::new(),
             import_references: Vec::new(),
             callable_invocations: Vec::new(),
+            callable_invocation_keys: HashSet::new(),
             opcode_count: 0,
             opcode_counts: HashMap::new(),
             global_count: 0,
@@ -488,7 +489,6 @@ impl<'a> ScanState<'a> {
             seen_finding_keys: HashSet::new(),
             seen_notice_keys: HashSet::new(),
             seen_global_reference_keys: HashSet::new(),
-            seen_callable_invocation_keys: HashSet::new(),
             import_references_truncated: false,
         }
     }
@@ -3806,18 +3806,19 @@ impl<'a> ScanState<'a> {
             return;
         }
 
-        let symbol = invocation.reference.symbol();
-        let key = (
-            symbol.clone(),
-            invocation.op_name.to_string(),
+        let dedupe_key = (
+            invocation.reference.module.clone(),
+            invocation.reference.name.clone(),
             invocation.positional_arg_count,
         );
-        if !self.seen_callable_invocation_keys.insert(key)
+        if self.callable_invocation_keys.contains(&dedupe_key)
             || self.callable_invocations.len() >= MAX_IMPORT_REFERENCES
         {
             return;
         }
+        self.callable_invocation_keys.insert(dedupe_key);
 
+        let symbol = invocation.reference.symbol();
         let mut details = vec![
             (
                 "opcode".to_string(),
@@ -3848,27 +3849,6 @@ impl<'a> ScanState<'a> {
             ));
         }
         self.callable_invocations.push(details);
-    }
-
-    fn push_callable_invocation_details(&mut self, details: Vec<(String, DetailValue)>) {
-        let key = Self::callable_invocation_details_key(&details);
-        if key
-            .as_ref()
-            .is_some_and(|key| !self.seen_callable_invocation_keys.insert(key.clone()))
-            || self.callable_invocations.len() >= MAX_IMPORT_REFERENCES
-        {
-            return;
-        }
-        self.callable_invocations.push(details);
-    }
-
-    fn callable_invocation_details_key(
-        details: &[(String, DetailValue)],
-    ) -> Option<CallableInvocationDedupeKey> {
-        let import_reference = detail_string(details, "import_reference")?;
-        let opcode = detail_string(details, "opcode").unwrap_or_default();
-        let positional_arg_count = detail_usize(details, "positional_arg_count");
-        Some((import_reference, opcode, positional_arg_count))
     }
 
     fn rebuild_seen_notice_keys(&mut self) {
@@ -4408,7 +4388,11 @@ impl<'a> ScanState<'a> {
                 self.push_import_reference(reference);
             }
             for invocation in follow_on_scan.callable_invocations {
-                self.push_callable_invocation_details(invocation);
+                if self.callable_invocations.len() < MAX_IMPORT_REFERENCES
+                    && self.remember_callable_invocation_details(&invocation)
+                {
+                    self.callable_invocations.push(invocation);
+                }
             }
             if had_findings {
                 self.add_notice(Notice {
@@ -4431,6 +4415,17 @@ impl<'a> ScanState<'a> {
                 return;
             }
         }
+    }
+
+    fn remember_callable_invocation_details(&mut self, details: &[(String, DetailValue)]) -> bool {
+        let module = detail_string(details, "module").unwrap_or_default();
+        let name = detail_string(details, "name").unwrap_or_default();
+        if module.is_empty() || name.is_empty() {
+            return false;
+        }
+        let positional_arg_count = detail_usize(details, "positional_arg_count");
+        self.callable_invocation_keys
+            .insert((module, name, positional_arg_count))
     }
 
     fn coalesce_redundant_global_findings(&mut self) {

@@ -52,6 +52,9 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   paths in pickle call-graph analysis so process-dispatch wrappers are blocked.
 - Resolve function-local import aliases in pickle call-graph analysis so
   wrappers that import RCE sinks inside function bodies are blocked.
+- Preserve callable invocation aliases when import-reference metadata is
+  crowded, while ignoring uninvoked nested function and lambda bodies during
+  pickle call-graph analysis.
 - Detect `typing._eval_type` pickle call targets that can evaluate
   attacker-controlled `ForwardRef` expressions.
 - Detect `dataclasses._create_fn` pickle call targets that can execute
@@ -125,8 +128,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Track literal mapping keys through memoized dicts and mapping wrappers so
   shadowed `ChainMap` lookups stay clean while deeply wrapped `defaultdict`
   factories remain detected.
-- Ignore nested function, class, and lambda bodies when modeling an outer
-  function's call graph.
+- Ignore nested function and lambda bodies when modeling an outer function's
+  call graph.
 - Detect policy-backed dangerous globals in post-budget tails instead of relying
   on a small hardcoded byte-needle table.
 - Detect nested payloads that use PERSID/BINPERSID semantics, proto-0 payloads,

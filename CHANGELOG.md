@@ -90,6 +90,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pickle call-graph analysis so wrapper functions like `click.edit` are blocked
 - **security:** resolve function-local import aliases in pickle call-graph
   analysis so wrappers that import RCE sinks inside function bodies are blocked
+- **security:** preserve callable invocation aliases when import-reference
+  metadata is crowded, while ignoring uninvoked nested function and lambda
+  bodies during pickle call-graph analysis
 - **security:** detect `typing._eval_type` pickle call targets that can
   evaluate attacker-controlled `ForwardRef` expressions
 - **security:** detect `dataclasses._create_fn` pickle call targets that can
@@ -258,8 +261,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invocation aliases ahead of import-reference budget exhaustion, dedupe repeated
   invocation metadata before the reporting cap, preserve literal mapping-key
   shadowing through `ChainMap`, block deeply wrapped `defaultdict` factories,
-  and avoid outer-function call-graph false positives from nested function,
-  class, and lambda bodies.
+  and avoid outer-function call-graph false positives from nested function and
+  lambda bodies.
 - **security:** prevent HuggingFace whitelist provenance from downgrading active payload, CVE, traversal, executable, operational-error, or incomplete-coverage findings. Exemptions now cover S1xx code-execution primitives (`S101`–`S115`) and HIGH-severity S3xx network primitives (`S301`/`S304`/`S305`/`S310`), and the keyword fallback uses word-boundary matching so substrings like "executable" inside "ExecuTorch" no longer over-suppress legitimate downgrades.
 - **security:** scan generic ZIP/TAR/NPZ Python members and ZIP/TAR/NPZ executable members, including wildcard imports and callable rebindings while failing closed on malformed Python source. Findings carry accurate rule codes per risk category (`S101` for `os.system`/`os.popen`, `S103` for `subprocess.*`, `S104` for `eval`/`exec`, `S106` for `__import__`, `S107` for `importlib.import_module`, `S213` for `pickle.load`/`pickle.loads`) instead of a single catch-all, the ZIP path now honors `max_mar_python_analysis_bytes` for non-MAR Python members, and source bytes are parsed directly so PEP 263 encoding declarations are respected.
 - **security:** bound PyTorch ZIP JIT/network member reads (default 32 MiB per-member cap, configurable via `max_jit_scan_member_bytes`) and mark oversized or unreadable member coverage inconclusive. Oversize and read-failure events are aggregated into a single summary INFO check per kind (with per-member detail in `details["entries"]`) so adversarial archives cannot flood the checks list, duplicate-name entries are de-duplicated by `ZipInfo` identity rather than filename so the second of two same-name members is still analyzed, directory entries are skipped explicitly, and pickle members continue through the bounded JIT/network pass so padded payloads remain covered beyond the pickle scanner raw window.

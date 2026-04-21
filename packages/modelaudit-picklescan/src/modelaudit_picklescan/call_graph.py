@@ -340,18 +340,17 @@ def _iter_call_graph_references(
 ) -> tuple[dict[str, object], ...]:
     normalized: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
-    for item in (
-        *_iter_callable_invocation_references(callable_invocations),
-        *_iter_import_references(import_references),
+    for references in (
+        _iter_import_references(import_references),
+        _iter_callable_invocation_references(callable_invocations),
     ):
-        module = str(item.get("module", ""))
-        name = str(item.get("name", ""))
-        if not module or not name or (module, name) in seen:
-            continue
-        seen.add((module, name))
-        normalized.append(dict(item))
-        if len(normalized) >= _MAX_IMPORT_REFERENCES:
-            break
+        for item in references:
+            module = str(item.get("module", ""))
+            name = str(item.get("name", ""))
+            if not module or not name or (module, name) in seen:
+                continue
+            seen.add((module, name))
+            normalized.append(dict(item))
     return tuple(normalized)
 
 
@@ -2119,21 +2118,25 @@ def _iter_call_nodes(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> t
     calls: list[ast.Call] = []
 
     class _CallVisitor(ast.NodeVisitor):
-        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-            return None
-
-        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-            return None
-
-        def visit_ClassDef(self, node: ast.ClassDef) -> None:
-            return None
-
-        def visit_Lambda(self, node: ast.Lambda) -> None:
-            return None
-
         def visit_Call(self, node: ast.Call) -> None:
             calls.append(node)
             self.generic_visit(node)
+
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            self._visit_nested_function_signature(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            self._visit_nested_function_signature(node)
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            self.visit(node.args)
+
+        def _visit_nested_function_signature(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+            for decorator in node.decorator_list:
+                self.visit(decorator)
+            self.visit(node.args)
+            if node.returns is not None:
+                self.visit(node.returns)
 
     visitor = _CallVisitor()
     for statement in function_node.body:
