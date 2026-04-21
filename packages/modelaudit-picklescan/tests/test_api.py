@@ -20,6 +20,8 @@ import pytest
 
 import modelaudit_picklescan.api as package_api
 from modelaudit_picklescan import (
+    Finding,
+    PickleReport,
     PickleScanner,
     SafetyVerdict,
     ScanOptions,
@@ -2084,6 +2086,74 @@ def test_scan_bytes_resolves_short_binstring_stack_global_operands() -> None:
             "is_dangerous": False,
         }
     ]
+
+
+def test_with_call_graph_findings_promotes_click_startup_hook_write_paths() -> None:
+    pytest.importorskip("click")
+
+    report = PickleReport(
+        source="click-startup-hook-write.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            )
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.verdict == SafetyVerdict.MALICIOUS
+    file_write_findings = [
+        finding for finding in updated.findings if finding.rule_code == "DANGEROUS_CALL_GRAPH_FILE_WRITE"
+    ]
+    assert len(file_write_findings) == 1
+
+    finding = file_write_findings[0]
+    assert finding.details["module"] == "click"
+    assert finding.details["name"] == "echo"
+    assert finding.details["opener_module"] == "click"
+    assert finding.details["opener_name"] == "open_file"
+    assert finding.details["open_sink"] == "builtins.open"
+    assert finding.details["write_sink"] == "binary_file.write"
+    assert finding.details["opener_call_path"] == (
+        "click.utils.open_file",
+        "click.utils.LazyFile.__init__",
+        "builtins.open",
+    )
+    assert finding.details["writer_call_path"] == ("click.utils.echo", "binary_file.write")
+    assert finding.details["analysis"] == "python_call_graph_startup_hook_write"
+
+
+def test_with_call_graph_findings_dedupes_click_startup_hook_write_when_writer_is_already_critical() -> None:
+    pytest.importorskip("click")
+
+    existing_finding = Finding(
+        message="existing critical writer finding",
+        severity=Severity.CRITICAL,
+        location="click-startup-hook-write-dedupe.pkl",
+        rule_code="DANGEROUS_CALL",
+        details={"module": "click", "name": "echo"},
+    )
+    report = PickleReport(
+        source="click-startup-hook-write-dedupe.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(existing_finding,),
+        metadata={
+            "import_references": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            )
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated is report
+    assert updated.findings == (existing_finding,)
 
 
 def test_scan_bytes_warns_on_main_module_global_references() -> None:
