@@ -10,6 +10,13 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any, BinaryIO, cast
 
+from .call_graph import (
+    CallGraphFinding,
+    StartupHookWriteFinding,
+    find_dangerous_call_graphs,
+    find_startup_hook_write_call_graphs,
+    has_unanalyzed_call_graph_import_references,
+)
 from .options import ScanOptions
 from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdict, ScanError, ScanStatus, Severity
 
@@ -862,7 +869,7 @@ def _scan_pickle_payload_native(
         )
         if not isinstance(raw_report, Mapping):
             raise TypeError(f"Rust scanner returned {type(raw_report).__name__}, expected mapping")
-        return _report_from_native_dict(raw_report)
+        return _with_call_graph_findings(_report_from_native_dict(raw_report))
     except Exception as error:
         return _engine_error_report(
             source=source,
@@ -900,6 +907,130 @@ def _report_from_native_dict(raw_report: Mapping[str, Any]) -> PickleReport:
         ),
         metadata=dict(_mapping(raw_report.get("metadata", {}))),
         duration_s=float(raw_report.get("duration_s", 0.0)),
+    )
+
+
+def _with_call_graph_findings(report: PickleReport) -> PickleReport:
+    import_references = report.metadata.get("import_references")
+    callable_invocations = report.metadata.get("callable_invocations")
+    call_graph_limit_exceeded = has_unanalyzed_call_graph_import_references(import_references)
+    try:
+        call_graph_findings = find_dangerous_call_graphs(import_references, callable_invocations)
+    except Exception:
+        call_graph_findings = ()
+    try:
+        startup_hook_write_findings = find_startup_hook_write_call_graphs(import_references)
+    except Exception:
+        startup_hook_write_findings = ()
+    if not call_graph_findings and not startup_hook_write_findings and not call_graph_limit_exceeded:
+        return report
+
+    existing_critical_globals = {
+        (str(finding.details.get("module", "")), str(finding.details.get("name", "")))
+        for finding in report.findings
+        if finding.severity == Severity.CRITICAL
+    }
+    rce_findings = tuple(
+        _call_graph_finding_to_report_finding(report, finding)
+        for finding in call_graph_findings
+        if (finding.module, finding.name) not in existing_critical_globals
+    )
+    startup_findings = tuple(
+        _startup_hook_write_finding_to_report_finding(report, finding)
+        for finding in startup_hook_write_findings
+        if (finding.writer_module, finding.writer_name) not in existing_critical_globals
+        and (finding.opener_module, finding.opener_name) not in existing_critical_globals
+    )
+    limit_findings = (
+        (_call_graph_import_reference_limit_finding_to_report_finding(report),)
+        if call_graph_limit_exceeded and not rce_findings and not startup_findings
+        else ()
+    )
+    additional_findings = (*rce_findings, *startup_findings, *limit_findings)
+    if not additional_findings:
+        return report
+
+    return PickleReport(
+        source=report.source,
+        status=report.status,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(*report.findings, *additional_findings),
+        notices=report.notices,
+        errors=report.errors,
+        coverage=report.coverage,
+        metadata=report.to_dict()["metadata"],
+        duration_s=report.duration_s,
+    )
+
+
+def _call_graph_import_reference_limit_finding_to_report_finding(report: PickleReport) -> Finding:
+    return Finding(
+        message="Python call-graph analysis skipped import references beyond the unique-reference limit",
+        severity=Severity.CRITICAL,
+        location=report.source,
+        rule_code="DANGEROUS_CALL_GRAPH_LIMIT",
+        details={
+            "analysis": "python_call_graph_limit",
+            "max_unique_import_references": 32,
+            "analysis_incomplete": True,
+        },
+        why=(
+            "The pickle imports more unique globals than the bounded Python call-graph pass analyzes; "
+            "unanalyzed globals can hide call-graph-only RCE primitives."
+        ),
+    )
+
+
+def _startup_hook_write_finding_to_report_finding(report: PickleReport, finding: StartupHookWriteFinding) -> Finding:
+    return Finding(
+        message=(
+            f"Pickle globals '{finding.opener_import_reference}' and "
+            f"'{finding.writer_import_reference}' can open and write "
+            "attacker-controlled files through the installed call graph"
+        ),
+        severity=Severity.CRITICAL,
+        location=report.source,
+        rule_code="DANGEROUS_CALL_GRAPH_FILE_WRITE",
+        details={
+            "module": finding.writer_module,
+            "name": finding.writer_name,
+            "import_reference": finding.writer_import_reference,
+            "opener_module": finding.opener_module,
+            "opener_name": finding.opener_name,
+            "opener_import_reference": finding.opener_import_reference,
+            "open_sink": finding.open_sink,
+            "write_sink": finding.write_sink,
+            "opener_call_path": list(finding.opener_call_path),
+            "writer_call_path": list(finding.writer_call_path),
+            "analysis": "python_call_graph_startup_hook_write",
+        },
+        why=(
+            "The pickle imports Python wrappers that can open a pickle-controlled path and write "
+            "pickle-controlled content, which can create executable Python startup hooks."
+        ),
+    )
+
+
+def _call_graph_finding_to_report_finding(report: PickleReport, finding: CallGraphFinding) -> Finding:
+    return Finding(
+        message=(
+            f"Pickle global '{finding.import_reference}' reaches dangerous Python "
+            f"primitive '{finding.sink}' through the installed call graph"
+        ),
+        severity=Severity.CRITICAL,
+        location=report.source,
+        rule_code="DANGEROUS_CALL_GRAPH",
+        details={
+            "module": finding.module,
+            "name": finding.name,
+            "import_reference": finding.import_reference,
+            "sink": finding.sink,
+            "call_path": list(finding.call_path),
+            "analysis": "python_call_graph",
+        },
+        why=(
+            "The pickle imports a Python wrapper whose source code reaches a known RCE-capable primitive when invoked."
+        ),
     )
 
 

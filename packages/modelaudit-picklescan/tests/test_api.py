@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import collections
+import copyreg
 import datetime
 import decimal
 import functools
@@ -427,6 +428,32 @@ def test_scan_bytes_escalates_copyreg_extension_reduce() -> None:
         and finding.details.get("opaque_extension") is True
         for finding in report.findings
     )
+
+
+def test_scan_bytes_blocks_operator_setitem_copyreg_dispatch_table_poisoning() -> None:
+    payload = b"\x80\x02coperator\nsetitem\nccopyreg\ndispatch_table\ncdecimal\nDecimal\ncbuiltins\nstr\n\x87R."
+    original_dispatch_table = dict(copyreg.dispatch_table)
+
+    try:
+        copyreg.dispatch_table.pop(decimal.Decimal, None)
+
+        report = scan_bytes(payload, source="operator-setitem-copyreg-dispatch-table.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert decimal.Decimal not in copyreg.dispatch_table
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == "operator.setitem"
+            for finding in report.findings
+        )
+
+        assert pickle.loads(payload) is None
+        assert copyreg.dispatch_table.get(decimal.Decimal) is str
+    finally:
+        copyreg.dispatch_table.clear()
+        copyreg.dispatch_table.update(original_dispatch_table)
 
 
 @pytest.mark.parametrize(
@@ -1809,6 +1836,7 @@ def test_scan_bytes_allows_benign_dill_text_literal() -> None:
         (b"cnumpy\nload\n(tR.", "numpy.load"),
         (b"cshutil\nrmtree\n(tR.", "shutil.rmtree"),
         (b"ctarfile\nopen\n(tR.", "tarfile.open"),
+        (b"ctempfile\nNamedTemporaryFile\n(tR.", "tempfile.NamedTemporaryFile"),
         (b"cwebbrowser\nopen\n(tR.", "webbrowser.open"),
         (b"czipfile\nZipFile\n(tR.", "zipfile.ZipFile"),
         (b"cbuiltins\nglobals\n(tR.", "builtins.globals"),
@@ -1857,7 +1885,6 @@ def test_scan_bytes_flags_newobj_ex_dangerous_class() -> None:
             "uuid.UUID",
         ),
         (b"clogging\ngetLogger\n.", "logging.getLogger"),
-        (b"ctempfile\nNamedTemporaryFile\n.", "tempfile.NamedTemporaryFile"),
         (pickle.dumps(tarfile.TarInfo("weights.bin"), protocol=4), "tarfile.TarInfo"),
         (pickle.dumps(zipfile.ZipInfo("weights.bin"), protocol=4), "zipfile.ZipInfo"),
     ],

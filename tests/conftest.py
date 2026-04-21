@@ -175,6 +175,13 @@ def pytest_runtest_setup(item):
             "test_file_iterator.py",  # Streaming file iterator memory regression tests
             "test_benchmark_report.py",  # benchmark CI summary and regression gate tests
             "test_large_pickle_corpus_qa.py",  # large PickleScan Rust corpus QA harness tests
+            "test_call_graph_click.py",  # standalone picklescan Click editor call-graph RCE regressions
+            "test_call_graph_execnet.py",  # standalone picklescan execnet call-graph RCE regressions
+            "test_call_graph_instance_defaults.py",  # standalone picklescan constructor-default alias RCE regressions
+            "test_call_graph_import_statements.py",  # standalone picklescan import-statement call-graph RCE regressions
+            "test_call_graph_local_imports.py",  # standalone picklescan function-local import RCE regressions
+            "test_call_graph_six.py",  # standalone picklescan six.moves alias RCE regressions
+            "test_call_graph_tkinter.py",  # standalone picklescan Tcl call-graph RCE regressions
             "test_dill_joblib_enhanced.py",  # Dill/joblib pickle routing regression tests
             "test_pickle_context_filtering.py",  # Pickle context filtering regression tests
             "test_xdist_status.py",  # xdist worker progress reporting tests
