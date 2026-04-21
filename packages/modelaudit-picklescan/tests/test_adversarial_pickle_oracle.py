@@ -623,6 +623,16 @@ def _has_critical_operator_call_finding(report: PickleReport) -> bool:
     )
 
 
+def _has_critical_operator_setitem_finding(report: PickleReport) -> bool:
+    return any(
+        finding.severity == Severity.CRITICAL
+        and finding.rule_code == "DANGEROUS_CALL"
+        and finding.details.get("module") == "operator"
+        and finding.details.get("name") == "setitem"
+        for finding in report.findings
+    )
+
+
 def _has_critical_typing_eval_type_finding(report: PickleReport) -> bool:
     return any(
         finding.severity == Severity.CRITICAL
@@ -6044,7 +6054,8 @@ def test_scan_bytes_blocks_builtins_type_setitem_assignment_rce(tmp_path: Path) 
 
     report = scan_bytes(payload, source="builtins-type-setitem-assignment-rce.pkl")
 
-    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_operator_setitem_finding(report)
     assert _has_suspicious_magic_method_finding(report)
 
     assert not marker.exists()

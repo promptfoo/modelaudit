@@ -122,6 +122,14 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Detect public `operator.setitem` pickle calls, preserve callable-invocation
+  aliases before import-reference budget exhaustion, and dedupe repeated
+  invocation metadata before applying the reporting cap.
+- Track literal mapping keys through memoized dicts and mapping wrappers so
+  shadowed `ChainMap` lookups stay clean while deeply wrapped `defaultdict`
+  factories remain detected.
+- Ignore nested function and lambda bodies when modeling an outer function's
+  call graph.
 - Detect policy-backed dangerous globals in post-budget tails instead of relying
   on a small hardcoded byte-needle table.
 - Detect nested payloads that use PERSID/BINPERSID semantics, proto-0 payloads,

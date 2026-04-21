@@ -57,6 +57,14 @@ pub(crate) enum StackValue {
     DefaultDict {
         default_factory: GlobalRef,
     },
+    TrackedDict {
+        keys: Vec<String>,
+        memo_index: Option<i64>,
+    },
+    MappingWrapper {
+        reference: GlobalRef,
+        mappings: Vec<StackValue>,
+    },
     StringTemplate {
         template: String,
     },
@@ -108,6 +116,16 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
         Some(StackValue::DefaultDict { default_factory }) => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
+        Some(StackValue::TrackedDict { keys, .. }) if keys.is_empty() => "dict:{}".to_string(),
+        Some(StackValue::TrackedDict { keys, .. }) => format!("dict(keys={})", keys.len()),
+        Some(StackValue::MappingWrapper {
+            reference,
+            mappings,
+        }) => format!(
+            "mapping_wrapper:{}(mappings={})",
+            reference.symbol(),
+            mappings.len()
+        ),
         Some(StackValue::StringTemplate { template }) => {
             format!("string_template:{template:?}")
         }
@@ -203,6 +221,16 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
         StackValue::DefaultDict { default_factory } => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
+        StackValue::TrackedDict { keys, .. } if keys.is_empty() => "dict:{}".to_string(),
+        StackValue::TrackedDict { keys, .. } => format!("dict(keys={})", keys.len()),
+        StackValue::MappingWrapper {
+            reference,
+            mappings,
+        } => format!(
+            "mapping_wrapper:{}(mappings={})",
+            reference.symbol(),
+            mappings.len()
+        ),
         StackValue::StringTemplate { template } => format!("string_template:{template:?}"),
         StackValue::RegexPattern { pattern, flags } => {
             format!(
