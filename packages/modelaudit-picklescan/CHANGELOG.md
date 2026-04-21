@@ -122,6 +122,11 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Detect additional stdlib callable pickle targets that can access files,
+  mutate registries, suppress diagnostics, or change process state, including
+  Python 3.13 `pathlib._local` concrete path aliases, public `operator.setitem`
+  registry poisoning, target-aware `operator.imul` warning-filter mutation, and
+  target-aware handling for list/dict mutators.
 - Detect public `operator.setitem` pickle calls, preserve callable-invocation
   aliases before import-reference budget exhaustion, and dedupe repeated
   invocation metadata before applying the reporting cap.

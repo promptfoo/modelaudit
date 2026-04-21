@@ -6,15 +6,20 @@ import collections
 import copyreg
 import datetime
 import decimal
+import faulthandler
 import functools
 import io
+import logging
 import os
 import pickle
 import re
+import sys
 import tarfile
 import uuid
+import warnings
 import zipfile
 from pathlib import Path, PurePosixPath
+from typing import cast
 
 import pytest
 
@@ -37,6 +42,246 @@ def _short_binunicode(data: bytes) -> bytes:
     if len(data) > 0xFF:
         raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
     return b"\x8c" + bytes([len(data)]) + data
+
+
+def _global(module: bytes, name: bytes) -> bytes:
+    return b"c" + module + b"\n" + name + b"\n"
+
+
+def _binunicode(data: bytes) -> bytes:
+    return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def _concrete_pathlib_class_name() -> str:
+    return "WindowsPath" if os.name == "nt" else "PosixPath"
+
+
+def _pathlib_method_reduce_payload(target: Path, method: str) -> bytes:
+    class_name = _concrete_pathlib_class_name()
+    return (
+        b"\x80\x04"
+        + f"cpathlib\n{class_name}\n".encode("ascii")
+        + _binunicode(str(target).encode())
+        + b"\x85R\x94"
+        + f"cpathlib\n{class_name}.{method}\n".encode("ascii")
+        + b"h\x00\x85R."
+    )
+
+
+def _file_mode_reduce_payload(module: bytes, name: bytes, target: Path, mode: bytes) -> bytes:
+    return (
+        b"\x80\x04c"
+        + module
+        + b"\n"
+        + name
+        + b"\n"
+        + _binunicode(str(target).encode())
+        + _short_binunicode(mode)
+        + b"\x86R."
+    )
+
+
+def _dbm_open_payload(base: Path) -> bytes:
+    return b"\x80\x04cdbm\nopen\n" + _binunicode(str(base).encode()) + _short_binunicode(b"c") + b"\x86R."
+
+
+def _maildir_payload(maildir: Path) -> bytes:
+    return b"\x80\x04cmailbox\nMaildir\n" + _binunicode(str(maildir).encode()) + b"\x88\x86R."
+
+
+def _named_temporary_file_payload(directory: Path) -> bytes:
+    return (
+        b"\x80\x04ctempfile\nNamedTemporaryFile\n("
+        + _short_binunicode(b"w+b")
+        + b"J\xff\xff\xff\xff"
+        + b"N"
+        + b"N"
+        + _short_binunicode(b"")
+        + _short_binunicode(b"pickle-")
+        + _binunicode(str(directory).encode())
+        + b"\x89"
+        + b"tR."
+    )
+
+
+def _temporary_directory_payload(parent: Path) -> bytes:
+    return (
+        b"\x80\x04ctempfile\nTemporaryDirectory\n("
+        + _short_binunicode(b"")
+        + _short_binunicode(b"pickle-")
+        + _binunicode(str(parent).encode())
+        + b"tR."
+    )
+
+
+def _configparser_read_get_payload(config_path: Path, read_method: bytes) -> bytes:
+    return (
+        b"\x80\x04"
+        b"cconfigparser\nConfigParser\n)R\x94"
+        + _global(b"configparser", read_method)
+        + b"h\x00"
+        + _binunicode(str(config_path).encode())
+        + b"\x86R0"
+        b"cconfigparser\nConfigParser.get\n"
+        b"h\x00" + _short_binunicode(b"secrets") + _short_binunicode(b"token") + b"\x87R."
+    )
+
+
+def _argparse_filetype_payload(target: Path) -> bytes:
+    return (
+        b"\x80\x04"
+        b"cargparse\nFileType\n"
+        + _short_binunicode(b"w")
+        + b"\x85R\x94"
+        + b"h\x00"
+        + _binunicode(str(target).encode())
+        + b"\x85R."
+    )
+
+
+def _copyreg_pickle_payload() -> bytes:
+    return b"\x80\x04ccopyreg\npickle\ncdecimal\nDecimal\ncbuiltins\nstr\n\x86R."
+
+
+def _copyreg_dispatch_table_update_payload() -> bytes:
+    return b"\x80\x04cbuiltins\ndict.update\nccopyreg\ndispatch_table\n}cdecimal\nDecimal\ncbuiltins\nstr\ns\x86R."
+
+
+def _copyreg_dispatch_table_setitem_payload() -> bytes:
+    return b"\x80\x04cbuiltins\ndict.__setitem__\nccopyreg\ndispatch_table\ncdecimal\nDecimal\ncbuiltins\nstr\n\x87R."
+
+
+def _copyreg_dispatch_table_operator_setitem_payload() -> bytes:
+    return b"\x80\x04coperator\nsetitem\nccopyreg\ndispatch_table\ncdecimal\nDecimal\ncbuiltins\nstr\n\x87R."
+
+
+def _copyreg_dispatch_table_operator_ior_payload() -> bytes:
+    return b"\x80\x04coperator\nior\nccopyreg\ndispatch_table\n}cdecimal\nDecimal\ncbuiltins\nstr\ns\x86R."
+
+
+def _copyreg_dispatch_table_setdefault_payload() -> bytes:
+    return b"\x80\x04cbuiltins\ndict.setdefault\nccopyreg\ndispatch_table\ncdecimal\nDecimal\ncbuiltins\nstr\n\x87R."
+
+
+def _copyreg_dispatch_table_ior_payload() -> bytes:
+    return b"\x80\x04cbuiltins\ndict.__ior__\nccopyreg\ndispatch_table\n}cdecimal\nDecimal\ncbuiltins\nstr\ns\x86R."
+
+
+def _copyreg_dispatch_table_pop_union_payload() -> bytes:
+    return b"\x80\x04cbuiltins\ndict.pop\nccopyreg\ndispatch_table\n" + _global(b"types", b"UnionType") + b"\x86R."
+
+
+def _copyreg_dispatch_table_delitem_union_payload() -> bytes:
+    return (
+        b"\x80\x04cbuiltins\ndict.__delitem__\nccopyreg\ndispatch_table\n" + _global(b"types", b"UnionType") + b"\x86R."
+    )
+
+
+def _copyreg_dispatch_table_operator_delitem_union_payload() -> bytes:
+    return b"\x80\x04coperator\ndelitem\nccopyreg\ndispatch_table\n" + _global(b"types", b"UnionType") + b"\x86R."
+
+
+def _copyreg_dispatch_table_popitem_payload() -> bytes:
+    return b"\x80\x04cbuiltins\ndict.popitem\nccopyreg\ndispatch_table\n\x85R."
+
+
+def _copyreg_dispatch_table_clear_payload() -> bytes:
+    return b"\x80\x04cbuiltins\ndict.clear\nccopyreg\ndispatch_table\n\x85R."
+
+
+def _warnings_filters_list_clear_payload() -> bytes:
+    return b"\x80\x04cbuiltins\nlist.clear\ncwarnings\nfilters\n\x85R."
+
+
+def _warnings_filters_operator_imul_payload() -> bytes:
+    return b"\x80\x04coperator\nimul\ncwarnings\nfilters\nK\x00\x86R."
+
+
+def _warning_ignore_filter_tuple_payload() -> bytes:
+    return b"(" + _short_binunicode(b"ignore") + b"Ncbuiltins\nWarning\nNK\x00t"
+
+
+def _warnings_filters_list_insert_ignore_payload() -> bytes:
+    return (
+        b"\x80\x04"
+        b"cbuiltins\nlist.insert\n"
+        b"cwarnings\nfilters\n"
+        b"K\x00" + _warning_ignore_filter_tuple_payload() + b"\x87R."
+    )
+
+
+def _warnings_filters_list_pop_payload() -> bytes:
+    return b"\x80\x04cbuiltins\nlist.pop\ncwarnings\nfilters\nK\x00\x86R."
+
+
+def _warnings_filters_list_setitem_ignore_payload() -> bytes:
+    return (
+        b"\x80\x04"
+        b"cbuiltins\nlist.__setitem__\n"
+        b"cwarnings\nfilters\n"
+        b"K\x00" + _warning_ignore_filter_tuple_payload() + b"\x87R."
+    )
+
+
+def _logging_root_handlers_list_clear_payload() -> bytes:
+    return b"\x80\x04cbuiltins\nlist.clear\nclogging\nroot.handlers\n\x85R."
+
+
+def _logging_root_handlers_list_pop_payload() -> bytes:
+    return b"\x80\x04cbuiltins\nlist.pop\nclogging\nroot.handlers\nK\x00\x86R."
+
+
+def _logging_root_handlers_list_delitem_payload() -> bytes:
+    return b"\x80\x04cbuiltins\nlist.__delitem__\nclogging\nroot.handlers\nK\x00\x86R."
+
+
+def _local_list_append_payload() -> bytes:
+    return b"\x80\x04cbuiltins\nlist.append\n]K\x01\x86R."
+
+
+def _local_list_clear_payload() -> bytes:
+    return b"\x80\x04cbuiltins\nlist.clear\n]K\x01a\x85R."
+
+
+def _local_dict_setitem_payload() -> bytes:
+    return b"\x80\x04cbuiltins\ndict.__setitem__\n}K\x01K\x02\x87R."
+
+
+def _local_dict_update_payload() -> bytes:
+    return b"\x80\x04cbuiltins\ndict.update\n}}K\x01K\x02s\x86R."
+
+
+def _local_operator_setitem_payload() -> bytes:
+    return b"\x80\x04coperator\nsetitem\n}K\x01K\x02\x87R."
+
+
+def _local_operator_ior_payload() -> bytes:
+    return b"\x80\x04coperator\nior\n}}K\x01K\x02s\x86R."
+
+
+def _local_operator_imul_payload() -> bytes:
+    return b"\x80\x04coperator\nimul\n]K\x01aK\x00\x86R."
+
+
+def _site_addsitedir_payload(site_dir: Path) -> bytes:
+    return b"\x80\x04csite\naddsitedir\n" + _binunicode(str(site_dir).encode()) + b"\x85R."
+
+
+def _site_addpackage_payload(site_dir: Path, pth_name: str) -> bytes:
+    return (
+        b"\x80\x04csite\naddpackage\n("
+        + _binunicode(str(site_dir).encode())
+        + _short_binunicode(pth_name.encode())
+        + b"N"
+        + b"tR."
+    )
+
+
+def _write_executing_pth(pth_path: Path, marker: Path, message: str) -> None:
+    pth_path.write_text(
+        "import pathlib; pathlib.Path(" + repr(str(marker)) + f").write_text({message!r}, encoding='utf-8')\n",
+        encoding="utf-8",
+    )
 
 
 def _make_pre_memoized_post_budget_stack_global_payload(tail: bytes) -> bytes:
@@ -1761,6 +2006,842 @@ def test_scan_bytes_warns_on_functools_partial_without_marking_benign_partial_ma
     assert not any(finding.severity.value == "critical" for finding in report.findings)
 
 
+def test_scan_bytes_detects_pathlib_mutating_dotted_method_reduce(tmp_path: Path) -> None:
+    target = tmp_path / "pickle_touch_bypass_marker"
+    expected_reference = f"pathlib.{_concrete_pathlib_class_name()}.touch"
+    payload = _pathlib_method_reduce_payload(target, "touch")
+
+    report = scan_bytes(payload, source="pathlib-touch.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert target.exists() is False
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == expected_reference
+        for finding in report.findings
+    )
+    assert any(
+        ref["import_reference"] == expected_reference and ref["is_dangerous"] is False
+        for ref in report.metadata["import_references"]
+    )
+    pickle.loads(payload)
+    assert target.exists() is True
+
+
+def test_scan_bytes_detects_pathlib_read_text_dotted_method_reduce(tmp_path: Path) -> None:
+    secret = tmp_path / "secret.txt"
+    secret.write_text("modelaudit-secret-8\n", encoding="utf-8")
+    expected_reference = f"pathlib.{_concrete_pathlib_class_name()}.read_text"
+    payload = _pathlib_method_reduce_payload(secret, "read_text")
+
+    report = scan_bytes(payload, source="pathlib-read-text.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == expected_reference
+        for finding in report.findings
+    )
+    assert pickle.loads(payload) == "modelaudit-secret-8\n"
+
+
+def test_scan_bytes_detects_pathlib_read_bytes_dotted_method_reduce(tmp_path: Path) -> None:
+    secret = tmp_path / "secret.bin"
+    secret.write_bytes(b"\x00modelaudit-secret-8\xff")
+    expected_reference = f"pathlib.{_concrete_pathlib_class_name()}.read_bytes"
+    payload = _pathlib_method_reduce_payload(secret, "read_bytes")
+
+    report = scan_bytes(payload, source="pathlib-read-bytes.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == expected_reference
+        for finding in report.findings
+    )
+    assert pickle.loads(payload) == b"\x00modelaudit-secret-8\xff"
+
+
+@pytest.mark.parametrize(
+    "expected_reference",
+    [
+        "pathlib._local.PosixPath.iterdir",
+        "pathlib._local.PosixPath.read_text",
+    ],
+)
+def test_scan_bytes_detects_python313_pathlib_local_dotted_method_reduce(expected_reference: str) -> None:
+    method_name = expected_reference.removeprefix("pathlib._local.")
+    payload = b"\x80\x04cpathlib._local\n" + method_name.encode("ascii") + b"\n)R."
+
+    report = scan_bytes(payload, source=f"{expected_reference}-local-method.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == expected_reference
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_allows_benign_pathlib_path_constructor() -> None:
+    class_name = _concrete_pathlib_class_name()
+    payload = b"\x80\x04" + f"cpathlib\n{class_name}\n".encode("ascii") + _binunicode(b"model.bin") + b"\x85R."
+
+    report = scan_bytes(payload, source="pathlib-constructor.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+@pytest.mark.parametrize(
+    ("module", "name", "expected_reference"),
+    [
+        (b"io", b"open", "io.open"),
+        (b"logging", b"FileHandler", "logging.FileHandler"),
+    ],
+)
+def test_scan_bytes_detects_file_truncating_stdlib_reduce(
+    tmp_path: Path,
+    module: bytes,
+    name: bytes,
+    expected_reference: str,
+) -> None:
+    target = tmp_path / f"{module.decode()}-{name.decode()}-should-not-truncate.txt"
+    target.write_text("keep this content\n", encoding="utf-8")
+    payload = _file_mode_reduce_payload(module, name, target, b"w")
+
+    report = scan_bytes(payload, source=f"{expected_reference}-truncate.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert target.stat().st_size > 0
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == expected_reference
+        for finding in report.findings
+    )
+    result = pickle.loads(payload)
+    try:
+        assert target.stat().st_size == 0
+    finally:
+        result.close()
+
+
+@pytest.mark.parametrize(
+    ("module", "mode", "expected_reference", "close_may_fail"),
+    [
+        ("codecs", b"w", "codecs.open", False),
+        ("gzip", b"wb", "gzip.open", False),
+        ("bz2", b"wb", "bz2.open", False),
+        ("lzma", b"wb", "lzma.open", False),
+        ("wave", b"wb", "wave.open", True),
+        ("aifc", b"wb", "aifc.open", True),
+        ("sunau", b"wb", "sunau.open", True),
+    ],
+)
+def test_scan_bytes_detects_stdlib_file_opening_wrappers(
+    tmp_path: Path,
+    module: str,
+    mode: bytes,
+    expected_reference: str,
+    close_may_fail: bool,
+) -> None:
+    pytest.importorskip(module)
+    target = tmp_path / f"{expected_reference.replace('.', '-')}-should-not-truncate.dat"
+    original = b"keep this content\n" * 2
+    target.write_bytes(original)
+    payload = _file_mode_reduce_payload(module.encode("ascii"), b"open", target, mode)
+
+    report = scan_bytes(payload, source=f"{expected_reference}-truncate.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert target.read_bytes() == original
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == expected_reference
+        for finding in report.findings
+    )
+    result = pickle.loads(payload)
+    close = getattr(result, "close", None)
+    if close is not None:
+        try:
+            close()
+        except Exception:
+            if not close_may_fail:
+                raise
+    assert target.read_bytes() != original
+
+
+def test_scan_bytes_detects_logging_disable_diagnostic_suppression() -> None:
+    payload = b"\x80\x04clogging\ndisable\nK2\x85R."
+    previous_disable = logging.root.manager.disable
+
+    try:
+        logging.disable(logging.NOTSET)
+        report = scan_bytes(payload, source="logging-disable.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert logging.root.manager.disable == logging.NOTSET
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == "logging.disable"
+            for finding in report.findings
+        )
+        assert pickle.loads(payload) is None
+        assert logging.root.manager.disable == logging.CRITICAL
+    finally:
+        logging.disable(previous_disable)
+
+
+def test_scan_bytes_detects_logging_capture_warnings_diagnostic_reroute() -> None:
+    payload = b"\x80\x04clogging\ncaptureWarnings\n\x88\x85R."
+    original_showwarning = warnings.showwarning
+
+    try:
+        logging.captureWarnings(False)
+        baseline_showwarning = warnings.showwarning
+        report = scan_bytes(payload, source="logging-capture-warnings.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert warnings.showwarning is baseline_showwarning
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == "logging.captureWarnings"
+            for finding in report.findings
+        )
+        assert pickle.loads(payload) is None
+        assert warnings.showwarning is not baseline_showwarning
+    finally:
+        logging.captureWarnings(False)
+        warnings.showwarning = original_showwarning
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_reference"),
+    [
+        (
+            b"\x80\x04cwarnings\nsimplefilter\n" + _short_binunicode(b"ignore") + b"\x85R.",
+            "warnings.simplefilter",
+        ),
+        (
+            b"\x80\x04cwarnings\nfilterwarnings\n" + _short_binunicode(b"ignore") + b"\x85R.",
+            "warnings.filterwarnings",
+        ),
+    ],
+)
+def test_scan_bytes_detects_warnings_filter_suppression(payload: bytes, expected_reference: str) -> None:
+    original_filters = list(warnings.filters)
+
+    try:
+        warnings.resetwarnings()
+        report = scan_bytes(payload, source=f"{expected_reference}.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert warnings.filters == []
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == expected_reference
+            for finding in report.findings
+        )
+        assert pickle.loads(payload) is None
+        assert warnings.filters[0][0] == "ignore"
+    finally:
+        mutable_filters = cast(list[object], warnings.filters)
+        mutable_filters[:] = original_filters
+
+
+def test_scan_bytes_detects_warnings_resetwarnings_policy_erasure() -> None:
+    payload = b"\x80\x04cwarnings\nresetwarnings\n)R."
+    original_filters = list(warnings.filters)
+
+    try:
+        warnings.resetwarnings()
+        warnings.simplefilter("error")
+        report = scan_bytes(payload, source="warnings-resetwarnings.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert warnings.filters[0][0] == "error"
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == "warnings.resetwarnings"
+            for finding in report.findings
+        )
+        assert pickle.loads(payload) is None
+        assert warnings.filters == []
+    finally:
+        mutable_filters = cast(list[object], warnings.filters)
+        mutable_filters[:] = original_filters
+
+
+def test_scan_bytes_detects_warnings_filters_list_clear_policy_erasure() -> None:
+    payload = _warnings_filters_list_clear_payload()
+    original_filters = list(warnings.filters)
+
+    try:
+        warnings.resetwarnings()
+        warnings.simplefilter("error")
+        report = scan_bytes(payload, source="warnings-filters-list-clear.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert warnings.filters[0][0] == "error"
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == "builtins.list.clear"
+            for finding in report.findings
+        )
+        assert pickle.loads(payload) is None
+        assert warnings.filters == []
+    finally:
+        mutable_filters = cast(list[object], warnings.filters)
+        mutable_filters[:] = original_filters
+
+
+def test_scan_bytes_detects_warnings_filters_operator_imul_policy_erasure() -> None:
+    payload = _warnings_filters_operator_imul_payload()
+    original_filters = list(warnings.filters)
+
+    try:
+        warnings.resetwarnings()
+        warnings.simplefilter("error")
+        report = scan_bytes(payload, source="warnings-filters-operator-imul.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert warnings.filters[0][0] == "error"
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == "operator.imul"
+            and finding.details.get("mutation_target") == "warnings.filters"
+            for finding in report.findings
+        )
+        assert pickle.loads(payload) == []
+        assert warnings.filters == []
+    finally:
+        mutable_filters = cast(list[object], warnings.filters)
+        mutable_filters[:] = original_filters
+
+
+def test_scan_bytes_detects_warnings_filters_list_insert_suppression() -> None:
+    payload = _warnings_filters_list_insert_ignore_payload()
+    original_filters = list(warnings.filters)
+
+    try:
+        warnings.resetwarnings()
+        warnings.simplefilter("error")
+        with pytest.raises(UserWarning):
+            warnings.warn("before-pickle", UserWarning, stacklevel=2)
+        report = scan_bytes(payload, source="warnings-filters-list-insert.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert warnings.filters[0][0] == "error"
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == "builtins.list.insert"
+            for finding in report.findings
+        )
+        assert pickle.loads(payload) is None
+        warnings.warn("after-pickle", UserWarning, stacklevel=2)
+        assert warnings.filters[0][0] == "ignore"
+    finally:
+        mutable_filters = cast(list[object], warnings.filters)
+        mutable_filters[:] = original_filters
+
+
+def test_scan_bytes_detects_logging_root_handlers_list_clear() -> None:
+    payload = _logging_root_handlers_list_clear_payload()
+    original_handlers = list(logging.root.handlers)
+
+    try:
+        handler = logging.StreamHandler(io.StringIO())
+        logging.root.handlers[:] = [handler]
+        report = scan_bytes(payload, source="logging-root-handlers-list-clear.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert len(logging.root.handlers) == 1
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == "builtins.list.clear"
+            for finding in report.findings
+        )
+        assert pickle.loads(payload) is None
+        assert logging.root.handlers == []
+    finally:
+        logging.root.handlers[:] = original_handlers
+
+
+def test_scan_bytes_detects_warnings_filters_list_pop_policy_erasure() -> None:
+    payload = _warnings_filters_list_pop_payload()
+    original_filters = list(warnings.filters)
+
+    try:
+        warnings.resetwarnings()
+        warnings.simplefilter("error")
+        report = scan_bytes(payload, source="warnings-filters-list-pop.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert warnings.filters[0][0] == "error"
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == "builtins.list.pop"
+            for finding in report.findings
+        )
+        removed_filter = pickle.loads(payload)
+        assert removed_filter[0] == "error"
+        assert warnings.filters == []
+    finally:
+        mutable_filters = cast(list[object], warnings.filters)
+        mutable_filters[:] = original_filters
+
+
+def test_scan_bytes_detects_warnings_filters_list_setitem_suppression() -> None:
+    payload = _warnings_filters_list_setitem_ignore_payload()
+    original_filters = list(warnings.filters)
+
+    try:
+        warnings.resetwarnings()
+        warnings.simplefilter("error")
+        report = scan_bytes(payload, source="warnings-filters-list-setitem.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert warnings.filters[0][0] == "error"
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == "builtins.list.__setitem__"
+            for finding in report.findings
+        )
+        assert pickle.loads(payload) is None
+        assert warnings.filters[0][0] == "ignore"
+    finally:
+        mutable_filters = cast(list[object], warnings.filters)
+        mutable_filters[:] = original_filters
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_reference"),
+    [
+        (_logging_root_handlers_list_pop_payload(), "builtins.list.pop"),
+        (_logging_root_handlers_list_delitem_payload(), "builtins.list.__delitem__"),
+    ],
+)
+def test_scan_bytes_detects_logging_root_handlers_list_item_removal(
+    payload: bytes,
+    expected_reference: str,
+) -> None:
+    original_handlers = list(logging.root.handlers)
+
+    try:
+        handler = logging.StreamHandler(io.StringIO())
+        logging.root.handlers[:] = [handler]
+        report = scan_bytes(payload, source=f"{expected_reference}-logging-root-handler.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert logging.root.handlers == [handler]
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == expected_reference
+            for finding in report.findings
+        )
+        pickle.loads(payload)
+        assert logging.root.handlers == []
+    finally:
+        logging.root.handlers[:] = original_handlers
+
+
+def test_scan_bytes_detects_faulthandler_disable_diagnostic_suppression() -> None:
+    payload = b"\x80\x04cfaulthandler\ndisable\n)R."
+    was_enabled = faulthandler.is_enabled()
+
+    try:
+        faulthandler.enable()
+        report = scan_bytes(payload, source="faulthandler-disable.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert faulthandler.is_enabled() is True
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == "faulthandler.disable"
+            for finding in report.findings
+        )
+        assert pickle.loads(payload) is True
+        assert faulthandler.is_enabled() is False
+    finally:
+        if was_enabled:
+            faulthandler.enable()
+        else:
+            faulthandler.disable()
+
+
+@pytest.mark.parametrize(
+    ("helper", "expected_reference"),
+    [
+        ("addsitedir", "site.addsitedir"),
+        ("addpackage", "site.addpackage"),
+    ],
+)
+def test_scan_bytes_detects_site_pth_execution_helpers(
+    tmp_path: Path,
+    helper: str,
+    expected_reference: str,
+) -> None:
+    site_dir = tmp_path / "attacker_site"
+    site_dir.mkdir()
+    marker = tmp_path / f"{helper}-pth-executed.txt"
+    message = f"{helper}-pth-payload"
+    pth_path = site_dir / "payload.pth"
+    _write_executing_pth(pth_path, marker, message)
+    payload = (
+        _site_addsitedir_payload(site_dir)
+        if helper == "addsitedir"
+        else _site_addpackage_payload(site_dir, pth_path.name)
+    )
+    site_dir_text = str(site_dir)
+
+    try:
+        while site_dir_text in sys.path:
+            sys.path.remove(site_dir_text)
+        report = scan_bytes(payload, source=f"{expected_reference}-pth.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert marker.exists() is False
+        assert site_dir_text not in sys.path
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == expected_reference
+            for finding in report.findings
+        )
+        assert pickle.loads(payload) is None
+        assert marker.read_text(encoding="utf-8") == message
+        if helper == "addsitedir":
+            assert site_dir_text in sys.path
+    finally:
+        while site_dir_text in sys.path:
+            sys.path.remove(site_dir_text)
+
+
+def test_scan_bytes_detects_dbm_open_resource_creation(tmp_path: Path) -> None:
+    base = tmp_path / "payload_dbm"
+    payload = _dbm_open_payload(base)
+
+    report = scan_bytes(payload, source="dbm-open-create.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert not list(tmp_path.iterdir())
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == "dbm.open"
+        for finding in report.findings
+    )
+    db = pickle.loads(payload)
+    try:
+        assert any(path.name.startswith("payload_dbm") for path in tmp_path.iterdir())
+    finally:
+        db.close()
+
+
+def test_scan_bytes_detects_maildir_resource_creation(tmp_path: Path) -> None:
+    maildir = tmp_path / "payload_maildir"
+    payload = _maildir_payload(maildir)
+
+    report = scan_bytes(payload, source="maildir-create.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert maildir.exists() is False
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == "mailbox.Maildir"
+        for finding in report.findings
+    )
+    pickle.loads(payload)
+    assert sorted(path.name for path in maildir.iterdir()) == ["cur", "new", "tmp"]
+
+
+def test_scan_bytes_detects_named_temporary_file_resource_creation(tmp_path: Path) -> None:
+    payload = _named_temporary_file_payload(tmp_path)
+
+    report = scan_bytes(payload, source="named-temporary-file-create.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert not list(tmp_path.iterdir())
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == "tempfile.NamedTemporaryFile"
+        for finding in report.findings
+    )
+    created_path: Path | None = None
+    wrapper = pickle.loads(payload)
+    try:
+        created_path = Path(wrapper.name)
+        assert created_path.parent == tmp_path
+        assert created_path.exists() is True
+    finally:
+        wrapper.close()
+        if created_path is not None:
+            created_path.unlink(missing_ok=True)
+
+
+def test_scan_bytes_detects_temporary_directory_resource_creation(tmp_path: Path) -> None:
+    payload = _temporary_directory_payload(tmp_path)
+
+    report = scan_bytes(payload, source="temporary-directory-create.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert not list(tmp_path.iterdir())
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == "tempfile.TemporaryDirectory"
+        for finding in report.findings
+    )
+    created_path: Path | None = None
+    temporary_directory = pickle.loads(payload)
+    try:
+        created_path = Path(temporary_directory.name)
+        assert created_path.parent == tmp_path
+        assert created_path.is_dir()
+    finally:
+        temporary_directory.cleanup()
+
+
+@pytest.mark.parametrize(
+    ("read_method", "expected_reference"),
+    [
+        (b"ConfigParser.read", "configparser.ConfigParser.read"),
+        (b"RawConfigParser.read", "configparser.RawConfigParser.read"),
+    ],
+)
+def test_scan_bytes_detects_configparser_read_get_disclosure_chain(
+    tmp_path: Path,
+    read_method: bytes,
+    expected_reference: str,
+) -> None:
+    config_path = tmp_path / "secret.ini"
+    config_path.write_text("[secrets]\ntoken = modelaudit-config-secret-10\n", encoding="utf-8")
+    payload = _configparser_read_get_payload(config_path, read_method)
+
+    report = scan_bytes(payload, source=f"{expected_reference}-read-get.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == expected_reference
+        for finding in report.findings
+    )
+    assert pickle.loads(payload) == "modelaudit-config-secret-10"
+
+
+def test_scan_bytes_detects_argparse_filetype_constructed_callable(tmp_path: Path) -> None:
+    target = tmp_path / "argparse-filetype-should-not-truncate.txt"
+    target.write_text("keep this content\n", encoding="utf-8")
+    payload = _argparse_filetype_payload(target)
+
+    report = scan_bytes(payload, source="argparse-filetype.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert target.stat().st_size > 0
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == "argparse.FileType"
+        for finding in report.findings
+    )
+    handle = pickle.loads(payload)
+    try:
+        assert target.stat().st_size == 0
+    finally:
+        handle.close()
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_reference"),
+    [
+        (_copyreg_pickle_payload(), "copyreg.pickle"),
+        (_copyreg_dispatch_table_update_payload(), "builtins.dict.update"),
+        (_copyreg_dispatch_table_setitem_payload(), "builtins.dict.__setitem__"),
+        (_copyreg_dispatch_table_operator_setitem_payload(), "operator.setitem"),
+        (_copyreg_dispatch_table_operator_ior_payload(), "operator.ior"),
+        (_copyreg_dispatch_table_setdefault_payload(), "builtins.dict.setdefault"),
+        (_copyreg_dispatch_table_ior_payload(), "builtins.dict.__ior__"),
+    ],
+)
+def test_scan_bytes_detects_copyreg_dispatch_table_poisoning(payload: bytes, expected_reference: str) -> None:
+    original_dispatch_table = dict(copyreg.dispatch_table)
+
+    try:
+        copyreg.dispatch_table.pop(decimal.Decimal, None)
+        report = scan_bytes(payload, source=f"{expected_reference}-copyreg-poison.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert decimal.Decimal not in copyreg.dispatch_table
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == expected_reference
+            for finding in report.findings
+        )
+        pickle.loads(payload)
+        assert copyreg.dispatch_table.get(decimal.Decimal) is str
+        with pytest.raises(pickle.PicklingError):
+            pickle.dumps(decimal.Decimal("1.25"), protocol=4)
+    finally:
+        copyreg.dispatch_table.clear()
+        copyreg.dispatch_table.update(original_dispatch_table)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _local_dict_setitem_payload(),
+        _local_dict_update_payload(),
+        _local_list_append_payload(),
+        _local_list_clear_payload(),
+        _local_operator_setitem_payload(),
+        _local_operator_ior_payload(),
+        _local_operator_imul_payload(),
+    ],
+)
+def test_scan_bytes_allows_local_container_mutations(payload: bytes) -> None:
+    pickle.loads(payload)
+
+    report = scan_bytes(payload, source="local-container-mutation.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_reference"),
+    [
+        (_copyreg_dispatch_table_pop_union_payload(), "builtins.dict.pop"),
+        (_copyreg_dispatch_table_delitem_union_payload(), "builtins.dict.__delitem__"),
+        (_copyreg_dispatch_table_operator_delitem_union_payload(), "operator.delitem"),
+    ],
+)
+def test_scan_bytes_detects_copyreg_dispatch_table_reducer_deletion(
+    payload: bytes,
+    expected_reference: str,
+) -> None:
+    original_dispatch_table = dict(copyreg.dispatch_table)
+    union_type = type(int | str)
+
+    try:
+        assert union_type in copyreg.dispatch_table
+        pickle.dumps(int | str, protocol=4)
+        report = scan_bytes(payload, source=f"{expected_reference}-copyreg-delete.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == expected_reference
+            for finding in report.findings
+        )
+        pickle.loads(payload)
+        assert union_type not in copyreg.dispatch_table
+        with pytest.raises(TypeError, match=r"cannot pickle 'types\.UnionType' object"):
+            pickle.dumps(int | str, protocol=4)
+    finally:
+        copyreg.dispatch_table.clear()
+        copyreg.dispatch_table.update(original_dispatch_table)
+
+
+def test_scan_bytes_detects_copyreg_dispatch_table_popitem_erasure() -> None:
+    original_dispatch_table = dict(copyreg.dispatch_table)
+    payload = _copyreg_dispatch_table_popitem_payload()
+
+    try:
+        copyreg.dispatch_table[decimal.Decimal] = str
+        report = scan_bytes(payload, source="builtins-dict-popitem-copyreg.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert copyreg.dispatch_table.get(decimal.Decimal) is str
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == "builtins.dict.popitem"
+            for finding in report.findings
+        )
+        popped_item = pickle.loads(payload)
+        assert popped_item == (decimal.Decimal, str)
+        assert decimal.Decimal not in copyreg.dispatch_table
+    finally:
+        copyreg.dispatch_table.clear()
+        copyreg.dispatch_table.update(original_dispatch_table)
+
+
+def test_scan_bytes_detects_copyreg_dispatch_table_erasure() -> None:
+    original_dispatch_table = dict(copyreg.dispatch_table)
+    payload = _copyreg_dispatch_table_clear_payload()
+
+    try:
+        assert copyreg.dispatch_table
+        report = scan_bytes(payload, source="builtins-dict-clear-copyreg.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == "builtins.dict.clear"
+            for finding in report.findings
+        )
+        assert pickle.loads(payload) is None
+        assert copyreg.dispatch_table == {}
+    finally:
+        copyreg.dispatch_table.clear()
+        copyreg.dispatch_table.update(original_dispatch_table)
+
+
 def test_scan_bytes_does_not_flag_dill_dump_as_dangerous() -> None:
     payload = b"\x80\x02cdill\ndump\n(tR."
 
@@ -1827,16 +2908,41 @@ def test_scan_bytes_allows_benign_dill_text_literal() -> None:
 @pytest.mark.parametrize(
     ("payload", "expected_reference"),
     [
+        (b"cargparse\nFileType\n(tR.", "argparse.FileType"),
         (b"cbase64\nb64decode\n(tR.", "base64.b64decode"),
         (b"cbase64\nb64encode\n(tR.", "base64.b64encode"),
         (b"cbase64\ndecode\n(tR.", "base64.decode"),
         (b"ccodecs\ndecode\n(tR.", "codecs.decode"),
         (b"ccodecs\nencode\n(tR.", "codecs.encode"),
+        (b"ccodecs\nopen\n(tR.", "codecs.open"),
+        (b"cconfigparser\nConfigParser.read\n(tR.", "configparser.ConfigParser.read"),
+        (b"cconfigparser\nRawConfigParser.read\n(tR.", "configparser.RawConfigParser.read"),
+        (b"ccopyreg\npickle\n(tR.", "copyreg.pickle"),
+        (b"cdbm\nopen\n(tR.", "dbm.open"),
+        (b"cfaulthandler\ndisable\n(tR.", "faulthandler.disable"),
+        (b"cgzip\nopen\n(tR.", "gzip.open"),
+        (b"cbz2\nopen\n(tR.", "bz2.open"),
+        (b"cio\nopen\n(tR.", "io.open"),
+        (b"clzma\nopen\n(tR.", "lzma.open"),
         (b"cpip\nmain\n(tR.", "pip.main"),
         (b"cnumpy\nload\n(tR.", "numpy.load"),
+        (b"clogging\nFileHandler\n(tR.", "logging.FileHandler"),
+        (b"clogging\ncaptureWarnings\n(tR.", "logging.captureWarnings"),
+        (b"clogging\ndisable\n(tR.", "logging.disable"),
+        (b"cmailbox\nMaildir\n(tR.", "mailbox.Maildir"),
         (b"cshutil\nrmtree\n(tR.", "shutil.rmtree"),
+        (b"csite\naddpackage\n(tR.", "site.addpackage"),
+        (b"csite\naddsitedir\n(tR.", "site.addsitedir"),
+        (b"csite\nmain\n(tR.", "site.main"),
         (b"ctarfile\nopen\n(tR.", "tarfile.open"),
         (b"ctempfile\nNamedTemporaryFile\n(tR.", "tempfile.NamedTemporaryFile"),
+        (b"ctempfile\nTemporaryDirectory\n(tR.", "tempfile.TemporaryDirectory"),
+        (b"cwave\nopen\n(tR.", "wave.open"),
+        (b"caifc\nopen\n(tR.", "aifc.open"),
+        (b"csunau\nopen\n(tR.", "sunau.open"),
+        (b"cwarnings\nfilterwarnings\n(tR.", "warnings.filterwarnings"),
+        (b"cwarnings\nresetwarnings\n(tR.", "warnings.resetwarnings"),
+        (b"cwarnings\nsimplefilter\n(tR.", "warnings.simplefilter"),
         (b"cwebbrowser\nopen\n(tR.", "webbrowser.open"),
         (b"czipfile\nZipFile\n(tR.", "zipfile.ZipFile"),
         (b"cbuiltins\nglobals\n(tR.", "builtins.globals"),
@@ -1884,7 +2990,9 @@ def test_scan_bytes_flags_newobj_ex_dangerous_class() -> None:
             pickle.dumps(uuid.UUID("12345678-1234-5678-1234-567812345678"), protocol=4),
             "uuid.UUID",
         ),
+        (b"cconfigparser\nConfigParser\n)R.", "configparser.ConfigParser"),
         (b"clogging\ngetLogger\n.", "logging.getLogger"),
+        (b"ctempfile\ngettempdir\n.", "tempfile.gettempdir"),
         (pickle.dumps(tarfile.TarInfo("weights.bin"), protocol=4), "tarfile.TarInfo"),
         (pickle.dumps(zipfile.ZipInfo("weights.bin"), protocol=4), "zipfile.ZipInfo"),
     ],
