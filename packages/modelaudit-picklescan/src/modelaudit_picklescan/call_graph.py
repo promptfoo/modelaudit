@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import os
 import sys
+import sysconfig
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -975,6 +976,38 @@ def _collect_import_aliases(nodes: Iterable[ast.AST], module_name: str, is_packa
     return aliases
 
 
+def _collect_function_import_aliases(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    module_name: str,
+    is_package: bool,
+) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+
+    class _FunctionImportAliasVisitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            if node is function_node:
+                self.generic_visit(node)
+
+        def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+            if node is function_node:
+                self.generic_visit(node)
+
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            return None
+
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            self.visit(node.args)
+
+        def visit_Import(self, node: ast.Import) -> None:
+            aliases.update(_collect_import_aliases((node,), module_name, is_package))
+
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            aliases.update(_collect_import_aliases((node,), module_name, is_package))
+
+    _FunctionImportAliasVisitor().visit(function_node)
+    return aliases
+
+
 def _collect_local_defs(statements: Iterable[ast.stmt]) -> set[str]:
     local_defs: set[str] = set()
     for statement in statements:
@@ -1276,6 +1309,22 @@ def _assignment_alias_value(
         or _file_write_sink(resolved) is not None
     ):
         return resolved
+    alias_target = _static_import_reference_alias(resolved) or resolved
+    if alias_target.startswith(f"{module_name}."):
+        return None
+    current_source_path = _resolve_module_source(module_name)
+    if current_source_path is None or _is_library_source_path(str(current_source_path)):
+        return None
+    imported_module, imported_name = _split_source_qualified_name(alias_target)
+    source_path = _resolve_module_source(imported_module) if imported_module is not None else None
+    if (
+        imported_module is not None
+        and imported_module != module_name
+        and imported_name
+        and source_path is not None
+        and not _is_stdlib_source_path(str(source_path))
+    ):
+        return resolved
     return None
 
 
@@ -1295,6 +1344,47 @@ def _is_local_class_member_alias(resolved: str, local_class_targets: set[str]) -
     return any(
         resolved == class_target or resolved.startswith(f"{class_target}.") for class_target in local_class_targets
     )
+
+
+def _looks_like_class_reference(function_name: str) -> bool:
+    tail = function_name.rpartition(".")[2]
+    return bool(tail and tail[0].isupper())
+
+
+def _should_expand_imported_class_reference(function_name: str, module_name: str) -> bool:
+    if not _looks_like_class_reference(function_name) or function_name.startswith(f"{module_name}."):
+        return False
+    current_source_path = _resolve_module_source(module_name)
+    if current_source_path is None or _is_library_source_path(str(current_source_path)):
+        return False
+    imported_module, imported_name = _split_source_qualified_name(function_name)
+    if imported_module is None or not imported_name:
+        return False
+    source_path = _resolve_module_source(imported_module)
+    return source_path is not None and not _is_stdlib_source_path(str(source_path))
+
+
+def _is_library_source_path(source_path: str) -> bool:
+    return _is_stdlib_source_path(source_path) or _is_installed_package_source_path(source_path)
+
+
+@lru_cache(maxsize=1024)
+def _is_stdlib_source_path(source_path: str) -> bool:
+    try:
+        resolved = Path(source_path).resolve()
+        stdlib = Path(sysconfig.get_paths()["stdlib"]).resolve()
+    except Exception:
+        return False
+    return (
+        resolved.is_relative_to(stdlib)
+        and "site-packages" not in resolved.parts
+        and "dist-packages" not in resolved.parts
+    )
+
+
+def _is_installed_package_source_path(source_path: str) -> bool:
+    parts = Path(source_path).parts
+    return "site-packages" in parts or "dist-packages" in parts
 
 
 def _collect_class_instance_default_aliases(
@@ -1644,7 +1734,7 @@ def _calls_in_function(
     call_nodes = _iter_call_nodes(function_node)
     function_aliases = {
         **aliases,
-        **_collect_import_aliases(ast.walk(function_node), module_name, is_package),
+        **_collect_function_import_aliases(function_node, module_name, is_package),
     }
     function_aliases.update(
         _collect_function_instance_aliases(
@@ -1740,6 +1830,9 @@ def _calls_in_function(
                 if not _call_uses_parameter_controlled_argument(node, parameter_controlled_names):
                     continue
             class_entrypoints = local_class_entrypoints.get(resolved, ())
+            if not class_entrypoints and _should_expand_imported_class_reference(resolved, module_name):
+                class_target = _resolve_class_target(resolved)
+                class_entrypoints = _class_entrypoints(class_target) if class_target is not None else ()
             if class_entrypoints:
                 calls.extend(class_entrypoints)
                 continue
@@ -1753,7 +1846,7 @@ def _import_execution_calls(
     module_name: str,
     is_package: bool,
 ) -> tuple[str, ...]:
-    if _has_required_user_arguments(function_node):
+    if _has_required_user_arguments(function_node) and function_node.name not in _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS:
         return ()
     return _direct_import_execution_calls(function_node, module_name, is_package)
 
@@ -1821,6 +1914,8 @@ def _can_follow_import_execution_fallback(function_name: str, positional_arg_cou
     resolved = _resolve_function_target(function_name)
     if resolved is None or not _is_pickle_entered_import_execution_entrypoint(resolved):
         return False
+    if _is_pickle_lifecycle_entrypoint(resolved):
+        return True
     return _can_invoke_function_with_positional_args(resolved, positional_arg_count)
 
 
@@ -1830,6 +1925,12 @@ def _is_pickle_entered_import_execution_entrypoint(function_name: str) -> bool:
     if not class_name or method_name not in _CLASS_ENTRYPOINT_METHODS:
         return True
     return method_name in _PICKLE_ENTERED_IMPORT_EXECUTION_METHODS
+
+
+def _is_pickle_lifecycle_entrypoint(function_name: str) -> bool:
+    _module_name, qualified_name = _split_source_qualified_name(function_name)
+    class_name, _separator, method_name = qualified_name.rpartition(".")
+    return bool(class_name and method_name in _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS)
 
 
 def _can_enter_function_with_positional_args(
@@ -2120,6 +2221,14 @@ def _iter_call_nodes(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> t
     class _CallVisitor(ast.NodeVisitor):
         def visit_Call(self, node: ast.Call) -> None:
             calls.append(node)
+            if isinstance(node.func, ast.Lambda):
+                self.visit(node.func.args)
+                self.visit(node.func.body)
+                for arg in node.args:
+                    self.visit(arg)
+                for keyword in node.keywords:
+                    self.visit(keyword.value)
+                return
             self.generic_visit(node)
 
         def visit_FunctionDef(self, node: ast.FunctionDef) -> None:

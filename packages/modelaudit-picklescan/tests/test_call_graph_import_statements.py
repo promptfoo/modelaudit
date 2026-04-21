@@ -1655,6 +1655,147 @@ def test_scan_bytes_ignores_nested_function_body_sink_when_outer_function_is_imp
     assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
 
 
+def test_scan_bytes_blocks_called_inline_lambda_body_sink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_inline_lambda_{tmp_path.name.replace('-', '_')}"
+    marker = tmp_path / "inline_lambda_marker"
+    command = f"{sys.executable} -c \"from pathlib import Path; Path({str(marker)!r}).write_text('owned')\""
+    (tmp_path / f"{module_name}.py").write_text(
+        "import os\n\ndef invoke(value):\n    return (lambda: os.system(value))()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = _global_call_payload(module_name, "invoke", _unicode_operand(command))
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(report, module_name, "invoke", "os.system")
+
+
+def test_scan_bytes_ignores_nested_import_aliases_outside_outer_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = f"modelaudit_nested_import_alias_{tmp_path.name.replace('-', '_')}"
+    (tmp_path / f"{module_name}.py").write_text(
+        "def run(value):\n"
+        "    return value\n\n"
+        "def harmless(value):\n"
+        "    def inner():\n"
+        "        from os import system as run\n"
+        "        return run(value)\n"
+        "    return run(value)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = _global_call_payload(module_name, "harmless", _unicode_operand("echo nested-alias"))
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not _has_critical_call_graph_finding(report, module_name, "harmless", "os.system")
+
+
+def test_scan_bytes_tracks_imported_callable_assignment_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_module = f"modelaudit_alias_target_{tmp_path.name.replace('-', '_')}"
+    module_name = f"modelaudit_alias_probe_{tmp_path.name.replace('-', '_')}"
+    (tmp_path / f"{target_module}.py").write_text(
+        "import os\n\ndef wrapper(value):\n    return os.system(value)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / f"{module_name}.py").write_text(
+        f"from {target_module} import wrapper\n\nalias = wrapper\n\ndef invoke(value):\n    return alias(value)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo imported-alias"))
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(report, module_name, "invoke", "os.system")
+
+
+def test_scan_bytes_follows_imported_class_constructor_entrypoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_module = f"modelaudit_class_target_{tmp_path.name.replace('-', '_')}"
+    module_name = f"modelaudit_class_probe_{tmp_path.name.replace('-', '_')}"
+    (tmp_path / f"{target_module}.py").write_text(
+        "import os\n\nclass Evil:\n    def __init__(self, value):\n        os.system(value)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / f"{module_name}.py").write_text(
+        f"from {target_module} import Evil\n\ndef invoke(value):\n    return Evil(value)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo imported-class"))
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(report, module_name, "invoke", "os.system")
+
+
+def test_scan_bytes_flags_setstate_import_execution_with_required_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload_module = f"modelaudit_setstate_payload_{tmp_path.name.replace('-', '_')}"
+    module_name = f"modelaudit_setstate_probe_{tmp_path.name.replace('-', '_')}"
+    marker = tmp_path / "setstate_import_marker"
+    (tmp_path / f"{payload_module}.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).write_text('owned')\n",
+        encoding="utf-8",
+    )
+    (tmp_path / f"{module_name}.py").write_text(
+        "class Stateful:\n"
+        "    def __setstate__(self, state):\n"
+        f"        import {payload_module}\n"
+        "        self.state = state\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    payload = b"".join([b"\x80\x04", _global_operand(module_name, "Stateful"), b")\x81}b."])
+
+    report = scan_bytes(payload, source=f"{module_name}.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(report, module_name, "Stateful", "builtins.__import__")
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+
+sys.path.insert(0, str(module_dir))
+pickle.loads(payload)
+if not marker.exists():
+    raise SystemExit("setstate import did not execute")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(tmp_path), str(marker), payload.hex()],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_scan_bytes_blocks_iter_callable_sentinel_consumption_rce(tmp_path: Path) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
