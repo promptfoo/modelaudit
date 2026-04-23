@@ -29,9 +29,10 @@ use crate::report::{
     Finding, FindingDedupeKey, Notice, NoticeDedupeKey, ScanError,
 };
 use crate::stack::{
-    collapse_tuple_values, operand_preview, pytorch_storage_key, resolve_global_operand,
-    stack_value_from_integer_arg, stack_value_from_text_arg, stack_value_preview,
-    stack_value_string, FutureCallbacks, GlobalRef, RegexScannerRule, StackValue,
+    collapse_tuple_values, operand_preview, pytorch_storage_descriptor_ref, pytorch_storage_key,
+    resolve_global_operand, stack_value_from_integer_arg, stack_value_from_text_arg,
+    stack_value_preview, stack_value_string, FutureCallbacks, GlobalRef, RegexScannerRule,
+    StackValue,
 };
 use crate::strings::{is_repeated_single_byte, suspicious_string_matches};
 
@@ -3798,6 +3799,8 @@ impl<'a> ScanState<'a> {
                 DetailValue::String(stack_value_preview(value, 0)),
             ));
             if let Some(storage_key) = pytorch_storage_key(value, self.payload) {
+                let storage_descriptor =
+                    pytorch_storage_descriptor_ref(value, self.payload).cloned();
                 details.push((
                     "pytorch_storage_persistent_id".to_string(),
                     DetailValue::Bool(true),
@@ -3806,6 +3809,9 @@ impl<'a> ScanState<'a> {
                     "pytorch_storage_key".to_string(),
                     DetailValue::String(storage_key),
                 ));
+                if let Some(descriptor) = storage_descriptor.as_ref() {
+                    self.mark_pytorch_storage_persistent_id_import_reference(descriptor);
+                }
             }
         }
 
@@ -3819,6 +3825,29 @@ impl<'a> ScanState<'a> {
                 "Persistent pickle IDs delegate object resolution to loader-defined callbacks, which can hide external object construction or storage lookups.",
             ),
         });
+    }
+
+    fn mark_pytorch_storage_persistent_id_import_reference(&mut self, descriptor: &GlobalRef) {
+        for details in &mut self.import_references {
+            if detail_usize(details, "position") != Some(descriptor.position) {
+                continue;
+            }
+            if detail_string(details, "module").as_deref() != Some(descriptor.module.as_str())
+                || detail_string(details, "name").as_deref() != Some(descriptor.name.as_str())
+            {
+                continue;
+            }
+            if !details
+                .iter()
+                .any(|(key, _)| key == "pytorch_storage_persistent_id")
+            {
+                details.push((
+                    "pytorch_storage_persistent_id".to_string(),
+                    DetailValue::Bool(true),
+                ));
+            }
+            break;
+        }
     }
 
     fn emit_persistent_id_notice(&mut self) {

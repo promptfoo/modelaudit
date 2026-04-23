@@ -930,6 +930,13 @@ def test_scan_bytes_flags_canonical_pytorch_storage_persistent_ids() -> None:
         finding.rule_code == "PERSISTENT_ID" and finding.details.get("pytorch_storage_key") == "k"
         for finding in report.findings
     )
+    import_references = cast(tuple[dict[str, object], ...], report.metadata.get("import_references", ()))
+    assert any(
+        reference.get("import_reference") == "torch.FloatStorage"
+        and reference.get("pytorch_storage_persistent_id") is True
+        for reference in import_references
+    )
+    assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
     assert report.notices == ()
 
 

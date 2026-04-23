@@ -367,6 +367,8 @@ def _iter_import_references(import_references: object) -> tuple[dict[str, object
         name = str(item.get("name", ""))
         if not module or not name or (module, name) in seen:
             continue
+        if _is_pytorch_storage_persistent_id_reference(item):
+            continue
         seen.add((module, name))
         normalized.append(dict(item))
         if len(normalized) >= _MAX_IMPORT_REFERENCES:
@@ -440,6 +442,14 @@ def _callable_singleton_aliases(module: str, name: str) -> tuple[tuple[str, str]
     return _CALLABLE_SINGLETON_ALIASES.get((module, name), ())
 
 
+def _is_pytorch_storage_persistent_id_reference(item: Mapping[str, object]) -> bool:
+    return (
+        item.get("pytorch_storage_persistent_id") is True
+        and item.get("module") == "torch"
+        and str(item.get("name", "")).endswith("Storage")
+    )
+
+
 def has_unanalyzed_call_graph_import_references(import_references: object) -> bool:
     if not isinstance(import_references, list | tuple):
         return False
@@ -450,6 +460,8 @@ def has_unanalyzed_call_graph_import_references(import_references: object) -> bo
         module = str(item.get("module", ""))
         name = str(item.get("name", ""))
         if not module or not name:
+            continue
+        if _is_pytorch_storage_persistent_id_reference(item):
             continue
         seen.add((module, name))
         if len(seen) > _MAX_IMPORT_REFERENCES:
