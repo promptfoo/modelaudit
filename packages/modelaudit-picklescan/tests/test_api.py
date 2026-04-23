@@ -38,6 +38,12 @@ from modelaudit_picklescan import (
 
 EXPECTED_SYSTEM_GLOBAL = "nt.system" if os.name == "nt" else "posix.system"
 SYSTEM_GLOBALS = frozenset({"nt.system", "os.system", "posix.system"})
+_PROTOCOL_MUTATION_EVENTS: list[tuple[str, str]] = []
+
+
+class ProtocolMutationTarget:
+    def __setitem__(self, key: str, value: str) -> None:
+        _PROTOCOL_MUTATION_EVENTS.append((key, value))
 
 
 def _short_binunicode(data: bytes) -> bytes:
@@ -263,6 +269,14 @@ def _local_operator_ior_payload() -> bytes:
 
 def _local_operator_imul_payload() -> bytes:
     return b"\x80\x04coperator\nimul\n]K\x01aK\x00\x86R."
+
+
+def _operator_setitem_constructed_object_payload() -> bytes:
+    return (
+        b"\x80\x04" + _global(__name__.encode("ascii"), b"ProtocolMutationTarget") + b")R\x94"
+        b"coperator\nsetitem\n"
+        b"h\x00" + _short_binunicode(b"token") + _short_binunicode(b"value") + b"\x87R."
+    )
 
 
 def _site_addsitedir_payload(site_dir: Path) -> bytes:
@@ -2757,6 +2771,29 @@ def test_scan_bytes_allows_local_container_mutations(payload: bytes) -> None:
     assert report.status == ScanStatus.COMPLETE
     assert report.verdict == SafetyVerdict.CLEAN
     assert report.findings == ()
+
+
+def test_scan_bytes_detects_operator_setitem_constructed_object_protocol() -> None:
+    payload = _operator_setitem_constructed_object_payload()
+    _PROTOCOL_MUTATION_EVENTS.clear()
+
+    try:
+        report = scan_bytes(payload, source="operator-setitem-constructed-object.pkl")
+
+        assert report.status == ScanStatus.COMPLETE
+        assert report.verdict == SafetyVerdict.MALICIOUS
+        assert _PROTOCOL_MUTATION_EVENTS == []
+        assert any(
+            finding.rule_code == "DANGEROUS_CALL"
+            and finding.severity == Severity.CRITICAL
+            and finding.details.get("import_reference") == "operator.setitem"
+            and finding.details.get("mutation_target") == "object.__setitem__"
+            for finding in report.findings
+        )
+        assert pickle.loads(payload) is None
+        assert _PROTOCOL_MUTATION_EVENTS == [("token", "value")]
+    finally:
+        _PROTOCOL_MUTATION_EVENTS.clear()
 
 
 @pytest.mark.parametrize(
