@@ -90,6 +90,8 @@ class TestPyTorchZipDetection:
             "weights": torch.randn(10, 10),
             "bias": torch.randn(10),
             "config": {"layers": 3, "hidden_size": 10},
+            "device": torch.device("cpu"),
+            "dtype": torch.float32,
         }
 
         # Save as .bin file

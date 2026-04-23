@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import importlib
+import io
 import os
+import pickle
 import subprocess
 import sys
+import zipfile
 from importlib.util import find_spec
 from pathlib import Path
 
@@ -1088,6 +1092,63 @@ if marker.exists():
     assert result.returncode == 0, result.stderr
 
 
+def test_scan_bytes_does_not_treat_newobj_as_init_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "newobj_init_marker"
+    command = f"{sys.executable} -c \"from pathlib import Path; Path({str(marker)!r}).write_text('owned')\""
+    module_name = "modelaudit_fp_probe_newobj_init"
+    (module_dir / f"{module_name}.py").write_text(
+        "import os\n\n"
+        "class InitImports:\n"
+        "    def __init__(self):\n"
+        f"        os.system({command!r})\n"
+        "    def __setstate__(self, state):\n"
+        "        self.__dict__.update(state)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(module_dir))
+    module = importlib.import_module(module_name)
+    target_type = module.InitImports
+    instance = target_type.__new__(target_type)
+    instance.value = "safe"
+    payload = pickle.dumps(instance, protocol=4)
+
+    report = scan_bytes(payload, source="newobj-init-import-clean.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not _has_critical_call_graph_finding(report, module_name, "InitImports", "os.system")
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+
+sys.path.insert(0, str(module_dir))
+result = pickle.loads(payload)
+if getattr(result, "value", None) != "safe":
+    raise SystemExit(f"unexpected state: {result.__dict__!r}")
+if marker.exists():
+    raise SystemExit("NEWOBJ unexpectedly executed __init__")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize("function_name", ["nested_default_executes", "lambda_default_executes"])
 def test_scan_bytes_preserves_nested_signature_execution_calls(
     tmp_path: Path,
@@ -1278,6 +1339,50 @@ def test_call_graph_models_builtins_help_singleton_invocations() -> None:
     assert findings[0].name == "_Helper.__call__"
     assert findings[0].sink == "builtins.__import__"
     assert findings[0].call_path == ("_sitebuiltins._Helper.__call__", "builtins.__import__")
+
+
+def test_scan_bytes_ignores_benign_torch_extension_metadata_globals() -> None:
+    torch = pytest.importorskip("torch")
+    payload = pickle.dumps(
+        {
+            "device": torch.device("cpu"),
+            "dtype": torch.float32,
+            "shape": torch.Size([2, 3]),
+        },
+        protocol=4,
+    )
+
+    report = scan_bytes(payload, source="torch-extension-metadata-clean.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+
+
+def test_scan_bytes_ignores_torch_layout_module_dict_lookup() -> None:
+    torch = pytest.importorskip("torch")
+    payload = pickle.dumps(torch.strided, protocol=4)
+
+    report = scan_bytes(payload, source="torch-layout-clean.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+
+
+def test_scan_bytes_uses_torch_module_lifecycle_entrypoints_for_newobj() -> None:
+    torch = pytest.importorskip("torch")
+    buffer = io.BytesIO()
+    torch.save(torch.nn.Linear(2, 2), buffer)
+    with zipfile.ZipFile(io.BytesIO(buffer.getvalue())) as archive:
+        data_pickle = archive.read("archive/data.pkl")
+
+    report = scan_bytes(data_pickle, source="torch-linear-data-clean.pkl")
+
+    assert not any(
+        finding.rule_code == "DANGEROUS_CALL_GRAPH"
+        and finding.details.get("module") == "torch.nn.modules.linear"
+        and finding.details.get("name") == "Linear"
+        for finding in report.findings
+    )
 
 
 def test_call_graph_models_builtin_format_protocol_dispatch_invocations() -> None:
