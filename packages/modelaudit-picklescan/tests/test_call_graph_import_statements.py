@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+import modelaudit_picklescan.call_graph as call_graph_module
 from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, Severity, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
 from modelaudit_picklescan.call_graph import (
@@ -56,6 +57,23 @@ def _args_tuple(*arg_operands: bytes) -> bytes:
 
 def _global_call_payload(module: str, name: str, *arg_operands: bytes) -> bytes:
     return b"".join([b"\x80\x04", _global_operand(module, name), _args_tuple(*arg_operands), b"R."])
+
+
+def _clear_call_graph_caches() -> None:
+    for function_name in (
+        "_analyze_module",
+        "_call_graph_entrypoints",
+        "_find_sink_path",
+        "_has_static_torch_extension_global_target",
+        "_resolve_class_target",
+        "_resolve_function_target",
+        "_resolve_module_source",
+        "_safe_call_graph_entrypoints",
+        "_wildcard_export_summary",
+    ):
+        cache_clear = getattr(getattr(call_graph_module, function_name), "cache_clear", None)
+        if cache_clear is not None:
+            cache_clear()
 
 
 def _sitebuiltins_helper_instance_call_payload() -> bytes:
@@ -1356,6 +1374,32 @@ def test_scan_bytes_ignores_benign_torch_extension_metadata_globals() -> None:
 
     assert report.verdict == SafetyVerdict.CLEAN
     assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+
+
+def test_scan_bytes_analyzes_shadowed_torch_extension_callable_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    (module_dir / "torch.py").write_text(
+        "import os\n\ndef device(command):\n    os.system(command)\n    return command\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            _global_call_payload("torch", "device", _unicode_operand("echo shadowed-torch-device")),
+            source="shadowed-torch-device-rce.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(report, "torch", "device", "os.system")
 
 
 def test_scan_bytes_ignores_torch_layout_module_dict_lookup() -> None:

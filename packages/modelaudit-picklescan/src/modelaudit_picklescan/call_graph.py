@@ -428,7 +428,7 @@ def _iter_call_graph_references(
     for item in callable_references:
         module = str(item.get("module", ""))
         name = str(item.get("name", ""))
-        if not module or not name or _is_torch_extension_global_reference(module, name):
+        if not module or not name or _is_skippable_torch_extension_global_reference(module, name):
             continue
         opcode = str(item.get("opcode", ""))
         positional_arg_count = item.get("positional_arg_count")
@@ -451,7 +451,7 @@ def _iter_call_graph_references(
             or not name
             or (module, name) in seen
             or (module, name) in invoked_references
-            or _is_torch_extension_global_reference(module, name)
+            or _is_skippable_torch_extension_global_reference(module, name)
         ):
             continue
         seen.add((module, name))
@@ -601,6 +601,28 @@ def _is_torch_extension_global_reference(module: str, name: str) -> bool:
     return module == "torch" and name in _TORCH_EXTENSION_GLOBALS
 
 
+def _is_skippable_torch_extension_global_reference(module: str, name: str) -> bool:
+    if not _is_torch_extension_global_reference(module, name):
+        return False
+    source_path = _resolve_module_source(module)
+    if source_path is not None and not _is_library_source_path(str(source_path)):
+        return False
+    return not _has_static_torch_extension_global_target(module, name)
+
+
+@lru_cache(maxsize=256)
+def _has_static_torch_extension_global_target(module: str, name: str) -> bool:
+    analysis = _analyze_module(module)
+    if analysis is None:
+        return False
+    full_name = f"{module}.{name}"
+    if full_name in analysis.calls_by_function or full_name in analysis.class_entrypoints:
+        return True
+    if analysis.aliases.get(name) is not None:
+        return True
+    return _resolve_wildcard_reexport_alias(module, name) is not None
+
+
 def has_unanalyzed_call_graph_import_references(import_references: object) -> bool:
     if not isinstance(import_references, list | tuple):
         return False
@@ -612,7 +634,9 @@ def has_unanalyzed_call_graph_import_references(import_references: object) -> bo
         name = str(item.get("name", ""))
         if not module or not name:
             continue
-        if _is_pytorch_storage_persistent_id_reference(item) or _is_torch_extension_global_reference(module, name):
+        if _is_pytorch_storage_persistent_id_reference(item) or _is_skippable_torch_extension_global_reference(
+            module, name
+        ):
             continue
         seen.add((module, name))
         if len(seen) > _MAX_IMPORT_REFERENCES:
