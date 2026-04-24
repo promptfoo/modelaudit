@@ -293,6 +293,26 @@ pub(crate) fn pytorch_storage_key(value: &StackValue, payload: &[u8]) -> Option<
     stack_value_string(&items[2], payload)
 }
 
+pub(crate) fn pytorch_storage_descriptor_ref<'a>(
+    value: &'a StackValue,
+    payload: &[u8],
+) -> Option<&'a GlobalRef> {
+    let StackValue::Tuple(items) = value else {
+        return None;
+    };
+    if items.len() < 4 || stack_value_text(&items[0], payload).as_deref() != Some("storage") {
+        return None;
+    }
+    let StackValue::Global(reference) = &items[1] else {
+        return None;
+    };
+    if is_pytorch_storage_descriptor(&items[1], payload) {
+        Some(reference)
+    } else {
+        None
+    }
+}
+
 pub(crate) fn stack_value_from_integer_arg(arg: &ArgValue, payload: &[u8]) -> StackValue {
     match arg {
         ArgValue::Int(value) => StackValue::Primitive {

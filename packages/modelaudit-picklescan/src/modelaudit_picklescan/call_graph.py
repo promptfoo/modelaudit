@@ -116,6 +116,79 @@ _SHORT_SINK_SECONDARY_PRIORITY_TOKENS = ("exec", "system", "run")
 _CALLABLE_SINGLETON_ALIASES = {
     ("builtins", "help"): (("_sitebuiltins", "_Helper.__call__"),),
 }
+_TORCH_EXTENSION_GLOBALS = frozenset(
+    {
+        "Size",
+        "Tensor",
+        "bfloat16",
+        "bits16",
+        "bits1x8",
+        "bits2x4",
+        "bits4x2",
+        "bits8",
+        "bool",
+        "cdouble",
+        "cfloat",
+        "chalf",
+        "channels_last",
+        "channels_last_3d",
+        "complex128",
+        "complex32",
+        "complex64",
+        "contiguous_format",
+        "device",
+        "double",
+        "float",
+        "float16",
+        "float32",
+        "float64",
+        "float8_e4m3fn",
+        "float8_e4m3fnuz",
+        "float8_e5m2",
+        "float8_e5m2fnuz",
+        "half",
+        "int",
+        "int16",
+        "int32",
+        "int64",
+        "int8",
+        "layout",
+        "long",
+        "memory_format",
+        "per_channel_affine",
+        "per_channel_affine_float_qparams",
+        "per_channel_symmetric",
+        "per_tensor_affine",
+        "per_tensor_symmetric",
+        "preserve_format",
+        "qint32",
+        "qint8",
+        "quint2x4",
+        "quint4x2",
+        "quint8",
+        "short",
+        "sparse_bsc",
+        "sparse_bsr",
+        "sparse_coo",
+        "sparse_csc",
+        "sparse_csr",
+        "strided",
+        "uint1",
+        "uint16",
+        "uint2",
+        "uint3",
+        "uint32",
+        "uint4",
+        "uint5",
+        "uint6",
+        "uint64",
+        "uint7",
+        "uint8",
+    }
+)
+_NEWOBJ_OPCODES = frozenset({"NEWOBJ", "NEWOBJ_EX"})
+_CONSTRUCTOR_OPCODES = frozenset({"INST", "OBJ", "REDUCE"})
+_BUILD_OPCODES = frozenset({"BUILD"})
 
 
 @dataclass(frozen=True)
@@ -188,16 +261,20 @@ def find_dangerous_call_graphs(
     callable_invocations: object | None = None,
 ) -> tuple[CallGraphFinding, ...]:
     findings: list[CallGraphFinding] = []
-    seen: set[tuple[str, str]] = set()
+    seen_findings: set[tuple[str, str, tuple[str, ...]]] = set()
     positional_arg_counts = _callable_invocation_positional_arg_counts(callable_invocations)
-    for reference in _iter_call_graph_references(import_references, callable_invocations):
+    callable_references = _iter_callable_invocation_references(callable_invocations)
+    invoked_references = {
+        (str(reference.get("module", "")), str(reference.get("name", ""))) for reference in callable_references
+    }
+
+    for reference in _iter_call_graph_references(import_references, callable_references, invoked_references):
         module = str(reference.get("module", ""))
         name = str(reference.get("name", ""))
-        if not module or not name or (module, name) in seen:
+        if not module or not name:
             continue
-        seen.add((module, name))
 
-        entrypoints = _safe_call_graph_entrypoints(f"{module}.{name}")
+        entrypoints = _call_graph_entrypoints_for_reference(module, name, reference)
         if not entrypoints:
             continue
         allow_invoked_non_lifecycle_entrypoint = _is_explicit_method_import_reference(name)
@@ -215,6 +292,11 @@ def find_dangerous_call_graphs(
                     break
         if sink_path is None:
             continue
+
+        finding_key = (module, name, sink_path)
+        if finding_key in seen_findings:
+            continue
+        seen_findings.add(finding_key)
 
         sink = sink_path[-1]
         findings.append(
@@ -337,21 +419,43 @@ def _invoked_import_execution_path_callback(
 
 def _iter_call_graph_references(
     import_references: object,
-    callable_invocations: object | None,
+    callable_references: tuple[dict[str, object], ...],
+    invoked_references: set[tuple[str, str]],
 ) -> tuple[dict[str, object], ...]:
     normalized: list[dict[str, object]] = []
     seen: set[tuple[str, str]] = set()
-    for references in (
-        _iter_import_references(import_references),
-        _iter_callable_invocation_references(callable_invocations),
-    ):
-        for item in references:
-            module = str(item.get("module", ""))
-            name = str(item.get("name", ""))
-            if not module or not name or (module, name) in seen:
-                continue
-            seen.add((module, name))
-            normalized.append(dict(item))
+    seen_invocations: set[tuple[str, str, str, int | None]] = set()
+    for item in callable_references:
+        module = str(item.get("module", ""))
+        name = str(item.get("name", ""))
+        if not module or not name or _is_skippable_torch_extension_global_reference(module, name):
+            continue
+        opcode = str(item.get("opcode", ""))
+        positional_arg_count = item.get("positional_arg_count")
+        invocation_key = (
+            module,
+            name,
+            opcode,
+            positional_arg_count if isinstance(positional_arg_count, int) else None,
+        )
+        if invocation_key in seen_invocations:
+            continue
+        seen_invocations.add(invocation_key)
+        normalized.append(dict(item))
+
+    for item in _iter_import_references(import_references):
+        module = str(item.get("module", ""))
+        name = str(item.get("name", ""))
+        if (
+            not module
+            or not name
+            or (module, name) in seen
+            or (module, name) in invoked_references
+            or _is_skippable_torch_extension_global_reference(module, name)
+        ):
+            continue
+        seen.add((module, name))
+        normalized.append(dict(item))
     return tuple(normalized)
 
 
@@ -367,6 +471,8 @@ def _iter_import_references(import_references: object) -> tuple[dict[str, object
         name = str(item.get("name", ""))
         if not module or not name or (module, name) in seen:
             continue
+        if _is_skippable_pytorch_storage_persistent_id_reference(item):
+            continue
         seen.add((module, name))
         normalized.append(dict(item))
         if len(normalized) >= _MAX_IMPORT_REFERENCES:
@@ -379,7 +485,7 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
         return ()
 
     normalized: list[dict[str, object]] = []
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str, int | None]] = set()
     for item in callable_invocations:
         if not isinstance(item, Mapping):
             continue
@@ -387,13 +493,21 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
         name = str(item.get("name", ""))
         if not module or not name:
             continue
+        opcode = str(item.get("opcode", ""))
+        positional_arg_count = item.get("positional_arg_count")
         for reference_module, reference_name in (
             (module, name),
             *_callable_singleton_aliases(module, name),
         ):
-            if (reference_module, reference_name) in seen:
+            reference_key = (
+                reference_module,
+                reference_name,
+                opcode,
+                positional_arg_count if isinstance(positional_arg_count, int) else None,
+            )
+            if reference_key in seen:
                 continue
-            seen.add((reference_module, reference_name))
+            seen.add(reference_key)
             reference = dict(item)
             reference["module"] = reference_module
             reference["name"] = reference_name
@@ -406,6 +520,43 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
 
 def _is_explicit_method_import_reference(name: str) -> bool:
     return "." in name
+
+
+def _call_graph_entrypoints_for_reference(
+    module: str,
+    name: str,
+    reference: Mapping[str, object],
+) -> tuple[str, ...]:
+    entrypoints = _safe_call_graph_entrypoints(f"{module}.{name}")
+    if not entrypoints:
+        return ()
+    if _is_explicit_method_import_reference(name):
+        return entrypoints
+    if _resolve_class_target(f"{module}.{name}") is None:
+        return entrypoints
+    opcode = str(reference.get("opcode", ""))
+    if opcode in _NEWOBJ_OPCODES:
+        if not isinstance(reference.get("positional_arg_count"), int):
+            return _filter_class_entrypoints(entrypoints, (*_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS, "__new__"))
+        return _filter_class_entrypoints(entrypoints, ("__new__",))
+    if opcode in _BUILD_OPCODES:
+        return _filter_class_entrypoints(entrypoints, _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS)
+    if opcode in _CONSTRUCTOR_OPCODES:
+        return _filter_class_entrypoints(entrypoints, _PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS)
+    return entrypoints
+
+
+def _filter_class_entrypoints(entrypoints: tuple[str, ...], methods: tuple[str, ...]) -> tuple[str, ...]:
+    class_entrypoints = tuple(
+        entrypoint
+        for entrypoint in entrypoints
+        if any(entrypoint.endswith(f".{method}") for method in _CLASS_ENTRYPOINT_METHODS)
+    )
+    if not class_entrypoints:
+        return entrypoints
+    return tuple(
+        entrypoint for entrypoint in class_entrypoints if any(entrypoint.endswith(f".{method}") for method in methods)
+    )
 
 
 def _callable_invocation_positional_arg_counts(
@@ -440,6 +591,47 @@ def _callable_singleton_aliases(module: str, name: str) -> tuple[tuple[str, str]
     return _CALLABLE_SINGLETON_ALIASES.get((module, name), ())
 
 
+def _is_pytorch_storage_persistent_id_reference(item: Mapping[str, object]) -> bool:
+    return (
+        item.get("pytorch_storage_persistent_id") is True
+        and item.get("module") == "torch"
+        and str(item.get("name", "")).endswith("Storage")
+    )
+
+
+def _is_skippable_pytorch_storage_persistent_id_reference(item: Mapping[str, object]) -> bool:
+    if not _is_pytorch_storage_persistent_id_reference(item):
+        return False
+    source_path = _resolve_module_source("torch")
+    return source_path is None or _is_library_source_path(str(source_path))
+
+
+def _is_torch_extension_global_reference(module: str, name: str) -> bool:
+    return module == "torch" and name in _TORCH_EXTENSION_GLOBALS
+
+
+def _is_skippable_torch_extension_global_reference(module: str, name: str) -> bool:
+    if not _is_torch_extension_global_reference(module, name):
+        return False
+    source_path = _resolve_module_source(module)
+    if source_path is not None and not _is_library_source_path(str(source_path)):
+        return False
+    return not _has_static_torch_extension_global_target(module, name)
+
+
+@lru_cache(maxsize=256)
+def _has_static_torch_extension_global_target(module: str, name: str) -> bool:
+    analysis = _analyze_module(module)
+    if analysis is None:
+        return False
+    full_name = f"{module}.{name}"
+    if full_name in analysis.calls_by_function or full_name in analysis.class_entrypoints:
+        return True
+    if analysis.aliases.get(name) is not None:
+        return True
+    return _resolve_wildcard_reexport_alias(module, name) is not None
+
+
 def has_unanalyzed_call_graph_import_references(import_references: object) -> bool:
     if not isinstance(import_references, list | tuple):
         return False
@@ -450,6 +642,10 @@ def has_unanalyzed_call_graph_import_references(import_references: object) -> bo
         module = str(item.get("module", ""))
         name = str(item.get("name", ""))
         if not module or not name:
+            continue
+        if _is_skippable_pytorch_storage_persistent_id_reference(
+            item
+        ) or _is_skippable_torch_extension_global_reference(module, name):
             continue
         seen.add((module, name))
         if len(seen) > _MAX_IMPORT_REFERENCES:
@@ -683,6 +879,8 @@ def _resolve_dotted_module_getattr_target(
 ) -> str | None:
     first_component, _separator, _remaining = qualified_name.partition(".")
     if not first_component or first_component in analysis.direct_names:
+        return None
+    if first_component == "__dict__":
         return None
     if analysis.aliases.get(first_component) is not None:
         return None
