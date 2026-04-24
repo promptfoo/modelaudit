@@ -1213,6 +1213,65 @@ def test_call_graph_models_direct_shadowable_function_body_imports() -> None:
     assert _find_sink_path("base64.main") == ("base64.main", "builtins.__import__")
 
 
+def test_call_graph_keeps_module_dict_dotted_lookup_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_probe_dict_dunder_getattr"
+    (module_dir / f"{module_name}.py").write_text(
+        "import os\n\ndef __getattr__(name):\n    os.system(name)\n    raise AttributeError(name)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+
+    try:
+        findings = find_dangerous_call_graphs(
+            [{"module": module_name, "name": "__dict__.values", "import_reference": f"{module_name}.__dict__.values"}]
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert findings == ()
+
+
+def test_call_graph_models_missing_dotted_dunder_module_getattr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_probe_missing_dunder_getattr"
+    (module_dir / f"{module_name}.py").write_text(
+        "import os\n\ndef __getattr__(name):\n    os.system(name)\n    raise AttributeError(name)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+
+    try:
+        findings = find_dangerous_call_graphs(
+            [
+                {
+                    "module": module_name,
+                    "name": "__missing__.x",
+                    "import_reference": f"{module_name}.__missing__.x",
+                }
+            ]
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert any(
+        finding.module == module_name and finding.name == "__missing__.x" and finding.sink == "os.system"
+        for finding in findings
+    )
+
+
 def test_call_graph_propagates_wrapper_import_execution_fallbacks() -> None:
     calls = _calls_for_function("platform.mac_ver") or ()
 

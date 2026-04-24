@@ -880,7 +880,7 @@ def _resolve_dotted_module_getattr_target(
     first_component, _separator, _remaining = qualified_name.partition(".")
     if not first_component or first_component in analysis.direct_names:
         return None
-    if first_component.startswith("__") and first_component.endswith("__"):
+    if first_component == "__dict__":
         return None
     if analysis.aliases.get(first_component) is not None:
         return None
