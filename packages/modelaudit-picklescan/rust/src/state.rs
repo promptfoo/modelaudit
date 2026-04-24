@@ -3785,6 +3785,12 @@ impl<'a> ScanState<'a> {
             Some(StackValue::Text(opcode.arg.coerce_text(self.payload)))
         };
         self.stack.push(StackValue::Other);
+        let storage_descriptor = persistent_id
+            .as_ref()
+            .and_then(|value| pytorch_storage_descriptor_ref(value, self.payload).cloned());
+        if let Some(descriptor) = storage_descriptor.as_ref() {
+            self.mark_pytorch_storage_persistent_id_import_reference(descriptor);
+        }
         if self.persistent_id_count > 1 {
             return;
         }
@@ -3799,8 +3805,6 @@ impl<'a> ScanState<'a> {
                 DetailValue::String(stack_value_preview(value, 0)),
             ));
             if let Some(storage_key) = pytorch_storage_key(value, self.payload) {
-                let storage_descriptor =
-                    pytorch_storage_descriptor_ref(value, self.payload).cloned();
                 details.push((
                     "pytorch_storage_persistent_id".to_string(),
                     DetailValue::Bool(true),
@@ -3809,9 +3813,6 @@ impl<'a> ScanState<'a> {
                     "pytorch_storage_key".to_string(),
                     DetailValue::String(storage_key),
                 ));
-                if let Some(descriptor) = storage_descriptor.as_ref() {
-                    self.mark_pytorch_storage_persistent_id_import_reference(descriptor);
-                }
             }
         }
 
