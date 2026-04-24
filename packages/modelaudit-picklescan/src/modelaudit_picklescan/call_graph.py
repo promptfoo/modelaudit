@@ -471,7 +471,7 @@ def _iter_import_references(import_references: object) -> tuple[dict[str, object
         name = str(item.get("name", ""))
         if not module or not name or (module, name) in seen:
             continue
-        if _is_pytorch_storage_persistent_id_reference(item):
+        if _is_skippable_pytorch_storage_persistent_id_reference(item):
             continue
         seen.add((module, name))
         normalized.append(dict(item))
@@ -536,6 +536,8 @@ def _call_graph_entrypoints_for_reference(
         return entrypoints
     opcode = str(reference.get("opcode", ""))
     if opcode in _NEWOBJ_OPCODES:
+        if not isinstance(reference.get("positional_arg_count"), int):
+            return _filter_class_entrypoints(entrypoints, (*_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS, "__new__"))
         return _filter_class_entrypoints(entrypoints, ("__new__",))
     if opcode in _BUILD_OPCODES:
         return _filter_class_entrypoints(entrypoints, _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS)
@@ -597,6 +599,13 @@ def _is_pytorch_storage_persistent_id_reference(item: Mapping[str, object]) -> b
     )
 
 
+def _is_skippable_pytorch_storage_persistent_id_reference(item: Mapping[str, object]) -> bool:
+    if not _is_pytorch_storage_persistent_id_reference(item):
+        return False
+    source_path = _resolve_module_source("torch")
+    return source_path is None or _is_library_source_path(str(source_path))
+
+
 def _is_torch_extension_global_reference(module: str, name: str) -> bool:
     return module == "torch" and name in _TORCH_EXTENSION_GLOBALS
 
@@ -634,9 +643,9 @@ def has_unanalyzed_call_graph_import_references(import_references: object) -> bo
         name = str(item.get("name", ""))
         if not module or not name:
             continue
-        if _is_pytorch_storage_persistent_id_reference(item) or _is_skippable_torch_extension_global_reference(
-            module, name
-        ):
+        if _is_skippable_pytorch_storage_persistent_id_reference(
+            item
+        ) or _is_skippable_torch_extension_global_reference(module, name):
             continue
         seen.add((module, name))
         if len(seen) > _MAX_IMPORT_REFERENCES:

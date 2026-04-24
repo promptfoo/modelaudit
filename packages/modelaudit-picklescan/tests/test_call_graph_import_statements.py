@@ -14,7 +14,6 @@ from pathlib import Path
 
 import pytest
 
-import modelaudit_picklescan.call_graph as call_graph_module
 from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, Severity, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
 from modelaudit_picklescan.call_graph import (
@@ -60,6 +59,7 @@ def _global_call_payload(module: str, name: str, *arg_operands: bytes) -> bytes:
 
 
 def _clear_call_graph_caches() -> None:
+    call_graph_module = sys.modules["modelaudit_picklescan.call_graph"]
     for function_name in (
         "_analyze_module",
         "_call_graph_entrypoints",
@@ -1400,6 +1400,82 @@ def test_scan_bytes_analyzes_shadowed_torch_extension_callable_invocation(
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_call_graph_finding(report, "torch", "device", "os.system")
+
+
+def test_call_graph_analyzes_shadowed_torch_storage_persistent_id_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    (module_dir / "torch.py").write_text(
+        "import os\n\ndef __getattr__(name):\n    os.system(name)\n    raise AttributeError(name)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+
+    try:
+        findings = find_dangerous_call_graphs(
+            [
+                {
+                    "module": "torch",
+                    "name": "FloatStorage",
+                    "import_reference": "torch.FloatStorage",
+                    "pytorch_storage_persistent_id": True,
+                }
+            ]
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert any(
+        finding.module == "torch" and finding.name == "FloatStorage" and finding.sink == "os.system"
+        for finding in findings
+    )
+
+
+def test_call_graph_keeps_setstate_entrypoint_for_unknown_newobj_invocation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_probe_unknown_newobj_setstate"
+    (module_dir / f"{module_name}.py").write_text(
+        "import os\n\n"
+        "class Stateful:\n"
+        "    def __new__(cls):\n"
+        "        return super().__new__(cls)\n\n"
+        "    def __setstate__(self, state):\n"
+        "        os.system(state)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+
+    try:
+        findings = find_dangerous_call_graphs(
+            [],
+            [
+                {
+                    "module": module_name,
+                    "name": "Stateful",
+                    "import_reference": f"{module_name}.Stateful",
+                    "opcode": "NEWOBJ",
+                    "positional_arg_count": None,
+                }
+            ],
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert any(
+        finding.module == module_name and finding.name == "Stateful" and finding.sink == "os.system"
+        for finding in findings
+    )
 
 
 def test_scan_bytes_ignores_torch_layout_module_dict_lookup() -> None:
