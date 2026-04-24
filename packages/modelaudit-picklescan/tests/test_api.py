@@ -3301,6 +3301,35 @@ def test_with_call_graph_findings_dedupes_click_startup_hook_write_when_writer_i
     assert updated.findings == (existing_finding,)
 
 
+def test_with_call_graph_findings_dedupes_click_startup_hook_write_when_opener_is_already_critical() -> None:
+    pytest.importorskip("click")
+
+    existing_finding = Finding(
+        message="existing critical opener finding",
+        severity=Severity.CRITICAL,
+        location="click-startup-hook-write-dedupe.pkl",
+        rule_code="DANGEROUS_CALL",
+        details={"module": "click", "name": "open_file"},
+    )
+    report = PickleReport(
+        source="click-startup-hook-write-dedupe.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(existing_finding,),
+        metadata={
+            "import_references": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            )
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated is report
+    assert updated.findings == (existing_finding,)
+
+
 def test_scan_bytes_warns_on_main_module_global_references() -> None:
     payload = b"\x80\x04\x8c\x08__main__\x94\x8c\x0aCustomType\x94\x93."
 
