@@ -249,6 +249,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **telemetry:** persist ModelAudit distinct IDs in Promptfoo's global config
+  format and include `isRunningInCi` on analytics payloads
 - **docs:** align public README and compatibility guidance with supported Python 3.10-3.13, TensorFlow extra requirements, supported formats, and telemetry sanitization behavior
 - **security:** credit @mosebit for privately reporting a TensorRT native-code detection gap that helped harden native-code scanner coverage
 - **security-policy:** clarify when low-impact scanner coverage gaps may be closed without publishing a public advisory while still crediting reporters

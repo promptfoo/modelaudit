@@ -129,6 +129,31 @@ _TELEMETRY_FILELIKE_ISSUE_ID_RE = re.compile(
     r"\.(?:bin|ckpt|gguf|gz|h5|hdf5|json|keras|nemo|onnx|pb|pickle|pkl|pt|pth|safetensors|tar|yaml|yml|zip)$",
     re.IGNORECASE,
 )
+_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "yup", "yeppers"})
+_CI_ENV_VARS = (
+    "CI",
+    "GITHUB_ACTIONS",
+    "TRAVIS",
+    "CIRCLECI",
+    "JENKINS",
+    "GITLAB_CI",
+    "APPVEYOR",
+    "CODEBUILD_BUILD_ID",
+    "TF_BUILD",
+    "BITBUCKET_COMMIT",
+    "BUDDY",
+    "BUILDKITE",
+    "TEAMCITY_VERSION",
+)
+
+
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").lower() in _TRUE_ENV_VALUES
+
+
+def _is_running_in_ci() -> bool:
+    """Match Promptfoo's CI telemetry property semantics."""
+    return any(_env_truthy(name) for name in _CI_ENV_VARS)
 
 
 def _is_development_install() -> bool:
@@ -179,7 +204,7 @@ def _runtime_signature() -> tuple[Any, ...]:
         os.getenv("MODELAUDIT_TELEMETRY_DEV", "").lower(),
         os.getenv("PROMPTFOO_DISABLE_TELEMETRY", "").lower(),
         os.getenv("NO_ANALYTICS", "").lower(),
-        os.getenv("CI", "").lower(),
+        *(os.getenv(name, "").lower() for name in _CI_ENV_VARS),
         os.getenv("IS_TESTING", "").lower(),
         os.getenv("MODELAUDIT_TELEMETRY_FLUSH_IMMEDIATELY", "").lower(),
     )
@@ -191,8 +216,10 @@ class UserConfig:
     def __init__(self):
         self._config_dir = Path.home() / ".modelaudit"
         self._config_file = self._config_dir / "user_config.json"
+        self._promptfoo_config_file = Path.home() / ".promptfoo" / "promptfoo.yaml"
         self._config = self._load_config()
         self._promptfoo_user_id: str | None = None
+        self._promptfoo_user_id_loaded = False
 
     def _load_config(self) -> dict[str, Any]:
         """Load user configuration from file."""
@@ -216,25 +243,61 @@ class UserConfig:
         except OSError as e:
             logger.debug(f"Failed to save user config: {e}")
 
-    def _get_promptfoo_user_id(self) -> str | None:
-        """Try to read Promptfoo's user ID for cross-tool correlation.
+    def _read_promptfoo_config(self) -> dict[str, Any] | None:
+        """Read Promptfoo's global config without creating or mutating it."""
+        if not self._promptfoo_config_file.exists():
+            return {}
 
-        This allows correlating ModelAudit usage with Promptfoo usage for the same user.
-        """
-        if self._promptfoo_user_id is not None:
+        try:
+            with open(self._promptfoo_config_file) as f:
+                config = yaml.safe_load(f)
+        except (OSError, yaml.YAMLError) as exc:
+            logger.debug("Unable to read promptfoo telemetry config: %s", exc)
+            return None
+
+        if config is None:
+            return {}
+        if isinstance(config, dict):
+            return cast(dict[str, Any], config)
+
+        logger.debug("Ignoring non-object promptfoo telemetry config")
+        return None
+
+    def _get_promptfoo_user_id(self) -> str | None:
+        """Read Promptfoo's user ID for cross-tool correlation."""
+        if self._promptfoo_user_id_loaded:
             return self._promptfoo_user_id
 
-        promptfoo_config = Path.home() / ".promptfoo" / "promptfoo.yaml"
-        if promptfoo_config.exists():
-            try:
-                with open(promptfoo_config) as f:
-                    config = yaml.safe_load(f)
-                if isinstance(config, dict) and "id" in config:
-                    self._promptfoo_user_id = str(config["id"])
-                    return self._promptfoo_user_id
-            except (OSError, yaml.YAMLError) as exc:
-                logger.debug("Unable to read promptfoo telemetry config: %s", exc)
-        return None
+        self._promptfoo_user_id_loaded = True
+        config = self._read_promptfoo_config()
+        if config is None:
+            return None
+
+        user_id = config.get("id")
+        if isinstance(user_id, str) and user_id:
+            self._promptfoo_user_id = user_id
+        return self._promptfoo_user_id
+
+    def _write_promptfoo_user_id(self, user_id: str) -> bool:
+        """Persist a user ID in Promptfoo's global config format."""
+        config = self._read_promptfoo_config()
+        if config is None:
+            return False
+
+        config["id"] = user_id
+        try:
+            self._promptfoo_config_file.parent.mkdir(parents=True, exist_ok=True)
+            temp_config_file = self._promptfoo_config_file.with_suffix(".yaml.tmp")
+            with open(temp_config_file, "w") as f:
+                yaml.safe_dump(config, f, sort_keys=False)
+            temp_config_file.replace(self._promptfoo_config_file)
+        except OSError as exc:
+            logger.debug("Unable to write promptfoo telemetry config: %s", exc)
+            return False
+
+        self._promptfoo_user_id = user_id
+        self._promptfoo_user_id_loaded = True
+        return True
 
     @property
     def user_id(self) -> str:
@@ -248,11 +311,18 @@ class UserConfig:
         if promptfoo_id:
             return promptfoo_id
 
-        # Fall back to ModelAudit's own user ID
-        if "user_id" not in self._config:
-            self._config["user_id"] = str(uuid.uuid4())
+        user_id = self._config.get("user_id")
+        if not isinstance(user_id, str) or not user_id:
+            user_id = str(uuid.uuid4())
+
+        if self._write_promptfoo_user_id(user_id):
+            return user_id
+
+        # Fall back to ModelAudit's legacy config only when Promptfoo's config cannot be written.
+        if self._config.get("user_id") != user_id:
+            self._config["user_id"] = user_id
             self._save_config()
-        return str(self._config["user_id"])
+        return user_id
 
     @property
     def email(self) -> str | None:
@@ -340,6 +410,7 @@ class TelemetryClient:
                 "modelaudit_version": __version__,
                 "platform": os.name,
                 "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+                "isRunningInCi": _is_running_in_ci(),
             }
 
             # PostHog v7 uses set() instead of identify()
@@ -519,6 +590,7 @@ class TelemetryClient:
             "user_id": self._user_config.user_id,
             "platform": sys.platform,
             "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            "isRunningInCi": _is_running_in_ci(),
         }
 
         # Send to PostHog

@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 
 from modelaudit.telemetry import (
     TelemetryClient,
@@ -21,14 +22,33 @@ from modelaudit.telemetry import (
     record_scan_started,
 )
 
+_NO_CI_ENV = {
+    "CI": "",
+    "GITHUB_ACTIONS": "",
+    "TRAVIS": "",
+    "CIRCLECI": "",
+    "JENKINS": "",
+    "GITLAB_CI": "",
+    "APPVEYOR": "",
+    "CODEBUILD_BUILD_ID": "",
+    "TF_BUILD": "",
+    "BITBUCKET_COMMIT": "",
+    "BUDDY": "",
+    "BUILDKITE": "",
+    "TEAMCITY_VERSION": "",
+    "IS_TESTING": "",
+    "PROMPTFOO_DISABLE_TELEMETRY": "",
+    "NO_ANALYTICS": "",
+}
+
 
 class TestUserConfig:
     """Test user configuration management."""
 
     def test_user_config_creates_user_id(self) -> None:
-        """Test that user config generates a UUID."""
+        """Test that user config generates a UUID in Promptfoo's config format."""
         with tempfile.TemporaryDirectory() as temp_dir:
-            config_file = Path(temp_dir) / ".modelaudit" / "user_config.json"
+            promptfoo_config_file = Path(temp_dir) / ".promptfoo" / "promptfoo.yaml"
 
             with patch("modelaudit.telemetry.Path.home") as mock_home:
                 mock_home.return_value = Path(temp_dir)
@@ -36,8 +56,43 @@ class TestUserConfig:
 
                 assert config.user_id
                 assert len(config.user_id) == 36  # UUID length
-                assert config_file.parent.exists()
-                assert config_file.exists()
+                assert promptfoo_config_file.parent.exists()
+                assert promptfoo_config_file.exists()
+                assert yaml.safe_load(promptfoo_config_file.read_text())["id"] == config.user_id
+
+    def test_user_config_uses_existing_promptfoo_user_id(self) -> None:
+        """Existing Promptfoo IDs should be reused without rewriting ModelAudit config."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            promptfoo_config_file = home / ".promptfoo" / "promptfoo.yaml"
+            promptfoo_config_file.parent.mkdir()
+            promptfoo_config_file.write_text(yaml.safe_dump({"id": "promptfoo-id", "cloud": {"enabled": True}}))
+
+            with patch("modelaudit.telemetry.Path.home") as mock_home:
+                mock_home.return_value = home
+                config = UserConfig()
+
+                assert config.user_id == "promptfoo-id"
+                promptfoo_config = yaml.safe_load(promptfoo_config_file.read_text())
+                assert promptfoo_config["cloud"] == {"enabled": True}
+                assert not (home / ".modelaudit" / "user_config.json").exists()
+
+    def test_user_config_migrates_legacy_modelaudit_user_id_to_promptfoo_config(self) -> None:
+        """Legacy ModelAudit IDs should remain stable when adopting Promptfoo config."""
+        legacy_user_id = "11111111-2222-4333-8444-555555555555"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            modelaudit_config_file = home / ".modelaudit" / "user_config.json"
+            modelaudit_config_file.parent.mkdir()
+            modelaudit_config_file.write_text(json.dumps({"user_id": legacy_user_id}))
+            promptfoo_config_file = home / ".promptfoo" / "promptfoo.yaml"
+
+            with patch("modelaudit.telemetry.Path.home") as mock_home:
+                mock_home.return_value = home
+                config = UserConfig()
+
+                assert config.user_id == legacy_user_id
+                assert yaml.safe_load(promptfoo_config_file.read_text())["id"] == legacy_user_id
 
     def test_user_config_defaults_to_enabled(self):
         """Test that telemetry defaults to enabled (opt-out model)."""
@@ -204,7 +259,7 @@ class TestTelemetryClient:
             patch("modelaudit.telemetry.Posthog", return_value=mock_posthog),
             patch.dict(
                 os.environ,
-                {"CI": "", "IS_TESTING": "", "PROMPTFOO_DISABLE_TELEMETRY": "", "NO_ANALYTICS": ""},
+                _NO_CI_ENV,
                 clear=False,
             ),
         ):
@@ -217,7 +272,55 @@ class TestTelemetryClient:
 
             # Should call PostHog capture
             mock_posthog.capture.assert_called_once()
+            capture_kwargs = mock_posthog.capture.call_args.kwargs
+            assert capture_kwargs["distinct_id"] == client._user_config.user_id
+            assert capture_kwargs["properties"]["isRunningInCi"] is False
             mock_posthog.flush.assert_not_called()
+
+    def test_identify_user_uses_stable_promptfoo_id_and_ci_property(self) -> None:
+        """Identify should use the same stable ID and Promptfoo-style CI property."""
+        mock_posthog = MagicMock()
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            patch("modelaudit.telemetry.POSTHOG_AVAILABLE", True),
+            patch("modelaudit.telemetry.Posthog", return_value=mock_posthog),
+            patch.dict(os.environ, _NO_CI_ENV, clear=False),
+        ):
+            home = Path(temp_dir)
+            promptfoo_config_file = home / ".promptfoo" / "promptfoo.yaml"
+            promptfoo_config_file.parent.mkdir()
+            promptfoo_config_file.write_text(yaml.safe_dump({"id": "promptfoo-id"}))
+            mock_home.return_value = home
+
+            TelemetryClient()
+
+            mock_posthog.set.assert_called_once()
+            set_kwargs = mock_posthog.set.call_args.kwargs
+            assert set_kwargs["distinct_id"] == "promptfoo-id"
+            assert set_kwargs["properties"]["isRunningInCi"] is False
+
+    def test_event_properties_mark_ci_environment(self) -> None:
+        """Telemetry payloads should expose Promptfoo-compatible CI state."""
+        mock_posthog = MagicMock()
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            patch("modelaudit.telemetry.POSTHOG_AVAILABLE", False),
+            patch.dict(os.environ, {**_NO_CI_ENV, "GITHUB_ACTIONS": "true"}, clear=False),
+        ):
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+            client._posthog_client = mock_posthog
+
+            client._send_event_internal(TelemetryEvent.COMMAND_USED, {"command": "test"})
+
+            properties = mock_posthog.capture.call_args.kwargs["properties"]
+            assert properties["isRunningInCi"] is True
 
     def test_event_recording_can_flush_immediately_when_configured(self):
         """Immediate flush can be enabled for low-latency delivery."""
