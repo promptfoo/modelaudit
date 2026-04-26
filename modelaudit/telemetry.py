@@ -130,30 +130,48 @@ _TELEMETRY_FILELIKE_ISSUE_ID_RE = re.compile(
     re.IGNORECASE,
 )
 _TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "yup", "yeppers"})
-_CI_ENV_VARS = (
+# Vars whose CI providers set a truthy literal ("true"/"1").
+_CI_TRUTHY_ENV_VARS = (
     "CI",
     "GITHUB_ACTIONS",
     "TRAVIS",
     "CIRCLECI",
-    "JENKINS",
     "GITLAB_CI",
     "APPVEYOR",
-    "CODEBUILD_BUILD_ID",
     "TF_BUILD",
-    "BITBUCKET_COMMIT",
-    "BUDDY",
     "BUILDKITE",
+    "BUDDY",
+)
+# Vars whose CI providers set a marker value (build ID, version, commit SHA),
+# so any non-empty value indicates CI. Promptfoo's upstream `getEnvBool` misses
+# these; we diverge intentionally so analytics filters work in the wild.
+_CI_PRESENCE_ENV_VARS = (
+    "JENKINS",
+    "CODEBUILD_BUILD_ID",
+    "BITBUCKET_COMMIT",
     "TEAMCITY_VERSION",
 )
+_CI_ENV_VARS = _CI_TRUTHY_ENV_VARS + _CI_PRESENCE_ENV_VARS
 
 
 def _env_truthy(name: str) -> bool:
     return os.getenv(name, "").lower() in _TRUE_ENV_VALUES
 
 
+def _env_present(name: str) -> bool:
+    return bool(os.getenv(name, "").strip())
+
+
 def _is_running_in_ci() -> bool:
-    """Match Promptfoo's CI telemetry property semantics."""
-    return any(_env_truthy(name) for name in _CI_ENV_VARS)
+    """Detect CI for the `isRunningInCi` telemetry property.
+
+    Mirrors Promptfoo's variable list but uses presence-based detection for
+    marker-style vars (TEAMCITY_VERSION, CODEBUILD_BUILD_ID, BITBUCKET_COMMIT,
+    JENKINS) that providers set to non-truthy values like build IDs.
+    """
+    if any(_env_truthy(name) for name in _CI_TRUTHY_ENV_VARS):
+        return True
+    return any(_env_present(name) for name in _CI_PRESENCE_ENV_VARS)
 
 
 def _is_development_install() -> bool:
@@ -278,11 +296,15 @@ class UserConfig:
             self._promptfoo_user_id = user_id
         return self._promptfoo_user_id
 
-    def _write_promptfoo_user_id(self, user_id: str) -> bool:
-        """Persist a user ID in Promptfoo's global config format."""
-        config = self._read_promptfoo_config()
+    def _write_promptfoo_user_id(self, user_id: str, config: dict[str, Any] | None = None) -> bool:
+        """Persist a user ID in Promptfoo's global config format.
+
+        Pass an already-loaded config to avoid a redundant disk read.
+        """
         if config is None:
-            return False
+            config = self._read_promptfoo_config()
+            if config is None:
+                return False
 
         config["id"] = user_id
         try:
@@ -304,7 +326,7 @@ class UserConfig:
         """Get or generate user ID.
 
         Prefers Promptfoo's user ID if available for cross-tool correlation,
-        otherwise uses ModelAudit's own user ID.
+        otherwise migrates ModelAudit's legacy ID into Promptfoo's config.
         """
         # Try Promptfoo's user ID first for correlation
         promptfoo_id = self._get_promptfoo_user_id()
@@ -315,7 +337,9 @@ class UserConfig:
         if not isinstance(user_id, str) or not user_id:
             user_id = str(uuid.uuid4())
 
-        if self._write_promptfoo_user_id(user_id):
+        # Reuse the config we just read instead of re-opening the file.
+        promptfoo_config = self._read_promptfoo_config()
+        if promptfoo_config is not None and self._write_promptfoo_user_id(user_id, promptfoo_config):
             return user_id
 
         # Fall back to ModelAudit's legacy config only when Promptfoo's config cannot be written.
@@ -387,6 +411,9 @@ class TelemetryClient:
             return True
         if os.getenv("NO_ANALYTICS", "").lower() in ("1", "true", "yes"):
             return True
+        # Intentionally narrower than `_is_running_in_ci()`: only an explicit
+        # CI=true disables telemetry, while the `isRunningInCi` analytics
+        # property is also set for marker-style providers.
         if os.getenv("CI", "").lower() in ("1", "true", "yes"):
             return True
         if os.getenv("IS_TESTING", "").lower() in ("1", "true", "yes"):

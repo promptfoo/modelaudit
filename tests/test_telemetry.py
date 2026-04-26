@@ -94,6 +94,46 @@ class TestUserConfig:
                 assert config.user_id == legacy_user_id
                 assert yaml.safe_load(promptfoo_config_file.read_text())["id"] == legacy_user_id
 
+    def test_user_config_falls_back_when_promptfoo_yaml_is_corrupt(self) -> None:
+        """A malformed promptfoo.yaml must not crash; the legacy file is used."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            promptfoo_config_file = home / ".promptfoo" / "promptfoo.yaml"
+            promptfoo_config_file.parent.mkdir()
+            # Invalid YAML — colons without values inside a flow mapping.
+            promptfoo_config_file.write_text("{not: valid: yaml: ::")
+            modelaudit_config_file = home / ".modelaudit" / "user_config.json"
+
+            with patch("modelaudit.telemetry.Path.home") as mock_home:
+                mock_home.return_value = home
+                config = UserConfig()
+                user_id = config.user_id
+
+            assert len(user_id) == 36
+            # The corrupt promptfoo file is left alone.
+            assert promptfoo_config_file.read_text() == "{not: valid: yaml: ::"
+            # Legacy fallback persists the freshly-minted ID.
+            assert modelaudit_config_file.exists()
+            assert json.loads(modelaudit_config_file.read_text())["user_id"] == user_id
+
+    def test_user_config_falls_back_when_promptfoo_yaml_is_unwritable(self) -> None:
+        """If we cannot persist to promptfoo.yaml, the ID still lands in the legacy config."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            modelaudit_config_file = home / ".modelaudit" / "user_config.json"
+
+            with (
+                patch("modelaudit.telemetry.Path.home") as mock_home,
+                patch("modelaudit.telemetry.yaml.safe_dump", side_effect=OSError("disk full")),
+            ):
+                mock_home.return_value = home
+                config = UserConfig()
+                user_id = config.user_id
+
+            assert len(user_id) == 36
+            assert modelaudit_config_file.exists()
+            assert json.loads(modelaudit_config_file.read_text())["user_id"] == user_id
+
     def test_user_config_defaults_to_enabled(self):
         """Test that telemetry defaults to enabled (opt-out model)."""
         with tempfile.TemporaryDirectory() as temp_dir, patch("modelaudit.telemetry.Path.home") as mock_home:
@@ -312,6 +352,35 @@ class TestTelemetryClient:
             patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
             patch("modelaudit.telemetry.POSTHOG_AVAILABLE", False),
             patch.dict(os.environ, {**_NO_CI_ENV, "GITHUB_ACTIONS": "true"}, clear=False),
+        ):
+            mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+            client._posthog_client = mock_posthog
+
+            client._send_event_internal(TelemetryEvent.COMMAND_USED, {"command": "test"})
+
+            properties = mock_posthog.capture.call_args.kwargs["properties"]
+            assert properties["isRunningInCi"] is True
+
+    @pytest.mark.parametrize(
+        ("env_var", "value"),
+        [
+            ("TEAMCITY_VERSION", "2024.07.1"),
+            ("CODEBUILD_BUILD_ID", "codebuild:abc-123"),
+            ("BITBUCKET_COMMIT", "deadbeefcafef00ddeadbeefcafef00ddeadbeef"),
+            ("JENKINS", "/var/jenkins_home"),
+        ],
+    )
+    def test_marker_style_ci_vars_are_detected_by_presence(self, env_var: str, value: str) -> None:
+        """Marker-style CI vars carry build IDs, version strings, or paths — not booleans."""
+        mock_posthog = MagicMock()
+
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            patch("modelaudit.telemetry.POSTHOG_AVAILABLE", False),
+            patch.dict(os.environ, {**_NO_CI_ENV, env_var: value}, clear=False),
         ):
             mock_home.return_value = Path(temp_dir)
             client = TelemetryClient()
