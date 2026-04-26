@@ -116,7 +116,7 @@ class Jinja2TemplateScanner(BaseScanner):
         self.max_template_size = self.config.get("max_template_size", 50000)  # Skip huge templates
         # Sandbox execution of untrusted templates is disabled by default because Jinja2's
         # SandboxedEnvironment can be escaped by crafted payloads, which could lead to
-        # code execution when scanning malicious model files.  Set enable_sandbox_test=True
+        # code execution when scanning malicious model files. Set enable_sandbox_test=True
         # explicitly only in controlled environments where this risk is acceptable.
         self.enable_sandbox_test = self.config.get("enable_sandbox_test", False) and HAS_JINJA2_SANDBOX
         self.skip_common_patterns = self.config.get("skip_common_patterns", True)  # Ignore common ML patterns

@@ -258,7 +258,7 @@ class OpenVinoScanner(BaseScanner):
                 rule_code="S701",
             )
 
-        if not HAS_DEFUSEDXML:  # pragma: no cover - defusedxml is a required dependency
+        if not HAS_DEFUSEDXML:  # pragma: no cover - fallback when defusedxml is not installed
             result.add_check(
                 name="XML Parser Security Check",
                 passed=False,
