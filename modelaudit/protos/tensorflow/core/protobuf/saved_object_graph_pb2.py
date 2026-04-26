@@ -30,6 +30,14 @@ from tensorflow.core.protobuf import struct_pb2 as tensorflow_dot_core_dot_proto
 from tensorflow.core.protobuf import trackable_object_graph_pb2 as tensorflow_dot_core_dot_protobuf_dot_trackable__object__graph__pb2
 
 # Keep generated dependency imports for descriptor registration side effects.
+# Reference aliases so static analysis preserves these side-effect imports.
+id(google_dot_protobuf_dot_any__pb2)
+id(tensorflow_dot_core_dot_framework_dot_tensor__shape__pb2)
+id(tensorflow_dot_core_dot_framework_dot_types__pb2)
+id(tensorflow_dot_core_dot_framework_dot_variable__pb2)
+id(tensorflow_dot_core_dot_framework_dot_versions__pb2)
+id(tensorflow_dot_core_dot_protobuf_dot_struct__pb2)
+id(tensorflow_dot_core_dot_protobuf_dot_trackable__object__graph__pb2)
 del google_dot_protobuf_dot_any__pb2
 del tensorflow_dot_core_dot_framework_dot_tensor__shape__pb2
 del tensorflow_dot_core_dot_framework_dot_types__pb2

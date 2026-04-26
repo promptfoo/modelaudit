@@ -25,6 +25,9 @@ from tensorflow.core.framework import graph_pb2 as tensorflow_dot_core_dot_frame
 from tensorflow.core.framework import types_pb2 as tensorflow_dot_core_dot_framework_dot_types__pb2
 
 # Keep generated dependency imports for descriptor registration side effects.
+# Reference aliases so static analysis preserves these side-effect imports.
+id(tensorflow_dot_core_dot_framework_dot_graph__pb2)
+id(tensorflow_dot_core_dot_framework_dot_types__pb2)
 del tensorflow_dot_core_dot_framework_dot_graph__pb2
 del tensorflow_dot_core_dot_framework_dot_types__pb2
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n8tensorflow/core/framework/optimized_function_graph.proto\x12\ntensorflow\x1a%tensorflow/core/framework/graph.proto\x1a%tensorflow/core/framework/types.proto\"\x93\x04\n\x16OptimizedFunctionGraph\x12\x0c\n\x04name\x18\x01 \x01(\t\x12,\n\x0e\x66unction_graph\x18\x02 \x01(\x0b\x32\x14.tensorflow.GraphDef\x12^\n\x18node_name_to_control_ret\x18\x03 \x03(\x0b\x32<.tensorflow.OptimizedFunctionGraph.NodeNameToControlRetEntry\x12\'\n\tret_types\x18\x04 \x03(\x0e\x32\x14.tensorflow.DataType\x12\x18\n\x10num_return_nodes\x18\x05 \x01(\r\x12J\n\x06source\x18\x07 \x01(\x0e\x32\x35.tensorflow.OptimizedFunctionGraph.OptimizationSourceH\x00\x88\x01\x01\x12$\n\x17optimization_time_usecs\x18\x08 \x01(\x04H\x01\x88\x01\x01\x1a;\n\x19NodeNameToControlRetEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\">\n\x12OptimizationSource\x12\x16\n\x12SOURCE_UNSPECIFIED\x10\x00\x12\x07\n\x03\x41OT\x10\x01\x12\x07\n\x03JIT\x10\x02\x42\t\n\x07_sourceB\x1a\n\x18_optimization_time_usecsJ\x04\x08\x06\x10\x07\x62\x06proto3')
