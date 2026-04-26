@@ -6611,6 +6611,7 @@ if marker.read_text() != marker_content:
     assert marker.read_text() == marker_content
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="platform.mac_ver proof depends on macOS/POSIX platform hooks")
 def test_scan_bytes_blocks_platform_mac_ver_wrapper_import_rce(tmp_path: Path) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()

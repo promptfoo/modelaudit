@@ -3032,6 +3032,7 @@ def test_scan_bytes_matches_cpython_oracle_for_adversarial_stack_global(
         assert not scanner_reports_subprocess_run, case.name
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="mailcap test command proof uses POSIX shell")
 def test_scan_bytes_blocks_mailcap_findmatch_test_command_rce(tmp_path: Path) -> None:
     if find_spec("mailcap") is None:
         pytest.skip("mailcap was removed in Python 3.13")
@@ -4295,6 +4296,7 @@ def test_scan_bytes_blocks_dotted_global_os_system_alias_rce(tmp_path: Path) -> 
     assert marker.read_text() == "owned-by-site-os-system"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="PosixPath proof is POSIX-specific")
 def test_scan_bytes_blocks_posixpath_writer_and_site_dict_lookup_pth_rce(tmp_path: Path) -> None:
     pth_path = tmp_path / "posixpath_site_dict_exec.pth"
     marker = tmp_path / "posixpath_site_dict_marker"
@@ -5206,6 +5208,7 @@ def test_scan_bytes_blocks_mailbox_singlefile_pth_writes(
 
 
 @pytest.mark.skipif(find_spec("_tkinter") is None, reason="_tkinter is unavailable")
+@pytest.mark.skipif(sys.platform == "win32", reason="Tcl process execution proof uses /bin/sh")
 @pytest.mark.parametrize(
     ("method_name", "payload_builder", "marker_content"),
     [
@@ -6448,6 +6451,7 @@ def test_scan_bytes_blocks_dataclasses_create_fn_default_arg_rce(tmp_path: Path)
     assert marker.read_text() == "x"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="pipes.Template proof uses POSIX shell and /dev/null")
 def test_scan_bytes_blocks_pipes_template_copy_pipeline_rce(tmp_path: Path) -> None:
     try:
         import pipes
