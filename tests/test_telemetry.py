@@ -45,94 +45,84 @@ _NO_CI_ENV = {
 class TestUserConfig:
     """Test user configuration management."""
 
-    def test_user_config_creates_user_id(self) -> None:
+    def test_user_config_creates_user_id(self, tmp_path: Path) -> None:
         """Test that user config generates a UUID in Promptfoo's config format."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            promptfoo_config_file = Path(temp_dir) / ".promptfoo" / "promptfoo.yaml"
+        promptfoo_config_file = tmp_path / ".promptfoo" / "promptfoo.yaml"
 
-            with patch("modelaudit.telemetry.Path.home") as mock_home:
-                mock_home.return_value = Path(temp_dir)
-                config = UserConfig()
+        with patch("modelaudit.telemetry.Path.home") as mock_home:
+            mock_home.return_value = tmp_path
+            config = UserConfig()
 
-                assert config.user_id
-                assert len(config.user_id) == 36  # UUID length
-                assert promptfoo_config_file.parent.exists()
-                assert promptfoo_config_file.exists()
-                assert yaml.safe_load(promptfoo_config_file.read_text())["id"] == config.user_id
+            assert config.user_id
+            assert len(config.user_id) == 36  # UUID length
+            assert promptfoo_config_file.parent.exists()
+            assert promptfoo_config_file.exists()
+            assert yaml.safe_load(promptfoo_config_file.read_text())["id"] == config.user_id
 
-    def test_user_config_uses_existing_promptfoo_user_id(self) -> None:
+    def test_user_config_uses_existing_promptfoo_user_id(self, tmp_path: Path) -> None:
         """Existing Promptfoo IDs should be reused without rewriting ModelAudit config."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            home = Path(temp_dir)
-            promptfoo_config_file = home / ".promptfoo" / "promptfoo.yaml"
-            promptfoo_config_file.parent.mkdir()
-            promptfoo_config_file.write_text(yaml.safe_dump({"id": "promptfoo-id", "cloud": {"enabled": True}}))
+        promptfoo_config_file = tmp_path / ".promptfoo" / "promptfoo.yaml"
+        promptfoo_config_file.parent.mkdir()
+        promptfoo_config_file.write_text(yaml.safe_dump({"id": "promptfoo-id", "cloud": {"enabled": True}}))
 
-            with patch("modelaudit.telemetry.Path.home") as mock_home:
-                mock_home.return_value = home
-                config = UserConfig()
+        with patch("modelaudit.telemetry.Path.home") as mock_home:
+            mock_home.return_value = tmp_path
+            config = UserConfig()
 
-                assert config.user_id == "promptfoo-id"
-                promptfoo_config = yaml.safe_load(promptfoo_config_file.read_text())
-                assert promptfoo_config["cloud"] == {"enabled": True}
-                assert not (home / ".modelaudit" / "user_config.json").exists()
+            assert config.user_id == "promptfoo-id"
+            promptfoo_config = yaml.safe_load(promptfoo_config_file.read_text())
+            assert promptfoo_config["cloud"] == {"enabled": True}
+            assert not (tmp_path / ".modelaudit" / "user_config.json").exists()
 
-    def test_user_config_migrates_legacy_modelaudit_user_id_to_promptfoo_config(self) -> None:
+    def test_user_config_migrates_legacy_modelaudit_user_id_to_promptfoo_config(self, tmp_path: Path) -> None:
         """Legacy ModelAudit IDs should remain stable when adopting Promptfoo config."""
         legacy_user_id = "11111111-2222-4333-8444-555555555555"
-        with tempfile.TemporaryDirectory() as temp_dir:
-            home = Path(temp_dir)
-            modelaudit_config_file = home / ".modelaudit" / "user_config.json"
-            modelaudit_config_file.parent.mkdir()
-            modelaudit_config_file.write_text(json.dumps({"user_id": legacy_user_id}))
-            promptfoo_config_file = home / ".promptfoo" / "promptfoo.yaml"
+        modelaudit_config_file = tmp_path / ".modelaudit" / "user_config.json"
+        modelaudit_config_file.parent.mkdir()
+        modelaudit_config_file.write_text(json.dumps({"user_id": legacy_user_id}))
+        promptfoo_config_file = tmp_path / ".promptfoo" / "promptfoo.yaml"
 
-            with patch("modelaudit.telemetry.Path.home") as mock_home:
-                mock_home.return_value = home
-                config = UserConfig()
+        with patch("modelaudit.telemetry.Path.home") as mock_home:
+            mock_home.return_value = tmp_path
+            config = UserConfig()
 
-                assert config.user_id == legacy_user_id
-                assert yaml.safe_load(promptfoo_config_file.read_text())["id"] == legacy_user_id
+            assert config.user_id == legacy_user_id
+            assert yaml.safe_load(promptfoo_config_file.read_text())["id"] == legacy_user_id
 
-    def test_user_config_falls_back_when_promptfoo_yaml_is_corrupt(self) -> None:
+    def test_user_config_falls_back_when_promptfoo_yaml_is_corrupt(self, tmp_path: Path) -> None:
         """A malformed promptfoo.yaml must not crash; the legacy file is used."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            home = Path(temp_dir)
-            promptfoo_config_file = home / ".promptfoo" / "promptfoo.yaml"
-            promptfoo_config_file.parent.mkdir()
-            # Invalid YAML — colons without values inside a flow mapping.
-            promptfoo_config_file.write_text("{not: valid: yaml: ::")
-            modelaudit_config_file = home / ".modelaudit" / "user_config.json"
+        promptfoo_config_file = tmp_path / ".promptfoo" / "promptfoo.yaml"
+        promptfoo_config_file.parent.mkdir()
+        promptfoo_config_file.write_text("{not: valid: yaml: ::")
+        modelaudit_config_file = tmp_path / ".modelaudit" / "user_config.json"
 
-            with patch("modelaudit.telemetry.Path.home") as mock_home:
-                mock_home.return_value = home
-                config = UserConfig()
-                user_id = config.user_id
+        with patch("modelaudit.telemetry.Path.home") as mock_home:
+            mock_home.return_value = tmp_path
+            config = UserConfig()
+            user_id = config.user_id
 
-            assert len(user_id) == 36
-            # The corrupt promptfoo file is left alone.
-            assert promptfoo_config_file.read_text() == "{not: valid: yaml: ::"
-            # Legacy fallback persists the freshly-minted ID.
-            assert modelaudit_config_file.exists()
-            assert json.loads(modelaudit_config_file.read_text())["user_id"] == user_id
+        assert len(user_id) == 36
+        # The corrupt promptfoo file is left alone.
+        assert promptfoo_config_file.read_text() == "{not: valid: yaml: ::"
+        # Legacy fallback persists the freshly-minted ID.
+        assert modelaudit_config_file.exists()
+        assert json.loads(modelaudit_config_file.read_text())["user_id"] == user_id
 
-    def test_user_config_falls_back_when_promptfoo_yaml_is_unwritable(self) -> None:
+    def test_user_config_falls_back_when_promptfoo_yaml_is_unwritable(self, tmp_path: Path) -> None:
         """If we cannot persist to promptfoo.yaml, the ID still lands in the legacy config."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            home = Path(temp_dir)
-            modelaudit_config_file = home / ".modelaudit" / "user_config.json"
+        modelaudit_config_file = tmp_path / ".modelaudit" / "user_config.json"
 
-            with (
-                patch("modelaudit.telemetry.Path.home") as mock_home,
-                patch("modelaudit.telemetry.yaml.safe_dump", side_effect=OSError("disk full")),
-            ):
-                mock_home.return_value = home
-                config = UserConfig()
-                user_id = config.user_id
+        with (
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+            patch("modelaudit.auth.config._write_yaml_atomic", side_effect=OSError("disk full")),
+        ):
+            mock_home.return_value = tmp_path
+            config = UserConfig()
+            user_id = config.user_id
 
-            assert len(user_id) == 36
-            assert modelaudit_config_file.exists()
-            assert json.loads(modelaudit_config_file.read_text())["user_id"] == user_id
+        assert len(user_id) == 36
+        assert modelaudit_config_file.exists()
+        assert json.loads(modelaudit_config_file.read_text())["user_id"] == user_id
 
     def test_user_config_defaults_to_enabled(self):
         """Test that telemetry defaults to enabled (opt-out model)."""
