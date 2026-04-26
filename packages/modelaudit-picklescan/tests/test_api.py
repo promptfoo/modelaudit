@@ -940,6 +940,30 @@ def test_scan_bytes_flags_canonical_pytorch_storage_persistent_ids() -> None:
     assert report.notices == ()
 
 
+def test_scan_bytes_marks_global_pytorch_storage_persistent_id_import_reference() -> None:
+    payload = (
+        b"\x80\x02("
+        + _binunicode(b"storage")
+        + _global(b"torch", b"FloatStorage")
+        + _binunicode(b"k")
+        + _binunicode(b"cpu")
+        + b"K\x01tQ."
+    )
+
+    report = scan_bytes(payload, source="global-pytorch-storage.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    import_references = cast(tuple[dict[str, object], ...], report.metadata.get("import_references", ()))
+    assert any(
+        reference.get("import_reference") == "torch.FloatStorage"
+        and reference.get("pytorch_storage_persistent_id") is True
+        for reference in import_references
+    )
+    assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH" for finding in report.findings)
+    assert report.notices == ()
+
+
 def test_scan_bytes_marks_each_pytorch_storage_persistent_id_import_reference() -> None:
     def storage_persistent_id(name: str, key: str, terminator: bytes) -> bytes:
         return (
