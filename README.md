@@ -244,7 +244,8 @@ ModelAudit includes telemetry for product reliability and usage analytics.
 - Collected metadata can include command usage, scan timing, scanner/file-type usage, issue severity/type aggregates, sanitized model names/references, and coarse metadata like file extension/domain.
 - URL telemetry strips userinfo, query strings, and fragments from model references. Avoid putting credentials in model names, file names, or artifact paths when telemetry is enabled.
 - Model files are scanned locally and ModelAudit does not upload model binary contents as telemetry events.
-- Telemetry is disabled automatically in CI/test environments and in editable development installs by default.
+- Telemetry is disabled automatically when `CI=true` is set or `IS_TESTING=true` is set, and in editable development installs by default. Events that are sent from other CI providers (TeamCity, CodeBuild, Bitbucket Pipelines, Jenkins) are tagged with `isRunningInCi=true` so they can be filtered downstream.
+- The anonymous user identifier is stored in `~/.promptfoo/promptfoo.yaml` for cross-tool correlation with [Promptfoo](https://www.promptfoo.dev/). Existing IDs from `~/.modelaudit/user_config.json` are migrated on first run after upgrade.
 
 Opt out explicitly with either environment variable:
 

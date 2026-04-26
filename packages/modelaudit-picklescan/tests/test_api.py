@@ -964,6 +964,40 @@ def test_scan_bytes_marks_global_pytorch_storage_persistent_id_import_reference(
     assert report.notices == ()
 
 
+def test_scan_bytes_marks_each_pytorch_storage_persistent_id_import_reference() -> None:
+    def storage_persistent_id(name: str, key: str, terminator: bytes) -> bytes:
+        return (
+            b"("
+            + _short_binunicode(b"storage")
+            + _short_binunicode(b"torch")
+            + _short_binunicode(name.encode())
+            + b"\x93"
+            + _short_binunicode(key.encode())
+            + _short_binunicode(b"cpu")
+            + b"K\x01tQ"
+            + terminator
+        )
+
+    storage_names = [f"Synthetic{index}Storage" for index in range(33)]
+    payload = b"\x80\x04" + b"".join(
+        storage_persistent_id(name, str(index), b"." if index == len(storage_names) - 1 else b"0")
+        for index, name in enumerate(storage_names)
+    )
+
+    report = scan_bytes(payload, source="many-pytorch-storage-persistent-ids.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.SUSPICIOUS
+    assert not any(finding.rule_code == "DANGEROUS_CALL_GRAPH_LIMIT" for finding in report.findings)
+    storage_references = [
+        reference
+        for reference in report.metadata["import_references"]
+        if reference.get("module") == "torch" and str(reference.get("name", "")).endswith("Storage")
+    ]
+    assert len(storage_references) == len(storage_names)
+    assert all(reference.get("pytorch_storage_persistent_id") is True for reference in storage_references)
+
+
 def test_scan_bytes_flags_noncanonical_pytorch_storage_persistent_ids() -> None:
     payload = b"\x80\x04(\x8c\x07storage\x94\x8c\x12torch.FloatStorage\x94\x8c\x04evil\x94\x8c\x03cpu\x94K\x01tQ."
 
