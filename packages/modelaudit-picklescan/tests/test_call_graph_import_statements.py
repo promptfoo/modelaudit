@@ -76,6 +76,10 @@ def _clear_call_graph_caches() -> None:
             cache_clear()
 
 
+def _env_without_pythonpath() -> dict[str, str]:
+    return {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+
+
 def _sitebuiltins_helper_instance_call_payload() -> bytes:
     return b"".join([b"\x80\x04", _global_operand("_sitebuiltins", "_Helper"), b")R)R."])
 
@@ -973,6 +977,18 @@ def _has_critical_call_graph_finding_with_sink_prefix(
     )
 
 
+def _run_python_subprocess(args: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        cwd=str(cwd),
+        env=_env_without_pythonpath(),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
 def test_scan_bytes_retains_late_invocation_after_duplicate_metadata_budget() -> None:
     parts = [b"\x80\x04"]
     for _ in range(10_000):
@@ -1061,26 +1077,31 @@ def test_scan_bytes_ignores_uninvoked_nested_function_body_calls(
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
     marker = tmp_path / "nested_body_marker"
-    command = f"{sys.executable} -c \"from pathlib import Path; Path({str(marker)!r}).write_text('owned')\""
+    command = (sys.executable, str(marker))
     module_name = "modelaudit_fp_probe_nested_body"
     (module_dir / f"{module_name}.py").write_text(
-        "import os\n\n"
+        "import subprocess\n\n"
+        "_CMD = \"from pathlib import Path; Path(__import__('sys').argv[1]).write_text('owned')\"\n\n"
         "def harmless_nested_def(value):\n"
         "    def inner():\n"
-        "        os.system(value)\n"
+        "        subprocess.run([value[0], '-c', _CMD, value[1]], check=True)\n"
         "    return value\n\n"
         "def harmless_lambda(value):\n"
-        "    inner = lambda: os.system(value)\n"
+        "    inner = lambda: subprocess.run([value[0], '-c', _CMD, value[1]], check=True)\n"
         "    return value\n",
         encoding="utf-8",
     )
     monkeypatch.syspath_prepend(str(module_dir))
-    payload = _global_call_payload(module_name, function_name, _unicode_operand(command))
+    payload = _global_call_payload(
+        module_name,
+        function_name,
+        _unicode_operand(command[0]) + _unicode_operand(command[1]) + b"\x86",
+    )
 
     report = scan_bytes(payload, source=f"{function_name}-nested-body-clean.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
-    assert not _has_critical_call_graph_finding(report, module_name, function_name, "os.system")
+    assert not _has_critical_call_graph_finding(report, module_name, function_name, "subprocess.run")
     child_code = """
 import pickle
 import sys
@@ -1089,23 +1110,15 @@ from pathlib import Path
 module_dir = Path(sys.argv[1])
 marker = Path(sys.argv[2])
 payload = bytes.fromhex(sys.argv[3])
-expected = sys.argv[4]
 
 sys.path.insert(0, str(module_dir))
-result = pickle.loads(payload)
-if result != expected:
-    raise SystemExit(f"unexpected result: {result!r}")
+pickle.loads(payload)
 if marker.exists():
     raise SystemExit("nested body unexpectedly executed")
 """
-    result = subprocess.run(
-        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), command],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    result = _run_python_subprocess(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
+        cwd=tmp_path.parent,
     )
     assert result.returncode == 0, result.stderr
 
@@ -1155,14 +1168,9 @@ if getattr(result, "value", None) != "safe":
 if marker.exists():
     raise SystemExit("NEWOBJ unexpectedly executed __init__")
 """
-    result = subprocess.run(
+    result = _run_python_subprocess(
         [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
-        cwd=str(tmp_path.parent),
-        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
+        cwd=tmp_path.parent,
     )
     assert result.returncode == 0, result.stderr
 
@@ -3019,7 +3027,7 @@ if marker.read_text() != marker_content:
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("collections", "OrderedDict", b"h\x00"),
-            "[(('owned-key', 'owned-value')), 'stop']",
+            "[('owned-key', 'owned-value'), 'stop']",
             "OrderedDict({'owned-key': 'owned-value'})",
         ),
         (

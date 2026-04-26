@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import collections
+import collections.abc
 import copyreg
 import datetime
 import decimal
@@ -36,9 +37,43 @@ from modelaudit_picklescan import (
     scan_file,
 )
 
-EXPECTED_SYSTEM_GLOBAL = "nt.system" if os.name == "nt" else "posix.system"
-SYSTEM_GLOBALS = frozenset({"nt.system", "os.system", "posix.system"})
+
+def _expected_system_global() -> str:
+    return "nt.system" if os.name == "nt" else "posix.system"
+
+
+EXPECTED_SYSTEM_GLOBAL = _expected_system_global()
+SYSTEM_GLOBALS = frozenset({"os.system", EXPECTED_SYSTEM_GLOBAL, "nt.system", "posix.system"})
+
+
+@pytest.fixture(autouse=True)
+def _restore_copyreg_dispatch_table() -> collections.abc.Iterator[None]:
+    original_dispatch_table = dict(copyreg.dispatch_table)
+    try:
+        yield
+    finally:
+        copyreg.dispatch_table.clear()
+        copyreg.dispatch_table.update(original_dispatch_table)
+
+
 _PROTOCOL_MUTATION_EVENTS: list[tuple[str, str]] = []
+
+
+@pytest.fixture(autouse=True)
+def _reset_protocol_mutation_events() -> collections.abc.Generator[None, None, None]:
+    _PROTOCOL_MUTATION_EVENTS.clear()
+    yield
+    _PROTOCOL_MUTATION_EVENTS.clear()
+
+
+@pytest.fixture(autouse=True)
+def _restore_warnings_filters() -> collections.abc.Generator[None, None, None]:
+    original_filters = list(warnings.filters)
+    try:
+        yield
+    finally:
+        mutable_filters = cast(list[object], warnings.filters)
+        mutable_filters[:] = original_filters
 
 
 class ProtocolMutationTarget:
@@ -693,28 +728,22 @@ def test_scan_bytes_escalates_copyreg_extension_reduce() -> None:
 
 def test_scan_bytes_blocks_operator_setitem_copyreg_dispatch_table_poisoning() -> None:
     payload = b"\x80\x02coperator\nsetitem\nccopyreg\ndispatch_table\ncdecimal\nDecimal\ncbuiltins\nstr\n\x87R."
-    original_dispatch_table = dict(copyreg.dispatch_table)
+    copyreg.dispatch_table.pop(decimal.Decimal, None)
 
-    try:
-        copyreg.dispatch_table.pop(decimal.Decimal, None)
+    report = scan_bytes(payload, source="operator-setitem-copyreg-dispatch-table.pkl")
 
-        report = scan_bytes(payload, source="operator-setitem-copyreg-dispatch-table.pkl")
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert decimal.Decimal not in copyreg.dispatch_table
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == "operator.setitem"
+        for finding in report.findings
+    )
 
-        assert report.status == ScanStatus.COMPLETE
-        assert report.verdict == SafetyVerdict.MALICIOUS
-        assert decimal.Decimal not in copyreg.dispatch_table
-        assert any(
-            finding.rule_code == "DANGEROUS_CALL"
-            and finding.severity == Severity.CRITICAL
-            and finding.details.get("import_reference") == "operator.setitem"
-            for finding in report.findings
-        )
-
-        assert pickle.loads(payload) is None
-        assert copyreg.dispatch_table.get(decimal.Decimal) is str
-    finally:
-        copyreg.dispatch_table.clear()
-        copyreg.dispatch_table.update(original_dispatch_table)
+    assert pickle.loads(payload) is None
+    assert copyreg.dispatch_table.get(decimal.Decimal) is str
 
 
 @pytest.mark.parametrize(
@@ -2327,26 +2356,20 @@ def test_scan_bytes_detects_logging_capture_warnings_diagnostic_reroute() -> Non
     ],
 )
 def test_scan_bytes_detects_warnings_filter_suppression(payload: bytes, expected_reference: str) -> None:
-    original_filters = list(warnings.filters)
+    warnings.resetwarnings()
+    report = scan_bytes(payload, source=f"{expected_reference}.pkl")
 
-    try:
-        warnings.resetwarnings()
-        report = scan_bytes(payload, source=f"{expected_reference}.pkl")
-
-        assert report.status == ScanStatus.COMPLETE
-        assert report.verdict == SafetyVerdict.MALICIOUS
-        assert warnings.filters == []
-        assert any(
-            finding.rule_code == "DANGEROUS_CALL"
-            and finding.severity == Severity.CRITICAL
-            and finding.details.get("import_reference") == expected_reference
-            for finding in report.findings
-        )
-        assert pickle.loads(payload) is None
-        assert warnings.filters[0][0] == "ignore"
-    finally:
-        mutable_filters = cast(list[object], warnings.filters)
-        mutable_filters[:] = original_filters
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert warnings.filters == []
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.severity == Severity.CRITICAL
+        and finding.details.get("import_reference") == expected_reference
+        for finding in report.findings
+    )
+    assert pickle.loads(payload) is None
+    assert warnings.filters[0][0] == "ignore"
 
 
 def test_scan_bytes_detects_warnings_resetwarnings_policy_erasure() -> None:

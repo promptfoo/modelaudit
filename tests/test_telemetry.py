@@ -22,24 +22,24 @@ from modelaudit.telemetry import (
     record_scan_started,
 )
 
-_NO_CI_ENV = {
-    "CI": "",
-    "GITHUB_ACTIONS": "",
-    "TRAVIS": "",
-    "CIRCLECI": "",
-    "JENKINS": "",
-    "GITLAB_CI": "",
-    "APPVEYOR": "",
-    "CODEBUILD_BUILD_ID": "",
-    "TF_BUILD": "",
-    "BITBUCKET_COMMIT": "",
-    "BUDDY": "",
-    "BUILDKITE": "",
-    "TEAMCITY_VERSION": "",
-    "IS_TESTING": "",
-    "PROMPTFOO_DISABLE_TELEMETRY": "",
-    "NO_ANALYTICS": "",
-}
+_NO_CI_ENV = (
+    "CI",
+    "GITHUB_ACTIONS",
+    "TRAVIS",
+    "CIRCLECI",
+    "JENKINS",
+    "GITLAB_CI",
+    "APPVEYOR",
+    "CODEBUILD_BUILD_ID",
+    "TF_BUILD",
+    "BITBUCKET_COMMIT",
+    "BUDDY",
+    "BUILDKITE",
+    "TEAMCITY_VERSION",
+    "IS_TESTING",
+    "PROMPTFOO_DISABLE_TELEMETRY",
+    "NO_ANALYTICS",
+)
 
 
 class TestUserConfig:
@@ -289,7 +289,7 @@ class TestTelemetryClient:
             patch("modelaudit.telemetry.Posthog", return_value=mock_posthog),
             patch.dict(
                 os.environ,
-                _NO_CI_ENV,
+                dict.fromkeys(_NO_CI_ENV, ""),
                 clear=False,
             ),
         ):
@@ -317,7 +317,7 @@ class TestTelemetryClient:
             patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
             patch("modelaudit.telemetry.POSTHOG_AVAILABLE", True),
             patch("modelaudit.telemetry.Posthog", return_value=mock_posthog),
-            patch.dict(os.environ, _NO_CI_ENV, clear=False),
+            patch.dict(os.environ, dict.fromkeys(_NO_CI_ENV, ""), clear=False),
         ):
             home = Path(temp_dir)
             promptfoo_config_file = home / ".promptfoo" / "promptfoo.yaml"
@@ -341,7 +341,7 @@ class TestTelemetryClient:
             patch("modelaudit.telemetry.Path.home") as mock_home,
             patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
             patch("modelaudit.telemetry.POSTHOG_AVAILABLE", False),
-            patch.dict(os.environ, {**_NO_CI_ENV, "GITHUB_ACTIONS": "true"}, clear=False),
+            patch.dict(os.environ, {**dict.fromkeys(_NO_CI_ENV, ""), "GITHUB_ACTIONS": "true"}, clear=False),
         ):
             mock_home.return_value = Path(temp_dir)
             client = TelemetryClient()
@@ -370,7 +370,7 @@ class TestTelemetryClient:
             patch("modelaudit.telemetry.Path.home") as mock_home,
             patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
             patch("modelaudit.telemetry.POSTHOG_AVAILABLE", False),
-            patch.dict(os.environ, {**_NO_CI_ENV, env_var: value}, clear=False),
+            patch.dict(os.environ, {**dict.fromkeys(_NO_CI_ENV, ""), env_var: value}, clear=False),
         ):
             mock_home.return_value = Path(temp_dir)
             client = TelemetryClient()
@@ -501,14 +501,22 @@ class TestTelemetryClient:
             assert "file_identifiers" not in properties
             assert properties["model_references"] == ["a.pkl", "b.zip"]
             canonical_issue = next(
-                detail for detail in properties["issue_details"] if detail["type"] == "pickle_dangerous_global"
+                (detail for detail in properties["issue_details"] if detail["type"] == "pickle_dangerous_global"),
+                None,
             )
+            assert canonical_issue is not None, "Expected issue detail with type 'pickle_dangerous_global'"
             assert canonical_issue["model_name"] == "a.pkl"
             assert canonical_issue["model_reference"] == "a.pkl"
             missing_location_issue = next(
-                detail
-                for detail in properties["issue_details"]
-                if detail["type"] == "unknown_issue" and detail["location_type"] == "unknown"
+                (
+                    detail
+                    for detail in properties["issue_details"]
+                    if detail["type"] == "unknown_issue" and detail["location_type"] == "unknown"
+                ),
+                None,
+            )
+            assert missing_location_issue is not None, (
+                "Expected issue detail with type 'unknown_issue' and location_type 'unknown'"
             )
             assert missing_location_issue["location_type"] == "unknown"
             assert missing_location_issue["model_name"] is None
