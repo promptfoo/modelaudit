@@ -1077,17 +1077,17 @@ def test_scan_bytes_ignores_uninvoked_nested_function_body_calls(
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
     marker = tmp_path / "nested_body_marker"
-    command = (sys.executable, str(marker))
+    command_args = (sys.executable, str(marker))
     module_name = "modelaudit_fp_probe_nested_body"
     (module_dir / f"{module_name}.py").write_text(
         "import subprocess\n\n"
-        "_CMD = \"from pathlib import Path; Path(__import__('sys').argv[1]).write_text('owned')\"\n\n"
+        "_WRITE_CMD = \"from pathlib import Path; Path(__import__('sys').argv[1]).write_text('owned')\"\n\n"
         "def harmless_nested_def(value):\n"
         "    def inner():\n"
-        "        subprocess.run([value[0], '-c', _CMD, value[1]], check=True)\n"
+        "        subprocess.run([value[0], '-c', _WRITE_CMD, value[1]], check=True)\n"
         "    return value\n\n"
         "def harmless_lambda(value):\n"
-        "    inner = lambda: subprocess.run([value[0], '-c', _CMD, value[1]], check=True)\n"
+        "    inner = lambda: subprocess.run([value[0], '-c', _WRITE_CMD, value[1]], check=True)\n"
         "    return value\n",
         encoding="utf-8",
     )
@@ -1095,7 +1095,7 @@ def test_scan_bytes_ignores_uninvoked_nested_function_body_calls(
     payload = _global_call_payload(
         module_name,
         function_name,
-        _unicode_operand(command[0]) + _unicode_operand(command[1]) + b"\x86",
+        _unicode_operand(command_args[0]) + _unicode_operand(command_args[1]) + b"\x86",
     )
 
     report = scan_bytes(payload, source=f"{function_name}-nested-body-clean.pkl")
