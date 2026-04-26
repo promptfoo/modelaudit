@@ -89,6 +89,29 @@ class TestUserConfig:
             assert config.user_id == legacy_user_id
             assert yaml.safe_load(promptfoo_config_file.read_text())["id"] == legacy_user_id
 
+    def test_user_config_migrates_legacy_id_into_existing_promptfoo_config(self, tmp_path: Path) -> None:
+        """Promptfoo configs without an ID should receive the legacy ID without losing settings."""
+        legacy_user_id = "11111111-2222-4333-8444-555555555555"
+        modelaudit_config_file = tmp_path / ".modelaudit" / "user_config.json"
+        modelaudit_config_file.parent.mkdir()
+        modelaudit_config_file.write_text(json.dumps({"user_id": legacy_user_id}))
+        promptfoo_config_file = tmp_path / ".promptfoo" / "promptfoo.yaml"
+        promptfoo_config_file.parent.mkdir()
+        promptfoo_config_file.write_text(
+            yaml.safe_dump({"cloud": {"apiKey": "test-key"}, "hasHarmfulRedteamConsent": True})
+        )
+
+        with patch("modelaudit.telemetry.Path.home") as mock_home:
+            mock_home.return_value = tmp_path
+            config = UserConfig()
+
+            assert config.user_id == legacy_user_id
+
+        promptfoo_config = yaml.safe_load(promptfoo_config_file.read_text())
+        assert promptfoo_config["id"] == legacy_user_id
+        assert promptfoo_config["cloud"] == {"apiKey": "test-key"}
+        assert promptfoo_config["hasHarmfulRedteamConsent"] is True
+
     def test_user_config_falls_back_when_promptfoo_yaml_is_corrupt(self, tmp_path: Path) -> None:
         """A malformed promptfoo.yaml must not crash; the legacy file is used."""
         promptfoo_config_file = tmp_path / ".promptfoo" / "promptfoo.yaml"
@@ -254,6 +277,18 @@ class TestTelemetryClient:
             patch("modelaudit.telemetry.Path.home") as mock_home,
         ):
             mock_home.return_value = Path(temp_dir)
+            client = TelemetryClient()
+
+            assert client._is_disabled() is True
+
+    def test_promptfoo_truthy_aliases_disable_telemetry(self, tmp_path: Path) -> None:
+        """Promptfoo truthy env aliases should use the same disable path as true/1."""
+        with (
+            patch.dict(os.environ, {"NO_ANALYTICS": "yeppers"}, clear=False),
+            patch("modelaudit.telemetry._IS_DEVELOPMENT", False),
+            patch("modelaudit.telemetry.Path.home") as mock_home,
+        ):
+            mock_home.return_value = tmp_path
             client = TelemetryClient()
 
             assert client._is_disabled() is True
