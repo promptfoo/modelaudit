@@ -123,6 +123,7 @@ When in doubt, we err toward issuing a CVE.
 **In scope:**
 
 - The `modelaudit` Python package published on [PyPI](https://pypi.org/project/modelaudit/).
+- The `modelaudit-picklescan` Python package published on [PyPI](https://pypi.org/project/modelaudit-picklescan/), including its bundled Rust pickle engine.
 - The official Docker images.
 - The GitHub Actions CI/CD workflows in the [modelaudit repository](https://github.com/promptfoo/modelaudit).
 

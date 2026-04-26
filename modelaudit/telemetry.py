@@ -129,6 +129,49 @@ _TELEMETRY_FILELIKE_ISSUE_ID_RE = re.compile(
     r"\.(?:bin|ckpt|gguf|gz|h5|hdf5|json|keras|nemo|onnx|pb|pickle|pkl|pt|pth|safetensors|tar|yaml|yml|zip)$",
     re.IGNORECASE,
 )
+_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "yup", "yeppers"})
+# Vars whose CI providers set a truthy literal ("true"/"1").
+_CI_TRUTHY_ENV_VARS = (
+    "CI",
+    "GITHUB_ACTIONS",
+    "TRAVIS",
+    "CIRCLECI",
+    "GITLAB_CI",
+    "APPVEYOR",
+    "TF_BUILD",
+    "BUILDKITE",
+    "BUDDY",
+)
+# Vars whose CI providers set a marker value (build ID, version, commit SHA),
+# so any non-empty value indicates CI. Promptfoo's upstream `getEnvBool` misses
+# these; we diverge intentionally so analytics filters work in the wild.
+_CI_PRESENCE_ENV_VARS = (
+    "JENKINS",
+    "CODEBUILD_BUILD_ID",
+    "BITBUCKET_COMMIT",
+    "TEAMCITY_VERSION",
+)
+_CI_ENV_VARS = _CI_TRUTHY_ENV_VARS + _CI_PRESENCE_ENV_VARS
+
+
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").lower() in _TRUE_ENV_VALUES
+
+
+def _env_present(name: str) -> bool:
+    return bool(os.getenv(name, "").strip())
+
+
+def _is_running_in_ci() -> bool:
+    """Detect CI for the `isRunningInCi` telemetry property.
+
+    Mirrors Promptfoo's variable list but uses presence-based detection for
+    marker-style vars (TEAMCITY_VERSION, CODEBUILD_BUILD_ID, BITBUCKET_COMMIT,
+    JENKINS) that providers set to non-truthy values like build IDs.
+    """
+    if any(_env_truthy(name) for name in _CI_TRUTHY_ENV_VARS):
+        return True
+    return any(_env_present(name) for name in _CI_PRESENCE_ENV_VARS)
 
 
 def _is_development_install() -> bool:
@@ -137,28 +180,20 @@ def _is_development_install() -> bool:
     This prevents polluting production analytics with development test data.
     Uses importlib.metadata to properly detect editable installs.
     See: https://stackoverflow.com/questions/43348746/how-to-detect-if-module-is-installed-in-editable-mode
-
-    Returns True if:
-    - Package is installed in editable mode (pip install -e)
-    - MODELAUDIT_DEV=1 is explicitly set
     """
-    # Explicit dev mode flag
-    if os.getenv("MODELAUDIT_DEV", "").lower() in ("1", "true", "yes"):
+    if _env_truthy("MODELAUDIT_DEV"):
         return True
 
-    # Check if installed in editable mode using importlib.metadata
     try:
         from importlib.metadata import Distribution
 
         dist = Distribution.from_name("modelaudit")
-        # Modern pip (21.3+) uses direct_url.json for editable installs
         direct_url_text = dist.read_text("direct_url.json")
         if direct_url_text:
             direct_url = json.loads(direct_url_text)
             if direct_url.get("dir_info", {}).get("editable", False):
                 return True
     except Exception as exc:
-        # Package not installed or metadata not available - not editable.
         logger.debug("Unable to inspect editable install metadata: %s", exc)
 
     return False
@@ -166,6 +201,18 @@ def _is_development_install() -> bool:
 
 # Cache the development check at module load time
 _IS_DEVELOPMENT = _is_development_install()
+
+# Env vars that gate the telemetry client's behavior. Changes here invalidate
+# the cached client; `_CI_PRESENCE_ENV_VARS` are excluded because they only
+# tag events with `isRunningInCi` and don't change disable state.
+_BEHAVIOR_GATING_ENV_VARS = (
+    "MODELAUDIT_TELEMETRY_DEV",
+    "PROMPTFOO_DISABLE_TELEMETRY",
+    "NO_ANALYTICS",
+    "CI",
+    "IS_TESTING",
+    "MODELAUDIT_TELEMETRY_FLUSH_IMMEDIATELY",
+)
 
 
 def _runtime_signature() -> tuple[Any, ...]:
@@ -176,12 +223,7 @@ def _runtime_signature() -> tuple[Any, ...]:
         POSTHOG_PROJECT_KEY,
         POSTHOG_HOST,
         _IS_DEVELOPMENT,
-        os.getenv("MODELAUDIT_TELEMETRY_DEV", "").lower(),
-        os.getenv("PROMPTFOO_DISABLE_TELEMETRY", "").lower(),
-        os.getenv("NO_ANALYTICS", "").lower(),
-        os.getenv("CI", "").lower(),
-        os.getenv("IS_TESTING", "").lower(),
-        os.getenv("MODELAUDIT_TELEMETRY_FLUSH_IMMEDIATELY", "").lower(),
+        *(_env_truthy(name) for name in _BEHAVIOR_GATING_ENV_VARS),
     )
 
 
@@ -191,8 +233,10 @@ class UserConfig:
     def __init__(self):
         self._config_dir = Path.home() / ".modelaudit"
         self._config_file = self._config_dir / "user_config.json"
+        self._promptfoo_config_file = Path.home() / ".promptfoo" / "promptfoo.yaml"
         self._config = self._load_config()
-        self._promptfoo_user_id: str | None = None
+        self._promptfoo_config_cache: dict[str, Any] | None = None
+        self._promptfoo_config_loaded = False
 
     def _load_config(self) -> dict[str, Any]:
         """Load user configuration from file."""
@@ -216,43 +260,79 @@ class UserConfig:
         except OSError as e:
             logger.debug(f"Failed to save user config: {e}")
 
-    def _get_promptfoo_user_id(self) -> str | None:
-        """Try to read Promptfoo's user ID for cross-tool correlation.
+    def _load_promptfoo_config(self) -> dict[str, Any] | None:
+        """Load Promptfoo's global config once, caching the result.
 
-        This allows correlating ModelAudit usage with Promptfoo usage for the same user.
+        Returns the loaded mapping (possibly empty if the file is absent), or
+        None if the file is unreadable or contains non-mapping data.
         """
-        if self._promptfoo_user_id is not None:
-            return self._promptfoo_user_id
+        if self._promptfoo_config_loaded:
+            return self._promptfoo_config_cache
 
-        promptfoo_config = Path.home() / ".promptfoo" / "promptfoo.yaml"
-        if promptfoo_config.exists():
-            try:
-                with open(promptfoo_config) as f:
-                    config = yaml.safe_load(f)
-                if isinstance(config, dict) and "id" in config:
-                    self._promptfoo_user_id = str(config["id"])
-                    return self._promptfoo_user_id
-            except (OSError, yaml.YAMLError) as exc:
-                logger.debug("Unable to read promptfoo telemetry config: %s", exc)
-        return None
+        self._promptfoo_config_loaded = True
+
+        if not self._promptfoo_config_file.exists():
+            self._promptfoo_config_cache = {}
+            return self._promptfoo_config_cache
+
+        try:
+            with open(self._promptfoo_config_file) as f:
+                loaded = yaml.safe_load(f)
+        except (OSError, yaml.YAMLError) as exc:
+            logger.debug("Unable to read promptfoo telemetry config: %s", exc)
+            return None
+
+        if loaded is None:
+            self._promptfoo_config_cache = {}
+        elif isinstance(loaded, dict):
+            self._promptfoo_config_cache = cast(dict[str, Any], loaded)
+        else:
+            logger.debug("Ignoring non-object promptfoo telemetry config")
+            return None
+
+        return self._promptfoo_config_cache
+
+    def _persist_user_id_to_promptfoo(self, user_id: str, config: dict[str, Any]) -> bool:
+        """Write user_id into promptfoo.yaml using auth.config's hardened atomic writer.
+
+        Skips the disk write when the file already holds the same id.
+        """
+        if config.get("id") == user_id:
+            self._promptfoo_config_cache = config
+            return True
+
+        try:
+            from .auth.config import _write_yaml_atomic
+
+            self._promptfoo_config_file.parent.mkdir(parents=True, exist_ok=True)
+            updated = {**config, "id": user_id}
+            _write_yaml_atomic(self._promptfoo_config_file, updated)
+        except (OSError, ImportError) as exc:
+            logger.debug("Unable to write promptfoo telemetry config: %s", exc)
+            return False
+
+        self._promptfoo_config_cache = updated
+        return True
 
     @property
     def user_id(self) -> str:
-        """Get or generate user ID.
+        """Return a stable identifier, preferring Promptfoo's for cross-tool correlation."""
+        promptfoo_config = self._load_promptfoo_config()
+        if promptfoo_config is not None:
+            existing = promptfoo_config.get("id")
+            if isinstance(existing, str) and existing:
+                return existing
 
-        Prefers Promptfoo's user ID if available for cross-tool correlation,
-        otherwise uses ModelAudit's own user ID.
-        """
-        # Try Promptfoo's user ID first for correlation
-        promptfoo_id = self._get_promptfoo_user_id()
-        if promptfoo_id:
-            return promptfoo_id
+        legacy = self._config.get("user_id")
+        user_id = legacy if isinstance(legacy, str) and legacy else str(uuid.uuid4())
 
-        # Fall back to ModelAudit's own user ID
-        if "user_id" not in self._config:
-            self._config["user_id"] = str(uuid.uuid4())
+        if promptfoo_config is not None and self._persist_user_id_to_promptfoo(user_id, promptfoo_config):
+            return user_id
+
+        if self._config.get("user_id") != user_id:
+            self._config["user_id"] = user_id
             self._save_config()
-        return str(self._config["user_id"])
+        return user_id
 
     @property
     def email(self) -> str | None:
@@ -297,32 +377,21 @@ class TelemetryClient:
         self._session_id = str(uuid.uuid4())
         self._telemetry_disabled_recorded = False
         self._atexit_flush_registered = False
-        self._flush_immediately = os.getenv("MODELAUDIT_TELEMETRY_FLUSH_IMMEDIATELY", "").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
+        self._flush_immediately = _env_truthy("MODELAUDIT_TELEMETRY_FLUSH_IMMEDIATELY")
 
         self._ensure_posthog_client()
 
     def _is_disabled(self) -> bool:
         """Check if telemetry is disabled via environment variables or user config."""
-        # Development installs don't send telemetry by default (prevents polluting analytics)
-        # Allow explicit opt-in during development with MODELAUDIT_TELEMETRY_DEV=1
-        if _IS_DEVELOPMENT and os.getenv("MODELAUDIT_TELEMETRY_DEV", "").lower() not in ("1", "true", "yes"):
+        # Editable installs are off by default; MODELAUDIT_TELEMETRY_DEV=1 opts back in.
+        if _IS_DEVELOPMENT and not _env_truthy("MODELAUDIT_TELEMETRY_DEV"):
             return True
 
-        # Check environment variables - use Promptfoo's standard env var
-        if os.getenv("PROMPTFOO_DISABLE_TELEMETRY", "").lower() in ("1", "true", "yes"):
-            return True
-        if os.getenv("NO_ANALYTICS", "").lower() in ("1", "true", "yes"):
-            return True
-        if os.getenv("CI", "").lower() in ("1", "true", "yes"):
-            return True
-        if os.getenv("IS_TESTING", "").lower() in ("1", "true", "yes"):
+        # `CI` here is the universal opt-out flag. The broader `_is_running_in_ci()`
+        # only tags events; events from marker-only providers still get sent.
+        if any(_env_truthy(name) for name in ("PROMPTFOO_DISABLE_TELEMETRY", "NO_ANALYTICS", "CI", "IS_TESTING")):
             return True
 
-        # Check user configuration - defaults to enabled (opt-out model)
         return not self._user_config.telemetry_enabled
 
     def _identify_user(self) -> None:
@@ -340,6 +409,7 @@ class TelemetryClient:
                 "modelaudit_version": __version__,
                 "platform": os.name,
                 "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+                "isRunningInCi": _is_running_in_ci(),
             }
 
             # PostHog v7 uses set() instead of identify()
@@ -519,6 +589,7 @@ class TelemetryClient:
             "user_id": self._user_config.user_id,
             "platform": sys.platform,
             "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            "isRunningInCi": _is_running_in_ci(),
         }
 
         # Send to PostHog
