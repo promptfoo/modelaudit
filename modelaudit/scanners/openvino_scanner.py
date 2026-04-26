@@ -258,6 +258,21 @@ class OpenVinoScanner(BaseScanner):
                 rule_code="S701",
             )
 
+        if not HAS_DEFUSEDXML:  # pragma: no cover - defusedxml is a required dependency
+            result.add_check(
+                name="XML Parser Security Check",
+                passed=False,
+                message="Using unsafe XML parser - defusedxml not available",
+                severity=IssueSeverity.WARNING,
+                location=path,
+                why=(
+                    "defusedxml is not installed. The standard XML parser may be vulnerable to "
+                    "XML entity expansion attacks (e.g. 'billion laughs'). "
+                    "Install defusedxml for better security."
+                ),
+                rule_code="S902",
+            )
+
         try:
             tree = DefusedET.parse(path)
             root = tree.getroot()

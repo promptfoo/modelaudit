@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- **jinja2_template_scanner**: Disable sandbox template execution by default (`enable_sandbox_test` now defaults to `false`). Jinja2's `SandboxedEnvironment` can be escaped by crafted payloads in malicious model files, potentially allowing code execution during a scan. Users who need sandbox testing can opt in explicitly by setting `enable_sandbox_test: true` in scanner config.
+- **openvino_scanner**: Emit an explicit `XML Parser Security Check` warning when `defusedxml` is unavailable and the scanner falls back to the standard-library XML parser, which is vulnerable to XML entity expansion attacks. This brings the OpenVINO scanner in line with the PMML scanner's existing behaviour.
+
 ## [0.2.40](https://github.com/promptfoo/modelaudit/compare/v0.2.39...v0.2.40) (2026-04-17)
 
 ### Bug Fixes
