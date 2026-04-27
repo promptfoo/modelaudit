@@ -179,19 +179,21 @@ jobs:
 
   docker-ci-success:
     name: Docker CI Success
-    needs: [build-test-lightweight]
-    # Don't require full image test to pass since it's conditional
+    needs: [build-test-lightweight, build-test-full]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check if required jobs succeeded
         run: |
           LIGHTWEIGHT_RESULT="${{ needs.build-test-lightweight.result }}"
+          FULL_RESULT="${{ needs.build-test-full.result }}"
           echo "Lightweight Docker build result: $LIGHTWEIGHT_RESULT"
+          echo "Full Docker build result: $FULL_RESULT"
 
           # Success or skipped are both acceptable
           # (skipped means the path filters determined the job wasn't needed)
-          if [[ "$LIGHTWEIGHT_RESULT" == "success" || "$LIGHTWEIGHT_RESULT" == "skipped" ]]; then
+          if [[ ("$LIGHTWEIGHT_RESULT" == "success" || "$LIGHTWEIGHT_RESULT" == "skipped") && \
+                ("$FULL_RESULT" == "success" || "$FULL_RESULT" == "skipped") ]]; then
             echo "Docker CI checks passed (or were skipped due to path filters)!"
             exit 0
           else
