@@ -836,10 +836,16 @@ jobs:
         needs.publish-pypi.result == 'success' &&
         (
           needs.release-please.outputs.picklescan_release_created != 'true' ||
-          needs.publish-picklescan-pypi.result == 'success'
+          needs.verify-picklescan-pypi.result == 'success'
         )
       }}
-    needs: [publish-pypi, publish-picklescan-pypi, release-please]
+    needs:
+      [
+        publish-pypi,
+        publish-picklescan-pypi,
+        release-please,
+        verify-picklescan-pypi,
+      ]
     runs-on: ubuntu-latest
     permissions:
       contents: read
