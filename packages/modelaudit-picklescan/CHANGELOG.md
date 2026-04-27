@@ -5,6 +5,20 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.2...modelaudit-picklescan-v0.1.3) (2026-04-27)
+
+### Bug Fixes
+
+- **ci:** skip POSIX proof cases on Windows ([#1072](https://github.com/promptfoo/modelaudit/issues/1072)) ([bfa17a3](https://github.com/promptfoo/modelaudit/commit/bfa17a3e152cd178c5d1fdbfec55dd3f124778ef))
+- harden picklescan call graph RCE detection ([#1061](https://github.com/promptfoo/modelaudit/issues/1061)) ([19c4fc4](https://github.com/promptfoo/modelaudit/commit/19c4fc487b4758462ac2107a3f3e59463e5d888b))
+- harden picklescan stdlib callable detection ([f0f57b4](https://github.com/promptfoo/modelaudit/commit/f0f57b47f3355bea008a48779dbd856e6f550ec7))
+- improve test isolation, reduce duplication, and fix command injection risk in test suite ([#1078](https://github.com/promptfoo/modelaudit/issues/1078)) ([3867c83](https://github.com/promptfoo/modelaudit/commit/3867c83b2dd0d5ab6a83b650c28d64122a675dea))
+- **picklescan:** avoid call-graph false positives for PyTorch storage IDs ([#1069](https://github.com/promptfoo/modelaudit/issues/1069)) ([e75ed24](https://github.com/promptfoo/modelaudit/commit/e75ed249948558864d8f56882a02f1327323205d))
+
+### Documentation
+
+- improve PyPI READMEs ([#1057](https://github.com/promptfoo/modelaudit/issues/1057)) ([1cfb27d](https://github.com/promptfoo/modelaudit/commit/1cfb27de814125470d1e1a38eec03a83d79ff3d9))
+
 ## [0.1.2](https://github.com/promptfoo/modelaudit/releases/tag/modelaudit-picklescan-v0.1.2) (2026-04-17)
 
 ### Bug Fixes
