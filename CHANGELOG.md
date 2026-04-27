@@ -7,10 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.42](https://github.com/promptfoo/modelaudit/compare/v0.2.41...v0.2.42) (2026-04-27)
 
-
 ### Bug Fixes
 
-* require latest picklescan release ([a0237a7](https://github.com/promptfoo/modelaudit/commit/a0237a7658c0885848eea8d51b792ccfad45cc1c))
+- require latest picklescan release ([a0237a7](https://github.com/promptfoo/modelaudit/commit/a0237a7658c0885848eea8d51b792ccfad45cc1c))
 
 ## [0.2.41](https://github.com/promptfoo/modelaudit/compare/v0.2.40...v0.2.41) (2026-04-27)
 
