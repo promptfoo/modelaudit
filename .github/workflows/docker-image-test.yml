@@ -168,7 +168,7 @@ jobs:
       - name: Verify ML dependencies in full image
         run: |
           # Test that ML dependencies are available
-          docker run --rm modelaudit:full python -c "import tensorflow, torch, onnx; print('All ML dependencies available')" || echo "Warning: Some ML dependencies missing"
+          docker run --rm modelaudit:full python -c "import tensorflow, torch, onnx; print('All ML dependencies available')"
 
       - name: Test full container with ML model scan
         run: |
