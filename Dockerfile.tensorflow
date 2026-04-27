@@ -1,18 +1,20 @@
-FROM python:3.13-slim@sha256:a0779d7c12fc20be6ec6b4ddc901a4fd7657b8a6bc9def9d3fde89ed5efe0a3d
+FROM python:3.12-slim@sha256:46cb7cc2877e60fbd5e21a9ae6115c30ace7a077b9f8772da879e4590c18c2e3
 
 WORKDIR /app
 
 # Pull in current Debian security fixes from the configured apt sources.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy only necessary files for installation
 COPY pyproject.toml README.md ./
+COPY requirements-tensorflow.txt ./
 COPY modelaudit ./modelaudit
 
-# Install the application with TensorFlow extras
-RUN pip install --no-cache-dir ".[tensorflow]"
+# Install the application with TensorFlow extras using pinned constraints
+RUN pip install --no-cache-dir -c requirements-tensorflow.txt ".[tensorflow]"
 
 # Create a non-root user
 ARG UID=10001

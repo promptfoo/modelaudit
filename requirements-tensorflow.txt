@@ -1,0 +1,4 @@
+# Pinned version constraints for the TensorFlow Docker image.
+# Used as pip constraints: pip install -c requirements-tensorflow.txt ".[tensorflow]"
+# Update this pin when updating the TensorFlow extra in pyproject.toml.
+tensorflow==2.21.0

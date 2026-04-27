@@ -26,6 +26,10 @@ from tensorflow.core.framework import tensor_shape_pb2 as tensorflow_dot_core_do
 from tensorflow.core.framework import types_pb2 as tensorflow_dot_core_dot_framework_dot_types__pb2
 
 # Keep generated dependency imports for descriptor registration side effects.
+# Reference aliases so static analysis preserves these side-effect imports.
+id(tensorflow_dot_core_dot_framework_dot_tensor__pb2)
+id(tensorflow_dot_core_dot_framework_dot_tensor__shape__pb2)
+id(tensorflow_dot_core_dot_framework_dot_types__pb2)
 del tensorflow_dot_core_dot_framework_dot_tensor__pb2
 del tensorflow_dot_core_dot_framework_dot_tensor__shape__pb2
 del tensorflow_dot_core_dot_framework_dot_types__pb2
