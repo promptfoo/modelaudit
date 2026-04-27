@@ -22,6 +22,7 @@ from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdic
 
 _RUST_STREAM_READ_CHUNK_SIZE = 1024 * 1024
 _PYTORCH_ZIP_METADATA_BASENAMES = frozenset({"version", "byteorder"})
+_PYTORCH_CHECKPOINT_SUFFIXES = frozenset({".pt", ".pth", ".ckpt"})
 _PICKLE_MEMBER_SUFFIXES = (".pkl", ".pickle")
 _PICKLE_BINARY_PROTOCOL_PREFIXES = (b"\x80\x01", b"\x80\x02", b"\x80\x03", b"\x80\x04", b"\x80\x05")
 _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
@@ -186,6 +187,8 @@ class PickleScanner:
                 container_report = self._scan_pytorch_zip_file(path_obj, source=source, size=size)
                 if container_report is not None:
                     return container_report
+                if _has_pytorch_checkpoint_suffix(path_obj):
+                    return _unsupported_zip_report(source=source, size=size)
             with path_obj.open("rb") as handle:
                 return self.scan_stream(handle, source=source, size=size)
         except OSError as error:
@@ -844,6 +847,37 @@ def _io_error_report(
             raw_scan_complete=False,
             opcode_scan_complete=False,
         ),
+    )
+
+
+def _has_pytorch_checkpoint_suffix(path: Path) -> bool:
+    return path.suffix.lower() in _PYTORCH_CHECKPOINT_SUFFIXES
+
+
+def _unsupported_zip_report(*, source: str, size: int) -> PickleReport:
+    return PickleReport(
+        source=source,
+        status=ScanStatus.ERROR,
+        verdict=SafetyVerdict.UNKNOWN,
+        errors=(
+            ScanError(
+                message="ZIP archive is not a PyTorch checkpoint and cannot be scanned as a pickle stream",
+                category="unsupported_zip_container",
+                location=source,
+                exception_type="ValueError",
+                details={"analysis_incomplete": True},
+            ),
+        ),
+        coverage=CoverageSummary(
+            bytes_scanned=0,
+            bytes_total=size,
+            raw_scan_complete=False,
+            opcode_scan_complete=False,
+        ),
+        metadata={
+            "container_type": "zip",
+            "analysis_incomplete": True,
+        },
     )
 
 

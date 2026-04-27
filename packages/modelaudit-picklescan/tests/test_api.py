@@ -1185,6 +1185,7 @@ def test_scan_file_does_not_treat_suffix_only_zip_as_pytorch(tmp_path: Path) -> 
     report = scan_file(archive_path)
 
     assert report.metadata.get("container_type") != "pytorch_zip"
+    assert report.errors[0].category == "unsupported_zip_container"
     assert report.status == ScanStatus.ERROR
     assert report.verdict == SafetyVerdict.UNKNOWN
 
