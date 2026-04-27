@@ -734,6 +734,293 @@ jobs:
           print-hash: true
           attestations: true
 
+  verify-picklescan-pypi:
+    if: needs.release-please.outputs.picklescan_release_created == 'true'
+    needs: [publish-picklescan-pypi, release-please]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      EXPECTED_VERSION: ${{ needs.release-please.outputs.picklescan_version }}
+    steps:
+      - name: Wait for modelaudit-picklescan files on PyPI
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.request
+
+          version = os.environ["EXPECTED_VERSION"]
+          expected_files = {
+              f"modelaudit_picklescan-{version}-cp310-abi3-macosx_10_12_x86_64.whl",
+              f"modelaudit_picklescan-{version}-cp310-abi3-macosx_11_0_arm64.whl",
+              f"modelaudit_picklescan-{version}-cp310-abi3-manylinux_2_28_aarch64.whl",
+              f"modelaudit_picklescan-{version}-cp310-abi3-manylinux_2_28_x86_64.whl",
+              f"modelaudit_picklescan-{version}-cp310-abi3-win_amd64.whl",
+              f"modelaudit_picklescan-{version}.tar.gz",
+          }
+          url = f"https://pypi.org/pypi/modelaudit-picklescan/{version}/json"
+          deadline = time.monotonic() + 600
+          last_status = "not checked"
+
+          while time.monotonic() < deadline:
+              try:
+                  with urllib.request.urlopen(url, timeout=20) as response:
+                      payload = json.load(response)
+                  filenames = {entry["filename"] for entry in payload.get("urls", [])}
+                  missing = sorted(expected_files - filenames)
+                  info_version = payload.get("info", {}).get("version")
+                  if info_version == version and not missing:
+                      print(f"PyPI has modelaudit-picklescan {version}: {sorted(filenames)}")
+                      break
+                  last_status = f"version={info_version!r}, missing={missing}"
+              except Exception as exc:
+                  last_status = repr(exc)
+              time.sleep(10)
+          else:
+              raise SystemExit(f"Timed out waiting for modelaudit-picklescan {version} on PyPI: {last_status}")
+          PY
+
+      - name: Install published modelaudit-picklescan and smoke test API
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/modelaudit-picklescan-pypi-smoke
+          /tmp/modelaudit-picklescan-pypi-smoke/bin/python -m pip install --upgrade pip
+          /tmp/modelaudit-picklescan-pypi-smoke/bin/python -m pip install \
+            --no-cache-dir \
+            --retries 10 \
+            --timeout 60 \
+            "modelaudit-picklescan==${EXPECTED_VERSION}"
+
+          /tmp/modelaudit-picklescan-pypi-smoke/bin/python - <<'PY'
+          import importlib.metadata as md
+          import importlib.util
+          import os
+          import pickle
+
+          import modelaudit_picklescan
+
+          expected_version = os.environ["EXPECTED_VERSION"]
+          installed_version = md.version("modelaudit-picklescan")
+          if installed_version != expected_version:
+              raise SystemExit(f"Expected modelaudit-picklescan {expected_version}, got {installed_version}")
+          if importlib.util.find_spec("modelaudit_picklescan._rust") is None:
+              raise SystemExit("modelaudit_picklescan._rust extension was not installed")
+
+          clean_report = modelaudit_picklescan.scan_bytes(pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+          if clean_report.status.value != "complete" or clean_report.verdict.value != "clean":
+              raise SystemExit(f"Expected clean complete report, got {clean_report}")
+
+          class MaliciousPayload:
+              def __reduce__(self):
+                  return (os.system, ("echo modelaudit-picklescan-smoke",))
+
+          malicious_report = modelaudit_picklescan.scan_bytes(
+              pickle.dumps(MaliciousPayload(), protocol=4),
+              source="malicious.pkl",
+          )
+          if malicious_report.status.value != "complete" or malicious_report.verdict.value != "malicious":
+              raise SystemExit(f"Expected malicious complete report, got {malicious_report}")
+          if not any(finding.rule_code == "DANGEROUS_CALL" for finding in malicious_report.findings):
+              raise SystemExit(f"Expected DANGEROUS_CALL finding, got {malicious_report.findings}")
+
+          print("Published modelaudit-picklescan API smoke test passed.")
+          PY
+
+  verify-pypi:
+    if: >-
+      ${{
+        always() &&
+        needs.release-please.outputs.release_created == 'true' &&
+        needs.publish-pypi.result == 'success' &&
+        (
+          needs.release-please.outputs.picklescan_release_created != 'true' ||
+          needs.publish-picklescan-pypi.result == 'success'
+        )
+      }}
+    needs: [publish-pypi, publish-picklescan-pypi, release-please]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      EXPECTED_VERSION: ${{ needs.release-please.outputs.version }}
+      EXPECTED_PICKLESCAN_VERSION: ${{ needs.release-please.outputs.picklescan_version }}
+      PICKLESCAN_RELEASE_CREATED: ${{ needs.release-please.outputs.picklescan_release_created }}
+      PROMPTFOO_DISABLE_TELEMETRY: "1"
+    steps:
+      - name: Wait for modelaudit files on PyPI
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.request
+
+          version = os.environ["EXPECTED_VERSION"]
+          expected_files = {
+              f"modelaudit-{version}-py3-none-any.whl",
+              f"modelaudit-{version}.tar.gz",
+          }
+          url = f"https://pypi.org/pypi/modelaudit/{version}/json"
+          deadline = time.monotonic() + 600
+          last_status = "not checked"
+
+          while time.monotonic() < deadline:
+              try:
+                  with urllib.request.urlopen(url, timeout=20) as response:
+                      payload = json.load(response)
+                  filenames = {entry["filename"] for entry in payload.get("urls", [])}
+                  missing = sorted(expected_files - filenames)
+                  info_version = payload.get("info", {}).get("version")
+                  if info_version == version and not missing:
+                      print(f"PyPI has modelaudit {version}: {sorted(filenames)}")
+                      break
+                  last_status = f"version={info_version!r}, missing={missing}"
+              except Exception as exc:
+                  last_status = repr(exc)
+              time.sleep(10)
+          else:
+              raise SystemExit(f"Timed out waiting for modelaudit {version} on PyPI: {last_status}")
+          PY
+
+      - name: Install published modelaudit and run end-to-end smoke tests
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/modelaudit-pypi-smoke
+          /tmp/modelaudit-pypi-smoke/bin/python -m pip install --upgrade pip
+          /tmp/modelaudit-pypi-smoke/bin/python -m pip install \
+            --no-cache-dir \
+            --retries 10 \
+            --timeout 60 \
+            "modelaudit[all]==${EXPECTED_VERSION}"
+
+          /tmp/modelaudit-pypi-smoke/bin/python - <<'PY'
+          import importlib.metadata as md
+          import json
+          import os
+          import pickle
+          import subprocess
+          import tempfile
+          import zipfile
+          from pathlib import Path
+
+          expected_version = os.environ["EXPECTED_VERSION"]
+          installed_version = md.version("modelaudit")
+          if installed_version != expected_version:
+              raise SystemExit(f"Expected modelaudit {expected_version}, got {installed_version}")
+
+          picklescan_version = md.version("modelaudit-picklescan")
+          expected_picklescan_version = os.environ.get("EXPECTED_PICKLESCAN_VERSION")
+          if os.environ.get("PICKLESCAN_RELEASE_CREATED") == "true" and expected_picklescan_version:
+              if picklescan_version != expected_picklescan_version:
+                  raise SystemExit(
+                      "Expected coordinated picklescan "
+                      f"{expected_picklescan_version}, got {picklescan_version}"
+                  )
+          print(f"Installed modelaudit {installed_version} with modelaudit-picklescan {picklescan_version}.")
+
+          modelaudit = Path("/tmp/modelaudit-pypi-smoke/bin/modelaudit")
+          env = os.environ.copy()
+          env["PROMPTFOO_DISABLE_TELEMETRY"] = "1"
+
+          def run(args: list[str | Path], expected_returncode: int) -> subprocess.CompletedProcess[str]:
+              command = [str(arg) for arg in args]
+              print("$", " ".join(command))
+              completed = subprocess.run(
+                  command,
+                  capture_output=True,
+                  text=True,
+                  env=env,
+                  check=False,
+              )
+              if completed.stdout:
+                  print(completed.stdout)
+              if completed.stderr:
+                  print(completed.stderr)
+              if completed.returncode != expected_returncode:
+                  raise SystemExit(
+                      f"Expected exit {expected_returncode} from {' '.join(command)}, "
+                      f"got {completed.returncode}"
+                  )
+              return completed
+
+          run([modelaudit, "--version"], 0)
+          run([modelaudit, "doctor", "--show-failed"], 0)
+
+          with tempfile.TemporaryDirectory(prefix="modelaudit-pypi-smoke-") as tmpdir:
+              workdir = Path(tmpdir)
+              marker = workdir / "payload-executed"
+              benign = workdir / "benign.pkl"
+              malicious = workdir / "malicious.pkl"
+              malicious_zip = workdir / "malicious.zip"
+
+              with benign.open("wb") as handle:
+                  pickle.dump({"weights": [1.0, 2.0, 3.0], "metadata": {"name": "release-smoke"}}, handle)
+
+              class MaliciousPayload:
+                  def __reduce__(self):
+                      return (os.system, (f"touch {marker}",))
+
+              with malicious.open("wb") as handle:
+                  pickle.dump(MaliciousPayload(), handle, protocol=4)
+              with zipfile.ZipFile(malicious_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                  archive.write(malicious, arcname="malicious.pkl")
+
+              benign_json = workdir / "benign.json"
+              malicious_json = workdir / "malicious.json"
+              zip_json = workdir / "malicious-zip.json"
+              sarif_json = workdir / "malicious.sarif"
+              sbom_json = workdir / "sbom.json"
+
+              run([modelaudit, "scan", benign, "--format", "json", "--output", benign_json, "--no-cache"], 0)
+              run([modelaudit, "scan", malicious, "--format", "json", "--output", malicious_json, "--no-cache"], 1)
+              run([modelaudit, "scan", malicious_zip, "--format", "json", "--output", zip_json, "--no-cache"], 1)
+              run(
+                  [
+                      modelaudit,
+                      "scan",
+                      malicious,
+                      "--format",
+                      "sarif",
+                      "--output",
+                      sarif_json,
+                      "--sbom",
+                      sbom_json,
+                      "--no-cache",
+                  ],
+                  1,
+              )
+
+              if marker.exists():
+                  raise SystemExit("Malicious pickle payload executed during scan")
+
+              benign_report = json.loads(benign_json.read_text())
+              if benign_report.get("issues") or benign_report.get("failed_checks") != 0:
+                  raise SystemExit(f"Expected benign pickle to be clean, got {benign_report}")
+
+              for report_path in (malicious_json, zip_json):
+                  report = json.loads(report_path.read_text())
+                  if not any(
+                      issue.get("rule_code") == "S201" and issue.get("severity") == "critical"
+                      for issue in report.get("issues", [])
+                  ):
+                      raise SystemExit(f"Expected critical S201 in {report_path}, got {report}")
+
+              sarif_report = json.loads(sarif_json.read_text())
+              sarif_results = sarif_report.get("runs", [{}])[0].get("results", [])
+              if sarif_report.get("version") != "2.1.0" or not any(
+                  result.get("ruleId") == "S201" for result in sarif_results
+              ):
+                  raise SystemExit(f"Expected SARIF S201 result, got {sarif_report}")
+
+              sbom_report = json.loads(sbom_json.read_text())
+              if sbom_report.get("bomFormat") != "CycloneDX" or not sbom_report.get("components"):
+                  raise SystemExit(f"Expected CycloneDX SBOM with components, got {sbom_report}")
+
+          print("Published modelaudit end-to-end smoke test passed.")
+          PY
+
   provenance:
     if: needs.release-please.outputs.release_created == 'true'
     needs: [build, publish-pypi, release-please]
