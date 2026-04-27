@@ -138,12 +138,17 @@ for path in sorted(output_dir.rglob("*_pb2.py")):
     aliases: list[str] = []
     for line in after_sym_db.splitlines():
         match = re.match(r"from\s+.+\s+import\s+.+\s+as\s+([A-Za-z_][A-Za-z0-9_]*)$", line.strip())
-        if match:
+        if match and "_dot_" in match.group(1):
             aliases.append(match.group(1))
 
     cleanup = ""
     if aliases:
-        cleanup_lines = ["", cleanup_marker]
+        cleanup_lines = [
+            "",
+            cleanup_marker,
+            "# Reference aliases so static analysis preserves these side-effect imports.",
+        ]
+        cleanup_lines.extend(f"id({alias})" for alias in aliases)
         cleanup_lines.extend(f"del {alias}" for alias in aliases)
         cleanup = "\n" + "\n".join(cleanup_lines)
 

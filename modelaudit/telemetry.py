@@ -151,7 +151,6 @@ _CI_PRESENCE_ENV_VARS = (
     "BITBUCKET_COMMIT",
     "TEAMCITY_VERSION",
 )
-_CI_ENV_VARS = _CI_TRUTHY_ENV_VARS + _CI_PRESENCE_ENV_VARS
 
 
 def _env_truthy(name: str) -> bool:

@@ -24,6 +24,8 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 from tensorflow.core.framework import attr_value_pb2 as tensorflow_dot_core_dot_framework_dot_attr__value__pb2
 
 # Keep generated dependency imports for descriptor registration side effects.
+# Reference aliases so static analysis preserves these side-effect imports.
+id(tensorflow_dot_core_dot_framework_dot_attr__value__pb2)
 del tensorflow_dot_core_dot_framework_dot_attr__value__pb2
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n*tensorflow/core/framework/kernel_def.proto\x12\ntensorflow\x1a*tensorflow/core/framework/attr_value.proto\"\xef\x01\n\tKernelDef\x12\n\n\x02op\x18\x01 \x01(\t\x12\x13\n\x0b\x64\x65vice_type\x18\x02 \x01(\t\x12\x38\n\nconstraint\x18\x03 \x03(\x0b\x32$.tensorflow.KernelDef.AttrConstraint\x12\x17\n\x0fhost_memory_arg\x18\x04 \x03(\t\x12\r\n\x05label\x18\x05 \x01(\t\x12\x10\n\x08priority\x18\x06 \x01(\x05\x1aM\n\x0e\x41ttrConstraint\x12\x0c\n\x04name\x18\x01 \x01(\t\x12-\n\x0e\x61llowed_values\x18\x02 \x01(\x0b\x32\x15.tensorflow.AttrValue\"3\n\nKernelList\x12%\n\x06kernel\x18\x01 \x03(\x0b\x32\x15.tensorflow.KernelDefB\x83\x01\n\x18org.tensorflow.frameworkB\x0fKernelDefProtosP\x01ZQgithub.com/tensorflow/tensorflow/tensorflow/go/core/framework/kernel_def_go_proto\xf8\x01\x01\x62\x06proto3')
 
