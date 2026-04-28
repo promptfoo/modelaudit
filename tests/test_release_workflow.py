@@ -37,6 +37,12 @@ def _step_by_name(steps: list[dict[str, Any]], name: str) -> dict[str, Any]:
     raise AssertionError(f"Step {name!r} not found")
 
 
+def _jobs(workflow: dict[str, Any]) -> dict[str, Any]:
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    return jobs
+
+
 def test_release_workflow_manual_dispatch_inputs_and_guardrails() -> None:
     workflow = _load_release_workflow()
 
@@ -121,3 +127,96 @@ def test_release_workflow_picklescan_artifacts_stay_in_package_workspace() -> No
         "path": "dist/",
         "merge-multiple": True,
     }
+
+
+def test_release_workflow_verifies_published_picklescan_package() -> None:
+    workflow = _load_release_workflow()
+
+    job = _jobs(workflow)["verify-picklescan-pypi"]
+    assert isinstance(job, dict)
+    assert job["if"] == "needs.release-please.outputs.picklescan_release_created == 'true'"
+    assert job["needs"] == ["publish-picklescan-pypi", "release-please"]
+    assert job["permissions"] == {"contents": "read"}
+    assert job["env"] == {"EXPECTED_VERSION": "${{ needs.release-please.outputs.picklescan_version }}"}
+
+    steps = _job_steps(workflow, "verify-picklescan-pypi")
+    wait_step = _step_by_name(steps, "Wait for modelaudit-picklescan files on PyPI")
+    wait_run = wait_step["run"]
+    assert "https://pypi.org/pypi/modelaudit-picklescan/{version}/json" in wait_run
+    assert "deadline = time.monotonic() + 600" in wait_run
+    for expected_fragment in (
+        "modelaudit_picklescan-{version}-cp310-abi3-macosx_10_12_x86_64.whl",
+        "modelaudit_picklescan-{version}-cp310-abi3-macosx_11_0_arm64.whl",
+        "modelaudit_picklescan-{version}-cp310-abi3-manylinux_2_28_aarch64.whl",
+        "modelaudit_picklescan-{version}-cp310-abi3-manylinux_2_28_x86_64.whl",
+        "modelaudit_picklescan-{version}-cp310-abi3-win_amd64.whl",
+        "modelaudit_picklescan-{version}.tar.gz",
+    ):
+        assert expected_fragment in wait_run
+
+    smoke_step = _step_by_name(steps, "Install published modelaudit-picklescan and smoke test API")
+    smoke_run = smoke_step["run"]
+    assert "--no-cache-dir" in smoke_run
+    assert '"modelaudit-picklescan==${EXPECTED_VERSION}"' in smoke_run
+    assert 'md.version("modelaudit-picklescan")' in smoke_run
+    assert 'find_spec("modelaudit_picklescan._rust")' in smoke_run
+    assert 'clean_report.status.value != "complete"' in smoke_run
+    assert 'malicious_report.verdict.value != "malicious"' in smoke_run
+    assert 'finding.rule_code == "DANGEROUS_CALL"' in smoke_run
+
+
+def test_release_workflow_verifies_published_root_package_after_picklescan() -> None:
+    workflow = _load_release_workflow()
+
+    job = _jobs(workflow)["verify-pypi"]
+    assert isinstance(job, dict)
+    job_condition = job["if"]
+    assert "always()" in job_condition
+    assert "needs.release-please.outputs.release_created == 'true'" in job_condition
+    assert "needs.publish-pypi.result == 'success'" in job_condition
+    assert "needs.release-please.outputs.picklescan_release_created != 'true'" in job_condition
+    assert "needs.verify-picklescan-pypi.result == 'success'" in job_condition
+    assert job["needs"] == [
+        "publish-pypi",
+        "publish-picklescan-pypi",
+        "release-please",
+        "verify-picklescan-pypi",
+    ]
+    assert job["permissions"] == {"contents": "read"}
+    assert job["env"] == {
+        "EXPECTED_VERSION": "${{ needs.release-please.outputs.version }}",
+        "EXPECTED_PICKLESCAN_VERSION": "${{ needs.release-please.outputs.picklescan_version }}",
+        "PICKLESCAN_RELEASE_CREATED": "${{ needs.release-please.outputs.picklescan_release_created }}",
+        "PROMPTFOO_DISABLE_TELEMETRY": "1",
+    }
+
+    steps = _job_steps(workflow, "verify-pypi")
+    wait_step = _step_by_name(steps, "Wait for modelaudit files on PyPI")
+    wait_run = wait_step["run"]
+    assert "https://pypi.org/pypi/modelaudit/{version}/json" in wait_run
+    assert "deadline = time.monotonic() + 600" in wait_run
+    assert "modelaudit-{version}-py3-none-any.whl" in wait_run
+    assert "modelaudit-{version}.tar.gz" in wait_run
+
+    smoke_step = _step_by_name(steps, "Install published modelaudit and run end-to-end smoke tests")
+    smoke_run = smoke_step["run"]
+    assert "--no-cache-dir" in smoke_run
+    assert '"modelaudit[all]==${EXPECTED_VERSION}"' in smoke_run
+    assert 'md.version("modelaudit")' in smoke_run
+    assert 'md.version("modelaudit-picklescan")' in smoke_run
+    assert 'os.environ.get("PICKLESCAN_RELEASE_CREATED") == "true"' in smoke_run
+    assert 'env["PROMPTFOO_DISABLE_TELEMETRY"] = "1"' in smoke_run
+    assert 'run([modelaudit, "--version"], 0)' in smoke_run
+    assert 'run([modelaudit, "doctor", "--show-failed"], 0)' in smoke_run
+    assert 'run([modelaudit, "scan", benign, "--format", "json", "--output", benign_json, "--no-cache"], 0)' in (
+        smoke_run
+    )
+    assert 'run([modelaudit, "scan", malicious, "--format", "json", "--output", malicious_json, "--no-cache"], 1)' in (
+        smoke_run
+    )
+    assert 'run([modelaudit, "scan", malicious_zip, "--format", "json", "--output", zip_json, "--no-cache"], 1)' in (
+        smoke_run
+    )
+    assert 'result.get("ruleId") == "S201"' in smoke_run
+    assert 'sbom_report.get("bomFormat") != "CycloneDX"' in smoke_run
+    assert "Malicious pickle payload executed during scan" in smoke_run
