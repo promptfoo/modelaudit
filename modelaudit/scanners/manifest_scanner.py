@@ -842,24 +842,31 @@ class ManifestScanner(BaseScanner):
         return _PARSE_FAILED
 
     def _scan_embedded_jinja_templates(self, path: str, content: Any, result: ScanResult) -> None:
-        if not self._contains_jinja_template_field(content):
+        templates = self._collect_jinja_template_fields(content)
+        if not templates:
             return
 
         from .jinja2_template_scanner import Jinja2TemplateScanner
 
-        result.merge(Jinja2TemplateScanner(config=self.config).scan(path))
+        result.merge(Jinja2TemplateScanner(config=self.config).scan_extracted_templates(path, templates))
 
     @classmethod
-    def _contains_jinja_template_field(cls, value: Any) -> bool:
+    def _collect_jinja_template_fields(cls, value: Any, path: str = "") -> dict[str, str]:
         if isinstance(value, dict):
-            return any(
-                (key in JINJA_TEMPLATE_FIELD_NAMES and isinstance(item, str) and item.strip())
-                or cls._contains_jinja_template_field(item)
-                for key, item in value.items()
-            )
+            templates: dict[str, str] = {}
+            for key, item in value.items():
+                child_path = f"{path}.{key}" if path else str(key)
+                if key in JINJA_TEMPLATE_FIELD_NAMES and isinstance(item, str) and item.strip():
+                    templates[child_path] = item
+                templates.update(cls._collect_jinja_template_fields(item, child_path))
+            return templates
         if isinstance(value, list):
-            return any(cls._contains_jinja_template_field(item) for item in value)
-        return False
+            templates = {}
+            for index, item in enumerate(value):
+                child_path = f"{path}[{index}]" if path else f"[{index}]"
+                templates.update(cls._collect_jinja_template_fields(item, child_path))
+            return templates
+        return {}
 
     def _parse_ini_file(self, content: str) -> dict[str, Any]:
         """Parse INI-style manifests into nested dictionaries."""

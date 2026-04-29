@@ -288,6 +288,28 @@ def test_manifest_scanner_keeps_benign_chat_templates_clean(tmp_path: Path) -> N
     )
 
 
+def test_manifest_scanner_delegates_templates_from_parsed_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text('{"chat_template": "{{ harmless }}"}', encoding="utf-8")
+    captured: dict[str, dict[str, str]] = {}
+
+    def capture_templates(self: object, path: str, templates: dict[str, str]) -> ScanResult:
+        captured[path] = templates
+        return ScanResult("jinja2_template")
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.jinja2_template_scanner.Jinja2TemplateScanner.scan_extracted_templates",
+        capture_templates,
+    )
+
+    ManifestScanner().scan(str(config_path))
+
+    assert captured[str(config_path)] == {"chat_template": "{{ harmless }}"}
+
+
 def test_manifest_scanner_redacts_untrusted_url_credentials(tmp_path: Path) -> None:
     """Untrusted URL findings should not store userinfo, query strings, or fragments."""
     test_file = tmp_path / "config.json"
