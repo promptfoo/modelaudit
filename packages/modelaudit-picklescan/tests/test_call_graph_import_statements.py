@@ -6129,6 +6129,9 @@ if marker.read_text() != marker_content:
         ("{0[x]}", (b"h\x00",)),
         ("{[x]}", (b"h\x00",)),
         ("{0:{1[x]}}", (_unicode_operand("safe"), b"h\x00")),
+        ("{0!r:{1[x]}}", (_unicode_operand("safe"), b"h\x00")),
+        ("{[x]} {0}", (b"h\x00",)),
+        ("{[x]} }", (b"h\x00",)),
     ],
 )
 def test_scan_bytes_blocks_str_format_defaultdict_factory_rce(

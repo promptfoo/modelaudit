@@ -2045,10 +2045,7 @@ impl<'a> ScanState<'a> {
         let Some(format_string) = resolve_global_operand(arguments.first(), self.payload) else {
             return invocations;
         };
-        let Some(lookup_indices) = Self::str_format_positional_lookup_indices(&format_string)
-        else {
-            return invocations;
-        };
+        let lookup_indices = Self::str_format_positional_lookup_indices(&format_string);
 
         for index in lookup_indices {
             invocations.extend(self.mapping_lookup_invocations(
@@ -2061,18 +2058,18 @@ impl<'a> ScanState<'a> {
         invocations
     }
 
-    fn str_format_positional_lookup_indices(format_string: &str) -> Option<Vec<usize>> {
+    fn str_format_positional_lookup_indices(format_string: &str) -> Vec<usize> {
         let mut numbering = FormatFieldNumbering::Unset;
         let mut next_auto_index = 0;
         let mut lookup_indices = Vec::new();
-        Self::collect_str_format_lookup_indices(
+        let _ = Self::collect_str_format_lookup_indices(
             format_string,
             0,
             &mut numbering,
             &mut next_auto_index,
             &mut lookup_indices,
-        )?;
-        Some(lookup_indices)
+        );
+        lookup_indices
     }
 
     fn collect_str_format_lookup_indices(
@@ -2152,13 +2149,21 @@ impl<'a> ScanState<'a> {
         let bytes = field.as_bytes();
         let mut delimiter_index = bytes.len();
         let mut format_spec_index = None;
+        let mut item_depth = 0usize;
         for (index, byte) in bytes.iter().enumerate() {
-            if matches!(byte, b'!' | b':') {
-                delimiter_index = index;
-                if *byte == b':' {
-                    format_spec_index = Some(index + 1);
+            match byte {
+                b'[' => item_depth += 1,
+                b']' if item_depth > 0 => item_depth -= 1,
+                b'!' | b':' if item_depth == 0 => {
+                    if delimiter_index == bytes.len() {
+                        delimiter_index = index;
+                    }
+                    if *byte == b':' {
+                        format_spec_index = Some(index + 1);
+                        break;
+                    }
                 }
-                break;
+                _ => {}
             }
         }
 
