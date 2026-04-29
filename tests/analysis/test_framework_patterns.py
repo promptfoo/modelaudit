@@ -245,14 +245,20 @@ class TestShouldSkipPatternForFramework:
         should_skip = knowledge_base.should_skip_pattern_for_framework("joblib.load", FrameworkType.SKLEARN, {})
         assert should_skip is True
 
-    def test_attacker_controlled_filename_context_does_not_skip(self, knowledge_base) -> None:
+    def test_attacker_controlled_filename_context_does_not_skip(
+        self,
+        knowledge_base: FrameworkKnowledgeBase,
+    ) -> None:
         """Attacker-chosen file names must not soften dangerous pattern handling."""
         should_skip = knowledge_base.should_skip_pattern_for_framework(
             "eval", FrameworkType.PYTORCH, {"filename": "test_model.py"}
         )
         assert should_skip is False
 
-    def test_attacker_controlled_directory_context_does_not_skip(self, knowledge_base) -> None:
+    def test_attacker_controlled_directory_context_does_not_skip(
+        self,
+        knowledge_base: FrameworkKnowledgeBase,
+    ) -> None:
         """Parent directory names must not soften dangerous pattern handling."""
         should_skip = knowledge_base.should_skip_pattern_for_framework(
             "exec", FrameworkType.PYTORCH, {"filename": "samples/eval_bucket/payload.py"}
