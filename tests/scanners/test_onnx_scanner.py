@@ -14,6 +14,8 @@ from onnx.onnx_ml_pb2 import StringStringEntryProto
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.detectors.jit_script import JITScriptDetector
+from modelaudit.detectors.network_comm import NetworkCommDetector
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.onnx_scanner import OnnxScanner
 
@@ -932,3 +934,63 @@ class TestWeightDistributionCoverage:
         assert coverage_checks[0].details["oversized_initializers_skipped"] == 1
         assert coverage_checks[0].details["analyzed_initializers"] == 0
         self._assert_uncached_inconclusive_exit2(model_path, tmp_path / "cache", max_array_size=1)
+
+
+class TestRawDetectorCoverage:
+    """Tests for ONNX raw JIT/network detector coverage gaps."""
+
+    _INCONCLUSIVE_REASON = "onnx_raw_detection_analysis_incomplete"
+
+    @staticmethod
+    def _coverage_checks(result: Any) -> list[Any]:
+        return [c for c in result.checks if c.name == "Raw Detector Analysis Coverage"]
+
+    def _assert_inconclusive_exit2(self, model_path: Path, direct: Any, *, detector: str) -> None:
+        aggregate = scan_model_directory_or_file(str(model_path), recursive=False)
+        metadata = next(iter(aggregate.file_metadata.values()))
+        coverage_checks = self._coverage_checks(direct)
+
+        assert direct.success is False
+        assert direct.has_errors is False
+        assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert self._INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+        assert len(coverage_checks) == 1
+        assert coverage_checks[0].status == CheckStatus.FAILED
+        assert coverage_checks[0].severity == IssueSeverity.INFO
+        assert coverage_checks[0].details["coverage_gap"] == "analysis_failed"
+        assert coverage_checks[0].details["detector"] == detector
+        assert aggregate.success is False
+        assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert self._INCONCLUSIVE_REASON in metadata.get("scan_outcome_reasons", [])
+        assert determine_exit_code(aggregate) == 2
+        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
+
+    def test_jit_detector_failure_is_inconclusive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = create_onnx_model(tmp_path)
+
+        def _raise_analysis_failure(self: JITScriptDetector, *_args: Any, **_kwargs: Any) -> list[Any]:
+            raise RuntimeError("jit detector unavailable")
+
+        monkeypatch.setattr(JITScriptDetector, "scan_model", _raise_analysis_failure)
+
+        direct = OnnxScanner().scan(str(model_path))
+        self._assert_inconclusive_exit2(model_path, direct, detector="jit_script")
+
+    def test_network_detector_failure_is_inconclusive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_path = create_onnx_model(tmp_path)
+
+        def _raise_analysis_failure(self: NetworkCommDetector, *_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+            raise RuntimeError("network detector unavailable")
+
+        monkeypatch.setattr(NetworkCommDetector, "scan", _raise_analysis_failure)
+
+        direct = OnnxScanner().scan(str(model_path))
+        self._assert_inconclusive_exit2(model_path, direct, detector="network_communication")
