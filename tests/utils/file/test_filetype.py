@@ -94,6 +94,15 @@ def test_detect_file_format_zip(tmp_path):
     assert detect_file_format(str(zip_path)) == "zip"
 
 
+def test_detect_file_format_rejects_pk_prefix_near_match(tmp_path: Path) -> None:
+    near_match = tmp_path / "not-a-zip.dat"
+    near_match.write_bytes(b"PKNOPE harmless text")
+
+    assert is_zipfile(str(near_match)) is False
+    assert detect_file_format_from_magic(str(near_match)) == "unknown"
+    assert detect_file_format(str(near_match)) == "unknown"
+
+
 def test_detect_valid_torchserve_mar_by_magic_and_validation(tmp_path: Path) -> None:
     mar_path = _create_mar_archive(
         tmp_path,

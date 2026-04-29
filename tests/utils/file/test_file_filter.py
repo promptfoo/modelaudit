@@ -212,6 +212,12 @@ class TestFileFilter:
         assert not should_skip_file(str(disguised_legacy_tar))
         assert should_skip_file(str(real_image))
 
+    def test_pk_prefix_near_match_stays_skipped(self, tmp_path: Path) -> None:
+        near_match = tmp_path / "pknope.jpg"
+        near_match.write_bytes(b"PKNO harmless text")
+
+        assert should_skip_file(str(near_match))
+
     def test_disguised_lightgbm_text_model_bypasses_default_skip(self, tmp_path: Path) -> None:
         """Default skip filtering must preserve supported text models under skipped suffixes."""
         disguised_lightgbm = tmp_path / "model.txt"

@@ -113,6 +113,17 @@ def test_scan_file_does_not_route_compression_magic_near_match_to_compressed(tmp
     assert result.issues == []
 
 
+def test_scan_file_does_not_route_pk_prefix_near_match_to_zip(tmp_path: Path) -> None:
+    near_match = tmp_path / "payload.jpg"
+    near_match.write_bytes(b"PKNO harmless text")
+
+    result = scan_file(str(near_match))
+
+    assert result.scanner_name == "unknown"
+    assert not [check for check in result.checks if "ZIP" in check.name]
+    assert result.issues == []
+
+
 def test_scan_file_detects_shadowed_duplicate_pickle_in_misleading_zip(tmp_path: Path) -> None:
     disguised_zip = tmp_path / "payload.jpg"
     _create_zip_with_ordered_entries(
