@@ -440,10 +440,4 @@ class FrameworkKnowledgeBase:
                 if re.search(skip_pattern, pattern, re.IGNORECASE) and should_skip:
                     return True
 
-        # Check if pattern appears in safe context
-        safe_contexts = ["test_", "eval_", "validate_", "benchmark_"]
-        if any(ctx in str(file_context.get("filename", "")).lower() for ctx in safe_contexts):
-            # More lenient in test files
-            return pattern in ["eval", "exec", "assert"]
-
         return False
