@@ -232,59 +232,7 @@ class Jinja2TemplateScanner(BaseScanner):
                 result.finish(success=True)
                 return result
 
-            # Analyze each extracted template
-            total_detections = 0
-            for template_location, template_content in templates.items():
-                detections = self._analyze_template(template_content, context, f"{path}:{template_location}")
-                total_detections += len(detections)
-
-                # Convert detections to issues
-                for detection in detections:
-                    severity = self._get_severity_for_detection(detection, context)
-                    why_explanation = self._get_why_explanation(detection, context)
-
-                    result.add_check(
-                        name="Jinja2 Template Injection Detection",
-                        passed=False,
-                        message=f"Potential SSTI vulnerability detected: {detection.pattern_type}",
-                        severity=severity,
-                        location=detection.location or f"{path}:{template_location}",
-                        details={
-                            "pattern_type": detection.pattern_type,
-                            "pattern": detection.pattern,
-                            "match_text": detection.match_text[:200],  # Limit output size
-                            "risk_level": detection.risk_level,
-                            "template_location": template_location,
-                            "ml_context": context.framework,
-                        },
-                        why=why_explanation,
-                    )
-
-            # Overall assessment
-            if total_detections == 0:
-                result.add_check(
-                    name="Jinja2 SSTI Analysis",
-                    passed=True,
-                    message="No template injection patterns detected",
-                    location=path,
-                    details={"templates_analyzed": len(templates)},
-                )
-            else:
-                result.add_check(
-                    name="Jinja2 SSTI Analysis Summary",
-                    passed=False,
-                    message=f"Found {total_detections} potential SSTI patterns across {len(templates)} templates",
-                    severity=IssueSeverity.WARNING,
-                    location=path,
-                    details={
-                        "total_detections": total_detections,
-                        "templates_analyzed": len(templates),
-                        "sensitivity_level": self.sensitivity_level,
-                    },
-                )
-
-            result.bytes_scanned = file_size
-            self._finish_scan_result(result)
+            self._analyze_extracted_templates(result, path, context, templates, file_size)
             return result
 
         except Exception as e:
@@ -308,6 +256,81 @@ class Jinja2TemplateScanner(BaseScanner):
             )
             result.finish(success=False)
             return result
+
+    def scan_extracted_templates(self, path: str, templates: dict[str, str]) -> ScanResult:
+        """Analyze already-extracted templates with normal Jinja reporting."""
+        result = self._create_result()
+        file_size = self.get_file_size(path)
+        result.metadata["file_size"] = file_size
+
+        context = self._determine_context(path)
+        result.metadata["ml_context"] = {
+            "framework": context.framework,
+            "file_type": context.file_type,
+            "is_tokenizer": context.is_tokenizer,
+            "confidence": context.confidence,
+        }
+        self._analyze_extracted_templates(result, path, context, templates, file_size)
+        return result
+
+    def _analyze_extracted_templates(
+        self,
+        result: ScanResult,
+        path: str,
+        context: MLContext,
+        templates: dict[str, str],
+        file_size: int,
+    ) -> None:
+        total_detections = 0
+        for template_location, template_content in templates.items():
+            detections = self._analyze_template(template_content, context, f"{path}:{template_location}")
+            total_detections += len(detections)
+
+            for detection in detections:
+                severity = self._get_severity_for_detection(detection, context)
+                why_explanation = self._get_why_explanation(detection, context)
+
+                result.add_check(
+                    name="Jinja2 Template Injection Detection",
+                    passed=False,
+                    message=f"Potential SSTI vulnerability detected: {detection.pattern_type}",
+                    severity=severity,
+                    location=detection.location or f"{path}:{template_location}",
+                    details={
+                        "pattern_type": detection.pattern_type,
+                        "pattern": detection.pattern,
+                        "match_text": detection.match_text[:200],
+                        "risk_level": detection.risk_level,
+                        "template_location": template_location,
+                        "ml_context": context.framework,
+                    },
+                    why=why_explanation,
+                )
+
+        if total_detections == 0:
+            result.add_check(
+                name="Jinja2 SSTI Analysis",
+                passed=True,
+                message="No template injection patterns detected",
+                location=path,
+                details={"templates_analyzed": len(templates)},
+            )
+        else:
+            result.add_check(
+                name="Jinja2 SSTI Analysis Summary",
+                passed=False,
+                message=f"Found {total_detections} potential SSTI patterns across {len(templates)} templates",
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={
+                    "total_detections": total_detections,
+                    "templates_analyzed": len(templates),
+                    "sensitivity_level": self.sensitivity_level,
+                },
+            )
+
+        result.bytes_scanned = file_size
+        self._finish_scan_result(result)
 
     def _mark_inconclusive_scan_result(
         self,

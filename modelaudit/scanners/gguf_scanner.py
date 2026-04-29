@@ -244,6 +244,7 @@ class GgufScanner(BaseScanner):
                     )
 
             result.metadata["metadata"] = metadata
+            self._scan_embedded_chat_template(metadata, result)
         except Exception as e:
             # Parsing errors are informational - indicate corruption/format issues, not security threats
             result.add_check(
@@ -622,6 +623,20 @@ class GgufScanner(BaseScanner):
             return struct.unpack("<d", f.read(8))[0]
 
         raise ValueError(f"Unknown metadata type {vtype}")
+
+    def _scan_embedded_chat_template(self, metadata: dict[str, Any], result: ScanResult) -> None:
+        template = metadata.get("tokenizer.chat_template")
+        if not isinstance(template, str) or not template.strip():
+            return
+
+        from .jinja2_template_scanner import Jinja2TemplateScanner
+
+        result.merge(
+            Jinja2TemplateScanner(config=self.config).scan_extracted_templates(
+                self.current_file_path,
+                {"tokenizer.chat_template": template},
+            )
+        )
 
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         """Extract GGUF metadata."""

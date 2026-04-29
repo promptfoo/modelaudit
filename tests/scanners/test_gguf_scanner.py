@@ -8,8 +8,9 @@ import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
+from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.gguf_scanner import GgufScanner
+from tests.helpers import create_mock_gguf
 
 
 def _write_minimal_gguf(path, n_kv=1, n_tensors=0, kv_key=b"test", kv_value=b"val"):
@@ -211,6 +212,37 @@ def test_gguf_scanner_basic_scan(tmp_path):
     assert result.metadata["format"] == "gguf"
     assert result.metadata["n_kv"] == 1
     assert result.metadata["n_tensors"] == 0
+
+
+def test_gguf_scanner_delegates_malicious_chat_templates_to_jinja_analysis(tmp_path: Path) -> None:
+    path = create_mock_gguf(
+        tmp_path / "malicious.gguf",
+        metadata={"tokenizer.chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}"},
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_gguf_scanner_keeps_benign_chat_templates_clean(tmp_path: Path) -> None:
+    path = create_mock_gguf(
+        tmp_path / "benign.gguf",
+        metadata={
+            "tokenizer.chat_template": "{% for message in messages %}{{ message['content'] }}{% endfor %}",
+        },
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    assert any(check.name == "Jinja2 SSTI Analysis" and check.status == CheckStatus.PASSED for check in result.checks)
+    assert not any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
 
 
 def test_gguf_scanner_comprehensive_scan(tmp_path):

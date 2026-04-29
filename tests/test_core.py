@@ -15,7 +15,7 @@ import pytest
 from modelaudit import core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import scan_file
-from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from tests.helpers import create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
@@ -745,6 +745,21 @@ def test_scan_file_routes_misnamed_gguf_by_header(tmp_path: Path) -> None:
 
     assert result.scanner_name == "gguf"
     assert result.metadata["format"] == "gguf"
+
+
+def test_scan_file_routes_gguf_chat_templates_through_jinja_analysis(tmp_path: Path) -> None:
+    gguf_path = create_mock_gguf(
+        tmp_path / "model.gguf",
+        metadata={"tokenizer.chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}"},
+    )
+
+    result = scan_file(str(gguf_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "gguf"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
 
 
 def test_scan_file_does_not_route_gguf_magic_near_match_to_gguf(tmp_path: Path) -> None:
