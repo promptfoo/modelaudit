@@ -968,8 +968,8 @@ class TestCVE202523304HydraTarget:
         suspicious = [c for c in result.checks if "Suspicious File" in c.name]
         assert len(suspicious) > 0, "Should detect executable in archive"
 
-    def test_no_yaml_configs(self, tmp_path):
-        """Archive with no YAML should note absence."""
+    def test_no_yaml_configs_fail_closed_as_inconclusive(self, tmp_path: Path) -> None:
+        """Archives with no YAML should not report a clean complete scan."""
         nemo_path = tmp_path / "model.nemo"
         with tarfile.open(nemo_path, "w") as tar:
             data = b"binary weights data"
@@ -977,7 +977,25 @@ class TestCVE202523304HydraTarget:
             info.size = len(data)
             tar.addfile(info, io.BytesIO(data))
 
-        result = NemoScanner().scan(str(nemo_path))
+        direct_result = NemoScanner().scan(str(nemo_path))
+        aggregate_result = scan_model_directory_or_file(
+            str(nemo_path),
+            config={"cache_scan_results": False},
+        )
 
-        no_config = [c for c in result.checks if "Config Presence" in c.name and c.status != CheckStatus.PASSED]
-        assert len(no_config) > 0, "Should note missing YAML configs"
+        assert direct_result.success is False
+        assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_config_missing" in direct_result.metadata["scan_outcome_reasons"]
+        no_config = [
+            check
+            for check in direct_result.checks
+            if check.name == "NeMo Config Presence" and check.status == CheckStatus.FAILED
+        ]
+        assert len(no_config) == 1
+        assert no_config[0].details["scan_outcome_reason"] == "nemo_config_missing"
+
+        metadata = aggregate_result.file_metadata[str(nemo_path)]
+        assert aggregate_result.success is False
+        assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_config_missing" in metadata.get("scan_outcome_reasons", [])
+        assert determine_exit_code(aggregate_result) == 2
