@@ -755,11 +755,45 @@ def test_can_handle_json_checkpoint_rejects_non_jax_near_match(tmp_path: Path) -
     assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
 
 
+def test_can_handle_json_checkpoint_rejects_ajax_near_match(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "ajax_model.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps({"framework": "ajax", "format": "checkpoint"}),
+        encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
+
+
+def test_can_handle_json_checkpoint_rejects_late_ajax_near_match(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "late_ajax_model.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps({"padding": "x" * 1024, "framework": "ajax", "format": "checkpoint"}),
+        encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
+
+
+def test_can_handle_pickle_checkpoint_rejects_ajax_near_match(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "ajax_state.pickle"
+    checkpoint_path.write_bytes(pickle.dumps({"framework": "ajax"}))
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
+
+
 def test_can_handle_bom_json_checkpoint_rejects_non_jax_near_match(tmp_path: Path) -> None:
     checkpoint_path = tmp_path / "bom_generic_model.checkpoint"
     checkpoint_path.write_bytes(
         b"\xef\xbb\xbf" + json.dumps({"framework": "pytorch", "format": "checkpoint"}).encode("utf-8")
     )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
+
+
+def test_can_handle_numpy_checkpoint_rejects_ajax_filename_near_match(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "ajax_weights.checkpoint"
+    checkpoint_path.write_bytes(b"\x93NUMPY" + (b"\x00" * 64))
 
     assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
 

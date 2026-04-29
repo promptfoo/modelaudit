@@ -56,6 +56,9 @@ class JaxCheckpointScanner(BaseScanner):
         "jaxlib",
         "device_array",
     )
+    _JAX_INDICATOR_PATTERNS: ClassVar[tuple[re.Pattern[str], ...]] = tuple(
+        re.compile(rf"(?<![a-z0-9_]){re.escape(indicator)}", re.IGNORECASE) for indicator in _JAX_INDICATORS
+    )
     _DOCUMENTATION_CONTEXT_HINTS: ClassVar[frozenset[str]] = frozenset(
         {
             "description",
@@ -484,19 +487,17 @@ class JaxCheckpointScanner(BaseScanner):
                         data = f.read(8192)  # Read first 8KB
                         data_str = data.decode("utf-8", errors="ignore").lower()
 
-                    return any(indicator in data_str for indicator in cls._JAX_INDICATORS)
+                    return cls._contains_jax_indicator(data_str)
 
             decoded_header = header.decode("utf-8", errors="ignore").lower()
 
             # Check for JSON metadata files, including extensionful `.checkpoint`
             # files that contain JAX/Orbax metadata rather than pickle bytes.
             if cls._header_looks_like_json(header):
-                return any(
-                    indicator in decoded_header for indicator in cls._JAX_INDICATORS
-                ) or cls._file_contains_jax_indicator(path)
+                return cls._contains_jax_indicator(decoded_header) or cls._file_contains_jax_indicator(path)
 
             # Check for NumPy files in JAX context
-            if header.startswith(b"\x93NUMPY") and "jax" in path.lower():
+            if header.startswith(b"\x93NUMPY") and cls._contains_jax_indicator(path.lower()):
                 return True
 
         except Exception:
@@ -515,13 +516,18 @@ class JaxCheckpointScanner(BaseScanner):
                 while chunk := f.read(cls._JAX_INDICATOR_SCAN_CHUNK_BYTES):
                     decoded_chunk = chunk.decode("utf-8", errors="ignore").lower()
                     search_text = chunk_tail + decoded_chunk
-                    if any(indicator in search_text for indicator in cls._JAX_INDICATORS):
+                    if cls._contains_jax_indicator(search_text):
                         return True
                     chunk_tail = search_text[-tail_length:]
         except Exception:
             return False
 
         return False
+
+    @classmethod
+    def _contains_jax_indicator(cls, text: str) -> bool:
+        """Return True when text contains a JAX-family indicator that is not a suffix."""
+        return any(pattern.search(text) for pattern in cls._JAX_INDICATOR_PATTERNS)
 
     def _scan_orbax_checkpoint(self, path: str, result: ScanResult) -> None:
         """Scan Orbax checkpoint directory."""
