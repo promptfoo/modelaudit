@@ -448,8 +448,28 @@ class TestDirectoryFileFiltering:
         model_dir.mkdir()
         (model_dir / "config.json").write_text('{"model_type":"gpt2"}')
         local_gitignore = model_dir / ".cache" / "huggingface" / "download" / ".gitignore"
+        local_gitignore.parent.mkdir(parents=True)
+        local_gitignore.write_text("*\n")
 
         assert _is_huggingface_cache_file(str(local_gitignore)) is True
+
+    def test_local_download_bookkeeping_rejects_spoofed_payloads(self, tmp_path: Path) -> None:
+        """Local cache-looking paths must not skip binary payloads."""
+
+        class DangerousPayload:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo spoofed-local-bookkeeping-test",))
+
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type":"gpt2"}')
+        payload = model_dir / ".cache" / "huggingface" / "download" / "payload.pkl.lock"
+        payload.parent.mkdir(parents=True)
+        payload.write_bytes(pickle.dumps(DangerousPayload()))
+
+        assert _is_huggingface_cache_file(str(payload)) is False
 
     @pytest.mark.parametrize("filename", ["payload.pkl.lock", ".gitignore", ".gitattributes"])
     def test_direct_scans_do_not_skip_local_bookkeeping_filenames(self, tmp_path: Path, filename: str) -> None:

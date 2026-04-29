@@ -841,9 +841,29 @@ def _is_hf_download_bookkeeping_path(path_obj: Path) -> bool:
 
     local_model_root = resolved_parent.parents[2]
     try:
-        return any(child.is_file() for child in local_model_root.iterdir() if child.name != ".cache")
+        has_local_model_assets = any(child.is_file() for child in local_model_root.iterdir() if child.name != ".cache")
     except OSError:
         return False
+    return has_local_model_assets and _is_benign_local_hf_download_bookkeeping_file(path_obj)
+
+
+def _is_benign_local_hf_download_bookkeeping_file(path_obj: Path) -> bool:
+    """Return True only for text-like local download bookkeeping files."""
+    import json
+
+    filename = path_obj.name
+    try:
+        if filename.endswith(".lock"):
+            return path_obj.stat().st_size == 0
+        if filename.endswith(".metadata"):
+            with path_obj.open(encoding="utf-8") as handle:
+                return isinstance(json.load(handle), dict)
+        if filename in {".gitignore", ".gitattributes"}:
+            content = path_obj.read_text(encoding="utf-8")
+            return "\x00" not in content and len(content) <= 64 * 1024
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return False
 
 
 def _is_huggingface_cache_file(path: str) -> bool:
