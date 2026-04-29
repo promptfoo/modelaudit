@@ -4,7 +4,7 @@ from importlib.metadata import PackageNotFoundError, version
 import pytest
 
 import modelaudit
-from modelaudit.core import scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity, ScanResult
 
 
@@ -117,7 +117,8 @@ def test_max_total_size(tmp_path):
 
     results = scan_model_directory_or_file(str(tmp_path), max_total_size=150, cache_enabled=False)
 
-    assert results.success is True
+    assert results.success is False
+    assert determine_exit_code(results) == 2
 
     limit_issues = [i for i in results.issues if "Total scan size limit exceeded" in i.message]
     assert len(limit_issues) == 1
