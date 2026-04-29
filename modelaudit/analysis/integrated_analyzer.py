@@ -116,12 +116,9 @@ class IntegratedAnalyzer:
         total_weight = sum(self.signal_weights[k] for k in signals)
         weighted_confidence = sum(signals[k] * self.signal_weights[k] for k in signals) / total_weight
 
-        # Weighted confidence measures safety, so lower confidence means the
-        # pattern remains suspicious.
-        is_suspicious = weighted_confidence < 0.5
-
         # Determine risk level
         risk_level = self._calculate_risk_level(weighted_confidence, signals)
+        is_suspicious = risk_level in {"medium", "high", "critical"}
 
         # Add general recommendations
         if not is_suspicious:

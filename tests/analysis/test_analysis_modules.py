@@ -182,3 +182,29 @@ class TestAnalysisModules:
         assert result.confidence == pytest.approx(0.1)
         assert result.risk_level == "critical"
         assert result.is_suspicious is True
+
+    def test_integrated_analyzer_uses_adjusted_risk_for_suspiciousness(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Critical component signals should override a safe-looking average."""
+        from modelaudit.analysis import IntegratedAnalyzer
+        from modelaudit.analysis.unified_context import UnifiedMLContext
+
+        context = UnifiedMLContext(Path("test.pkl"), 1024, "pickle")
+        analyzer = IntegratedAnalyzer()
+        monkeypatch.setattr(analyzer, "_analyze_ml_context", lambda *_args: {"confidence": 1.0, "reasoning": []})
+        monkeypatch.setattr(analyzer, "_analyze_anomalies", lambda *_args: {"confidence": 1.0, "reasoning": []})
+        monkeypatch.setattr(
+            analyzer,
+            "_analyze_framework_patterns",
+            lambda *_args: {"confidence": 1.0, "reasoning": []},
+        )
+        monkeypatch.setattr(analyzer, "_analyze_semantics", lambda *_args: {"confidence": 0.2, "reasoning": []})
+
+        result = analyzer.analyze_suspicious_pattern("x", "code", context, code_snippet="x")
+
+        assert result.confidence > 0.5
+        assert result.risk_level == "high"
+        assert result.is_suspicious is True
+        assert "Pattern appears safe in current context" not in result.recommendations
