@@ -150,6 +150,7 @@ class PaddleScanner(BaseScanner):
                     details={"pattern": pattern.decode("ascii", "ignore"), "offset": offset + pos},
                     rule_code="S902",
                 )
+                break
 
         text = chunk.decode("latin-1")
         for regex in SUSPICIOUS_STRING_PATTERNS:

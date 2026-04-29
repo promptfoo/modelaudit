@@ -80,6 +80,16 @@ def test_paddle_scanner_ignores_near_match_split_across_chunk_boundary(tmp_path:
     assert not any(issue.details.get("pattern") == "os.system" for issue in result.issues)
 
 
+def test_paddle_scanner_caps_repeated_binary_pattern_findings_per_chunk(tmp_path: Path) -> None:
+    path = tmp_path / "model.pdmodel"
+    path.write_bytes(b"open(" * 1024)
+
+    with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
+        result = PaddleScanner().scan(str(path))
+
+    assert sum(issue.details.get("pattern") == "open(" for issue in result.issues) == 1
+
+
 def test_paddle_suspicious_pdmodel_aggregate_exit_code_is_security_finding(tmp_path: Path) -> None:
     """Suspicious .pdmodel patterns should be warning-level security findings."""
     path = tmp_path / "model.pdmodel"
