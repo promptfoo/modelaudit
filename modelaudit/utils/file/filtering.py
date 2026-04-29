@@ -137,14 +137,6 @@ _ARCHIVE_SIGNAL_EXTENSION_EXCLUSIONS: frozenset[str] = frozenset(
 )
 
 _ZIP_MEMBER_SNIFF_LIMIT: int = 256
-_OFFICE_ARCHIVE_PREFIXES: tuple[str, ...] = ("word/", "xl/", "ppt/")
-_OFFICE_ARCHIVE_MARKER_FILES: frozenset[str] = frozenset(
-    {
-        "word/document.xml",
-        "xl/workbook.xml",
-        "ppt/presentation.xml",
-    }
-)
 _ZIP_LOCAL_FILE_SIGNATURES: tuple[bytes, ...] = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 _MODEL_ARCHIVE_SIGNAL_BASENAMES: frozenset[str] = frozenset(
     {
@@ -233,15 +225,12 @@ def _has_scannable_content(path: str) -> bool:
             has_pytorch_data = False
             has_pytorch_marker = False
             processed_members = 0
-            archive_names = archive.NameToInfo
-            saw_content_types = "[Content_Types].xml" in archive_names
-            saw_office_prefix = any(marker in archive_names for marker in _OFFICE_ARCHIVE_MARKER_FILES)
             for member in archive.filelist:
                 if processed_members >= _ZIP_MEMBER_SNIFF_LIMIT:
                     # If we cannot finish classifying the archive within the
-                    # prefilter budget, preserve it for full scanning unless it
-                    # already looks like a standard Office document container.
-                    return not (saw_content_types and saw_office_prefix)
+                    # prefilter budget, preserve it for full scanning. Office
+                    # markers do not prove that later members are benign.
+                    return True
 
                 if not member.filename or member.is_dir():
                     continue
@@ -251,11 +240,7 @@ def _has_scannable_content(path: str) -> bool:
                 member_basename = Path(member_name).name.lower()
 
                 if member_name == "[Content_Types].xml":
-                    saw_content_types = True
                     continue
-
-                if member_name.startswith(_OFFICE_ARCHIVE_PREFIXES):
-                    saw_office_prefix = True
 
                 # Preserve Keras, TorchServe, and PyTorch ZIP containers even
                 # when the outer filename uses a skipped suffix.
@@ -384,10 +369,13 @@ def should_skip_file(
         and ext != ".dvc"
         and not any(candidate in scannable_extensions for candidate in candidate_extensions)
     ):
-        return True
+        return not (use_default_skip_extensions and _has_scannable_content(path))
 
     # Skip specific filenames
-    return filename in skip_filenames
+    if filename in skip_filenames:
+        return not (use_default_skip_extensions and _has_scannable_content(path))
+
+    return False
 
 
 logger = logging.getLogger(__name__)
