@@ -350,9 +350,9 @@ def scan_model_directory_or_file(
 
             scanner = get_scanner_for_file(stream_url, config=config)
             if scanner:
-                scan_result, was_complete = stream_analyze_file(stream_url, scanner)
+                scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:
-                    if not was_complete:
+                    if not analysis_complete:
                         _mark_inconclusive_scan_outcome(scan_result, "streaming_analysis_incomplete")
                     results.files_scanned += 1
 
@@ -362,10 +362,10 @@ def scan_model_directory_or_file(
                     # Add asset
                     _add_asset_to_results(results, stream_url, scan_result)
 
-                    if not was_complete:
+                    if not analysis_complete:
                         _add_issue_to_model(
                             results,
-                            "Streaming analysis was partial - only analyzed file header",
+                            "Streaming analysis incomplete - full scanner coverage was not available",
                             severity=IssueSeverity.INFO.value,
                             location=stream_url,
                             details={"analysis_complete": False},
