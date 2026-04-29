@@ -47,6 +47,8 @@ _ASSET_MACHO_HEADERS = (
 _ASSET_PE_HEADER = b"MZ"  # Windows PE executables
 _ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 6))
 _ASSET_PROBE_BYTES = max(8192, PROTO0_1_MAX_PROBE_BYTES)
+_CORE_ROOT_MODEL_FILES = frozenset({"saved_model.pb", "keras_metadata.pb", "fingerprint.pb"})
+_CORE_ROOT_MODEL_DIRS = frozenset({"assets", "assets.extra", "variables"})
 _ASSET_PYTHON_PATTERN = re.compile(
     r"(?m)(^\s*(?:"
     r"from\s+[A-Za-z_][\w.]*\s+import\s+"
@@ -303,6 +305,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
             self._scan_keras_metadata(str(keras_metadata_path), result)
 
         self._scan_saved_model_assets(model_root, result)
+        self._scan_saved_model_root_siblings(model_root, result)
 
         # Check for other suspicious files in the directory
         for root, _dirs, files in os.walk(dir_path):
@@ -498,6 +501,37 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         },
                         rule_code="S902",
                     )
+
+    def _scan_saved_model_root_siblings(self, model_root: Path, result: ScanResult) -> None:
+        """Scan non-canonical root files that can accompany a SavedModel."""
+        for child_path in model_root.iterdir():
+            if (
+                child_path.name in _CORE_ROOT_MODEL_FILES
+                or child_path.name in _CORE_ROOT_MODEL_DIRS
+                or child_path.is_dir()
+            ):
+                continue
+
+            detected_types = self._detect_suspicious_asset_content(child_path, result)
+            if not detected_types:
+                continue
+
+            file_size = self.get_file_size(str(child_path))
+            result.add_check(
+                name="SavedModel Supplemental File Security Check",
+                passed=False,
+                message=(
+                    f"Suspicious executable-like content detected in SavedModel supplemental file: {child_path.name}"
+                ),
+                severity=IssueSeverity.WARNING,
+                location=str(child_path),
+                details={
+                    "file_name": child_path.name,
+                    "detected_content_type": ", ".join(detected_types),
+                    "size": file_size,
+                },
+                rule_code="S902",
+            )
 
     def _detect_suspicious_asset_content(self, file_path: Path, result: ScanResult) -> list[str]:
         """Return suspicious content types found in a SavedModel asset file."""

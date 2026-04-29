@@ -599,6 +599,39 @@ def test_savedmodel_assets_benign_text_file_passes(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_root_sibling_pickle_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    sibling_path = model_dir / "payload.dat"
+    sibling_path.write_bytes(_build_protocol1_pickle_payload())
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    matching_checks = [
+        check
+        for check in result.checks
+        if check.name == "SavedModel Supplemental File Security Check" and check.location == str(sibling_path)
+    ]
+
+    assert matching_checks
+    assert all(check.severity == IssueSeverity.WARNING for check in matching_checks)
+    assert any("pickle_payload" in check.details.get("detected_content_type", "") for check in matching_checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_root_sibling_benign_text_stays_clean(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    sibling_path = model_dir / "README.txt"
+    sibling_path.write_text("model notes only\n", encoding="utf-8")
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "SavedModel Supplemental File Security Check" and check.location == str(sibling_path)
+    ]
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
 def test_savedmodel_assets_shell_script_is_flagged(tmp_path: Path) -> None:
     model_dir = Path(create_tf_savedmodel(tmp_path))
     asset_path = model_dir / "assets" / "evil.sh"
