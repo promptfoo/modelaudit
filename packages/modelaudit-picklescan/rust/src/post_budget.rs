@@ -143,14 +143,21 @@ fn record_post_budget_opcode_stream(
 ) {
     let mut stack = initial_stack.to_vec();
     let mut memo_overlay: HashMap<i64, StackValue> = HashMap::new();
-    let mut memo_len = i64::try_from(initial_memo_len).unwrap_or(i64::MAX);
+    let initial_memo_len = i64::try_from(initial_memo_len).unwrap_or(i64::MAX);
+    let mut memo_len = initial_memo_len;
     let mut index = start_index.min(tail.len());
     let mut sink = PostBudgetRecordSink { seen, matches };
 
     while index < tail.len() {
         let parsed = match parse_opcode(tail, index, tail.len()) {
             Ok(parsed) => parsed,
-            Err(_) => break,
+            Err(_) => {
+                stack.clear();
+                memo_overlay.clear();
+                memo_len = initial_memo_len;
+                index += 1;
+                continue;
+            }
         };
 
         handle_post_budget_opcode(

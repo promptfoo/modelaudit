@@ -136,6 +136,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Resynchronize bounded post-budget replay after malformed bytes so later
+  self-contained modern globals still surface critical findings.
 - Detect additional stdlib callable pickle targets that can access files,
   mutate registries, suppress diagnostics, or change process state, including
   Python 3.13 `pathlib._local` concrete path aliases, public `operator.setitem`
