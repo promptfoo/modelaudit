@@ -1462,6 +1462,39 @@ def test_pickle_scanner_delegates_jax_specific_patterns_for_jax_pickles(tmp_path
     )
 
 
+def test_pickle_scanner_delegates_jax_patterns_for_pkl_suffixes(tmp_path: Path) -> None:
+    path = tmp_path / "jax_state.pkl"
+    path.write_bytes(pickle.dumps({"payload": "jax.experimental.io_callback"}))
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        check.name == "JAX Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["pattern"] == r"jax\.experimental\.io_callback"
+        for check in result.checks
+    )
+
+
+def test_pickle_scanner_uses_jax_window_beyond_root_raw_scan_limit(tmp_path: Path) -> None:
+    path = tmp_path / "late-jax.pkl"
+    path.write_bytes(pickle.dumps({"padding": "a" * 256, "payload": "jax.experimental.io_callback"}))
+
+    result = PickleScanner(
+        config={
+            "pickle_root_raw_scan_limit_bytes": 64,
+            "jax_pickle_max_scan_bytes": 1024,
+        }
+    ).scan(str(path))
+
+    assert any(
+        check.name == "JAX Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["pattern"] == r"jax\.experimental\.io_callback"
+        for check in result.checks
+    )
+
+
 def test_policy_compatibility_exports_cover_required_dangerous_symbols() -> None:
     assert {"os.system", "subprocess.Popen", "eval", "exec", "__import__"} <= ALWAYS_DANGEROUS_FUNCTIONS
     assert {"os", "subprocess", "posix", "nt"} <= ALWAYS_DANGEROUS_MODULES

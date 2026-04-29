@@ -2432,17 +2432,36 @@ class PickleScanner(BaseScanner):
             return result
 
         self._add_root_legacy_metadata_detectors(result, path)
-        self._scan_jax_checkpoint_patterns_if_needed(path, raw_data, result)
+        self._scan_jax_checkpoint_patterns_if_needed(path, file_size, result)
         self._finish_after_wrapper_analysis(result, base_success=scan_result.success)
         return result
 
-    def _scan_jax_checkpoint_patterns_if_needed(self, path: str, raw_data: bytes, result: ScanResult) -> None:
+    def _scan_jax_checkpoint_patterns_if_needed(self, path: str, file_size: int, result: ScanResult) -> None:
         from .jax_checkpoint_scanner import JaxCheckpointScanner
 
-        if JaxCheckpointScanner.can_handle(path):
-            result.merge(
-                JaxCheckpointScanner(config=self.config).scan_pickle_pattern_text(
-                    path,
-                    raw_data.decode("utf-8", errors="ignore"),
-                )
+        if Path(path).suffix.lower() not in _KNOWN_PICKLE_EXTENSIONS and not JaxCheckpointScanner.can_handle(path):
+            return
+
+        jax_scanner = JaxCheckpointScanner(config=self.config)
+        read_limit = min(file_size, jax_scanner.max_pickle_scan_bytes)
+        with open(path, "rb") as handle:
+            data = handle.read(read_limit + 1)
+
+        jax_result = jax_scanner.scan_pickle_pattern_text(
+            path,
+            data[: jax_scanner.max_pickle_scan_bytes].decode("utf-8", errors="ignore"),
+        )
+        if len(data) > jax_scanner.max_pickle_scan_bytes:
+            jax_result.add_check(
+                name="Pickle Checkpoint Prefix Scan Limit",
+                passed=False,
+                message=(
+                    f"Only the first {jax_scanner.max_pickle_scan_bytes} bytes of the pickle checkpoint were "
+                    "inspected for opcode patterns"
+                ),
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={"max_pickle_scan_bytes": jax_scanner.max_pickle_scan_bytes},
+                rule_code="S902",
             )
+        result.merge(jax_result)
