@@ -197,6 +197,12 @@ class TestJITScriptDetector:
 
         assert findings == []
 
+    def test_scan_model_detects_unmarked_module_scope_python_source(self) -> None:
+        detector = JITScriptDetector()
+        findings = detector.scan_model(b"import os\nos.system('id')\n", "pytorch", "payload.bin")
+
+        assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
+
     def test_strict_mode(self) -> None:
         """Test strict mode flags any JIT usage."""
         detector_normal = JITScriptDetector({"strict_mode": False})

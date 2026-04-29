@@ -168,8 +168,6 @@ class JITScriptDetector:
     def _looks_like_dangerous_python_source(data: bytes) -> bool:
         """Return whether marker-free bytes look like dangerous embedded Python source."""
         bounded = data[:1000000]
-        if not (b"def " in bounded or b"class " in bounded):
-            return False
         dangerous_imports = b"|".join(re.escape(module.encode()) for module in DANGEROUS_IMPORTS)
         if re.search(rb"(?m)^\s*(?:from|import)\s+(?:" + dangerous_imports + rb")\b", bounded):
             return True
