@@ -1495,6 +1495,29 @@ def test_pickle_scanner_uses_jax_window_beyond_root_raw_scan_limit(tmp_path: Pat
     )
 
 
+def test_pickle_scanner_delegates_late_jax_patterns_for_ckpt_suffixes(tmp_path: Path) -> None:
+    path = tmp_path / "late-jax.ckpt"
+    path.write_bytes(pickle.dumps({"padding": "a" * 9000, "payload": "jax.experimental.io_callback"}))
+
+    result = PickleScanner().scan(str(path))
+
+    assert any(
+        check.name == "JAX Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["pattern"] == r"jax\.experimental\.io_callback"
+        for check in result.checks
+    )
+
+
+def test_pickle_scanner_suppresses_jax_truncation_warning_without_jax_context(tmp_path: Path) -> None:
+    path = tmp_path / "large-benign.pkl"
+    path.write_bytes(pickle.dumps({"padding": "a" * 4096}))
+
+    result = PickleScanner(config={"jax_pickle_max_scan_bytes": 1024}).scan(str(path))
+
+    assert not any(check.name == "Pickle Checkpoint Prefix Scan Limit" for check in result.checks)
+
+
 def test_policy_compatibility_exports_cover_required_dangerous_symbols() -> None:
     assert {"os.system", "subprocess.Popen", "eval", "exec", "__import__"} <= ALWAYS_DANGEROUS_FUNCTIONS
     assert {"os", "subprocess", "posix", "nt"} <= ALWAYS_DANGEROUS_MODULES

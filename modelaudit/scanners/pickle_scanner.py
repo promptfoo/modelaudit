@@ -18,7 +18,7 @@ from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 from modelaudit.utils.helpers.code_validation import validate_python_syntax
 
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 from .picklescan_adapter import pickle_report_to_scan_result, scan_options_from_config
 
 _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES = 64 * 1024
@@ -2439,19 +2439,22 @@ class PickleScanner(BaseScanner):
     def _scan_jax_checkpoint_patterns_if_needed(self, path: str, file_size: int, result: ScanResult) -> None:
         from .jax_checkpoint_scanner import JaxCheckpointScanner
 
-        if Path(path).suffix.lower() not in _KNOWN_PICKLE_EXTENSIONS and not JaxCheckpointScanner.can_handle(path):
-            return
-
         jax_scanner = JaxCheckpointScanner(config=self.config)
         read_limit = min(file_size, jax_scanner.max_pickle_scan_bytes)
         with open(path, "rb") as handle:
             data = handle.read(read_limit + 1)
 
+        decoded_text = data[: jax_scanner.max_pickle_scan_bytes].decode("utf-8", errors="ignore")
         jax_result = jax_scanner.scan_pickle_pattern_text(
             path,
-            data[: jax_scanner.max_pickle_scan_bytes].decode("utf-8", errors="ignore"),
+            decoded_text,
         )
-        if len(data) > jax_scanner.max_pickle_scan_bytes:
+        has_jax_context = any(indicator in decoded_text.lower() for indicator in jax_scanner._JAX_INDICATORS)
+        has_jax_findings = any(
+            check.name == "JAX Pattern Security Check" and check.status == CheckStatus.FAILED
+            for check in jax_result.checks
+        )
+        if len(data) > jax_scanner.max_pickle_scan_bytes and (has_jax_context or has_jax_findings):
             jax_result.add_check(
                 name="Pickle Checkpoint Prefix Scan Limit",
                 passed=False,
