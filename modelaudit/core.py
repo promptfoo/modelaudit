@@ -57,7 +57,12 @@ from modelaudit.utils.helpers.types import (
     ProgressCallback,
 )
 from modelaudit.utils.lfs import check_lfs_pointer, get_lfs_issue_details, get_lfs_remediation_steps
-from modelaudit.utils.sources._huggingface_cache import _find_hf_cache_root, _path_has_part, _resolve_hf_cache_path
+from modelaudit.utils.sources._huggingface_cache import (
+    _find_hf_cache_root,
+    _get_hf_cache_roots,
+    _path_has_part,
+    _resolve_hf_cache_path,
+)
 
 logger = logging.getLogger("modelaudit.core")
 
@@ -801,7 +806,7 @@ def scan_model_directory_or_file(
 def _is_hf_hub_bookkeeping_path(path_obj: Path) -> bool:
     """Return True for files stored under known HuggingFace hub bookkeeping directories."""
     hf_cache_root = _find_hf_cache_root(path_obj)
-    if hf_cache_root is None or hf_cache_root.parent.name.lower() != "hub":
+    if hf_cache_root is None:
         return False
 
     try:
@@ -814,8 +819,18 @@ def _is_hf_hub_bookkeeping_path(path_obj: Path) -> bool:
 
 def _is_hf_download_bookkeeping_path(path_obj: Path) -> bool:
     """Return True for files stored in HuggingFace download bookkeeping directories."""
-    normalized_parts = [part.lower() for part in path_obj.parent.parts]
-    return len(normalized_parts) >= 3 and normalized_parts[-3:] == [".cache", "huggingface", "download"]
+    import os
+
+    resolved_parent = _resolve_hf_cache_path(path_obj.parent)
+    configured_download_roots = {
+        _resolve_hf_cache_path(root.parent / "download")
+        for root in _get_hf_cache_roots()
+        if root.parent.name.lower() == "huggingface"
+    }
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        configured_download_roots.add(_resolve_hf_cache_path(Path(hf_home) / "download"))
+    return resolved_parent in configured_download_roots
 
 
 def _is_huggingface_cache_file(path: str) -> bool:

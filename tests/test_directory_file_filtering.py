@@ -416,6 +416,32 @@ class TestDirectoryFileFiltering:
         assert _is_huggingface_cache_file(str(hf_download_gitignore)) is True
         assert _is_huggingface_cache_file(str(hf_download_gitattributes)) is True
 
+    def test_custom_hf_hub_cache_root_skips_hub_bookkeeping(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Custom HF_HUB_CACHE roots do not need to be named hub."""
+        custom_hub = tmp_path / "custom-cache-root"
+        monkeypatch.setenv("HF_HUB_CACHE", str(custom_hub))
+        lock_path = custom_hub / "models--org--repo" / "snapshots" / "abc123" / "payload.pkl.lock"
+
+        assert _is_huggingface_cache_file(str(lock_path)) is True
+
+    def test_download_bookkeeping_requires_configured_hf_home(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Suffix-shaped local paths must not be trusted as HF downloads."""
+        hf_home = tmp_path / "real-home"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+        trusted_gitignore = hf_home / "download" / ".gitignore"
+        spoofed_gitignore = tmp_path / "project" / ".cache" / "huggingface" / "download" / ".gitignore"
+
+        assert _is_huggingface_cache_file(str(trusted_gitignore)) is True
+        assert _is_huggingface_cache_file(str(spoofed_gitignore)) is False
+
     @pytest.mark.parametrize("filename", ["payload.pkl.lock", ".gitignore", ".gitattributes"])
     def test_direct_scans_do_not_skip_local_bookkeeping_filenames(self, tmp_path: Path, filename: str) -> None:
         """A malicious local file should not become trusted because of its basename."""
