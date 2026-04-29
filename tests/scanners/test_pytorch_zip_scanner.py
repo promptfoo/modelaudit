@@ -1704,6 +1704,58 @@ def test_pytorch_zip_scanner_compression_ratio_check(tmp_path):
     assert ratio_issues[0].severity == IssueSeverity.WARNING
 
 
+def test_pytorch_zip_scanner_high_ratio_pickle_marks_scan_inconclusive(tmp_path: Path) -> None:
+    """Skipped high-ratio pickle members must fail closed instead of disappearing from coverage."""
+    zip_path = tmp_path / "ratio_elided_pickle.pt"
+    payload = pickle.dumps(
+        {
+            "padding": b"\x00" * (1024 * 1024),
+            "payload": _malicious_eval_pickle_payload(),
+        },
+        protocol=4,
+    )
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("data.pkl", payload)
+
+    result = PyTorchZipScanner(config={"max_compression_ratio": 10}).scan(str(zip_path))
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_compression_ratio_unscanned" in result.metadata["scan_outcome_reasons"]
+    ratio_checks = [
+        check
+        for check in result.checks
+        if check.name == "Compression Ratio Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(ratio_checks) == 1
+    assert ratio_checks[0].details["analysis_incomplete"] is True
+
+
+def test_pytorch_zip_scanner_recurses_into_nested_zip_members(tmp_path: Path) -> None:
+    """Nested ZIP payloads should be recursively routed instead of staying invisible."""
+    nested_zip = tmp_path / "nested.zip"
+    with zipfile.ZipFile(nested_zip, "w") as archive:
+        archive.writestr("payload.pkl", _malicious_eval_pickle_payload())
+
+    zip_path = tmp_path / "nested_payload.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zipf.write(nested_zip, "archive/nested.zip")
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.location is not None
+        and f"{zip_path}:archive/nested.zip:payload.pkl" in issue.location
+        for issue in result.issues
+    )
+
+
 def test_pytorch_zip_scanner_small_high_ratio_metadata_stays_clean(tmp_path: Path) -> None:
     """Small repetitive metadata should not fail the compression ratio check."""
     zip_path = create_mock_pytorch_zip(tmp_path / "model.pt")

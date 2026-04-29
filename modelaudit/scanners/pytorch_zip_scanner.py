@@ -19,6 +19,9 @@ from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_
 from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils import sanitize_archive_path
 from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTES, _looks_like_proto0_or_1_pickle
+from ._archive_config import get_archive_depth
+from ._archive_locations import rewrite_extracted_member_location
+from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
 from .archive_member_security import is_executable_archive_member_name
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
@@ -110,6 +113,8 @@ _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
 _JIT_SCAN_MEMBER_MAX_BYTES = 32 * 1024 * 1024
 _PICKLE_DISCOVERY_LONG_PROBE_BYTES = PROTO0_1_MAX_PROBE_BYTES
 _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN = re.compile(r"^(?:.+/)?data/[0-9]+$")
+_NESTED_ZIP_HEADER_PROBE_BYTES = 4
+_ZIP_LOCAL_FILE_SIGNATURES: tuple[bytes, ...] = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 
 
 @dataclass(frozen=True)
@@ -317,6 +322,7 @@ class PyTorchZipScanner(BaseScanner):
                     path,
                     trusted_pytorch_storage_data_pkl_members=trusted_pytorch_storage_data_pkl_members,
                 )
+                self._scan_nested_zip_members(zip_file, safe_entries, pickle_files, result, path)
                 self._check_timeout()  # Check timeout after pickle scanning
 
                 # Validate tensor metadata consistency (CVE-2026-24747)
@@ -838,9 +844,11 @@ class PyTorchZipScanner(BaseScanner):
                             "threshold": self.max_compression_ratio,
                             "min_uncompressed_size": self.min_compression_bomb_uncompressed_size,
                             "risk": "High compression ratio may indicate a decompression bomb",
+                            "analysis_incomplete": True,
                         },
                         why="Decompression bombs use high compression ratios to exhaust system resources",
                     )
+                    mark_inconclusive_scan_result(result, "pytorch_zip_compression_ratio_unscanned")
                     compression_issues_found = True
                     continue
 
@@ -959,6 +967,155 @@ class PyTorchZipScanner(BaseScanner):
 
         result.metadata["pickle_files"] = self._get_zip_member_names(pickle_files)
         return pickle_files
+
+    def _scan_nested_zip_members(
+        self,
+        zip_file: zipfile.ZipFile,
+        safe_entries: list[zipfile.ZipInfo],
+        pickle_files: list[zipfile.ZipInfo],
+        result: ScanResult,
+        path: str,
+    ) -> None:
+        """Recursively route embedded ZIP members while avoiding duplicate pickle scans."""
+        pickle_entry_ids = {id(entry) for entry in pickle_files}
+        current_depth = get_archive_depth(self.config)
+        probe_failures: list[dict[str, str]] = []
+        scan_failures: list[dict[str, str]] = []
+
+        for entry in safe_entries:
+            if entry.is_dir() or id(entry) in pickle_entry_ids:
+                continue
+
+            try:
+                header = self._read_member_prefix(
+                    zip_file,
+                    entry,
+                    _NESTED_ZIP_HEADER_PROBE_BYTES,
+                    phase="nested_zip_probe",
+                    result=result,
+                )
+            except Exception as exc:
+                logger.debug("Unable to inspect ZIP member %s for nested archives: %s", entry.filename, exc)
+                probe_failures.append(
+                    {
+                        "zip_entry": entry.filename,
+                        "exception": str(exc),
+                        "exception_type": type(exc).__name__,
+                    }
+                )
+                continue
+
+            if not any(header.startswith(signature) for signature in _ZIP_LOCAL_FILE_SIGNATURES):
+                continue
+
+            temp_path: str | None = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_file:
+                    temp_path = temp_file.name
+                    with zip_file.open(entry) as source:
+                        while chunk := source.read(1024 * 1024):
+                            temp_file.write(chunk)
+
+                nested_config = dict(self.config)
+                nested_config["_archive_depth"] = current_depth + 1
+                nested_scan_callback = self.config.get(NESTED_SCAN_CALLBACK_CONFIG_KEY)
+                if callable(nested_scan_callback):
+                    nested_result = nested_scan_callback(temp_path, nested_config)
+                else:
+                    nested_result = scan_nested_file(temp_path, nested_config)
+
+                self._rewrite_nested_result_context(nested_result, temp_path, path, self._get_zip_member_name(entry))
+                result.merge(nested_result)
+            except Exception as exc:
+                logger.debug("Unable to scan nested ZIP member %s: %s", entry.filename, exc)
+                scan_failures.append(
+                    {
+                        "zip_entry": entry.filename,
+                        "exception": str(exc),
+                        "exception_type": type(exc).__name__,
+                    }
+                )
+            finally:
+                if temp_path is not None:
+                    with suppress(FileNotFoundError):
+                        os.unlink(temp_path)
+
+        if probe_failures:
+            self._record_nested_zip_incomplete(
+                result,
+                failures=probe_failures,
+                reason="pytorch_zip_nested_archive_probe_incomplete",
+                check_name="Nested ZIP Discovery",
+                message="PyTorch ZIP members could not be inspected for nested ZIP payloads",
+            )
+
+        if scan_failures:
+            self._record_nested_zip_incomplete(
+                result,
+                failures=scan_failures,
+                reason="pytorch_zip_nested_archive_scan_incomplete",
+                check_name="Nested ZIP Scan",
+                message="Nested ZIP members could not be scanned completely",
+            )
+
+    def _record_nested_zip_incomplete(
+        self,
+        result: ScanResult,
+        *,
+        failures: list[dict[str, str]],
+        reason: str,
+        check_name: str,
+        message: str,
+    ) -> None:
+        """Record aggregated nested ZIP probe/scan failures without flooding checks."""
+        mark_inconclusive_scan_result(result, reason)
+        result.add_check(
+            name=check_name,
+            passed=False,
+            message=f"{len(failures)} {message}",
+            severity=IssueSeverity.INFO,
+            location=self.current_file_path,
+            details={
+                "zip_entries": [failure["zip_entry"] for failure in failures],
+                "entries": failures,
+                "failed_count": len(failures),
+                "analysis_incomplete": True,
+            },
+        )
+
+    @staticmethod
+    def _rewrite_nested_result_context(
+        nested_result: ScanResult,
+        temp_path: str,
+        archive_path: str,
+        member_name: str,
+    ) -> None:
+        """Rewrite extracted nested ZIP paths back to archive provenance."""
+        archive_location = f"{archive_path}:{member_name}"
+
+        for issue in nested_result.issues:
+            issue.location = rewrite_extracted_member_location(
+                issue.location,
+                temp_path,
+                archive_location,
+                preserve_non_delimited_suffix=False,
+            )
+            existing_entry = issue.details.get("zip_entry")
+            issue.details["zip_entry"] = (
+                f"{member_name}:{existing_entry}" if isinstance(existing_entry, str) and existing_entry else member_name
+            )
+
+        for check in nested_result.checks:
+            check.location = rewrite_extracted_member_location(
+                check.location,
+                temp_path,
+                archive_location,
+                preserve_non_delimited_suffix=False,
+            )
+            existing_entry = check.details.get("zip_entry")
+            check.details["zip_entry"] = (
+                f"{member_name}:{existing_entry}" if isinstance(existing_entry, str) and existing_entry else member_name
+            )
 
     def _entry_looks_like_pickle(
         self,
