@@ -641,6 +641,23 @@ class TestCVE20245480Detection:
         assert cve_attrs[0].cvss == 10.0
         assert cve_attrs[0].cwe == "CWE-94"
 
+    def test_comment_padding_does_not_bypass(self) -> None:
+        """Padding exploit content with comments should not suppress detection."""
+        content = "\n".join(
+            [
+                "# note 1",
+                "# note 2",
+                "# note 3",
+                "torch.distributed.rpc.rpc_sync('node', fn)",
+                "eval(payload)",
+            ]
+        )
+
+        attributions = analyze_cve_patterns(content, b"")
+
+        cve_attrs = [attr for attr in attributions if attr.cve_id == "CVE-2024-5480"]
+        assert len(cve_attrs) > 0, "Comment padding should not bypass CVE detection"
+
 
 class TestCVE202448063Detection:
     """Test detection of CVE-2024-48063 (PyTorch RemoteModule deserialization RCE)."""

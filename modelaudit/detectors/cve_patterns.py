@@ -130,16 +130,16 @@ def _analyze_cve_patterns_basic(content: str, binary_content: bytes = b"") -> li
 def _is_primarily_documentation(content: str) -> bool:
     """Check if content is primarily documentation/comments rather than executable code.
 
-    Only suppresses detection when the majority (>50%) of non-empty lines are
-    comment or docstring lines. This avoids the bypass where embedding a single
-    comment token (e.g. ``#``) in a malicious payload would suppress all detection.
+    Only suppresses detection when every non-empty line is clearly a comment or
+    docstring line. A majority threshold lets attackers pad a live payload with
+    harmless comments until the detector suppresses it.
     """
     lines = [line.strip() for line in content.splitlines() if line.strip()]
     if not lines:
         return False
     doc_prefixes = ("#", '"""', "'''", "warning:", "note:")
     doc_line_count = sum(1 for line in lines if any(line.startswith(p) for p in doc_prefixes))
-    return doc_line_count > len(lines) / 2
+    return doc_line_count == len(lines)
 
 
 def _check_cve_2020_13092_multiline(content: str, binary_content: bytes) -> list[str]:

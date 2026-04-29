@@ -131,6 +131,23 @@ class TestSecretsDetector:
         # Let's test that we can at least scan without errors
         assert isinstance(findings, list)
 
+    def test_detect_password_in_text_backed_bytes(self) -> None:
+        """Structured credentials inside bytes should not be dropped wholesale."""
+        detector = SecretsDetector()
+
+        findings = detector.scan_bytes(b"password=super_secret_password_123")
+
+        assert any(finding["secret_type"] == "Hardcoded Password" for finding in findings)
+
+    def test_default_high_entropy_threshold_is_reachable(self) -> None:
+        """The default entropy threshold should surface encoded-looking byte regions."""
+        detector = SecretsDetector()
+        data = (b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/" * 2)[:64]
+
+        findings = detector.scan_bytes(data)
+
+        assert any(finding["type"] == "high_entropy_region" for finding in findings)
+
     def test_no_false_positives_on_normal_text(self):
         """Test that normal text doesn't trigger false positives."""
         detector = SecretsDetector()

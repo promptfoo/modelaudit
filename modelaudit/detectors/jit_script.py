@@ -203,29 +203,29 @@ class JITScriptDetector:
                 )
 
         # Check for TorchScript markers
-        if b"TorchScript" in data or b"torch.jit" in data:
-            if self.strict_mode:
-                finding_data = {
-                    "message": "TorchScript JIT compilation detected",
-                    "severity": "WARNING",
-                    "context": context,
-                    "pattern": None,
-                    "recommendation": "JIT-compiled models can contain arbitrary code - verify source",
-                    "confidence": 0.8,
-                    "framework": "TorchScript",
-                    "code_snippet": None,
-                    "type": "jit_usage",
-                    "operation": None,
-                    "builtin": None,
-                    "import": None,
-                }
-                findings.append(create_jit_finding(**finding_data))
+        if self.strict_mode and (b"TorchScript" in data or b"torch.jit" in data):
+            finding_data = {
+                "message": "TorchScript JIT compilation detected",
+                "severity": "WARNING",
+                "context": context,
+                "pattern": None,
+                "recommendation": "JIT-compiled models can contain arbitrary code - verify source",
+                "confidence": 0.8,
+                "framework": "TorchScript",
+                "code_snippet": None,
+                "type": "jit_usage",
+                "operation": None,
+                "builtin": None,
+                "import": None,
+            }
+            findings.append(create_jit_finding(**finding_data))
 
-            # Look for embedded Python code
-            if b"def " in data or b"class " in data:
-                # Try to extract and parse Python code
-                code_findings = self._extract_and_check_python_code(data, "TorchScript", context)
-                findings.extend(code_findings)
+        # Look for embedded Python code even when framework markers are absent.
+        # Scanner callers can hand us raw code-bearing blobs, and an attacker can
+        # remove marker strings without removing the executable payload.
+        if b"def " in data or b"class " in data:
+            code_findings = self._extract_and_check_python_code(data, "TorchScript", context)
+            findings.extend(code_findings)
 
         # Check for pickle within TorchScript (common attack vector)
         if b"GLOBAL" in data and b"torch" in data:

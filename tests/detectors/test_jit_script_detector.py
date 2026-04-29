@@ -117,6 +117,19 @@ class TestJITScriptDetector:
         assert any("subprocess" in getattr(f, "import_", "") for f in findings)
         assert any(f.severity == "CRITICAL" for f in findings)
 
+    def test_scan_torchscript_checks_unmarked_python_blobs(self) -> None:
+        """Raw Python payloads should be analyzed even without TorchScript markers."""
+        detector = JITScriptDetector()
+        data = b"""
+        def payload():
+            import os
+            return os.system("echo pwned")
+        """
+
+        findings = detector.scan_torchscript(data, "opaque.bin")
+
+        assert any(getattr(finding, "import_", "") == "os" for finding in findings)
+
     def test_detect_dangerous_builtins(self):
         """Test detection of dangerous builtins like eval, exec."""
         detector = JITScriptDetector()

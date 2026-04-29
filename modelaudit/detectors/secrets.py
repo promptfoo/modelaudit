@@ -340,12 +340,13 @@ class SecretsDetector:
         if len(data) < 1024 * 1024:  # Only for files < 1MB
             window_size = 64
             stride = 32  # Sliding window stride
+            high_entropy_threshold = min(self.max_entropy, math.log2(window_size) - 0.25)
 
-            for i in range(0, min(len(data) - window_size, 10000), stride):  # Check first 10KB max
+            for i in range(0, min(len(data) - window_size, 10000) + 1, stride):  # Check first 10KB max
                 window = data[i : i + window_size]
                 entropy = self.calculate_shannon_entropy(window, window_size)
 
-                if entropy > self.max_entropy:
+                if entropy > high_entropy_threshold:
                     # Very high entropy - check if it's actually suspicious
                     # Try to decode as text to see if it contains patterns
                     try:
@@ -497,9 +498,7 @@ class SecretsDetector:
                     "Bearer Token",  # "Bearer " + alphanums matches binary data
                     "UUID (potential secret)",  # Random bytes form valid UUID patterns
                 }
-                if (description in binary_false_positive_types) and (
-                    is_binary_source or self._is_likely_binary_context(text, position)
-                ):
+                if (description in binary_false_positive_types) and self._is_likely_binary_context(text, position):
                     continue
 
                 confidence = self._calculate_confidence(secret_text, description, context)

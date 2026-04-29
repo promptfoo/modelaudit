@@ -94,6 +94,18 @@ _INLINE_COMPOUND_STATEMENT_PATTERN = re.compile(
     rb"^\s*(?:if|elif|else|for|while|with|try|except|finally|match|case)\b[^#\n]*:\s*\S"
 )
 _STRUCTURED_METADATA_PREFIXES: tuple[bytes, ...] = (b"{", b"[", b'"', b"'")
+_VERSION_LITERAL_CONTEXT_PATTERN = re.compile(
+    rb"\b(?:version|ver|release|build)\s*[:=]\s*[\"']?"
+    rb"(?P<value>(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\."
+    rb"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\."
+    rb"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\."
+    rb"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))[\"']?",
+    re.IGNORECASE,
+)
+_ML_LAYER_DOMAIN_PATTERN = re.compile(
+    r"^(?:layer\d+|conv\d*d?|bn\d+|norm\d+|fc\d+|dense\d+)\.(?:weight|bias)$",
+    re.IGNORECASE,
+)
 
 
 def _is_metadata_context(context: str) -> bool:
@@ -531,14 +543,15 @@ class NetworkCommDetector:
         for match in self.IPV4_PATTERN.finditer(data):
             ip = match.group().decode("utf-8", errors="ignore")
 
-            # Check for common false positives (version numbers)
-            # Look at surrounding context
+            # Check for common false positives (version numbers) only when the
+            # matched token itself is the version literal.
             start = max(0, match.start() - 20)
             end = min(len(data), match.end() + 20)
-            surrounding = data[start:end].decode("utf-8", errors="ignore").lower()
+            surrounding_bytes = data[start:end]
+            surrounding = surrounding_bytes.decode("utf-8", errors="ignore").lower()
 
-            # Skip if it looks like a version number
-            if any(word in surrounding for word in ["version", "ver", "v.", "release", "build"]):
+            version_match = _VERSION_LITERAL_CONTEXT_PATTERN.search(surrounding_bytes)
+            if version_match and version_match.group("value") == match.group():
                 continue
 
             # Skip if surrounded by quotes and has typical version patterns
@@ -653,8 +666,9 @@ class NetworkCommDetector:
             if domain in ["numpy.org", "pytorch.org", "tensorflow.org"]:
                 continue  # ML framework domains
 
-            # Skip ML model layer names (e.g., layer1.weight, conv2d.bias)
-            if any(pattern in domain for pattern in ["layer", "weight", "bias", "conv", "bn", "norm", "fc", "dense"]):
+            # Skip actual layer-name grammar (e.g., layer1.weight), not any
+            # attacker-controlled DNS name that happens to contain ML words.
+            if _ML_LAYER_DOMAIN_PATTERN.fullmatch(domain):
                 continue
 
             # Skip very short domain names in binary files (likely false positives)
