@@ -212,6 +212,8 @@ def test_manifest_scanner_can_handle(tmp_path):
     (tmp_path / "environment.yml").write_text("name: model-env\n")
     (tmp_path / "conda.yaml").write_text("name: model-env\n")
     (tmp_path / "artifact.manifest").write_text('{"model_type": "bert"}')
+    (tmp_path / "weights.model").write_text('{"blob": true}')
+    (tmp_path / "weights.metadata").write_text('{"blob": true}')
     (tmp_path / "tokenizer_config.json").write_text("{}")
     (tmp_path / "package.json").write_text("{}")
     (tmp_path / "tsconfig.json").write_text("{}")
@@ -225,6 +227,8 @@ def test_manifest_scanner_can_handle(tmp_path):
     assert scanner.can_handle(str(tmp_path / "environment.yml")) is True
     assert scanner.can_handle(str(tmp_path / "conda.yaml")) is True
     assert scanner.can_handle(str(tmp_path / "artifact.manifest")) is True
+    assert scanner.can_handle(str(tmp_path / "weights.model")) is False
+    assert scanner.can_handle(str(tmp_path / "weights.metadata")) is False
 
     # Should not handle tokenizer configs (excluded)
     assert scanner.can_handle(str(tmp_path / "tokenizer_config.json")) is False

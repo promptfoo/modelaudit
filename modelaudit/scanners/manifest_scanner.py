@@ -71,7 +71,7 @@ MANIFEST_EXACT_FILENAMES = frozenset(
         "index.json",
     }
 )
-MANIFEST_EXACT_EXTENSIONS = frozenset({".manifest", ".model", ".metadata"})
+MANIFEST_EXACT_EXTENSIONS = frozenset({".manifest"})
 
 # Keys that might contain model names
 MODEL_NAME_KEYS_LOWER = [
