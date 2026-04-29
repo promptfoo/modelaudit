@@ -11,6 +11,7 @@ import pytest
 
 from modelaudit.detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Check, ScanResult
+from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
@@ -1745,6 +1746,155 @@ def test_pytorch_zip_scanner_compression_ratio_check(tmp_path):
     ratio_issues = [i for i in result.issues if "compression" in i.message.lower() and "ratio" in i.message.lower()]
     assert len(ratio_issues) > 0
     assert ratio_issues[0].severity == IssueSeverity.WARNING
+
+
+def test_pytorch_zip_scanner_high_ratio_pickle_marks_scan_inconclusive(tmp_path: Path) -> None:
+    """Skipped high-ratio pickle members must fail closed instead of disappearing from coverage."""
+    zip_path = tmp_path / "ratio_elided_pickle.pt"
+    payload = pickle.dumps(
+        {
+            "padding": b"\x00" * (1024 * 1024),
+            "payload": _malicious_eval_pickle_payload(),
+        },
+        protocol=4,
+    )
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("data.pkl", payload)
+
+    result = PyTorchZipScanner(config={"max_compression_ratio": 10}).scan(str(zip_path))
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_compression_ratio_unscanned" in result.metadata["scan_outcome_reasons"]
+    ratio_checks = [
+        check
+        for check in result.checks
+        if check.name == "Compression Ratio Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(ratio_checks) == 1
+    assert ratio_checks[0].details["analysis_incomplete"] is True
+
+
+def test_pytorch_zip_scanner_recurses_into_nested_zip_members(tmp_path: Path) -> None:
+    """Nested ZIP payloads should be recursively routed instead of staying invisible."""
+    nested_zip = tmp_path / "nested.zip"
+    with zipfile.ZipFile(nested_zip, "w") as archive:
+        archive.writestr("payload.pkl", _malicious_eval_pickle_payload())
+
+    zip_path = tmp_path / "nested_payload.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zipf.write(nested_zip, "archive/nested.zip")
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert result.metadata["file_size"] == zip_path.stat().st_size
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.location is not None
+        and f"{zip_path}:archive/nested.zip:payload.pkl" in issue.location
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_scanner_recurses_into_zip_members_named_like_pickles(tmp_path: Path) -> None:
+    nested_zip = tmp_path / "nested.zip"
+    with zipfile.ZipFile(nested_zip, "w") as archive:
+        archive.writestr("payload.pkl", _malicious_eval_pickle_payload())
+
+    zip_path = tmp_path / "nested_payload.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zipf.write(nested_zip, "archive/nested.pkl")
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.location is not None
+        and f"{zip_path}:archive/nested.pkl:payload.pkl" in issue.location
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_scanner_bounds_nested_zip_member_copy(tmp_path: Path) -> None:
+    """Oversized nested ZIP members should fail closed before rescanning."""
+    nested_zip = tmp_path / "nested.zip"
+    with zipfile.ZipFile(nested_zip, "w") as archive:
+        archive.writestr("payload.pkl", _malicious_eval_pickle_payload())
+
+    zip_path = tmp_path / "nested_payload.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zipf.write(nested_zip, "archive/nested.zip")
+
+    nested_scan_calls: list[str] = []
+
+    def scan_nested_member(path: str, config: dict[str, object] | None = None) -> ScanResult:
+        nested_scan_calls.append(path)
+        nested_result = ScanResult(scanner_name="zip")
+        nested_result.finish(success=True)
+        return nested_result
+
+    result = PyTorchZipScanner(
+        config={
+            "max_nested_zip_member_bytes": nested_zip.stat().st_size - 1,
+            NESTED_SCAN_CALLBACK_CONFIG_KEY: scan_nested_member,
+        }
+    ).scan(str(zip_path))
+
+    assert result.success is False
+    assert nested_scan_calls == []
+    size_checks = [check for check in result.checks if check.name == "Nested ZIP Size Limit"]
+    assert len(size_checks) == 1
+    assert size_checks[0].details["zip_entries"] == ["archive/nested.zip"]
+    assert size_checks[0].details["max_member_bytes"] == nested_zip.stat().st_size - 1
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_nested_archive_size_limit" in result.metadata["scan_outcome_reasons"]
+
+
+def test_pytorch_zip_scanner_enforces_nested_zip_depth_limit(tmp_path: Path) -> None:
+    """Nested ZIP recursion should stop once the shared archive depth cap is reached."""
+    nested_zip = tmp_path / "nested.zip"
+    with zipfile.ZipFile(nested_zip, "w") as archive:
+        archive.writestr("payload.pkl", _malicious_eval_pickle_payload())
+
+    zip_path = tmp_path / "nested_payload.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zipf.write(nested_zip, "archive/nested.zip")
+
+    nested_scan_calls: list[str] = []
+
+    def scan_nested_member(path: str, config: dict[str, object] | None = None) -> ScanResult:
+        nested_scan_calls.append(path)
+        nested_result = ScanResult(scanner_name="zip")
+        nested_result.finish(success=True)
+        return nested_result
+
+    result = PyTorchZipScanner(
+        config={
+            "max_zip_depth": 1,
+            "_archive_depth": 1,
+            NESTED_SCAN_CALLBACK_CONFIG_KEY: scan_nested_member,
+        }
+    ).scan(str(zip_path))
+
+    assert result.success is False
+    assert nested_scan_calls == []
+    depth_checks = [check for check in result.checks if check.name == "Nested ZIP Depth Limit"]
+    assert len(depth_checks) == 1
+    assert depth_checks[0].details["zip_entries"] == ["archive/nested.zip"]
+    assert depth_checks[0].details["max_depth"] == 1
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_nested_archive_depth_limit" in result.metadata["scan_outcome_reasons"]
 
 
 def test_pytorch_zip_scanner_small_high_ratio_metadata_stays_clean(tmp_path: Path) -> None:

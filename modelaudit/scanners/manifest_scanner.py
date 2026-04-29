@@ -157,6 +157,7 @@ HASH_INTEGRITY_KEYS = [
 
 # Regex pattern for hexadecimal strings (used to detect hash values)
 HEX_PATTERN = re.compile(r"^[a-fA-F0-9]+$")
+JINJA_TEMPLATE_FIELD_NAMES = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
 
 # Comprehensive allowlist of trusted domains for ML model configs
 # URLs from domains NOT in this list will be flagged as untrusted
@@ -653,6 +654,12 @@ class ManifestScanner(BaseScanner):
                 self._check_weak_hashes(content, result)
                 self._check_timeout()
 
+                # Manifest-owned configs can still carry executable chat
+                # templates, so preserve manifest checks while delegating those
+                # embedded fields to the dedicated Jinja analyzer.
+                self._scan_embedded_jinja_templates(path, content, result)
+                self._check_timeout()
+
             else:
                 result.add_check(
                     name="Manifest Structure",
@@ -833,6 +840,33 @@ class ManifestScanner(BaseScanner):
                 )
 
         return _PARSE_FAILED
+
+    def _scan_embedded_jinja_templates(self, path: str, content: Any, result: ScanResult) -> None:
+        templates = self._collect_jinja_template_fields(content)
+        if not templates:
+            return
+
+        from .jinja2_template_scanner import Jinja2TemplateScanner
+
+        result.merge(Jinja2TemplateScanner(config=self.config).scan_extracted_templates(path, templates))
+
+    @classmethod
+    def _collect_jinja_template_fields(cls, value: Any, path: str = "") -> dict[str, str]:
+        if isinstance(value, dict):
+            templates: dict[str, str] = {}
+            for key, item in value.items():
+                child_path = f"{path}.{key}" if path else str(key)
+                if key in JINJA_TEMPLATE_FIELD_NAMES and isinstance(item, str) and item.strip():
+                    templates[child_path] = item
+                templates.update(cls._collect_jinja_template_fields(item, child_path))
+            return templates
+        if isinstance(value, list):
+            templates = {}
+            for index, item in enumerate(value):
+                child_path = f"{path}[{index}]" if path else f"[{index}]"
+                templates.update(cls._collect_jinja_template_fields(item, child_path))
+            return templates
+        return {}
 
     def _parse_ini_file(self, content: str) -> dict[str, Any]:
         """Parse INI-style manifests into nested dictionaries."""
