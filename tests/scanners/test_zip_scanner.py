@@ -498,6 +498,31 @@ def test_scan_npz_ignores_extensionless_executable_near_match(tmp_path: Path) ->
     assert not any(check.name == "Executable Archive Member Detection" for check in result.checks)
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\xca\xfe\xba\xbf" + b"\x00" * 64,
+        b"\xbf\xba\xfe\xca" + b"\x00" * 64,
+    ],
+)
+def test_scan_npz_flags_extensionless_macho_fat64_members(tmp_path: Path, payload: bytes) -> None:
+    """ZIP-like archives should flag both endian variants of Mach-O fat64 binaries."""
+    archive_path = tmp_path / "model_bundle.npz"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("bin/runme", payload)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    executable_checks = [
+        check
+        for check in result.checks
+        if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert len(executable_checks) == 1
+    assert executable_checks[0].details["entry"] == "bin/runme"
+
+
 def test_scan_npz_ignores_numpy_member_near_python_suffix(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.npz"
     with zipfile.ZipFile(archive_path, "w") as archive:

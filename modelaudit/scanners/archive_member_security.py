@@ -35,6 +35,9 @@ _EXECUTABLE_ARCHIVE_MEMBER_MAGIC_PREFIXES = (
     b"\xcf\xfa\xed\xfe",
     b"\xce\xfa\xed\xfe",
     b"\xca\xfe\xba\xbe",
+    b"\xbe\xba\xfe\xca",
+    b"\xca\xfe\xba\xbf",
+    b"\xbf\xba\xfe\xca",
     b"#!",
 )
 _VERSIONED_SHARED_OBJECT_SUFFIX_RE = re.compile(r"\.so(?:\.[0-9]+)+$")
