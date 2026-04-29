@@ -57,7 +57,7 @@ class JaxCheckpointScanner(BaseScanner):
         "device_array",
     )
     _JAX_INDICATOR_PATTERNS: ClassVar[tuple[re.Pattern[str], ...]] = tuple(
-        re.compile(rf"(?<![a-z0-9]){re.escape(indicator)}", re.IGNORECASE) for indicator in _JAX_INDICATORS
+        re.compile(rf"(?<![a-z]){re.escape(indicator)}", re.IGNORECASE) for indicator in _JAX_INDICATORS
     )
     _DOCUMENTATION_CONTEXT_HINTS: ClassVar[frozenset[str]] = frozenset(
         {
