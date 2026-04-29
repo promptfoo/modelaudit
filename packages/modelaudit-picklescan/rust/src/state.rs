@@ -38,6 +38,14 @@ use crate::strings::{is_repeated_single_byte, suspicious_string_matches};
 
 const MIN_SUSPICIOUS_LITERAL_SCAN_WINDOW_CHARS: usize = 8192;
 const SUSPICIOUS_LITERAL_SCAN_OVERLAP_CHARS: usize = 4096;
+const MAX_STR_FORMAT_FIELD_NESTING: usize = 4;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FormatFieldNumbering {
+    Unset,
+    Auto,
+    Manual,
+}
 const TIME_CHECK_INTERVAL_OPCODES: usize = 4096;
 const MAX_IMPORT_REFERENCES: usize = 10_000;
 
@@ -1491,9 +1499,7 @@ impl<'a> ScanState<'a> {
             ("builtins", "format") => {
                 Self::builtins_format_invocations(arguments, op_name, position)
             }
-            ("builtins", "str.format") => {
-                Self::str_format_invocations(arguments, op_name, position)
-            }
+            ("builtins", "str.format") => self.str_format_invocations(arguments, op_name, position),
             ("builtins", "str.format_map") => {
                 self.str_format_map_invocations(arguments, op_name, position)
             }
@@ -2017,6 +2023,7 @@ impl<'a> ScanState<'a> {
     }
 
     fn str_format_invocations(
+        &self,
         arguments: &[StackValue],
         op_name: &'static str,
         position: usize,
@@ -2024,7 +2031,7 @@ impl<'a> ScanState<'a> {
         if arguments.len() < 2 || !Self::is_format_string_argument(arguments.first()) {
             return Vec::new();
         }
-        arguments
+        let mut invocations: Vec<CallableInvocation> = arguments
             .iter()
             .skip(1)
             .filter_map(|argument| match argument {
@@ -2033,7 +2040,167 @@ impl<'a> ScanState<'a> {
                 }
                 _ => None,
             })
-            .collect()
+            .collect();
+
+        let Some(format_string) = resolve_global_operand(arguments.first(), self.payload) else {
+            return invocations;
+        };
+        let Some(lookup_indices) = Self::str_format_positional_lookup_indices(&format_string)
+        else {
+            return invocations;
+        };
+
+        for index in lookup_indices {
+            invocations.extend(self.mapping_lookup_invocations(
+                arguments.get(index + 1),
+                None,
+                op_name,
+                position,
+            ));
+        }
+        invocations
+    }
+
+    fn str_format_positional_lookup_indices(format_string: &str) -> Option<Vec<usize>> {
+        let mut numbering = FormatFieldNumbering::Unset;
+        let mut next_auto_index = 0;
+        let mut lookup_indices = Vec::new();
+        Self::collect_str_format_lookup_indices(
+            format_string,
+            0,
+            &mut numbering,
+            &mut next_auto_index,
+            &mut lookup_indices,
+        )?;
+        Some(lookup_indices)
+    }
+
+    fn collect_str_format_lookup_indices(
+        format_string: &str,
+        depth: usize,
+        numbering: &mut FormatFieldNumbering,
+        next_auto_index: &mut usize,
+        lookup_indices: &mut Vec<usize>,
+    ) -> Option<()> {
+        if depth > MAX_STR_FORMAT_FIELD_NESTING {
+            return Some(());
+        }
+
+        let bytes = format_string.as_bytes();
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'{' if bytes.get(cursor + 1) == Some(&b'{') => {
+                    cursor += 2;
+                }
+                b'{' => {
+                    let (field, next_cursor) =
+                        Self::extract_str_format_field(format_string, cursor + 1)?;
+                    Self::collect_str_format_field_lookup_indices(
+                        field,
+                        depth,
+                        numbering,
+                        next_auto_index,
+                        lookup_indices,
+                    )?;
+                    cursor = next_cursor;
+                }
+                b'}' if bytes.get(cursor + 1) == Some(&b'}') => {
+                    cursor += 2;
+                }
+                b'}' => return None,
+                _ => cursor += 1,
+            }
+        }
+        Some(())
+    }
+
+    fn extract_str_format_field(format_string: &str, start: usize) -> Option<(&str, usize)> {
+        let bytes = format_string.as_bytes();
+        let mut cursor = start;
+        let mut nested_depth = 0usize;
+
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'{' if bytes.get(cursor + 1) == Some(&b'{') => {
+                    cursor += 2;
+                }
+                b'{' => {
+                    nested_depth += 1;
+                    cursor += 1;
+                }
+                b'}' if nested_depth == 0 => {
+                    return Some((&format_string[start..cursor], cursor + 1));
+                }
+                b'}' => {
+                    nested_depth -= 1;
+                    cursor += 1;
+                }
+                _ => cursor += 1,
+            }
+        }
+        None
+    }
+
+    fn collect_str_format_field_lookup_indices(
+        field: &str,
+        depth: usize,
+        numbering: &mut FormatFieldNumbering,
+        next_auto_index: &mut usize,
+        lookup_indices: &mut Vec<usize>,
+    ) -> Option<()> {
+        let bytes = field.as_bytes();
+        let mut delimiter_index = bytes.len();
+        let mut format_spec_index = None;
+        for (index, byte) in bytes.iter().enumerate() {
+            if matches!(byte, b'!' | b':') {
+                delimiter_index = index;
+                if *byte == b':' {
+                    format_spec_index = Some(index + 1);
+                }
+                break;
+            }
+        }
+
+        let field_name = &field[..delimiter_index];
+        let root_end = field_name.find(['[', '.']).unwrap_or(field_name.len());
+        let root = &field_name[..root_end];
+        let has_item_lookup = field_name[root_end..].contains('[');
+
+        let positional_index = if root.is_empty() {
+            if *numbering == FormatFieldNumbering::Manual {
+                return None;
+            }
+            *numbering = FormatFieldNumbering::Auto;
+            let index = *next_auto_index;
+            *next_auto_index += 1;
+            Some(index)
+        } else if root.bytes().all(|byte| byte.is_ascii_digit()) {
+            if *numbering == FormatFieldNumbering::Auto {
+                return None;
+            }
+            *numbering = FormatFieldNumbering::Manual;
+            root.parse::<usize>().ok()
+        } else {
+            None
+        };
+
+        if has_item_lookup {
+            if let Some(index) = positional_index {
+                lookup_indices.push(index);
+            }
+        }
+
+        if let Some(spec_start) = format_spec_index {
+            Self::collect_str_format_lookup_indices(
+                &field[spec_start..],
+                depth + 1,
+                numbering,
+                next_auto_index,
+                lookup_indices,
+            )?;
+        }
+        Some(())
     }
 
     fn str_format_map_invocations(
