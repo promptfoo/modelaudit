@@ -1509,13 +1509,15 @@ def test_pickle_scanner_delegates_late_jax_patterns_for_ckpt_suffixes(tmp_path: 
     )
 
 
-def test_pickle_scanner_suppresses_jax_truncation_warning_without_jax_context(tmp_path: Path) -> None:
+def test_pickle_scanner_reports_info_only_jax_truncation_without_jax_context(tmp_path: Path) -> None:
     path = tmp_path / "large-benign.pkl"
     path.write_bytes(pickle.dumps({"padding": "a" * 4096}))
 
     result = PickleScanner(config={"jax_pickle_max_scan_bytes": 1024}).scan(str(path))
 
-    assert not any(check.name == "Pickle Checkpoint Prefix Scan Limit" for check in result.checks)
+    prefix_limit_checks = [check for check in result.checks if check.name == "Pickle Checkpoint Prefix Scan Limit"]
+    assert len(prefix_limit_checks) == 1
+    assert prefix_limit_checks[0].severity == IssueSeverity.INFO
 
 
 def test_policy_compatibility_exports_cover_required_dangerous_symbols() -> None:

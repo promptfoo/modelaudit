@@ -2454,7 +2454,7 @@ class PickleScanner(BaseScanner):
             check.name == "JAX Pattern Security Check" and check.status == CheckStatus.FAILED
             for check in jax_result.checks
         )
-        if len(data) > jax_scanner.max_pickle_scan_bytes and (has_jax_context or has_jax_findings):
+        if len(data) > jax_scanner.max_pickle_scan_bytes:
             jax_result.add_check(
                 name="Pickle Checkpoint Prefix Scan Limit",
                 passed=False,
@@ -2462,7 +2462,7 @@ class PickleScanner(BaseScanner):
                     f"Only the first {jax_scanner.max_pickle_scan_bytes} bytes of the pickle checkpoint were "
                     "inspected for opcode patterns"
                 ),
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.WARNING if has_jax_context or has_jax_findings else IssueSeverity.INFO,
                 location=path,
                 details={"max_pickle_scan_bytes": jax_scanner.max_pickle_scan_bytes},
                 rule_code="S902",
