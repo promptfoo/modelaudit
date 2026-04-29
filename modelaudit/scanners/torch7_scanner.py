@@ -26,7 +26,7 @@ NETWORK_OR_SHELL_PATTERN = re.compile(
     r"/bin/sh|/bin/bash|bash\s+-c|sh\s+-c|netcat|nc\s+"
     r")"
 )
-REQUIRE_PATTERN = re.compile(r"(?i)\brequire\s*\(\s*['\"]([^'\"]+)['\"]\s*\)")
+REQUIRE_PATTERN = re.compile(r"(?i)\brequire\s*(?:\(\s*['\"]([^'\"]+)['\"]\s*\)|['\"]([^'\"]+)['\"])")
 DYNAMIC_LOAD_PATTERN = re.compile(r"(?i)\b(?:package\.loadlib|ffi\.load|loadlib)\b")
 
 SAFE_REQUIRE_MODULES = frozenset(
@@ -241,7 +241,7 @@ class Torch7Scanner(BaseScanner):
 
         for text in strings:
             load_hit = bool(DYNAMIC_LOAD_PATTERN.search(text))
-            requires = REQUIRE_PATTERN.findall(text)
+            requires = [module for match in REQUIRE_PATTERN.findall(text) for module in match if module]
             suspicious_requires = [
                 module
                 for module in requires

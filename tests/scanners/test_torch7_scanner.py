@@ -61,6 +61,35 @@ def test_scan_comment_token_does_not_suppress_lua_execution_detection(tmp_path: 
     assert execution_findings[0].severity == IssueSeverity.CRITICAL
 
 
+def test_scan_detects_bare_string_require_for_untrusted_module(tmp_path: Path) -> None:
+    payload = b'T7\x00\x00torch.FloatTensor nn.Sequential\nlocal mod = require "socket"\n'
+    path = _write_torch7_file(tmp_path, payload, filename="bare-require.t7")
+
+    result = Torch7Scanner().scan(str(path))
+
+    dynamic_findings = [
+        check
+        for check in result.checks
+        if check.name == "Torch7 Dynamic Module Load Analysis" and check.status == CheckStatus.FAILED
+    ]
+    assert len(dynamic_findings) == 1
+    assert dynamic_findings[0].severity == IssueSeverity.WARNING
+
+
+def test_scan_allows_bare_string_require_for_safe_module(tmp_path: Path) -> None:
+    payload = b'T7\x00\x00torch.FloatTensor nn.Sequential\nlocal torch = require "torch"\n'
+    path = _write_torch7_file(tmp_path, payload, filename="safe-bare-require.t7")
+
+    result = Torch7Scanner().scan(str(path))
+
+    dynamic_findings = [
+        check
+        for check in result.checks
+        if check.name == "Torch7 Dynamic Module Load Analysis" and check.status == CheckStatus.FAILED
+    ]
+    assert dynamic_findings == []
+
+
 def test_scan_handles_corrupt_file_gracefully(tmp_path: Path) -> None:
     path = _write_torch7_file(tmp_path, b"NOT7", filename="corrupt.t7")
 
