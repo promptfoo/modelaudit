@@ -245,6 +245,17 @@ class TestFileFilter:
         assert not should_skip_file(str(disguised_pmml))
         assert should_skip_file(str(benign_xml))
 
+    def test_disguised_pmml_with_oversized_doctype_subset_bypasses_default_skip(self, tmp_path: Path) -> None:
+        """Oversized PMML DOCTYPE subsets should still preserve routing under skipped suffixes."""
+        disguised_pmml = tmp_path / "pmml.txt"
+        disguised_pmml.write_text(
+            "<?xml version='1.0'?><!DOCTYPE PMML [" + ("x" * ((1024 * 1024) + 64)) + "]><PMML version='4.4'></PMML>",
+            encoding="utf-8",
+        )
+
+        assert detect_file_format_for_skip_filter(str(disguised_pmml)) == "pmml"
+        assert not should_skip_file(str(disguised_pmml))
+
     def test_executorch_payloads_bypass_extension_skip(self, tmp_path: Path) -> None:
         """Disguised ZIPs carrying supported ExecuTorch payloads should survive prefiltering."""
         disguised_zip = tmp_path / "executorch.jpg"

@@ -1100,6 +1100,17 @@ def test_detect_pmml_xml_beyond_64_bytes(tmp_path):
     assert detect_file_format_from_magic(str(pmml_path)) == "pmml"
 
 
+def test_detect_pmml_xml_with_oversized_doctype_subset(tmp_path):
+    """DOCTYPE roots should preserve PMML routing when the subset exceeds the bounded probe."""
+    pmml_path = tmp_path / "oversized_doctype_pmml.txt"
+    pmml_path.write_text(
+        "<?xml version='1.0'?><!DOCTYPE PMML [" + ("x" * ((1024 * 1024) + 64)) + "]><PMML/>",
+        encoding="utf-8",
+    )
+
+    assert detect_file_format_from_magic(str(pmml_path)) == "pmml"
+
+
 def test_detect_pmml_xml_short_file(tmp_path):
     """Test PMML detection with file smaller than 64 bytes."""
     # Create a short PMML XML file

@@ -150,6 +150,23 @@ def _skip_xml_doctype_declaration(xml_prefix: bytes, start_offset: int) -> int |
     return None
 
 
+def _get_xml_doctype_root_tag(xml_prefix: bytes, start_offset: int) -> str | None:
+    """Return the normalized root name declared by a DOCTYPE."""
+    index = start_offset + len(b"<!DOCTYPE")
+    prefix_length = len(xml_prefix)
+    while index < prefix_length and chr(xml_prefix[index]).isspace():
+        index += 1
+
+    name_start = index
+    while index < prefix_length and xml_prefix[index : index + 1] not in b" \t\r\n\f[>":
+        index += 1
+    if index == name_start:
+        return None
+
+    raw_tag = xml_prefix[name_start:index].decode("utf-8", "ignore")
+    return raw_tag.rsplit(":", 1)[-1].lower()
+
+
 def _xml_root_tag_from_prefix(xml_prefix: bytes) -> str | None:
     """Return the normalized first XML element name from a bounded prefix."""
     index = 3 if xml_prefix.startswith(b"\xef\xbb\xbf") else 0
@@ -174,9 +191,10 @@ def _xml_root_tag_from_prefix(xml_prefix: bytes) -> str | None:
             continue
 
         if xml_prefix[index : index + len(b"<!DOCTYPE")].upper() == b"<!DOCTYPE":
+            doctype_root_tag = _get_xml_doctype_root_tag(xml_prefix, index)
             next_index = _skip_xml_doctype_declaration(xml_prefix, index)
             if next_index is None:
-                return None
+                return doctype_root_tag
             index = next_index
             continue
 
