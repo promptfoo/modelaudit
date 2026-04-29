@@ -218,6 +218,18 @@ class TestFileFilter:
 
         assert should_skip_file(str(near_match))
 
+    @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
+    def test_content_recognized_payloads_bypass_default_hidden_and_basename_skips(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        """Supported payloads should survive default hidden and basename filters."""
+        disguised_pickle = tmp_path / filename
+        disguised_pickle.write_bytes(pickle.dumps({"safe": True}))
+
+        assert not should_skip_file(str(disguised_pickle))
+
     def test_disguised_lightgbm_text_model_bypasses_default_skip(self, tmp_path: Path) -> None:
         """Default skip filtering must preserve supported text models under skipped suffixes."""
         disguised_lightgbm = tmp_path / "model.txt"
@@ -310,8 +322,8 @@ class TestFileFilter:
 
         assert should_skip_file(str(config_zip))
 
-    def test_docx_like_zip_remains_skipped_when_office_markers_appear_late(self, tmp_path: Path) -> None:
-        """Office ZIP detection should not depend on member order within the sniff budget."""
+    def test_large_docx_like_zip_is_preserved_when_sniff_budget_is_exhausted(self, tmp_path: Path) -> None:
+        """Large Office ZIPs should be preserved once the prefilter can no longer prove they are benign."""
         docx_path = tmp_path / "late-office.docx"
         with zipfile.ZipFile(docx_path, "w") as archive:
             archive.writestr("[Content_Types].xml", "<Types></Types>")
@@ -319,7 +331,19 @@ class TestFileFilter:
                 archive.writestr(f"docs/{index}.txt", "filler")
             archive.writestr("word/document.xml", "<w:document></w:document>")
 
-        assert should_skip_file(str(docx_path))
+        assert not should_skip_file(str(docx_path))
+
+    def test_large_docx_with_late_pickle_payload_is_preserved(self, tmp_path: Path) -> None:
+        """Late payloads in Office-like ZIPs must survive bounded prefiltering."""
+        docx_path = tmp_path / "late-payload.docx"
+        with zipfile.ZipFile(docx_path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types></Types>")
+            archive.writestr("word/document.xml", "<w:document></w:document>")
+            for index in range(_ZIP_MEMBER_SNIFF_LIMIT):
+                archive.writestr(f"docs/{index}.txt", "filler")
+            archive.writestr("payload.pkl", pickle.dumps({"safe": True}, protocol=4))
+
+        assert not should_skip_file(str(docx_path))
 
     def test_large_ambiguous_zip_is_preserved_for_scanning(self, tmp_path: Path) -> None:
         """Ambiguous ZIPs should survive the prefilter when the sniff budget is exhausted."""
