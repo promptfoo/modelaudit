@@ -576,6 +576,13 @@ def test_get_scanner_for_path_routes_extensionless_readme_to_metadata_scanner(tm
     _assert_scanner_for_path(readme_path, "metadata")
 
 
+def test_get_scanner_for_path_routes_extensionless_llamafile(tmp_path: Path) -> None:
+    llamafile_path = tmp_path / "llama"
+    llamafile_path.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime")
+
+    _assert_scanner_for_path(llamafile_path, "llamafile")
+
+
 @pytest.mark.parametrize("filename", ["README.md.bak", "model_card.tmp"])
 def test_get_scanner_for_path_does_not_route_metadata_near_match_suffixes(
     tmp_path: Path,

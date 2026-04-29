@@ -251,6 +251,8 @@ class ScannerRegistry:
                 candidate_extensions.append(candidate)
         if file_ext and file_ext not in candidate_extensions:
             candidate_extensions.append(file_ext)
+        if not candidate_extensions:
+            candidate_extensions.append("")
 
         is_zip_file = False
         try:

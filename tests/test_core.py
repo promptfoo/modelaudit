@@ -757,6 +757,15 @@ def test_scan_file_does_not_route_gguf_magic_near_match_to_gguf(tmp_path: Path) 
     assert result.issues == []
 
 
+def test_scan_file_routes_extensionless_llamafile(tmp_path: Path) -> None:
+    extensionless_llamafile = tmp_path / "llama"
+    extensionless_llamafile.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime")
+
+    result = scan_file(str(extensionless_llamafile))
+
+    assert result.scanner_name == "llamafile"
+
+
 def test_scan_file_routes_misnamed_onnx_by_header(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     disguised_onnx = tmp_path / "model.payload"
