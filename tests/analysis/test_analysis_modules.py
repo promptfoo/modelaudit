@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 
 class TestAnalysisModules:
     """Test that analysis modules can be imported and instantiated."""
@@ -87,6 +89,29 @@ class TestAnalysisModules:
         }
         assert risk_order[safe_risk] < risk_order[dangerous_risk]
 
+    def test_semantic_analyzer_resolves_import_aliases(self) -> None:
+        """Dangerous calls made through imported aliases should remain visible."""
+        from modelaudit.analysis import CodeRiskLevel, SemanticAnalyzer
+
+        analyzer = SemanticAnalyzer()
+
+        risk_level, details = analyzer.analyze_code_behavior("import os as o\no.system('id')", {})
+
+        assert risk_level != CodeRiskLevel.SAFE
+        assert "os.system" in details["function_calls"]
+
+    def test_semantic_analyzer_scopes_safe_patterns_to_operation(self) -> None:
+        """A safe eval should not pardon an unrelated dangerous operation."""
+        from modelaudit.analysis import CodeRiskLevel, SemanticAnalyzer
+
+        analyzer = SemanticAnalyzer()
+
+        risk_level, details = analyzer.analyze_code_behavior("eval('1+1')\nimport os\nos.system('id')", {})
+
+        assert risk_level != CodeRiskLevel.SAFE
+        assert "Dangerous operation: os.system" in details["risk_factors"]
+        assert "Safe usage of os.system" not in details["mitigating_factors"]
+
     def test_integrated_analyzer_basic(self):
         """Test basic integrated analyzer functionality."""
         from modelaudit.analysis import IntegratedAnalyzer
@@ -109,3 +134,51 @@ class TestAnalysisModules:
         assert isinstance(result.is_suspicious, bool)
         assert isinstance(result.confidence, float)
         assert isinstance(result.risk_level, str)
+
+    def test_integrated_analyzer_treats_high_safety_confidence_as_not_suspicious(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The final suspiciousness flag should agree with the safety-confidence scale."""
+        from modelaudit.analysis import IntegratedAnalyzer
+        from modelaudit.analysis.unified_context import UnifiedMLContext
+
+        context = UnifiedMLContext(Path("test.pkl"), 1024, "pickle")
+        analyzer = IntegratedAnalyzer()
+        monkeypatch.setattr(analyzer, "_analyze_ml_context", lambda *_args: {"confidence": 0.9, "reasoning": []})
+        monkeypatch.setattr(analyzer, "_analyze_anomalies", lambda *_args: {"confidence": 0.9, "reasoning": []})
+        monkeypatch.setattr(
+            analyzer,
+            "_analyze_framework_patterns",
+            lambda *_args: {"confidence": 0.9, "reasoning": []},
+        )
+
+        result = analyzer.analyze_suspicious_pattern("x", "token", context)
+
+        assert result.confidence == pytest.approx(0.9)
+        assert result.risk_level == "safe"
+        assert result.is_suspicious is False
+
+    def test_integrated_analyzer_treats_low_safety_confidence_as_suspicious(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Low confidence in safety should remain suspicious."""
+        from modelaudit.analysis import IntegratedAnalyzer
+        from modelaudit.analysis.unified_context import UnifiedMLContext
+
+        context = UnifiedMLContext(Path("test.pkl"), 1024, "pickle")
+        analyzer = IntegratedAnalyzer()
+        monkeypatch.setattr(analyzer, "_analyze_ml_context", lambda *_args: {"confidence": 0.1, "reasoning": []})
+        monkeypatch.setattr(analyzer, "_analyze_anomalies", lambda *_args: {"confidence": 0.1, "reasoning": []})
+        monkeypatch.setattr(
+            analyzer,
+            "_analyze_framework_patterns",
+            lambda *_args: {"confidence": 0.1, "reasoning": []},
+        )
+
+        result = analyzer.analyze_suspicious_pattern("x", "token", context)
+
+        assert result.confidence == pytest.approx(0.1)
+        assert result.risk_level == "critical"
+        assert result.is_suspicious is True
