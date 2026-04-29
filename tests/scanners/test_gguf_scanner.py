@@ -245,6 +245,22 @@ def test_gguf_scanner_keeps_benign_chat_templates_clean(tmp_path: Path) -> None:
     )
 
 
+def test_gguf_scanner_skips_oversized_chat_templates_before_jinja_analysis(tmp_path: Path) -> None:
+    path = create_mock_gguf(
+        tmp_path / "large-template.gguf",
+        metadata={"tokenizer.chat_template": "{{ content }}" * 10000},
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    assert any(
+        check.name == "Jinja2 SSTI Analysis"
+        and check.status == CheckStatus.PASSED
+        and check.details["templates_analyzed"] == 0
+        for check in result.checks
+    )
+
+
 def test_gguf_scanner_comprehensive_scan(tmp_path):
     """Test comprehensive GGUF scanning with tensors."""
     path = tmp_path / "model.gguf"

@@ -270,7 +270,12 @@ class Jinja2TemplateScanner(BaseScanner):
             "is_tokenizer": context.is_tokenizer,
             "confidence": context.confidence,
         }
-        self._analyze_extracted_templates(result, path, context, templates, file_size)
+        bounded_templates = {
+            template_location: template_content
+            for template_location, template_content in templates.items()
+            if len(template_content) <= self.max_template_size
+        }
+        self._analyze_extracted_templates(result, path, context, bounded_templates, file_size)
         return result
 
     def _analyze_extracted_templates(
