@@ -140,14 +140,20 @@ def _apply_aliases(call_name: str, alias_scopes: _AliasScopes) -> frozenset[str]
     return frozenset(f"{resolved_head}.{suffix}" for resolved_head in resolved_heads)
 
 
-def _resolve_static_string(node: ast.AST) -> str | None:
+_MAX_STATIC_STRING_DEPTH = 32
+_MAX_STATIC_STRING_LENGTH = 1024
+
+
+def _resolve_static_string(node: ast.AST, *, depth: int = 0) -> str | None:
     """Resolve bounded compile-time string expressions used in attribute lookups."""
+    if depth > _MAX_STATIC_STRING_DEPTH:
+        return None
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
+        return node.value if len(node.value) <= _MAX_STATIC_STRING_LENGTH else None
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left = _resolve_static_string(node.left)
-        right = _resolve_static_string(node.right)
-        if left is not None and right is not None:
+        left = _resolve_static_string(node.left, depth=depth + 1)
+        right = _resolve_static_string(node.right, depth=depth + 1)
+        if left is not None and right is not None and len(left) + len(right) <= _MAX_STATIC_STRING_LENGTH:
             return left + right
     return None
 

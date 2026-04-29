@@ -226,6 +226,20 @@ def test_scan_zip_flags_concatenated_getattr_name_dangerous_python_member(tmp_pa
     assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
 
+def test_scan_zip_bounds_deep_concatenated_getattr_names(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    nested_name = " + ".join(["'s'"] * 40)
+    source = f"import os\ngetattr(os, {nested_name})('echo hidden')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
 def test_scan_zip_flags_rebound_dangerous_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = "import subprocess\nrunner = subprocess.run\nrunner(['echo', 'hidden'], check=False)\n"
