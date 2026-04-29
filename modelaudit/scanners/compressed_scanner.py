@@ -34,13 +34,19 @@ class _MissingOptionalDependencyError(ImportError):
 class _DecompressedOutputSink:
     """Write aggregate and per-member decompressed payloads to temp files."""
 
-    def __init__(self, suffix: str):
+    def __init__(self, suffix: str, max_members: int):
         aggregate_fd, self.aggregate_path = tempfile.mkstemp(suffix=suffix)
         self.aggregate_file = os.fdopen(aggregate_fd, "w+b")
         self.member_paths: list[str] = []
+        self.max_members = max_members
         self.current_member_file = self._open_member_file(suffix)
 
     def _open_member_file(self, suffix: str) -> Any:
+        next_member_count = len(self.member_paths) + 1
+        if next_member_count > self.max_members:
+            raise _DecompressionLimitExceeded(
+                f"Compressed member count exceeded limit ({next_member_count} > {self.max_members})",
+            )
         member_fd, member_path = tempfile.mkstemp(suffix=suffix)
         self.member_paths.append(member_path)
         return os.fdopen(member_fd, "w+b")
@@ -89,6 +95,7 @@ class CompressedScanner(BaseScanner):
     DEFAULT_MAX_DECOMPRESSED_BYTES: ClassVar[int] = 512 * 1024 * 1024
     DEFAULT_MAX_DECOMPRESSION_RATIO: ClassVar[float] = 250.0
     DEFAULT_MAX_DEPTH: ClassVar[int] = 3
+    DEFAULT_MAX_MEMBERS: ClassVar[int] = 1000
     DEFAULT_CHUNK_SIZE: ClassVar[int] = 64 * 1024
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -100,6 +107,10 @@ class CompressedScanner(BaseScanner):
             self.config.get("compressed_max_decompression_ratio", self.DEFAULT_MAX_DECOMPRESSION_RATIO),
         )
         self.max_depth = int(self.config.get("compressed_max_depth", self.DEFAULT_MAX_DEPTH))
+        self.max_members = self._normalize_positive_int_config(
+            self.config.get("compressed_max_members"),
+            self.DEFAULT_MAX_MEMBERS,
+        )
         self.chunk_size = int(self.config.get("compressed_chunk_size", self.DEFAULT_CHUNK_SIZE))
 
     @classmethod
@@ -248,6 +259,8 @@ class CompressedScanner(BaseScanner):
                 if getattr(decompressor, "eof", False):
                     if not pending:
                         break
+                    if on_new_member is not None:
+                        on_new_member()
                     decompressor = decompressor_factory()
 
                 try:
@@ -564,7 +577,7 @@ class CompressedScanner(BaseScanner):
     def _decompress_to_tempfiles(self, path: str, codec: str) -> tuple[str, list[str], int]:
         compressed_size = self.get_file_size(path)
         suffix = self._derive_inner_suffix(path)
-        outputs = _DecompressedOutputSink(suffix)
+        outputs = _DecompressedOutputSink(suffix, self.max_members)
         try:
             with open(path, "rb") as source:
                 if codec == "gzip":
@@ -824,6 +837,7 @@ class CompressedScanner(BaseScanner):
                     "codec": expected_codec,
                     "max_decompressed_bytes": self.max_decompressed_bytes,
                     "max_decompression_ratio": self.max_decompression_ratio,
+                    "max_compressed_members": self.max_members,
                 },
             )
             result.finish(success=False)

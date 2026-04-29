@@ -429,6 +429,35 @@ def test_read_concatenated_stream_uses_chunk_bounded_decompression() -> None:
     assert [length for fake in fake_decompressors for length in fake.max_lengths] == [8]
 
 
+def test_read_concatenated_stream_splits_member_after_chunk_boundary() -> None:
+    class _FakeDecompressor:
+        def __init__(self) -> None:
+            self.eof = False
+            self.needs_input = True
+            self.unused_data = b""
+
+        def decompress(self, _chunk: bytes, max_length: int = 0) -> bytes:
+            self.eof = True
+            return b"x"
+
+    new_member_calls: list[None] = []
+
+    CompressedScanner._read_concatenated_stream_with_limits(
+        source=io.BytesIO(b"ab"),
+        destination=io.BytesIO(),
+        decompressor_factory=_FakeDecompressor,
+        error_types=(ValueError,),
+        codec="fake",
+        max_decompressed_bytes=1024,
+        max_ratio=1000.0,
+        compressed_size=2,
+        chunk_size=1,
+        on_new_member=lambda: new_member_calls.append(None),
+    )
+
+    assert len(new_member_calls) == 1
+
+
 def test_read_lz4_stream_uses_chunk_bounded_decompression() -> None:
     fake_lz4_frame = _FakeLz4FrameModule({b"S": b"12345678"})
     destination = io.BytesIO()
@@ -610,6 +639,19 @@ def test_compressed_scanner_scans_each_concatenated_member(
     ]
     assert len(member_routing_checks) == 2
     assert member_routing_checks[1].details["inner_scanner"] == "pickle"
+
+
+def test_compressed_scanner_rejects_excess_concatenated_members(tmp_path: Path) -> None:
+    path = tmp_path / "too_many_members.pkl.zlib"
+    path.write_bytes(zlib.compress(b"a") + zlib.compress(b"b") + zlib.compress(b"c"))
+
+    result = CompressedScanner(config={"compressed_max_members": 2}).scan(str(path))
+
+    limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+    assert limit_checks and limit_checks[0].status == CheckStatus.FAILED
+    assert "member count exceeded limit (3 > 2)" in limit_checks[0].message.lower()
+    assert limit_checks[0].details["max_compressed_members"] == 2
+    assert result.success is False
 
 
 def test_compressed_scanner_rejects_raw_trailer_after_lz4_frame(
