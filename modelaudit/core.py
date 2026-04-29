@@ -798,6 +798,26 @@ def scan_model_directory_or_file(
 # _should_skip_file has been moved to utils.file_filter module
 
 
+def _is_hf_hub_bookkeeping_path(path_obj: Path) -> bool:
+    """Return True for files stored under known HuggingFace hub bookkeeping directories."""
+    hf_cache_root = _find_hf_cache_root(path_obj)
+    if hf_cache_root is None or hf_cache_root.parent.name.lower() != "hub":
+        return False
+
+    try:
+        relative_parts = _resolve_hf_cache_path(path_obj).relative_to(hf_cache_root).parts
+    except ValueError:
+        return False
+
+    return bool(relative_parts and relative_parts[0] in {"snapshots", "blobs", "refs"})
+
+
+def _is_hf_download_bookkeeping_path(path_obj: Path) -> bool:
+    """Return True for files stored in HuggingFace download bookkeeping directories."""
+    normalized_parts = [part.lower() for part in path_obj.parent.parts]
+    return len(normalized_parts) >= 3 and normalized_parts[-3:] == [".cache", "huggingface", "download"]
+
+
 def _is_huggingface_cache_file(path: str) -> bool:
     """
     Check if a file is a HuggingFace cache/metadata file that should be skipped.
@@ -813,32 +833,23 @@ def _is_huggingface_cache_file(path: str) -> bool:
     filename = os.path.basename(path)
     path_obj = Path(path)
 
-    # Download lock files are HuggingFace bookkeeping files regardless of cache layout.
+    is_hf_bookkeeping_path = _is_hf_hub_bookkeeping_path(path_obj) or _is_hf_download_bookkeeping_path(path_obj)
+
+    # Only trust bookkeeping-shaped filenames when they actually live in a
+    # recognized HuggingFace cache layout.
     if filename.endswith(".lock"):
-        return True
+        return is_hf_bookkeeping_path
 
     # Only skip HuggingFace .metadata files in known cache/download layouts.
     if filename.endswith(".metadata"):
-        hf_cache_root = _find_hf_cache_root(path_obj)
-        if hf_cache_root is not None and hf_cache_root.parent.name.lower() == "hub":
-            try:
-                relative_parts = _resolve_hf_cache_path(path_obj).relative_to(hf_cache_root).parts
-            except ValueError:
-                relative_parts = ()
-
-            if relative_parts and relative_parts[0] in {"snapshots", "blobs", "refs"}:
-                return True
-
-        normalized_parts = [part.lower() for part in path_obj.parent.parts]
-        if len(normalized_parts) >= 3 and normalized_parts[-3:] == [".cache", "huggingface", "download"]:
-            return True
+        return is_hf_bookkeeping_path
 
     # Check for specific HuggingFace cache metadata files
     # We no longer skip all HuggingFace cache files since we handle symlinks properly now
 
     # Check for Git-related files that are commonly cached
     if filename in [".gitignore", ".gitattributes"]:
-        return True
+        return is_hf_bookkeeping_path
 
     if filename in ["main", "HEAD"]:
         hf_cache_root = _find_hf_cache_root(path_obj)

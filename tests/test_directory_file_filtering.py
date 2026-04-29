@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_model_directory_or_file
+from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
 
 
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
@@ -392,6 +392,47 @@ class TestDirectoryFileFiltering:
         assert _is_huggingface_cache_file(str(local_snapshots_metadata)) is False
         assert _is_huggingface_cache_file(str(hf_cache_metadata)) is True
         assert _is_huggingface_cache_file(str(hf_download_metadata)) is True
+
+    def test_bookkeeping_filenames_only_skip_inside_huggingface_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Local files with bookkeeping-looking names must still be scanned."""
+        hf_home = tmp_path / ".cache" / "huggingface"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+
+        local_lock = tmp_path / "payload.pkl.lock"
+        local_gitignore = tmp_path / ".gitignore"
+        local_gitattributes = tmp_path / ".gitattributes"
+        hf_cache_lock = hf_home / "hub" / "models--org--repo" / "snapshots" / "abc123" / "payload.pkl.lock"
+        hf_download_gitignore = hf_home / "download" / ".gitignore"
+        hf_download_gitattributes = hf_home / "download" / ".gitattributes"
+
+        assert _is_huggingface_cache_file(str(local_lock)) is False
+        assert _is_huggingface_cache_file(str(local_gitignore)) is False
+        assert _is_huggingface_cache_file(str(local_gitattributes)) is False
+        assert _is_huggingface_cache_file(str(hf_cache_lock)) is True
+        assert _is_huggingface_cache_file(str(hf_download_gitignore)) is True
+        assert _is_huggingface_cache_file(str(hf_download_gitattributes)) is True
+
+    @pytest.mark.parametrize("filename", ["payload.pkl.lock", ".gitignore", ".gitattributes"])
+    def test_direct_scans_do_not_skip_local_bookkeeping_filenames(self, tmp_path: Path, filename: str) -> None:
+        """A malicious local file should not become trusted because of its basename."""
+
+        class DangerousPayload:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo direct-scan-bookkeeping-test",))
+
+        payload = tmp_path / filename
+        payload.write_bytes(pickle.dumps(DangerousPayload()))
+
+        result = scan_file(str(payload))
+
+        assert result.scanner_name != "skipped"
+        assert any(issue.severity.value == "critical" for issue in result.issues)
 
     def test_huggingface_cache_metadata_skip_uses_resolved_cache_root(
         self,
