@@ -217,6 +217,30 @@ class TestDirectoryFileFiltering:
         assert results["files_scanned"] == 1
         assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
 
+    @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
+    def test_disguised_pickle_with_default_hidden_or_basename_skip_is_scanned(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        """Default hidden/basename filters must not suppress supported payload content."""
+
+        class DangerousPayload:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo directory-hidden-filter-test",))
+
+        safe_payload = tmp_path / "safe.pkl"
+        disguised_payload = tmp_path / filename
+        safe_payload.write_bytes(pickle.dumps({"safe": True}))
+        disguised_payload.write_bytes(pickle.dumps(DangerousPayload()))
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 2
+        assert any(filename in (issue.location or "") for issue in results.issues)
+
     def test_real_images_remain_skipped(self, tmp_path: Path) -> None:
         """Content sniffing should not promote ordinary media files into the scan set."""
         image_path = tmp_path / "cover.jpg"
