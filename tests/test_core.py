@@ -15,7 +15,7 @@ import pytest
 from modelaudit import core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import scan_file
-from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from tests.helpers import create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
@@ -638,6 +638,28 @@ def test_scan_file_routes_raw_pickle_torch_suffix_collisions_to_pickle(
     assert result.success is True
 
 
+def test_scan_file_routes_jax_pickles_through_jax_specific_analysis(tmp_path: Path) -> None:
+    model_path = tmp_path / "state.pickle"
+    model_path.write_bytes(
+        pickle.dumps(
+            {
+                "framework": "jax",
+                "payload": "jax.experimental.io_callback",
+            }
+        )
+    )
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    assert any(
+        check.name == "JAX Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["pattern"] == r"jax\.experimental\.io_callback"
+        for check in result.checks
+    )
+
+
 def test_scan_file_routes_raw_bin_without_zip_structure_to_pytorch_binary(tmp_path: Path) -> None:
     model_path = tmp_path / "weights.bin"
     model_path.write_bytes(b"\x00" * 128)
@@ -936,3 +958,23 @@ def test_scan_file_routes_model_config_json_to_manifest_scanner(tmp_path: Path) 
 
     assert result.scanner_name == "manifest"
     assert result.success is True
+
+
+def test_scan_file_routes_manifest_owned_chat_templates_through_jinja_analysis(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "config.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+            }
+        )
+    )
+
+    result = scan_file(str(manifest_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "manifest"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
