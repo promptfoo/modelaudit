@@ -624,6 +624,18 @@ class TestModelAuditResultModel:
         assert result.success is False
 
 
+def test_scan_result_merge_preserves_unsuccessful_child_after_parent_finish() -> None:
+    """Merged child failures must survive a later successful parent finish call."""
+    parent = ScanResult(scanner_name="parent")
+    child = ScanResult(scanner_name="child")
+    child.finish(success=False)
+
+    parent.merge(child)
+    parent.finish(success=True)
+
+    assert parent.success is False
+
+
 class TestScanConfigModel:
     """Tests for ScanConfigModel."""
 
