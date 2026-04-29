@@ -142,6 +142,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Mark invoked call-graph targets as incomplete when Python source cannot be
+  analyzed, and refresh source-derived call-graph caches between scans.
 - Detect additional stdlib callable pickle targets that can access files,
   mutate registries, suppress diagnostics, or change process state, including
   Python 3.13 `pathlib._local` concrete path aliases, public `operator.setitem`
