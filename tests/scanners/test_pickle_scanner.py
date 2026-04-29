@@ -1516,8 +1516,26 @@ def test_pickle_scanner_reports_info_only_jax_truncation_without_jax_context(tmp
     result = PickleScanner(config={"jax_pickle_max_scan_bytes": 1024}).scan(str(path))
 
     prefix_limit_checks = [check for check in result.checks if check.name == "Pickle Checkpoint Prefix Scan Limit"]
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["jax_pickle_scan_limit_exceeded"]
     assert len(prefix_limit_checks) == 1
     assert prefix_limit_checks[0].severity == IssueSeverity.INFO
+
+
+def test_pickle_scanner_fails_closed_when_jax_payload_is_after_delegated_scan_window(tmp_path: Path) -> None:
+    path = tmp_path / "late-hidden-jax.pkl"
+    path.write_bytes(pickle.dumps({"padding": "a" * 4096, "payload": "jax.experimental.io_callback"}))
+
+    result = PickleScanner(config={"jax_pickle_max_scan_bytes": 1024}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["jax_pickle_scan_limit_exceeded"]
+    assert any(check.name == "Pickle Checkpoint Prefix Scan Limit" for check in result.checks)
+    assert not any(
+        check.name == "JAX Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
 
 
 def test_policy_compatibility_exports_cover_required_dangerous_symbols() -> None:

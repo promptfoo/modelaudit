@@ -2455,6 +2455,11 @@ class PickleScanner(BaseScanner):
             for check in jax_result.checks
         )
         if len(data) > jax_scanner.max_pickle_scan_bytes:
+            result.metadata["analysis_incomplete"] = True
+            result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+            scan_outcome_reasons = result.metadata.setdefault("scan_outcome_reasons", [])
+            if isinstance(scan_outcome_reasons, list) and "jax_pickle_scan_limit_exceeded" not in scan_outcome_reasons:
+                scan_outcome_reasons.append("jax_pickle_scan_limit_exceeded")
             jax_result.add_check(
                 name="Pickle Checkpoint Prefix Scan Limit",
                 passed=False,
