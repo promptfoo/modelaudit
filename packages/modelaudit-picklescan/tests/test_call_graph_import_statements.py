@@ -6,6 +6,7 @@ import importlib
 import io
 import os
 import pickle
+import py_compile
 import subprocess
 import sys
 import zipfile
@@ -14,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, ScanStatus, Severity, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
 from modelaudit_picklescan.call_graph import (
@@ -1314,6 +1316,93 @@ def test_scan_bytes_marks_zipimported_invoked_call_graph_source_unavailable(
         report = scan_bytes(
             _global_call_payload(module_name, "invoke", _unicode_operand("echo hidden")),
             source="zipimport-call-graph-source.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
+
+
+def test_scan_bytes_marks_zipimported_dotted_source_unavailable_without_parent_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_name = "modelaudit_tp_zip_parent_probe"
+    module_name = f"{package_name}.child"
+    marker = tmp_path / "parent_imported"
+    module_zip = tmp_path / "modules.zip"
+    with zipfile.ZipFile(module_zip, "w") as archive:
+        archive.writestr(
+            f"{package_name}/__init__.py",
+            f"from pathlib import Path\nPath({str(marker)!r}).write_text('imported')\n",
+        )
+        archive.writestr(
+            f"{package_name}/child.py",
+            "def invoke(command):\n    return command\n",
+        )
+    monkeypatch.syspath_prepend(str(module_zip))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            _global_call_payload(module_name, "invoke", _unicode_operand("echo hidden")),
+            source="zipimport-dotted-call-graph-source.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
+    assert not marker.exists()
+
+
+def test_scan_bytes_marks_lookup_failures_as_unanalyzable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_tp_lookup_failure_probe"
+
+    def raise_lookup_failure(_: str) -> None:
+        raise RuntimeError("lookup failed")
+
+    monkeypatch.setattr(call_graph, "_find_module_spec_without_imports", raise_lookup_failure)
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            _global_call_payload(module_name, "invoke", _unicode_operand("echo hidden")),
+            source="lookup-failure-call-graph-source.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
+
+
+def test_scan_bytes_marks_bytecode_only_invoked_call_graph_source_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_bytecode_only_call_graph_source"
+    source_path = module_dir / f"{module_name}.py"
+    source_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
+    py_compile.compile(str(source_path), cfile=str(module_dir / f"{module_name}.pyc"), doraise=True)
+    source_path.unlink()
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            _global_call_payload(module_name, "invoke", _unicode_operand("echo hidden")),
+            source="bytecode-only-call-graph-source.pkl",
         )
     finally:
         _clear_call_graph_caches()

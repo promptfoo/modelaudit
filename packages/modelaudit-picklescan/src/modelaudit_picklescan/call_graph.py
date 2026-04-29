@@ -10,7 +10,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
-from importlib.util import find_spec
+from importlib.machinery import ModuleSpec, PathFinder
 from pathlib import Path
 
 _MAX_IMPORT_REFERENCES = 32
@@ -739,14 +739,33 @@ def _call_graph_source_unavailable_reason(module_name: str) -> str | None:
         return None
 
     try:
-        spec = find_spec(module_name)
+        spec = _find_module_spec_without_imports(module_name)
     except Exception:
-        return None
-    if spec is None or spec.origin is None or spec.origin in {"built-in", "frozen"}:
-        return None
-    if spec.origin.lower().endswith((".py", ".pyw")):
         return "source_unavailable"
-    return None
+    if spec is None or spec.origin in {"built-in", "frozen"}:
+        return None
+    return "source_unavailable"
+
+
+def _find_module_spec_without_imports(module_name: str) -> ModuleSpec | None:
+    parts = module_name.split(".")
+    if not parts or any(not part or "/" in part or "\\" in part for part in parts):
+        return None
+
+    search_path: list[str] | None = None
+    spec: ModuleSpec | None = None
+    for index in range(len(parts)):
+        qualified_name = ".".join(parts[: index + 1])
+        spec = PathFinder.find_spec(qualified_name, search_path)
+        if spec is None:
+            return None
+        if index == len(parts) - 1:
+            return spec
+        locations = spec.submodule_search_locations
+        if locations is None:
+            return None
+        search_path = list(locations)
+    return spec
 
 
 @lru_cache(maxsize=4096)
