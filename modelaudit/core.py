@@ -670,12 +670,14 @@ def scan_model_directory_or_file(
             # Stop scanning if size limit reached
             if limit_reached:
                 logger.warning("Scan terminated early due to total size limit")
+                scan_metadata["success"] = False
+                scan_metadata["has_operational_errors"] = True
                 _add_issue_to_model(
                     results,
                     "Scan terminated early due to total size limit",
                     severity=IssueSeverity.INFO.value,
                     location=path,
-                    details={"max_total_size": max_total_size},
+                    details={"max_total_size": max_total_size, "analysis_incomplete": True},
                 )
         else:
             # Scan a single file or DVC pointer
