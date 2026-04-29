@@ -20,6 +20,7 @@ from modelaudit.utils.helpers.code_validation import (
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
@@ -271,7 +272,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=not result.has_errors)
+        result.finish(
+            success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
+        )
         return result
 
     def _scan_saved_model_directory(self, dir_path: str) -> ScanResult:
@@ -375,7 +378,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
                             },
                         )
 
-        result.finish(success=not result.has_errors)
+        result.finish(
+            success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
+        )
         return result
 
     def _scan_saved_model_assets(self, model_root: Path, result: ScanResult) -> None:
@@ -608,6 +613,22 @@ class TensorFlowSavedModelScanner(BaseScanner):
         decoded_head = content_head.decode("utf-8", errors="ignore")
         if decoded_head and _ASSET_PYTHON_PATTERN.search(decoded_head):
             _record_detected_type("python_source_pattern")
+
+        if content_head_is_prefix and not detected_types:
+            mark_inconclusive_scan_result(result, "savedmodel_asset_probe_incomplete")
+            result.add_check(
+                name="SavedModel Asset Probe Limit",
+                passed=False,
+                message=f"Asset exceeds bounded security probe window: {file_path.name}",
+                severity=IssueSeverity.INFO,
+                location=str(file_path),
+                details={
+                    "file_name": file_path.name,
+                    "asset_size": file_stat.st_size,
+                    "probe_bytes": _ASSET_PROBE_BYTES,
+                    "analysis_incomplete": True,
+                },
+            )
 
         return detected_types
 
