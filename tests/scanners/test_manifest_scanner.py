@@ -207,6 +207,11 @@ def test_manifest_scanner_can_handle(tmp_path):
     (tmp_path / "config.json").write_text('{"model_type": "test"}')
     (tmp_path / "generation_config.json").write_text("{}")
     (tmp_path / "model_index.json").write_text("{}")
+    (tmp_path / "manifest.json").write_text("{}")
+    (tmp_path / "hyperparams.yaml").write_text("model_type: bert\n")
+    (tmp_path / "environment.yml").write_text("name: model-env\n")
+    (tmp_path / "conda.yaml").write_text("name: model-env\n")
+    (tmp_path / "artifact.manifest").write_text('{"model_type": "bert"}')
     (tmp_path / "tokenizer_config.json").write_text("{}")
     (tmp_path / "package.json").write_text("{}")
     (tmp_path / "tsconfig.json").write_text("{}")
@@ -215,6 +220,11 @@ def test_manifest_scanner_can_handle(tmp_path):
     assert scanner.can_handle(str(tmp_path / "config.json")) is True
     assert scanner.can_handle(str(tmp_path / "generation_config.json")) is True
     assert scanner.can_handle(str(tmp_path / "model_index.json")) is True
+    assert scanner.can_handle(str(tmp_path / "manifest.json")) is True
+    assert scanner.can_handle(str(tmp_path / "hyperparams.yaml")) is True
+    assert scanner.can_handle(str(tmp_path / "environment.yml")) is True
+    assert scanner.can_handle(str(tmp_path / "conda.yaml")) is True
+    assert scanner.can_handle(str(tmp_path / "artifact.manifest")) is True
 
     # Should not handle tokenizer configs (excluded)
     assert scanner.can_handle(str(tmp_path / "tokenizer_config.json")) is False
