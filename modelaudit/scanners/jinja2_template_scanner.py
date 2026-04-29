@@ -270,11 +270,30 @@ class Jinja2TemplateScanner(BaseScanner):
             "is_tokenizer": context.is_tokenizer,
             "confidence": context.confidence,
         }
-        bounded_templates = {
-            template_location: template_content
-            for template_location, template_content in templates.items()
-            if len(template_content) <= self.max_template_size
-        }
+        bounded_templates = {}
+        oversized_template_locations = []
+        for template_location, template_content in templates.items():
+            if len(template_content) <= self.max_template_size:
+                bounded_templates[template_location] = template_content
+            else:
+                oversized_template_locations.append(template_location)
+
+        if oversized_template_locations:
+            result.metadata[_INCONCLUSIVE_METADATA_KEY] = INCONCLUSIVE_SCAN_OUTCOME
+            result.metadata[_INCONCLUSIVE_REASONS_METADATA_KEY] = ["jinja2_template_size_limit_exceeded"]
+            result.add_check(
+                name="Template Size Limit",
+                passed=False,
+                message="Template analysis incomplete because one or more extracted templates exceed the size limit",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "reason": "jinja2_template_size_limit_exceeded",
+                    "max_template_size": self.max_template_size,
+                    "skipped_template_locations": oversized_template_locations,
+                },
+            )
+
         self._analyze_extracted_templates(result, path, context, bounded_templates, file_size)
         return result
 
