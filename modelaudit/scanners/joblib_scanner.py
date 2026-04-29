@@ -270,6 +270,7 @@ class JoblibScanner(BaseScanner):
     @staticmethod
     def _mark_trusted_numpy_wrapper_tail(result: ScanResult, payload: bytes) -> None:
         if result.metadata.get("trusted_incomplete_tail") is True:
+            result.trust_merged_child_failures()
             return
         if result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME:
             return
@@ -288,6 +289,7 @@ class JoblibScanner(BaseScanner):
 
         result.metadata["trusted_incomplete_tail"] = True
         result.metadata["trusted_incomplete_tail_reason"] = "joblib_numpy_array_payload"
+        result.trust_merged_child_failures()
 
     def _looks_like_raw_pickle_payload(self, data: bytes) -> bool:
         """Return True when `.joblib` bytes should be scanned directly as pickle."""
