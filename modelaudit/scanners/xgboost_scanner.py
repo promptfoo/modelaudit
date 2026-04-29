@@ -44,6 +44,7 @@ SUSPICIOUS_JSON_PATTERNS = [
     (re.compile(r"__import__", re.IGNORECASE), "Dynamic import in JSON"),
     (re.compile(r"\\x[0-9a-fA-F]{2}", re.IGNORECASE), "Hex-encoded data (potential shellcode)"),
 ]
+_INERT_JSON_SECURITY_PATHS: frozenset[tuple[str, ...]] = frozenset({("learner", "feature_names")})
 XGBOOST_DEFAULT_MAX_FILE_READ_SIZE = 256 * 1024 * 1024
 XGBOOST_JSON_ROUTING_CHUNK_BYTES = 64 * 1024
 _JSON_KEY_MAX_BYTES = 256
@@ -731,14 +732,18 @@ class XGBoostScanner(BaseScanner):
                         details={param_name: str(params[param_name])},
                     )
 
-    def _sanitize_for_json(self, obj: Any) -> Any:
-        """Recursively sanitize object for JSON serialization by converting bytes to hex strings."""
+    def _sanitize_for_json(self, obj: Any, *, path: tuple[str, ...] = ()) -> Any:
+        """Recursively sanitize object for JSON security scanning."""
         if isinstance(obj, bytes):
             return obj.hex()
         elif isinstance(obj, dict):
-            return {k: self._sanitize_for_json(v) for k, v in obj.items()}
+            return {
+                k: self._sanitize_for_json(v, path=(*path, k))
+                for k, v in obj.items()
+                if (*path, k) not in _INERT_JSON_SECURITY_PATHS
+            }
         elif isinstance(obj, list | tuple):
-            return [self._sanitize_for_json(item) for item in obj]
+            return [self._sanitize_for_json(item, path=path) for item in obj]
         return obj
 
     def _check_json_for_malicious_content(self, data: dict[str, Any], result: ScanResult, path: str) -> None:

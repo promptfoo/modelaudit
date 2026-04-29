@@ -450,6 +450,35 @@ class TestXGBoostJSONScanning:
         assert len(critical_issues) > 0
         assert any("Suspicious pattern detected" in str(issue.message) for issue in critical_issues)
 
+    def test_feature_names_metadata_does_not_false_positive(
+        self,
+        temp_dir: Path,
+        valid_xgboost_json: dict[str, Any],
+    ) -> None:
+        """Feature labels are inert metadata, not executable JSON content."""
+        valid_xgboost_json["learner"]["feature_names"] = ["system(cpu)"]
+        json_file = temp_dir / "feature_names.json"
+        json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
+
+        result = XGBoostScanner().scan(str(json_file))
+
+        assert result.success is True
+        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+    def test_system_call_outside_feature_names_still_detected(
+        self,
+        temp_dir: Path,
+        valid_xgboost_json: dict[str, Any],
+    ) -> None:
+        """The feature-name exemption must not suppress real payload fields."""
+        valid_xgboost_json["learner"]["malicious_code"] = "system(cpu)"
+        json_file = temp_dir / "malicious_field.json"
+        json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
+
+        result = XGBoostScanner().scan(str(json_file))
+
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
 
 @pytest.mark.skipif(not hasattr(pytest, "importorskip"), reason="pytest.importorskip not available")
 class TestXGBoostUBJScanning:
