@@ -42,14 +42,18 @@ def test_extract_primary_asset_preserves_spaces_in_path() -> None:
 def test_check_consolidation_keeps_distinct_duplicate_groups_with_spaces(tmp_path: Path) -> None:
     group_one = tmp_path / "group one"
     group_two = tmp_path / "group two"
-    group_one.mkdir()
-    group_two.mkdir()
+    group_one_a = group_one / "shard a"
+    group_one_b = group_one / "shard b"
+    group_two_a = group_two / "shard a"
+    group_two_b = group_two / "shard b"
+    for directory in (group_one_a, group_one_b, group_two_a, group_two_b):
+        directory.mkdir(parents=True)
 
-    for path in (group_one / "dup a.pkl", group_one / "dup b.pkl"):
+    for path in (group_one_a / "model.pkl", group_one_b / "model.pkl"):
         with path.open("wb") as handle:
             pickle.dump({"group": 1}, handle)
 
-    for path in (group_two / "other a.pkl", group_two / "other b.pkl"):
+    for path in (group_two_a / "model.pkl", group_two_b / "model.pkl"):
         with path.open("wb") as handle:
             pickle.dump({"group": 2}, handle)
 
@@ -59,8 +63,8 @@ def test_check_consolidation_keeps_distinct_duplicate_groups_with_spaces(tmp_pat
     assert len(path_exists_checks) == 2
     duplicate_groups = {frozenset(check.details["duplicate_files"]) for check in path_exists_checks}
     assert duplicate_groups == {
-        frozenset({str(group_one / "dup a.pkl"), str(group_one / "dup b.pkl")}),
-        frozenset({str(group_two / "other a.pkl"), str(group_two / "other b.pkl")}),
+        frozenset({str(group_one_a / "model.pkl"), str(group_one_b / "model.pkl")}),
+        frozenset({str(group_two_a / "model.pkl"), str(group_two_b / "model.pkl")}),
     }
 
     for check in path_exists_checks:
@@ -71,9 +75,12 @@ def test_check_consolidation_keeps_distinct_duplicate_groups_with_spaces(tmp_pat
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows paths cannot contain newline characters")
 def test_check_consolidation_handles_newlines_in_file_paths(tmp_path: Path) -> None:
     group = tmp_path / "group\nnewline"
-    group.mkdir()
+    group_a = group / "shard a"
+    group_b = group / "shard b"
+    group_a.mkdir(parents=True)
+    group_b.mkdir(parents=True)
 
-    for path in (group / "dup a.pkl", group / "dup b.pkl"):
+    for path in (group_a / "model.pkl", group_b / "model.pkl"):
         with path.open("wb") as handle:
             pickle.dump({"group": "newline"}, handle)
 
@@ -82,7 +89,7 @@ def test_check_consolidation_handles_newlines_in_file_paths(tmp_path: Path) -> N
 
     assert len(path_exists_checks) == 1
     check = path_exists_checks[0]
-    expected_paths = {str(group / "dup a.pkl"), str(group / "dup b.pkl")}
+    expected_paths = {str(group_a / "model.pkl"), str(group_b / "model.pkl")}
     assert set(check.details["duplicate_files"]) == expected_paths
     assert check.location in expected_paths
 

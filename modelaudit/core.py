@@ -179,29 +179,30 @@ def _calculate_file_hash(file_path: str) -> str:
     return hash_sha256.hexdigest()
 
 
-def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
-    """Group files by their content hash to avoid scanning duplicates.
+def _group_files_by_content(file_paths: list[str]) -> dict[tuple[str, str], list[str]]:
+    """Group files by content and normalized basename for safe deduplication.
 
     Args:
         file_paths: List of file paths to group
 
     Returns:
-        Dictionary mapping content hash to list of file paths with that content
+        Dictionary mapping `(content_hash, normalized_basename)` to file paths
+        that can safely share one scan result.
     """
-    content_groups: dict[str, list[str]] = defaultdict(list)
+    content_groups: dict[tuple[str, str], list[str]] = defaultdict(list)
 
     for file_path in file_paths:
         try:
             content_hash = _calculate_file_hash(file_path)
-            content_groups[content_hash].append(file_path)
+            content_groups[(content_hash, Path(file_path).name.lower())].append(file_path)
         except Exception as e:
             # Log error but continue with other files to prevent single I/O failure from aborting entire scan
             logger.warning(f"Failed to hash file {file_path}: {e}. Skipping deduplication for this file.")
             # Add file with unique hash to ensure it gets scanned independently
-            content_groups[f"unhashable_{id(file_path)}"].append(file_path)
+            content_groups[(f"unhashable_{id(file_path)}", Path(file_path).name.lower())].append(file_path)
 
     # Log information about duplicate content found
-    for content_hash, paths in content_groups.items():
+    for (content_hash, _scan_identity), paths in content_groups.items():
         if len(paths) > 1:
             logger.debug(f"Found {len(paths)} files with identical content (hash: {content_hash[:16]})")
             for path in paths:
@@ -493,14 +494,16 @@ def scan_model_directory_or_file(
             if files_to_scan:
                 content_groups = _group_files_by_content(files_to_scan)
                 content_processed = 0
+                recorded_content_hashes: set[str] = set()
 
-                for content_hash, file_paths in content_groups.items():
+                for (content_hash, _scan_identity), file_paths in content_groups.items():
                     # Collect valid content hashes for aggregate hash computation
                     # Skip "unhashable_" prefix entries (those are placeholder hashes for files that failed to hash)
-                    if not content_hash.startswith("unhashable_"):
+                    if not content_hash.startswith("unhashable_") and content_hash not in recorded_content_hashes:
                         file_hashes.append(content_hash)
+                        recorded_content_hashes.add(content_hash)
 
-                    # Scan the first file in each content group (representative)
+                    # Scan the first file in each content/name group (representative)
                     representative_file = file_paths[0]
 
                     # Check for interrupts
