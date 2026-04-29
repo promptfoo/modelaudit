@@ -13,7 +13,7 @@ import json
 import pickle
 import subprocess as real_subprocess
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import ANY, Mock, patch
@@ -292,6 +292,49 @@ class TestXGBoostJSONScanning:
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "xgboost_json_parse_failed" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize(
+        ("field", "mutate_model"),
+        [
+            (
+                "learner.gradient_booster",
+                lambda payload: payload["learner"].update({"gradient_booster": "oops"}),
+            ),
+            (
+                "learner.gradient_booster.model",
+                lambda payload: payload["learner"]["gradient_booster"].update({"model": "oops"}),
+            ),
+            (
+                "learner.gradient_booster.model.trees",
+                lambda payload: payload["learner"]["gradient_booster"]["model"].update({"trees": "oops"}),
+            ),
+            (
+                "learner.gradient_booster.model.trees[0].children",
+                lambda payload: payload["learner"]["gradient_booster"]["model"]["trees"][0].update(
+                    {"left_children": "oops"}
+                ),
+            ),
+        ],
+    )
+    def test_malformed_nested_json_is_inconclusive(
+        self,
+        temp_dir: Path,
+        valid_xgboost_json: dict[str, Any],
+        field: str,
+        mutate_model: Callable[[dict[str, Any]], None],
+    ) -> None:
+        """Malformed nested fields should not disappear behind a clean JSON scan."""
+        mutate_model(valid_xgboost_json)
+        json_file = temp_dir / "malformed_nested.json"
+        json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
+
+        result = XGBoostScanner().scan(str(json_file))
+
+        checks = [check for check in result.checks if check.name == "XGBoost JSON Structure Validation"]
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_json_structure_invalid" in result.metadata["scan_outcome_reasons"]
+        assert any(check.details["field"] == field for check in checks)
 
     def test_malformed_xgboost_json_candidate_is_routed(self, temp_dir: Path) -> None:
         """Malformed XGBoost-shaped JSON should reach the fail-closed parser path."""

@@ -244,6 +244,7 @@ class XGBoostScanner(BaseScanner):
     _INCONCLUSIVE_REASONS: ClassVar[dict[str, str]] = {
         "json_parse_failed": "xgboost_json_parse_failed",
         "json_analysis_failed": "xgboost_json_analysis_failed",
+        "json_structure_invalid": "xgboost_json_structure_invalid",
         "ubj_dependency_missing": "xgboost_ubj_dependency_missing",
         "ubj_analysis_failed": "xgboost_ubj_analysis_failed",
         "binary_empty": "xgboost_binary_empty",
@@ -613,12 +614,36 @@ class XGBoostScanner(BaseScanner):
         """Validate XGBoost learner parameters for suspicious values."""
         # Check for gradient booster
         gradient_booster = learner.get("gradient_booster")
-        if gradient_booster and isinstance(gradient_booster, dict):
+        if gradient_booster is not None and not isinstance(gradient_booster, dict):
+            self._record_invalid_json_structure(
+                result,
+                path,
+                field="learner.gradient_booster",
+                expected_type="dict",
+                value=gradient_booster,
+            )
+        elif isinstance(gradient_booster, dict):
             model = gradient_booster.get("model")
-            if model and isinstance(model, dict):
+            if model is not None and not isinstance(model, dict):
+                self._record_invalid_json_structure(
+                    result,
+                    path,
+                    field="learner.gradient_booster.model",
+                    expected_type="dict",
+                    value=model,
+                )
+            elif isinstance(model, dict):
                 # Check number of trees
                 trees = model.get("trees", [])
-                if isinstance(trees, list):
+                if not isinstance(trees, list):
+                    self._record_invalid_json_structure(
+                        result,
+                        path,
+                        field="learner.gradient_booster.model.trees",
+                        expected_type="list",
+                        value=trees,
+                    )
+                else:
                     num_trees = len(trees)
                     if num_trees > self.max_num_trees:
                         result.add_check(
@@ -641,20 +666,51 @@ class XGBoostScanner(BaseScanner):
         if isinstance(params, dict):
             self._validate_model_parameters(params, result, path)
 
-    def _validate_tree_structures(self, trees: list[dict[str, Any]], result: ScanResult, path: str) -> None:
+    def _validate_tree_structures(self, trees: list[Any], result: ScanResult, path: str) -> None:
         """Validate individual tree structures for anomalies."""
         for i, tree in enumerate(trees):
+            if not isinstance(tree, dict):
+                self._record_invalid_json_structure(
+                    result,
+                    path,
+                    field=f"learner.gradient_booster.model.trees[{i}]",
+                    expected_type="dict",
+                    value=tree,
+                )
+                continue
+
             left_children = tree.get("left_children")
             right_children = tree.get("right_children")
             if not isinstance(left_children, list) or not isinstance(right_children, list):
+                self._record_invalid_json_structure(
+                    result,
+                    path,
+                    field=f"learner.gradient_booster.model.trees[{i}].children",
+                    expected_type="list",
+                    value={"left_children": left_children, "right_children": right_children},
+                )
                 continue
             if len(left_children) != len(right_children) or len(left_children) == 0:
+                self._record_invalid_json_structure(
+                    result,
+                    path,
+                    field=f"learner.gradient_booster.model.trees[{i}].children",
+                    expected_type="same-length non-empty lists",
+                    value={"left_children": left_children, "right_children": right_children},
+                )
                 continue
 
             try:
                 left = [int(child) for child in left_children]
                 right = [int(child) for child in right_children]
             except (ValueError, TypeError):
+                self._record_invalid_json_structure(
+                    result,
+                    path,
+                    field=f"learner.gradient_booster.model.trees[{i}].children",
+                    expected_type="integer child indices",
+                    value={"left_children": left_children, "right_children": right_children},
+                )
                 continue
 
             depth = self._compute_tree_depth(left, right)
@@ -668,6 +724,30 @@ class XGBoostScanner(BaseScanner):
                     details={"tree_index": i, "depth": depth, "max_depth": self.max_tree_depth},
                     why="Deep trees may impact performance but can be legitimate in complex models",
                 )
+
+    def _record_invalid_json_structure(
+        self,
+        result: ScanResult,
+        path: str,
+        *,
+        field: str,
+        expected_type: str,
+        value: Any,
+    ) -> None:
+        result.add_check(
+            name="XGBoost JSON Structure Validation",
+            passed=False,
+            message=f"Invalid XGBoost JSON structure at {field}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "field": field,
+                "expected_type": expected_type,
+                "actual_type": type(value).__name__,
+            },
+            why="Malformed XGBoost JSON structure prevents complete model validation",
+        )
+        self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["json_structure_invalid"])
 
     @staticmethod
     def _compute_tree_depth(left_children: list[int], right_children: list[int]) -> int:
