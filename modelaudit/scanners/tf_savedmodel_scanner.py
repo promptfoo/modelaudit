@@ -48,6 +48,7 @@ _ASSET_PE_HEADER = b"MZ"  # Windows PE executables
 _ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 6))
 _ASSET_PROBE_BYTES = max(8192, PROTO0_1_MAX_PROBE_BYTES)
 _CORE_ROOT_MODEL_FILES = frozenset({"saved_model.pb", "keras_metadata.pb", "fingerprint.pb"})
+_CORE_ROOT_MODEL_DIRS = frozenset({"assets", "assets.extra", "variables"})
 _ASSET_PYTHON_PATTERN = re.compile(
     r"(?m)(^\s*(?:"
     r"from\s+[A-Za-z_][\w.]*\s+import\s+"
@@ -504,7 +505,11 @@ class TensorFlowSavedModelScanner(BaseScanner):
     def _scan_saved_model_root_siblings(self, model_root: Path, result: ScanResult) -> None:
         """Scan non-canonical root files that can accompany a SavedModel."""
         for child_path in model_root.iterdir():
-            if child_path.name in _CORE_ROOT_MODEL_FILES or child_path.is_dir():
+            if child_path.name in _CORE_ROOT_MODEL_FILES:
+                continue
+            if child_path.name in _CORE_ROOT_MODEL_DIRS and (child_path.is_dir() or child_path.is_symlink()):
+                continue
+            if child_path.is_dir():
                 continue
 
             detected_types = self._detect_suspicious_asset_content(child_path, result)
