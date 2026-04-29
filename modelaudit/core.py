@@ -830,7 +830,20 @@ def _is_hf_download_bookkeeping_path(path_obj: Path) -> bool:
     hf_home = os.environ.get("HF_HOME")
     if hf_home:
         configured_download_roots.add(_resolve_hf_cache_path(Path(hf_home) / "download"))
-    return resolved_parent in configured_download_roots
+    if resolved_parent in configured_download_roots:
+        return True
+
+    # Local snapshot downloads keep bookkeeping under the downloaded model
+    # directory rather than the global cache root.
+    parts = resolved_parent.parts
+    if len(parts) < 3 or tuple(part.lower() for part in parts[-3:]) != (".cache", "huggingface", "download"):
+        return False
+
+    local_model_root = resolved_parent.parents[2]
+    try:
+        return any(child.is_file() for child in local_model_root.iterdir() if child.name != ".cache")
+    except OSError:
+        return False
 
 
 def _is_huggingface_cache_file(path: str) -> bool:

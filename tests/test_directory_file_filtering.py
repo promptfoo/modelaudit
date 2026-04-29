@@ -442,6 +442,15 @@ class TestDirectoryFileFiltering:
         assert _is_huggingface_cache_file(str(trusted_gitignore)) is True
         assert _is_huggingface_cache_file(str(spoofed_gitignore)) is False
 
+    def test_local_download_bookkeeping_skips_when_model_root_has_assets(self, tmp_path: Path) -> None:
+        """Downloaded model directories retain their local HF bookkeeping skip."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type":"gpt2"}')
+        local_gitignore = model_dir / ".cache" / "huggingface" / "download" / ".gitignore"
+
+        assert _is_huggingface_cache_file(str(local_gitignore)) is True
+
     @pytest.mark.parametrize("filename", ["payload.pkl.lock", ".gitignore", ".gitattributes"])
     def test_direct_scans_do_not_skip_local_bookkeeping_filenames(self, tmp_path: Path, filename: str) -> None:
         """A malicious local file should not become trusted because of its basename."""
