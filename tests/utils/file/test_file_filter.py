@@ -212,6 +212,18 @@ class TestFileFilter:
         assert not should_skip_file(str(disguised_legacy_tar))
         assert should_skip_file(str(real_image))
 
+    @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
+    def test_content_recognized_payloads_bypass_default_hidden_and_basename_skips(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        """Supported payloads should survive default hidden and basename filters."""
+        disguised_pickle = tmp_path / filename
+        disguised_pickle.write_bytes(pickle.dumps({"safe": True}))
+
+        assert not should_skip_file(str(disguised_pickle))
+
     def test_disguised_lightgbm_text_model_bypasses_default_skip(self, tmp_path: Path) -> None:
         """Default skip filtering must preserve supported text models under skipped suffixes."""
         disguised_lightgbm = tmp_path / "model.txt"
