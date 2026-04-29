@@ -505,11 +505,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
     def _scan_saved_model_root_siblings(self, model_root: Path, result: ScanResult) -> None:
         """Scan non-canonical root files that can accompany a SavedModel."""
         for child_path in model_root.iterdir():
-            if (
-                child_path.name in _CORE_ROOT_MODEL_FILES
-                or child_path.name in _CORE_ROOT_MODEL_DIRS
-                or child_path.is_dir()
-            ):
+            if child_path.name in _CORE_ROOT_MODEL_FILES or child_path.is_dir():
                 continue
 
             detected_types = self._detect_suspicious_asset_content(child_path, result)
