@@ -75,6 +75,8 @@ class PaddleScanner(BaseScanner):
 
         bytes_scanned = 0
         chunk_size = 1024 * 1024
+        previous_chunk_tail = b""
+        chunk_overlap = self._get_chunk_overlap_size(chunk_size)
         try:
             with open(path, "rb") as f:
                 while True:
@@ -82,7 +84,17 @@ class PaddleScanner(BaseScanner):
                     if not chunk:
                         break
                     bytes_scanned += len(chunk)
-                    self._check_chunk(chunk, result, bytes_scanned - len(chunk), path, is_binary_weights)
+                    chunk_offset = bytes_scanned - len(chunk)
+                    scan_window = previous_chunk_tail + chunk
+                    self._check_chunk(
+                        scan_window,
+                        result,
+                        chunk_offset - len(previous_chunk_tail),
+                        path,
+                        is_binary_weights,
+                        overlap_prefix_len=len(previous_chunk_tail),
+                    )
+                    previous_chunk_tail = chunk[-chunk_overlap:] if chunk_overlap else b""
             result.bytes_scanned = bytes_scanned
         except Exception as e:  # pragma: no cover - unexpected I/O errors
             result.add_check(
@@ -99,6 +111,17 @@ class PaddleScanner(BaseScanner):
         result.finish(success=not result.has_errors)
         return result
 
+    @staticmethod
+    def _get_chunk_overlap_size(chunk_size: int) -> int:
+        """Return the trailing bytes to carry into the next Paddle scan window."""
+        longest_pattern = max(
+            [
+                *(len(pattern) for pattern in BINARY_CODE_PATTERNS),
+                *(len(pattern.encode("utf-8")) for pattern in SUSPICIOUS_STRING_PATTERNS if pattern),
+            ]
+        )
+        return max(0, min(chunk_size - 1, longest_pattern - 1))
+
     def _check_chunk(
         self,
         chunk: bytes,
@@ -106,10 +129,18 @@ class PaddleScanner(BaseScanner):
         offset: int,
         path: str,
         is_binary_weights: bool = False,
+        *,
+        overlap_prefix_len: int = 0,
     ) -> None:
         for pattern in BINARY_CODE_PATTERNS:
-            if pattern in chunk:
-                pos = chunk.find(pattern)
+            search_start = 0
+            while True:
+                pos = chunk.find(pattern, search_start)
+                if pos == -1:
+                    break
+                search_start = pos + 1
+                if pos + len(pattern) <= overlap_prefix_len:
+                    continue
                 result.add_check(
                     name="Binary Pattern Detection",
                     passed=False,
@@ -120,16 +151,13 @@ class PaddleScanner(BaseScanner):
                     rule_code="S902",
                 )
 
-        try:
-            text = chunk.decode("utf-8")
-        except UnicodeDecodeError:
-            text = chunk.decode("utf-8", "ignore")
+        text = chunk.decode("latin-1")
         for regex in SUSPICIOUS_STRING_PATTERNS:
             # Skip patterns known to produce false positives on raw binary
             # weight data (e.g. hex-escape sequences in float tensors).
             if is_binary_weights and regex in _BINARY_WEIGHT_SKIP_PATTERNS:
                 continue
-            if re.search(regex, text):
+            if any(match.end() > overlap_prefix_len for match in re.finditer(regex, text, flags=re.ASCII)):
                 result.add_check(
                     name="String Pattern Detection",
                     passed=False,

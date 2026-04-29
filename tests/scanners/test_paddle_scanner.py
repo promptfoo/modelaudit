@@ -8,6 +8,11 @@ from modelaudit.scanners.paddle_scanner import PaddleScanner
 from modelaudit.utils.file.detection import validate_file_type
 
 
+def _write_chunk_boundary_payload(path: Path, pattern: bytes, *, prefix_len: int, suffix: bytes = b"") -> None:
+    chunk_size = 1024 * 1024
+    path.write_bytes(b"\x00" * (chunk_size - prefix_len) + pattern[:prefix_len] + pattern[prefix_len:] + suffix)
+
+
 def test_paddle_scanner_can_handle(tmp_path: Path) -> None:
     path = tmp_path / "model.pdmodel"
     path.write_bytes(b"dummy")
@@ -33,6 +38,46 @@ def test_paddle_scanner_detects_suspicious_pattern(tmp_path: Path) -> None:
 
     assert suspicious_issues
     assert all(issue.severity == IssueSeverity.WARNING for issue in suspicious_issues)
+
+
+def test_paddle_scanner_detects_pattern_split_across_chunk_boundary(tmp_path: Path) -> None:
+    path = tmp_path / "model.pdmodel"
+    _write_chunk_boundary_payload(path, b"os.system", prefix_len=4)
+
+    with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
+        result = PaddleScanner().scan(str(path))
+
+    assert any(issue.details.get("pattern") == "os.system" for issue in result.issues)
+
+
+def test_paddle_scanner_detects_binary_only_pattern_split_across_chunk_boundary(tmp_path: Path) -> None:
+    path = tmp_path / "model.pdmodel"
+    _write_chunk_boundary_payload(path, b"compile(", prefix_len=4)
+
+    with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
+        result = PaddleScanner().scan(str(path))
+
+    assert any(issue.details.get("pattern") == "compile(" for issue in result.issues)
+
+
+def test_paddle_scanner_detects_regex_only_pattern_split_across_chunk_boundary(tmp_path: Path) -> None:
+    path = tmp_path / "model.pdmodel"
+    _write_chunk_boundary_payload(path, b"base64.b64decode", prefix_len=7)
+
+    with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
+        result = PaddleScanner().scan(str(path))
+
+    assert any(issue.details.get("pattern") == r"base64\.b64decode" for issue in result.issues)
+
+
+def test_paddle_scanner_ignores_near_match_split_across_chunk_boundary(tmp_path: Path) -> None:
+    path = tmp_path / "model.pdmodel"
+    _write_chunk_boundary_payload(path, b"os.systen", prefix_len=4)
+
+    with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
+        result = PaddleScanner().scan(str(path))
+
+    assert not any(issue.details.get("pattern") == "os.system" for issue in result.issues)
 
 
 def test_paddle_suspicious_pdmodel_aggregate_exit_code_is_security_finding(tmp_path: Path) -> None:
