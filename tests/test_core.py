@@ -15,6 +15,7 @@ import pytest
 from modelaudit import core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import scan_file
+from modelaudit.scanners import flax_msgpack_scanner
 from modelaudit.scanners.base import IssueSeverity, ScanResult
 from tests.helpers import create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
 
@@ -82,6 +83,23 @@ def test_scan_file_detects_malicious_zip_with_misleading_extension(tmp_path: Pat
 
     assert result.scanner_name == "zip"
     _assert_system_pickle_detected(result, "payload.pkl")
+
+
+@pytest.mark.parametrize("suffix", [".flax", ".orbax", ".jax"])
+def test_scan_file_fails_closed_for_msgpack_extensions_when_dependency_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+) -> None:
+    checkpoint = tmp_path / f"model{suffix}"
+    checkpoint.write_bytes(b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03")
+    monkeypatch.setattr(flax_msgpack_scanner, "HAS_MSGPACK", False)
+
+    result = scan_file(str(checkpoint))
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(check.name == "msgpack Library Check" for check in result.checks)
 
 
 def test_scan_file_detects_misnamed_gzip_wrapped_pickle_by_header(tmp_path: Path) -> None:

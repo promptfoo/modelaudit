@@ -293,6 +293,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **flax:** keep explicit Flax/JAX checkpoint suffixes routed to the scanner when
+  `msgpack` is unavailable so missing parser coverage fails closed
 - **pickle:** detect stdlib filesystem probe and process-state callables such as `pathlib` metadata methods, `decimal.setcontext`, and `gc.disable` during pickle scans, while keeping local container mutations clean and covering public `operator.setitem` registry poisoning plus target-aware `operator.imul` warning-filter mutation.
 - **pickle:** detect public `operator.setitem` pickle calls, keep callable
   invocation aliases ahead of import-reference budget exhaustion, dedupe repeated
