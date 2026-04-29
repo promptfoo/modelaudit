@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Bug Fixes
+
+- fail closed when TorchServe MAR limits leave manifest-referenced payloads unscanned
+- recurse into nested ZIP members inside PyTorch archives and fail closed when compression-ratio guards leave members unscanned
+- preserve large Office-like ZIPs when prefilter inspection is incomplete
+- fail closed when directory scans stop at the total-size budget
+- restrict Hugging Face bookkeeping filename skips to recognized cache layouts
+- preserve unsuccessful child results after scan-result merges
+- preserve supported payloads hidden behind default directory-skip names
+
 ## [0.2.42](https://github.com/promptfoo/modelaudit/compare/v0.2.41...v0.2.42) (2026-04-27)
 
 ### Bug Fixes
@@ -295,6 +307,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** run Jinja template analysis for manifest-owned configs that carry
+  embedded chat-template fields.
 - **pickle:** detect stdlib filesystem probe and process-state callables such as `pathlib` metadata methods, `decimal.setcontext`, and `gc.disable` during pickle scans, while keeping local container mutations clean and covering public `operator.setitem` registry poisoning plus target-aware `operator.imul` warning-filter mutation.
 - **pickle:** detect public `operator.setitem` pickle calls, keep callable
   invocation aliases ahead of import-reference budget exhaustion, dedupe repeated
