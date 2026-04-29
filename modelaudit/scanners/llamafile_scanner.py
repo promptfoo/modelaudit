@@ -13,6 +13,7 @@ from ._evidence_redaction import redact_evidence_string
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 LLAMAFILE_MARKER = b"llamafile"
+LLAMAFILE_ROUTE_SCAN_BYTES = 8 * 1024 * 1024
 GGUF_MARKER = b"GGUF"
 
 ELF_MAGIC = b"\x7fELF"
@@ -135,8 +136,11 @@ class LlamafileScanner(BaseScanner):
             return False
 
         try:
-            file_size = path_obj.stat().st_size
-            marker_offset = cls._find_casefolded_marker_offset(path_obj, LLAMAFILE_MARKER, file_size)
+            marker_offset = cls._find_casefolded_marker_offset(
+                path_obj,
+                LLAMAFILE_MARKER,
+                LLAMAFILE_ROUTE_SCAN_BYTES,
+            )
         except OSError:
             return False
 

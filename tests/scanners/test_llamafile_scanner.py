@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.llamafile_scanner import LlamafileScanner
+from modelaudit.scanners.llamafile_scanner import LLAMAFILE_ROUTE_SCAN_BYTES, LlamafileScanner
 
 
 def _build_llamafile_blob(
@@ -54,6 +54,13 @@ def test_llamafile_scanner_can_handle_casefolded_middle_marker_in_exe(tmp_path: 
     )
 
     assert LlamafileScanner.can_handle(str(binary))
+
+
+def test_llamafile_scanner_can_handle_does_not_scan_past_route_budget(tmp_path: Path) -> None:
+    binary = tmp_path / "late-marker.exe"
+    binary.write_bytes(b"MZ" + b"\x00" * 62 + b"A" * LLAMAFILE_ROUTE_SCAN_BYTES + b"llamafile runtime")
+
+    assert not LlamafileScanner.can_handle(str(binary))
 
 
 def test_llamafile_scanner_benign_sample_has_no_high_severity(tmp_path: Path) -> None:
