@@ -216,6 +216,9 @@ class EntropyAnalyzer:
 
     def should_skip_pattern_search(self, data: bytes, pattern: bytes) -> bool:
         """Determine if pattern search should be skipped based on data type."""
+        if pattern and pattern in data:
+            return False
+
         data_type, confidence = self.classify_data_type(data)
 
         # High confidence ML weights - skip most pattern searches

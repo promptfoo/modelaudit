@@ -109,3 +109,19 @@ class TestAnalysisModules:
         assert isinstance(result.is_suspicious, bool)
         assert isinstance(result.confidence, float)
         assert isinstance(result.risk_level, str)
+
+    def test_integrated_entropy_does_not_upgrade_exact_dangerous_literals(self) -> None:
+        """Weight-like bytes with an exact sink literal must not get skip confidence."""
+        import numpy as np
+
+        from modelaudit.analysis import IntegratedAnalyzer
+
+        np.random.seed(42)
+        weights = np.random.normal(0, 0.2, 1000).astype(np.float32)
+        data = weights.tobytes() + b"os.system"
+
+        result = IntegratedAnalyzer()._analyze_entropy(data, "os.system")
+
+        assert result["data_type"] == "ml_weights"
+        assert result["confidence"] == 0.85
+        assert "Pattern search not recommended for this data type" not in result["reasoning"]

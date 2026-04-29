@@ -230,6 +230,20 @@ class TestPatternSearchSkipping:
         should_skip_exec = analyzer.should_skip_pattern_search(data, b"exec")
         assert should_skip_exec is False
 
+    def test_exact_dangerous_literal_not_skipped_for_ml_weights(self, analyzer: EntropyAnalyzer) -> None:
+        """Exact dangerous literals must not be suppressed by weight-like entropy."""
+        import numpy as np
+
+        np.random.seed(42)
+        weights = np.random.normal(0, 0.2, 1000).astype(np.float32)
+        data = weights.tobytes() + b"os.system"
+
+        data_type, confidence = analyzer.classify_data_type(data)
+
+        assert data_type == "ml_weights"
+        assert confidence > 0.8
+        assert analyzer.should_skip_pattern_search(data, b"os.system") is False
+
     def test_skip_for_random_data(self, analyzer):
         """Test that pattern search is skipped for random data."""
         data = bytes(range(256)) * 50  # High-entropy data
