@@ -553,11 +553,12 @@ def test_compressed_scanner_allows_concatenated_zlib_members(tmp_path: Path) -> 
 @pytest.mark.parametrize(
     ("filename", "compressor"),
     [
+        ("safe_multi_stream.pkl.gz", gzip.compress),
         ("safe_multi_stream.pkl.bz2", bz2.compress),
         ("safe_multi_stream.pkl.xz", lzma.compress),
     ],
 )
-def test_compressed_scanner_allows_concatenated_bzip2_and_xz_members(
+def test_compressed_scanner_allows_concatenated_gzip_bzip2_and_xz_members(
     tmp_path: Path,
     filename: str,
     compressor: Callable[[bytes], bytes],
@@ -577,6 +578,38 @@ def test_compressed_scanner_allows_concatenated_bzip2_and_xz_members(
         for check in result.checks
     )
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    ("filename", "compressor"),
+    [
+        ("payload.txt.gz", gzip.compress),
+        ("payload.txt.bz2", bz2.compress),
+        ("payload.txt.xz", lzma.compress),
+        ("payload.txt.zlib", zlib.compress),
+    ],
+)
+def test_compressed_scanner_scans_each_concatenated_member(
+    tmp_path: Path,
+    filename: str,
+    compressor: Callable[[bytes], bytes],
+) -> None:
+    """A benign first member must not hide a later malicious member."""
+    path = tmp_path / filename
+    path.write_bytes(compressor(b"harmless prelude\n") + compressor(pickle.dumps(_MaliciousPayload())))
+
+    result = CompressedScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["compressed_member_count"] == 2
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+    assert critical_issues
+    assert any(issue.location == f"{path} -> payload.txt#member-2" for issue in critical_issues)
+    member_routing_checks = [
+        check for check in result.checks if check.name == "Compressed Wrapper Member Scanner Routing"
+    ]
+    assert len(member_routing_checks) == 2
+    assert member_routing_checks[1].details["inner_scanner"] == "pickle"
 
 
 def test_compressed_scanner_rejects_raw_trailer_after_lz4_frame(

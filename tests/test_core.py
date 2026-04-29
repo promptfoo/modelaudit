@@ -102,6 +102,25 @@ def test_scan_file_detects_misnamed_gzip_wrapped_pickle_by_header(tmp_path: Path
     ), f"Expected compressed inner pickle finding, got: {[(i.location, i.message, i.details) for i in result.issues]}"
 
 
+def test_scan_file_detects_late_pickle_in_misnamed_concatenated_gzip(tmp_path: Path) -> None:
+    disguised_gzip = tmp_path / "payload.jpg"
+    disguised_gzip.write_bytes(gzip.compress(b"harmless prelude\n") + gzip.compress(_build_malicious_pickle()))
+
+    result = scan_file(str(disguised_gzip))
+
+    assert result.scanner_name == "compressed"
+    assert result.metadata["compressed_member_count"] == 2
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("compressed_wrapper") == f"{disguised_gzip} -> payload.jpg.inner#member-2"
+        and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    ), (
+        "Expected late compressed-member pickle finding, got: "
+        f"{[(i.location, i.message, i.details) for i in result.issues]}"
+    )
+
+
 def test_scan_file_does_not_route_compression_magic_near_match_to_compressed(tmp_path: Path) -> None:
     near_match = tmp_path / "payload.jpg"
     near_match.write_bytes(b"\x1f\x00not-a-gzip-stream")

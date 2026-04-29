@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import bz2
-import gzip
 import importlib
 import lzma
 import os
@@ -30,6 +29,39 @@ class _CorruptStreamError(ValueError):
 
 class _MissingOptionalDependencyError(ImportError):
     """Raised when an optional dependency is unavailable."""
+
+
+class _DecompressedOutputSink:
+    """Write aggregate and per-member decompressed payloads to temp files."""
+
+    def __init__(self, suffix: str):
+        aggregate_fd, self.aggregate_path = tempfile.mkstemp(suffix=suffix)
+        self.aggregate_file = os.fdopen(aggregate_fd, "w+b")
+        self.member_paths: list[str] = []
+        self.current_member_file = self._open_member_file(suffix)
+
+    def _open_member_file(self, suffix: str) -> Any:
+        member_fd, member_path = tempfile.mkstemp(suffix=suffix)
+        self.member_paths.append(member_path)
+        return os.fdopen(member_fd, "w+b")
+
+    def write(self, output: bytes) -> int:
+        self.aggregate_file.write(output)
+        return self.current_member_file.write(output)
+
+    def start_new_member(self, suffix: str) -> None:
+        self.current_member_file.close()
+        self.current_member_file = self._open_member_file(suffix)
+
+    def close(self) -> None:
+        self.current_member_file.close()
+        self.aggregate_file.close()
+
+    def cleanup(self) -> None:
+        self.close()
+        for temp_path in [self.aggregate_path, *self.member_paths]:
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
 
 
 class CompressedScanner(BaseScanner):
@@ -205,6 +237,7 @@ class CompressedScanner(BaseScanner):
         max_ratio: float,
         compressed_size: int,
         chunk_size: int,
+        on_new_member: Callable[[], None] | None = None,
     ) -> int:
         decompressor = decompressor_factory()
         total_out = 0
@@ -238,6 +271,8 @@ class CompressedScanner(BaseScanner):
                 unused_data = getattr(decompressor, "unused_data", b"")
                 if unused_data:
                     pending = unused_data
+                    if on_new_member is not None:
+                        on_new_member()
                     decompressor = decompressor_factory()
 
         while True:
@@ -261,6 +296,7 @@ class CompressedScanner(BaseScanner):
         max_ratio: float,
         compressed_size: int,
         chunk_size: int,
+        on_new_member: Callable[[], None] | None = None,
     ) -> int:
         return CompressedScanner._read_concatenated_stream_with_limits(
             source=source,
@@ -272,6 +308,7 @@ class CompressedScanner(BaseScanner):
             max_ratio=max_ratio,
             compressed_size=compressed_size,
             chunk_size=chunk_size,
+            on_new_member=on_new_member,
         )
 
     @staticmethod
@@ -282,6 +319,7 @@ class CompressedScanner(BaseScanner):
         max_ratio: float,
         compressed_size: int,
         chunk_size: int,
+        on_new_member: Callable[[], None] | None = None,
     ) -> int:
         return CompressedScanner._read_concatenated_stream_with_limits(
             source=source,
@@ -293,6 +331,30 @@ class CompressedScanner(BaseScanner):
             max_ratio=max_ratio,
             compressed_size=compressed_size,
             chunk_size=chunk_size,
+            on_new_member=on_new_member,
+        )
+
+    @staticmethod
+    def _read_gzip_stream_with_limits(
+        source: Any,
+        destination: Any,
+        max_decompressed_bytes: int,
+        max_ratio: float,
+        compressed_size: int,
+        chunk_size: int,
+        on_new_member: Callable[[], None] | None = None,
+    ) -> int:
+        return CompressedScanner._read_concatenated_stream_with_limits(
+            source=source,
+            destination=destination,
+            decompressor_factory=lambda: zlib.decompressobj(16 + zlib.MAX_WBITS),
+            error_types=(zlib.error,),
+            codec="gzip",
+            max_decompressed_bytes=max_decompressed_bytes,
+            max_ratio=max_ratio,
+            compressed_size=compressed_size,
+            chunk_size=chunk_size,
+            on_new_member=on_new_member,
         )
 
     @staticmethod
@@ -303,6 +365,7 @@ class CompressedScanner(BaseScanner):
         max_ratio: float,
         compressed_size: int,
         chunk_size: int,
+        on_new_member: Callable[[], None] | None = None,
     ) -> int:
         decompressor = zlib.decompressobj()
         total_out = 0
@@ -342,6 +405,8 @@ class CompressedScanner(BaseScanner):
                     # Support concatenated zlib members while rejecting raw
                     # trailer bytes that could hide an unscanned payload.
                     pending = decompressor.unused_data
+                    if on_new_member is not None:
+                        on_new_member()
                     decompressor = zlib.decompressobj()
                     continue
 
@@ -386,6 +451,7 @@ class CompressedScanner(BaseScanner):
         max_ratio: float,
         compressed_size: int,
         chunk_size: int,
+        on_new_member: Callable[[], None] | None = None,
     ) -> int:
         try:
             decompressor_factory = lz4_frame.LZ4FrameDecompressor
@@ -398,6 +464,7 @@ class CompressedScanner(BaseScanner):
                 max_ratio=max_ratio,
                 compressed_size=compressed_size,
                 chunk_size=chunk_size,
+                on_new_member=on_new_member,
             )
 
         return CompressedScanner._read_concatenated_stream_with_limits(
@@ -410,6 +477,7 @@ class CompressedScanner(BaseScanner):
             max_ratio=max_ratio,
             compressed_size=compressed_size,
             chunk_size=chunk_size,
+            on_new_member=on_new_member,
         )
 
     @staticmethod
@@ -421,6 +489,7 @@ class CompressedScanner(BaseScanner):
         max_ratio: float,
         compressed_size: int,
         chunk_size: int,
+        on_new_member: Callable[[], None] | None = None,
     ) -> int:
         create_context = getattr(lz4_frame, "create_decompression_context", None)
         decompress_chunk = getattr(lz4_frame, "decompress_chunk", None)
@@ -469,6 +538,8 @@ class CompressedScanner(BaseScanner):
             pending = pending[bytes_read:]
             if frame_eof:
                 if pending:
+                    if on_new_member is not None:
+                        on_new_member()
                     context = create_context()
                     frame_eof = False
                 probe_buffered_output = False
@@ -490,69 +561,72 @@ class CompressedScanner(BaseScanner):
 
         return total_out
 
-    def _decompress_to_tempfile(self, path: str, codec: str) -> tuple[str, int]:
+    def _decompress_to_tempfiles(self, path: str, codec: str) -> tuple[str, list[str], int]:
         compressed_size = self.get_file_size(path)
         suffix = self._derive_inner_suffix(path)
-
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_file:
-            temp_path = temp_file.name
-
+        outputs = _DecompressedOutputSink(suffix)
+        try:
             with open(path, "rb") as source:
                 if codec == "gzip":
-                    try:
-                        with gzip.GzipFile(fileobj=source, mode="rb") as reader:
-                            total_out = self._copy_stream_with_limits(
-                                source=reader,
-                                destination=temp_file,
-                                max_decompressed_bytes=self.max_decompressed_bytes,
-                                max_ratio=self.max_decompression_ratio,
-                                compressed_size=compressed_size,
-                                chunk_size=self.chunk_size,
-                            )
-                    except (OSError, EOFError, gzip.BadGzipFile) as exc:
-                        raise _CorruptStreamError(f"Invalid gzip stream: {exc}") from exc
-                elif codec == "bzip2":
-                    total_out = self._read_bzip2_stream_with_limits(
+                    total_out = self._read_gzip_stream_with_limits(
                         source=source,
-                        destination=temp_file,
+                        destination=outputs,
                         max_decompressed_bytes=self.max_decompressed_bytes,
                         max_ratio=self.max_decompression_ratio,
                         compressed_size=compressed_size,
                         chunk_size=self.chunk_size,
+                        on_new_member=lambda: outputs.start_new_member(suffix),
+                    )
+                elif codec == "bzip2":
+                    total_out = self._read_bzip2_stream_with_limits(
+                        source=source,
+                        destination=outputs,
+                        max_decompressed_bytes=self.max_decompressed_bytes,
+                        max_ratio=self.max_decompression_ratio,
+                        compressed_size=compressed_size,
+                        chunk_size=self.chunk_size,
+                        on_new_member=lambda: outputs.start_new_member(suffix),
                     )
                 elif codec == "xz":
                     total_out = self._read_xz_stream_with_limits(
                         source=source,
-                        destination=temp_file,
+                        destination=outputs,
                         max_decompressed_bytes=self.max_decompressed_bytes,
                         max_ratio=self.max_decompression_ratio,
                         compressed_size=compressed_size,
                         chunk_size=self.chunk_size,
+                        on_new_member=lambda: outputs.start_new_member(suffix),
                     )
                 elif codec == "lz4":
                     lz4_frame = self._get_lz4_frame_module()
                     total_out = self._read_lz4_stream_with_limits(
                         source=source,
-                        destination=temp_file,
+                        destination=outputs,
                         lz4_frame=lz4_frame,
                         max_decompressed_bytes=self.max_decompressed_bytes,
                         max_ratio=self.max_decompression_ratio,
                         compressed_size=compressed_size,
                         chunk_size=self.chunk_size,
+                        on_new_member=lambda: outputs.start_new_member(suffix),
                     )
                 elif codec == "zlib":
                     total_out = self._read_zlib_stream_with_limits(
                         source=source,
-                        destination=temp_file,
+                        destination=outputs,
                         max_decompressed_bytes=self.max_decompressed_bytes,
                         max_ratio=self.max_decompression_ratio,
                         compressed_size=compressed_size,
                         chunk_size=self.chunk_size,
+                        on_new_member=lambda: outputs.start_new_member(suffix),
                     )
                 else:
                     raise _CorruptStreamError(f"Unsupported compression codec: {codec}")
+        except Exception:
+            outputs.cleanup()
+            raise
 
-        return temp_path, total_out
+        outputs.close()
+        return outputs.aggregate_path, outputs.member_paths, total_out
 
     @staticmethod
     def _rewrite_wrapper_location(location: str | None, temp_path: str, provenance: str) -> str:
@@ -669,11 +743,13 @@ class CompressedScanner(BaseScanner):
             details={"codec": expected_codec},
         )
 
-        temp_path: str | None = None
+        temp_paths: list[str] = []
         decompressed_bytes = 0
         try:
-            temp_path, decompressed_bytes = self._decompress_to_tempfile(path, expected_codec)
+            temp_path, member_temp_paths, decompressed_bytes = self._decompress_to_tempfiles(path, expected_codec)
+            temp_paths = [temp_path, *member_temp_paths]
             result.metadata["decompressed_bytes"] = decompressed_bytes
+            result.metadata["compressed_member_count"] = len(member_temp_paths)
             compressed_size = max(1, self.get_file_size(path))
             ratio = decompressed_bytes / compressed_size
             result.add_check(
@@ -708,6 +784,23 @@ class CompressedScanner(BaseScanner):
             )
 
             result.merge(inner_result)
+            if len(member_temp_paths) > 1:
+                for member_index, member_temp_path in enumerate(member_temp_paths, start=1):
+                    member_result = core.scan_file(member_temp_path, nested_config)
+                    member_provenance = f"{provenance}#member-{member_index}"
+                    self._rewrite_inner_locations(member_result, member_temp_path, member_provenance)
+                    result.add_check(
+                        name="Compressed Wrapper Member Scanner Routing",
+                        passed=True,
+                        message=(f"Routed decompressed member {member_index} to scanner: {member_result.scanner_name}"),
+                        location=path,
+                        details={
+                            "inner_scanner": member_result.scanner_name,
+                            "member_index": member_index,
+                            "provenance": member_provenance,
+                        },
+                    )
+                    result.merge(member_result)
             result.bytes_scanned += self.get_file_size(path)
         except _MissingOptionalDependencyError as exc:
             result.add_check(
@@ -758,8 +851,9 @@ class CompressedScanner(BaseScanner):
             result.finish(success=False)
             return result
         finally:
-            if temp_path and os.path.exists(temp_path):
-                os.unlink(temp_path)
+            for temp_path in temp_paths:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
 
         result.finish(success=not result.has_errors)
         return result
