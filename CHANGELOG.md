@@ -97,6 +97,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **security:** keep trusted NeMo namespaces from suppressing suspicious Hydra
+  `_target_` leaf names
 - **security:** detect `mailcap.findmatch` pickle call targets that can execute
   attacker-controlled mailcap `test` commands on Python versions that still
   provide `mailcap`

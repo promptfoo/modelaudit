@@ -900,6 +900,19 @@ class TestCVE202523304HydraTarget:
             f"Safe-prefixed target with 'eval' should not trigger CVE. Checks: {[c.name for c in result.checks]}"
         )
 
+    def test_safe_prefix_does_not_suppress_suspicious_leaf_target(self, tmp_path: Path) -> None:
+        """Trusted namespaces must not hide obviously dangerous target components."""
+        config = {
+            "model": {"_target_": "nemo.eval_utils.system"},
+        }
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        suspicious_checks = [c for c in result.checks if c.name == "CVE-2025-23304: Suspicious Hydra _target_"]
+        assert len(suspicious_checks) == 1
+        assert suspicious_checks[0].details["pattern"] == "system"
+
     def test_nested_target_detected(self, tmp_path):
         """Deeply nested _target_ should still be found."""
         config = {
