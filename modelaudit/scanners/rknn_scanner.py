@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 from typing import Any, ClassVar
 
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ._evidence_redaction import redact_evidence_string
 from ._string_extraction import extract_bounded_printable_strings
 from .base import BaseScanner, IssueSeverity, ScanResult
@@ -135,6 +136,7 @@ class RknnScanner(BaseScanner):
         result.metadata["scan_truncated"] = truncated
 
         if truncated:
+            mark_inconclusive_scan_result(result, "rknn_bounded_read_incomplete")
             result.add_check(
                 name="RKNN Bounded Read",
                 passed=False,
@@ -208,7 +210,9 @@ class RknnScanner(BaseScanner):
         self._check_command_and_network_indicators(path, extracted_strings, result)
         self._check_obfuscated_payload_hints(path, extracted_strings, result)
 
-        result.finish(success=not result.has_errors)
+        result.finish(
+            success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
+        )
         return result
 
     @staticmethod
