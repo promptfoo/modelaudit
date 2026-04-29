@@ -3410,6 +3410,28 @@ def test_with_call_graph_findings_promotes_click_startup_hook_paths_when_invocat
     assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH_FILE_WRITE" for finding in updated.findings)
 
 
+def test_with_call_graph_findings_promotes_click_startup_hook_paths_when_scan_is_inconclusive() -> None:
+    pytest.importorskip("click")
+
+    report = PickleReport(
+        source="click-startup-hook-incomplete.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        metadata={
+            "import_references": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            ),
+            "callable_invocations": (),
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH_FILE_WRITE" for finding in updated.findings)
+
+
 def test_scan_bytes_keeps_import_only_click_startup_hook_paths_clean() -> None:
     pytest.importorskip("click")
 

@@ -4522,15 +4522,10 @@ impl<'a> ScanState<'a> {
             for reference in follow_on_scan.import_references {
                 self.push_import_reference(reference);
             }
-            for invocation in follow_on_scan.callable_invocations {
-                if self.callable_invocations.len() < MAX_IMPORT_REFERENCES
-                    && self.remember_callable_invocation_details(&invocation)
-                {
-                    self.callable_invocations.push(invocation);
-                } else if self.callable_invocations.len() >= MAX_IMPORT_REFERENCES {
-                    self.record_callable_invocations_truncated_notice();
-                }
-            }
+            self.merge_follow_on_callable_invocations(
+                follow_on_scan.callable_invocations,
+                follow_on_scan.callable_invocations_truncated,
+            );
             if had_findings {
                 self.add_notice(Notice {
                     message: "Follow-on pickle stream detected after malformed padding".to_string(),
@@ -4550,6 +4545,25 @@ impl<'a> ScanState<'a> {
                     ],
                 });
                 return;
+            }
+        }
+    }
+
+    fn merge_follow_on_callable_invocations(
+        &mut self,
+        follow_on_invocations: Vec<Vec<(String, DetailValue)>>,
+        follow_on_invocations_truncated: bool,
+    ) {
+        if follow_on_invocations_truncated {
+            self.record_callable_invocations_truncated_notice();
+        }
+        for invocation in follow_on_invocations {
+            if self.callable_invocations.len() < MAX_IMPORT_REFERENCES
+                && self.remember_callable_invocation_details(&invocation)
+            {
+                self.callable_invocations.push(invocation);
+            } else if self.callable_invocations.len() >= MAX_IMPORT_REFERENCES {
+                self.record_callable_invocations_truncated_notice();
             }
         }
     }
@@ -5687,6 +5701,35 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn follow_on_callable_invocation_truncation_is_propagated() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "follow-on-truncated-invocations.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+
+        scan.merge_follow_on_callable_invocations(Vec::new(), true);
+
+        assert!(scan.callable_invocations_truncated);
+        assert!(scan
+            .notices
+            .iter()
+            .any(|notice| notice.code == Some("callable_invocations_truncated")));
     }
 
     #[test]
