@@ -220,6 +220,31 @@ class TestFileFilter:
         assert detect_file_format_for_skip_filter(str(disguised_lightgbm)) == "lightgbm"
         assert not should_skip_file(str(disguised_lightgbm))
 
+    def test_disguised_xml_models_with_long_prologs_bypass_default_skip(self, tmp_path: Path) -> None:
+        """Skipped suffixes must not hide XML model roots after long benign prologs."""
+        disguised_openvino = tmp_path / "openvino.txt"
+        disguised_openvino.write_text(
+            f"<?xml version='1.0'?><!--{'x' * 1024}--><net name='Model0' version='11'></net>",
+            encoding="utf-8",
+        )
+        disguised_pmml = tmp_path / "pmml.txt"
+        disguised_pmml.write_text(
+            f"<?xml version='1.0'?><!--{'x' * 1024}--><PMML version='4.4'></PMML>",
+            encoding="utf-8",
+        )
+        benign_xml = tmp_path / "notes.txt"
+        benign_xml.write_text(
+            f"<?xml version='1.0'?><!--{'x' * 1024}--><project><model name='safe'/></project>",
+            encoding="utf-8",
+        )
+
+        assert detect_file_format_for_skip_filter(str(disguised_openvino)) == "openvino"
+        assert detect_file_format_for_skip_filter(str(disguised_pmml)) == "pmml"
+        assert detect_file_format_for_skip_filter(str(benign_xml)) == "unknown"
+        assert not should_skip_file(str(disguised_openvino))
+        assert not should_skip_file(str(disguised_pmml))
+        assert should_skip_file(str(benign_xml))
+
     def test_executorch_payloads_bypass_extension_skip(self, tmp_path: Path) -> None:
         """Disguised ZIPs carrying supported ExecuTorch payloads should survive prefiltering."""
         disguised_zip = tmp_path / "executorch.jpg"
