@@ -2432,5 +2432,17 @@ class PickleScanner(BaseScanner):
             return result
 
         self._add_root_legacy_metadata_detectors(result, path)
+        self._scan_jax_checkpoint_patterns_if_needed(path, raw_data, result)
         self._finish_after_wrapper_analysis(result, base_success=scan_result.success)
         return result
+
+    def _scan_jax_checkpoint_patterns_if_needed(self, path: str, raw_data: bytes, result: ScanResult) -> None:
+        from .jax_checkpoint_scanner import JaxCheckpointScanner
+
+        if JaxCheckpointScanner.can_handle(path):
+            result.merge(
+                JaxCheckpointScanner(config=self.config).scan_pickle_pattern_text(
+                    path,
+                    raw_data.decode("utf-8", errors="ignore"),
+                )
+            )
