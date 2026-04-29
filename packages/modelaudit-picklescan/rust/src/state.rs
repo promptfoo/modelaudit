@@ -1491,9 +1491,7 @@ impl<'a> ScanState<'a> {
             ("builtins", "format") => {
                 Self::builtins_format_invocations(arguments, op_name, position)
             }
-            ("builtins", "str.format") => {
-                Self::str_format_invocations(arguments, op_name, position)
-            }
+            ("builtins", "str.format") => self.str_format_invocations(arguments, op_name, position),
             ("builtins", "str.format_map") => {
                 self.str_format_map_invocations(arguments, op_name, position)
             }
@@ -2017,11 +2015,12 @@ impl<'a> ScanState<'a> {
     }
 
     fn str_format_invocations(
+        &self,
         arguments: &[StackValue],
         op_name: &'static str,
         position: usize,
     ) -> Vec<CallableInvocation> {
-        if arguments.len() < 2 || !Self::is_format_string_argument(arguments.first()) {
+        if arguments.len() < 2 || !self.brace_format_string_may_use_field(arguments.first()) {
             return Vec::new();
         }
         arguments
@@ -2042,7 +2041,7 @@ impl<'a> ScanState<'a> {
         op_name: &'static str,
         position: usize,
     ) -> Vec<CallableInvocation> {
-        if arguments.len() != 2 || !Self::is_format_string_argument(arguments.first()) {
+        if arguments.len() != 2 || !self.brace_format_string_may_use_field(arguments.first()) {
             return Vec::new();
         }
         self.mapping_lookup_invocations(arguments.get(1), None, op_name, position)
@@ -2054,7 +2053,9 @@ impl<'a> ScanState<'a> {
         op_name: &'static str,
         position: usize,
     ) -> Vec<CallableInvocation> {
-        if arguments.len() != 2 || !Self::is_format_string_argument(arguments.first()) {
+        if arguments.len() != 2
+            || !self.percent_format_string_may_use_mapping_key(arguments.first())
+        {
             return Vec::new();
         }
         self.mapping_lookup_invocations(arguments.get(1), None, op_name, position)
@@ -2152,7 +2153,7 @@ impl<'a> ScanState<'a> {
         position: usize,
     ) -> Vec<CallableInvocation> {
         if !expected_arg_counts.contains(&arguments.len())
-            || !Self::is_format_string_argument(arguments.get(1))
+            || !self.brace_format_string_may_use_field(arguments.get(1))
         {
             return Vec::new();
         }
@@ -2190,6 +2191,54 @@ impl<'a> ScanState<'a> {
                 }
                 Some(_) => return true,
                 None => {}
+            }
+        }
+        false
+    }
+
+    fn brace_format_string_may_use_field(&self, value: Option<&StackValue>) -> bool {
+        let Some(format_string) = value.and_then(|value| stack_value_string(value, self.payload))
+        else {
+            return false;
+        };
+        Self::brace_format_literal_contains_field(&format_string)
+    }
+
+    fn brace_format_literal_contains_field(format_string: &str) -> bool {
+        let mut chars = format_string.chars().peekable();
+        while let Some(character) = chars.next() {
+            if character != '{' {
+                continue;
+            }
+            if chars.peek() == Some(&'{') {
+                chars.next();
+                continue;
+            }
+            return true;
+        }
+        false
+    }
+
+    fn percent_format_string_may_use_mapping_key(&self, value: Option<&StackValue>) -> bool {
+        let Some(format_string) = value.and_then(|value| stack_value_string(value, self.payload))
+        else {
+            return false;
+        };
+        Self::percent_format_literal_contains_mapping_key(&format_string)
+    }
+
+    fn percent_format_literal_contains_mapping_key(format_string: &str) -> bool {
+        let mut chars = format_string.chars().peekable();
+        while let Some(character) = chars.next() {
+            if character != '%' {
+                continue;
+            }
+            match chars.peek() {
+                Some('%') => {
+                    chars.next();
+                }
+                Some('(') => return true,
+                _ => {}
             }
         }
         false
