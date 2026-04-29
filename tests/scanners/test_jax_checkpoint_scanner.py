@@ -798,6 +798,13 @@ def test_can_handle_numpy_checkpoint_rejects_ajax_filename_near_match(tmp_path: 
     assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
 
 
+def test_can_handle_numpy_checkpoint_accepts_underscored_jax_filename(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "model_jax_weights.checkpoint"
+    checkpoint_path.write_bytes(b"\x93NUMPY")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+
+
 def test_metadata_traversal_stops_at_depth_limit_without_recursing_unbounded() -> None:
     nested_metadata: object = "jax.experimental.host_callback.call(os.system, 'id')"
     for _ in range(2 * JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH):
