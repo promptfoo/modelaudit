@@ -591,6 +591,16 @@ pub(crate) fn encoded_nested_literal_probe_windows(
     windows
 }
 
+pub(crate) fn encoded_nested_literal_probe_coverage_incomplete(value: &str) -> bool {
+    if value.len() <= MAX_ENCODED_LITERAL_MID_SCAN_BYTES {
+        return false;
+    }
+
+    let prefix_has_base64_pickle = base64_prefix_has_pickle_prefix(value);
+    let prefix_has_hex_pickle = !prefix_has_base64_pickle && hex_prefix_has_pickle_prefix(value);
+    !encoded_prefix_consumes_literal(value, prefix_has_base64_pickle, prefix_has_hex_pickle)
+}
+
 pub(crate) fn encoded_literal_may_contain_pickle(value: &str) -> bool {
     let stripped = value.trim();
     if stripped.len() < 16 {
@@ -1089,6 +1099,9 @@ mod tests {
         assert!(!beyond_windows
             .iter()
             .any(|window| window.starts_with("gAR9Lg==")));
+        assert!(encoded_nested_literal_probe_coverage_incomplete(
+            &beyond_bound
+        ));
     }
 
     #[test]

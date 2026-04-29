@@ -10,10 +10,10 @@ use crate::expansion::{
 };
 use crate::nested::{
     decode_possible_encoded_pickle, detect_oversized_encoded_pickle_prefixes,
-    encoded_literal_may_contain_pickle, encoded_nested_literal_probe_windows,
-    encoded_nested_window_char_limit, has_execution_opcode, has_pickle_prefix,
-    looks_like_pickle_payload, nested_pickle_probe_offsets, pickle_payload_extent,
-    truncated_pickle_prefix_requires_fail_closed, MAX_NESTED_PAYLOAD_PROBES,
+    encoded_literal_may_contain_pickle, encoded_nested_literal_probe_coverage_incomplete,
+    encoded_nested_literal_probe_windows, encoded_nested_window_char_limit, has_execution_opcode,
+    has_pickle_prefix, looks_like_pickle_payload, nested_pickle_probe_offsets,
+    pickle_payload_extent, truncated_pickle_prefix_requires_fail_closed, MAX_NESTED_PAYLOAD_PROBES,
 };
 use crate::nested_surface::{
     encoded_nested_payload_finding, is_allowlisted_nested_constructor_ref,
@@ -3481,6 +3481,7 @@ impl<'a> ScanState<'a> {
 
         let max_window_chars =
             encoded_nested_window_char_limit(value, self.options.max_nested_pickle_bytes);
+        let probe_coverage_incomplete = encoded_nested_literal_probe_coverage_incomplete(value);
         if !found_candidate
             && (value.len() <= max_window_chars || value.chars().count() <= max_window_chars)
         {
@@ -3494,7 +3495,20 @@ impl<'a> ScanState<'a> {
             found_candidate |= self.scan_encoded_nested_pickle_candidate(&candidate, position);
         }
 
+        if probe_coverage_incomplete {
+            self.record_literal_scan_truncated(
+                "string",
+                string_char_len(value),
+                "encoded_nested_pickle",
+                position,
+            );
+        }
+
         if found_candidate {
+            return;
+        }
+
+        if probe_coverage_incomplete {
             return;
         }
 

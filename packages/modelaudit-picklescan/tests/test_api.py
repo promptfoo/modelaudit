@@ -3805,6 +3805,21 @@ def test_scan_bytes_records_data_only_base64_nested_pickle_hidden_inside_large_l
     assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 
+def test_scan_bytes_marks_late_base64_nested_pickle_inside_budget_as_incomplete() -> None:
+    nested_payload = pickle.dumps({"inner": "data"}, protocol=4)
+    hidden_payload = "A" * (1024 * 1024 + 64) + base64.b64encode(nested_payload).decode("ascii") + "A" * 64
+
+    report = scan_bytes(
+        pickle.dumps({"outer": hidden_payload}, protocol=4),
+        source="late-hidden-base64-nested.pkl",
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+
+
 def test_scan_bytes_ignores_invalid_base64_nested_pickle_near_match_hidden_inside_large_literal() -> None:
     nested_payload = _corrupt_first_byte(pickle.dumps({"inner": "data"}, protocol=4))
     hidden_payload = "A" * 64 + base64.b64encode(nested_payload).decode("ascii") + "A" * 64
