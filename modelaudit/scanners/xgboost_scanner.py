@@ -633,8 +633,7 @@ class XGBoostScanner(BaseScanner):
                             ),
                         )
 
-                    # Check individual tree structures
-                    self._validate_tree_structures(trees[:10], result, path)  # Sample first 10 trees
+                    self._validate_tree_structures(trees, result, path)
 
         # Check learner model parameters
         params = learner.get("learner_model_param", {})
