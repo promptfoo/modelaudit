@@ -3333,7 +3333,11 @@ def test_with_call_graph_findings_promotes_click_startup_hook_write_paths() -> N
             "import_references": (
                 {"module": "click", "name": "open_file"},
                 {"module": "click", "name": "echo"},
-            )
+            ),
+            "callable_invocations": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            ),
         },
     )
 
@@ -3361,6 +3365,59 @@ def test_with_call_graph_findings_promotes_click_startup_hook_write_paths() -> N
     assert finding.details["analysis"] == "python_call_graph_startup_hook_write"
 
 
+def test_with_call_graph_findings_ignores_uninvoked_click_startup_hook_paths() -> None:
+    pytest.importorskip("click")
+
+    report = PickleReport(
+        source="click-startup-hook-import-only.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            )
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated is report
+    assert updated.verdict == SafetyVerdict.CLEAN
+    assert updated.findings == ()
+
+
+def test_scan_bytes_keeps_import_only_click_startup_hook_paths_clean() -> None:
+    pytest.importorskip("click")
+
+    payload = b"\x80\x04cclick\nopen_file\ncclick\necho\n\x86."
+
+    report = scan_bytes(payload, source="click-startup-hook-import-only.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert report.metadata["import_references"] == (
+        {
+            "import_reference": "click.open_file",
+            "module": "click",
+            "name": "open_file",
+            "opcode": "GLOBAL",
+            "position": 2,
+            "is_dangerous": False,
+        },
+        {
+            "import_reference": "click.echo",
+            "module": "click",
+            "name": "echo",
+            "opcode": "GLOBAL",
+            "position": 19,
+            "is_dangerous": False,
+        },
+    )
+    assert report.metadata["callable_invocations"] == ()
+
+
 def test_with_call_graph_findings_dedupes_click_startup_hook_write_when_writer_is_already_critical() -> None:
     pytest.importorskip("click")
 
@@ -3380,7 +3437,11 @@ def test_with_call_graph_findings_dedupes_click_startup_hook_write_when_writer_i
             "import_references": (
                 {"module": "click", "name": "open_file"},
                 {"module": "click", "name": "echo"},
-            )
+            ),
+            "callable_invocations": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            ),
         },
     )
 
@@ -3409,7 +3470,11 @@ def test_with_call_graph_findings_dedupes_click_startup_hook_write_when_opener_i
             "import_references": (
                 {"module": "click", "name": "open_file"},
                 {"module": "click", "name": "echo"},
-            )
+            ),
+            "callable_invocations": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            ),
         },
     )
 

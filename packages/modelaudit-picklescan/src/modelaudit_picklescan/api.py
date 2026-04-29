@@ -953,7 +953,7 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     except Exception:
         call_graph_findings = ()
     try:
-        startup_hook_write_findings = find_startup_hook_write_call_graphs(import_references)
+        startup_hook_write_findings = find_startup_hook_write_call_graphs(import_references, callable_invocations)
     except Exception:
         startup_hook_write_findings = ()
     if not call_graph_findings and not startup_hook_write_findings and not call_graph_limit_exceeded:
