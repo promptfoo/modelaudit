@@ -27,6 +27,16 @@ _EXECUTABLE_ARCHIVE_MEMBER_SUFFIXES = (
     ".bat",
     ".ps1",
 )
+_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES = 1024
+_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_PREFIXES = (
+    b"\x7fELF",
+    b"\xfe\xed\xfa\xce",
+    b"\xfe\xed\xfa\xcf",
+    b"\xcf\xfa\xed\xfe",
+    b"\xce\xfa\xed\xfe",
+    b"\xca\xfe\xba\xbe",
+    b"#!",
+)
 _VERSIONED_SHARED_OBJECT_SUFFIX_RE = re.compile(r"\.so(?:\.[0-9]+)+$")
 _PYTHON_ARCHIVE_MEMBER_SUFFIXES = (".py", ".pyw")
 _HIGH_RISK_PYTHON_CALLS = {
@@ -104,6 +114,30 @@ def is_executable_archive_member_name(member_name: str) -> bool:
     return normalized_name.endswith(_EXECUTABLE_ARCHIVE_MEMBER_SUFFIXES) or bool(
         _VERSIONED_SHARED_OBJECT_SUFFIX_RE.search(normalized_name)
     )
+
+
+def _looks_like_portable_executable(data: bytes) -> bool:
+    if not data.startswith(b"MZ"):
+        return False
+    if b"This program cannot be run in DOS mode" in data[:512]:
+        return True
+    if len(data) < 0x40:
+        return False
+    pe_offset = int.from_bytes(data[0x3C:0x40], "little", signed=False)
+    return pe_offset > 0 and pe_offset + 4 <= len(data) and data[pe_offset : pe_offset + 4] == b"PE\x00\x00"
+
+
+def is_executable_archive_member_content(path: str) -> bool:
+    """Return True when a member begins with a strong executable signature."""
+    try:
+        with open(path, "rb") as member_file:
+            prefix = member_file.read(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES)
+    except OSError:
+        return False
+
+    if prefix.startswith(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_PREFIXES):
+        return True
+    return _looks_like_portable_executable(prefix)
 
 
 def is_python_archive_member_name(member_name: str) -> bool:
@@ -644,7 +678,7 @@ def scan_archive_member_for_known_risks(
             )
         return
 
-    if is_executable_archive_member_name(normalized_lower):
+    if is_executable_archive_member_name(normalized_lower) or is_executable_archive_member_content(tmp_path):
         result.add_check(
             name=_EXECUTABLE_MEMBER_CHECK_NAME,
             passed=False,

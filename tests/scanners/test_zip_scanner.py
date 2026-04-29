@@ -467,6 +467,37 @@ def test_scan_npz_flags_executable_member(tmp_path: Path) -> None:
     assert executable_checks[0].details["entry"] == "bin/run.sh"
 
 
+def test_scan_npz_flags_extensionless_executable_member(tmp_path: Path) -> None:
+    """Executable payloads should not need a helpful suffix inside ZIP-like archives."""
+    archive_path = tmp_path / "model_bundle.npz"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("bin/runme", b"\x7fELF" + b"\x00" * 64)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    executable_checks = [
+        check
+        for check in result.checks
+        if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert len(executable_checks) == 1
+    assert executable_checks[0].severity == IssueSeverity.WARNING
+    assert executable_checks[0].details["entry"] == "bin/runme"
+
+
+def test_scan_npz_ignores_extensionless_executable_near_match(tmp_path: Path) -> None:
+    """Near-match member bytes should not become executable findings."""
+    archive_path = tmp_path / "model_bundle.npz"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("bin/runme", b"\x7fELG" + b"\x00" * 64)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(check.name == "Executable Archive Member Detection" for check in result.checks)
+
+
 def test_scan_npz_ignores_numpy_member_near_python_suffix(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.npz"
     with zipfile.ZipFile(archive_path, "w") as archive:
