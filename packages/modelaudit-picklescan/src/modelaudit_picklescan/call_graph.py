@@ -10,7 +10,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
-from importlib.machinery import ModuleSpec, PathFinder
+from importlib.machinery import EXTENSION_SUFFIXES, ModuleSpec, PathFinder
 from pathlib import Path
 
 _MAX_IMPORT_REFERENCES = 32
@@ -738,11 +738,18 @@ def _call_graph_source_unavailable_reason(module_name: str) -> str | None:
             return "source_parse_error"
         return None
 
+    if module_name.split(".", maxsplit=1)[0] in sys.builtin_module_names:
+        return None
+
     try:
         spec = _find_module_spec_without_imports(module_name)
     except Exception:
         return "source_unavailable"
-    if spec is None or spec.origin in {"built-in", "frozen"}:
+    if spec is None:
+        return "source_unavailable"
+    if spec.origin in {"built-in", "frozen"}:
+        return None
+    if spec.origin is not None and any(spec.origin.endswith(suffix) for suffix in EXTENSION_SUFFIXES):
         return None
     return "source_unavailable"
 

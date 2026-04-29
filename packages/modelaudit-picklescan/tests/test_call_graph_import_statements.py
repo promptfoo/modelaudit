@@ -1378,6 +1378,27 @@ def test_scan_bytes_marks_lookup_failures_as_unanalyzable(
     assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
 
 
+def test_scan_bytes_marks_unresolved_specs_as_unanalyzable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_tp_unresolved_spec_probe"
+
+    monkeypatch.setattr(call_graph, "_find_module_spec_without_imports", lambda _: None)
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            _global_call_payload(module_name, "invoke", _unicode_operand("echo hidden")),
+            source="unresolved-spec-call-graph-source.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
+
+
 def test_scan_bytes_marks_bytecode_only_invoked_call_graph_source_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1033,7 +1033,11 @@ def _with_unanalyzed_call_graph_notices(
     metadata = {**report.to_dict()["metadata"], "analysis_incomplete": True}
     return PickleReport(
         source=report.source,
-        status=ScanStatus.INCONCLUSIVE if report.status == ScanStatus.COMPLETE else report.status,
+        status=(
+            ScanStatus.INCONCLUSIVE
+            if report.status == ScanStatus.COMPLETE and report.verdict == SafetyVerdict.CLEAN
+            else report.status
+        ),
         verdict=SafetyVerdict.UNKNOWN if report.verdict == SafetyVerdict.CLEAN else report.verdict,
         findings=report.findings,
         notices=notices,
