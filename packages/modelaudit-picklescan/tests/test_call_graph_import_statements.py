@@ -697,6 +697,22 @@ def _builtins_help_defaultdict_format_map_payload(*, lookup: bool) -> bytes:
     return b"".join(parts)
 
 
+def _builtins_help_defaultdict_str_format_payload(format_string: str, *format_arguments: bytes) -> bytes:
+    return b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("collections", "defaultdict"),
+            _global_operand("builtins", "help"),
+            b"\x85R",
+            b"\x94",
+            b"0",
+            _global_operand("builtins", "str.format"),
+            _args_tuple(_unicode_operand(format_string), *format_arguments),
+            b"R.",
+        ]
+    )
+
+
 def _builtins_help_defaultdict_operator_mod_payload(*, lookup: bool, operator_name: str = "mod") -> bytes:
     parts = [
         b"\x80\x04",
@@ -6105,6 +6121,64 @@ if marker.read_text() != marker_content:
     )
     assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
+
+
+@pytest.mark.parametrize(
+    ("format_string", "format_arguments"),
+    [
+        ("{0[x]}", (b"h\x00",)),
+        ("{[x]}", (b"h\x00",)),
+        ("{0:{1[x]}}", (_unicode_operand("safe"), b"h\x00")),
+        ("{0!r:{1[x]}}", (_unicode_operand("safe"), b"h\x00")),
+        ("{[x]} {0}", (b"h\x00",)),
+        ("{[x]} }", (b"h\x00",)),
+    ],
+)
+def test_scan_bytes_blocks_str_format_defaultdict_factory_rce(
+    format_string: str,
+    format_arguments: tuple[bytes, ...],
+) -> None:
+    payload = _builtins_help_defaultdict_str_format_payload(format_string, *format_arguments)
+
+    report = scan_bytes(payload, source="str-format-defaultdict-factory-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+
+@pytest.mark.parametrize(
+    ("format_string", "format_arguments"),
+    [
+        ("{}", (b"h\x00",)),
+        ("{0} {[x]}", (_unicode_operand("safe"), b"h\x00")),
+    ],
+)
+def test_scan_bytes_keeps_non_lookup_str_format_defaultdict_cases_clean(
+    format_string: str,
+    format_arguments: tuple[bytes, ...],
+) -> None:
+    payload = _builtins_help_defaultdict_str_format_payload(format_string, *format_arguments)
+
+    report = scan_bytes(payload, source="str-format-defaultdict-no-lookup.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
 
 
 @pytest.mark.parametrize("operator_name", ["mod", "imod"])
