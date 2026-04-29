@@ -948,15 +948,23 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     import_references = report.metadata.get("import_references")
     callable_invocations = report.metadata.get("callable_invocations")
     call_graph_limit_exceeded = has_unanalyzed_call_graph_import_references(import_references)
+    enrichment_errors: list[tuple[str, Exception]] = []
     try:
         call_graph_findings = find_dangerous_call_graphs(import_references, callable_invocations)
-    except Exception:
+    except Exception as error:
         call_graph_findings = ()
+        enrichment_errors.append(("python_call_graph", error))
     try:
         startup_hook_write_findings = find_startup_hook_write_call_graphs(import_references)
-    except Exception:
+    except Exception as error:
         startup_hook_write_findings = ()
-    if not call_graph_findings and not startup_hook_write_findings and not call_graph_limit_exceeded:
+        enrichment_errors.append(("python_call_graph_startup_hook_write", error))
+    if (
+        not call_graph_findings
+        and not startup_hook_write_findings
+        and not call_graph_limit_exceeded
+        and not enrichment_errors
+    ):
         return report
 
     existing_critical_globals = {
@@ -981,18 +989,57 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         else ()
     )
     additional_findings = (*rce_findings, *startup_findings, *limit_findings)
-    if not additional_findings:
-        return report
+    updated_report = (
+        PickleReport(
+            source=report.source,
+            status=report.status,
+            verdict=SafetyVerdict.MALICIOUS,
+            findings=(*report.findings, *additional_findings),
+            notices=report.notices,
+            errors=report.errors,
+            coverage=report.coverage,
+            metadata=report.to_dict()["metadata"],
+            duration_s=report.duration_s,
+        )
+        if additional_findings
+        else report
+    )
+    return (
+        _with_call_graph_enrichment_errors(updated_report, tuple(enrichment_errors))
+        if enrichment_errors
+        else updated_report
+    )
 
+
+def _with_call_graph_enrichment_errors(
+    report: PickleReport,
+    enrichment_errors: tuple[tuple[str, Exception], ...],
+) -> PickleReport:
+    errors = (
+        *report.errors,
+        *(
+            ScanError(
+                message=f"Python call-graph analysis could not complete: {error!s}",
+                category="call_graph_analysis_error",
+                location=report.source,
+                exception_type=type(error).__name__,
+                details={"analysis": analysis, "analysis_incomplete": True},
+            )
+            for analysis, error in enrichment_errors
+        ),
+    )
+    status = ScanStatus.INCONCLUSIVE if report.status == ScanStatus.COMPLETE else report.status
+    verdict = SafetyVerdict.UNKNOWN if report.verdict == SafetyVerdict.CLEAN else report.verdict
+    metadata = {**report.to_dict()["metadata"], "analysis_incomplete": True}
     return PickleReport(
         source=report.source,
-        status=report.status,
-        verdict=SafetyVerdict.MALICIOUS,
-        findings=(*report.findings, *additional_findings),
+        status=status,
+        verdict=verdict,
+        findings=report.findings,
         notices=report.notices,
-        errors=report.errors,
+        errors=errors,
         coverage=report.coverage,
-        metadata=report.to_dict()["metadata"],
+        metadata=metadata,
         duration_s=report.duration_s,
     )
 

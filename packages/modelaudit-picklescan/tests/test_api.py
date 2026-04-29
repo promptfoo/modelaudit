@@ -3361,6 +3361,61 @@ def test_with_call_graph_findings_promotes_click_startup_hook_write_paths() -> N
     assert finding.details["analysis"] == "python_call_graph_startup_hook_write"
 
 
+def test_scan_bytes_marks_call_graph_enrichment_failures_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    def raise_call_graph_error(*_args: object, **_kwargs: object) -> tuple[()]:
+        raise RuntimeError("call graph exploded")
+
+    monkeypatch.setattr(package_api, "find_dangerous_call_graphs", raise_call_graph_error)
+
+    report = scan_bytes(b"crandom\n_os.system\n.", source="call-graph-enrichment-error.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert report.metadata["analysis_incomplete"] is True
+    assert any(
+        error.category == "call_graph_analysis_error"
+        and error.exception_type == "RuntimeError"
+        and error.details["analysis"] == "python_call_graph"
+        and error.details["analysis_incomplete"] is True
+        for error in report.errors
+    )
+
+
+def test_with_call_graph_findings_marks_startup_hook_enrichment_failures_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_startup_hook_error(*_args: object, **_kwargs: object) -> tuple[()]:
+        raise RuntimeError("startup graph exploded")
+
+    monkeypatch.setattr(package_api, "find_startup_hook_write_call_graphs", raise_startup_hook_error)
+    report = PickleReport(
+        source="startup-hook-enrichment-error.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            )
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.UNKNOWN
+    assert updated.findings == ()
+    assert updated.metadata["analysis_incomplete"] is True
+    assert any(
+        error.category == "call_graph_analysis_error"
+        and error.exception_type == "RuntimeError"
+        and error.details["analysis"] == "python_call_graph_startup_hook_write"
+        and error.details["analysis_incomplete"] is True
+        for error in updated.errors
+    )
+
+
 def test_with_call_graph_findings_dedupes_click_startup_hook_write_when_writer_is_already_critical() -> None:
     pytest.importorskip("click")
 
