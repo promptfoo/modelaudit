@@ -90,12 +90,11 @@ class TestSkopsScannerCanHandle:
 class TestSkopsScannerCVE2025_54412:
     """Test CVE-2025-54412: OperatorFuncNode trusted-type confusion detection."""
 
-    def test_detects_operatorfuncnode_pattern(self, tmp_path: Path) -> None:
-        """Test detection of OperatorFuncNode pattern in file names."""
+    def test_detects_operatorfuncnode_loader(self, tmp_path: Path) -> None:
+        """Test detection of structured OperatorFuncNode loader entries."""
         skops_file = tmp_path / "malicious.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
-            zf.writestr("OperatorFuncNode_exploit.json", '{"type": "exploit"}')
-            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("schema.json", '{"__loader__": "OperatorFuncNode"}')
 
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
@@ -147,12 +146,11 @@ class TestSkopsScannerCVE2025_54412:
 class TestSkopsScannerCVE2025_54413:
     """Test CVE-2025-54413: MethodNode inconsistency detection."""
 
-    def test_detects_methodnode_pattern(self, tmp_path: Path) -> None:
-        """Test detection of MethodNode pattern in file names."""
+    def test_detects_methodnode_loader(self, tmp_path: Path) -> None:
+        """Test detection of structured MethodNode loader entries."""
         skops_file = tmp_path / "malicious.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
-            zf.writestr("MethodNode_accessor.json", '{"type": "method"}')
-            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("schema.json", '{"__loader__": "MethodNode"}')
 
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
@@ -163,8 +161,8 @@ class TestSkopsScannerCVE2025_54413:
         assert cve_checks[0].status == CheckStatus.FAILED
         assert cve_checks[0].severity == IssueSeverity.CRITICAL
 
-    def test_detects_getattr_pattern(self, tmp_path: Path) -> None:
-        """Test detection of __getattr__ pattern."""
+    def test_getattr_filename_without_methodnode_loader_is_not_flagged(self, tmp_path: Path) -> None:
+        """Plain filenames should not stand in for structured MethodNode entries."""
         skops_file = tmp_path / "malicious.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
             zf.writestr("__getattr__hook.py", "malicious code")
@@ -173,11 +171,8 @@ class TestSkopsScannerCVE2025_54413:
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
 
-        assert result.success is False
         cve_checks = [c for c in result.checks if "CVE-2025-54413" in c.name]
-        assert len(cve_checks) > 0
-        assert cve_checks[0].status == CheckStatus.FAILED
-        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert not [c for c in cve_checks if c.status == CheckStatus.FAILED]
 
 
 class TestSkopsScannerCVE2025_54886:
@@ -682,9 +677,9 @@ class TestSkopsScannerMultipleCVEs:
         skops_file = tmp_path / "multi_exploit.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
             # CVE-2025-54412 pattern
-            zf.writestr("OperatorFuncNode.json", '{"exploit": true}')
+            zf.writestr("operator.json", '{"__loader__": "OperatorFuncNode"}')
             # CVE-2025-54413 pattern
-            zf.writestr("MethodNode_hook.py", "malicious")
+            zf.writestr("method.json", '{"__loader__": "MethodNode"}')
             # CVE-2025-54886 pattern
             zf.writestr("model_card.md", "use get_model() with joblib fallback")
             zf.writestr("schema.json", '{"version": "1.0"}')
@@ -716,8 +711,7 @@ class TestSkopsScannerCVEDetails:
         """Test that CVE checks include all required detail fields."""
         skops_file = tmp_path / "malicious.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
-            zf.writestr("OperatorFuncNode.json", '{"exploit": true}')
-            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("schema.json", '{"__loader__": "OperatorFuncNode"}')
 
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
