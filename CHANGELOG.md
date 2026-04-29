@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - fail closed when TorchServe MAR limits leave manifest-referenced payloads unscanned
+- recurse into nested ZIP members inside PyTorch archives and fail closed when compression-ratio guards leave members unscanned
+- preserve large Office-like ZIPs when prefilter inspection is incomplete
+- fail closed when directory scans stop at the total-size budget
+- restrict Hugging Face bookkeeping filename skips to recognized cache layouts
 - preserve unsuccessful child results after scan-result merges
 - preserve supported payloads hidden behind default directory-skip names
 
