@@ -48,7 +48,6 @@ _ASSET_PE_HEADER = b"MZ"  # Windows PE executables
 _ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 6))
 _ASSET_PROBE_BYTES = max(8192, PROTO0_1_MAX_PROBE_BYTES)
 _CORE_ROOT_MODEL_FILES = frozenset({"saved_model.pb", "keras_metadata.pb", "fingerprint.pb"})
-_CORE_ROOT_MODEL_DIRS = frozenset({"assets", "assets.extra", "variables"})
 _ASSET_PYTHON_PATTERN = re.compile(
     r"(?m)(^\s*(?:"
     r"from\s+[A-Za-z_][\w.]*\s+import\s+"
