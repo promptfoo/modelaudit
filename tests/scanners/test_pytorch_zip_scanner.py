@@ -2234,6 +2234,63 @@ def test_pytorch_zip_tensor_metadata_mismatch_detection(tmp_path: Path) -> None:
     )
 
 
+def test_pytorch_zip_tensor_metadata_parse_failure_fails_closed(tmp_path: Path) -> None:
+    """Malformed full-member metadata analysis must not collapse into a clean scan."""
+    zip_path = tmp_path / "malformed_tensor_metadata.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", b"\x80\x02B")
+        zipf.writestr("archive/data/0", b"\x00" * 24)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_tensor_metadata_validation_failed" in result.metadata["scan_outcome_reasons"]
+
+
+def test_pytorch_zip_tensor_metadata_prefix_truncation_fails_closed(tmp_path: Path) -> None:
+    """Late tensor metadata after the bounded validation prefix must not report clean coverage."""
+    max_pkl_read = 10 * 1024 * 1024
+    pkl_data = bytearray()
+    pkl_data.extend(b"\x80\x02")  # PROTO 2
+    payload = b"A" * (max_pkl_read + 1024)
+    pkl_data.extend(b"B")  # BINBYTES
+    pkl_data.extend(struct.pack("<I", len(payload)))
+    pkl_data.extend(payload)
+    pkl_data.extend(b"0")  # POP
+    pkl_data.extend(b"ctorch._utils\n_rebuild_tensor_v2\n")
+    pkl_data.extend(b"\x8c\x010")
+    pkl_data.extend(b"J")
+    pkl_data.extend(struct.pack("<i", 1_000_000))
+    pkl_data.extend(b".")
+
+    scanner = PyTorchZipScanner()
+    mismatches, parse_complete = scanner._check_tensor_storage_mismatches(bytes(pkl_data), {"archive/data/0": 24})
+    assert parse_complete is True
+    assert mismatches
+
+    zip_path = tmp_path / "late_tensor_metadata.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", bytes(pkl_data))
+        zipf.writestr("archive/data/0", b"\x00" * 24)
+
+    result = scanner.scan(str(zip_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_tensor_metadata_validation_truncated" in result.metadata["scan_outcome_reasons"]
+    truncation_checks = [
+        check
+        for check in result.checks
+        if check.name == "CVE-2026-24747 Tensor Metadata Validation"
+        and check.details.get("analysis_incomplete") is True
+    ]
+    assert truncation_checks
+    assert truncation_checks[0].details["max_read_bytes"] == max_pkl_read
+
+
 # --- CVE-2022-45907 version check tests ---
 
 
