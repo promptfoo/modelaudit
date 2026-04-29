@@ -140,22 +140,32 @@ def _apply_aliases(call_name: str, alias_scopes: _AliasScopes) -> frozenset[str]
     return frozenset(f"{resolved_head}.{suffix}" for resolved_head in resolved_heads)
 
 
-_MAX_STATIC_STRING_DEPTH = 32
 _MAX_STATIC_STRING_LENGTH = 1024
+_MAX_STATIC_STRING_PARTS = 128
 
 
-def _resolve_static_string(node: ast.AST, *, depth: int = 0) -> str | None:
+def _resolve_static_string(node: ast.AST) -> str | None:
     """Resolve bounded compile-time string expressions used in attribute lookups."""
-    if depth > _MAX_STATIC_STRING_DEPTH:
-        return None
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value if len(node.value) <= _MAX_STATIC_STRING_LENGTH else None
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left = _resolve_static_string(node.left, depth=depth + 1)
-        right = _resolve_static_string(node.right, depth=depth + 1)
-        if left is not None and right is not None and len(left) + len(right) <= _MAX_STATIC_STRING_LENGTH:
-            return left + right
-    return None
+    pending = [node]
+    parts: list[str] = []
+    total_length = 0
+
+    while pending:
+        current = pending.pop()
+        if isinstance(current, ast.BinOp) and isinstance(current.op, ast.Add):
+            if len(parts) + len(pending) >= _MAX_STATIC_STRING_PARTS:
+                return None
+            pending.extend([current.right, current.left])
+            continue
+        if not isinstance(current, ast.Constant) or not isinstance(current.value, str):
+            return None
+
+        total_length += len(current.value)
+        if total_length > _MAX_STATIC_STRING_LENGTH:
+            return None
+        parts.append(current.value)
+
+    return "".join(parts)
 
 
 def _resolve_getattr_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:

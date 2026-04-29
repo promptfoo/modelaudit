@@ -240,6 +240,23 @@ def test_scan_zip_bounds_deep_concatenated_getattr_names(tmp_path: Path) -> None
     )
 
 
+def test_scan_zip_flags_padded_split_literal_getattr_name(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    padding = " + ".join(["''"] * 40)
+    source = f"import os\ngetattr(os, 'sys' + {padding} + 'tem')('echo hidden')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert any(
+        check.name == "Python Archive Member Security"
+        and check.status == CheckStatus.FAILED
+        and check.details["reason"] == "high-risk calls: os.system"
+        for check in result.checks
+    )
+
+
 def test_scan_zip_flags_rebound_dangerous_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = "import subprocess\nrunner = subprocess.run\nrunner(['echo', 'hidden'], check=False)\n"
