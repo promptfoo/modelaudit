@@ -241,6 +241,7 @@ class XGBoostScanner(BaseScanner):
         b"dart",
     )
     _BINARY_MIN_STRUCTURE_BYTES: ClassVar[int] = 32
+    _BINARY_SIGNATURE: ClassVar[bytes] = b"binf"
     _INCONCLUSIVE_REASONS: ClassVar[dict[str, str]] = {
         "json_parse_failed": "xgboost_json_parse_failed",
         "json_analysis_failed": "xgboost_json_analysis_failed",
@@ -810,13 +811,14 @@ class XGBoostScanner(BaseScanner):
                     )
                     return
 
-                # Check for readable strings that typically appear in XGBoost models
+                # The legacy binary format starts with `binf`; marker strings
+                # alone can be planted in arbitrary text payloads.
                 header_str = header.decode("utf-8", errors="ignore")
-                expected_patterns = ["binf", "gbtree", "gblinear", "dart", "reg:", "binary:", "multi:"]
+                expected_patterns = ["gbtree", "gblinear", "dart", "reg:", "binary:", "multi:"]
+                patterns_found = [pattern for pattern in expected_patterns if pattern in header_str.lower()]
+                has_binary_signature = header.startswith(self._BINARY_SIGNATURE)
 
-                has_expected_pattern = any(pattern in header_str.lower() for pattern in expected_patterns)
-
-                if not has_expected_pattern:
+                if not has_binary_signature:
                     # Check if it looks like binary data or something else
                     if all(b < 32 or b > 126 for b in header[:16]):
                         result.add_check(
@@ -835,11 +837,17 @@ class XGBoostScanner(BaseScanner):
                         result.add_check(
                             name="Binary Structure Validation",
                             passed=False,
-                            message="File does not contain expected XGBoost binary model markers",
+                            message="File does not start with the expected XGBoost binary signature",
                             severity=IssueSeverity.INFO,
                             location=path,
-                            details={"expected_patterns": expected_patterns},
-                            why="Missing XGBoost markers may indicate a truncated, corrupted, or mislabeled model file",
+                            details={
+                                "expected_signature": self._BINARY_SIGNATURE.decode("ascii"),
+                                "text_markers_found": patterns_found,
+                            },
+                            why=(
+                                "Missing the XGBoost binary signature may indicate a truncated, corrupted, "
+                                "or mislabeled model file"
+                            ),
                         )
                     if not self.enable_xgb_loading:
                         self._mark_inconclusive_scan_result(
@@ -849,9 +857,9 @@ class XGBoostScanner(BaseScanner):
                     result.add_check(
                         name="XGBoost Binary Pattern Check",
                         passed=True,
-                        message="Found expected XGBoost patterns in binary file",
+                        message="Found expected XGBoost binary signature",
                         location=path,
-                        details={"patterns_found": [p for p in expected_patterns if p in header_str.lower()]},
+                        details={"patterns_found": [self._BINARY_SIGNATURE.decode("ascii"), *patterns_found]},
                     )
 
         except Exception as e:
