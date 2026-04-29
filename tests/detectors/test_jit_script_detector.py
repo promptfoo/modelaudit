@@ -197,9 +197,31 @@ class TestJITScriptDetector:
 
         assert findings == []
 
+    def test_scan_model_ignores_non_source_dangerous_text(self) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(b"metadata says eval( is unsupported", "pytorch", "payload.bin")
+
+        assert findings == []
+
     def test_scan_model_detects_unmarked_module_scope_python_source(self) -> None:
         detector = JITScriptDetector()
         findings = detector.scan_model(b"import os\nos.system('id')\n", "pytorch", "payload.bin")
+
+        assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
+
+    def test_scan_model_detects_late_unmarked_module_scope_python_source(self) -> None:
+        detector = JITScriptDetector()
+        data = b"# pad\n" * 200000 + b"import os\nos.system('id')\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
+
+    def test_scan_model_detects_unmarked_from_import_source(self) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(b"from os import system as run\nrun('id')\n", "pytorch", "payload.bin")
 
         assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
 

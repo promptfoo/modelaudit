@@ -844,7 +844,7 @@ def test_pytorch_zip_skips_numeric_data_files(tmp_path):
     assert result.success is True
 
 
-def test_pytorch_zip_scans_non_numeric_files_in_archive_data(tmp_path):
+def test_pytorch_zip_scans_non_numeric_files_in_archive_data(tmp_path: Path) -> None:
     """Test that non-numeric files in archive/data/ are still scanned for security."""
     zip_path = tmp_path / "model.pt"
 
@@ -900,6 +900,21 @@ def test_pytorch_zip_scans_unmarked_python_blobs_in_archive_data(tmp_path: Path)
     ]
     assert jit_failures
     assert any(check.location == f"{zip_path}:archive/data/payload.bin" for check in jit_failures)
+
+
+def test_pytorch_zip_ignores_non_source_eval_text_in_archive_data(tmp_path: Path) -> None:
+    """Plain payload text containing a dangerous substring must not become a JIT false positive."""
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"note": "eval("}))
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
 
 
 def test_pytorch_zip_allows_torchscript_generated_python_files(tmp_path: Path) -> None:
