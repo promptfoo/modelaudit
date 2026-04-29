@@ -658,6 +658,22 @@ class TestCVE20245480Detection:
         cve_attrs = [attr for attr in attributions if attr.cve_id == "CVE-2024-5480"]
         assert len(cve_attrs) > 0, "Comment padding should not bypass CVE detection"
 
+    def test_mostly_documentation_with_unrelated_code_stays_clean(self) -> None:
+        """Docs should stay clean when the only live line is unrelated code."""
+        content = "\n".join(
+            [
+                "# CVE-2024-5480 notes",
+                "# torch.distributed.rpc.rpc_sync can invoke eval",
+                "# upgrade guidance",
+                'print("ready")',
+            ]
+        )
+
+        attributions = analyze_cve_patterns(content, b"")
+
+        cve_attrs = [attr for attr in attributions if attr.cve_id == "CVE-2024-5480"]
+        assert cve_attrs == []
+
 
 class TestCVE202448063Detection:
     """Test detection of CVE-2024-48063 (PyTorch RemoteModule deserialization RCE)."""

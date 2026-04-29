@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - harden detector heuristics against comment padding, byte-backed credentials, unmarked Python blobs, and spoofed network context
+- preserve unsuccessful child results after scan-result merges
+- preserve supported payloads hidden behind default directory-skip names
 
 ## [0.2.42](https://github.com/promptfoo/modelaudit/compare/v0.2.41...v0.2.42) (2026-04-27)
 

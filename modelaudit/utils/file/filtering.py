@@ -384,10 +384,13 @@ def should_skip_file(
         and ext != ".dvc"
         and not any(candidate in scannable_extensions for candidate in candidate_extensions)
     ):
-        return True
+        return not (use_default_skip_extensions and _has_scannable_content(path))
 
     # Skip specific filenames
-    return filename in skip_filenames
+    if filename in skip_filenames:
+        return not (use_default_skip_extensions and _has_scannable_content(path))
+
+    return False
 
 
 logger = logging.getLogger(__name__)
