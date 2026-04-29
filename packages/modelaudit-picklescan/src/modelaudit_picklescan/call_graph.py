@@ -316,6 +316,8 @@ def find_dangerous_call_graphs(
 def find_startup_hook_write_call_graphs(
     import_references: object,
     callable_invocations: object | None = None,
+    *,
+    callable_invocations_complete: bool = True,
 ) -> tuple[StartupHookWriteFinding, ...]:
     openers: list[_ImportCallPath] = []
     writers: list[_ImportCallPath] = []
@@ -327,7 +329,9 @@ def find_startup_hook_write_call_graphs(
     for reference in _iter_import_references(import_references):
         module = str(reference.get("module", ""))
         name = str(reference.get("name", ""))
-        if not module or not name or (module, name) in seen or (module, name) not in invoked_references:
+        if not module or not name or (module, name) in seen:
+            continue
+        if callable_invocations_complete and (module, name) not in invoked_references:
             continue
         seen.add((module, name))
 

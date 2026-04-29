@@ -440,6 +440,7 @@ pub(crate) struct ScanState<'a> {
     seen_notice_keys: HashSet<NoticeDedupeKey>,
     seen_global_reference_keys: HashSet<GlobalReferenceDedupeKey>,
     import_references_truncated: bool,
+    callable_invocations_truncated: bool,
 }
 
 impl<'a> ScanState<'a> {
@@ -492,6 +493,7 @@ impl<'a> ScanState<'a> {
             seen_notice_keys: HashSet::new(),
             seen_global_reference_keys: HashSet::new(),
             import_references_truncated: false,
+            callable_invocations_truncated: false,
         }
     }
 
@@ -3921,9 +3923,11 @@ impl<'a> ScanState<'a> {
             invocation.reference.name.clone(),
             invocation.positional_arg_count,
         );
-        if self.callable_invocation_keys.contains(&dedupe_key)
-            || self.callable_invocations.len() >= MAX_IMPORT_REFERENCES
-        {
+        if self.callable_invocation_keys.contains(&dedupe_key) {
+            return;
+        }
+        if self.callable_invocations.len() >= MAX_IMPORT_REFERENCES {
+            self.record_callable_invocations_truncated_notice();
             return;
         }
         self.callable_invocation_keys.insert(dedupe_key);
@@ -3959,6 +3963,27 @@ impl<'a> ScanState<'a> {
             ));
         }
         self.callable_invocations.push(details);
+    }
+
+    fn record_callable_invocations_truncated_notice(&mut self) {
+        if self.callable_invocations_truncated {
+            return;
+        }
+        self.callable_invocations_truncated = true;
+        self.add_notice(Notice {
+            message: "Callable invocation metadata exceeded the scanner reporting limit"
+                .to_string(),
+            severity: "info",
+            location: Some(self.source.clone()),
+            code: Some("callable_invocations_truncated"),
+            details: vec![
+                (
+                    "max_callable_invocations".to_string(),
+                    DetailValue::UInt(MAX_IMPORT_REFERENCES as u64),
+                ),
+                ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
+            ],
+        });
     }
 
     fn rebuild_seen_notice_keys(&mut self) {
@@ -4502,6 +4527,8 @@ impl<'a> ScanState<'a> {
                     && self.remember_callable_invocation_details(&invocation)
                 {
                     self.callable_invocations.push(invocation);
+                } else if self.callable_invocations.len() >= MAX_IMPORT_REFERENCES {
+                    self.record_callable_invocations_truncated_notice();
                 }
             }
             if had_findings {
@@ -4657,6 +4684,10 @@ impl<'a> ScanState<'a> {
             callable_invocations.append(DetailValue::Dict(invocation.clone()).to_py_object(py)?)?;
         }
         metadata.set_item("callable_invocations", callable_invocations)?;
+        metadata.set_item(
+            "callable_invocations_truncated",
+            self.callable_invocations_truncated,
+        )?;
         if !self.protocols.is_empty() {
             metadata.set_item("protocols", &self.protocols)?;
         }
@@ -5608,6 +5639,51 @@ mod tests {
             scan.notices
                 .iter()
                 .filter(|notice| notice.code == Some("import_references_truncated"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn callable_invocation_metadata_is_capped_with_notice() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "callable-invocation-cap.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+
+        for index in 0..=MAX_IMPORT_REFERENCES {
+            let invocation = ScanState::callable_invocation(
+                GlobalRef {
+                    module: "module".to_string(),
+                    name: format!("call_{index}"),
+                    position: index,
+                    malformed: false,
+                },
+                "REDUCE",
+                index,
+                Some(0),
+            );
+            scan.push_callable_invocation(&invocation);
+        }
+
+        assert_eq!(scan.callable_invocations.len(), MAX_IMPORT_REFERENCES);
+        assert_eq!(
+            scan.notices
+                .iter()
+                .filter(|notice| notice.code == Some("callable_invocations_truncated"))
                 .count(),
             1
         );

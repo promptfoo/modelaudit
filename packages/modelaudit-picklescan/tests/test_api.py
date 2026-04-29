@@ -3387,6 +3387,29 @@ def test_with_call_graph_findings_ignores_uninvoked_click_startup_hook_paths() -
     assert updated.findings == ()
 
 
+def test_with_call_graph_findings_promotes_click_startup_hook_paths_when_invocations_truncated() -> None:
+    pytest.importorskip("click")
+
+    report = PickleReport(
+        source="click-startup-hook-truncated-invocations.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            ),
+            "callable_invocations": (),
+            "callable_invocations_truncated": True,
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH_FILE_WRITE" for finding in updated.findings)
+
+
 def test_scan_bytes_keeps_import_only_click_startup_hook_paths_clean() -> None:
     pytest.importorskip("click")
 
