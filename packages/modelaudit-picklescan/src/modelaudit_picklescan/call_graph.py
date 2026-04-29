@@ -10,6 +10,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
+from importlib.util import find_spec
 from pathlib import Path
 
 _MAX_IMPORT_REFERENCES = 32
@@ -215,6 +216,14 @@ class StartupHookWriteFinding:
 
 
 @dataclass(frozen=True)
+class UnanalyzedCallGraphReference:
+    module: str
+    name: str
+    import_reference: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class _ModuleAnalysis:
     module: str
     source_path: str
@@ -260,6 +269,7 @@ def find_dangerous_call_graphs(
     import_references: object,
     callable_invocations: object | None = None,
 ) -> tuple[CallGraphFinding, ...]:
+    _clear_source_sensitive_caches()
     findings: list[CallGraphFinding] = []
     seen_findings: set[tuple[str, str, tuple[str, ...]]] = set()
     positional_arg_counts = _callable_invocation_positional_arg_counts(callable_invocations)
@@ -314,6 +324,7 @@ def find_dangerous_call_graphs(
 
 
 def find_startup_hook_write_call_graphs(import_references: object) -> tuple[StartupHookWriteFinding, ...]:
+    _clear_source_sensitive_caches()
     openers: list[_ImportCallPath] = []
     writers: list[_ImportCallPath] = []
     seen: set[tuple[str, str]] = set()
@@ -378,6 +389,39 @@ def find_startup_hook_write_call_graphs(import_references: object) -> tuple[Star
             if len(findings) >= _MAX_IMPORT_REFERENCES:
                 return tuple(findings)
     return tuple(findings)
+
+
+def find_unanalyzed_callable_call_graph_references(
+    callable_invocations: object | None,
+) -> tuple[UnanalyzedCallGraphReference, ...]:
+    _clear_source_sensitive_caches()
+    references: list[UnanalyzedCallGraphReference] = []
+    seen: set[tuple[str, str]] = set()
+
+    for reference in _iter_callable_invocation_references(callable_invocations):
+        module = str(reference.get("module", ""))
+        name = str(reference.get("name", ""))
+        if not module or not name or (module, name) in seen:
+            continue
+        seen.add((module, name))
+        if _is_skippable_torch_extension_global_reference(module, name):
+            continue
+        if _call_graph_entrypoints_for_reference(module, name, reference):
+            continue
+        reason = _call_graph_source_unavailable_reason(module)
+        if reason is None:
+            continue
+        references.append(
+            UnanalyzedCallGraphReference(
+                module=module,
+                name=name,
+                import_reference=f"{module}.{name}",
+                reason=reason,
+            )
+        )
+        if len(references) >= _MAX_IMPORT_REFERENCES:
+            break
+    return tuple(references)
 
 
 @lru_cache(maxsize=4096)
@@ -651,6 +695,58 @@ def has_unanalyzed_call_graph_import_references(import_references: object) -> bo
         if len(seen) > _MAX_IMPORT_REFERENCES:
             return True
     return False
+
+
+def _clear_source_sensitive_caches() -> None:
+    for function in (
+        _safe_call_graph_entrypoints,
+        _has_static_torch_extension_global_target,
+        _find_sink_path,
+        _find_invoked_import_execution_path,
+        _find_file_open_path,
+        _find_file_write_path,
+        _call_graph_entrypoints,
+        _resolve_function_target,
+        _resolve_wildcard_reexport_alias,
+        _wildcard_export_summary,
+        _resolve_class_target,
+        _analyze_module,
+        _source_function_context,
+        _source_class_context,
+        _constructor_parameter_self_attribute_targets,
+        _can_invoke_function_with_positional_args,
+        _can_follow_import_execution_fallback,
+        _resolve_module_source,
+    ):
+        function.cache_clear()
+
+
+def _call_graph_source_unavailable_reason(module_name: str) -> str | None:
+    source_path = _resolve_module_source(module_name)
+    if source_path is not None:
+        try:
+            if source_path.stat().st_size > _MAX_SOURCE_BYTES:
+                return "source_too_large"
+            source = source_path.read_text(encoding="utf-8")
+        except OSError:
+            return "source_unreadable"
+        except UnicodeError:
+            return "source_unreadable"
+        try:
+            ast.parse(source, filename=str(source_path))
+        except SyntaxError:
+            return "source_parse_error"
+        return None
+
+    try:
+        spec = find_spec(module_name)
+    except Exception:
+        return None
+    if spec is None or spec.origin is None or spec.origin in {"built-in", "frozen"}:
+        return None
+    if spec.origin.lower().endswith((".py", ".pyw")):
+        return "source_unavailable"
+    return None
 
 
 @lru_cache(maxsize=4096)
