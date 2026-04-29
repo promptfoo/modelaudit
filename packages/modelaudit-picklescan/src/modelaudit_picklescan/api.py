@@ -13,8 +13,10 @@ from typing import Any, BinaryIO, cast
 from .call_graph import (
     CallGraphFinding,
     StartupHookWriteFinding,
+    UnanalyzedCallGraphReference,
     find_dangerous_call_graphs,
     find_startup_hook_write_call_graphs,
+    find_unanalyzed_callable_call_graph_references,
     has_unanalyzed_call_graph_import_references,
 )
 from .options import ScanOptions
@@ -956,43 +958,92 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         startup_hook_write_findings = find_startup_hook_write_call_graphs(import_references)
     except Exception:
         startup_hook_write_findings = ()
+    try:
+        unanalyzed_references = find_unanalyzed_callable_call_graph_references(callable_invocations)
+    except Exception:
+        unanalyzed_references = ()
+
+    updated_report = (
+        _with_unanalyzed_call_graph_notices(report, unanalyzed_references) if unanalyzed_references else report
+    )
     if not call_graph_findings and not startup_hook_write_findings and not call_graph_limit_exceeded:
-        return report
+        return updated_report
 
     existing_critical_globals = {
         (str(finding.details.get("module", "")), str(finding.details.get("name", "")))
-        for finding in report.findings
+        for finding in updated_report.findings
         if finding.severity == Severity.CRITICAL
     }
     rce_findings = tuple(
-        _call_graph_finding_to_report_finding(report, finding)
+        _call_graph_finding_to_report_finding(updated_report, finding)
         for finding in call_graph_findings
         if (finding.module, finding.name) not in existing_critical_globals
     )
     startup_findings = tuple(
-        _startup_hook_write_finding_to_report_finding(report, finding)
+        _startup_hook_write_finding_to_report_finding(updated_report, finding)
         for finding in startup_hook_write_findings
         if (finding.writer_module, finding.writer_name) not in existing_critical_globals
         and (finding.opener_module, finding.opener_name) not in existing_critical_globals
     )
     limit_findings = (
-        (_call_graph_import_reference_limit_finding_to_report_finding(report),)
+        (_call_graph_import_reference_limit_finding_to_report_finding(updated_report),)
         if call_graph_limit_exceeded and not rce_findings and not startup_findings
         else ()
     )
     additional_findings = (*rce_findings, *startup_findings, *limit_findings)
     if not additional_findings:
-        return report
+        return updated_report
 
     return PickleReport(
-        source=report.source,
-        status=report.status,
+        source=updated_report.source,
+        status=updated_report.status,
         verdict=SafetyVerdict.MALICIOUS,
-        findings=(*report.findings, *additional_findings),
-        notices=report.notices,
+        findings=(*updated_report.findings, *additional_findings),
+        notices=updated_report.notices,
+        errors=updated_report.errors,
+        coverage=updated_report.coverage,
+        metadata=updated_report.to_dict()["metadata"],
+        duration_s=updated_report.duration_s,
+    )
+
+
+def _with_unanalyzed_call_graph_notices(
+    report: PickleReport,
+    references: tuple[UnanalyzedCallGraphReference, ...],
+) -> PickleReport:
+    notices = (
+        *report.notices,
+        *(
+            Notice(
+                message="Python call-graph analysis could not inspect invoked callable source",
+                severity=Severity.INFO,
+                location=report.source,
+                code="call_graph_source_unavailable",
+                details={
+                    "module": reference.module,
+                    "name": reference.name,
+                    "import_reference": reference.import_reference,
+                    "reason": reference.reason,
+                    "analysis_incomplete": True,
+                },
+            )
+            for reference in references
+        ),
+    )
+    metadata = {**report.to_dict()["metadata"], "analysis_incomplete": True}
+    return PickleReport(
+        source=report.source,
+        status=(
+            ScanStatus.INCONCLUSIVE
+            if report.status == ScanStatus.COMPLETE and report.verdict == SafetyVerdict.CLEAN
+            else report.status
+        ),
+        verdict=SafetyVerdict.UNKNOWN if report.verdict == SafetyVerdict.CLEAN else report.verdict,
+        findings=report.findings,
+        notices=notices,
         errors=report.errors,
         coverage=report.coverage,
-        metadata=report.to_dict()["metadata"],
+        metadata=metadata,
         duration_s=report.duration_s,
     )
 
