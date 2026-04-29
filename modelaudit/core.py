@@ -848,11 +848,13 @@ def _is_hf_download_bookkeeping_path(path_obj: Path) -> bool:
 
 
 def _is_benign_local_hf_download_bookkeeping_file(path_obj: Path) -> bool:
-    """Return True only for text-like local download bookkeeping files."""
+    """Return True only for local download bookkeeping files that do not look scannable."""
     import json
 
     filename = path_obj.name
     try:
+        if detect_file_format(str(path_obj)) != "unknown":
+            return False
         if filename.endswith(".lock"):
             return path_obj.stat().st_size == 0
         if filename.endswith(".metadata"):
