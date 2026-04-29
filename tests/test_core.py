@@ -803,6 +803,40 @@ def test_scan_file_does_not_route_incidental_onnx_pb_string(tmp_path: Path) -> N
     assert not any(check.name == "Python Operator Detection" for check in result.checks)
 
 
+def test_scan_file_fails_closed_when_recognized_format_scanner_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unavailable_onnx = tmp_path / "model.onnx"
+    unavailable_onnx.write_bytes(b"recognized-format")
+
+    monkeypatch.setattr(core_module, "detect_file_format", lambda _path: "onnx")
+    monkeypatch.setattr(core_module, "detect_file_format_from_magic", lambda _path: "onnx")
+    monkeypatch.setattr(core_module, "detect_format_from_extension", lambda _path: "onnx")
+    monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(core_module._registry, "get_scanner_for_path", lambda *_args, **_kwargs: None)
+
+    result = scan_file(str(unavailable_onnx))
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.has_errors is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+    assert "recognized_format_scanner_unavailable" in result.metadata["scan_outcome_reasons"]
+
+    check = next(check for check in result.checks if check.name == "Format Detection")
+    assert check.severity == IssueSeverity.INFO
+    assert check.details["format"] == "onnx"
+    assert check.details["preferred_scanner_id"] == "onnx"
+
+    aggregate = core_module.scan_model_directory_or_file(str(unavailable_onnx))
+    assert aggregate.success is False
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
 def test_scan_file_ignores_benign_onnx_token_near_match(tmp_path: Path) -> None:
     near_match = tmp_path / "note.payload"
     near_match.write_bytes(b"this documentation mentions onnx but is not a model")

@@ -81,6 +81,7 @@ _COMPRESSED_HEADER_FORMATS = frozenset({"compressed", "gzip", "bzip2", "xz", "lz
 _R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
 _XGBOOST_BINARY_EXTENSIONS = frozenset({".bst"})
 _XGBOOST_PICKLE_SPOOF_REASON = "xgboost_binary_pickle_spoof"
+_RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
 
 
 def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
@@ -163,6 +164,30 @@ def _mark_xgboost_pickle_extension_spoof(result: ScanResult, path: str, ext: str
     )
     _mark_inconclusive_scan_outcome(result, _XGBOOST_PICKLE_SPOOF_REASON)
     result.success = False
+
+
+def _make_unavailable_recognized_format_result(path: str, format_: str, scanner_id: str | None) -> ScanResult:
+    """Fail closed when routing recognizes a format but no scanner can analyze it."""
+    result = ScanResult(scanner_name="unknown")
+    details: dict[str, Any] = {"format": format_, "path": path}
+    if scanner_id:
+        details["preferred_scanner_id"] = scanner_id
+        scanner_load_error = _registry.get_failed_scanners().get(scanner_id)
+        if scanner_load_error:
+            details["scanner_load_error"] = scanner_load_error
+
+    result.add_check(
+        name="Format Detection",
+        passed=False,
+        message=f"Recognized format could not be scanned because no scanner was available: {format_}",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details=details,
+    )
+    _mark_inconclusive_scan_outcome(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
+    _mark_operational_scan_error(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
+    result.finish(success=False)
+    return result
 
 
 def _calculate_file_hash(file_path: str) -> str:
@@ -1149,19 +1174,12 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                     return result
 
             format_ = header_format
-            sr = ScanResult(scanner_name="unknown")
             if format_ == "unknown":
                 # Not a recognized model format — skip silently
+                sr = ScanResult(scanner_name="unknown")
                 logger.debug(f"Skipping unrecognized format file: {path}")
             else:
-                # Known format but no scanner available
-                sr.add_check(
-                    name="Format Detection",
-                    passed=False,
-                    message=f"Unknown or unhandled format: {format_}",
-                    severity=IssueSeverity.DEBUG,
-                    details={"format": format_, "path": path},
-                )
+                sr = _make_unavailable_recognized_format_result(path, format_, scanner_id)
             result = sr
 
     if is_xgboost_pickle_spoof:
