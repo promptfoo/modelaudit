@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- preserve large Office-like ZIPs when prefilter inspection is incomplete
 - fail closed when directory scans stop at the total-size budget
 - restrict Hugging Face bookkeeping filename skips to recognized cache layouts
 - preserve unsuccessful child results after scan-result merges

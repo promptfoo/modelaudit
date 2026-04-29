@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
 
 
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
@@ -368,6 +369,29 @@ class TestDirectoryFileFiltering:
         assert results["files_scanned"] == 1
         assert "zip" in results.scanner_names
         assert any("word/embeddings/oleObject1.bin" in (issue.location or "") for issue in results.issues)
+
+    def test_large_docx_with_late_pickle_payload_is_scanned(self, tmp_path: Path) -> None:
+        """Late model payloads in Office-like ZIPs must survive bounded prefiltering."""
+        docx_path = tmp_path / "late-payload.docx"
+
+        class DangerousPayload:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo late-office-prefilter-test",))
+
+        with zipfile.ZipFile(docx_path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types></Types>")
+            archive.writestr("word/document.xml", "<w:document></w:document>")
+            for index in range(_ZIP_MEMBER_SNIFF_LIMIT):
+                archive.writestr(f"docs/{index}.txt", "filler")
+            archive.writestr("payload.pkl", pickle.dumps(DangerousPayload(), protocol=4))
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "zip" in results.scanner_names
+        assert any("payload.pkl" in (issue.location or "") for issue in results.issues)
 
     def test_config_only_keras_zip_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         """Directory prefilter should preserve Keras ZIPs identified by config structure."""
