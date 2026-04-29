@@ -110,6 +110,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **security:** run JAX checkpoint analysis for JAX-like pickle payloads that
+  stay on the primary pickle scanner path
 - **security:** detect `mailcap.findmatch` pickle call targets that can execute
   attacker-controlled mailcap `test` commands on Python versions that still
   provide `mailcap`
