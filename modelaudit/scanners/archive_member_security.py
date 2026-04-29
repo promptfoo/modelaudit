@@ -141,7 +141,6 @@ def _apply_aliases(call_name: str, alias_scopes: _AliasScopes) -> frozenset[str]
 
 
 _MAX_STATIC_STRING_LENGTH = 1024
-_MAX_STATIC_STRING_PARTS = 128
 
 
 def _resolve_static_string(node: ast.AST) -> str | None:
@@ -153,8 +152,6 @@ def _resolve_static_string(node: ast.AST) -> str | None:
     while pending:
         current = pending.pop()
         if isinstance(current, ast.BinOp) and isinstance(current.op, ast.Add):
-            if len(parts) + len(pending) >= _MAX_STATIC_STRING_PARTS:
-                return None
             pending.extend([current.right, current.left])
             continue
         if not isinstance(current, ast.Constant) or not isinstance(current.value, str):

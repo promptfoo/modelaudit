@@ -242,7 +242,7 @@ def test_scan_zip_bounds_deep_concatenated_getattr_names(tmp_path: Path) -> None
 
 def test_scan_zip_flags_padded_split_literal_getattr_name(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
-    padding = " + ".join(["''"] * 40)
+    padding = " + ".join(["''"] * 160)
     source = f"import os\ngetattr(os, 'sys' + {padding} + 'tem')('echo hidden')\n"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
