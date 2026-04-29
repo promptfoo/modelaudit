@@ -38,6 +38,24 @@ def test_llamafile_scanner_does_not_misclassify_generic_executable(tmp_path: Pat
     assert not LlamafileScanner.can_handle(str(generic_exe))
 
 
+def test_llamafile_scanner_can_handle_middle_only_marker_in_exe(tmp_path: Path) -> None:
+    binary = tmp_path / "middle-marker.exe"
+    binary.write_bytes(
+        b"MZ" + b"\x00" * 62 + b"A" * (2 * 1024 * 1024 + 64) + b"llamafile runtime" + b"B" * (2 * 1024 * 1024 + 64)
+    )
+
+    assert LlamafileScanner.can_handle(str(binary))
+
+
+def test_llamafile_scanner_can_handle_casefolded_middle_marker_in_exe(tmp_path: Path) -> None:
+    binary = tmp_path / "middle-marker-uppercase.exe"
+    binary.write_bytes(
+        b"MZ" + b"\x00" * 62 + b"A" * (2 * 1024 * 1024 + 64) + b"LLAMAFILE runtime" + b"B" * (2 * 1024 * 1024 + 64)
+    )
+
+    assert LlamafileScanner.can_handle(str(binary))
+
+
 def test_llamafile_scanner_benign_sample_has_no_high_severity(tmp_path: Path) -> None:
     binary = tmp_path / "safe.llamafile"
     binary.write_bytes(_build_llamafile_blob())
