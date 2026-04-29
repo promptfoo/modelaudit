@@ -331,7 +331,7 @@ class PyTorchZipScanner(BaseScanner):
                     path,
                     trusted_pytorch_storage_data_pkl_members=trusted_pytorch_storage_data_pkl_members,
                 )
-                self._scan_nested_zip_members(zip_file, safe_entries, pickle_files, result, path)
+                self._scan_nested_zip_members(zip_file, safe_entries, result, path)
                 self._check_timeout()  # Check timeout after pickle scanning
 
                 # Validate tensor metadata consistency (CVE-2026-24747)
@@ -981,12 +981,10 @@ class PyTorchZipScanner(BaseScanner):
         self,
         zip_file: zipfile.ZipFile,
         safe_entries: list[zipfile.ZipInfo],
-        pickle_files: list[zipfile.ZipInfo],
         result: ScanResult,
         path: str,
     ) -> None:
-        """Recursively route embedded ZIP members while avoiding duplicate pickle scans."""
-        pickle_entry_ids = {id(entry) for entry in pickle_files}
+        """Recursively route embedded ZIP members, including ZIPs named like pickle files."""
         current_depth = get_archive_depth(self.config)
         probe_failures: list[dict[str, str]] = []
         size_limited_entries: list[dict[str, Any]] = []
@@ -994,7 +992,7 @@ class PyTorchZipScanner(BaseScanner):
         scan_failures: list[dict[str, str]] = []
 
         for entry in safe_entries:
-            if entry.is_dir() or id(entry) in pickle_entry_ids:
+            if entry.is_dir():
                 continue
 
             try:
@@ -1053,7 +1051,7 @@ class PyTorchZipScanner(BaseScanner):
                     nested_result = scan_nested_file(temp_path, nested_config)
 
                 self._rewrite_nested_result_context(nested_result, temp_path, path, self._get_zip_member_name(entry))
-                result.merge(nested_result)
+                self._merge_nested_zip_result(result, nested_result, entry_name)
             except ValueError as exc:
                 size_limited_entries.append(
                     {
@@ -1185,6 +1183,23 @@ class PyTorchZipScanner(BaseScanner):
                 "analysis_incomplete": True,
             },
         )
+
+    @staticmethod
+    def _merge_nested_zip_result(result: ScanResult, nested_result: ScanResult, member_name: str) -> None:
+        """Merge nested findings while preserving the parent archive metadata."""
+        parent_metadata = dict(result.metadata)
+        result.merge(nested_result)
+        result.metadata = parent_metadata
+        nested_scans = result.metadata.setdefault("nested_zip_scans", [])
+        if isinstance(nested_scans, list):
+            nested_scans.append(
+                {
+                    "zip_entry": member_name,
+                    "scanner_name": nested_result.scanner_name,
+                    "success": nested_result.success,
+                    "metadata": dict(nested_result.metadata),
+                }
+            )
 
     @staticmethod
     def _rewrite_nested_result_context(

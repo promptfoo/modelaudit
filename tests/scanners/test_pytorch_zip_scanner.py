@@ -1749,10 +1749,32 @@ def test_pytorch_zip_scanner_recurses_into_nested_zip_members(tmp_path: Path) ->
 
     result = PyTorchZipScanner().scan(str(zip_path))
 
+    assert result.metadata["file_size"] == zip_path.stat().st_size
     assert any(
         issue.severity == IssueSeverity.CRITICAL
         and issue.location is not None
         and f"{zip_path}:archive/nested.zip:payload.pkl" in issue.location
+        for issue in result.issues
+    )
+
+
+def test_pytorch_zip_scanner_recurses_into_zip_members_named_like_pickles(tmp_path: Path) -> None:
+    nested_zip = tmp_path / "nested.zip"
+    with zipfile.ZipFile(nested_zip, "w") as archive:
+        archive.writestr("payload.pkl", _malicious_eval_pickle_payload())
+
+    zip_path = tmp_path / "nested_payload.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("version", "3")
+        zipf.writestr("data.pkl", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        zipf.write(nested_zip, "archive/nested.pkl")
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.location is not None
+        and f"{zip_path}:archive/nested.pkl:payload.pkl" in issue.location
         for issue in result.issues
     )
 
