@@ -281,6 +281,11 @@ class CompressedScanner(BaseScanner):
                     compressed_size=compressed_size,
                 )
 
+                unconsumed_tail = getattr(decompressor, "unconsumed_tail", b"")
+                if unconsumed_tail:
+                    pending = unconsumed_tail
+                    continue
+
                 unused_data = getattr(decompressor, "unused_data", b"")
                 if unused_data:
                     pending = unused_data

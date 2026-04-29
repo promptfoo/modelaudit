@@ -458,6 +458,23 @@ def test_read_concatenated_stream_splits_member_after_chunk_boundary() -> None:
     assert len(new_member_calls) == 1
 
 
+def test_read_gzip_stream_preserves_buffered_input_when_probe_cap_is_hit() -> None:
+    payload = b"x" * 64
+    destination = io.BytesIO()
+
+    total_out = CompressedScanner._read_gzip_stream_with_limits(
+        source=io.BytesIO(gzip.compress(payload)),
+        destination=destination,
+        max_decompressed_bytes=1024,
+        max_ratio=1000.0,
+        compressed_size=1,
+        chunk_size=8,
+    )
+
+    assert total_out == len(payload)
+    assert destination.getvalue() == payload
+
+
 def test_read_lz4_stream_uses_chunk_bounded_decompression() -> None:
     fake_lz4_frame = _FakeLz4FrameModule({b"S": b"12345678"})
     destination = io.BytesIO()
