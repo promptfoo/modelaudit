@@ -598,6 +598,8 @@ def test_non_handler_python_analysis_respects_entry_limit(tmp_path: Path) -> Non
     assert len(non_handler_failures) == 0
     entry_limit_failures = _failed_checks(result, "TorchServe MAR Entry Limit")
     assert len(entry_limit_failures) == 1
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
 
 
 def test_non_handler_python_analysis_respects_uncompressed_budget(tmp_path: Path) -> None:
@@ -623,6 +625,8 @@ def test_non_handler_python_analysis_respects_uncompressed_budget(tmp_path: Path
     assert len(non_handler_failures) == 0
     budget_failures = _failed_checks(result, "TorchServe MAR Uncompressed Size Budget")
     assert len(budget_failures) == 1
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
 
 
 def test_non_handler_python_analysis_handles_valueerror_from_ast_parse(
@@ -791,6 +795,81 @@ def test_scan_detects_malicious_pickle_payload_in_serialized_file(tmp_path: Path
     serialized_security_checks = _failed_checks(result, "TorchServe Serialized Payload Security")
     assert len(serialized_security_checks) >= 1
     assert any(":model.pkl" in (issue.location or "") for issue in result.issues)
+
+
+def test_scan_fails_closed_when_manifest_payload_falls_after_entry_limit(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "late.pkl"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"def handle(data, context):\n    return data\n"),
+            ("filler.txt", b"filler"),
+            ("late.pkl", _build_malicious_pickle()),
+        ],
+        filename="late_payload_after_entry_limit.mar",
+    )
+
+    result = TorchServeMarScanner(config={"max_mar_entries": 3}).scan(str(mar_path))
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    coverage_checks = _failed_checks(result, "TorchServe Manifest Referenced Payload Coverage")
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["unscanned_payload_members"] == ["late.pkl"]
+    assert not _checks_named(result, "TorchServe Serialized Payload Security")
+
+
+def test_scan_fails_closed_when_manifest_payload_exceeds_member_limit(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "model.pkl"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return data\n",
+            "model.pkl": _build_malicious_pickle() + (b"\x00" * 4096),
+        },
+        filename="serialized_payload_too_large.mar",
+    )
+
+    result = TorchServeMarScanner(config={"max_mar_member_bytes": 128}).scan(str(mar_path))
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    member_limit_checks = _failed_checks(result, "TorchServe MAR Member Size Limit")
+    coverage_checks = _failed_checks(result, "TorchServe Manifest Referenced Payload Coverage")
+    assert len(member_limit_checks) == 1
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["unscanned_payload_members"] == ["model.pkl"]
+    assert not _checks_named(result, "TorchServe Serialized Payload Security")
+
+
+def test_scan_fails_closed_when_manifest_payload_falls_after_uncompressed_budget(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "late.pkl"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries=[
+            ("handler.py", b"def handle(data, context):\n    return data\n"),
+            ("late.pkl", _build_malicious_pickle()),
+        ],
+        filename="late_payload_after_budget.mar",
+    )
+
+    with zipfile.ZipFile(mar_path, "r") as archive:
+        member_sizes = {info.filename: info.file_size for info in archive.infolist()}
+
+    budget = member_sizes["MAR-INF/MANIFEST.json"] + member_sizes["handler.py"]
+    result = TorchServeMarScanner(config={"max_mar_uncompressed_bytes": budget}).scan(str(mar_path))
+
+    assert result.success is False
+    assert result.metadata["analysis_incomplete"] is True
+    budget_checks = _failed_checks(result, "TorchServe MAR Uncompressed Size Budget")
+    coverage_checks = _failed_checks(result, "TorchServe Manifest Referenced Payload Coverage")
+    assert len(budget_checks) == 1
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["unscanned_payload_members"] == ["late.pkl"]
+    assert not _checks_named(result, "TorchServe Serialized Payload Security")
 
 
 def test_scan_detects_path_traversal_member_names(tmp_path: Path) -> None:
