@@ -164,6 +164,20 @@ class JITScriptDetector:
             if "tf" in custom_ops:
                 self.dangerous_tf_ops.extend(custom_ops["tf"])
 
+    @staticmethod
+    def _looks_like_dangerous_python_source(data: bytes) -> bool:
+        """Return whether marker-free bytes look like dangerous embedded Python source."""
+        bounded = data[:1000000]
+        if not (b"def " in bounded or b"class " in bounded):
+            return False
+        dangerous_imports = b"|".join(re.escape(module.encode()) for module in DANGEROUS_IMPORTS)
+        if re.search(rb"(?m)^\s*(?:from|import)\s+(?:" + dangerous_imports + rb")\b", bounded):
+            return True
+        dangerous_builtins = b"|".join(re.escape(builtin.encode()) for builtin in DANGEROUS_BUILTINS)
+        if re.search(rb"(?<![A-Za-z0-9_])(?:" + dangerous_builtins + rb")\s*\(", bounded):
+            return True
+        return any(re.search(pattern, bounded) for pattern, _description in CODE_EXECUTION_PATTERNS)
+
     def scan_torchscript(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
         """Scan TorchScript model data for dangerous operations.
 
@@ -870,6 +884,9 @@ class JITScriptDetector:
             findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
             findings.extend(self.scan_tensorflow(data, context))
             findings.extend(self.scan_onnx(data, context))
+
+        if self._looks_like_dangerous_python_source(data):
+            findings.extend(self._extract_and_check_python_code(data, "Generic Python", context))
 
         return findings
 
