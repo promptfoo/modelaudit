@@ -18,12 +18,6 @@ import pytest
 import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, ScanStatus, Severity, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
-from modelaudit_picklescan.call_graph import (
-    _call_graph_entrypoints,
-    _calls_for_function,
-    _find_sink_path,
-    find_dangerous_call_graphs,
-)
 
 pytestmark = pytest.mark.skipif(
     find_spec(_RUST_EXTENSION_MODULE) is None,
@@ -1227,15 +1221,15 @@ def test_scan_bytes_preserves_nested_signature_execution_calls(
 def test_call_graph_models_site_customization_import_statements(helper_name: str) -> None:
     function_name = f"site.{helper_name}"
 
-    assert "builtins.__import__" in (_calls_for_function(function_name) or ())
-    assert _find_sink_path(function_name) == (function_name, "builtins.__import__")
+    assert "builtins.__import__" in (call_graph._calls_for_function(function_name) or ())
+    assert call_graph._find_sink_path(function_name) == (function_name, "builtins.__import__")
 
 
 def test_call_graph_models_direct_shadowable_function_body_imports() -> None:
-    calls = _calls_for_function("base64.main") or ()
+    calls = call_graph._calls_for_function("base64.main") or ()
 
     assert "builtins.__import__" in calls
-    assert _find_sink_path("base64.main") == ("base64.main", "builtins.__import__")
+    assert call_graph._find_sink_path("base64.main") == ("base64.main", "builtins.__import__")
 
 
 def test_call_graph_keeps_module_dict_dotted_lookup_clean(
@@ -1254,7 +1248,7 @@ def test_call_graph_keeps_module_dict_dotted_lookup_clean(
     _clear_call_graph_caches()
 
     try:
-        findings = find_dangerous_call_graphs(
+        findings = call_graph.find_dangerous_call_graphs(
             [{"module": module_name, "name": "__dict__.values", "import_reference": f"{module_name}.__dict__.values"}]
         )
     finally:
@@ -1279,7 +1273,7 @@ def test_call_graph_models_missing_dotted_dunder_module_getattr(
     _clear_call_graph_caches()
 
     try:
-        findings = find_dangerous_call_graphs(
+        findings = call_graph.find_dangerous_call_graphs(
             [
                 {
                     "module": module_name,
@@ -1444,10 +1438,10 @@ def test_scan_bytes_refreshes_call_graph_after_source_rewrite(
 
 
 def test_call_graph_propagates_wrapper_import_execution_fallbacks() -> None:
-    calls = _calls_for_function("platform.mac_ver") or ()
+    calls = call_graph._calls_for_function("platform.mac_ver") or ()
 
     assert "platform._mac_ver_xml" in calls
-    assert _find_sink_path("platform.mac_ver") == (
+    assert call_graph._find_sink_path("platform.mac_ver") == (
         "platform.mac_ver",
         "platform._mac_ver_xml",
         "builtins.__import__",
@@ -1455,17 +1449,17 @@ def test_call_graph_propagates_wrapper_import_execution_fallbacks() -> None:
 
 
 def test_call_graph_ignores_imports_inside_nested_functions_until_called() -> None:
-    calls = _calls_for_function("site.enablerlcompleter") or ()
+    calls = call_graph._calls_for_function("site.enablerlcompleter") or ()
 
     assert "builtins.__import__" not in calls
-    assert _find_sink_path("site.enablerlcompleter") is None
+    assert call_graph._find_sink_path("site.enablerlcompleter") is None
 
 
 def test_call_graph_models_getattr_default_callable_fallbacks() -> None:
-    calls = _calls_for_function("platform._Processor.get") or ()
+    calls = call_graph._calls_for_function("platform._Processor.get") or ()
 
     assert "platform._Processor.from_subprocess" in calls
-    assert _find_sink_path("platform._Processor.get") == (
+    assert call_graph._find_sink_path("platform._Processor.get") == (
         "platform._Processor.get",
         "platform._Processor.from_subprocess",
         "subprocess.check_output",
@@ -1476,10 +1470,10 @@ def test_call_graph_models_version_gated_typing_extensions_definitions() -> None
     pytest.importorskip("typing_extensions")
 
     function_name = "typing_extensions.get_type_hints"
-    calls = _calls_for_function(function_name) or ()
-    path = _find_sink_path(function_name)
+    calls = call_graph._calls_for_function(function_name) or ()
+    path = call_graph._find_sink_path(function_name)
 
-    assert _call_graph_entrypoints(function_name) == (function_name,)
+    assert call_graph._call_graph_entrypoints(function_name) == (function_name,)
     assert "typing.get_type_hints" in calls
     assert path is not None
     assert path[0] == function_name
@@ -1495,10 +1489,10 @@ def test_call_graph_models_required_arg_imports_when_pickle_supplies_args() -> N
         }
     ]
 
-    assert _find_sink_path("_pyio._open_code_with_warning") is None
-    assert find_dangerous_call_graphs(import_references) == ()
+    assert call_graph._find_sink_path("_pyio._open_code_with_warning") is None
+    assert call_graph.find_dangerous_call_graphs(import_references) == ()
     assert (
-        find_dangerous_call_graphs(
+        call_graph.find_dangerous_call_graphs(
             import_references,
             [
                 {
@@ -1511,7 +1505,7 @@ def test_call_graph_models_required_arg_imports_when_pickle_supplies_args() -> N
         == ()
     )
 
-    findings = find_dangerous_call_graphs(
+    findings = call_graph.find_dangerous_call_graphs(
         import_references,
         [
             {
@@ -1551,9 +1545,9 @@ def test_call_graph_models_constructed_callable_instance_invocations() -> None:
         },
     ]
 
-    assert find_dangerous_call_graphs(import_references, constructor_only_invocations) == ()
+    assert call_graph.find_dangerous_call_graphs(import_references, constructor_only_invocations) == ()
 
-    findings = find_dangerous_call_graphs(import_references, callable_instance_invocations)
+    findings = call_graph.find_dangerous_call_graphs(import_references, callable_instance_invocations)
 
     assert len(findings) == 1
     assert findings[0].module == "_sitebuiltins"
@@ -1578,9 +1572,9 @@ def test_call_graph_models_builtins_help_singleton_invocations() -> None:
         }
     ]
 
-    assert find_dangerous_call_graphs(import_references) == ()
+    assert call_graph.find_dangerous_call_graphs(import_references) == ()
 
-    findings = find_dangerous_call_graphs(import_references, help_invocations)
+    findings = call_graph.find_dangerous_call_graphs(import_references, help_invocations)
 
     assert len(findings) == 1
     assert findings[0].module == "_sitebuiltins"
@@ -1647,7 +1641,7 @@ def test_call_graph_analyzes_shadowed_torch_storage_persistent_id_reference(
     _clear_call_graph_caches()
 
     try:
-        findings = find_dangerous_call_graphs(
+        findings = call_graph.find_dangerous_call_graphs(
             [
                 {
                     "module": "torch",
@@ -1687,7 +1681,7 @@ def test_call_graph_keeps_setstate_entrypoint_for_unknown_newobj_invocation(
     _clear_call_graph_caches()
 
     try:
-        findings = find_dangerous_call_graphs(
+        findings = call_graph.find_dangerous_call_graphs(
             [],
             [
                 {
@@ -1769,9 +1763,9 @@ def test_call_graph_models_builtin_format_protocol_dispatch_invocations() -> Non
         },
     ]
 
-    assert find_dangerous_call_graphs(import_references, direct_invocations) == ()
+    assert call_graph.find_dangerous_call_graphs(import_references, direct_invocations) == ()
 
-    findings = find_dangerous_call_graphs(import_references, protocol_invocations)
+    findings = call_graph.find_dangerous_call_graphs(import_references, protocol_invocations)
 
     assert len(findings) == 1
     assert findings[0].module == "ipaddress"
@@ -1814,9 +1808,9 @@ def test_call_graph_models_str_format_protocol_dispatch_invocations() -> None:
         },
     ]
 
-    assert find_dangerous_call_graphs(import_references, direct_invocations) == ()
+    assert call_graph.find_dangerous_call_graphs(import_references, direct_invocations) == ()
 
-    findings = find_dangerous_call_graphs(import_references, protocol_invocations)
+    findings = call_graph.find_dangerous_call_graphs(import_references, protocol_invocations)
 
     assert len(findings) == 1
     assert findings[0].module == "ipaddress"
