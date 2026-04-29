@@ -157,6 +157,7 @@ HASH_INTEGRITY_KEYS = [
 
 # Regex pattern for hexadecimal strings (used to detect hash values)
 HEX_PATTERN = re.compile(r"^[a-fA-F0-9]+$")
+JINJA_TEMPLATE_FIELD_NAMES = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
 
 # Comprehensive allowlist of trusted domains for ML model configs
 # URLs from domains NOT in this list will be flagged as untrusted
@@ -653,6 +654,12 @@ class ManifestScanner(BaseScanner):
                 self._check_weak_hashes(content, result)
                 self._check_timeout()
 
+                # Manifest-owned configs can still carry executable chat
+                # templates, so preserve manifest checks while delegating those
+                # embedded fields to the dedicated Jinja analyzer.
+                self._scan_embedded_jinja_templates(path, content, result)
+                self._check_timeout()
+
             else:
                 result.add_check(
                     name="Manifest Structure",
@@ -833,6 +840,26 @@ class ManifestScanner(BaseScanner):
                 )
 
         return _PARSE_FAILED
+
+    def _scan_embedded_jinja_templates(self, path: str, content: Any, result: ScanResult) -> None:
+        if not self._contains_jinja_template_field(content):
+            return
+
+        from .jinja2_template_scanner import Jinja2TemplateScanner
+
+        result.merge(Jinja2TemplateScanner(config=self.config).scan(path))
+
+    @classmethod
+    def _contains_jinja_template_field(cls, value: Any) -> bool:
+        if isinstance(value, dict):
+            return any(
+                (key in JINJA_TEMPLATE_FIELD_NAMES and isinstance(item, str) and item.strip())
+                or cls._contains_jinja_template_field(item)
+                for key, item in value.items()
+            )
+        if isinstance(value, list):
+            return any(cls._contains_jinja_template_field(item) for item in value)
+        return False
 
     def _parse_ini_file(self, content: str) -> dict[str, Any]:
         """Parse INI-style manifests into nested dictionaries."""
