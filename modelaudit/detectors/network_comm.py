@@ -34,6 +34,7 @@ def _redact_url_for_finding(url: str) -> str:
     netloc = f"{hostname}:{port}" if port is not None else hostname
     return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
+
 _DOC_CONTEXT_EXTENSIONS: tuple[str, ...] = (
     ".md",
     ".rst",
