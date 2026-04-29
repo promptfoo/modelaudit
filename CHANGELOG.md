@@ -308,6 +308,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** detect dangerous marker-free Python source blobs through the public JIT path so disguised archive members are still analyzed
 - **security:** mark ONNX scans inconclusive when raw JIT/script or network
   detector analysis cannot complete instead of treating detector failures as
   clean passes.
