@@ -5,6 +5,12 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Bug Fixes
+
+- recognize PyTorch ZIP archives that contain only hidden pickle members
+
 ## [0.1.3](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.2...modelaudit-picklescan-v0.1.3) (2026-04-27)
 
 ### Bug Fixes
