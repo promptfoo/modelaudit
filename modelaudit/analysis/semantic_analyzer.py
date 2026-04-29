@@ -176,7 +176,9 @@ class SemanticAnalyzer:
 
             def _get_call_name(self, node):
                 if isinstance(node.func, ast.Name):
-                    return self.context.import_aliases.get(node.func.id, node.func.id)
+                    return self._normalize_builtin_call_name(
+                        self.context.import_aliases.get(node.func.id, node.func.id)
+                    )
                 elif isinstance(node.func, ast.Attribute):
                     parts = []
                     current = node.func
@@ -194,8 +196,16 @@ class SemanticAnalyzer:
                     call_name = ".".join(reversed(parts))
                     base_name, _, remainder = call_name.partition(".")
                     canonical_base = self.context.import_aliases.get(base_name)
-                    return f"{canonical_base}.{remainder}" if canonical_base and remainder else call_name
+                    normalized_name = f"{canonical_base}.{remainder}" if canonical_base and remainder else call_name
+                    return self._normalize_builtin_call_name(normalized_name)
                 return None
+
+            @staticmethod
+            def _normalize_builtin_call_name(call_name: str) -> str:
+                builtin_prefix = "builtins."
+                if call_name.startswith(builtin_prefix):
+                    return call_name[len(builtin_prefix) :]
+                return call_name
 
         visitor = ContextVisitor(context)
         visitor.visit(tree)

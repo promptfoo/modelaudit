@@ -100,6 +100,17 @@ class TestAnalysisModules:
         assert risk_level != CodeRiskLevel.SAFE
         assert "os.system" in details["function_calls"]
 
+    def test_semantic_analyzer_preserves_bare_builtin_aliases(self) -> None:
+        """Dangerous builtins imported from builtins should keep their dangerous names."""
+        from modelaudit.analysis import CodeRiskLevel, SemanticAnalyzer
+
+        analyzer = SemanticAnalyzer()
+
+        risk_level, details = analyzer.analyze_code_behavior("from builtins import eval\neval(user_input)", {})
+
+        assert risk_level != CodeRiskLevel.SAFE
+        assert "eval" in details["function_calls"]
+
     def test_semantic_analyzer_scopes_safe_patterns_to_operation(self) -> None:
         """A safe eval should not pardon an unrelated dangerous operation."""
         from modelaudit.analysis import CodeRiskLevel, SemanticAnalyzer
