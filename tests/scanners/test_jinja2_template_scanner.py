@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners import jinja2_template_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.jinja2_template_scanner import Jinja2TemplateScanner
 
@@ -336,6 +337,45 @@ model:
 
         failed_checks = [c for c in result.checks if c.status == CheckStatus.FAILED]
         assert len(failed_checks) > 0
+
+    def test_missing_yaml_dependency_uses_raw_fallback_and_marks_inconclusive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        yaml_file = model_dir / "config.yaml"
+        yaml_file.write_text(
+            "chat_template: \"{{ lipsum.__globals__.os.popen('id') }}\"\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(jinja2_template_scanner, "HAS_YAML", False)
+
+        result = Jinja2TemplateScanner().scan(str(yaml_file))
+
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_yaml_dependency_unavailable" in result.metadata["scan_outcome_reasons"]
+        failed_checks = [c for c in result.checks if c.name == "Jinja2 Template Injection Detection"]
+        assert failed_checks
+        assert any(c.details.get("template_location") == "raw_yaml_dependency_fallback" for c in failed_checks)
+
+    def test_missing_yaml_dependency_without_template_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        model_dir = tmp_path / "model"
+        model_dir.mkdir()
+        yaml_file = model_dir / "config.yaml"
+        yaml_file.write_text("model: safe\n", encoding="utf-8")
+        monkeypatch.setattr(jinja2_template_scanner, "HAS_YAML", False)
+
+        result = Jinja2TemplateScanner().scan(str(yaml_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_yaml_dependency_unavailable" in result.metadata["scan_outcome_reasons"]
 
 
 class TestJinja2TemplateScannerEdgeCases:
