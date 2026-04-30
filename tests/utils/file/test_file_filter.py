@@ -218,6 +218,14 @@ class TestFileFilter:
 
         assert should_skip_file(str(near_match))
 
+    def test_prefixed_zip_with_central_directory_stub_stays_scannable(self, tmp_path: Path) -> None:
+        disguised_zip = tmp_path / "archive.jpg"
+        with zipfile.ZipFile(disguised_zip, "w") as archive:
+            archive.writestr("payload.pkl", b"payload")
+        disguised_zip.write_bytes(b"PK\x01\x02stub-prefix" + disguised_zip.read_bytes())
+
+        assert not should_skip_file(str(disguised_zip))
+
     @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
     def test_content_recognized_payloads_bypass_default_hidden_and_basename_skips(
         self,

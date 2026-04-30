@@ -76,6 +76,7 @@ _RAR5_MAGIC = b"Rar!\x1a\x07\x01\x00"
 _LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
 _ZIP_MAGIC_SIGNATURES = (
     b"PK\x03\x04",  # local file header
+    b"PK\x01\x02",  # central directory file header
     b"PK\x05\x06",  # end of central directory
     b"PK\x06\x06",  # ZIP64 end of central directory
     b"PK\x06\x07",  # ZIP64 end of central directory locator

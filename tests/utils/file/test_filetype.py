@@ -103,6 +103,17 @@ def test_detect_file_format_rejects_pk_prefix_near_match(tmp_path: Path) -> None
     assert detect_file_format(str(near_match)) == "unknown"
 
 
+def test_detect_file_format_accepts_prefixed_zip_with_central_directory_stub(tmp_path: Path) -> None:
+    prefixed_zip = tmp_path / "prefixed.zip"
+    with zipfile.ZipFile(prefixed_zip, "w") as archive:
+        archive.writestr("payload.txt", "hello")
+    prefixed_zip.write_bytes(b"PK\x01\x02stub-prefix" + prefixed_zip.read_bytes())
+
+    assert is_zipfile(str(prefixed_zip)) is True
+    assert detect_file_format_from_magic(str(prefixed_zip)) == "zip"
+    assert detect_file_format(str(prefixed_zip)) == "zip"
+
+
 def test_detect_valid_torchserve_mar_by_magic_and_validation(tmp_path: Path) -> None:
     mar_path = _create_mar_archive(
         tmp_path,
