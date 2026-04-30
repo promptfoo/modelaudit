@@ -9,6 +9,8 @@ from typing import IO
 
 import pytest
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Check, ScanResult
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
@@ -2424,6 +2426,171 @@ def test_pytorch_zip_tensor_metadata_mismatch_detection(tmp_path: Path) -> None:
     assert len(mismatch_checks) > 0, (
         f"Should detect tensor storage size mismatch (24 bytes vs 1M declared elements). "
         f"Checks: {[(c.name, c.status, c.message) for c in result.checks]}"
+    )
+
+
+def test_pytorch_zip_tensor_metadata_parse_failure_fails_closed(tmp_path: Path) -> None:
+    """Malformed full-member metadata analysis must not collapse into a clean scan."""
+    zip_path = tmp_path / "malformed_tensor_metadata.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", b"\x80\x02B")
+        zipf.writestr("archive/data/0", b"\x00" * 24)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_tensor_metadata_validation_failed" in result.metadata["scan_outcome_reasons"]
+    validation_checks = [check for check in result.checks if check.name == "CVE-2026-24747 Tensor Metadata Validation"]
+    assert validation_checks
+    assert validation_checks[0].message == "Tensor metadata validation could not parse pickle member archive/data.pkl"
+
+
+def test_pytorch_zip_tensor_metadata_prefix_truncation_fails_closed(tmp_path: Path) -> None:
+    """Late tensor metadata after the bounded validation prefix must not report clean coverage."""
+    max_pkl_read = 10 * 1024 * 1024
+    pkl_data = bytearray()
+    pkl_data.extend(b"\x80\x02")  # PROTO 2
+    payload = b"A" * (max_pkl_read + 1024)
+    pkl_data.extend(b"B")  # BINBYTES
+    pkl_data.extend(struct.pack("<I", len(payload)))
+    pkl_data.extend(payload)
+    pkl_data.extend(b"0")  # POP
+    pkl_data.extend(b"ctorch._utils\n_rebuild_tensor_v2\n")
+    pkl_data.extend(b"\x8c\x010")
+    pkl_data.extend(b"J")
+    pkl_data.extend(struct.pack("<i", 1_000_000))
+    pkl_data.extend(b".")
+
+    scanner = PyTorchZipScanner()
+    mismatches, parse_complete = scanner._check_tensor_storage_mismatches(bytes(pkl_data), {"archive/data/0": 24})
+    assert parse_complete is True
+    assert mismatches
+
+    zip_path = tmp_path / "late_tensor_metadata.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", bytes(pkl_data))
+        zipf.writestr("archive/data/0", b"\x00" * 24)
+
+    result = scanner.scan(str(zip_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_tensor_metadata_validation_truncated" in result.metadata["scan_outcome_reasons"]
+    truncation_checks = [
+        check
+        for check in result.checks
+        if check.name == "CVE-2026-24747 Tensor Metadata Validation"
+        and check.details.get("analysis_incomplete") is True
+    ]
+    assert truncation_checks
+    assert truncation_checks[0].message == (
+        f"Tensor metadata validation only inspected the first {max_pkl_read} bytes "
+        "of oversized pickle member archive/data.pkl"
+    )
+    assert truncation_checks[0].details["max_read_bytes"] == max_pkl_read
+
+
+def test_pytorch_zip_tensor_metadata_large_auxiliary_pickle_stays_clean(tmp_path: Path) -> None:
+    """Oversized non-storage sidecar pickles must not poison otherwise valid archives."""
+    zip_path = tmp_path / "large_auxiliary_pickle.pt"
+    payload = b"A" * ((10 * 1024 * 1024) + 1024)
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", b"\x80\x02N.")
+        zipf.writestr("archive/data/0", b"\x00" * 24)
+        zipf.writestr("archive/constants.pkl", b"\x80\x02B" + struct.pack("<I", len(payload)) + payload + b".")
+
+    scanner = PyTorchZipScanner()
+    result = scanner._create_result()
+    scanner.current_file_path = str(zip_path)
+    with zipfile.ZipFile(zip_path, "r") as zipf:
+        safe_entries = zipf.infolist()
+        pickle_files = scanner._discover_pickle_files(zipf, safe_entries, result)
+        scanner._validate_tensor_metadata_consistency(zipf, safe_entries, pickle_files, result, str(zip_path))
+
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(
+        check.name == "CVE-2026-24747 Tensor Metadata Validation" and check.details.get("analysis_incomplete") is True
+        for check in result.checks
+    )
+
+
+def _assert_tensor_metadata_inconclusive_not_cached(
+    path: Path,
+    cache_dir: Path,
+    reason: str,
+    *,
+    expected_success: bool,
+    expected_exit_code: int,
+) -> None:
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert aggregate.success is expected_success
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert reason in metadata["scan_outcome_reasons"]
+            assert determine_exit_code(aggregate) == expected_exit_code
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_pytorch_zip_tensor_metadata_parse_failure_is_exit1_and_not_cached(tmp_path: Path) -> None:
+    zip_path = tmp_path / "malformed_tensor_metadata.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", b"\x80\x02B")
+        zipf.writestr("archive/data/0", b"\x00" * 24)
+
+    _assert_tensor_metadata_inconclusive_not_cached(
+        zip_path,
+        tmp_path / "parse-failure-cache",
+        "pytorch_zip_tensor_metadata_validation_failed",
+        expected_success=True,
+        expected_exit_code=1,
+    )
+
+
+def test_pytorch_zip_tensor_metadata_truncation_is_exit2_and_not_cached(tmp_path: Path) -> None:
+    max_pkl_read = 10 * 1024 * 1024
+    payload = b"A" * (max_pkl_read + 1024)
+    zip_path = tmp_path / "late_tensor_metadata.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr(
+            "archive/data.pkl",
+            b"\x80\x02B"
+            + struct.pack("<I", len(payload))
+            + payload
+            + b"0ctorch._utils\n_rebuild_tensor_v2\n\x8c\x010J"
+            + struct.pack("<i", 1_000_000)
+            + b".",
+        )
+        zipf.writestr("archive/data/0", b"\x00" * 24)
+
+    _assert_tensor_metadata_inconclusive_not_cached(
+        zip_path,
+        tmp_path / "truncation-cache",
+        "pytorch_zip_tensor_metadata_validation_truncated",
+        expected_success=False,
+        expected_exit_code=2,
     )
 
 

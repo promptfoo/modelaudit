@@ -2424,10 +2424,31 @@ class PyTorchZipScanner(BaseScanner):
         # Parse pickle to look for tensor rebuild patterns and cross-reference storage
         # Use bounded reads to avoid memory spikes on large pickle entries
         max_pkl_read = 10 * 1024 * 1024  # 10 MB limit for metadata validation
+        trusted_storage_data_pkl_members = self._trusted_pytorch_storage_data_pkl_members(safe_entries)
         for pkl_info in pickle_files:
             pkl_name = self._get_zip_member_name(pkl_info)
+            normalized_name = pkl_name.replace("\\", "/").lstrip("/")
+            is_trusted_storage_data_pkl = normalized_name in trusted_storage_data_pkl_members
             try:
                 if pkl_info.file_size > max_pkl_read:
+                    if is_trusted_storage_data_pkl:
+                        mark_inconclusive_scan_result(result, "pytorch_zip_tensor_metadata_validation_truncated")
+                        result.add_check(
+                            name="CVE-2026-24747 Tensor Metadata Validation",
+                            passed=False,
+                            message=(
+                                f"Tensor metadata validation only inspected the first {max_pkl_read} bytes "
+                                f"of oversized pickle member {pkl_name}"
+                            ),
+                            severity=IssueSeverity.INFO,
+                            location=f"{path}:{pkl_name}",
+                            details={
+                                "cve_id": self.CVE_2026_24747_ID,
+                                "analysis_incomplete": True,
+                                "member_size": pkl_info.file_size,
+                                "max_read_bytes": max_pkl_read,
+                            },
+                        )
                     pkl_data = self._read_member_prefix(
                         zip_file,
                         pkl_info,
@@ -2442,7 +2463,20 @@ class PyTorchZipScanner(BaseScanner):
                         phase="tensor_metadata_validation",
                         result=result,
                     )
-                mismatches = self._check_tensor_storage_mismatches(pkl_data, data_blob_sizes)
+                mismatches, parse_complete = self._check_tensor_storage_mismatches(pkl_data, data_blob_sizes)
+                if not parse_complete and pkl_info.file_size <= max_pkl_read and is_trusted_storage_data_pkl:
+                    mark_inconclusive_scan_result(result, "pytorch_zip_tensor_metadata_validation_failed")
+                    result.add_check(
+                        name="CVE-2026-24747 Tensor Metadata Validation",
+                        passed=False,
+                        message=f"Tensor metadata validation could not parse pickle member {pkl_name}",
+                        severity=IssueSeverity.INFO,
+                        location=f"{path}:{pkl_name}",
+                        details={
+                            "cve_id": self.CVE_2026_24747_ID,
+                            "analysis_incomplete": True,
+                        },
+                    )
                 if mismatches:
                     result.add_check(
                         name="CVE-2026-24747 Tensor Metadata Validation",
@@ -2464,15 +2498,28 @@ class PyTorchZipScanner(BaseScanner):
                             "during deserialization. Legitimate models have consistent metadata."
                         ),
                     )
-            except Exception:
+            except Exception as exc:
+                mark_inconclusive_scan_result(result, "pytorch_zip_tensor_metadata_validation_failed")
+                result.add_check(
+                    name="CVE-2026-24747 Tensor Metadata Validation",
+                    passed=False,
+                    message=f"Tensor metadata validation could not be completed for {pkl_name}: {exc}",
+                    severity=IssueSeverity.INFO,
+                    location=f"{path}:{pkl_name}",
+                    details={
+                        "cve_id": self.CVE_2026_24747_ID,
+                        "analysis_incomplete": True,
+                        "exception_type": type(exc).__name__,
+                    },
+                )
                 continue
 
     def _check_tensor_storage_mismatches(
         self, pkl_data: bytes, data_blob_sizes: dict[str, int]
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], bool]:
         """Check for mismatches between pickle tensor declarations and actual blob sizes.
 
-        Best-effort parsing: returns empty list if pickle cannot be parsed.
+        Return parsed mismatches plus whether pickle parsing completed.
         """
         import pickletools
 
@@ -2557,8 +2604,9 @@ class PyTorchZipScanner(BaseScanner):
                                 )
         except Exception as exc:
             logger.debug("Unable to compare PyTorch storage blob sizes: %s", exc)
+            return mismatches, False
 
-        return mismatches
+        return mismatches, True
 
     def _check_safetensors_available(self, model_path: str) -> bool:
         """Check if a SafeTensors alternative exists in the same directory"""
