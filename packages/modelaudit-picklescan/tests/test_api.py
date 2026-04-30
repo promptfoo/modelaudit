@@ -1369,6 +1369,18 @@ def test_scan_file_detects_hidden_pytorch_zip_pickle_member_without_data_pickle(
     )
 
 
+def test_scan_file_leaves_hidden_pickle_like_zip_without_pytorch_metadata_unrecognized(tmp_path: Path) -> None:
+    archive_path = tmp_path / "hidden-only.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/payload", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.ERROR
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert "container_type" not in report.metadata
+
+
 def test_scan_file_returns_error_report_for_pytorch_zip_member_access_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
