@@ -320,6 +320,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **flax:** keep explicit Flax/JAX checkpoint suffixes routed to the scanner when
+  `msgpack` is unavailable so missing parser coverage fails closed
 - **llamafile:** fail closed when bounded embedded-payload scanning stops before
   covering the full executable
 - **skops:** require exploit-shaped structured loader nodes for CVE-2025-54412
