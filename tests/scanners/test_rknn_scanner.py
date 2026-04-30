@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from modelaudit import core
-from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.rknn_scanner import RknnScanner
 
 
@@ -106,6 +106,17 @@ def test_scan_handles_truncated_rknn_gracefully(tmp_path: Path) -> None:
     assert len(structural_failures) == 1
     assert structural_failures[0].status == CheckStatus.FAILED
     assert result.success is False
+
+
+def test_scan_bounded_rknn_window_is_inconclusive(tmp_path: Path) -> None:
+    payload = b"RKNN\x01\x00\x00\x00model_name=resnet50\nruntime=rockchip\n" + (b"safe\n" * 40)
+    path = _write_rknn_file(tmp_path, payload, filename="bounded.rknn")
+
+    result = RknnScanner(config={"rknn_max_scan_bytes": 32}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "rknn_bounded_read_incomplete" in result.metadata["scan_outcome_reasons"]
 
 
 def test_regression_rknn_routes_to_dedicated_scanner(tmp_path: Path) -> None:

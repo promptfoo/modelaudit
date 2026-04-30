@@ -6,6 +6,7 @@ import os
 import re
 from typing import ClassVar
 
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Discovery assumptions captured from upstream CNTK sources:
@@ -338,6 +339,8 @@ class CntkScanner(BaseScanner):
 
         result.bytes_scanned = len(data)
         result.metadata["scan_truncated"] = truncated
+        if truncated:
+            mark_inconclusive_scan_result(result, "cntk_bounded_read_incomplete")
 
         if (variant == "legacy_v1" and len(data) < 32) or (variant == "cntk_v2" and len(data) < 24):
             result.add_check(
@@ -364,7 +367,7 @@ class CntkScanner(BaseScanner):
                 location=path,
                 details={"variant": variant},
             )
-            result.finish(success=True)
+            result.finish(success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME)
             return result
 
         category_messages = {
