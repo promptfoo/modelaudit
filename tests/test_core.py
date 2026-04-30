@@ -952,6 +952,17 @@ def test_scan_file_routes_extensionless_llamafile(tmp_path: Path) -> None:
     assert result.scanner_name == "llamafile"
 
 
+def test_scan_file_routes_extensionless_middle_marker_llamafile(tmp_path: Path) -> None:
+    extensionless_llamafile = tmp_path / "llama"
+    extensionless_llamafile.write_bytes(
+        b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"A" * (2 * 1024 * 1024 + 64) + b"llamafile runtime"
+    )
+
+    result = scan_file(str(extensionless_llamafile))
+
+    assert result.scanner_name == "llamafile"
+
+
 def test_scan_file_detects_malicious_extensionless_llamafile(tmp_path: Path) -> None:
     extensionless_llamafile = tmp_path / "llama"
     extensionless_llamafile.write_bytes(
