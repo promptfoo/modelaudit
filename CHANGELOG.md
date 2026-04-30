@@ -320,6 +320,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **pmml:** avoid flagging benign `ecosystem()` prose as a `system(...)` call.
 - **jax:** avoid routing `ajax` near-matches as JAX checkpoint indicators.
 - **security:** fail closed on malformed nested XGBoost JSON structures that
   would otherwise skip booster or tree validation.
