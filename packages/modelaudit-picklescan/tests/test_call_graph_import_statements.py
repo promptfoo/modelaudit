@@ -39,6 +39,12 @@ def _unicode_operand(value: str) -> bytes:
     return b"X" + len(data).to_bytes(4, "little") + data
 
 
+def _bytes_operand(value: bytes) -> bytes:
+    if len(value) <= 0xFF:
+        return b"C" + bytes([len(value)]) + value
+    return b"B" + len(value).to_bytes(4, "little") + value
+
+
 def _global_operand(module: str, name: str) -> bytes:
     return _unicode_operand(module) + _unicode_operand(name) + b"\x93"
 
@@ -673,7 +679,12 @@ def _duplicate_callable_invocation_budget_payload(repetitions: int) -> bytes:
     return b"".join(parts)
 
 
-def _builtins_help_defaultdict_format_map_payload(*, lookup: bool) -> bytes:
+def _builtins_help_defaultdict_format_map_payload(
+    *,
+    lookup: bool,
+    format_string: str = "{x}",
+    format_operand: bytes | None = None,
+) -> bytes:
     parts = [
         b"\x80\x04",
         _global_operand("collections", "defaultdict"),
@@ -686,7 +697,7 @@ def _builtins_help_defaultdict_format_map_payload(*, lookup: bool) -> bytes:
                 b"\x94",
                 b"0",
                 _global_operand("builtins", "str.format_map"),
-                _args_tuple(_unicode_operand("{x}"), b"h\x00"),
+                _args_tuple(format_operand or _unicode_operand(format_string), b"h\x00"),
                 b"R",
             ]
         )
@@ -710,7 +721,12 @@ def _builtins_help_defaultdict_str_format_payload(format_string: str, *format_ar
     )
 
 
-def _builtins_help_defaultdict_operator_mod_payload(*, lookup: bool, operator_name: str = "mod") -> bytes:
+def _builtins_help_defaultdict_operator_mod_payload(
+    *,
+    lookup: bool,
+    operator_name: str = "mod",
+    format_string: str = "%(x)s",
+) -> bytes:
     parts = [
         b"\x80\x04",
         _global_operand("collections", "defaultdict"),
@@ -723,7 +739,7 @@ def _builtins_help_defaultdict_operator_mod_payload(*, lookup: bool, operator_na
                 b"\x94",
                 b"0",
                 _global_operand("operator", operator_name),
-                _args_tuple(_unicode_operand("%(x)s"), b"h\x00"),
+                _args_tuple(_unicode_operand(format_string), b"h\x00"),
                 b"R",
             ]
         )
@@ -731,7 +747,7 @@ def _builtins_help_defaultdict_operator_mod_payload(*, lookup: bool, operator_na
     return b"".join(parts)
 
 
-def _builtins_help_defaultdict_formatter_vformat_payload(*, lookup: bool) -> bytes:
+def _builtins_help_defaultdict_formatter_vformat_payload(*, lookup: bool, format_string: str = "{x}") -> bytes:
     parts = [
         b"\x80\x04",
         _global_operand("string", "Formatter"),
@@ -748,7 +764,7 @@ def _builtins_help_defaultdict_formatter_vformat_payload(*, lookup: bool) -> byt
                 b"\x94",
                 b"0",
                 _global_operand("string", "Formatter.vformat"),
-                _args_tuple(b"h\x00", _unicode_operand("{x}"), b"N", b"h\x01"),
+                _args_tuple(b"h\x00", _unicode_operand(format_string), b"N", b"h\x01"),
                 b"R",
             ]
         )
@@ -756,7 +772,11 @@ def _builtins_help_defaultdict_formatter_vformat_payload(*, lookup: bool) -> byt
     return b"".join(parts)
 
 
-def _builtins_help_defaultdict_formatter_private_vformat_payload(*, lookup: bool) -> bytes:
+def _builtins_help_defaultdict_formatter_private_vformat_payload(
+    *,
+    lookup: bool,
+    format_string: str = "{x}",
+) -> bytes:
     parts = [
         b"\x80\x04",
         _global_operand("string", "Formatter"),
@@ -773,7 +793,7 @@ def _builtins_help_defaultdict_formatter_private_vformat_payload(*, lookup: bool
                 b"\x94",
                 b"0",
                 _global_operand("string", "Formatter._vformat"),
-                _args_tuple(b"h\x00", _unicode_operand("{x}"), b"N", b"h\x01", b"\x8f", b"K\x02"),
+                _args_tuple(b"h\x00", _unicode_operand(format_string), b"N", b"h\x01", b"\x8f", b"K\x02"),
                 b"R",
             ]
         )
@@ -920,7 +940,7 @@ def _ipaddress_format_payload() -> bytes:
     )
 
 
-def _ipaddress_str_format_payload() -> bytes:
+def _ipaddress_str_format_payload(format_string: str = "{:b}", *, format_operand: bytes | None = None) -> bytes:
     return b"".join(
         [
             b"\x80\x04",
@@ -930,7 +950,7 @@ def _ipaddress_str_format_payload() -> bytes:
             b"\x94",
             b"0",
             _global_operand("builtins", "str.format"),
-            _args_tuple(_unicode_operand("{:b}"), b"h\x00"),
+            _args_tuple(format_operand or _unicode_operand(format_string), b"h\x00"),
             b"R.",
         ]
     )
@@ -6310,6 +6330,21 @@ if marker.read_text() != marker_content:
     assert marker.read_text() == marker_content
 
 
+@pytest.mark.parametrize("format_string", ["", "plain text", "{{x}}"])
+def test_scan_bytes_keeps_format_map_defaultdict_without_live_fields_clean(format_string: str) -> None:
+    payload = _builtins_help_defaultdict_format_map_payload(lookup=True, format_string=format_string)
+
+    report = scan_bytes(payload, source="format-map-defaultdict-no-live-field.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+
+
 @pytest.mark.parametrize(
     ("format_string", "format_arguments"),
     [
@@ -6358,6 +6393,23 @@ def test_scan_bytes_keeps_non_lookup_str_format_defaultdict_cases_clean(
     payload = _builtins_help_defaultdict_str_format_payload(format_string, *format_arguments)
 
     report = scan_bytes(payload, source="str-format-defaultdict-no-lookup.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+
+def test_scan_bytes_keeps_format_map_defaultdict_bytes_receiver_clean() -> None:
+    payload = _builtins_help_defaultdict_format_map_payload(
+        lookup=True,
+        format_operand=_bytes_operand(b"{x}"),
+    )
+
+    report = scan_bytes(payload, source="format-map-defaultdict-bytes-receiver.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
     assert not any(
@@ -6438,6 +6490,25 @@ if marker.read_text() != marker_content:
     )
     assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
+
+
+@pytest.mark.parametrize("operator_name", ["mod", "imod"])
+def test_scan_bytes_keeps_operator_percent_defaultdict_without_mapping_fields_clean(operator_name: str) -> None:
+    payload = _builtins_help_defaultdict_operator_mod_payload(
+        lookup=True,
+        operator_name=operator_name,
+        format_string="%%(x)s",
+    )
+
+    report = scan_bytes(payload, source=f"operator-{operator_name}-defaultdict-no-mapping-field.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
 
 
 @pytest.mark.parametrize("method_name", ["Template.substitute", "Template.safe_substitute"])
@@ -6593,6 +6664,20 @@ if marker.read_text() != marker_content:
     assert marker.read_text() == marker_content
 
 
+def test_scan_bytes_keeps_formatter_vformat_defaultdict_without_live_fields_clean() -> None:
+    payload = _builtins_help_defaultdict_formatter_vformat_payload(lookup=True, format_string="{{x}}")
+
+    report = scan_bytes(payload, source="formatter-vformat-defaultdict-no-live-field.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+
 def test_scan_bytes_blocks_formatter_private_vformat_defaultdict_factory_rce(tmp_path: Path) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
@@ -6662,6 +6747,20 @@ if marker.read_text() != marker_content:
     )
     assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
+
+
+def test_scan_bytes_keeps_formatter_private_vformat_defaultdict_without_live_fields_clean() -> None:
+    payload = _builtins_help_defaultdict_formatter_private_vformat_payload(lookup=True, format_string="{{x}}")
+
+    report = scan_bytes(payload, source="formatter-private-vformat-defaultdict-no-live-field.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
 
 
 def test_scan_bytes_blocks_ipaddress_format_protocol_dispatch_import_rce(tmp_path: Path) -> None:
@@ -6809,6 +6908,34 @@ if marker.read_text() != marker_content:
     )
     assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
+
+
+def test_scan_bytes_keeps_ipaddress_str_format_without_live_fields_clean() -> None:
+    payload = _ipaddress_str_format_payload("plain text")
+
+    report = scan_bytes(payload, source="ipaddress-str-format-no-live-field.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "ipaddress"
+        and invocation.get("name") == "IPv4Address.__format__"
+        and invocation.get("positional_arg_count") == 1
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+
+def test_scan_bytes_keeps_ipaddress_str_format_bytes_receiver_clean() -> None:
+    payload = _ipaddress_str_format_payload(format_operand=_bytes_operand(b"{:b}"))
+
+    report = scan_bytes(payload, source="ipaddress-str-format-bytes-receiver.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "ipaddress"
+        and invocation.get("name") == "IPv4Address.__format__"
+        and invocation.get("positional_arg_count") == 1
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
 
 
 def test_scan_bytes_blocks_platform_processor_get_dynamic_fallback_rce(tmp_path: Path) -> None:
