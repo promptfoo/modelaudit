@@ -1,6 +1,8 @@
 from pathlib import Path
 
-from modelaudit.scanners.base import IssueSeverity
+import pytest
+
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.cntk_scanner import DISCOVERY_ASSUMPTIONS, CntkScanner
 
 
@@ -122,6 +124,21 @@ def test_cntk_scanner_reports_truncated_supported_variant(tmp_path: Path) -> Non
 
     assert not result.success
     assert any("truncated or structurally incomplete" in issue.message.lower() for issue in result.issues)
+
+
+def test_cntk_scanner_marks_bounded_prefix_analysis_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "bounded.cmf"
+    _write_cntkv2(path, payload=b" " + (b"safe " * 64))
+    monkeypatch.setattr("modelaudit.scanners.cntk_scanner._MAX_SCAN_BYTES", 64)
+
+    result = CntkScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "cntk_bounded_read_incomplete" in result.metadata["scan_outcome_reasons"]
 
 
 def test_cntk_scanner_records_scope_assumptions(tmp_path: Path) -> None:
