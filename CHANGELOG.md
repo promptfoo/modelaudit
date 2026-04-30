@@ -113,6 +113,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **security:** fail closed when NeMo archives contain no analyzable config files
+- **security:** analyze GGUF-embedded chat templates through the Jinja scanner
+  while preserving GGUF scanner ownership
 - **security:** run JAX checkpoint analysis for JAX-like pickle payloads that
   stay on the primary pickle scanner path
 - **security:** detect `mailcap.findmatch` pickle call targets that can execute
@@ -313,6 +316,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **xgboost:** avoid flagging inert `feature_names` metadata as executable JSON
   content.
+- **routing:** align manifest scanner routing with the manifest filenames and
+  dedicated manifest-style suffixes declared by the registry.
+- **security:** detect strong executable headers in generic archive members even
+  when the payload has no executable-looking suffix.
+- **routing:** preserve renamed OpenVINO and PMML XML models with long benign
+  prologs during content-based directory filtering.
+- **security:** resolve compile-time string concatenation in archive-member `getattr` calls so high-risk targets like `os.system` cannot hide behind split literals
+- **security:** fail closed when routing recognizes a model format but no scanner is available to analyze it
+- **security:** fail closed when streaming scans only fall back to heuristic header checks, even if the remote file bytes were fully read
 - **docs:** narrow public scan-coverage wording so unsupported or merely discovered formats are not over-promised
 - **analysis:** keep exact dangerous literals visible even when surrounding bytes look like ML weights
 - **analysis:** stop attacker-controlled file and directory names from suppressing dangerous framework-pattern findings
