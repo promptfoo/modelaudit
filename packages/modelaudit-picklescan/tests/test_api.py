@@ -1178,17 +1178,28 @@ def test_scan_file_scans_strict_pickle_path(tmp_path: Path) -> None:
     assert report.coverage.bytes_total == payload_path.stat().st_size
 
 
-def test_scan_file_does_not_treat_suffix_only_zip_as_pytorch(tmp_path: Path) -> None:
-    archive_path = tmp_path / "not-a-checkpoint.pt"
+@pytest.mark.parametrize("suffix", [".pt", ".pth", ".ckpt", ".PT"])
+def test_scan_file_reports_unsupported_checkpoint_suffix_zip(suffix: str, tmp_path: Path) -> None:
+    archive_path = tmp_path / f"not-a-checkpoint{suffix}"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("data.pkl", pickle.dumps({"safe": True}, protocol=4))
 
     report = scan_file(archive_path)
 
+    assert report.source == str(archive_path)
     assert report.metadata.get("container_type") != "pytorch_zip"
-    assert report.errors[0].category == "unsupported_zip_container"
+    assert report.metadata == {"container_type": "zip", "analysis_incomplete": True}
     assert report.status == ScanStatus.ERROR
     assert report.verdict == SafetyVerdict.UNKNOWN
+    assert len(report.errors) == 1
+    assert report.errors[0].category == "unsupported_zip_container"
+    assert report.errors[0].location == str(archive_path)
+    assert report.errors[0].exception_type == "ValueError"
+    assert report.errors[0].details == {"analysis_incomplete": True}
+    assert report.coverage.bytes_scanned == 0
+    assert report.coverage.bytes_total == archive_path.stat().st_size
+    assert not report.coverage.raw_scan_complete
+    assert not report.coverage.opcode_scan_complete
 
 
 def test_scan_file_scans_pytorch_zip_data_pickle(tmp_path: Path) -> None:
