@@ -1348,6 +1348,39 @@ def test_scan_file_scans_pickle_members_without_data_pickle_in_pytorch_zip(tmp_p
     )
 
 
+def test_scan_file_detects_hidden_pytorch_zip_pickle_member_without_data_pickle(tmp_path: Path) -> None:
+    archive_path = tmp_path / "hidden-only.pt"
+    hidden_payload = b"cposix\nsystem\n(S'echo hidden'\ntR."
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/version", "3\n")
+        archive.writestr("archive/byteorder", "little")
+        archive.writestr("archive/payload", hidden_payload)
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert list(report.metadata["pickle_files"]) == ["archive/payload"]
+    assert any(
+        finding.rule_code == "DANGEROUS_CALL"
+        and finding.location is not None
+        and f"{archive_path}:archive/payload" in finding.location
+        for finding in report.findings
+    )
+
+
+def test_scan_file_leaves_hidden_pickle_like_zip_without_pytorch_metadata_unrecognized(tmp_path: Path) -> None:
+    archive_path = tmp_path / "hidden-only.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/payload", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+
+    report = scan_file(archive_path)
+
+    assert report.status == ScanStatus.ERROR
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert "container_type" not in report.metadata
+
+
 def test_scan_file_returns_error_report_for_pytorch_zip_member_access_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

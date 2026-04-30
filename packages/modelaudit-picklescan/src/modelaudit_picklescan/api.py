@@ -225,10 +225,12 @@ class PickleScanner:
             entries = _bounded_zip_entries(archive, source=source, size=size)
             if isinstance(entries, PickleReport):
                 return entries
-            if not _is_pytorch_zip_archive(entries):
+            if not _has_pytorch_zip_metadata(entries):
                 return None
 
             pickle_entries, discovery_notices = _discover_pytorch_zip_pickle_entries(archive, entries, source=source)
+            if not _is_pytorch_zip_archive(entries, discovered_pickle_entries=pickle_entries):
+                return None
             if not pickle_entries:
                 return _pytorch_zip_notice_report(
                     source=source,
@@ -385,16 +387,24 @@ def _bounded_zip_entries(
     return entries
 
 
-def _is_pytorch_zip_archive(entries: list[zipfile.ZipInfo]) -> bool:
+def _has_pytorch_zip_metadata(entries: list[zipfile.ZipInfo]) -> bool:
+    names = [entry.filename for entry in entries if not entry.is_dir()]
+    return any(Path(name).name in _PYTORCH_ZIP_METADATA_BASENAMES for name in names)
+
+
+def _is_pytorch_zip_archive(
+    entries: list[zipfile.ZipInfo],
+    *,
+    discovered_pickle_entries: list[zipfile.ZipInfo] | None = None,
+) -> bool:
     names = [entry.filename for entry in entries if not entry.is_dir()]
     has_data_pickle = any(_is_data_pickle_member(name) for name in names)
-    has_metadata_marker = any(Path(name).name in _PYTORCH_ZIP_METADATA_BASENAMES for name in names)
-    if not has_metadata_marker:
+    if not _has_pytorch_zip_metadata(entries):
         return False
     if has_data_pickle:
         return True
     has_pickle_members = any(name.lower().endswith(_PICKLE_MEMBER_SUFFIXES) for name in names)
-    return has_pickle_members
+    return has_pickle_members or bool(discovered_pickle_entries)
 
 
 def _discover_pytorch_zip_pickle_entries(
