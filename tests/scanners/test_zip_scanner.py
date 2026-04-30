@@ -207,6 +207,56 @@ def test_scan_zip_flags_aliased_getattr_helper_dangerous_python_member(tmp_path:
     assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
 
+def test_scan_zip_flags_concatenated_getattr_name_dangerous_python_member(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import os\ngetattr(os, 'sys' + 'tem')('echo hidden')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].severity == IssueSeverity.WARNING
+    assert python_checks[0].rule_code == "S101"
+    assert python_checks[0].details["reason"] == "high-risk calls: os.system"
+
+
+def test_scan_zip_bounds_large_concatenated_getattr_names(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    padding = " + ".join(["''"] * 300)
+    source = f"import os\ngetattr(os, 'sys' + {padding} + 'tem')('echo hidden')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_zip_flags_padded_split_literal_getattr_name(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    padding = " + ".join(["''"] * 160)
+    source = f"import os\ngetattr(os, 'sys' + {padding} + 'tem')('echo hidden')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert any(
+        check.name == "Python Archive Member Security"
+        and check.status == CheckStatus.FAILED
+        and check.details["reason"] == "high-risk calls: os.system"
+        for check in result.checks
+    )
+
+
 def test_scan_zip_flags_rebound_dangerous_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = "import subprocess\nrunner = subprocess.run\nrunner(['echo', 'hidden'], check=False)\n"
@@ -467,6 +517,96 @@ def test_scan_npz_flags_executable_member(tmp_path: Path) -> None:
     assert executable_checks[0].details["entry"] == "bin/run.sh"
 
 
+def test_scan_npz_flags_extensionless_executable_member(tmp_path: Path) -> None:
+    """Executable payloads should not need a helpful suffix inside ZIP-like archives."""
+    archive_path = tmp_path / "model_bundle.npz"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("bin/runme", b"\x7fELF" + b"\x00" * 64)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    executable_checks = [
+        check
+        for check in result.checks
+        if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert len(executable_checks) == 1
+    assert executable_checks[0].severity == IssueSeverity.WARNING
+    assert executable_checks[0].details["entry"] == "bin/runme"
+
+
+def test_scan_npz_ignores_extensionless_executable_near_match(tmp_path: Path) -> None:
+    """Near-match member bytes should not become executable findings."""
+    archive_path = tmp_path / "model_bundle.npz"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("bin/runme", b"\x7fELG" + b"\x00" * 64)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(check.name == "Executable Archive Member Detection" for check in result.checks)
+
+
+def test_scan_npz_ignores_java_class_header_near_match(tmp_path: Path) -> None:
+    """Java class files should not be mistaken for Mach-O fat binaries."""
+    archive_path = tmp_path / "model_bundle.npz"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("Foo.class", b"\xca\xfe\xba\xbe\x00\x00\x00\x3d" + b"\x00" * 64)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(check.name == "Executable Archive Member Detection" for check in result.checks)
+
+
+def test_scan_npz_flags_extensionless_pe_member_with_late_header(tmp_path: Path) -> None:
+    """Extensionless PEs with large DOS stubs should still be detected by content."""
+    archive_path = tmp_path / "model_bundle.npz"
+    payload = bytearray(2048)
+    payload[:2] = b"MZ"
+    payload[0x3C:0x40] = (1536).to_bytes(4, "little")
+    payload[1536:1540] = b"PE\x00\x00"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("bin/runme", payload)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    executable_checks = [
+        check
+        for check in result.checks
+        if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert len(executable_checks) == 1
+    assert executable_checks[0].details["entry"] == "bin/runme"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\xca\xfe\xba\xbf" + (1).to_bytes(4, "big") + b"\x00" * 64,
+        b"\xbf\xba\xfe\xca" + (1).to_bytes(4, "little") + b"\x00" * 64,
+    ],
+)
+def test_scan_npz_flags_extensionless_macho_fat64_members(tmp_path: Path, payload: bytes) -> None:
+    """ZIP-like archives should flag both endian variants of Mach-O fat64 binaries."""
+    archive_path = tmp_path / "model_bundle.npz"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("bin/runme", payload)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    executable_checks = [
+        check
+        for check in result.checks
+        if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert len(executable_checks) == 1
+    assert executable_checks[0].details["entry"] == "bin/runme"
+
+
 def test_scan_npz_ignores_numpy_member_near_python_suffix(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.npz"
     with zipfile.ZipFile(archive_path, "w") as archive:
@@ -715,6 +855,103 @@ def test_scan_nested_file_header_routed_generic_suffix_can_report_findings(
     assert "detected header-routed payload" in failed_checks[0].message.lower()
     assert result.has_warnings is True
     assert result.has_errors is False
+
+
+def test_scan_nested_file_fails_closed_when_recognized_header_scanner_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted_member = tmp_path / "member.dat"
+    extracted_member.write_bytes(b"header-routed model payload")
+
+    monkeypatch.setattr(archive_dispatch, "detect_file_format", lambda _path: "header_only_model")
+    monkeypatch.setattr(archive_dispatch, "detect_file_format_from_magic", lambda _path: "header_only_model")
+    monkeypatch.setitem(
+        archive_dispatch._HEADER_FORMAT_TO_SCANNER_ID,
+        "header_only_model",
+        "header_only_scanner",
+    )
+    monkeypatch.setattr(_registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(_registry, "get_scanner_for_path", lambda _path: None)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.has_errors is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+    assert "recognized_format_scanner_unavailable" in result.metadata["scan_outcome_reasons"]
+
+    check = next(check for check in result.checks if check.name == "Format Detection")
+    assert check.severity == IssueSeverity.INFO
+    assert "Recognized format could not be scanned" in check.message
+    assert check.details["format"] == "header_only_model"
+    assert check.details["preferred_scanner_id"] == "header_only_scanner"
+
+
+def test_scan_nested_file_does_not_fail_closed_for_extension_only_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted_member = tmp_path / "metadata.pb"
+    extracted_member.write_bytes(b"plain protobuf-ish bytes")
+
+    monkeypatch.setattr(_registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(_registry, "get_scanner_for_path", lambda _path: None)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(check.name == "Format Detection" for check in result.checks)
+
+
+def test_scan_nested_file_fails_closed_when_xml_root_is_beyond_bounded_probe(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "payload.txt"
+    extracted_member.write_text(
+        "<?xml version='1.0'?><!--" + ("x" * ((1024 * 1024) + 64)) + "--><PMML version='4.4'></PMML>",
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["operational_error_reason"] == "xml_model_routing_incomplete"
+    check = next(check for check in result.checks if check.name == "XML Model Routing")
+    assert "bounded probe ended before the first structural root element" in check.message
+
+
+def test_scan_zip_fails_closed_when_nested_recognized_header_scanner_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("member.dat", b"header-routed model payload")
+
+    monkeypatch.setattr(archive_dispatch, "detect_file_format", lambda _path: "header_only_model")
+    monkeypatch.setattr(archive_dispatch, "detect_file_format_from_magic", lambda _path: "header_only_model")
+    monkeypatch.setitem(
+        archive_dispatch._HEADER_FORMAT_TO_SCANNER_ID,
+        "header_only_model",
+        "header_only_scanner",
+    )
+    monkeypatch.setattr(_registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(_registry, "get_scanner_for_path", lambda _path: None)
+
+    result = ZipScanner({"cache_enabled": False}).scan(str(archive_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    nested_check = next(check for check in result.checks if check.name == "Format Detection")
+    assert nested_check.location == f"{archive_path}:member.dat"
 
 
 class TestZipScanner:

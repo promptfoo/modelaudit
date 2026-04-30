@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from modelaudit import core
-from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.torch7_scanner import Torch7Scanner
 
 
@@ -68,6 +68,17 @@ def test_scan_handles_corrupt_file_gracefully(tmp_path: Path) -> None:
     header_failures = [check for check in result.checks if check.name == "Torch7 Header Signature"]
     assert len(header_failures) == 1
     assert header_failures[0].status == CheckStatus.FAILED
+
+
+def test_scan_bounded_torch7_window_is_inconclusive(tmp_path: Path) -> None:
+    payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\n" + (b"safe\n" * 64)
+    path = _write_torch7_file(tmp_path, payload, filename="bounded.t7")
+
+    result = Torch7Scanner(config={"torch7_max_scan_bytes": 32}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "torch7_bounded_read_incomplete" in result.metadata["scan_outcome_reasons"]
     assert result.success is False
 
 

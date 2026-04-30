@@ -8,6 +8,7 @@ import re
 from typing import Any, ClassVar
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 _LIGHTGBM_HEADER_MARKERS: tuple[str, ...] = (
@@ -413,6 +414,7 @@ class LightGBMScanner(BaseScanner):
         )
 
         if truncated:
+            mark_inconclusive_scan_result(result, "lightgbm_bounded_read_incomplete")
             result.add_check(
                 name="LightGBM Bounded Read",
                 passed=False,
@@ -433,6 +435,7 @@ class LightGBMScanner(BaseScanner):
         lines = [line for line in preview.splitlines() if line.strip()]
         if len(lines) > self.max_line_count:
             lines = lines[: self.max_line_count]
+            mark_inconclusive_scan_result(result, "lightgbm_line_budget_incomplete")
             result.add_check(
                 name="LightGBM Line Budget",
                 passed=False,
@@ -454,5 +457,7 @@ class LightGBMScanner(BaseScanner):
         result.metadata["line_count"] = len(lines)
         self._analyze_lines(lines, result, path)
 
-        result.finish(success=not result.has_errors)
+        result.finish(
+            success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
+        )
         return result

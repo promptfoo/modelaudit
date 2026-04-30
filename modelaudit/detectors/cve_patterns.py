@@ -127,19 +127,35 @@ def _analyze_cve_patterns_basic(content: str, binary_content: bytes = b"") -> li
     return analyze_cve_patterns(content, binary_content)
 
 
+_DOCUMENTATION_LINE_PREFIXES = ("#", '"""', "'''", "warning:", "note:")
+
+
+def _is_documentation_line(line: str) -> bool:
+    return any(line.startswith(prefix) for prefix in _DOCUMENTATION_LINE_PREFIXES)
+
+
 def _is_primarily_documentation(content: str) -> bool:
     """Check if content is primarily documentation/comments rather than executable code.
 
-    Only suppresses detection when the majority (>50%) of non-empty lines are
-    comment or docstring lines. This avoids the bypass where embedding a single
-    comment token (e.g. ``#``) in a malicious payload would suppress all detection.
+    Documentation-heavy content is common in model metadata. Use the majority
+    rule so one unrelated executable line does not make those docs suspicious.
     """
     lines = [line.strip() for line in content.splitlines() if line.strip()]
     if not lines:
         return False
-    doc_prefixes = ("#", '"""', "'''", "warning:", "note:")
-    doc_line_count = sum(1 for line in lines if any(line.startswith(p) for p in doc_prefixes))
+    doc_line_count = sum(1 for line in lines if _is_documentation_line(line))
     return doc_line_count > len(lines) / 2
+
+
+def _content_for_cve_analysis(content: str) -> str:
+    """Strip documentation lines before CVE matching in documentation-heavy text."""
+    if not _is_primarily_documentation(content):
+        return content
+
+    executable_lines = [
+        line for line in content.splitlines() if line.strip() and not _is_documentation_line(line.strip())
+    ]
+    return "\n".join(executable_lines)
 
 
 def _check_cve_2020_13092_multiline(content: str, binary_content: bytes) -> list[str]:
@@ -150,11 +166,10 @@ def _check_cve_2020_13092_multiline(content: str, binary_content: bytes) -> list
     Real malicious code spreads indicators across multiple lines.
     """
     matches = []
-    content_lower = content.lower()
-
-    # Skip content that is primarily documentation/comments
-    if _is_primarily_documentation(content):
+    analysis_content = _content_for_cve_analysis(content)
+    if not analysis_content:
         return []
+    content_lower = analysis_content.lower()
 
     # Required indicators for CVE-2020-13092
     sklearn_indicators = ["sklearn", "joblib"]
@@ -207,11 +222,10 @@ def _check_cve_2024_34997_multiline(content: str, binary_content: bytes) -> list
     Real malicious code spreads indicators across multiple lines.
     """
     matches = []
-    content_lower = content.lower()
-
-    # Skip content that is primarily documentation/comments
-    if _is_primarily_documentation(content):
+    analysis_content = _content_for_cve_analysis(content)
+    if not analysis_content:
         return []
+    content_lower = analysis_content.lower()
 
     # Required indicators for CVE-2024-34997
     numpy_indicators = ["numpyarraywrapper", "read_array", "numpy_pickle"]
@@ -272,11 +286,10 @@ def _check_cve_2026_24747_multiline(content: str, binary_content: bytes) -> list
     via SETITEM/SETITEMS abuse on non-dict objects and tensor metadata mismatches.
     """
     matches = []
-    content_lower = content.lower()
-
-    # Skip content that is primarily documentation/comments
-    if _is_primarily_documentation(content):
+    analysis_content = _content_for_cve_analysis(content)
+    if not analysis_content:
         return []
+    content_lower = analysis_content.lower()
 
     # Required indicators for CVE-2026-24747
     pytorch_indicators = [
@@ -346,11 +359,10 @@ def _check_cve_2022_45907_multiline(content: str, binary_content: bytes) -> list
     allowing arbitrary code execution via crafted type annotations.
     """
     matches = []
-    content_lower = content.lower()
-
-    # Skip content that is primarily documentation/comments
-    if _is_primarily_documentation(content):
+    analysis_content = _content_for_cve_analysis(content)
+    if not analysis_content:
         return []
+    content_lower = analysis_content.lower()
 
     # Required indicators for CVE-2022-45907
     jit_indicators = ["parse_type_line", "torch.jit.annotations", "jit.annotations"]
@@ -390,11 +402,10 @@ def _check_cve_2024_5480_multiline(content: str, binary_content: bytes) -> list[
     function calls; attacker sends eval/exec as PythonUDF.
     """
     matches = []
-    content_lower = content.lower()
-
-    # Skip content that is primarily documentation/comments
-    if _is_primarily_documentation(content):
+    analysis_content = _content_for_cve_analysis(content)
+    if not analysis_content:
         return []
+    content_lower = analysis_content.lower()
 
     # Required indicators for CVE-2024-5480
     rpc_indicators = ["torch.distributed.rpc", "rpc_sync", "rpc_async", "pythonudf"]
@@ -444,11 +455,10 @@ def _check_cve_2024_48063_multiline(content: str, binary_content: bytes) -> list
     RCE via pickle. Disputed as "intended behavior."
     """
     matches = []
-    content_lower = content.lower()
-
-    # Skip content that is primarily documentation/comments
-    if _is_primarily_documentation(content):
+    analysis_content = _content_for_cve_analysis(content)
+    if not analysis_content:
         return []
+    content_lower = analysis_content.lower()
 
     # Required indicators for CVE-2024-48063
     remote_indicators = ["remotemodule", "remote_module_pickled", "torch.distributed.rpc.remotemodule"]
