@@ -48,6 +48,9 @@ _ASSET_MACHO_HEADERS = (
 _ASSET_PE_HEADER = b"MZ"  # Windows PE executables
 _ASSET_PICKLE_PREFIXES = tuple(bytes([0x80, protocol]) for protocol in range(2, 6))
 _ASSET_PROBE_BYTES = max(8192, PROTO0_1_MAX_PROBE_BYTES)
+_CORE_ROOT_MODEL_FILES = frozenset({"saved_model.pb", "keras_metadata.pb", "fingerprint.pb"})
+_CORE_ROOT_MODEL_DIRS = frozenset({"assets", "assets.extra", "variables"})
+_CORE_ROOT_ASSET_DIRS = frozenset({"assets", "assets.extra"})
 _ASSET_PYTHON_PATTERN = re.compile(
     r"(?m)(^\s*(?:"
     r"from\s+[A-Za-z_][\w.]*\s+import\s+"
@@ -306,6 +309,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
             self._scan_keras_metadata(str(keras_metadata_path), result)
 
         self._scan_saved_model_assets(model_root, result)
+        self._scan_saved_model_root_siblings(model_root, result)
 
         # Check for other suspicious files in the directory
         for root, _dirs, files in os.walk(dir_path):
@@ -504,15 +508,146 @@ class TensorFlowSavedModelScanner(BaseScanner):
                         rule_code="S902",
                     )
 
-    def _detect_suspicious_asset_content(self, file_path: Path, result: ScanResult) -> list[str]:
+    def _scan_saved_model_root_siblings(self, model_root: Path, result: ScanResult) -> None:
+        """Scan non-canonical root entries that can accompany a SavedModel."""
+        for child_path in model_root.iterdir():
+            try:
+                child_stat = child_path.lstat()
+            except OSError as exc:
+                result.add_check(
+                    name="SavedModel Supplemental Directory Security Check",
+                    passed=False,
+                    message=f"Cannot inspect SavedModel supplemental entry: {child_path.name}: {exc}",
+                    severity=IssueSeverity.WARNING,
+                    location=str(child_path),
+                    details={
+                        "file_name": child_path.name,
+                        "detected_content_type": "unscannable_supplemental_entry",
+                        "entry_kind": "stat_error",
+                        "exception": str(exc),
+                        "exception_type": type(exc).__name__,
+                    },
+                    rule_code="S902",
+                )
+                continue
+
+            if child_path.name in _CORE_ROOT_MODEL_FILES and stat.S_ISREG(child_stat.st_mode):
+                continue
+            if child_path.name in _CORE_ROOT_ASSET_DIRS and (
+                stat.S_ISDIR(child_stat.st_mode) or stat.S_ISLNK(child_stat.st_mode)
+            ):
+                continue
+            if child_path.name in _CORE_ROOT_MODEL_DIRS and stat.S_ISDIR(child_stat.st_mode):
+                continue
+            if stat.S_ISDIR(child_stat.st_mode):
+                self._scan_saved_model_supplemental_directory(model_root, child_path, result)
+                continue
+
+            self._scan_saved_model_supplemental_file(child_path, result)
+
+    def _scan_saved_model_supplemental_directory(
+        self,
+        model_root: Path,
+        directory_path: Path,
+        result: ScanResult,
+    ) -> None:
+        """Scan a non-canonical SavedModel sibling directory without following symlinks."""
+        for root, dir_names, files in os.walk(directory_path):
+            retained_dirs: list[str] = []
+            for dir_name in dir_names:
+                child_dir = Path(root) / dir_name
+                try:
+                    child_stat = child_dir.lstat()
+                except OSError as exc:
+                    result.add_check(
+                        name="SavedModel Supplemental Directory Security Check",
+                        passed=False,
+                        message=(
+                            "Cannot inspect nested SavedModel supplemental directory: "
+                            f"{child_dir.relative_to(model_root)}: {exc}"
+                        ),
+                        severity=IssueSeverity.WARNING,
+                        location=str(child_dir),
+                        details={
+                            "file_name": dir_name,
+                            "detected_content_type": "unscannable_supplemental_dir",
+                            "entry_kind": "stat_error",
+                            "exception": str(exc),
+                            "exception_type": type(exc).__name__,
+                        },
+                        rule_code="S902",
+                    )
+                    continue
+
+                if stat.S_ISLNK(child_stat.st_mode):
+                    result.add_check(
+                        name="SavedModel Supplemental Directory Security Check",
+                        passed=False,
+                        message=(
+                            "Symlinked SavedModel supplemental directory is not traversed during security analysis: "
+                            f"{child_dir.relative_to(model_root)}"
+                        ),
+                        severity=IssueSeverity.WARNING,
+                        location=str(child_dir),
+                        details={
+                            "file_name": dir_name,
+                            "detected_content_type": "unscannable_supplemental_dir",
+                            "entry_kind": "symlink_directory",
+                        },
+                        rule_code="S902",
+                    )
+                    continue
+
+                if stat.S_ISDIR(child_stat.st_mode):
+                    retained_dirs.append(dir_name)
+
+            dir_names[:] = retained_dirs
+
+            for file_name in files:
+                self._scan_saved_model_supplemental_file(Path(root) / file_name, result)
+
+    def _scan_saved_model_supplemental_file(self, file_path: Path, result: ScanResult) -> None:
+        """Scan one supplemental SavedModel file-like entry."""
+        detected_types = self._detect_suspicious_asset_content(
+            file_path,
+            result,
+            check_name="SavedModel Supplemental File Security Check",
+            file_label="supplemental file",
+        )
+        if not detected_types:
+            return
+
+        file_size = self.get_file_size(str(file_path))
+        result.add_check(
+            name="SavedModel Supplemental File Security Check",
+            passed=False,
+            message=f"Suspicious executable-like content detected in SavedModel supplemental file: {file_path.name}",
+            severity=IssueSeverity.WARNING,
+            location=str(file_path),
+            details={
+                "file_name": file_path.name,
+                "detected_content_type": ", ".join(detected_types),
+                "size": file_size,
+            },
+            rule_code="S902",
+        )
+
+    def _detect_suspicious_asset_content(
+        self,
+        file_path: Path,
+        result: ScanResult,
+        *,
+        check_name: str = "SavedModel Assets Security Check",
+        file_label: str = "asset file",
+    ) -> list[str]:
         """Return suspicious content types found in a SavedModel asset file."""
         try:
             file_stat = file_path.lstat()
         except OSError as exc:
             result.add_check(
-                name="SavedModel Assets Security Check",
+                name=check_name,
                 passed=False,
-                message=f"Cannot inspect asset file for security analysis: {file_path.name}: {exc}",
+                message=f"Cannot inspect {file_label} for security analysis: {file_path.name}: {exc}",
                 severity=IssueSeverity.WARNING,
                 location=str(file_path),
                 details={
@@ -527,9 +662,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
             return []
         if stat.S_ISLNK(file_stat.st_mode):
             result.add_check(
-                name="SavedModel Assets Security Check",
+                name=check_name,
                 passed=False,
-                message=f"Symlink asset is not followed during security analysis: {file_path.name}",
+                message=f"Symlink {file_label} is not followed during security analysis: {file_path.name}",
                 severity=IssueSeverity.WARNING,
                 location=str(file_path),
                 details={
@@ -543,9 +678,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
             return []
         if not stat.S_ISREG(file_stat.st_mode):
             result.add_check(
-                name="SavedModel Assets Security Check",
+                name=check_name,
                 passed=False,
-                message=f"Non-regular asset file is not scanned during security analysis: {file_path.name}",
+                message=f"Non-regular {file_label} is not scanned during security analysis: {file_path.name}",
                 severity=IssueSeverity.WARNING,
                 location=str(file_path),
                 details={
@@ -563,9 +698,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 content_head = file_obj.read(_ASSET_PROBE_BYTES)
         except OSError as exc:
             result.add_check(
-                name="SavedModel Assets Security Check",
+                name=check_name,
                 passed=False,
-                message=f"Cannot read asset file for security analysis: {file_path.name}: {exc}",
+                message=f"Cannot read {file_label} for security analysis: {file_path.name}: {exc}",
                 severity=IssueSeverity.WARNING,
                 location=str(file_path),
                 details={
