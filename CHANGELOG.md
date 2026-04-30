@@ -320,6 +320,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **xgboost:** avoid flagging inert `feature_names` metadata as executable JSON
+  content.
 - **pmml:** avoid flagging benign `ecosystem()` prose as a `system(...)` call.
 - **jax:** avoid routing `ajax` near-matches as JAX checkpoint indicators.
 - **security:** fail closed on malformed nested XGBoost JSON structures that
