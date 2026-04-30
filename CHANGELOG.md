@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- preserve filename-sensitive scan results when deduplicating identical directory contents
+- preserve path-sensitive scan results while hashing duplicate directory contents
 - correct analysis suspiciousness scoring and alias-aware semantic risk handling
 - harden detector heuristics against comment padding, byte-backed credentials, unmarked Python blobs, and spoofed network context
 - fail closed when bounded scanner windows leave relevant model content uninspected

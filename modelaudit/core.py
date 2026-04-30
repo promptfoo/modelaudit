@@ -4,7 +4,6 @@ import hashlib
 import logging
 import os
 import time
-from collections import defaultdict
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -184,36 +183,27 @@ def _calculate_file_hash(file_path: str) -> str:
     return hash_sha256.hexdigest()
 
 
-def _group_files_by_content(file_paths: list[str]) -> dict[tuple[str, str], list[str]]:
-    """Group files by content and normalized basename for safe deduplication.
+def _hash_files_by_path(file_paths: list[str]) -> dict[str, str]:
+    """Hash files individually so scan results stay path-specific.
 
     Args:
         file_paths: List of file paths to group
 
     Returns:
-        Dictionary mapping `(content_hash, normalized_basename)` to file paths
-        that can safely share one scan result.
+        Dictionary mapping each file path to its content hash. Files that fail to
+        hash get unique placeholder values so they still scan independently.
     """
-    content_groups: dict[tuple[str, str], list[str]] = defaultdict(list)
+    content_hashes: dict[str, str] = {}
 
     for file_path in file_paths:
         try:
-            content_hash = _calculate_file_hash(file_path)
-            content_groups[(content_hash, Path(file_path).name.lower())].append(file_path)
+            content_hashes[file_path] = _calculate_file_hash(file_path)
         except Exception as e:
             # Log error but continue with other files to prevent single I/O failure from aborting entire scan
             logger.warning(f"Failed to hash file {file_path}: {e}. Skipping deduplication for this file.")
-            # Add file with unique hash to ensure it gets scanned independently
-            content_groups[(f"unhashable_{id(file_path)}", Path(file_path).name.lower())].append(file_path)
+            content_hashes[file_path] = f"unhashable_{id(file_path)}"
 
-    # Log information about duplicate content found
-    for (content_hash, _scan_identity), paths in content_groups.items():
-        if len(paths) > 1:
-            logger.debug(f"Found {len(paths)} files with identical content (hash: {content_hash[:16]})")
-            for path in paths:
-                logger.debug(f"  - {path}")
-
-    return dict(content_groups)
+    return content_hashes
 
 
 def _resolve_directory_scan_target(
@@ -495,21 +485,23 @@ def scan_model_directory_or_file(
                         # Add to files to scan list instead of scanning immediately
                         files_to_scan.append(target_str)
 
-            # Second pass: group files by content and scan unique content only once
+            # Second pass: scan every path independently. Some scanners depend on
+            # parent paths or sibling files, so content equality alone is not a
+            # safe proxy for scan-result equality.
             if files_to_scan:
-                content_groups = _group_files_by_content(files_to_scan)
-                content_processed = 0
+                content_hashes = _hash_files_by_path(files_to_scan)
+                duplicate_paths_by_hash: dict[str, list[str]] = {}
+                for file_path, content_hash in content_hashes.items():
+                    if not content_hash.startswith("unhashable_"):
+                        duplicate_paths_by_hash.setdefault(content_hash, []).append(file_path)
                 recorded_content_hashes: set[str] = set()
 
-                for (content_hash, _scan_identity), file_paths in content_groups.items():
+                for representative_file, content_hash in content_hashes.items():
                     # Collect valid content hashes for aggregate hash computation
                     # Skip "unhashable_" prefix entries (those are placeholder hashes for files that failed to hash)
                     if not content_hash.startswith("unhashable_") and content_hash not in recorded_content_hashes:
                         file_hashes.append(content_hash)
                         recorded_content_hashes.add(content_hash)
-
-                    # Scan the first file in each content/name group (representative)
-                    representative_file = file_paths[0]
 
                     # Check for interrupts
                     check_interrupted()
@@ -522,14 +514,12 @@ def scan_model_directory_or_file(
                     if progress_callback:
                         if total_files is not None and total_files > 0:
                             progress_callback(
-                                f"Scanning file {processed_files + 1}/{total_files}: "
-                                f"{Path(representative_file).name} ({len(file_paths)} copies)",
+                                f"Scanning file {processed_files + 1}/{total_files}: {Path(representative_file).name}",
                                 processed_files / total_files * 100,
                             )
                         else:
                             progress_callback(
-                                f"Scanning file {processed_files + 1}: "
-                                f"{Path(representative_file).name} ({len(file_paths)} copies)",
+                                f"Scanning file {processed_files + 1}: {Path(representative_file).name}",
                                 0.0,
                             )
 
@@ -542,9 +532,8 @@ def scan_model_directory_or_file(
                         if _scan_result_has_operational_error(file_result):
                             scan_metadata["has_operational_errors"] = True
                         results.bytes_scanned += file_result.bytes_scanned
-                        results.files_scanned += len(file_paths)  # Count all copies
-                        processed_files += len(file_paths)  # Count all copies for progress
-                        content_processed += 1
+                        results.files_scanned += 1
+                        processed_files += 1
 
                         # Add scanner to tracking list (different from scanner_names)
                         scanner_name = file_result.scanner_name
@@ -558,7 +547,7 @@ def scan_model_directory_or_file(
                         if scanner_name and scanner_name not in results.scanner_names and scanner_name != "unknown":
                             results.scanner_names.append(scanner_name)
 
-                        # Add issues for each file path that shares this content using Pydantic models
+                        # Add issues from this path-specific scan using Pydantic models
                         for issue in file_result.issues:
                             issue_dict = issue.to_dict() if hasattr(issue, "to_dict") else issue
                             if isinstance(issue_dict, dict):
@@ -588,19 +577,13 @@ def scan_model_directory_or_file(
                                 if not issue_dict.get("location"):
                                     issue_dict["location"] = representative_file
 
-                                if len(file_paths) > 1:
-                                    if "details" not in issue_dict:
-                                        issue_dict["details"] = {}
-                                    issue_dict["details"]["duplicate_files"] = file_paths
-                                    issue_dict["details"]["content_hash"] = content_hash
-
                                 # Ensure timestamp is present
                                 if "timestamp" not in issue_dict:
                                     issue_dict["timestamp"] = time.time()
 
                                 results.issues.append(Issue(**issue_dict))
 
-                        # Add checks for each file path that shares this content using Pydantic models
+                        # Add checks from this path-specific scan using Pydantic models
                         if hasattr(file_result, "checks"):
                             from .models import Check
 
@@ -610,38 +593,30 @@ def scan_model_directory_or_file(
                                     if not check_dict.get("location"):
                                         check_dict["location"] = representative_file
 
-                                    if len(file_paths) > 1:
-                                        if "details" not in check_dict:
-                                            check_dict["details"] = {}
-                                        check_dict["details"]["duplicate_files"] = file_paths
-                                        check_dict["details"]["content_hash"] = content_hash
-
                                     # Ensure timestamp is present
                                     if "timestamp" not in check_dict:
                                         check_dict["timestamp"] = time.time()
 
                                     results.checks.append(Check(**check_dict))
 
-                        # Add assets for all file paths that share this content
-                        for file_path in file_paths:
-                            _add_asset_to_results(results, file_path, file_result)
+                        _add_asset_to_results(results, representative_file, file_result)
 
-                            # Add metadata for all file paths using Pydantic models
-                            license_metadata = collect_license_metadata(file_path)
-                            combined_metadata = {**file_result.metadata, **license_metadata}
-                            # Add information about content deduplication
-                            combined_metadata["content_hash"] = content_hash
-                            combined_metadata["duplicate_files"] = file_paths if len(file_paths) > 1 else None
+                        # Add metadata for this path using Pydantic models
+                        license_metadata = collect_license_metadata(representative_file)
+                        combined_metadata = {**file_result.metadata, **license_metadata}
+                        combined_metadata["content_hash"] = content_hash
+                        duplicate_files = duplicate_paths_by_hash.get(content_hash, [])
+                        combined_metadata["duplicate_files"] = duplicate_files if len(duplicate_files) > 1 else None
 
-                            # Convert ml_context if present
-                            if "ml_context" in combined_metadata and isinstance(combined_metadata["ml_context"], dict):
-                                from .models import MLContextModel
+                        # Convert ml_context if present
+                        if "ml_context" in combined_metadata and isinstance(combined_metadata["ml_context"], dict):
+                            from .models import MLContextModel
 
-                                combined_metadata["ml_context"] = MLContextModel(**combined_metadata["ml_context"])
+                            combined_metadata["ml_context"] = MLContextModel(**combined_metadata["ml_context"])
 
-                            from .models import FileMetadataModel
+                        from .models import FileMetadataModel
 
-                            results.file_metadata[file_path] = FileMetadataModel(**combined_metadata)
+                        results.file_metadata[representative_file] = FileMetadataModel(**combined_metadata)
 
                         if max_total_size > 0 and results.bytes_scanned > max_total_size:
                             _add_issue_to_model(
@@ -658,16 +633,14 @@ def scan_model_directory_or_file(
                         logger.warning(f"Error scanning file {representative_file}: {e!s}")
                         scan_metadata["success"] = False
 
-                        # Add error for all files that share this content
-                        for file_path in file_paths:
-                            _add_issue_to_model(
-                                results,
-                                f"Error scanning file: {e!s}",
-                                severity=IssueSeverity.INFO.value,
-                                location=file_path,
-                                details={"exception_type": type(e).__name__},
-                            )
-                            _add_error_asset_to_results(results, file_path)
+                        _add_issue_to_model(
+                            results,
+                            f"Error scanning file: {e!s}",
+                            severity=IssueSeverity.INFO.value,
+                            location=representative_file,
+                            details={"exception_type": type(e).__name__},
+                        )
+                        _add_error_asset_to_results(results, representative_file)
 
             # Final progress update for directory scan
             if progress_callback and not limit_reached and total_files is not None and total_files > 0:

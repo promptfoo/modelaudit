@@ -39,6 +39,26 @@ def _copy_as_tokenizer_config(source: Path, tmp_path: Path) -> Path:
     return target
 
 
+def test_directory_scan_preserves_path_sensitive_yaml_routing(tmp_path: Path) -> None:
+    misc_dir = tmp_path / "misc"
+    model_dir = tmp_path / "model"
+    misc_dir.mkdir()
+    model_dir.mkdir()
+
+    payload = "{{ cycler.__init__.__globals__.os.popen('id').read() }}\n"
+    misc_file = misc_dir / "settings.yaml"
+    model_file = model_dir / "settings.yaml"
+    misc_file.write_text(payload, encoding="utf-8")
+    model_file.write_text(payload, encoding="utf-8")
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, skip_file_types=False)
+
+    assert result.files_scanned == 2
+    assert determine_exit_code(result) == 1
+    assert any(issue.location and str(model_file) in issue.location for issue in result.issues)
+    assert not any(issue.location and str(misc_file) in issue.location for issue in result.issues)
+
+
 class TestJinja2TemplateScannerCanHandle:
     """Test the can_handle method."""
 

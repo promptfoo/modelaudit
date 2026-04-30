@@ -39,7 +39,7 @@ def test_extract_primary_asset_preserves_spaces_in_path() -> None:
     assert _extract_primary_asset_from_location(location) == "/tmp/group one/model a.pkl"
 
 
-def test_check_consolidation_keeps_distinct_duplicate_groups_with_spaces(tmp_path: Path) -> None:
+def test_duplicate_metadata_keeps_distinct_groups_with_spaces(tmp_path: Path) -> None:
     group_one = tmp_path / "group one"
     group_two = tmp_path / "group two"
     group_one_a = group_one / "shard a"
@@ -60,20 +60,28 @@ def test_check_consolidation_keeps_distinct_duplicate_groups_with_spaces(tmp_pat
     result = scan_model_directory_or_file(str(tmp_path))
     path_exists_checks = [check for check in result.checks if check.name == "Path Exists"]
 
-    assert len(path_exists_checks) == 2
-    duplicate_groups = {frozenset(check.details["duplicate_files"]) for check in path_exists_checks}
+    assert len(path_exists_checks) == 4
+    assert {check.location for check in path_exists_checks} == {
+        str(group_one_a / "model.pkl"),
+        str(group_one_b / "model.pkl"),
+        str(group_two_a / "model.pkl"),
+        str(group_two_b / "model.pkl"),
+    }
+    assert all("duplicate_files" not in check.details for check in path_exists_checks)
+    assert all("\n" not in (check.location or "") for check in path_exists_checks)
+    duplicate_groups = {
+        frozenset(metadata["duplicate_files"])
+        for metadata in result.file_metadata.values()
+        if metadata["duplicate_files"] is not None
+    }
     assert duplicate_groups == {
         frozenset({str(group_one_a / "model.pkl"), str(group_one_b / "model.pkl")}),
         frozenset({str(group_two_a / "model.pkl"), str(group_two_b / "model.pkl")}),
     }
 
-    for check in path_exists_checks:
-        assert check.location in check.details["duplicate_files"]
-        assert "\n" not in (check.location or "")
-
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows paths cannot contain newline characters")
-def test_check_consolidation_handles_newlines_in_file_paths(tmp_path: Path) -> None:
+def test_duplicate_metadata_handles_newline_paths(tmp_path: Path) -> None:
     group = tmp_path / "group\nnewline"
     group_a = group / "shard a"
     group_b = group / "shard b"
@@ -87,11 +95,15 @@ def test_check_consolidation_handles_newlines_in_file_paths(tmp_path: Path) -> N
     result = scan_model_directory_or_file(str(tmp_path))
     path_exists_checks = [check for check in result.checks if check.name == "Path Exists"]
 
-    assert len(path_exists_checks) == 1
-    check = path_exists_checks[0]
+    assert len(path_exists_checks) == 2
     expected_paths = {str(group_a / "model.pkl"), str(group_b / "model.pkl")}
-    assert set(check.details["duplicate_files"]) == expected_paths
-    assert check.location in expected_paths
+    assert {check.location for check in path_exists_checks} == expected_paths
+    assert all("duplicate_files" not in check.details for check in path_exists_checks)
+    assert {
+        frozenset(metadata["duplicate_files"])
+        for metadata in result.file_metadata.values()
+        if metadata["duplicate_files"] is not None
+    } == {frozenset(expected_paths)}
 
 
 def test_npz_member_checks_keep_archive_member_locations(tmp_path: Path) -> None:
