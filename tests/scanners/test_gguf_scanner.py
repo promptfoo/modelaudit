@@ -251,15 +251,31 @@ def test_gguf_scanner_fails_closed_on_oversized_chat_templates(tmp_path: Path) -
         metadata={"tokenizer.chat_template": "{{ content }}" * 10000},
     )
 
-    result = GgufScanner().scan(str(path))
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path))
 
-    assert result.success is False
-    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert any(
         check.name == "Template Size Limit"
         and check.status == CheckStatus.FAILED
+        and "analysis incomplete" in check.message.lower()
         and check.details["reason"] == "jinja2_template_size_limit_exceeded"
-        for check in result.checks
+        for check in direct.checks
+    )
+    _assert_inconclusive_exit2(aggregate, "jinja2_template_size_limit_exceeded")
+
+
+def test_gguf_oversized_chat_template_uncached_rerun_preserves_exit2(tmp_path: Path) -> None:
+    path = create_mock_gguf(
+        tmp_path / "large-template.gguf",
+        metadata={"tokenizer.chat_template": "{{ content }}" * 10000},
+    )
+
+    _assert_uncached_rerun_preserves_inconclusive_exit2(
+        path,
+        tmp_path / "cache",
+        "jinja2_template_size_limit_exceeded",
     )
 
 
