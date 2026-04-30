@@ -138,7 +138,7 @@ Reports and all nested models are frozen — call `to_dict()` if you need a muta
 
 ## PyTorch ZIP checkpoints
 
-`scan_file` auto-detects PyTorch ZIP containers (archives containing `data.pkl` plus `version` / `byteorder` metadata), enumerates pickle members (including hidden ones identified by content sniffing, not just extension), and combines per-member reports into a single container-level report with `metadata.container_type="pytorch_zip"`. Archive member count is capped at 10,000 entries; per-member pickles are capped at 512 MiB. Both limits are enforced by structured notices, not silent skips.
+`scan_file` auto-detects PyTorch ZIP containers from PyTorch metadata plus pickle members, including hidden members, and combines per-member reports into a single container-level report with `metadata.container_type="pytorch_zip"`. Archive member count is capped at 10,000 entries; per-member pickles are capped at 512 MiB. Both limits are enforced by structured notices, not silent skips.
 
 ## Building from source
 
