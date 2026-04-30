@@ -30,6 +30,7 @@ from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.file.detection import (
+    XML_MODEL_INCONCLUSIVE_FORMAT,
     detect_file_format,
     detect_file_format_from_magic,
     detect_format_from_extension,
@@ -86,6 +87,7 @@ _R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
 _XGBOOST_BINARY_EXTENSIONS = frozenset({".bst"})
 _XGBOOST_PICKLE_SPOOF_REASON = "xgboost_binary_pickle_spoof"
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
+_XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 
 
 def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
@@ -190,6 +192,26 @@ def _make_unavailable_recognized_format_result(path: str, format_: str, scanner_
     )
     _mark_inconclusive_scan_outcome(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
     _mark_operational_scan_error(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_xml_model_result(path: str) -> ScanResult:
+    """Fail closed when bounded XML routing cannot reach the structural root."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="XML Model Routing",
+        passed=False,
+        message=(
+            "XML model routing was inconclusive because the bounded probe ended "
+            "before the first structural root element"
+        ),
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": XML_MODEL_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _XML_MODEL_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _XML_MODEL_ROUTING_INCOMPLETE_REASON)
     result.finish(success=False)
     return result
 
@@ -1212,7 +1234,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                         result.bytes_scanned = file_size
                     return result
 
-            if magic_format == "unknown":
+            if magic_format == XML_MODEL_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_xml_model_result(path)
+            elif magic_format == "unknown":
                 # Not a recognized model format — skip silently
                 sr = ScanResult(scanner_name="unknown")
                 logger.debug(f"Skipping unrecognized format file: {path}")

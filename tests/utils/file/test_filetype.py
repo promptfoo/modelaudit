@@ -1043,7 +1043,7 @@ def test_detect_generic_xml_format(tmp_path):
     assert detect_file_format_from_magic(str(xml_path)) == "unknown"
 
 
-def test_detect_openvino_xml_net_beyond_64_bytes(tmp_path):
+def test_detect_openvino_xml_net_beyond_64_bytes(tmp_path: Path) -> None:
     """Test that bounded XML root parsing still detects late OpenVINO roots."""
     # Create XML where <net> appears after 64 bytes
     xml_path = tmp_path / "late_net.xml"
@@ -1066,7 +1066,7 @@ def test_detect_openvino_xml_short_file(tmp_path):
     assert detect_file_format_from_magic(str(xml_path)) == "openvino"
 
 
-def test_detect_xml_with_net_in_comment(tmp_path):
+def test_detect_xml_with_net_in_comment(tmp_path: Path) -> None:
     """Test that <net> in XML comments does not trigger model routing."""
     # Create XML with <net> inside a comment
     xml_path = tmp_path / "commented.xml"
@@ -1088,7 +1088,7 @@ def test_xml_detection_boundary_conditions(tmp_path):
     assert detect_file_format_from_magic(str(xml_path)) == "openvino"
 
 
-def test_detect_pmml_xml_beyond_64_bytes(tmp_path):
+def test_detect_pmml_xml_beyond_64_bytes(tmp_path: Path) -> None:
     """Test that bounded XML root parsing still detects late PMML roots."""
     # Create XML where <PMML> appears after 64 bytes
     pmml_path = tmp_path / "late_pmml.pmml"
@@ -1100,15 +1100,15 @@ def test_detect_pmml_xml_beyond_64_bytes(tmp_path):
     assert detect_file_format_from_magic(str(pmml_path)) == "pmml"
 
 
-def test_detect_pmml_xml_with_oversized_doctype_subset(tmp_path):
-    """DOCTYPE roots should preserve PMML routing when the subset exceeds the bounded probe."""
+def test_detect_pmml_xml_with_oversized_doctype_subset(tmp_path: Path) -> None:
+    """Incomplete bounded XML prologs should fail closed instead of guessing a PMML root."""
     pmml_path = tmp_path / "oversized_doctype_pmml.txt"
     pmml_path.write_text(
         "<?xml version='1.0'?><!DOCTYPE PMML [" + ("x" * ((1024 * 1024) + 64)) + "]><PMML/>",
         encoding="utf-8",
     )
 
-    assert detect_file_format_from_magic(str(pmml_path)) == "pmml"
+    assert detect_file_format_from_magic(str(pmml_path)) == "xml_model_inconclusive"
 
 
 def test_detect_pmml_xml_short_file(tmp_path):
@@ -1122,7 +1122,7 @@ def test_detect_pmml_xml_short_file(tmp_path):
     assert detect_file_format_from_magic(str(pmml_path)) == "pmml"
 
 
-def test_detect_xml_with_pmml_in_comment(tmp_path):
+def test_detect_xml_with_pmml_in_comment(tmp_path: Path) -> None:
     """Test that <PMML> in XML comments does not trigger model routing."""
     # Create XML with <PMML> inside a comment
     xml_path = tmp_path / "commented.pmml"

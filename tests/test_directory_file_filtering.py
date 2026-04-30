@@ -315,8 +315,8 @@ class TestDirectoryFileFiltering:
 
         assert results["files_scanned"] == 0
 
-    def test_disguised_pmml_with_oversized_doctype_subset_is_scanned(self, tmp_path: Path) -> None:
-        """DOCTYPE roots should keep renamed PMML payloads routable after oversized subsets."""
+    def test_disguised_pmml_with_oversized_doctype_subset_fails_closed(self, tmp_path: Path) -> None:
+        """Incomplete oversized XML prologs should fail closed instead of guessing a model root."""
         disguised_pmml = tmp_path / "payload.txt"
         disguised_pmml.write_text(
             "<?xml version='1.0'?><!DOCTYPE PMML [" + ("x" * ((1024 * 1024) + 64)) + "]><PMML version='4.4'></PMML>",
@@ -326,9 +326,11 @@ class TestDirectoryFileFiltering:
         results = scan_model_directory_or_file(str(tmp_path))
 
         assert results["files_scanned"] == 1
-        assert "pmml" in results.scanner_names
-        assert determine_exit_code(results) == 1
-        assert any("DOCTYPE declaration" in issue.message for issue in results.issues)
+        assert results["success"] is False
+        assert determine_exit_code(results) == 2
+        assert any(
+            "bounded probe ended before the first structural root element" in check.message for check in results.checks
+        )
 
     def test_rar_archive_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
         """RAR archives should be recognized and fail closed instead of being skipped."""

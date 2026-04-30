@@ -113,6 +113,7 @@ _XML_MODEL_ROOT_FORMATS = {
     "net": "openvino",
     "pmml": "pmml",
 }
+XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -150,25 +151,8 @@ def _skip_xml_doctype_declaration(xml_prefix: bytes, start_offset: int) -> int |
     return None
 
 
-def _get_xml_doctype_root_tag(xml_prefix: bytes, start_offset: int) -> str | None:
-    """Return the normalized root name declared by a DOCTYPE."""
-    index = start_offset + len(b"<!DOCTYPE")
-    prefix_length = len(xml_prefix)
-    while index < prefix_length and chr(xml_prefix[index]).isspace():
-        index += 1
-
-    name_start = index
-    while index < prefix_length and xml_prefix[index : index + 1] not in b" \t\r\n\f[>":
-        index += 1
-    if index == name_start:
-        return None
-
-    raw_tag = xml_prefix[name_start:index].decode("utf-8", "ignore")
-    return raw_tag.rsplit(":", 1)[-1].lower()
-
-
-def _xml_root_tag_from_prefix(xml_prefix: bytes) -> str | None:
-    """Return the normalized first XML element name from a bounded prefix."""
+def _xml_root_tag_from_prefix(xml_prefix: bytes) -> tuple[str | None, bool]:
+    """Return the normalized first XML element name and whether the probe ran out first."""
     index = 3 if xml_prefix.startswith(b"\xef\xbb\xbf") else 0
     prefix_length = len(xml_prefix)
 
@@ -179,45 +163,50 @@ def _xml_root_tag_from_prefix(xml_prefix: bytes) -> str | None:
         if xml_prefix.startswith(b"<?", index):
             end_offset = xml_prefix.find(b"?>", index + 2)
             if end_offset == -1:
-                return None
+                return None, True
             index = end_offset + 2
             continue
 
         if xml_prefix.startswith(b"<!--", index):
             end_offset = xml_prefix.find(b"-->", index + 4)
             if end_offset == -1:
-                return None
+                return None, True
             index = end_offset + 3
             continue
 
         if xml_prefix[index : index + len(b"<!DOCTYPE")].upper() == b"<!DOCTYPE":
-            doctype_root_tag = _get_xml_doctype_root_tag(xml_prefix, index)
             next_index = _skip_xml_doctype_declaration(xml_prefix, index)
             if next_index is None:
-                return doctype_root_tag
+                return None, True
             index = next_index
             continue
 
         break
 
-    if index >= prefix_length or xml_prefix[index : index + 1] != b"<":
-        return None
+    if index >= prefix_length:
+        return None, True
+    if xml_prefix[index : index + 1] != b"<":
+        return None, False
     if xml_prefix[index + 1 : index + 2] in {b"/", b"!", b"?"}:
-        return None
+        return None, False
 
     tag_end = index + 1
     while tag_end < prefix_length and xml_prefix[tag_end : tag_end + 1] not in b" \t\r\n\f/>":
         tag_end += 1
     if tag_end == index + 1:
-        return None
+        return None, tag_end >= prefix_length
+    if tag_end >= prefix_length:
+        return None, True
 
     raw_tag = xml_prefix[index + 1 : tag_end].decode("utf-8", "ignore")
-    return raw_tag.rsplit(":", 1)[-1].lower()
+    return raw_tag.rsplit(":", 1)[-1].lower(), False
 
 
-def _detect_xml_model_format(xml_prefix: bytes) -> str:
+def _detect_xml_model_format(xml_prefix: bytes, *, sample_is_prefix: bool) -> str:
     """Return a model format for recognized XML roots within a bounded prefix."""
-    root_tag = _xml_root_tag_from_prefix(xml_prefix)
+    root_tag, prefix_exhausted_before_root = _xml_root_tag_from_prefix(xml_prefix)
+    if prefix_exhausted_before_root and sample_is_prefix:
+        return XML_MODEL_INCONCLUSIVE_FORMAT
     if root_tag is None:
         return "unknown"
     return _XML_MODEL_ROOT_FORMATS.get(root_tag, "unknown")
@@ -1314,7 +1303,10 @@ def detect_file_format_from_magic(path: str) -> str:
             if _could_be_xml_prefix(header):
                 f.seek(0)
                 xml_prefix = f.read(min(size, _XML_MODEL_SIGNATURE_READ_BYTES))
-                xml_format = _detect_xml_model_format(xml_prefix)
+                xml_format = _detect_xml_model_format(
+                    xml_prefix,
+                    sample_is_prefix=size > len(xml_prefix),
+                )
                 if xml_format != "unknown":
                     return xml_format
 
@@ -1411,7 +1403,10 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             xml_probe_size = min(size, _XML_MODEL_SIGNATURE_READ_BYTES)
             if len(prefix) < xml_probe_size:
                 prefix += f.read(xml_probe_size - len(prefix))
-            xml_format = _detect_xml_model_format(prefix)
+            xml_format = _detect_xml_model_format(
+                prefix,
+                sample_is_prefix=size > len(prefix),
+            )
             if xml_format != "unknown":
                 return xml_format
 
@@ -1508,7 +1503,11 @@ def detect_file_format(path: str) -> str:
     ):
         return "pickle"
     if _could_be_xml_prefix(header):
-        xml_format = _detect_xml_model_format(read_magic_bytes(path, _XML_MODEL_SIGNATURE_READ_BYTES))
+        xml_prefix = read_magic_bytes(path, _XML_MODEL_SIGNATURE_READ_BYTES)
+        xml_format = _detect_xml_model_format(
+            xml_prefix,
+            sample_is_prefix=size > len(xml_prefix),
+        )
         if xml_format != "unknown":
             return xml_format
 
