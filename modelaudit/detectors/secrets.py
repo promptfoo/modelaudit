@@ -350,7 +350,7 @@ class SecretsDetector:
                     # Very high entropy - check if it's actually suspicious
                     # Try to decode as text to see if it contains patterns
                     try:
-                        decoded_text = window.decode("utf-8", errors="ignore")
+                        decoded_text = window.decode("ascii")
                         # If it decodes to mostly printable ASCII, it might be base64/hex
                         if (
                             len(decoded_text) > 0

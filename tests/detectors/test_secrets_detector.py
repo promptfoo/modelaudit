@@ -148,6 +148,15 @@ class TestSecretsDetector:
 
         assert any(finding["type"] == "high_entropy_region" for finding in findings)
 
+    def test_high_entropy_binary_noise_is_not_reported_as_encoded_secret(self) -> None:
+        """Lossy decoding should not turn binary noise into an encoded-secret finding."""
+        detector = SecretsDetector()
+        data = bytes(range(128, 184)) + b"ABCDEFGH"
+
+        findings = detector.scan_bytes(data)
+
+        assert not [finding for finding in findings if finding["type"] == "high_entropy_region"]
+
     def test_no_false_positives_on_normal_text(self):
         """Test that normal text doesn't trigger false positives."""
         detector = SecretsDetector()

@@ -939,6 +939,9 @@ class JITScriptDetector:
         if model_type == "onnx":
             findings.extend(self.scan_onnx(data, context))
 
+        if model_type == "pickle" and (b"def " in data or b"class " in data):
+            findings.extend(self._extract_and_check_python_code(data, "Generic Python", context))
+
         # Always check for generic dangerous patterns
         # Only run fallback scanners if model type is truly unknown
         # Don't run fallback on known types (pytorch, tensorflow, onnx) even if they have no findings

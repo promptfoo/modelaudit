@@ -94,8 +94,16 @@ _INLINE_COMPOUND_STATEMENT_PATTERN = re.compile(
     rb"^\s*(?:if|elif|else|for|while|with|try|except|finally|match|case)\b[^#\n]*:\s*\S"
 )
 _STRUCTURED_METADATA_PREFIXES: tuple[bytes, ...] = (b"{", b"[", b'"', b"'")
-_VERSION_LITERAL_CONTEXT_PATTERN = re.compile(
+_EXPLICIT_VERSION_LITERAL_CONTEXT_PATTERN = re.compile(
     rb"\b(?:version|ver|release|build)\s*[:=]\s*[\"']?"
+    rb"(?P<value>(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\."
+    rb"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\."
+    rb"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\."
+    rb"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))[\"']?",
+    re.IGNORECASE,
+)
+_PLAIN_VERSION_LITERAL_CONTEXT_PATTERN = re.compile(
+    rb"(?:(?:^|[\r\n])\s*version|model\s+version|release|build)\s+[\"']?"
     rb"(?P<value>(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\."
     rb"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\."
     rb"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\."
@@ -149,6 +157,15 @@ def _has_call_syntax(data: bytes, match_index: int, token_len: int) -> bool:
     while cursor < len(data) and data[cursor : cursor + 1] in {b" ", b"\t", b"\r", b"\n"}:
         cursor += 1
     return cursor < len(data) and data[cursor : cursor + 1] == b"("
+
+
+def _is_version_literal_context(surrounding_bytes: bytes, token: bytes) -> bool:
+    """Return whether the matched token is explicitly presented as a version literal."""
+    return any(
+        match.group("value") == token
+        for pattern in (_EXPLICIT_VERSION_LITERAL_CONTEXT_PATTERN, _PLAIN_VERSION_LITERAL_CONTEXT_PATTERN)
+        for match in pattern.finditer(surrounding_bytes)
+    )
 
 
 def _is_doc_only_network_reference(
@@ -550,8 +567,7 @@ class NetworkCommDetector:
             surrounding_bytes = data[start:end]
             surrounding = surrounding_bytes.decode("utf-8", errors="ignore").lower()
 
-            version_match = _VERSION_LITERAL_CONTEXT_PATTERN.search(surrounding_bytes)
-            if version_match and version_match.group("value") == match.group():
+            if _is_version_literal_context(surrounding_bytes, match.group()):
                 continue
 
             # Skip if surrounded by quotes and has typical version patterns
@@ -669,6 +685,9 @@ class NetworkCommDetector:
             # Skip actual layer-name grammar (e.g., layer1.weight), not any
             # attacker-controlled DNS name that happens to contain ML words.
             if _ML_LAYER_DOMAIN_PATTERN.fullmatch(domain):
+                continue
+            # Bare method calls such as weight.to(device) are code tokens, not DNS names.
+            if _has_call_syntax(data, match.start(), len(match.group())):
                 continue
 
             # Skip very short domain names in binary files (likely false positives)
