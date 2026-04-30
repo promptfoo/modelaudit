@@ -110,6 +110,24 @@ class TestNetworkCommDetector:
         assert len(private_ips) == 3  # 192.168, 10.0, 172.16
         assert len(public_ips) == 1  # 8.8.8.8
 
+    def test_nearby_version_word_does_not_hide_ipv4(self) -> None:
+        """Nearby prose should not hide an actual IP address."""
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(b"callback version 8.8.8.8 now")
+
+        assert any(finding["type"] == "ipv4_address" and finding["ip"] == "8.8.8.8" for finding in findings)
+
+    def test_explicit_version_literals_are_not_reported_as_ipv4(self) -> None:
+        """Version-shaped metadata should not be reported as network endpoints."""
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(
+            b"version 1.2.3.4\nmodel version 2.3.4.5\nrelease 3.4.5.6\nver=4.5.6.7 build=5.6.7.8\n"
+        )
+
+        assert not [finding for finding in findings if finding["type"] == "ipv4_address"]
+
     def test_detect_ipv6_addresses(self) -> None:
         """Test detection of IPv6 addresses."""
         detector = NetworkCommDetector()
@@ -142,6 +160,24 @@ class TestNetworkCommDetector:
         # Check suspicious TLD detection
         suspicious = [f for f in domain_findings if f["confidence"] > 0.6]
         assert len(suspicious) >= 2  # .tk and .ml are suspicious
+
+    def test_ml_word_inside_real_domain_is_still_detected(self) -> None:
+        """DNS-shaped endpoints containing ML terms should not be suppressed."""
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(b"connect to evil-weight-domain.com")
+
+        assert any(
+            finding["type"] == "domain_name" and finding["domain"] == "evil-weight-domain.com" for finding in findings
+        )
+
+    def test_tensor_method_calls_are_not_reported_as_domains(self) -> None:
+        """Common tensor method calls should not be mistaken for DNS names."""
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(b"weight.to(device)\nbias.to(device)\n")
+
+        assert not [finding for finding in findings if finding["type"] == "domain_name"]
 
     def test_detect_network_libraries(self) -> None:
         """Test detection of network library imports."""
