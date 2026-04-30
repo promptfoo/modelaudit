@@ -755,6 +755,50 @@ def test_can_handle_json_checkpoint_rejects_non_jax_near_match(tmp_path: Path) -
     assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
 
 
+def test_can_handle_json_checkpoint_rejects_ajax_near_match(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "ajax_model.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps({"framework": "ajax", "format": "checkpoint"}),
+        encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
+
+
+def test_can_handle_json_checkpoint_rejects_late_ajax_near_match(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "late_ajax_model.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps({"padding": "x" * 1024, "framework": "ajax", "format": "checkpoint"}),
+        encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
+
+
+def test_can_handle_pickle_checkpoint_rejects_ajax_near_match(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "ajax_state.pickle"
+    checkpoint_path.write_bytes(pickle.dumps({"framework": "ajax"}))
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
+
+
+def test_can_handle_pickle_checkpoint_accepts_protocol_zero_jax_indicator(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "state.pickle"
+    checkpoint_path.write_bytes(b"Vjax\np0\n.")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+
+
+def test_can_handle_json_checkpoint_accepts_letter_prefixed_jax_indicator(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "prefixed_model.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps({"framework": "myflax", "format": "checkpoint"}),
+        encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+
+
 def test_can_handle_bom_json_checkpoint_rejects_non_jax_near_match(tmp_path: Path) -> None:
     checkpoint_path = tmp_path / "bom_generic_model.checkpoint"
     checkpoint_path.write_bytes(
@@ -762,6 +806,59 @@ def test_can_handle_bom_json_checkpoint_rejects_non_jax_near_match(tmp_path: Pat
     )
 
     assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
+
+
+def test_can_handle_numpy_checkpoint_rejects_ajax_filename_near_match(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "ajax_weights.checkpoint"
+    checkpoint_path.write_bytes(b"\x93NUMPY" + (b"\x00" * 64))
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
+
+
+def test_can_handle_numpy_checkpoint_accepts_underscored_jax_filename(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "model_jax_weights.checkpoint"
+    checkpoint_path.write_bytes(b"\x93NUMPY")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+
+
+def test_can_handle_numpy_checkpoint_accepts_digit_prefixed_jax_filename(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "model1jax_weights.checkpoint"
+    checkpoint_path.write_bytes(b"\x93NUMPY")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+
+
+def test_can_handle_numpy_checkpoint_accepts_letter_prefixed_jax_filename(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "myjax_weights.checkpoint"
+    checkpoint_path.write_bytes(b"\x93NUMPY")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+
+
+def test_can_handle_letter_prefixed_jax_payload_still_routes_malicious_json(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "prefixed_payload.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "framework": "myjax",
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
 
 
 def test_metadata_traversal_stops_at_depth_limit_without_recursing_unbounded() -> None:

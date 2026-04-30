@@ -113,6 +113,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **security:** inspect non-canonical SavedModel root siblings for suspicious
+  executable-like content
+- **security:** detect bare-string Lua `require "module"` loads in Torch7
+  artifacts
+- **security:** keep trusted NeMo namespaces from suppressing suspicious Hydra
+  `_target_` leaf names
 - **security:** fail closed when NeMo archives contain no analyzable config files
 - **security:** analyze GGUF-embedded chat templates through the Jinja scanner
   while preserving GGUF scanner ownership
@@ -316,6 +322,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **routing:** require recognized ZIP signatures before classifying files or
   streaming previews as archives, so benign `PK*` near-matches stay unclassified
+- **xgboost:** avoid flagging inert `feature_names` metadata as executable JSON
+  content.
+- **pmml:** avoid flagging benign `ecosystem()` prose as a `system(...)` call.
+- **jax:** avoid routing `ajax` near-matches as JAX checkpoint indicators.
+- **security:** fail closed on malformed nested XGBoost JSON structures that
+  would otherwise skip booster or tree validation.
+- **security:** require the legacy XGBoost binary signature instead of
+  accepting marker-shaped text payloads as valid `.bst` models.
+- **security:** validate late XGBoost trees instead of sampling only the first
+  ten tree structures.
+- **security:** detect PaddlePaddle suspicious tokens that span the scanner's
+  1 MiB read boundaries.
 - **routing:** align manifest scanner routing with the manifest filenames and
   dedicated manifest-style suffixes declared by the registry.
 - **security:** detect strong executable headers in generic archive members even
