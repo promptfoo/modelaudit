@@ -115,6 +115,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **security:** inspect non-canonical SavedModel root siblings for suspicious
   executable-like content
+- **security:** detect bare-string Lua `require "module"` loads in Torch7
+  artifacts
+- **security:** keep trusted NeMo namespaces from suppressing suspicious Hydra
+  `_target_` leaf names
 - **security:** fail closed when NeMo archives contain no analyzable config files
 - **security:** analyze GGUF-embedded chat templates through the Jinja scanner
   while preserving GGUF scanner ownership
