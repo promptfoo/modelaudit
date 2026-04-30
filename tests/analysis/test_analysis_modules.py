@@ -125,3 +125,22 @@ class TestAnalysisModules:
         assert result["data_type"] == "ml_weights"
         assert result["confidence"] == 0.85
         assert "Pattern search not recommended for this data type" not in result["reasoning"]
+
+    def test_integrated_analyzer_ignores_attacker_controlled_filename_context(self) -> None:
+        """Filename text should not change framework-pattern confidence."""
+        from modelaudit.analysis import IntegratedAnalyzer
+        from modelaudit.analysis.unified_context import UnifiedMLContext
+
+        analyzer = IntegratedAnalyzer()
+        normal_context = UnifiedMLContext(Path("payload.py"), 1024, "python", primary_framework="pytorch")
+        spoofed_context = UnifiedMLContext(
+            Path("samples/eval_bucket/validate_payload.py"),
+            1024,
+            "python",
+            primary_framework="pytorch",
+        )
+
+        normal = analyzer._analyze_framework_patterns("eval", "code_execution", normal_context)
+        spoofed = analyzer._analyze_framework_patterns("eval", "code_execution", spoofed_context)
+
+        assert spoofed == normal
