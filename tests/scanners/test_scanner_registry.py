@@ -583,6 +583,20 @@ def test_get_scanner_for_path_routes_extensionless_llamafile(tmp_path: Path) -> 
     _assert_scanner_for_path(llamafile_path, "llamafile")
 
 
+def test_get_scanner_for_path_routes_extensionless_middle_marker_llamafile(tmp_path: Path) -> None:
+    llamafile_path = tmp_path / "llama"
+    llamafile_path.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"A" * (2 * 1024 * 1024 + 64)
+        + b"llamafile runtime"
+        + b"B" * (2 * 1024 * 1024 + 64)
+    )
+
+    _assert_scanner_for_path(llamafile_path, "llamafile")
+
+
 def test_get_scanner_for_path_routes_extensionless_malicious_llamafile(tmp_path: Path) -> None:
     llamafile_path = tmp_path / "llama"
     llamafile_path.write_bytes(
