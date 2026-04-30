@@ -36,6 +36,7 @@ from modelaudit_picklescan import (
     scan_bytes,
     scan_file,
 )
+from modelaudit_picklescan.call_graph import find_startup_hook_write_call_graphs
 
 
 def _expected_system_global() -> str:
@@ -1861,6 +1862,51 @@ def test_scan_bytes_post_budget_tail_detects_default_protocol_stack_global() -> 
     )
 
 
+def test_scan_bytes_post_budget_tail_resynchronizes_after_malformed_bytes() -> None:
+    payload = b"\x80\x04\x88\x88\xff" + pickle.dumps(MaliciousPayload(), protocol=4)[2:]
+
+    report = scan_bytes(
+        payload,
+        source="budget-malformed-default-protocol-stack-global.pkl",
+        options=ScanOptions(max_opcodes=2, post_budget_scan_bytes=4096),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "POST_BUDGET_GLOBAL"
+        and finding.severity == Severity.CRITICAL
+        and f"{finding.details.get('module')}.{finding.details.get('name')}" in SYSTEM_GLOBALS
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_post_budget_tail_does_not_resynchronize_inside_truncated_literals() -> None:
+    inert_inner_bytes = b"\x8c\nsubprocess\x94\x8c\x03run\x94\x93)R."
+    payload = (
+        b"\x80\x04\x88\x88X"
+        + (64).to_bytes(4, "little")
+        + inert_inner_bytes
+        + (b"A" * (64 - len(inert_inner_bytes)))
+        + b"."
+    )
+
+    report = scan_bytes(
+        payload,
+        source="budget-truncated-literal.pkl",
+        options=ScanOptions(max_opcodes=2, post_budget_scan_bytes=32),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(
+        finding.rule_code == "POST_BUDGET_GLOBAL"
+        and finding.details.get("module") == "subprocess"
+        and finding.details.get("name") == "run"
+        for finding in report.findings
+    )
+
+
 @pytest.mark.parametrize(
     "payload_suffix",
     [
@@ -3365,7 +3411,11 @@ def test_with_call_graph_findings_promotes_click_startup_hook_write_paths() -> N
             "import_references": (
                 {"module": "click", "name": "open_file"},
                 {"module": "click", "name": "echo"},
-            )
+            ),
+            "callable_invocations": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            ),
         },
     )
 
@@ -3393,6 +3443,255 @@ def test_with_call_graph_findings_promotes_click_startup_hook_write_paths() -> N
     assert finding.details["analysis"] == "python_call_graph_startup_hook_write"
 
 
+def test_with_call_graph_findings_ignores_uninvoked_click_startup_hook_paths() -> None:
+    pytest.importorskip("click")
+
+    report = PickleReport(
+        source="click-startup-hook-import-only.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            )
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated is report
+    assert updated.verdict == SafetyVerdict.CLEAN
+    assert updated.findings == ()
+
+
+def test_scan_bytes_marks_call_graph_enrichment_failures_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    def raise_call_graph_error(*_args: object, **_kwargs: object) -> tuple[()]:
+        raise RuntimeError("call graph exploded")
+
+    monkeypatch.setattr(package_api, "find_dangerous_call_graphs", raise_call_graph_error)
+
+    report = scan_bytes(b"crandom\n_os.system\n.", source="call-graph-enrichment-error.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert report.metadata["analysis_incomplete"] is True
+    assert any(
+        error.message == "Python call-graph analysis could not complete: call graph exploded"
+        and error.category == "call_graph_analysis_error"
+        and error.exception_type == "RuntimeError"
+        and error.details["analysis"] == "python_call_graph"
+        and error.details["analysis_incomplete"] is True
+        for error in report.errors
+    )
+
+
+def test_with_call_graph_findings_marks_startup_hook_enrichment_failures_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_startup_hook_error(*_args: object, **_kwargs: object) -> tuple[()]:
+        raise RuntimeError("startup graph exploded")
+
+    monkeypatch.setattr(package_api, "find_startup_hook_write_call_graphs", raise_startup_hook_error)
+    report = PickleReport(
+        source="startup-hook-enrichment-error.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            )
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.UNKNOWN
+    assert updated.findings == ()
+    assert updated.metadata["analysis_incomplete"] is True
+    assert any(
+        error.message == "Python call-graph analysis could not complete: startup graph exploded"
+        and error.category == "call_graph_analysis_error"
+        and error.exception_type == "RuntimeError"
+        and error.details["analysis"] == "python_call_graph_startup_hook_write"
+        and error.details["analysis_incomplete"] is True
+        for error in updated.errors
+    )
+
+
+def test_with_call_graph_findings_marks_source_unavailable_enrichment_failures_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_source_unavailable_error(*_args: object, **_kwargs: object) -> tuple[()]:
+        raise RuntimeError("source graph exploded")
+
+    monkeypatch.setattr(
+        package_api,
+        "find_unanalyzed_callable_call_graph_references",
+        raise_source_unavailable_error,
+    )
+    report = PickleReport(
+        source="source-unavailable-enrichment-error.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={"callable_invocations": ({"module": "module", "name": "invoke"},)},
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.UNKNOWN
+    assert updated.findings == ()
+    assert updated.metadata["analysis_incomplete"] is True
+    assert any(
+        error.message == "Python call-graph analysis could not complete: source graph exploded"
+        and error.category == "call_graph_analysis_error"
+        and error.exception_type == "RuntimeError"
+        and error.details["analysis"] == "python_call_graph_source_unavailable"
+        and error.details["analysis_incomplete"] is True
+        for error in updated.errors
+    )
+
+
+def test_with_call_graph_findings_ignores_click_startup_hook_paths_when_invocations_truncated() -> None:
+    pytest.importorskip("click")
+
+    report = PickleReport(
+        source="click-startup-hook-truncated-invocations.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        metadata={
+            "import_references": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            ),
+            "callable_invocations": (),
+            "callable_invocations_truncated": True,
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated is report
+    assert updated.verdict == SafetyVerdict.UNKNOWN
+    assert updated.findings == ()
+
+
+def test_with_call_graph_findings_keeps_late_click_startup_hook_invocations() -> None:
+    pytest.importorskip("click")
+
+    report = PickleReport(
+        source="click-startup-hook-late-invocations.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            ),
+            "callable_invocations": (
+                *({"module": "module", "name": f"call_{index}"} for index in range(32)),
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            ),
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.verdict == SafetyVerdict.MALICIOUS
+    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH_FILE_WRITE" for finding in updated.findings)
+
+
+def test_with_call_graph_findings_ignores_click_startup_hook_paths_when_scan_is_inconclusive() -> None:
+    pytest.importorskip("click")
+
+    report = PickleReport(
+        source="click-startup-hook-incomplete.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        metadata={
+            "import_references": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            ),
+            "callable_invocations": (),
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated is report
+    assert updated.verdict == SafetyVerdict.UNKNOWN
+    assert updated.findings == ()
+
+
+def test_find_startup_hook_write_call_graphs_preserves_legacy_import_only_calls() -> None:
+    pytest.importorskip("click")
+
+    findings = find_startup_hook_write_call_graphs(
+        (
+            {"module": "click", "name": "open_file"},
+            {"module": "click", "name": "echo"},
+        )
+    )
+
+    assert len(findings) == 1
+    assert findings[0].opener_import_reference == "click.open_file"
+    assert findings[0].writer_import_reference == "click.echo"
+
+
+def test_scan_bytes_keeps_import_only_click_startup_hook_paths_clean() -> None:
+    pytest.importorskip("click")
+
+    payload = b"\x80\x04cclick\nopen_file\ncclick\necho\n\x86."
+
+    report = scan_bytes(payload, source="click-startup-hook-import-only.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+    assert report.metadata["import_references"] == (
+        {
+            "import_reference": "click.open_file",
+            "module": "click",
+            "name": "open_file",
+            "opcode": "GLOBAL",
+            "position": 2,
+            "is_dangerous": False,
+        },
+        {
+            "import_reference": "click.echo",
+            "module": "click",
+            "name": "echo",
+            "opcode": "GLOBAL",
+            "position": 19,
+            "is_dangerous": False,
+        },
+    )
+    assert report.metadata["callable_invocations"] == ()
+
+
+def test_scan_bytes_keeps_import_only_click_startup_hook_paths_unknown_after_benign_follow_on() -> None:
+    pytest.importorskip("click")
+
+    payload = (
+        b"\x80\x04cclick\nopen_file\ncclick\necho\n\x86."
+        + (b"\x00" * 4096)
+        + pickle.dumps({"benign": True}, protocol=4)
+    )
+
+    report = scan_bytes(payload, source="click-startup-hook-import-only-follow-on.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert report.metadata["callable_invocations"] == ()
+
+
 def test_with_call_graph_findings_dedupes_click_startup_hook_write_when_writer_is_already_critical() -> None:
     pytest.importorskip("click")
 
@@ -3412,7 +3711,11 @@ def test_with_call_graph_findings_dedupes_click_startup_hook_write_when_writer_i
             "import_references": (
                 {"module": "click", "name": "open_file"},
                 {"module": "click", "name": "echo"},
-            )
+            ),
+            "callable_invocations": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            ),
         },
     )
 
@@ -3441,7 +3744,11 @@ def test_with_call_graph_findings_dedupes_click_startup_hook_write_when_opener_i
             "import_references": (
                 {"module": "click", "name": "open_file"},
                 {"module": "click", "name": "echo"},
-            )
+            ),
+            "callable_invocations": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            ),
         },
     )
 
