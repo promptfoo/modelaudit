@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - restrict Hugging Face bookkeeping filename skips to recognized cache layouts
 - preserve unsuccessful child results after scan-result merges
 - preserve supported payloads hidden behind default directory-skip names
+- use bounded raw Jinja fallback windows and fail closed when PyYAML is
+  unavailable for YAML template configs
 
 ## [0.2.42](https://github.com/promptfoo/modelaudit/compare/v0.2.41...v0.2.42) (2026-04-27)
 
@@ -319,9 +321,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **pickle:** keep internal Rust finding codes such as `STRUCTURAL_TAMPER` and `PICKLE_EXPANSION` in `pickle_rule_code` details while exposing stable ModelAudit rule codes for dashboards, SARIF, suppression, and severity configuration.
 
 ### Fixed
-
-- **jinja:** use bounded raw fallback windows and fail closed when PyYAML is
-  unavailable for YAML template configs
 - **flax:** keep explicit Flax/JAX checkpoint suffixes routed to the scanner when
   `msgpack` is unavailable so missing parser coverage fails closed
 - **llamafile:** fail closed when bounded embedded-payload scanning stops before

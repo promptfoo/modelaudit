@@ -396,6 +396,19 @@ model:
         assert result.success is False
         assert result.metadata["scan_outcome"] == "inconclusive"
         assert "jinja2_yaml_dependency_unavailable" in result.metadata["scan_outcome_reasons"]
+        parsing_checks = [c for c in result.checks if c.name == "Template Config Parsing"]
+        assert len(parsing_checks) == 1
+        assert parsing_checks[0].message == "Failed to parse yaml config for template extraction"
+
+        aggregate_result = scan_model_directory_or_file(
+            str(yaml_file),
+            config={"cache_scan_results": False},
+        )
+        metadata = aggregate_result.file_metadata[str(yaml_file)]
+        assert aggregate_result.success is False
+        assert metadata.get("scan_outcome") == "inconclusive"
+        assert "jinja2_yaml_dependency_unavailable" in metadata.get("scan_outcome_reasons")
+        assert determine_exit_code(aggregate_result) == 2
 
 
 class TestJinja2TemplateScannerEdgeCases:
