@@ -113,6 +113,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **security:** fail closed when NeMo archives contain no analyzable config files
 - **security:** analyze GGUF-embedded chat templates through the Jinja scanner
   while preserving GGUF scanner ownership
 - **security:** run JAX checkpoint analysis for JAX-like pickle payloads that
