@@ -142,6 +142,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Resynchronize bounded post-budget replay after malformed bytes so later
+  self-contained modern globals still surface critical findings.
 - Require actual callable invocations before pairing startup-hook opener and
   writer imports, avoiding critical findings for pickles that only reconstruct
   those function objects.

@@ -6402,6 +6402,112 @@ mod tests {
         }
     }
 
+    #[test]
+    fn post_budget_tail_resynchronizes_after_malformed_bytes_before_modern_globals() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: 2,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x04\x88\x88\xff\x8c\nsubprocess\x94\x8c\x03run\x94\x93)R.";
+        let mut scan = ScanState::new(
+            "post-budget-malformed-modern-global.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let finding = scan
+            .findings
+            .iter()
+            .find(|finding| finding.rule_code == Some("POST_BUDGET_GLOBAL"))
+            .expect("post-budget modern global finding after malformed byte");
+        assert_eq!(finding.severity, "critical");
+        assert_eq!(
+            detail_string(&finding.details, "pattern").as_deref(),
+            Some("subprocess\nrun")
+        );
+    }
+
+    #[test]
+    fn post_budget_tail_does_not_resolve_tuple_wrapped_globals_after_malformed_bytes() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: 2,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x04\x88\x88\xff\x8c\nsubprocess\x94\x8c\x03run\x94\x86\x93)R.";
+        let mut scan = ScanState::new(
+            "post-budget-malformed-tuple-wrapped-global.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert!(
+            !scan.findings.iter().any(|finding| {
+                finding.rule_code == Some("POST_BUDGET_GLOBAL")
+                    && detail_string(&finding.details, "pattern").as_deref()
+                        == Some("subprocess\nrun")
+            }),
+            "tuple-wrapped STACK_GLOBAL operands after malformed bytes should stay unresolved"
+        );
+    }
+
+    #[test]
+    fn post_budget_tail_does_not_resynchronize_inside_truncated_literals() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: 2,
+            post_budget_scan_bytes: 32,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let inert_inner_bytes = b"\x8c\nsubprocess\x94\x8c\x03run\x94\x93)R.";
+        let mut payload = b"\x80\x04\x88\x88X".to_vec();
+        payload.extend_from_slice(&(64_u32).to_le_bytes());
+        payload.extend_from_slice(inert_inner_bytes);
+        payload.resize(4 + 1 + 4 + 64, b'A');
+        payload.push(b'.');
+        let mut scan = ScanState::new(
+            "post-budget-truncated-literal.pkl".to_string(),
+            &payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert!(
+            !scan.findings.iter().any(|finding| {
+                finding.rule_code == Some("POST_BUDGET_GLOBAL")
+                    && detail_string(&finding.details, "pattern").as_deref()
+                        == Some("subprocess\nrun")
+            }),
+            "truncated literal bodies must not be reparsed as executable opcodes"
+        );
+    }
+
     fn short_binunicode(value: &[u8]) -> Vec<u8> {
         assert!(value.len() <= u8::MAX as usize);
         let mut payload = vec![0x8c, value.len() as u8];
