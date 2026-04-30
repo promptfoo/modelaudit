@@ -3444,6 +3444,97 @@ def test_with_call_graph_findings_ignores_uninvoked_click_startup_hook_paths() -
     assert updated.findings == ()
 
 
+def test_scan_bytes_marks_call_graph_enrichment_failures_incomplete(monkeypatch: pytest.MonkeyPatch) -> None:
+    def raise_call_graph_error(*_args: object, **_kwargs: object) -> tuple[()]:
+        raise RuntimeError("call graph exploded")
+
+    monkeypatch.setattr(package_api, "find_dangerous_call_graphs", raise_call_graph_error)
+
+    report = scan_bytes(b"crandom\n_os.system\n.", source="call-graph-enrichment-error.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
+    assert report.metadata["analysis_incomplete"] is True
+    assert any(
+        error.message == "Python call-graph analysis could not complete: call graph exploded"
+        and error.category == "call_graph_analysis_error"
+        and error.exception_type == "RuntimeError"
+        and error.details["analysis"] == "python_call_graph"
+        and error.details["analysis_incomplete"] is True
+        for error in report.errors
+    )
+
+
+def test_with_call_graph_findings_marks_startup_hook_enrichment_failures_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_startup_hook_error(*_args: object, **_kwargs: object) -> tuple[()]:
+        raise RuntimeError("startup graph exploded")
+
+    monkeypatch.setattr(package_api, "find_startup_hook_write_call_graphs", raise_startup_hook_error)
+    report = PickleReport(
+        source="startup-hook-enrichment-error.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            )
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.UNKNOWN
+    assert updated.findings == ()
+    assert updated.metadata["analysis_incomplete"] is True
+    assert any(
+        error.message == "Python call-graph analysis could not complete: startup graph exploded"
+        and error.category == "call_graph_analysis_error"
+        and error.exception_type == "RuntimeError"
+        and error.details["analysis"] == "python_call_graph_startup_hook_write"
+        and error.details["analysis_incomplete"] is True
+        for error in updated.errors
+    )
+
+
+def test_with_call_graph_findings_marks_source_unavailable_enrichment_failures_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_source_unavailable_error(*_args: object, **_kwargs: object) -> tuple[()]:
+        raise RuntimeError("source graph exploded")
+
+    monkeypatch.setattr(
+        package_api,
+        "find_unanalyzed_callable_call_graph_references",
+        raise_source_unavailable_error,
+    )
+    report = PickleReport(
+        source="source-unavailable-enrichment-error.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={"callable_invocations": ({"module": "module", "name": "invoke"},)},
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.UNKNOWN
+    assert updated.findings == ()
+    assert updated.metadata["analysis_incomplete"] is True
+    assert any(
+        error.message == "Python call-graph analysis could not complete: source graph exploded"
+        and error.category == "call_graph_analysis_error"
+        and error.exception_type == "RuntimeError"
+        and error.details["analysis"] == "python_call_graph_source_unavailable"
+        and error.details["analysis_incomplete"] is True
+        for error in updated.errors
+    )
+
+
 def test_with_call_graph_findings_ignores_click_startup_hook_paths_when_invocations_truncated() -> None:
     pytest.importorskip("click")
 
