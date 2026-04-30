@@ -11,6 +11,7 @@ from collections.abc import Iterator
 from pathlib import Path, PurePosixPath
 from typing import ClassVar, NamedTuple
 
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 _MAX_VARINT_BYTES = 10
@@ -365,6 +366,7 @@ class CoreMLScanner(BaseScanner):
 
         if file_size > self.MAX_PARSE_BYTES:
             result.metadata["coreml_bounded_read_truncated"] = True
+            mark_inconclusive_scan_result(result, "coreml_bounded_parse_incomplete")
             result.add_check(
                 name="CoreML Bounded Parse Window",
                 passed=True,
@@ -444,6 +446,8 @@ class CoreMLScanner(BaseScanner):
         scan_truncated = bool(
             result.metadata.get("coreml_bounded_read_truncated") or result.metadata.get("coreml_traversal_truncated")
         )
+        if scan_truncated:
+            mark_inconclusive_scan_result(result, "coreml_analysis_incomplete")
 
         if metadata_findings == 0 and not scan_truncated:
             result.add_check(
@@ -469,7 +473,9 @@ class CoreMLScanner(BaseScanner):
                 location=path,
             )
 
-        result.finish(success=not result.has_errors)
+        result.finish(
+            success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
+        )
         return result
 
     def _iter_model_messages(

@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, ClassVar
 
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ._string_extraction import extract_bounded_printable_strings
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -121,6 +122,7 @@ class Torch7Scanner(BaseScanner):
         result.metadata["scan_truncated"] = truncated
 
         if truncated:
+            mark_inconclusive_scan_result(result, "torch7_bounded_read_incomplete")
             result.add_check(
                 name="Torch7 Bounded Read",
                 passed=False,
@@ -175,7 +177,9 @@ class Torch7Scanner(BaseScanner):
         self._analyze_dynamic_loads(path, extracted_strings, result)
         self._analyze_network_shell_strings(path, extracted_strings, result)
 
-        result.finish(success=not result.has_errors)
+        result.finish(
+            success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
+        )
         return result
 
     def _extract_strings(self, payload: bytes) -> list[str]:

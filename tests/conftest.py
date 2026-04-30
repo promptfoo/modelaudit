@@ -186,6 +186,7 @@ def pytest_runtest_setup(item):
             "test_pickle_context_filtering.py",  # Pickle context filtering regression tests
             "test_xdist_status.py",  # xdist worker progress reporting tests
             "test_release_workflow.py",  # release workflow regression tests
+            "test_docker_workflow.py",  # Docker workflow regression tests
         ]
 
         # Check if this is an allowed test file
