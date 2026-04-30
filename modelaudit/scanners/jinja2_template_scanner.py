@@ -232,7 +232,6 @@ class Jinja2TemplateScanner(BaseScanner):
                 result.finish(success=True)
                 return result
 
-            # Analyze each extracted template
             return self._scan_extracted_templates(path, templates, context, result=result, file_size=file_size)
 
         except Exception as e:
@@ -263,13 +262,44 @@ class Jinja2TemplateScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
         context = self._determine_context(path)
+        if any("chat_template" in template_location.lower() for template_location in templates):
+            context.is_chat_template = True
         result.metadata["ml_context"] = {
             "framework": context.framework,
             "file_type": context.file_type,
             "is_tokenizer": context.is_tokenizer,
             "confidence": context.confidence,
         }
-        return self._scan_extracted_templates(path, templates, context, result=result, file_size=file_size)
+        bounded_templates: dict[str, str] = {}
+        oversized_template_locations: list[str] = []
+        for template_location, template_content in templates.items():
+            if len(template_content) <= self.max_template_size:
+                bounded_templates[template_location] = template_content
+            else:
+                oversized_template_locations.append(template_location)
+
+        if oversized_template_locations:
+            result.metadata[_INCONCLUSIVE_METADATA_KEY] = INCONCLUSIVE_SCAN_OUTCOME
+            result.metadata[_INCONCLUSIVE_REASONS_METADATA_KEY] = ["jinja2_template_size_limit_exceeded"]
+            result.add_check(
+                name="Template Size Limit",
+                passed=False,
+                message="Template analysis incomplete because one or more extracted templates exceed the size limit",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "reason": "jinja2_template_size_limit_exceeded",
+                    "max_template_size": self.max_template_size,
+                    "skipped_template_locations": oversized_template_locations,
+                },
+            )
+
+        if not bounded_templates:
+            result.bytes_scanned = file_size
+            self._finish_scan_result(result)
+            return result
+
+        return self._scan_extracted_templates(path, bounded_templates, context, result=result, file_size=file_size)
 
     def _scan_extracted_templates(
         self,
@@ -758,10 +788,12 @@ class Jinja2TemplateScanner(BaseScanner):
 
     def _is_common_ml_pattern(self, match_text: str, context: MLContext) -> bool:
         """Check if match is a common, benign ML pattern"""
+        match_lower = match_text.lower()
+        if context.is_chat_template and match_lower.startswith("{% macro "):
+            return True
+
         if not context.framework:
             return False
-
-        match_lower = match_text.lower()
 
         # Common HuggingFace chat template patterns
         if context.framework == "huggingface":

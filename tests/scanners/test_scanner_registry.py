@@ -608,6 +608,16 @@ def test_get_scanner_for_path_routes_model_manifest_json_to_manifest_scanner(tmp
     _assert_scanner_for_path(manifest_path, "manifest")
 
 
+def test_get_scanner_for_path_routes_declared_manifest_paths_to_manifest_scanner(tmp_path: Path) -> None:
+    hyperparams_path = tmp_path / "hyperparams.yaml"
+    hyperparams_path.write_text("model_type: bert\n", encoding="utf-8")
+    manifest_path = tmp_path / "artifact.manifest"
+    manifest_path.write_text(json.dumps({"model_type": "bert"}), encoding="utf-8")
+
+    _assert_scanner_for_path(hyperparams_path, "manifest")
+    _assert_scanner_for_path(manifest_path, "manifest")
+
+
 def test_get_scanner_for_path_routes_generic_pkl_zip_without_pytorch_markers_to_zip(tmp_path: Path) -> None:
     model_path = _write_zip_archive(tmp_path / "generic.pkl", {"payload.txt": b"not a pytorch archive"})
 
