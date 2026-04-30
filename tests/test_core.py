@@ -14,12 +14,8 @@ import pytest
 
 from modelaudit import core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
-<<<<<<< HEAD
-from modelaudit.core import scan_file
-from modelaudit.scanners import flax_msgpack_scanner
-=======
 from modelaudit.core import scan_file, scan_model_directory_or_file
->>>>>>> origin/main
+from modelaudit.scanners import flax_msgpack_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from tests.helpers import create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
 
