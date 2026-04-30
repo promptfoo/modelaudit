@@ -210,7 +210,21 @@ class LlamafileScanner(BaseScanner):
         try:
             head = self._read_prefix(path_obj, self.preview_bytes)
             tail = self._read_suffix(path_obj, self.preview_bytes)
+            runtime_blobs = [head, tail]
             runtime_preview_bytes = len(head) + len(tail)
+            marker_offset = self._find_casefolded_marker_offset(
+                path_obj,
+                LLAMAFILE_MARKER,
+                LLAMAFILE_ROUTE_SCAN_BYTES,
+            )
+            if marker_offset is not None and not self._offset_is_in_preview_windows(
+                marker_offset,
+                path_obj.stat().st_size,
+                self.preview_bytes,
+            ):
+                middle = self._read_window_around_offset(path_obj, marker_offset, self.preview_bytes)
+                runtime_blobs.append(middle)
+                runtime_preview_bytes += len(middle)
         except OSError as exc:
             result.add_check(
                 name="Llamafile Runtime Preview Read",
@@ -224,7 +238,7 @@ class LlamafileScanner(BaseScanner):
             return result
 
         result.bytes_scanned = runtime_preview_bytes
-        self._scan_runtime_strings(path, head + b"\n" + tail, result)
+        self._scan_runtime_strings(path, b"\n".join(runtime_blobs), result)
 
         payload_bytes_scanned = self._scan_embedded_payload(path_obj, result)
         result.bytes_scanned += payload_bytes_scanned
@@ -508,3 +522,20 @@ class LlamafileScanner(BaseScanner):
         with path.open("rb") as handle:
             handle.seek(file_size - num_bytes)
             return handle.read(num_bytes)
+
+    @staticmethod
+    def _offset_is_in_preview_windows(offset: int, file_size: int, preview_bytes: int) -> bool:
+        """Return whether an offset is already covered by the head or tail preview."""
+        return offset < preview_bytes or offset >= max(0, file_size - preview_bytes)
+
+    @staticmethod
+    def _read_window_around_offset(path: Path, offset: int, num_bytes: int) -> bytes:
+        """Read a bounded preview window centered around a routed marker offset."""
+        file_size = path.stat().st_size
+        window_start = max(0, offset - (num_bytes // 2))
+        window_end = min(file_size, window_start + num_bytes)
+        if window_end - window_start < num_bytes:
+            window_start = max(0, window_end - num_bytes)
+        with path.open("rb") as handle:
+            handle.seek(window_start)
+            return handle.read(window_end - window_start)

