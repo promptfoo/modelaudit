@@ -12,6 +12,7 @@ Tests cover various XGBoost model formats and security vulnerabilities:
 import copy
 import json
 import pickle
+import struct
 import subprocess as real_subprocess
 import tempfile
 from collections.abc import Iterator
@@ -40,6 +41,11 @@ def temp_dir() -> Iterator[Path]:
     """Create a temporary directory for test files."""
     with tempfile.TemporaryDirectory() as tmpdir:
         yield Path(tmpdir)
+
+
+def _headerless_legacy_binary_header() -> bytes:
+    """Create the older pre-`binf` learner header used by legacy XGBoost binaries."""
+    return struct.pack("<fIiiiII27i", 0.5, 4, 0, 1, 0, 0, 90, *([0] * 27))
 
 
 @pytest.fixture
@@ -713,6 +719,23 @@ class TestXGBoostBinaryScanning:
             if "Pattern Check" in check.name
         )
 
+    def test_headerless_legacy_binary_passes_structure_validation(
+        self, temp_dir: Path, xgboost_scanner: XGBoostScanner
+    ) -> None:
+        """Older pre-`binf` binaries should remain accepted."""
+        binary_file = temp_dir / "legacy.bst"
+        binary_file.write_bytes(_headerless_legacy_binary_header())
+
+        result = xgboost_scanner.scan(str(binary_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert any(
+            check.details.get("binary_format") == "headerless_legacy"
+            for check in result.checks
+            if "Pattern Check" in check.name
+        )
+
     def test_suspicious_binary_patterns_detected(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
         """Test detection of suspicious binary patterns."""
         # Create binary data with no recognizable XGBoost patterns
@@ -1061,6 +1084,17 @@ class TestXGBoostFailClosedEndToEnd:
     def test_binf_signature_core_does_not_false_positive(self, tmp_path: Path) -> None:
         binary_file = tmp_path / "signature.bst"
         binary_file.write_bytes(b"binf" + (b"\0" * 60) + b"gbtree appears outside first read window")
+
+        result = scan_model_directory_or_file(str(binary_file), cache_enabled=False)
+
+        assert result.success is True
+        assert determine_exit_code(result) == 0
+        assert "xgboost" in result.scanner_names
+        assert not result.issues
+
+    def test_headerless_legacy_binary_core_does_not_false_positive(self, tmp_path: Path) -> None:
+        binary_file = tmp_path / "legacy.bst"
+        binary_file.write_bytes(_headerless_legacy_binary_header())
 
         result = scan_model_directory_or_file(str(binary_file), cache_enabled=False)
 
