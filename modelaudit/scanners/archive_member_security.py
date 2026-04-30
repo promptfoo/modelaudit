@@ -141,12 +141,14 @@ def _apply_aliases(call_name: str, alias_scopes: _AliasScopes) -> frozenset[str]
 
 
 _MAX_STATIC_STRING_LENGTH = 1024
+_MAX_STATIC_STRING_PARTS = 256
 
 
 def _resolve_static_string(node: ast.AST) -> str | None:
     """Resolve bounded compile-time string expressions used in attribute lookups."""
     pending = [node]
     parts: list[str] = []
+    part_count = 0
     total_length = 0
 
     while pending:
@@ -157,6 +159,9 @@ def _resolve_static_string(node: ast.AST) -> str | None:
         if not isinstance(current, ast.Constant) or not isinstance(current.value, str):
             return None
 
+        part_count += 1
+        if part_count > _MAX_STATIC_STRING_PARTS:
+            return None
         total_length += len(current.value)
         if total_length > _MAX_STATIC_STRING_LENGTH:
             return None

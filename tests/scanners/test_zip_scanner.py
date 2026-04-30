@@ -226,10 +226,10 @@ def test_scan_zip_flags_concatenated_getattr_name_dangerous_python_member(tmp_pa
     assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
 
-def test_scan_zip_bounds_deep_concatenated_getattr_names(tmp_path: Path) -> None:
+def test_scan_zip_bounds_large_concatenated_getattr_names(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
-    nested_name = " + ".join(["'s'"] * 40)
-    source = f"import os\ngetattr(os, {nested_name})('echo hidden')\n"
+    padding = " + ".join(["''"] * 300)
+    source = f"import os\ngetattr(os, 'sys' + {padding} + 'tem')('echo hidden')\n"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
 
