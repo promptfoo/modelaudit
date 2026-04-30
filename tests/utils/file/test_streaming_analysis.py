@@ -159,6 +159,31 @@ def test_stream_analyze_file_returns_clean_partial_header_result(
     assert "failed closed" in result.metadata["scan_outcome_message"]
 
 
+def test_stream_analyze_file_returns_incomplete_full_header_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = tmp_path / "sample.joblib"
+    file_path.write_bytes(b"model-header-only")
+    url = f"file://{file_path}"
+
+    monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "file")
+    monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: LocalFileSystem())
+
+    result, analysis_complete = streaming.stream_analyze_file(url, HeaderOnlyScanner())
+
+    assert analysis_complete is False
+    assert result is not None
+    assert result.issues == []
+    assert result.bytes_scanned == file_path.stat().st_size
+    assert result.success is False
+    assert result.metadata["bytes_complete"] is True
+    assert result.metadata["analysis_complete"] is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "streaming_header_only_fallback" in result.metadata["scan_outcome_reasons"]
+    assert "failed closed" in result.metadata["scan_outcome_message"]
+
+
 def test_stream_analyze_file_protocol_marker_only_does_not_emit_protocol_warning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -170,9 +195,9 @@ def test_stream_analyze_file_protocol_marker_only_does_not_emit_protocol_warning
     monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "file")
     monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: LocalFileSystem())
 
-    result, was_complete = streaming.stream_analyze_file(url, HeaderOnlyScanner())
+    result, analysis_complete = streaming.stream_analyze_file(url, HeaderOnlyScanner())
 
-    assert was_complete is True
+    assert analysis_complete is False
     assert result is not None
     assert not any(issue.type == "streaming_pickle_protocol_check" for issue in result.issues)
     assert result.has_warnings is False
@@ -189,9 +214,9 @@ def test_stream_analyze_file_protocol_with_payload_still_emits_warning(
     monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "file")
     monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: LocalFileSystem())
 
-    result, was_complete = streaming.stream_analyze_file(url, HeaderOnlyScanner())
+    result, analysis_complete = streaming.stream_analyze_file(url, HeaderOnlyScanner())
 
-    assert was_complete is True
+    assert analysis_complete is False
     assert result is not None
     assert any(issue.type == "streaming_pickle_protocol_check" for issue in result.issues)
     assert result.has_warnings is True
@@ -208,9 +233,9 @@ def test_stream_analyze_file_partial_protocol_marker_still_emits_warning(
     monkeypatch.setattr(streaming, "get_fs_protocol", lambda u: "file")
     monkeypatch.setattr(fsspec, "filesystem", lambda protocol, token=None: LocalFileSystem())
 
-    result, was_complete = streaming.stream_analyze_file(url, HeaderOnlyScanner(), max_bytes=2)
+    result, analysis_complete = streaming.stream_analyze_file(url, HeaderOnlyScanner(), max_bytes=2)
 
-    assert was_complete is False
+    assert analysis_complete is False
     assert result is not None
     assert any(issue.type == "streaming_pickle_protocol_check" for issue in result.issues)
     assert result.has_warnings is True
@@ -243,8 +268,8 @@ def test_stream_analyze_file_does_not_retry_sourceful_scan_stream_typeerror(
     monkeypatch.setattr(PickleScanner, "scan_stream", fake_scan_stream)
 
     scanner = PickleScanner()
-    result, was_complete = streaming.stream_analyze_file(url, scanner)
+    result, analysis_complete = streaming.stream_analyze_file(url, scanner)
 
     assert call_count == 1
-    assert was_complete is True
+    assert analysis_complete is False
     assert result is not None

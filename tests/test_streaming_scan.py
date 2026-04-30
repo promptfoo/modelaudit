@@ -93,8 +93,8 @@ def test_scan_model_directory_or_file_streaming_path() -> None:
         assert determine_exit_code(result) == 0
 
 
-def test_scan_model_directory_or_file_partial_streaming_path_returns_exit_code_2() -> None:
-    """Partial stream:// analysis without findings should be explicit and fail closed."""
+def test_scan_model_directory_or_file_incomplete_streaming_path_returns_exit_code_2() -> None:
+    """Incomplete stream:// analysis without findings should be explicit and fail closed."""
     stream_url = "s3://bucket/model.pkl"
     scan_result = ScanResult(scanner_name="streaming")
     scan_result.bytes_scanned = 128
@@ -115,7 +115,10 @@ def test_scan_model_directory_or_file_partial_streaming_path_returns_exit_code_2
     assert metadata["analysis_incomplete"] is True
     assert "streaming_analysis_incomplete" in metadata["scan_outcome_reasons"]
     assert "failed closed" in metadata["scan_outcome_message"]
-    assert any(issue.message == "Streaming analysis was partial - only analyzed file header" for issue in result.issues)
+    assert any(
+        issue.message == "Streaming analysis incomplete - full scanner coverage was not available"
+        for issue in result.issues
+    )
     assert result.has_errors is False
     assert result.files_scanned == 1
     assert result.success is False

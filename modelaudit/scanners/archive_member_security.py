@@ -6,7 +6,7 @@ import ast
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from ._archive_outcomes import mark_archive_scan_incomplete
 from .base import IssueSeverity
@@ -27,6 +27,29 @@ _EXECUTABLE_ARCHIVE_MEMBER_SUFFIXES = (
     ".bat",
     ".ps1",
 )
+_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES = 1024
+_PORTABLE_EXECUTABLE_POINTER_OFFSET = 0x3C
+_PORTABLE_EXECUTABLE_MIN_HEADER_OFFSET = 0x40
+_PORTABLE_EXECUTABLE_MAX_HEADER_OFFSET = 1024 * 1024
+_PORTABLE_EXECUTABLE_SIGNATURE = b"PE\x00\x00"
+_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_PREFIXES = (
+    b"\x7fELF",
+    b"\xfe\xed\xfa\xce",
+    b"\xfe\xed\xfa\xcf",
+    b"\xcf\xfa\xed\xfe",
+    b"\xce\xfa\xed\xfe",
+    b"#!",
+)
+_MACHO_FAT_MAGIC_32_BE = b"\xca\xfe\xba\xbe"
+_MACHO_FAT_MAGIC_32_LE = b"\xbe\xba\xfe\xca"
+_MACHO_FAT_MAGIC_64_BE = b"\xca\xfe\xba\xbf"
+_MACHO_FAT_MAGIC_64_LE = b"\xbf\xba\xfe\xca"
+_MACHO_FAT_MAGICS = {
+    _MACHO_FAT_MAGIC_32_BE,
+    _MACHO_FAT_MAGIC_32_LE,
+    _MACHO_FAT_MAGIC_64_BE,
+    _MACHO_FAT_MAGIC_64_LE,
+}
 _VERSIONED_SHARED_OBJECT_SUFFIX_RE = re.compile(r"\.so(?:\.[0-9]+)+$")
 _PYTHON_ARCHIVE_MEMBER_SUFFIXES = (".py", ".pyw")
 _HIGH_RISK_PYTHON_CALLS = {
@@ -106,6 +129,64 @@ def is_executable_archive_member_name(member_name: str) -> bool:
     )
 
 
+def _looks_like_portable_executable(prefix: bytes, *, path: str) -> bool:
+    if not prefix.startswith(b"MZ"):
+        return False
+    if b"This program cannot be run in DOS mode" in prefix[:512]:
+        return True
+    if len(prefix) < _PORTABLE_EXECUTABLE_MIN_HEADER_OFFSET:
+        return False
+
+    pe_offset = int.from_bytes(
+        prefix[_PORTABLE_EXECUTABLE_POINTER_OFFSET : _PORTABLE_EXECUTABLE_POINTER_OFFSET + 4],
+        "little",
+        signed=False,
+    )
+    if not _PORTABLE_EXECUTABLE_MIN_HEADER_OFFSET <= pe_offset <= _PORTABLE_EXECUTABLE_MAX_HEADER_OFFSET:
+        return False
+
+    if pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE) <= len(prefix):
+        return prefix[pe_offset : pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE)] == _PORTABLE_EXECUTABLE_SIGNATURE
+
+    try:
+        with open(path, "rb") as member_file:
+            member_file.seek(pe_offset)
+            return member_file.read(len(_PORTABLE_EXECUTABLE_SIGNATURE)) == _PORTABLE_EXECUTABLE_SIGNATURE
+    except OSError:
+        return False
+
+
+def _looks_like_macho_fat_binary(prefix: bytes) -> bool:
+    magic = prefix[:4]
+    if magic not in _MACHO_FAT_MAGICS or len(prefix) < 8:
+        return False
+
+    byteorder: Literal["big", "little"] = (
+        "big" if magic in {_MACHO_FAT_MAGIC_32_BE, _MACHO_FAT_MAGIC_64_BE} else "little"
+    )
+    arch_count = int.from_bytes(prefix[4:8], byteorder, signed=False)
+    if not 1 <= arch_count <= 128:
+        return False
+
+    arch_entry_size = 32 if magic in {_MACHO_FAT_MAGIC_64_BE, _MACHO_FAT_MAGIC_64_LE} else 20
+    return len(prefix) >= 8 + (arch_count * arch_entry_size)
+
+
+def is_executable_archive_member_content(path: str) -> bool:
+    """Return True when a member begins with a strong executable signature."""
+    try:
+        with open(path, "rb") as member_file:
+            prefix = member_file.read(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES)
+    except OSError:
+        return False
+
+    if prefix.startswith(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_PREFIXES):
+        return True
+    if _looks_like_macho_fat_binary(prefix):
+        return True
+    return _looks_like_portable_executable(prefix, path=path)
+
+
 def is_python_archive_member_name(member_name: str) -> bool:
     """Return True when an archive member name looks like Python source."""
     return member_name.lower().endswith(_PYTHON_ARCHIVE_MEMBER_SUFFIXES)
@@ -140,12 +221,39 @@ def _apply_aliases(call_name: str, alias_scopes: _AliasScopes) -> frozenset[str]
     return frozenset(f"{resolved_head}.{suffix}" for resolved_head in resolved_heads)
 
 
+_MAX_STATIC_STRING_LENGTH = 1024
+_MAX_STATIC_STRING_PARTS = 256
+
+
+def _resolve_static_string(node: ast.AST) -> str | None:
+    """Resolve bounded compile-time string expressions used in attribute lookups."""
+    pending = [node]
+    parts: list[str] = []
+    part_count = 0
+    total_length = 0
+
+    while pending:
+        current = pending.pop()
+        if isinstance(current, ast.BinOp) and isinstance(current.op, ast.Add):
+            pending.extend([current.right, current.left])
+            continue
+        if not isinstance(current, ast.Constant) or not isinstance(current.value, str):
+            return None
+
+        part_count += 1
+        if part_count > _MAX_STATIC_STRING_PARTS:
+            return None
+        total_length += len(current.value)
+        if total_length > _MAX_STATIC_STRING_LENGTH:
+            return None
+        parts.append(current.value)
+
+    return "".join(parts)
+
+
 def _resolve_getattr_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    # Only literal-string attribute names are resolved. Payloads that build the
-    # attribute name at runtime (``getattr(os, "sys" + "tem")``) need constant
-    # folding we deliberately do not perform here — the complexity is not
-    # worth chasing every string-arithmetic trick, and such payloads typically
-    # still trip pickle or runtime detectors elsewhere in the pipeline.
+    # Resolve literal names and compile-time string concatenation. Runtime-built
+    # names still fall outside this static member analysis by design.
     if isinstance(node, ast.Attribute) and node.attr == "__call__":
         return _resolve_getattr_call_names(node.value, alias_scopes)
 
@@ -175,13 +283,14 @@ def _resolve_getattr_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> fr
     if target_root is None:
         return None
 
-    if not isinstance(attr_name_node, ast.Constant) or not isinstance(attr_name_node.value, str):
+    attr_name = _resolve_static_string(attr_name_node)
+    if attr_name is None:
         return None
 
     resolved_target_roots = _apply_aliases(target_root, alias_scopes)
     if resolved_target_roots is None:
         return None
-    return frozenset(f"{resolved_target_root}.{attr_name_node.value}" for resolved_target_root in resolved_target_roots)
+    return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
 
 
 def _resolve_static_reference_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
@@ -644,7 +753,7 @@ def scan_archive_member_for_known_risks(
             )
         return
 
-    if is_executable_archive_member_name(normalized_lower):
+    if is_executable_archive_member_name(normalized_lower) or is_executable_archive_member_content(tmp_path):
         result.add_check(
             name=_EXECUTABLE_MEMBER_CHECK_NAME,
             passed=False,
