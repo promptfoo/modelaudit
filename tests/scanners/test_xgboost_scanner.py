@@ -12,6 +12,7 @@ Tests cover various XGBoost model formats and security vulnerabilities:
 import copy
 import json
 import pickle
+import struct
 import subprocess as real_subprocess
 import tempfile
 from collections.abc import Iterator
@@ -40,6 +41,11 @@ def temp_dir() -> Iterator[Path]:
     """Create a temporary directory for test files."""
     with tempfile.TemporaryDirectory() as tmpdir:
         yield Path(tmpdir)
+
+
+def _headerless_legacy_binary_header() -> bytes:
+    """Create the older pre-`binf` learner header used by legacy XGBoost binaries."""
+    return struct.pack("<fIiiiII27i", 0.5, 4, 0, 1, 0, 0, 90, *([0] * 27))
 
 
 @pytest.fixture
@@ -586,8 +592,9 @@ class TestXGBoostBinaryScanning:
 
         result = xgboost_scanner.scan(str(binary_file))
 
-        assert result.success is True
-        assert "scan_outcome" not in result.metadata
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_binary_structure_unrecognized" in result.metadata["scan_outcome_reasons"]
         assert not any("pickle file" in str(issue.message) for issue in result.issues)
 
     def test_bst_with_ubjson_header_routes_to_ubj_scan(self, temp_dir: Path) -> None:
@@ -672,7 +679,7 @@ class TestXGBoostBinaryScanning:
     def test_binary_structure_validation(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
         """Test binary structure validation."""
         # Create a file with some XGBoost-like content
-        binary_content = b"gbtree\x00\x00\x01\x02reg:squarederror\x00\x00extra xgboost bytes"
+        binary_content = b"binf\x00\x00\x01\x02reg:squarederror\x00\x00extra xgboost bytes"
 
         binary_file = temp_dir / "valid.bst"
         binary_file.write_bytes(binary_content)
@@ -682,6 +689,18 @@ class TestXGBoostBinaryScanning:
         # Should find expected XGBoost patterns
         pattern_checks = [c for c in result.checks if "Pattern Check" in c.name and c.status.value == "passed"]
         assert len(pattern_checks) > 0
+
+    def test_marker_only_binary_is_inconclusive(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
+        """Printable marker-shaped junk should not pass as a legacy binary model."""
+        binary_file = temp_dir / "marker_only.bst"
+        binary_file.write_bytes(b"custom xgboost binary gbtree reg:squarederror")
+
+        result = xgboost_scanner.scan(str(binary_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_binary_structure_unrecognized" in result.metadata["scan_outcome_reasons"]
+        assert any("expected XGBoost binary signature" in str(issue.message) for issue in result.issues)
 
     def test_binf_binary_signature_passes_structure_validation(
         self, temp_dir: Path, xgboost_scanner: XGBoostScanner
@@ -696,6 +715,23 @@ class TestXGBoostBinaryScanning:
         assert "scan_outcome" not in result.metadata
         assert any(
             "binf" in check.details.get("patterns_found", [])
+            for check in result.checks
+            if "Pattern Check" in check.name
+        )
+
+    def test_headerless_legacy_binary_passes_structure_validation(
+        self, temp_dir: Path, xgboost_scanner: XGBoostScanner
+    ) -> None:
+        """Older pre-`binf` binaries should remain accepted."""
+        binary_file = temp_dir / "legacy.bst"
+        binary_file.write_bytes(_headerless_legacy_binary_header())
+
+        result = xgboost_scanner.scan(str(binary_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert any(
+            check.details.get("binary_format") == "headerless_legacy"
             for check in result.checks
             if "Pattern Check" in check.name
         )
@@ -725,7 +761,7 @@ class TestXGBoostBinaryScanning:
 
         result = xgboost_scanner.scan(str(binary_file))
 
-        assert any("expected XGBoost binary model markers" in str(issue.message) for issue in result.issues)
+        assert any("expected XGBoost binary signature" in str(issue.message) for issue in result.issues)
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "xgboost_binary_structure_unrecognized" in result.metadata["scan_outcome_reasons"]
@@ -1034,9 +1070,20 @@ class TestXGBoostFailClosedEndToEnd:
         finally:
             reset_cache_manager()
 
-    def test_non_pickle_xgboost_binary_core_does_not_false_positive(self, tmp_path: Path) -> None:
+    def test_marker_only_xgboost_binary_core_fails_closed(self, tmp_path: Path) -> None:
         binary_file = tmp_path / "custom.bst"
         binary_file.write_bytes(b"custom xgboost binary gbtree reg:squarederror")
+
+        result = scan_model_directory_or_file(str(binary_file), cache_enabled=False)
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert "xgboost" in result.scanner_names
+        _assert_inconclusive_metadata(result, binary_file, "xgboost_binary_structure_unrecognized")
+
+    def test_binf_signature_core_does_not_false_positive(self, tmp_path: Path) -> None:
+        binary_file = tmp_path / "signature.bst"
+        binary_file.write_bytes(b"binf" + (b"\0" * 60) + b"gbtree appears outside first read window")
 
         result = scan_model_directory_or_file(str(binary_file), cache_enabled=False)
 
@@ -1045,9 +1092,9 @@ class TestXGBoostFailClosedEndToEnd:
         assert "xgboost" in result.scanner_names
         assert not result.issues
 
-    def test_binf_signature_core_does_not_false_positive(self, tmp_path: Path) -> None:
-        binary_file = tmp_path / "signature.bst"
-        binary_file.write_bytes(b"binf" + (b"\0" * 60) + b"gbtree appears outside first read window")
+    def test_headerless_legacy_binary_core_does_not_false_positive(self, tmp_path: Path) -> None:
+        binary_file = tmp_path / "legacy.bst"
+        binary_file.write_bytes(_headerless_legacy_binary_header())
 
         result = scan_model_directory_or_file(str(binary_file), cache_enabled=False)
 
@@ -1069,7 +1116,7 @@ class TestXGBoostFailClosedEndToEnd:
                 assert result.success is False
                 assert determine_exit_code(result) == 2
                 _assert_inconclusive_metadata(result, binary_file, "xgboost_binary_structure_unrecognized")
-                assert any("expected XGBoost binary model markers" in str(issue.message) for issue in result.issues)
+                assert any("expected XGBoost binary signature" in str(issue.message) for issue in result.issues)
 
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
         finally:

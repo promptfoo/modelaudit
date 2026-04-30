@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -241,6 +242,10 @@ class XGBoostScanner(BaseScanner):
         b"dart",
     )
     _BINARY_MIN_STRUCTURE_BYTES: ClassVar[int] = 32
+    _LEGACY_HEADER_BYTES: ClassVar[int] = 136
+    _BINARY_SIGNATURE: ClassVar[bytes] = b"binf"
+    _MAX_LEGACY_HEADER_MAJOR_VERSION: ClassVar[int] = 3
+    _MAX_LEGACY_HEADER_MINOR_VERSION: ClassVar[int] = 100
     _INCONCLUSIVE_REASONS: ClassVar[dict[str, str]] = {
         "json_parse_failed": "xgboost_json_parse_failed",
         "json_analysis_failed": "xgboost_json_analysis_failed",
@@ -808,12 +813,43 @@ class XGBoostScanner(BaseScanner):
         except OSError:
             return False
 
+    @classmethod
+    def _looks_like_headerless_legacy_binary(cls, header: bytes) -> bool:
+        """Recognize the older legacy payload header written before `binf` existed."""
+        if len(header) < cls._LEGACY_HEADER_BYTES:
+            return False
+
+        try:
+            (
+                base_score,
+                num_feature,
+                num_class,
+                contain_extra_attrs,
+                contain_eval_metrics,
+                major_version,
+                minor_version,
+            ) = struct.unpack("<fIiiiII", header[:28])
+        except struct.error:
+            return False
+
+        reserved = header[28 : cls._LEGACY_HEADER_BYTES]
+        return (
+            0.0 <= base_score <= 1.0
+            and 0 <= num_feature <= 1_000_000
+            and 0 <= num_class <= 100_000
+            and contain_extra_attrs in {0, 1}
+            and contain_eval_metrics in {0, 1}
+            and 0 <= major_version <= cls._MAX_LEGACY_HEADER_MAJOR_VERSION
+            and 0 <= minor_version <= cls._MAX_LEGACY_HEADER_MINOR_VERSION
+            and not any(reserved)
+        )
+
     def _validate_binary_structure(self, path: str, result: ScanResult) -> None:
         """Validate XGBoost binary file structure."""
         try:
             with open(path, "rb") as f:
                 # Read first few bytes to check for basic structure
-                header = f.read(64)
+                header = f.read(self._LEGACY_HEADER_BYTES)
 
                 if len(header) < self._BINARY_MIN_STRUCTURE_BYTES:
                     result.add_check(
@@ -830,13 +866,15 @@ class XGBoostScanner(BaseScanner):
                     )
                     return
 
-                # Check for readable strings that typically appear in XGBoost models
+                # The legacy binary format starts with `binf`; marker strings
+                # alone can be planted in arbitrary text payloads.
                 header_str = header.decode("utf-8", errors="ignore")
-                expected_patterns = ["binf", "gbtree", "gblinear", "dart", "reg:", "binary:", "multi:"]
+                expected_patterns = ["gbtree", "gblinear", "dart", "reg:", "binary:", "multi:"]
+                patterns_found = [pattern for pattern in expected_patterns if pattern in header_str.lower()]
+                has_binary_signature = header.startswith(self._BINARY_SIGNATURE)
+                has_headerless_legacy_structure = self._looks_like_headerless_legacy_binary(header)
 
-                has_expected_pattern = any(pattern in header_str.lower() for pattern in expected_patterns)
-
-                if not has_expected_pattern:
+                if not has_binary_signature and not has_headerless_legacy_structure:
                     # Check if it looks like binary data or something else
                     if all(b < 32 or b > 126 for b in header[:16]):
                         result.add_check(
@@ -855,23 +893,41 @@ class XGBoostScanner(BaseScanner):
                         result.add_check(
                             name="Binary Structure Validation",
                             passed=False,
-                            message="File does not contain expected XGBoost binary model markers",
+                            message="File does not start with the expected XGBoost binary signature",
                             severity=IssueSeverity.INFO,
                             location=path,
-                            details={"expected_patterns": expected_patterns},
-                            why="Missing XGBoost markers may indicate a truncated, corrupted, or mislabeled model file",
+                            details={
+                                "expected_signature": self._BINARY_SIGNATURE.decode("ascii"),
+                                "text_markers_found": patterns_found,
+                            },
+                            why=(
+                                "Missing the XGBoost binary signature may indicate a truncated, corrupted, "
+                                "or mislabeled model file"
+                            ),
                         )
                     if not self.enable_xgb_loading:
                         self._mark_inconclusive_scan_result(
                             result, self._INCONCLUSIVE_REASONS["binary_structure_unrecognized"]
                         )
                 else:
+                    binary_format = "binf" if has_binary_signature else "headerless_legacy"
                     result.add_check(
                         name="XGBoost Binary Pattern Check",
                         passed=True,
-                        message="Found expected XGBoost patterns in binary file",
+                        message=(
+                            "Found expected XGBoost binary signature"
+                            if has_binary_signature
+                            else "Found plausible headerless XGBoost legacy binary structure"
+                        ),
                         location=path,
-                        details={"patterns_found": [p for p in expected_patterns if p in header_str.lower()]},
+                        details={
+                            "binary_format": binary_format,
+                            "patterns_found": (
+                                [self._BINARY_SIGNATURE.decode("ascii"), *patterns_found]
+                                if has_binary_signature
+                                else patterns_found
+                            ),
+                        },
                     )
 
         except Exception as e:
