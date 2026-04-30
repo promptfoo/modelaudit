@@ -113,6 +113,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **security:** inspect non-canonical SavedModel root siblings for suspicious
+  executable-like content
 - **security:** detect bare-string Lua `require "module"` loads in Torch7
   artifacts
 - **security:** keep trusted NeMo namespaces from suppressing suspicious Hydra
