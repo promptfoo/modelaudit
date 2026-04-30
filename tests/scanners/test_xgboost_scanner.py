@@ -9,8 +9,10 @@ Tests cover various XGBoost model formats and security vulnerabilities:
 - Integration with pickle scanner for .pkl/.joblib files
 """
 
+import copy
 import json
 import pickle
+import struct
 import subprocess as real_subprocess
 import tempfile
 from collections.abc import Callable, Iterator
@@ -39,6 +41,11 @@ def temp_dir() -> Iterator[Path]:
     """Create a temporary directory for test files."""
     with tempfile.TemporaryDirectory() as tmpdir:
         yield Path(tmpdir)
+
+
+def _headerless_legacy_binary_header() -> bytes:
+    """Create the older pre-`binf` learner header used by legacy XGBoost binaries."""
+    return struct.pack("<fIiiiII27i", 0.5, 4, 0, 1, 0, 0, 90, *([0] * 27))
 
 
 @pytest.fixture
@@ -279,6 +286,62 @@ class TestXGBoostJSONScanning:
         checks = {check.name: check for check in result.checks}
         assert checks["Tree Depth Validation"].status == CheckStatus.FAILED
         assert checks["Tree Depth Validation"].details["depth"] == 3
+
+    def test_tree_depth_validation_checks_trees_after_first_ten(
+        self,
+        temp_dir: Path,
+        valid_xgboost_json: dict[str, Any],
+    ) -> None:
+        """Late trees should not bypass structure validation."""
+        trees = valid_xgboost_json["learner"]["gradient_booster"]["model"]["trees"]
+        shallow_tree = copy.deepcopy(trees[1])
+        deep_tree = copy.deepcopy(trees[0])
+        deep_tree["left_children"] = [1, 2, 3, -1]
+        deep_tree["right_children"] = [-1, -1, -1, -1]
+        deep_tree["parents"] = [2147483647, 0, 1, 2]
+        valid_xgboost_json["learner"]["gradient_booster"]["model"]["trees"] = [
+            *[copy.deepcopy(shallow_tree) for _ in range(10)],
+            deep_tree,
+        ]
+
+        json_file = temp_dir / "late_deep_tree.json"
+        json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
+
+        result = XGBoostScanner({"max_tree_depth": 2}).scan(str(json_file))
+
+        checks = [check for check in result.checks if check.name == "Tree Depth Validation"]
+        assert len(checks) == 1
+        assert checks[0].status == CheckStatus.FAILED
+        assert checks[0].details["tree_index"] == 10
+        assert checks[0].details["depth"] == 3
+
+    def test_tree_depth_validation_aggregates_many_late_failures(
+        self,
+        temp_dir: Path,
+        valid_xgboost_json: dict[str, Any],
+    ) -> None:
+        """Repeated deep trees should not flood the scan result."""
+        trees = valid_xgboost_json["learner"]["gradient_booster"]["model"]["trees"]
+        deep_tree = copy.deepcopy(trees[0])
+        deep_tree["left_children"] = [1, 2, 3, -1]
+        deep_tree["right_children"] = [-1, -1, -1, -1]
+        deep_tree["parents"] = [2147483647, 0, 1, 2]
+        valid_xgboost_json["learner"]["gradient_booster"]["model"]["trees"] = [
+            copy.deepcopy(deep_tree) for _ in range(25)
+        ]
+
+        json_file = temp_dir / "many_deep_trees.json"
+        json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
+
+        result = XGBoostScanner({"max_tree_depth": 2}).scan(str(json_file))
+
+        checks = [check for check in result.checks if check.name == "Tree Depth Validation"]
+        assert len(checks) == 1
+        assert checks[0].status == CheckStatus.FAILED
+        assert checks[0].details["tree_count"] == 25
+        assert checks[0].details["tree_index"] == 0
+        assert checks[0].details["max_observed_depth"] == 3
+        assert checks[0].details["examples"] == [{"tree_index": tree_index, "depth": 3} for tree_index in range(10)]
 
     def test_invalid_json_fails(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
         """Test that invalid JSON content is detected."""
@@ -572,8 +635,9 @@ class TestXGBoostBinaryScanning:
 
         result = xgboost_scanner.scan(str(binary_file))
 
-        assert result.success is True
-        assert "scan_outcome" not in result.metadata
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_binary_structure_unrecognized" in result.metadata["scan_outcome_reasons"]
         assert not any("pickle file" in str(issue.message) for issue in result.issues)
 
     def test_bst_with_ubjson_header_routes_to_ubj_scan(self, temp_dir: Path) -> None:
@@ -658,7 +722,7 @@ class TestXGBoostBinaryScanning:
     def test_binary_structure_validation(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
         """Test binary structure validation."""
         # Create a file with some XGBoost-like content
-        binary_content = b"gbtree\x00\x00\x01\x02reg:squarederror\x00\x00extra xgboost bytes"
+        binary_content = b"binf\x00\x00\x01\x02reg:squarederror\x00\x00extra xgboost bytes"
 
         binary_file = temp_dir / "valid.bst"
         binary_file.write_bytes(binary_content)
@@ -668,6 +732,18 @@ class TestXGBoostBinaryScanning:
         # Should find expected XGBoost patterns
         pattern_checks = [c for c in result.checks if "Pattern Check" in c.name and c.status.value == "passed"]
         assert len(pattern_checks) > 0
+
+    def test_marker_only_binary_is_inconclusive(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
+        """Printable marker-shaped junk should not pass as a legacy binary model."""
+        binary_file = temp_dir / "marker_only.bst"
+        binary_file.write_bytes(b"custom xgboost binary gbtree reg:squarederror")
+
+        result = xgboost_scanner.scan(str(binary_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_binary_structure_unrecognized" in result.metadata["scan_outcome_reasons"]
+        assert any("expected XGBoost binary signature" in str(issue.message) for issue in result.issues)
 
     def test_binf_binary_signature_passes_structure_validation(
         self, temp_dir: Path, xgboost_scanner: XGBoostScanner
@@ -682,6 +758,23 @@ class TestXGBoostBinaryScanning:
         assert "scan_outcome" not in result.metadata
         assert any(
             "binf" in check.details.get("patterns_found", [])
+            for check in result.checks
+            if "Pattern Check" in check.name
+        )
+
+    def test_headerless_legacy_binary_passes_structure_validation(
+        self, temp_dir: Path, xgboost_scanner: XGBoostScanner
+    ) -> None:
+        """Older pre-`binf` binaries should remain accepted."""
+        binary_file = temp_dir / "legacy.bst"
+        binary_file.write_bytes(_headerless_legacy_binary_header())
+
+        result = xgboost_scanner.scan(str(binary_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
+        assert any(
+            check.details.get("binary_format") == "headerless_legacy"
             for check in result.checks
             if "Pattern Check" in check.name
         )
@@ -711,7 +804,7 @@ class TestXGBoostBinaryScanning:
 
         result = xgboost_scanner.scan(str(binary_file))
 
-        assert any("expected XGBoost binary model markers" in str(issue.message) for issue in result.issues)
+        assert any("expected XGBoost binary signature" in str(issue.message) for issue in result.issues)
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "xgboost_binary_structure_unrecognized" in result.metadata["scan_outcome_reasons"]
@@ -1020,9 +1113,20 @@ class TestXGBoostFailClosedEndToEnd:
         finally:
             reset_cache_manager()
 
-    def test_non_pickle_xgboost_binary_core_does_not_false_positive(self, tmp_path: Path) -> None:
+    def test_marker_only_xgboost_binary_core_fails_closed(self, tmp_path: Path) -> None:
         binary_file = tmp_path / "custom.bst"
         binary_file.write_bytes(b"custom xgboost binary gbtree reg:squarederror")
+
+        result = scan_model_directory_or_file(str(binary_file), cache_enabled=False)
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert "xgboost" in result.scanner_names
+        _assert_inconclusive_metadata(result, binary_file, "xgboost_binary_structure_unrecognized")
+
+    def test_binf_signature_core_does_not_false_positive(self, tmp_path: Path) -> None:
+        binary_file = tmp_path / "signature.bst"
+        binary_file.write_bytes(b"binf" + (b"\0" * 60) + b"gbtree appears outside first read window")
 
         result = scan_model_directory_or_file(str(binary_file), cache_enabled=False)
 
@@ -1031,9 +1135,9 @@ class TestXGBoostFailClosedEndToEnd:
         assert "xgboost" in result.scanner_names
         assert not result.issues
 
-    def test_binf_signature_core_does_not_false_positive(self, tmp_path: Path) -> None:
-        binary_file = tmp_path / "signature.bst"
-        binary_file.write_bytes(b"binf" + (b"\0" * 60) + b"gbtree appears outside first read window")
+    def test_headerless_legacy_binary_core_does_not_false_positive(self, tmp_path: Path) -> None:
+        binary_file = tmp_path / "legacy.bst"
+        binary_file.write_bytes(_headerless_legacy_binary_header())
 
         result = scan_model_directory_or_file(str(binary_file), cache_enabled=False)
 
@@ -1055,7 +1159,7 @@ class TestXGBoostFailClosedEndToEnd:
                 assert result.success is False
                 assert determine_exit_code(result) == 2
                 _assert_inconclusive_metadata(result, binary_file, "xgboost_binary_structure_unrecognized")
-                assert any("expected XGBoost binary model markers" in str(issue.message) for issue in result.issues)
+                assert any("expected XGBoost binary signature" in str(issue.message) for issue in result.issues)
 
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
         finally:
