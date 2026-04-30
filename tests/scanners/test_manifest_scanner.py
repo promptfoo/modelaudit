@@ -199,7 +199,7 @@ def test_manifest_scanner_yml_not_handled(tmp_path):
     assert scanner.can_handle(str(yml_file)) is False
 
 
-def test_manifest_scanner_can_handle(tmp_path):
+def test_manifest_scanner_can_handle(tmp_path: Path) -> None:
     """Test that scanner correctly identifies supported files."""
     scanner = ManifestScanner()
 
@@ -207,6 +207,13 @@ def test_manifest_scanner_can_handle(tmp_path):
     (tmp_path / "config.json").write_text('{"model_type": "test"}')
     (tmp_path / "generation_config.json").write_text("{}")
     (tmp_path / "model_index.json").write_text("{}")
+    (tmp_path / "manifest.json").write_text("{}")
+    (tmp_path / "hyperparams.yaml").write_text("model_type: bert\n")
+    (tmp_path / "environment.yml").write_text("name: model-env\n")
+    (tmp_path / "conda.yaml").write_text("name: model-env\n")
+    (tmp_path / "artifact.manifest").write_text('{"model_type": "bert"}')
+    (tmp_path / "weights.model").write_text('{"blob": true}')
+    (tmp_path / "weights.metadata").write_text('{"blob": true}')
     (tmp_path / "tokenizer_config.json").write_text("{}")
     (tmp_path / "package.json").write_text("{}")
     (tmp_path / "tsconfig.json").write_text("{}")
@@ -215,6 +222,13 @@ def test_manifest_scanner_can_handle(tmp_path):
     assert scanner.can_handle(str(tmp_path / "config.json")) is True
     assert scanner.can_handle(str(tmp_path / "generation_config.json")) is True
     assert scanner.can_handle(str(tmp_path / "model_index.json")) is True
+    assert scanner.can_handle(str(tmp_path / "manifest.json")) is True
+    assert scanner.can_handle(str(tmp_path / "hyperparams.yaml")) is True
+    assert scanner.can_handle(str(tmp_path / "environment.yml")) is True
+    assert scanner.can_handle(str(tmp_path / "conda.yaml")) is True
+    assert scanner.can_handle(str(tmp_path / "artifact.manifest")) is True
+    assert scanner.can_handle(str(tmp_path / "weights.model")) is False
+    assert scanner.can_handle(str(tmp_path / "weights.metadata")) is False
 
     # Should not handle tokenizer configs (excluded)
     assert scanner.can_handle(str(tmp_path / "tokenizer_config.json")) is False
@@ -222,6 +236,19 @@ def test_manifest_scanner_can_handle(tmp_path):
     # Should not handle non-ML configs
     assert scanner.can_handle(str(tmp_path / "package.json")) is False
     assert scanner.can_handle(str(tmp_path / "tsconfig.json")) is False
+
+
+def test_manifest_scanner_flags_blacklist_on_manifest_suffix(tmp_path: Path) -> None:
+    test_file = tmp_path / "artifact.manifest"
+    test_file.write_text(json.dumps({"description": "unsafe model"}), encoding="utf-8")
+
+    result = ManifestScanner(config={"blacklist_patterns": ["unsafe"]}).scan(str(test_file))
+
+    assert result.success is True
+    assert any(
+        issue.details.get("blacklisted_term") == "unsafe" and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
 
 
 def test_manifest_scanner_url_shortener_flagged(tmp_path):
