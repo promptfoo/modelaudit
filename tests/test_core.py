@@ -15,7 +15,7 @@ import pytest
 from modelaudit import core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import scan_file, scan_model_directory_or_file
-from modelaudit.scanners import flax_msgpack_scanner
+from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from tests.helpers import create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
 
@@ -160,6 +160,37 @@ def test_scan_file_missing_msgpack_result_is_not_cached(tmp_path: Path, monkeypa
 
         assert first.success is False
         assert second.success is False
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_missing_yaml_parser_result_is_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    yaml_file = model_dir / "config.yaml"
+    yaml_file.write_text("model: safe\n", encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+    monkeypatch.setattr(jinja2_template_scanner, "HAS_YAML", False)
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(yaml_file), config=config)
+        second = scan_file(str(yaml_file), config=config)
+
+        assert first.scanner_name == "jinja2_template"
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert second.metadata["scan_outcome"] == "inconclusive"
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
