@@ -311,6 +311,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **routing:** align manifest scanner routing with the manifest filenames and
+  dedicated manifest-style suffixes declared by the registry.
 - **security:** detect strong executable headers in generic archive members even
   when the payload has no executable-looking suffix.
 - **routing:** preserve renamed OpenVINO and PMML XML models with long benign

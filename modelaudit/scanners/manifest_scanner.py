@@ -57,6 +57,21 @@ MANIFEST_EXTENSIONS = [
     ".model",
     ".metadata",
 ]
+MANIFEST_EXACT_FILENAMES = frozenset(
+    {
+        "manifest.json",
+        "model.json",
+        "params.json",
+        "hyperparams.yaml",
+        "training_args.json",
+        "dataset_info.json",
+        "environment.yml",
+        "conda.yaml",
+        "metadata.json",
+        "index.json",
+    }
+)
+MANIFEST_EXACT_EXTENSIONS = frozenset({".manifest"})
 
 # Keys that might contain model names
 MODEL_NAME_KEYS_LOWER = [
@@ -546,6 +561,12 @@ class ManifestScanner(BaseScanner):
         web_configs = ["package.json", "tsconfig.json", "jsconfig.json", "webpack.config.json"]
         if filename in web_configs:
             return False
+
+        if filename in MANIFEST_EXACT_FILENAMES:
+            return True
+
+        if os.path.splitext(filename)[1] in MANIFEST_EXACT_EXTENSIONS:
+            return True
 
         if any(filename == pattern or filename.endswith(pattern) for pattern in aiml_specific_patterns):
             return True
