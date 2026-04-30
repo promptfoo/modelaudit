@@ -619,6 +619,28 @@ def test_scan_file_routes_raw_pickle_torch_suffix_collisions_to_pickle(
     assert result.success is True
 
 
+def test_scan_file_routes_jax_pickles_through_jax_specific_analysis(tmp_path: Path) -> None:
+    model_path = tmp_path / "state.pickle"
+    model_path.write_bytes(
+        pickle.dumps(
+            {
+                "framework": "jax",
+                "payload": "jax.experimental.io_callback",
+            }
+        )
+    )
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    assert any(
+        check.name == "JAX Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["pattern"] == r"jax\.experimental\.io_callback"
+        for check in result.checks
+    )
+
+
 def test_scan_file_routes_raw_bin_without_zip_structure_to_pytorch_binary(tmp_path: Path) -> None:
     model_path = tmp_path / "weights.bin"
     model_path.write_bytes(b"\x00" * 128)

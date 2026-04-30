@@ -448,6 +448,7 @@ pub(crate) struct ScanState<'a> {
     seen_notice_keys: HashSet<NoticeDedupeKey>,
     seen_global_reference_keys: HashSet<GlobalReferenceDedupeKey>,
     import_references_truncated: bool,
+    callable_invocations_truncated: bool,
 }
 
 impl<'a> ScanState<'a> {
@@ -500,6 +501,7 @@ impl<'a> ScanState<'a> {
             seen_notice_keys: HashSet::new(),
             seen_global_reference_keys: HashSet::new(),
             import_references_truncated: false,
+            callable_invocations_truncated: false,
         }
     }
 
@@ -2028,7 +2030,7 @@ impl<'a> ScanState<'a> {
         op_name: &'static str,
         position: usize,
     ) -> Vec<CallableInvocation> {
-        if arguments.len() < 2 || !Self::is_format_string_argument(arguments.first()) {
+        if arguments.len() < 2 || !self.brace_format_string_may_use_field(arguments.first()) {
             return Vec::new();
         }
         let mut invocations: Vec<CallableInvocation> = arguments
@@ -2214,7 +2216,7 @@ impl<'a> ScanState<'a> {
         op_name: &'static str,
         position: usize,
     ) -> Vec<CallableInvocation> {
-        if arguments.len() != 2 || !Self::is_format_string_argument(arguments.first()) {
+        if arguments.len() != 2 || !self.brace_format_string_may_use_field(arguments.first()) {
             return Vec::new();
         }
         self.mapping_lookup_invocations(arguments.get(1), None, op_name, position)
@@ -2226,7 +2228,9 @@ impl<'a> ScanState<'a> {
         op_name: &'static str,
         position: usize,
     ) -> Vec<CallableInvocation> {
-        if arguments.len() != 2 || !Self::is_format_string_argument(arguments.first()) {
+        if arguments.len() != 2
+            || !self.percent_format_string_may_use_mapping_key(arguments.first())
+        {
             return Vec::new();
         }
         self.mapping_lookup_invocations(arguments.get(1), None, op_name, position)
@@ -2324,7 +2328,7 @@ impl<'a> ScanState<'a> {
         position: usize,
     ) -> Vec<CallableInvocation> {
         if !expected_arg_counts.contains(&arguments.len())
-            || !Self::is_format_string_argument(arguments.get(1))
+            || !self.brace_format_string_may_use_field(arguments.get(1))
         {
             return Vec::new();
         }
@@ -2362,6 +2366,57 @@ impl<'a> ScanState<'a> {
                 }
                 Some(_) => return true,
                 None => {}
+            }
+        }
+        false
+    }
+
+    fn brace_format_string_may_use_field(&self, value: Option<&StackValue>) -> bool {
+        if !Self::is_format_string_argument(value) {
+            return false;
+        }
+        let Some(format_string) = value.and_then(|value| stack_value_string(value, self.payload))
+        else {
+            return false;
+        };
+        Self::brace_format_literal_contains_field(&format_string)
+    }
+
+    fn brace_format_literal_contains_field(format_string: &str) -> bool {
+        let mut chars = format_string.chars().peekable();
+        while let Some(character) = chars.next() {
+            if character != '{' {
+                continue;
+            }
+            if chars.peek() == Some(&'{') {
+                chars.next();
+                continue;
+            }
+            return true;
+        }
+        false
+    }
+
+    fn percent_format_string_may_use_mapping_key(&self, value: Option<&StackValue>) -> bool {
+        let Some(format_string) = value.and_then(|value| stack_value_string(value, self.payload))
+        else {
+            return false;
+        };
+        Self::percent_format_literal_contains_mapping_key(&format_string)
+    }
+
+    fn percent_format_literal_contains_mapping_key(format_string: &str) -> bool {
+        let mut chars = format_string.chars().peekable();
+        while let Some(character) = chars.next() {
+            if character != '%' {
+                continue;
+            }
+            match chars.peek() {
+                Some('%') => {
+                    chars.next();
+                }
+                Some('(') => return true,
+                _ => {}
             }
         }
         false
@@ -4093,9 +4148,11 @@ impl<'a> ScanState<'a> {
             invocation.reference.name.clone(),
             invocation.positional_arg_count,
         );
-        if self.callable_invocation_keys.contains(&dedupe_key)
-            || self.callable_invocations.len() >= MAX_IMPORT_REFERENCES
-        {
+        if self.callable_invocation_keys.contains(&dedupe_key) {
+            return;
+        }
+        if self.callable_invocations.len() >= MAX_IMPORT_REFERENCES {
+            self.record_callable_invocations_truncated_notice();
             return;
         }
         self.callable_invocation_keys.insert(dedupe_key);
@@ -4131,6 +4188,30 @@ impl<'a> ScanState<'a> {
             ));
         }
         self.callable_invocations.push(details);
+    }
+
+    fn record_callable_invocations_truncated_notice(&mut self) {
+        if self.callable_invocations_truncated {
+            return;
+        }
+        if self.status.is_complete() {
+            self.status = ScanStatus::Inconclusive;
+        }
+        self.callable_invocations_truncated = true;
+        self.add_notice(Notice {
+            message: "Callable invocation metadata exceeded the scanner reporting limit"
+                .to_string(),
+            severity: "info",
+            location: Some(self.source.clone()),
+            code: Some("callable_invocations_truncated"),
+            details: vec![
+                (
+                    "max_callable_invocations".to_string(),
+                    DetailValue::UInt(MAX_IMPORT_REFERENCES as u64),
+                ),
+                ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
+            ],
+        });
     }
 
     fn rebuild_seen_notice_keys(&mut self) {
@@ -4669,13 +4750,10 @@ impl<'a> ScanState<'a> {
             for reference in follow_on_scan.import_references {
                 self.push_import_reference(reference);
             }
-            for invocation in follow_on_scan.callable_invocations {
-                if self.callable_invocations.len() < MAX_IMPORT_REFERENCES
-                    && self.remember_callable_invocation_details(&invocation)
-                {
-                    self.callable_invocations.push(invocation);
-                }
-            }
+            self.merge_follow_on_callable_invocations(
+                follow_on_scan.callable_invocations,
+                follow_on_scan.callable_invocations_truncated,
+            );
             if had_findings {
                 self.add_notice(Notice {
                     message: "Follow-on pickle stream detected after malformed padding".to_string(),
@@ -4699,15 +4777,40 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn remember_callable_invocation_details(&mut self, details: &[(String, DetailValue)]) -> bool {
+    fn merge_follow_on_callable_invocations(
+        &mut self,
+        follow_on_invocations: Vec<Vec<(String, DetailValue)>>,
+        follow_on_invocations_truncated: bool,
+    ) {
+        if follow_on_invocations_truncated {
+            self.record_callable_invocations_truncated_notice();
+        }
+        for invocation in follow_on_invocations {
+            let Some(invocation_key) = Self::callable_invocation_detail_key(&invocation) else {
+                continue;
+            };
+            if self.callable_invocation_keys.contains(&invocation_key) {
+                continue;
+            }
+            if self.callable_invocations.len() >= MAX_IMPORT_REFERENCES {
+                self.record_callable_invocations_truncated_notice();
+                continue;
+            }
+            self.callable_invocation_keys.insert(invocation_key);
+            self.callable_invocations.push(invocation);
+        }
+    }
+
+    fn callable_invocation_detail_key(
+        details: &[(String, DetailValue)],
+    ) -> Option<(String, String, Option<usize>)> {
         let module = detail_string(details, "module").unwrap_or_default();
         let name = detail_string(details, "name").unwrap_or_default();
         if module.is_empty() || name.is_empty() {
-            return false;
+            return None;
         }
         let positional_arg_count = detail_usize(details, "positional_arg_count");
-        self.callable_invocation_keys
-            .insert((module, name, positional_arg_count))
+        Some((module, name, positional_arg_count))
     }
 
     fn coalesce_redundant_global_findings(&mut self) {
@@ -4829,6 +4932,10 @@ impl<'a> ScanState<'a> {
             callable_invocations.append(DetailValue::Dict(invocation.clone()).to_py_object(py)?)?;
         }
         metadata.set_item("callable_invocations", callable_invocations)?;
+        metadata.set_item(
+            "callable_invocations_truncated",
+            self.callable_invocations_truncated,
+        )?;
         if !self.protocols.is_empty() {
             metadata.set_item("protocols", &self.protocols)?;
         }
@@ -5786,6 +5893,125 @@ mod tests {
     }
 
     #[test]
+    fn callable_invocation_metadata_is_capped_with_notice() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "callable-invocation-cap.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+
+        for index in 0..=MAX_IMPORT_REFERENCES {
+            let invocation = ScanState::callable_invocation(
+                GlobalRef {
+                    module: "module".to_string(),
+                    name: format!("call_{index}"),
+                    position: index,
+                    malformed: false,
+                },
+                "REDUCE",
+                index,
+                Some(0),
+            );
+            scan.push_callable_invocation(&invocation);
+        }
+
+        assert_eq!(scan.callable_invocations.len(), MAX_IMPORT_REFERENCES);
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(
+            scan.notices
+                .iter()
+                .filter(|notice| notice.code == Some("callable_invocations_truncated"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn follow_on_callable_invocation_truncation_is_propagated() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "follow-on-truncated-invocations.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+
+        scan.merge_follow_on_callable_invocations(Vec::new(), true);
+
+        assert!(scan.callable_invocations_truncated);
+        assert!(scan
+            .notices
+            .iter()
+            .any(|notice| notice.code == Some("callable_invocations_truncated")));
+    }
+
+    #[test]
+    fn follow_on_duplicate_callable_invocations_do_not_mark_metadata_truncated() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "follow-on-duplicate-invocation.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+
+        for index in 0..MAX_IMPORT_REFERENCES {
+            let invocation = ScanState::callable_invocation(
+                GlobalRef {
+                    module: "module".to_string(),
+                    name: format!("call_{index}"),
+                    position: index,
+                    malformed: false,
+                },
+                "REDUCE",
+                index,
+                Some(0),
+            );
+            scan.push_callable_invocation(&invocation);
+        }
+
+        scan.merge_follow_on_callable_invocations(
+            vec![scan.callable_invocations[0].clone()],
+            false,
+        );
+
+        assert!(!scan.callable_invocations_truncated);
+        assert_eq!(scan.status, ScanStatus::Complete);
+    }
+
+    #[test]
     fn persistent_id_opcodes_are_flagged() {
         let options = ScanOptions {
             timeout_s: DEFAULT_TIMEOUT_S,
@@ -6227,6 +6453,112 @@ mod tests {
                 Some("subprocess\nrun")
             );
         }
+    }
+
+    #[test]
+    fn post_budget_tail_resynchronizes_after_malformed_bytes_before_modern_globals() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: 2,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x04\x88\x88\xff\x8c\nsubprocess\x94\x8c\x03run\x94\x93)R.";
+        let mut scan = ScanState::new(
+            "post-budget-malformed-modern-global.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        let finding = scan
+            .findings
+            .iter()
+            .find(|finding| finding.rule_code == Some("POST_BUDGET_GLOBAL"))
+            .expect("post-budget modern global finding after malformed byte");
+        assert_eq!(finding.severity, "critical");
+        assert_eq!(
+            detail_string(&finding.details, "pattern").as_deref(),
+            Some("subprocess\nrun")
+        );
+    }
+
+    #[test]
+    fn post_budget_tail_does_not_resolve_tuple_wrapped_globals_after_malformed_bytes() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: 2,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let payload = b"\x80\x04\x88\x88\xff\x8c\nsubprocess\x94\x8c\x03run\x94\x86\x93)R.";
+        let mut scan = ScanState::new(
+            "post-budget-malformed-tuple-wrapped-global.pkl".to_string(),
+            payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert!(
+            !scan.findings.iter().any(|finding| {
+                finding.rule_code == Some("POST_BUDGET_GLOBAL")
+                    && detail_string(&finding.details, "pattern").as_deref()
+                        == Some("subprocess\nrun")
+            }),
+            "tuple-wrapped STACK_GLOBAL operands after malformed bytes should stay unresolved"
+        );
+    }
+
+    #[test]
+    fn post_budget_tail_does_not_resynchronize_inside_truncated_literals() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: 2,
+            post_budget_scan_bytes: 32,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let inert_inner_bytes = b"\x8c\nsubprocess\x94\x8c\x03run\x94\x93)R.";
+        let mut payload = b"\x80\x04\x88\x88X".to_vec();
+        payload.extend_from_slice(&(64_u32).to_le_bytes());
+        payload.extend_from_slice(inert_inner_bytes);
+        payload.resize(4 + 1 + 4 + 64, b'A');
+        payload.push(b'.');
+        let mut scan = ScanState::new(
+            "post-budget-truncated-literal.pkl".to_string(),
+            &payload,
+            &options,
+            Some(payload.len()),
+            0,
+            0,
+            None,
+        );
+
+        scan.run();
+
+        assert!(
+            !scan.findings.iter().any(|finding| {
+                finding.rule_code == Some("POST_BUDGET_GLOBAL")
+                    && detail_string(&finding.details, "pattern").as_deref()
+                        == Some("subprocess\nrun")
+            }),
+            "truncated literal bodies must not be reparsed as executable opcodes"
+        );
     }
 
     fn short_binunicode(value: &[u8]) -> Vec<u8> {

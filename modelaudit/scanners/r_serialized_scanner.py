@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar
 from urllib.parse import urlsplit, urlunsplit
 
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 
@@ -677,6 +678,7 @@ class RSerializedScanner(BaseScanner):
         )
 
         if truncated:
+            mark_inconclusive_scan_result(result, "r_serialized_byte_ceiling_incomplete")
             result.add_check(
                 name="Byte Scan Ceiling",
                 passed=False,
@@ -712,5 +714,7 @@ class RSerializedScanner(BaseScanner):
             strings_truncated=strings_truncated,
         )
 
-        result.finish(success=not result.has_errors)
+        result.finish(
+            success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
+        )
         return result

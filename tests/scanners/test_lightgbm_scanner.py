@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from modelaudit.scanners import get_scanner_for_file
-from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.lightgbm_scanner import LightGBMScanner
 from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension, validate_file_type
 
@@ -111,6 +111,17 @@ def test_scan_detects_command_and_network_correlation(tmp_path: Path) -> None:
     assert len(correlation_checks) == 1
     assert correlation_checks[0].status == CheckStatus.FAILED
     assert correlation_checks[0].severity == IssueSeverity.CRITICAL
+
+
+def test_scan_bounded_lightgbm_window_is_inconclusive(tmp_path: Path) -> None:
+    path = tmp_path / "bounded.model"
+    path.write_text(_build_lightgbm_text(["metadata=" + ("safe " * 200)]), encoding="utf-8")
+
+    result = LightGBMScanner(config={"lightgbm_scan_budget": 256}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "lightgbm_bounded_read_incomplete" in result.metadata["scan_outcome_reasons"]
 
 
 def test_scan_redacts_urls_in_lightgbm_findings(tmp_path: Path) -> None:
