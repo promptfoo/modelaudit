@@ -308,6 +308,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **docs:** narrow public scan-coverage wording so unsupported or merely discovered formats are not over-promised
 - **analysis:** keep exact dangerous literals visible even when surrounding bytes look like ML weights
 - **analysis:** stop attacker-controlled file and directory names from suppressing dangerous framework-pattern findings
 - **security:** detect dangerous marker-free Python source blobs through the public JIT path so disguised archive members are still analyzed
