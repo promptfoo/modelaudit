@@ -321,6 +321,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **pickle:** keep internal Rust finding codes such as `STRUCTURAL_TAMPER` and `PICKLE_EXPANSION` in `pickle_rule_code` details while exposing stable ModelAudit rule codes for dashboards, SARIF, suppression, and severity configuration.
 
 ### Fixed
+
 - **flax:** keep explicit Flax/JAX checkpoint suffixes routed to the scanner when
   `msgpack` is unavailable so missing parser coverage fails closed
 - **llamafile:** fail closed when bounded embedded-payload scanning stops before
