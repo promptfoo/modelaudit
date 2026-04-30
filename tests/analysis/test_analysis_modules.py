@@ -123,6 +123,42 @@ class TestAnalysisModules:
         assert "Dangerous operation: os.system" in details["risk_factors"]
         assert "Safe usage of os.system" not in details["mitigating_factors"]
 
+    def test_semantic_analyzer_updates_aliases_after_rebinding(self) -> None:
+        """Assignments should update imported aliases before later calls are normalized."""
+        from modelaudit.analysis import CodeRiskLevel, SemanticAnalyzer
+
+        analyzer = SemanticAnalyzer()
+        risk_level, details = analyzer.analyze_code_behavior(
+            "import math as os\nimport os as real_os\nos = real_os\nos.system('id')",
+            {},
+        )
+
+        assert risk_level != CodeRiskLevel.SAFE
+        assert "os.system" in details["function_calls"]
+
+    def test_semantic_analyzer_drops_aliases_after_shadowing(self) -> None:
+        """Reassigned names should no longer be treated as imported call targets."""
+        from modelaudit.analysis import CodeRiskLevel, SemanticAnalyzer
+
+        analyzer = SemanticAnalyzer()
+        risk_level, details = analyzer.analyze_code_behavior(
+            "from os import system\nsystem = print\nsystem('hello')",
+            {},
+        )
+
+        assert risk_level == CodeRiskLevel.SAFE
+        assert "os.system" not in details["function_calls"]
+
+    def test_semantic_analyzer_preserves_safe_builtin_alias_usage(self) -> None:
+        """Builtin aliases should keep the same safe-pattern treatment as direct calls."""
+        from modelaudit.analysis import CodeRiskLevel, SemanticAnalyzer
+
+        analyzer = SemanticAnalyzer()
+        risk_level, details = analyzer.analyze_code_behavior("from builtins import eval as e\ne('1+1')", {})
+
+        assert risk_level == CodeRiskLevel.SAFE
+        assert details["mitigating_factors"] == ["Safe usage of eval"]
+
     def test_integrated_analyzer_basic(self):
         """Test basic integrated analyzer functionality."""
         from modelaudit.analysis import IntegratedAnalyzer
@@ -219,6 +255,30 @@ class TestAnalysisModules:
         assert result.risk_level == "high"
         assert result.is_suspicious is True
         assert "Pattern appears safe in current context" not in result.recommendations
+
+    def test_integrated_analyzer_keeps_explicit_semantic_risks_suspicious(self) -> None:
+        """Dangerous semantic findings should not disappear behind reassuring context."""
+        from modelaudit.analysis import IntegratedAnalyzer
+        from modelaudit.analysis.unified_context import ModelArchitecture, UnifiedMLContext
+
+        context = UnifiedMLContext(
+            Path("test.pkl"),
+            1024,
+            "pickle",
+            primary_framework="pytorch",
+            architecture=ModelArchitecture.TRANSFORMER,
+        )
+
+        result = IntegratedAnalyzer().analyze_suspicious_pattern(
+            "eval",
+            "code_execution",
+            context,
+            code_snippet="eval(user_input)",
+        )
+
+        assert result.risk_level == "low"
+        assert result.is_suspicious is True
+        assert "Dangerous operation: eval" in result.reasoning
 
     def test_integrated_entropy_does_not_upgrade_exact_dangerous_literals(self) -> None:
         """Weight-like bytes with an exact sink literal must not get skip confidence."""

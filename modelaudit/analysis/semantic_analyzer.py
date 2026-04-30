@@ -160,6 +160,7 @@ class SemanticAnalyzer:
                 for target in node.targets:
                     if isinstance(target, ast.Name):
                         self.context.variable_assignments[target.id] = node.value
+                        self._update_alias_binding(target.id, node.value)
                 self.generic_visit(node)
 
             def visit_If(self, node):
@@ -199,6 +200,12 @@ class SemanticAnalyzer:
                     normalized_name = f"{canonical_base}.{remainder}" if canonical_base and remainder else call_name
                     return self._normalize_builtin_call_name(normalized_name)
                 return None
+
+            def _update_alias_binding(self, target_name: str, value: ast.AST) -> None:
+                if isinstance(value, ast.Name) and value.id in self.context.import_aliases:
+                    self.context.import_aliases[target_name] = self.context.import_aliases[value.id]
+                    return
+                self.context.import_aliases.pop(target_name, None)
 
             @staticmethod
             def _normalize_builtin_call_name(call_name: str) -> str:
@@ -286,6 +293,13 @@ class SemanticAnalyzer:
         for pattern in self.safe_patterns.get(operation, {}):
             if re.search(pattern, code):
                 return True
+
+        for alias, canonical_name in context.import_aliases.items():
+            if canonical_name.removeprefix("builtins.") != operation:
+                continue
+            for pattern in self.safe_patterns.get(operation, {}):
+                if re.search(pattern.replace(operation, re.escape(alias), 1), code):
+                    return True
 
         # Check ML context
         if ml_context.get("framework") and operation in self.safe_contexts["ml_operations"]:

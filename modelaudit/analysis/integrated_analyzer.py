@@ -118,7 +118,8 @@ class IntegratedAnalyzer:
 
         # Determine risk level
         risk_level = self._calculate_risk_level(weighted_confidence, signals)
-        is_suspicious = risk_level in {"medium", "high", "critical"}
+        semantic_risk_factors = detailed.get("semantic", {}).get("analysis", {}).get("risk_factors", [])
+        is_suspicious = risk_level in {"medium", "high", "critical"} or bool(semantic_risk_factors)
 
         # Add general recommendations
         if not is_suspicious:
