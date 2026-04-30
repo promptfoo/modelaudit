@@ -320,6 +320,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** detect PaddlePaddle suspicious tokens that span the scanner's
+  1 MiB read boundaries.
 - **routing:** align manifest scanner routing with the manifest filenames and
   dedicated manifest-style suffixes declared by the registry.
 - **security:** detect strong executable headers in generic archive members even
