@@ -22,6 +22,7 @@ class CodeContext:
     """Context information for code analysis."""
 
     imports: set[str]
+    import_aliases: dict[str, str]
     function_calls: set[str]
     class_definitions: set[str]
     variable_assignments: dict[str, Any]
@@ -77,12 +78,16 @@ class SemanticAnalyzer:
 
         # Safe usage patterns
         self.safe_patterns = {
-            # NumPy/math evaluations
-            r"eval\s*\(\s*['\"][\d\s\+\-\*/\(\)\.]+['\"]\s*\)": "math_expression",
-            # DataFrame operations
-            r"eval\s*\(\s*['\"]df\[.+\]['\"]\s*\)": "dataframe_operation",
-            # Safe pickle usage
-            r"pickle\.load\s*\(\s*open\s*\(\s*['\"][\w/\-_\.]+\.pkl['\"]": "model_loading",
+            "eval": {
+                # NumPy/math evaluations
+                r"eval\s*\(\s*['\"][\d\s\+\-\*/\(\)\.]+['\"]\s*\)": "math_expression",
+                # DataFrame operations
+                r"eval\s*\(\s*['\"]df\[.+\]['\"]\s*\)": "dataframe_operation",
+            },
+            "pickle.load": {
+                # Safe pickle usage
+                r"pickle\.load\s*\(\s*open\s*\(\s*['\"][\w/\-_\.]+\.pkl['\"]": "model_loading",
+            },
         }
 
     def extract_code_context(self, code: str) -> CodeContext | None:
@@ -94,6 +99,7 @@ class SemanticAnalyzer:
 
         context = CodeContext(
             imports=set(),
+            import_aliases={},
             function_calls=set(),
             class_definitions=set(),
             variable_assignments={},
@@ -112,11 +118,16 @@ class SemanticAnalyzer:
             def visit_Import(self, node):
                 for alias in node.names:
                     self.context.imports.add(alias.name)
+                    if alias.asname:
+                        self.context.import_aliases[alias.asname] = alias.name
                 self.generic_visit(node)
 
             def visit_ImportFrom(self, node):
                 if node.module:
                     self.context.imports.add(node.module)
+                    for alias in node.names:
+                        bound_name = alias.asname or alias.name
+                        self.context.import_aliases[bound_name] = f"{node.module}.{alias.name}"
                 self.generic_visit(node)
 
             def visit_Call(self, node):
@@ -149,6 +160,7 @@ class SemanticAnalyzer:
                 for target in node.targets:
                     if isinstance(target, ast.Name):
                         self.context.variable_assignments[target.id] = node.value
+                        self._update_alias_binding(target.id, node.value)
                 self.generic_visit(node)
 
             def visit_If(self, node):
@@ -165,7 +177,9 @@ class SemanticAnalyzer:
 
             def _get_call_name(self, node):
                 if isinstance(node.func, ast.Name):
-                    return node.func.id
+                    return self._normalize_builtin_call_name(
+                        self.context.import_aliases.get(node.func.id, node.func.id)
+                    )
                 elif isinstance(node.func, ast.Attribute):
                     parts = []
                     current = node.func
@@ -180,8 +194,25 @@ class SemanticAnalyzer:
                                 break
                             case _:
                                 break
-                    return ".".join(reversed(parts))
+                    call_name = ".".join(reversed(parts))
+                    base_name, _, remainder = call_name.partition(".")
+                    canonical_base = self.context.import_aliases.get(base_name)
+                    normalized_name = f"{canonical_base}.{remainder}" if canonical_base and remainder else call_name
+                    return self._normalize_builtin_call_name(normalized_name)
                 return None
+
+            def _update_alias_binding(self, target_name: str, value: ast.AST) -> None:
+                if isinstance(value, ast.Name) and value.id in self.context.import_aliases:
+                    self.context.import_aliases[target_name] = self.context.import_aliases[value.id]
+                    return
+                self.context.import_aliases.pop(target_name, None)
+
+            @staticmethod
+            def _normalize_builtin_call_name(call_name: str) -> str:
+                builtin_prefix = "builtins."
+                if call_name.startswith(builtin_prefix):
+                    return call_name[len(builtin_prefix) :]
+                return call_name
 
         visitor = ContextVisitor(context)
         visitor.visit(tree)
@@ -258,10 +289,17 @@ class SemanticAnalyzer:
 
     def _is_safe_usage(self, operation: str, code: str, context: CodeContext, ml_context: dict[str, Any]) -> bool:
         """Check if a potentially dangerous operation is used safely."""
-        # Check against safe patterns
-        for pattern, _usage_type in self.safe_patterns.items():
+        # Check only patterns that explicitly apply to this operation.
+        for pattern in self.safe_patterns.get(operation, {}):
             if re.search(pattern, code):
                 return True
+
+        for alias, canonical_name in context.import_aliases.items():
+            if canonical_name.removeprefix("builtins.") != operation:
+                continue
+            for pattern in self.safe_patterns.get(operation, {}):
+                if re.search(pattern.replace(operation, re.escape(alias), 1), code):
+                    return True
 
         # Check ML context
         if ml_context.get("framework") and operation in self.safe_contexts["ml_operations"]:

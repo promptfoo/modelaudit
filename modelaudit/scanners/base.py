@@ -630,6 +630,7 @@ class BaseScanner(ABC):
         model_type: str = "unknown",
         context: str = "",
         enable_check: bool = True,
+        raise_on_error: bool = False,
     ) -> list[dict]:
         """Collect JIT/script code findings without creating checks.
 
@@ -638,6 +639,7 @@ class BaseScanner(ABC):
             model_type: Type of model (pytorch, tensorflow, etc.)
             context: Context string for reporting
             enable_check: Whether to perform the check (allows disabling)
+            raise_on_error: Whether detector failures should propagate to the caller
 
         Returns:
             List of findings
@@ -666,9 +668,13 @@ class BaseScanner(ABC):
             return standardized_findings
 
         except ImportError:
+            if raise_on_error:
+                raise
             logger.debug("JITScriptDetector not available, skipping JIT/Script check")
             return []
         except Exception as e:
+            if raise_on_error:
+                raise
             logger.warning(f"Error checking for JIT/Script code: {e}")
             return []
 
@@ -849,6 +855,7 @@ class BaseScanner(ABC):
         data: bytes,
         context: str = "",
         enable_check: bool = True,
+        raise_on_error: bool = False,
     ) -> list[dict]:
         """Collect network communication findings without creating checks.
 
@@ -856,6 +863,7 @@ class BaseScanner(ABC):
             data: Binary model data to check
             context: Context string for reporting
             enable_check: Whether to perform the check (allows disabling)
+            raise_on_error: Whether detector failures should propagate to the caller
 
         Returns:
             List of findings
@@ -871,9 +879,13 @@ class BaseScanner(ABC):
             return findings
 
         except ImportError:
+            if raise_on_error:
+                raise
             logger.debug("NetworkCommDetector not available, skipping network comm check")
             return []
         except Exception as e:
+            if raise_on_error:
+                raise
             logger.warning(f"Error checking for network communication: {e}")
             return []
 
