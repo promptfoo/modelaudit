@@ -14,7 +14,8 @@ import pytest
 
 from modelaudit import core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
-from modelaudit.core import scan_file
+from modelaudit.core import scan_file, scan_model_directory_or_file
+from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from tests.helpers import create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
 
@@ -47,6 +48,11 @@ def _create_zip_with_ordered_entries(path: Path, entries: list[tuple[str, bytes]
     with zipfile.ZipFile(path, "w") as archive:
         for name, data in entries:
             archive.writestr(name, data)
+
+
+def _prepend_stub(path: Path, stub: bytes) -> None:
+    """Prefix an existing ZIP with reader-tolerated self-extracting stub bytes."""
+    path.write_bytes(stub + path.read_bytes())
 
 
 def _mark_zip_entries_encrypted(path: Path) -> None:
@@ -84,6 +90,138 @@ def test_scan_file_detects_malicious_zip_with_misleading_extension(tmp_path: Pat
     _assert_system_pickle_detected(result, "payload.pkl")
 
 
+@pytest.mark.parametrize("suffix", [".flax", ".orbax", ".jax"])
+def test_scan_file_fails_closed_for_msgpack_extensions_when_dependency_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+) -> None:
+    checkpoint = tmp_path / f"model{suffix}"
+    checkpoint.write_bytes(b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03")
+    monkeypatch.setattr(flax_msgpack_scanner, "HAS_MSGPACK", False)
+
+    result = scan_file(str(checkpoint))
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    library_check = next(check for check in result.checks if check.name == "msgpack Library Check")
+    assert library_check.message == "msgpack library not installed - cannot analyze Flax checkpoints"
+
+    aggregate = scan_model_directory_or_file(str(checkpoint), cache_scan_results=False)
+    assert aggregate.success is True
+    assert core_module.determine_exit_code(aggregate) == 1
+
+
+def test_scan_file_does_not_route_msgpack_suffix_near_match_without_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "model.flaxy"
+    checkpoint.write_bytes(b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03")
+    monkeypatch.setattr(flax_msgpack_scanner, "HAS_MSGPACK", False)
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+
+
+def test_scan_file_routes_malicious_explicit_flax_suffix_to_flax_scanner(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "malicious.flax"
+    checkpoint.write_bytes(
+        flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+def test_scan_file_missing_msgpack_result_is_not_cached(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checkpoint = tmp_path / "model.flax"
+    checkpoint.write_bytes(b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+    monkeypatch.setattr(flax_msgpack_scanner, "HAS_MSGPACK", False)
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(checkpoint), config=config)
+        second = scan_file(str(checkpoint), config=config)
+
+        assert first.success is False
+        assert second.success is False
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_missing_yaml_parser_result_is_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    yaml_file = model_dir / "config.yaml"
+    yaml_file.write_text("model: safe\n", encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+    monkeypatch.setattr(jinja2_template_scanner, "HAS_YAML", False)
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(yaml_file), config=config)
+        second = scan_file(str(yaml_file), config=config)
+
+        assert first.scanner_name == "jinja2_template"
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert second.metadata["scan_outcome"] == "inconclusive"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_still_routes_malicious_zip_with_local_header(tmp_path: Path) -> None:
+    disguised_zip = tmp_path / "payload.bin"
+    _create_misnamed_zip(disguised_zip, {"payload.pkl": _build_malicious_pickle()})
+
+    assert disguised_zip.read_bytes().startswith(b"PK\x03\x04")
+
+    result = scan_file(str(disguised_zip))
+
+    assert result.scanner_name == "zip"
+    _assert_system_pickle_detected(result, "payload.pkl")
+
+
+def test_scan_directory_preserves_parseable_prefixed_zip_with_central_directory_stub(tmp_path: Path) -> None:
+    disguised_zip = tmp_path / "payload.jpg"
+    _create_misnamed_zip(disguised_zip, {"payload.pkl": _build_malicious_pickle()})
+    _prepend_stub(disguised_zip, b"PK\x01\x02stub-prefix")
+
+    result = scan_model_directory_or_file(str(tmp_path))
+
+    assert any(scanner_name == "zip" for scanner_name in result.scanner_names)
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+
+
 def test_scan_file_detects_misnamed_gzip_wrapped_pickle_by_header(tmp_path: Path) -> None:
     disguised_gzip = tmp_path / "payload.jpg"
     disguised_gzip.write_bytes(gzip.compress(_build_malicious_pickle()))
@@ -110,6 +248,17 @@ def test_scan_file_does_not_route_compression_magic_near_match_to_compressed(tmp
 
     assert result.scanner_name == "unknown"
     assert not [check for check in result.checks if check.name.startswith("Compressed Wrapper")]
+    assert result.issues == []
+
+
+def test_scan_file_does_not_route_pk_prefix_near_match_to_zip(tmp_path: Path) -> None:
+    near_match = tmp_path / "payload.jpg"
+    near_match.write_bytes(b"PKNO harmless text")
+
+    result = scan_file(str(near_match))
+
+    assert result.scanner_name == "unknown"
+    assert not [check for check in result.checks if "ZIP" in check.name]
     assert result.issues == []
 
 

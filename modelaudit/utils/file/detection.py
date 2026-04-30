@@ -74,6 +74,14 @@ _SEVENZIP_MAGIC = b"7z\xbc\xaf\x27\x1c"
 _RAR4_MAGIC = b"Rar!\x1a\x07\x00"
 _RAR5_MAGIC = b"Rar!\x1a\x07\x01\x00"
 _LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
+_ZIP_MAGIC_SIGNATURES = (
+    b"PK\x03\x04",  # local file header
+    b"PK\x01\x02",  # central directory file header
+    b"PK\x05\x06",  # end of central directory
+    b"PK\x06\x06",  # ZIP64 end of central directory
+    b"PK\x06\x07",  # ZIP64 end of central directory locator
+    b"PK\x07\x08",  # data descriptor
+)
 _TAR_BLOCK_SIZE = 512
 _TAR_USTAR_OFFSET = 257
 _TAR_USTAR_MAGIC_SIZE = 5
@@ -1024,6 +1032,11 @@ def _looks_like_uncompressed_tar_header(header: bytes) -> bool:
     return _has_tar_ustar_signature(header) or _has_valid_tar_checksum_header(header)
 
 
+def _has_zip_magic(prefix: bytes) -> bool:
+    """Return whether a prefix starts with a recognized ZIP signature."""
+    return prefix.startswith(_ZIP_MAGIC_SIGNATURES)
+
+
 def is_zipfile(path: str) -> bool:
     """Check if file is a ZIP by reading the signature."""
     file_path = Path(path)
@@ -1031,7 +1044,7 @@ def is_zipfile(path: str) -> bool:
         return False
     try:
         signature = read_magic_bytes(path, 4)
-        return signature.startswith(b"PK")
+        return _has_zip_magic(signature)
     except OSError:
         return False
 
@@ -1192,7 +1205,7 @@ def detect_format_from_magic_bytes(
             return "gguf"
         case magic if magic in GGML_MAGIC_VARIANTS:
             return "ggml"
-        case magic if magic.startswith(b"PK"):
+        case magic if _has_zip_magic(magic):
             return "zip"
         case _:
             pass
@@ -1489,7 +1502,7 @@ def detect_file_format(path: str) -> str:
             return "tar"
         return compression_format
     # Check ZIP magic first (for .pt/.pth files that are actually zips)
-    if magic4.startswith(b"PK"):
+    if _has_zip_magic(magic4):
         if ext == ".mar" and is_torchserve_mar_archive(path):
             return "torchserve_mar"
         return "zip"
@@ -1517,7 +1530,7 @@ def detect_file_format(path: str) -> str:
         if _looks_like_tflite_header(magic8):
             return "tflite"
         # IMPORTANT: Check ZIP format first (PyTorch models saved with torch.save())
-        if magic4.startswith(b"PK"):
+        if _has_zip_magic(magic4):
             return "zip"
         if _looks_like_binary_pickle_protocol(magic4):
             return "pickle"
@@ -1547,7 +1560,7 @@ def detect_file_format(path: str) -> str:
     # For .pt/.pth/.ckpt files, check if they're ZIP format first
     if ext in (".pt", ".pth", ".ckpt"):
         # These files can be either ZIP or pickle format
-        if magic4.startswith(b"PK"):
+        if _has_zip_magic(magic4):
             return "zip"
         # If not ZIP, assume pickle format
         return "pickle"
@@ -1556,7 +1569,7 @@ def detect_file_format(path: str) -> str:
             return "tf_metagraph"
         return "unknown"
     if ext in (".ptl", ".pte"):
-        if magic4.startswith(b"PK"):
+        if _has_zip_magic(magic4):
             return "executorch"
         return "executorch"
     if ext in (".pkl", ".pickle", ".dill"):
@@ -1626,7 +1639,7 @@ def detect_file_format(path: str) -> str:
     if ext == ".npz":
         return "zip"
     if ext == ".joblib":
-        if magic4.startswith(b"PK"):
+        if _has_zip_magic(magic4):
             return "zip"
         return "pickle"
     if ext in (".rds", ".rda", ".rdata"):

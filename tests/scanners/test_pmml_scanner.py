@@ -64,6 +64,40 @@ def test_pmml_scanner_suspicious_extension_content(tmp_path: Path) -> None:
     assert all(i.severity == IssueSeverity.WARNING for i in suspicious_issues)
 
 
+def test_pmml_scanner_benign_ecosystem_call_is_not_flagged(tmp_path: Path) -> None:
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header>
+    <Extension>ecosystem()</Extension>
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "ecosystem.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is True
+    assert not any(issue.details.get("pattern") == r"\bsystem\s*\(" for issue in result.issues)
+
+
+def test_pmml_scanner_system_call_is_flagged(tmp_path: Path) -> None:
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header>
+    <Extension>system('id')</Extension>
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "system_call.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is True
+    assert any(issue.details.get("pattern") == r"\bsystem\s*\(" for issue in result.issues)
+
+
 def test_pmml_scanner_namespaced_extension_content(tmp_path: Path) -> None:
     """Test namespaced Extension and script tags are inspected."""
     pmml = """<?xml version='1.0'?>
