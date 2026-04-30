@@ -199,7 +199,7 @@ def test_manifest_scanner_yml_not_handled(tmp_path):
     assert scanner.can_handle(str(yml_file)) is False
 
 
-def test_manifest_scanner_can_handle(tmp_path):
+def test_manifest_scanner_can_handle(tmp_path: Path) -> None:
     """Test that scanner correctly identifies supported files."""
     scanner = ManifestScanner()
 
@@ -236,6 +236,19 @@ def test_manifest_scanner_can_handle(tmp_path):
     # Should not handle non-ML configs
     assert scanner.can_handle(str(tmp_path / "package.json")) is False
     assert scanner.can_handle(str(tmp_path / "tsconfig.json")) is False
+
+
+def test_manifest_scanner_flags_blacklist_on_manifest_suffix(tmp_path: Path) -> None:
+    test_file = tmp_path / "artifact.manifest"
+    test_file.write_text(json.dumps({"description": "unsafe model"}), encoding="utf-8")
+
+    result = ManifestScanner(config={"blacklist_patterns": ["unsafe"]}).scan(str(test_file))
+
+    assert result.success is True
+    assert any(
+        issue.details.get("blacklisted_term") == "unsafe" and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
 
 
 def test_manifest_scanner_url_shortener_flagged(tmp_path):
