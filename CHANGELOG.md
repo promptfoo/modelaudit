@@ -320,6 +320,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **skops:** require exploit-shaped structured loader nodes for CVE-2025-54412
+  and CVE-2025-54413 checks so inert prose, filenames, and valid loader nodes do
+  not become critical findings
 - **routing:** require recognized ZIP signatures before classifying files or
   streaming previews as archives, so benign `PK*` near-matches stay unclassified
 - **xgboost:** avoid flagging inert `feature_names` metadata as executable JSON
