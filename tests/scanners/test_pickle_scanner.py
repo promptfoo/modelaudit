@@ -388,6 +388,27 @@ def test_expensive_raw_prefilters_preserve_torch_jit_markers(tmp_path: Path) -> 
     assert result.metadata.get("pickle_jit_raw_detector_skipped") is not True
 
 
+def test_expensive_raw_prefilters_detect_embedded_python_payloads(tmp_path: Path) -> None:
+    path = tmp_path / "embedded-python.pkl"
+    path.write_bytes(
+        pickle.dumps(
+            {
+                "blob": b"def payload():\n    import os\n    return os.system('id')\n",
+            },
+            protocol=4,
+        )
+    )
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.metadata.get("pickle_expensive_raw_detectors_skipped") is not True
+    assert result.metadata.get("pickle_jit_raw_detector_skipped") is not True
+    assert any(
+        check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
 def test_expensive_raw_prefilters_preserve_structured_secret_assignments(tmp_path: Path) -> None:
     path = tmp_path / "structured-secret.pkl"
     path.write_bytes(pickle.dumps({"env": "password=CorrectHorseBattery42"}, protocol=4))
