@@ -58,6 +58,7 @@ STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset(
     }
 )
 ONNX_STRUCTURE_INCONCLUSIVE_REASON = "onnx_structure_validation_failed"
+ONNX_RAW_DETECTION_INCONCLUSIVE_REASON = "onnx_raw_detection_analysis_incomplete"
 ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON = "onnx_weight_distribution_analysis_incomplete"
 _PYTHON_OPERATOR_TYPES: frozenset[str] = frozenset(
     {
@@ -271,59 +272,79 @@ class OnnxScanner(BaseScanner):
             },
         )
 
-        # Check for JIT/Script code execution risks in the ONNX model
-        # Read the file as binary to scan for patterns
+        # Read the raw bytes once, then keep detector coverage separate so a
+        # failure in one detector does not masquerade as a clean pass.
         try:
-            # Check for interrupts before file reading
             self.check_interrupted()
             with open(path, "rb") as f:
                 model_data = f.read()
-            # Check for interrupts after file reading
             self.check_interrupted()
-            # Collect findings without creating individual checks
-            jit_findings = self.collect_jit_script_findings(
-                model_data,
-                model_type="onnx",
-                context=path,
+        except Exception as e:
+            logger.warning("Raw ONNX detector input read failed: %s", e)
+            self._mark_raw_detection_incomplete(
+                result,
+                path,
+                detector="raw_file_read",
+                reason="file_read_failed",
+                message=f"Raw ONNX detector input read failed: {e!s}",
+                details={"exception": str(e), "exception_type": type(e).__name__},
             )
-            network_findings = self.collect_network_communication_findings(
-                model_data,
-                context=path,
-            )
-
-            # Emit explicit checks for the file (only if checks are enabled)
+        else:
             check_jit = self._get_bool_config("check_jit_script", True)
             if check_jit:
-                self.add_jit_script_findings(
-                    jit_findings,
-                    result,
-                    model_type="onnx",
-                    context=path,
-                )
+                try:
+                    jit_findings = self.collect_jit_script_findings(
+                        model_data,
+                        model_type="onnx",
+                        context=path,
+                        raise_on_error=True,
+                    )
+                except Exception as e:
+                    logger.warning("ONNX JIT/script detector analysis failed: %s", e)
+                    self._mark_raw_detection_incomplete(
+                        result,
+                        path,
+                        detector="jit_script",
+                        reason="analysis_failed",
+                        message=f"ONNX JIT/script detector analysis failed: {e!s}",
+                        details={"exception": str(e), "exception_type": type(e).__name__},
+                    )
+                else:
+                    self.add_jit_script_findings(
+                        jit_findings,
+                        result,
+                        model_type="onnx",
+                        context=path,
+                    )
             else:
                 result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
 
             check_net = self._get_bool_config("check_network_comm", True)
             if check_net:
-                self.add_network_communication_findings(
-                    network_findings,
-                    result,
-                    context=path,
-                )
+                try:
+                    network_findings = self.collect_network_communication_findings(
+                        model_data,
+                        context=path,
+                        raise_on_error=True,
+                    )
+                except Exception as e:
+                    logger.warning("ONNX network detector analysis failed: %s", e)
+                    self._mark_raw_detection_incomplete(
+                        result,
+                        path,
+                        detector="network_communication",
+                        reason="analysis_failed",
+                        message=f"ONNX network detector analysis failed: {e!s}",
+                        details={"exception": str(e), "exception_type": type(e).__name__},
+                    )
+                else:
+                    self.add_network_communication_findings(
+                        network_findings,
+                        result,
+                        context=path,
+                    )
             else:
                 result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
-
-        except Exception as e:
-            # Log but don't fail the scan
-            result.add_check(
-                name="JIT/Script Code Execution Detection",
-                passed=False,
-                message=f"Failed to check for JIT/Script code: {e}",
-                severity=IssueSeverity.DEBUG,
-                location=path,
-                details={"exception": str(e)},
-                rule_code="S507",
-            )
 
         self._check_custom_ops(model, path, result)
         self._check_external_data(model, path, result)
@@ -332,6 +353,32 @@ class OnnxScanner(BaseScanner):
 
         _finish_scan_result(result)
         return result
+
+    def _mark_raw_detection_incomplete(
+        self,
+        result: ScanResult,
+        path: str,
+        *,
+        detector: str,
+        reason: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        _mark_inconclusive_scan_result(result, ONNX_RAW_DETECTION_INCONCLUSIVE_REASON)
+        result.add_check(
+            name="Raw Detector Analysis Coverage",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=path,
+            rule_code="S902",
+            details={
+                "scan_outcome_reason": ONNX_RAW_DETECTION_INCONCLUSIVE_REASON,
+                "coverage_gap": reason,
+                "detector": detector,
+                **(details or {}),
+            },
+        )
 
     def _check_custom_ops(self, model: Any, path: str, result: ScanResult) -> None:
         custom_domains = set()

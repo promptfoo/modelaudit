@@ -1052,8 +1052,8 @@ def test_detect_generic_xml_format(tmp_path):
     assert detect_file_format_from_magic(str(xml_path)) == "unknown"
 
 
-def test_detect_openvino_xml_net_beyond_64_bytes(tmp_path):
-    """Test that <net> tag beyond 64 bytes is not detected as OpenVINO."""
+def test_detect_openvino_xml_net_beyond_64_bytes(tmp_path: Path) -> None:
+    """Test that bounded XML root parsing still detects late OpenVINO roots."""
     # Create XML where <net> appears after 64 bytes
     xml_path = tmp_path / "late_net.xml"
     # Padding to push <net> beyond 64 bytes
@@ -1061,8 +1061,7 @@ def test_detect_openvino_xml_net_beyond_64_bytes(tmp_path):
     xml_content = b'<?xml version="1.0"?>\n' + padding + b'\n<net name="Model0">\n</net>'
     xml_path.write_bytes(xml_content)
 
-    # Should return unknown since <net> is beyond the 64-byte read limit
-    assert detect_file_format_from_magic(str(xml_path)) == "unknown"
+    assert detect_file_format_from_magic(str(xml_path)) == "openvino"
 
 
 def test_detect_openvino_xml_short_file(tmp_path):
@@ -1076,16 +1075,14 @@ def test_detect_openvino_xml_short_file(tmp_path):
     assert detect_file_format_from_magic(str(xml_path)) == "openvino"
 
 
-def test_detect_xml_with_net_in_comment(tmp_path):
-    """Test that <net> in XML comment doesn't trigger false positive."""
+def test_detect_xml_with_net_in_comment(tmp_path: Path) -> None:
+    """Test that <net> in XML comments does not trigger model routing."""
     # Create XML with <net> inside a comment
     xml_path = tmp_path / "commented.xml"
     xml_content = b'<?xml version="1.0"?>\n<!-- <net> -->\n<root/>'
     xml_path.write_bytes(xml_content)
 
-    # Should still detect as openvino because we're doing simple byte matching
-    # This is acceptable - the actual OpenVINO scanner will validate properly
-    assert detect_file_format_from_magic(str(xml_path)) == "openvino"
+    assert detect_file_format_from_magic(str(xml_path)) == "unknown"
 
 
 def test_xml_detection_boundary_conditions(tmp_path):
@@ -1100,8 +1097,8 @@ def test_xml_detection_boundary_conditions(tmp_path):
     assert detect_file_format_from_magic(str(xml_path)) == "openvino"
 
 
-def test_detect_pmml_xml_beyond_64_bytes(tmp_path):
-    """Test that <PMML> tag beyond 64 bytes is not detected as PMML."""
+def test_detect_pmml_xml_beyond_64_bytes(tmp_path: Path) -> None:
+    """Test that bounded XML root parsing still detects late PMML roots."""
     # Create XML where <PMML> appears after 64 bytes
     pmml_path = tmp_path / "late_pmml.pmml"
     # Padding to push <PMML> beyond 64 bytes
@@ -1109,8 +1106,18 @@ def test_detect_pmml_xml_beyond_64_bytes(tmp_path):
     pmml_content = b'<?xml version="1.0"?>\n' + padding + b'\n<PMML version="4.4">\n</PMML>'
     pmml_path.write_bytes(pmml_content)
 
-    # Should return unknown since <PMML> is beyond the 64-byte read limit
-    assert detect_file_format_from_magic(str(pmml_path)) == "unknown"
+    assert detect_file_format_from_magic(str(pmml_path)) == "pmml"
+
+
+def test_detect_pmml_xml_with_oversized_doctype_subset(tmp_path: Path) -> None:
+    """Incomplete bounded XML prologs should fail closed instead of guessing a PMML root."""
+    pmml_path = tmp_path / "oversized_doctype_pmml.txt"
+    pmml_path.write_text(
+        "<?xml version='1.0'?><!DOCTYPE PMML [" + ("x" * ((1024 * 1024) + 64)) + "]><PMML/>",
+        encoding="utf-8",
+    )
+
+    assert detect_file_format_from_magic(str(pmml_path)) == "xml_model_inconclusive"
 
 
 def test_detect_pmml_xml_short_file(tmp_path):
@@ -1124,16 +1131,14 @@ def test_detect_pmml_xml_short_file(tmp_path):
     assert detect_file_format_from_magic(str(pmml_path)) == "pmml"
 
 
-def test_detect_xml_with_pmml_in_comment(tmp_path):
-    """Test that <PMML> in XML comment still triggers detection."""
+def test_detect_xml_with_pmml_in_comment(tmp_path: Path) -> None:
+    """Test that <PMML> in XML comments does not trigger model routing."""
     # Create XML with <PMML> inside a comment
     xml_path = tmp_path / "commented.pmml"
     xml_content = b'<?xml version="1.0"?>\n<!-- <PMML> -->\n<root/>'
     xml_path.write_bytes(xml_content)
 
-    # Should still detect as pmml because we're doing simple byte matching
-    # This is acceptable - the actual PMML scanner will validate properly
-    assert detect_file_format_from_magic(str(xml_path)) == "pmml"
+    assert detect_file_format_from_magic(str(xml_path)) == "unknown"
 
 
 def test_pmml_detection_boundary_conditions(tmp_path):
