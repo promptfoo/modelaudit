@@ -19,7 +19,7 @@ Models download from untrusted registries, pass through CI, and end up running i
 - **Scan statically.** No model is ever loaded, unpickled, or executed.
 - **Cover the formats you actually ship.** 40+ scanners spanning pickle, PyTorch, SafeTensors, ONNX, TensorFlow, Keras, GGUF, archives, and configs.
 - **Fit into CI.** Machine-readable output (JSON, SARIF), strict mode, exit codes, and [selectable scanners](https://github.com/promptfoo/modelaudit/blob/main/docs/user/scanner-selection.md).
-- **Fail closed.** Truncated reads, exhausted budgets, and unsupported formats are reported as coverage gaps, not silent passes.
+- **Surface coverage limits.** Recognized scanners report bounded-analysis gaps such as truncated reads or exhausted budgets instead of presenting them as fully covered results.
 
 Comparable tools: [`picklescan`](https://github.com/mmaitre314/picklescan) (pickle only, Python-based), [`fickling`](https://github.com/trailofbits/fickling) (pickle only, AST-based), [`modelscan`](https://github.com/protectai/modelscan) (pickle + TensorFlow + Keras subset). ModelAudit is broader in coverage and ships a native Rust pickle engine via its companion package [`modelaudit-picklescan`](https://pypi.org/project/modelaudit-picklescan/).
 
