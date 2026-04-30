@@ -109,3 +109,22 @@ class TestAnalysisModules:
         assert isinstance(result.is_suspicious, bool)
         assert isinstance(result.confidence, float)
         assert isinstance(result.risk_level, str)
+
+    def test_integrated_analyzer_ignores_attacker_controlled_filename_context(self) -> None:
+        """Filename text should not change framework-pattern confidence."""
+        from modelaudit.analysis import IntegratedAnalyzer
+        from modelaudit.analysis.unified_context import UnifiedMLContext
+
+        analyzer = IntegratedAnalyzer()
+        normal_context = UnifiedMLContext(Path("payload.py"), 1024, "python", primary_framework="pytorch")
+        spoofed_context = UnifiedMLContext(
+            Path("samples/eval_bucket/validate_payload.py"),
+            1024,
+            "python",
+            primary_framework="pytorch",
+        )
+
+        normal = analyzer._analyze_framework_patterns("eval", "code_execution", normal_context)
+        spoofed = analyzer._analyze_framework_patterns("eval", "code_execution", spoofed_context)
+
+        assert spoofed == normal
