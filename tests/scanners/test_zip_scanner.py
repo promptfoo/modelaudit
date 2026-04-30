@@ -820,6 +820,23 @@ def test_scan_nested_file_does_not_fail_closed_for_extension_only_member(
     assert not any(check.name == "Format Detection" for check in result.checks)
 
 
+def test_scan_nested_file_fails_closed_when_xml_root_is_beyond_bounded_probe(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "payload.txt"
+    extracted_member.write_text(
+        "<?xml version='1.0'?><!--" + ("x" * ((1024 * 1024) + 64)) + "--><PMML version='4.4'></PMML>",
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["operational_error_reason"] == "xml_model_routing_incomplete"
+    check = next(check for check in result.checks if check.name == "XML Model Routing")
+    assert "bounded probe ended before the first structural root element" in check.message
+
+
 def test_scan_zip_fails_closed_when_nested_recognized_header_scanner_is_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

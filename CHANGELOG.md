@@ -311,6 +311,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **routing:** preserve renamed OpenVINO and PMML XML models with long benign
+  prologs during content-based directory filtering.
 - **security:** resolve compile-time string concatenation in archive-member `getattr` calls so high-risk targets like `os.system` cannot hide behind split literals
 - **security:** fail closed when routing recognizes a model format but no scanner is available to analyze it
 - **security:** fail closed when streaming scans only fall back to heuristic header checks, even if the remote file bytes were fully read

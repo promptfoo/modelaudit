@@ -911,6 +911,50 @@ def test_scan_file_unavailable_recognized_format_result_is_not_cached(
         reset_cache_manager()
 
 
+def test_scan_file_fails_closed_when_xml_root_is_beyond_bounded_probe(tmp_path: Path) -> None:
+    ambiguous_xml = tmp_path / "payload.txt"
+    ambiguous_xml.write_text(
+        "<?xml version='1.0'?><!--" + ("x" * ((1024 * 1024) + 64)) + "--><PMML version='4.4'></PMML>",
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(ambiguous_xml), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["operational_error_reason"] == "xml_model_routing_incomplete"
+    check = next(check for check in result.checks if check.name == "XML Model Routing")
+    assert "bounded probe ended before the first structural root element" in check.message
+
+
+def test_scan_file_incomplete_xml_routing_result_is_not_cached(tmp_path: Path) -> None:
+    ambiguous_xml = tmp_path / "payload.txt"
+    ambiguous_xml.write_text(
+        "<?xml version='1.0'?><!--" + ("x" * ((1024 * 1024) + 64)) + "--><PMML version='4.4'></PMML>",
+        encoding="utf-8",
+    )
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(ambiguous_xml), config=config)
+        second = scan_file(str(ambiguous_xml), config=config)
+
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert second.metadata["scan_outcome"] == "inconclusive"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 def test_scan_file_ignores_benign_onnx_token_near_match(tmp_path: Path) -> None:
     near_match = tmp_path / "note.payload"
     near_match.write_bytes(b"this documentation mentions onnx but is not a model")
