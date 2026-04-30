@@ -311,6 +311,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** fail closed when streaming scans only fall back to heuristic header checks, even if the remote file bytes were fully read
 - **docs:** narrow public scan-coverage wording so unsupported or merely discovered formats are not over-promised
 - **analysis:** keep exact dangerous literals visible even when surrounding bytes look like ML weights
 - **analysis:** stop attacker-controlled file and directory names from suppressing dangerous framework-pattern findings
