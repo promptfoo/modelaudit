@@ -181,6 +181,33 @@ def test_openvino_scanner_allows_bin_symlink_inside_model_dir(tmp_path: Path, re
     assert not any(check.name == "OpenVINO Weights Symlink Boundary Check" for check in result.checks)
 
 
+def test_directory_scan_preserves_path_sensitive_symlink_checks(tmp_path: Path, requires_symlinks: None) -> None:
+    safe_dir = tmp_path / "safe"
+    escaped_dir = tmp_path / "escaped"
+    outside_dir = tmp_path / "outside"
+    safe_dir.mkdir()
+    escaped_dir.mkdir()
+    outside_dir.mkdir()
+
+    xml_content = "<net version='10'></net>"
+    safe_xml = safe_dir / "model.xml"
+    escaped_xml = escaped_dir / "model.xml"
+    safe_xml.write_text(xml_content, encoding="utf-8")
+    escaped_xml.write_text(xml_content, encoding="utf-8")
+    (safe_dir / "model.bin").write_bytes(b"safe")
+    escaped_weights = outside_dir / "secret.bin"
+    escaped_weights.write_bytes(b"secret")
+    (escaped_dir / "model.bin").symlink_to(escaped_weights)
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, skip_file_types=False)
+
+    symlink_checks = [check for check in result.checks if check.name == "OpenVINO Weights Symlink Boundary Check"]
+    assert determine_exit_code(result) == 1
+    assert {check.location for check in symlink_checks} == {str(escaped_dir / "model.bin")}
+    assert result.file_metadata[str(safe_xml)]["bin_size"] == 4
+    assert "bin_size" not in result.file_metadata[str(escaped_xml)]
+
+
 def test_openvino_scanner_forbidden_doctype_fails_closed_with_exit_2(tmp_path: Path) -> None:
     """Forbidden DOCTYPE payloads should produce an explicit OpenVINO parse failure and exit 2."""
     xml_path = tmp_path / "model.xml"
