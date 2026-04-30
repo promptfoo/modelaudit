@@ -938,6 +938,28 @@ class TestXGBoostFailClosedEndToEnd:
         finally:
             reset_cache_manager()
 
+    def test_directory_dedup_preserves_filename_sensitive_spoof_detection(self, tmp_path: Path) -> None:
+        payload = pickle.dumps({"safe": True}, protocol=4)
+        pickle_file = tmp_path / "same.pkl"
+        spoof_file = tmp_path / "same.bst"
+        pickle_file.write_bytes(payload)
+        spoof_file.write_bytes(payload)
+
+        result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+        spoof_issues = [issue for issue in result.issues if "pickle file with .bst extension" in str(issue.message)]
+        assert result.files_scanned == 2
+        assert determine_exit_code(result) == 1
+        assert len(spoof_issues) == 1
+        assert spoof_issues[0].location == str(spoof_file)
+        assert (
+            "xgboost_binary_pickle_spoof" in result.file_metadata[str(spoof_file)].model_dump()["scan_outcome_reasons"]
+        )
+        assert "xgboost_binary_pickle_spoof" not in result.file_metadata[str(pickle_file)].model_dump().get(
+            "scan_outcome_reasons",
+            [],
+        )
+
     def test_generic_model_pickle_core_does_not_false_positive(self, tmp_path: Path) -> None:
         model_file = tmp_path / "safe.model"
         model_file.write_bytes(pickle.dumps({"safe": True}, protocol=4))

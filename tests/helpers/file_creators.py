@@ -132,7 +132,7 @@ def write_mock_pytorch_zip_metadata(zf: zipfile.ZipFile, *, prefix: str = "") ->
     zf.writestr(f"{member_prefix}byteorder", "little")
 
 
-def create_mock_gguf(path: Path, *, version: int = 3) -> Path:
+def create_mock_gguf(path: Path, *, version: int = 3, metadata: dict[str, str] | None = None) -> Path:
     """Create a mock GGUF file for testing.
 
     Args:
@@ -142,14 +142,23 @@ def create_mock_gguf(path: Path, *, version: int = 3) -> Path:
     Returns:
         Path to created file
     """
-    # GGUF magic: "GGUF" + version (little-endian uint32)
-    magic = b"GGUF"
-    version_bytes = struct.pack("<I", version)
-    # Minimal header: tensor_count=0, metadata_kv_count=0
-    tensor_count = struct.pack("<Q", 0)
-    metadata_count = struct.pack("<Q", 0)
+    payload = bytearray()
+    payload.extend(b"GGUF")
+    payload.extend(struct.pack("<I", version))
+    payload.extend(struct.pack("<Q", 0))
 
-    path.write_bytes(magic + version_bytes + tensor_count + metadata_count)
+    metadata = metadata or {}
+    payload.extend(struct.pack("<Q", len(metadata)))
+    for key, value in metadata.items():
+        encoded_key = key.encode("utf-8")
+        encoded_value = value.encode("utf-8")
+        payload.extend(struct.pack("<Q", len(encoded_key)))
+        payload.extend(encoded_key)
+        payload.extend(struct.pack("<I", 8))
+        payload.extend(struct.pack("<Q", len(encoded_value)))
+        payload.extend(encoded_value)
+
+    path.write_bytes(bytes(payload))
     return path
 
 
