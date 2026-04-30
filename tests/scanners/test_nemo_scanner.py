@@ -992,6 +992,7 @@ class TestCVE202523304HydraTarget:
             if check.name == "NeMo Config Presence" and check.status == CheckStatus.FAILED
         ]
         assert len(no_config) == 1
+        assert no_config[0].message == "No YAML configuration found in NeMo archive"
         assert no_config[0].details["scan_outcome_reason"] == "nemo_config_missing"
 
         metadata = aggregate_result.file_metadata[str(nemo_path)]
@@ -999,3 +1000,22 @@ class TestCVE202523304HydraTarget:
         assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
         assert "nemo_config_missing" in metadata.get("scan_outcome_reasons", [])
         assert determine_exit_code(aggregate_result) == 2
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            cached_aggregate = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            cached_metadata = cached_aggregate.file_metadata[str(nemo_path)]
+
+            assert cached_aggregate.success is False
+            assert cached_metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            assert "nemo_config_missing" in cached_metadata.get("scan_outcome_reasons", [])
+            assert determine_exit_code(cached_aggregate) == 2
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
