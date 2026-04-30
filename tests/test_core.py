@@ -851,12 +851,64 @@ def test_scan_file_fails_closed_when_recognized_format_scanner_is_unavailable(
 
     check = next(check for check in result.checks if check.name == "Format Detection")
     assert check.severity == IssueSeverity.INFO
+    assert "Recognized format could not be scanned" in check.message
     assert check.details["format"] == "onnx"
     assert check.details["preferred_scanner_id"] == "onnx"
 
     aggregate = core_module.scan_model_directory_or_file(str(unavailable_onnx))
     assert aggregate.success is False
     assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_does_not_fail_closed_for_extension_only_recognized_format(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generic_pb = tmp_path / "metadata.pb"
+    generic_pb.write_bytes(b"plain protobuf-ish bytes")
+
+    monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(core_module._registry, "get_scanner_for_path", lambda *_args, **_kwargs: None)
+
+    result = scan_file(str(generic_pb))
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != "inconclusive"
+    assert not any(check.name == "Format Detection" for check in result.checks)
+
+
+def test_scan_file_unavailable_recognized_format_result_is_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unavailable_onnx = tmp_path / "model.onnx"
+    unavailable_onnx.write_bytes(b"recognized-format")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    monkeypatch.setattr(core_module, "detect_file_format", lambda _path: "onnx")
+    monkeypatch.setattr(core_module, "detect_file_format_from_magic", lambda _path: "onnx")
+    monkeypatch.setattr(core_module, "detect_format_from_extension", lambda _path: "onnx")
+    monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(core_module._registry, "get_scanner_for_path", lambda *_args, **_kwargs: None)
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(unavailable_onnx), config=config)
+        second = scan_file(str(unavailable_onnx), config=config)
+
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert second.metadata["scan_outcome"] == "inconclusive"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_scan_file_ignores_benign_onnx_token_near_match(tmp_path: Path) -> None:

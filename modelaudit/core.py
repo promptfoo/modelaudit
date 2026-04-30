@@ -183,7 +183,7 @@ def _make_unavailable_recognized_format_result(path: str, format_: str, scanner_
     result.add_check(
         name="Format Detection",
         passed=False,
-        message=f"Recognized format could not be scanned because no scanner was available: {format_}",
+        message="Recognized format could not be scanned because no scanner was available",
         severity=IssueSeverity.INFO,
         location=path,
         details=details,
@@ -1212,13 +1212,12 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                         result.bytes_scanned = file_size
                     return result
 
-            format_ = header_format
-            if format_ == "unknown":
+            if magic_format == "unknown":
                 # Not a recognized model format — skip silently
                 sr = ScanResult(scanner_name="unknown")
                 logger.debug(f"Skipping unrecognized format file: {path}")
             else:
-                sr = _make_unavailable_recognized_format_result(path, format_, scanner_id)
+                sr = _make_unavailable_recognized_format_result(path, magic_format, scanner_id)
             result = sr
 
     if is_xgboost_pickle_spoof:
