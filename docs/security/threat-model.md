@@ -83,7 +83,7 @@ The core scanners do not upload model contents. The CLI may download model files
 
 **Parser bugs in binary format readers.** ModelAudit parses GGUF, pickle, and protobuf using custom or third-party code. Bugs in these parsers could cause incorrect results or, in extreme cases, crashes. Fuzzing coverage is incomplete.
 
-**Incomplete format coverage.** Some model formats or serialization variants may not be recognized or may fall through to a generic check. Unrecognized formats produce a warning, not a clean bill of health.
+**Incomplete format coverage.** Some model formats or serialization variants may not be recognized or may fall through to generic or unknown handling. An unrecognized format is not a guarantee that the file is safe.
 
 **Privilege of the scanning process.** ModelAudit runs as the invoking user. It does not drop privileges before parsing untrusted files. A parser vulnerability could be exploited at that privilege level.
 

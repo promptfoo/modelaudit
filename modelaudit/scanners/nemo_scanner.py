@@ -458,13 +458,22 @@ class NemoScanner(BaseScanner):
                 if yaml_config_files_found == 0
                 else "No analyzable YAML configuration found in NeMo archive"
             )
-            result.add_check(
-                name="NeMo Config Presence",
-                passed=False,
-                message=message,
-                severity=IssueSeverity.INFO,
-                location=path,
-            )
+            if yaml_config_files_found == 0:
+                self._mark_inconclusive_scan_result(
+                    result,
+                    reason="nemo_config_missing",
+                    check_name="NeMo Config Presence",
+                    message=message,
+                    location=path,
+                )
+            else:
+                result.add_check(
+                    name="NeMo Config Presence",
+                    passed=False,
+                    message=message,
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                )
         else:
             result.add_check(
                 name="NeMo Config Presence",
