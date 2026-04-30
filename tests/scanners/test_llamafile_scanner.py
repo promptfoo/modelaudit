@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.llamafile_scanner import LlamafileScanner
+from modelaudit.scanners.llamafile_scanner import LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON, LlamafileScanner
 
 
 def _build_llamafile_blob(
@@ -197,6 +199,53 @@ def test_llamafile_scanner_handles_truncated_binary(tmp_path: Path) -> None:
 
     assert result.success
     assert any("No embedded GGUF payload marker found" in issue.message for issue in result.issues)
+
+
+def test_llamafile_scanner_fails_closed_when_payload_scan_window_ends_before_gguf(tmp_path: Path) -> None:
+    binary = tmp_path / "late-payload.llamafile"
+    late_payload = b"\x00" * 1024 + b"GGUF" + struct.pack("<IQQ", 3, 0, 0)
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=late_payload))
+
+    result = LlamafileScanner(config={"llamafile_payload_scan_bytes": 256}).scan(str(binary))
+
+    assert result.success is False
+    assert result.metadata.get("analysis_incomplete") is True
+    assert LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON in result.metadata.get("scan_outcome_reasons", [])
+    payload_checks = [check for check in result.checks if check.name == "Llamafile Embedded Payload Detection"]
+    assert payload_checks
+    assert payload_checks[0].message == "No embedded GGUF payload marker found before bounded scan window ended"
+    assert payload_checks[0].details.get("analysis_incomplete") is True
+
+    aggregate = scan_model_directory_or_file(
+        str(binary),
+        llamafile_payload_scan_bytes=256,
+        cache_scan_results=False,
+    )
+    metadata = aggregate.file_metadata[str(binary)]
+    assert aggregate.success is False
+    assert metadata.get("scan_outcome") == "inconclusive"
+    assert LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON in metadata.get("scan_outcome_reasons", [])
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            llamafile_payload_scan_bytes=256,
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        cached_metadata = cached_aggregate.file_metadata[str(binary)]
+
+        assert cached_aggregate.success is False
+        assert cached_metadata.get("scan_outcome") == "inconclusive"
+        assert LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON in cached_metadata.get("scan_outcome_reasons", [])
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_llamafile_embedded_gguf_findings_include_location_mapping(tmp_path: Path) -> None:
