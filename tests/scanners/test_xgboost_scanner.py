@@ -309,6 +309,34 @@ class TestXGBoostJSONScanning:
         assert checks[0].details["tree_index"] == 10
         assert checks[0].details["depth"] == 3
 
+    def test_tree_depth_validation_aggregates_many_late_failures(
+        self,
+        temp_dir: Path,
+        valid_xgboost_json: dict[str, Any],
+    ) -> None:
+        """Repeated deep trees should not flood the scan result."""
+        trees = valid_xgboost_json["learner"]["gradient_booster"]["model"]["trees"]
+        deep_tree = copy.deepcopy(trees[0])
+        deep_tree["left_children"] = [1, 2, 3, -1]
+        deep_tree["right_children"] = [-1, -1, -1, -1]
+        deep_tree["parents"] = [2147483647, 0, 1, 2]
+        valid_xgboost_json["learner"]["gradient_booster"]["model"]["trees"] = [
+            copy.deepcopy(deep_tree) for _ in range(25)
+        ]
+
+        json_file = temp_dir / "many_deep_trees.json"
+        json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
+
+        result = XGBoostScanner({"max_tree_depth": 2}).scan(str(json_file))
+
+        checks = [check for check in result.checks if check.name == "Tree Depth Validation"]
+        assert len(checks) == 1
+        assert checks[0].status == CheckStatus.FAILED
+        assert checks[0].details["tree_count"] == 25
+        assert checks[0].details["tree_index"] == 0
+        assert checks[0].details["max_observed_depth"] == 3
+        assert checks[0].details["examples"] == [{"tree_index": tree_index, "depth": 3} for tree_index in range(10)]
+
     def test_invalid_json_fails(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
         """Test that invalid JSON content is detected."""
         json_file = temp_dir / "invalid.json"
