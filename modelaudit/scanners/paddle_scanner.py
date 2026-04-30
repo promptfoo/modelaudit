@@ -6,6 +6,7 @@ from typing import ClassVar
 
 from modelaudit.detectors.suspicious_symbols import BINARY_CODE_PATTERNS, SUSPICIOUS_STRING_PATTERNS
 
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 HAS_PADDLE = True
@@ -21,6 +22,43 @@ _BINARY_WEIGHT_SKIP_PATTERNS: frozenset[str] = frozenset(
         r"\\x[0-9a-fA-F]{2}",
         r"__[\w]+__",
     }
+)
+_BOUNDARY_UNBOUNDED_REGEX_PREFIXES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (r"os\.spawn[a-z]*", re.compile(r"os\.spawn[a-z]*$")),
+    (r"\bimport\s+[\w\.]+", re.compile(r"\bimport(?:\s+[\w\.]*)?$")),
+    (
+        r"getattr\s*\(\s*\w+\s*,\s*['\"]system['\"]\s*\)",
+        re.compile(r"getattr\s*\(\s*\w*(?:\s*,\s*['\"]system['\"]\s*)?$"),
+    ),
+    (
+        r"getattr\s*\(\s*\w+\s*,\s*['\"]exec['\"]\s*\)",
+        re.compile(r"getattr\s*\(\s*\w*(?:\s*,\s*['\"]exec['\"]\s*)?$"),
+    ),
+    (
+        r"getattr\s*\(\s*\w+\s*,\s*['\"]eval['\"]\s*\)",
+        re.compile(r"getattr\s*\(\s*\w*(?:\s*,\s*['\"]eval['\"]\s*)?$"),
+    ),
+    (
+        r"getattr\s*\(\s*\w+\s*,\s*['\"]popen['\"]\s*\)",
+        re.compile(r"getattr\s*\(\s*\w*(?:\s*,\s*['\"]popen['\"]\s*)?$"),
+    ),
+    (
+        r"getattr\s*\(\s*\w+\s*,\s*['\"]spawn['\"]\s*\)",
+        re.compile(r"getattr\s*\(\s*\w*(?:\s*,\s*['\"]spawn['\"]\s*)?$"),
+    ),
+    (
+        r"getattr\s*\(\s*\w+\s*,\s*['\"]call['\"]\s*\)",
+        re.compile(r"getattr\s*\(\s*\w*(?:\s*,\s*['\"]call['\"]\s*)?$"),
+    ),
+    (
+        r"getattr\s*\(\s*\w+\s*,\s*['\"]run['\"]\s*\)",
+        re.compile(r"getattr\s*\(\s*\w*(?:\s*,\s*['\"]run['\"]\s*)?$"),
+    ),
+    (
+        r"getattr\s*\(\s*\w+\s*,\s*['\"]Popen['\"]\s*\)",
+        re.compile(r"getattr\s*\(\s*\w*(?:\s*,\s*['\"]Popen['\"]\s*)?$"),
+    ),
+    (r"getattr\s*\(\s*getattr\s*\(", re.compile(r"getattr\s*\(\s*getattr\s*\($")),
 )
 
 
@@ -77,6 +115,7 @@ class PaddleScanner(BaseScanner):
         chunk_size = 1024 * 1024
         previous_chunk_tail = b""
         chunk_overlap = self._get_chunk_overlap_size(chunk_size)
+        reported_string_patterns: set[str] = set()
         try:
             with open(path, "rb") as f:
                 while True:
@@ -93,7 +132,16 @@ class PaddleScanner(BaseScanner):
                         path,
                         is_binary_weights,
                         overlap_prefix_len=len(previous_chunk_tail),
+                        reported_string_patterns=reported_string_patterns,
                     )
+                    if len(chunk) == chunk_size:
+                        self._mark_unbounded_boundary_risk(
+                            chunk,
+                            result,
+                            path,
+                            is_binary_weights,
+                            reported_string_patterns,
+                        )
                     previous_chunk_tail = chunk[-chunk_overlap:] if chunk_overlap else b""
             result.bytes_scanned = bytes_scanned
         except Exception as e:  # pragma: no cover - unexpected I/O errors
@@ -108,7 +156,9 @@ class PaddleScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=not result.has_errors)
+        result.finish(
+            success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
+        )
         return result
 
     @staticmethod
@@ -131,6 +181,7 @@ class PaddleScanner(BaseScanner):
         is_binary_weights: bool = False,
         *,
         overlap_prefix_len: int = 0,
+        reported_string_patterns: set[str] | None = None,
     ) -> None:
         for pattern in BINARY_CODE_PATTERNS:
             search_start = 0
@@ -152,13 +203,15 @@ class PaddleScanner(BaseScanner):
                 )
                 break
 
-        text = chunk.decode("latin-1")
+        text = chunk.decode("utf-8", errors="ignore")
         for regex in SUSPICIOUS_STRING_PATTERNS:
             # Skip patterns known to produce false positives on raw binary
             # weight data (e.g. hex-escape sequences in float tensors).
             if is_binary_weights and regex in _BINARY_WEIGHT_SKIP_PATTERNS:
                 continue
-            if any(match.end() > overlap_prefix_len for match in re.finditer(regex, text, flags=re.ASCII)):
+            if reported_string_patterns is not None and regex in reported_string_patterns:
+                continue
+            if any(match.end() > overlap_prefix_len for match in re.finditer(regex, text)):
                 result.add_check(
                     name="String Pattern Detection",
                     passed=False,
@@ -168,3 +221,35 @@ class PaddleScanner(BaseScanner):
                     details={"pattern": regex},
                     rule_code="S902",
                 )
+                if reported_string_patterns is not None:
+                    reported_string_patterns.add(regex)
+
+    def _mark_unbounded_boundary_risk(
+        self,
+        chunk: bytes,
+        result: ScanResult,
+        path: str,
+        is_binary_weights: bool,
+        reported_string_patterns: set[str],
+    ) -> None:
+        """Fail closed when an unbounded regex prefix is still live at a chunk edge."""
+        text = chunk.decode("utf-8", errors="ignore")
+        for regex, boundary_prefix in _BOUNDARY_UNBOUNDED_REGEX_PREFIXES:
+            if regex in reported_string_patterns:
+                continue
+            if is_binary_weights and regex in _BINARY_WEIGHT_SKIP_PATTERNS:
+                continue
+            if not boundary_prefix.search(text):
+                continue
+
+            mark_inconclusive_scan_result(result, "paddle_unbounded_regex_boundary")
+            result.add_check(
+                name="Paddle Boundary Coverage",
+                passed=False,
+                message="Paddle scan could not prove full coverage for a variable-width regex across a chunk boundary",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={"pattern": regex, "analysis_incomplete": True},
+                rule_code="S902",
+            )
+            return

@@ -90,6 +90,48 @@ def test_paddle_scanner_caps_repeated_binary_pattern_findings_per_chunk(tmp_path
     assert sum(issue.details.get("pattern") == "open(" for issue in result.issues) == 1
 
 
+def test_paddle_scanner_fails_closed_for_unbounded_regex_prefix_at_chunk_boundary(tmp_path: Path) -> None:
+    path = tmp_path / "model.pdmodel"
+    chunk_size = 1024 * 1024
+    path.write_bytes(b"\x00" * (chunk_size - 140) + b"getattr(" + b" " * 180 + b"os, 'system')")
+
+    with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
+        result = PaddleScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["scan_outcome_reasons"] == ["paddle_unbounded_regex_boundary"]
+    assert any(check.name == "Paddle Boundary Coverage" for check in result.checks)
+
+
+def test_paddle_scanner_deduplicates_variable_width_regex_across_chunk_boundary(tmp_path: Path) -> None:
+    path = tmp_path / "model.pdmodel"
+    chunk_size = 1024 * 1024
+    path.write_bytes(b"\x00" * (chunk_size - 120) + b"import " + b"a" * 200)
+
+    with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
+        result = PaddleScanner().scan(str(path))
+
+    assert sum(issue.details.get("pattern") == r"\bimport\s+[\w\.]+" for issue in result.issues) == 1
+    assert result.success is True
+
+
+def test_paddle_scanner_preserves_unicode_identifier_detection(tmp_path: Path) -> None:
+    path = tmp_path / "model.pdmodel"
+    unicode_identifier = "\U0001d698\U0001d69c"
+    path.write_text(
+        f'{unicode_identifier} = __import__("os")\ngetattr({unicode_identifier}, "system")',
+        encoding="utf-8",
+    )
+
+    with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
+        result = PaddleScanner().scan(str(path))
+
+    assert any(
+        issue.details.get("pattern") == r"getattr\s*\(\s*\w+\s*,\s*['\"]system['\"]\s*\)" for issue in result.issues
+    )
+
+
 def test_paddle_suspicious_pdmodel_aggregate_exit_code_is_security_finding(tmp_path: Path) -> None:
     """Suspicious .pdmodel patterns should be warning-level security findings."""
     path = tmp_path / "model.pdmodel"
