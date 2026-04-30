@@ -103,6 +103,23 @@ def test_scan_corrupt_cbm_aggregate_exit_code_is_inconclusive(tmp_path: Path) ->
     assert determine_exit_code(result) == 2
 
 
+def test_scan_bounded_parse_marks_uninspected_catboost_bytes_inconclusive(tmp_path: Path) -> None:
+    model_path = tmp_path / "bounded.cbm"
+    model_path.write_bytes(_build_cbm(["feature_names", "safe_metadata" * 16], trailing_strings=["late-safe"]))
+
+    result = CatBoostScanner(config={"catboost_core_scan_budget": 8, "catboost_trailing_scan_budget": 0}).scan(
+        str(model_path)
+    )
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "catboost_bounded_parse_incomplete" in result.metadata["scan_outcome_reasons"]
+    bounded_checks = [check for check in result.checks if check.name == "CatBoost Bounded Parse Check"]
+    assert len(bounded_checks) == 1
+    assert bounded_checks[0].status == CheckStatus.FAILED
+    assert bounded_checks[0].details["analysis_incomplete"] is True
+
+
 def test_scan_detects_correlated_command_and_network_indicators(tmp_path: Path) -> None:
     model_path = tmp_path / "malicious.cbm"
     model_path.write_bytes(
