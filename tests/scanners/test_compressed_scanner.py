@@ -11,6 +11,8 @@ from typing import Literal
 
 import pytest
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.compressed_scanner import CompressedScanner, _MissingOptionalDependencyError
@@ -429,6 +431,52 @@ def test_read_concatenated_stream_uses_chunk_bounded_decompression() -> None:
     assert [length for fake in fake_decompressors for length in fake.max_lengths] == [8]
 
 
+def test_read_concatenated_stream_splits_member_after_chunk_boundary() -> None:
+    class _FakeDecompressor:
+        def __init__(self) -> None:
+            self.eof = False
+            self.needs_input = True
+            self.unused_data = b""
+
+        def decompress(self, _chunk: bytes, max_length: int = 0) -> bytes:
+            self.eof = True
+            return b"x"
+
+    new_member_calls: list[None] = []
+
+    CompressedScanner._read_concatenated_stream_with_limits(
+        source=io.BytesIO(b"ab"),
+        destination=io.BytesIO(),
+        decompressor_factory=_FakeDecompressor,
+        error_types=(ValueError,),
+        codec="fake",
+        max_decompressed_bytes=1024,
+        max_ratio=1000.0,
+        compressed_size=2,
+        chunk_size=1,
+        on_new_member=lambda: new_member_calls.append(None),
+    )
+
+    assert len(new_member_calls) == 1
+
+
+def test_read_gzip_stream_preserves_buffered_input_when_probe_cap_is_hit() -> None:
+    payload = b"x" * 64
+    destination = io.BytesIO()
+
+    total_out = CompressedScanner._read_gzip_stream_with_limits(
+        source=io.BytesIO(gzip.compress(payload)),
+        destination=destination,
+        max_decompressed_bytes=1024,
+        max_ratio=1000.0,
+        compressed_size=1,
+        chunk_size=8,
+    )
+
+    assert total_out == len(payload)
+    assert destination.getvalue() == payload
+
+
 def test_read_lz4_stream_uses_chunk_bounded_decompression() -> None:
     fake_lz4_frame = _FakeLz4FrameModule({b"S": b"12345678"})
     destination = io.BytesIO()
@@ -553,11 +601,12 @@ def test_compressed_scanner_allows_concatenated_zlib_members(tmp_path: Path) -> 
 @pytest.mark.parametrize(
     ("filename", "compressor"),
     [
+        ("safe_multi_stream.pkl.gz", gzip.compress),
         ("safe_multi_stream.pkl.bz2", bz2.compress),
         ("safe_multi_stream.pkl.xz", lzma.compress),
     ],
 )
-def test_compressed_scanner_allows_concatenated_bzip2_and_xz_members(
+def test_compressed_scanner_allows_concatenated_gzip_bzip2_and_xz_members(
     tmp_path: Path,
     filename: str,
     compressor: Callable[[bytes], bytes],
@@ -577,6 +626,136 @@ def test_compressed_scanner_allows_concatenated_bzip2_and_xz_members(
         for check in result.checks
     )
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    ("filename", "compressor"),
+    [
+        ("payload.txt.gz", gzip.compress),
+        ("payload.txt.bz2", bz2.compress),
+        ("payload.txt.xz", lzma.compress),
+        ("payload.txt.zlib", zlib.compress),
+    ],
+)
+def test_compressed_scanner_scans_each_concatenated_member(
+    tmp_path: Path,
+    filename: str,
+    compressor: Callable[[bytes], bytes],
+) -> None:
+    """A benign first member must not hide a later malicious member."""
+    path = tmp_path / filename
+    path.write_bytes(compressor(b"harmless prelude\n") + compressor(pickle.dumps(_MaliciousPayload())))
+
+    result = CompressedScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["compressed_member_count"] == 2
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+    assert critical_issues
+    assert any(issue.location == f"{path} -> payload.txt#member-2" for issue in critical_issues)
+    member_routing_checks = [
+        check for check in result.checks if check.name == "Compressed Wrapper Member Scanner Routing"
+    ]
+    assert len(member_routing_checks) == 2
+    assert member_routing_checks[1].details["inner_scanner"] == "pickle"
+
+
+def test_compressed_scanner_rejects_excess_concatenated_members(tmp_path: Path) -> None:
+    path = tmp_path / "too_many_members.pkl.zlib"
+    path.write_bytes(zlib.compress(b"a") + zlib.compress(b"b") + zlib.compress(b"c"))
+
+    result = CompressedScanner(config={"compressed_max_members": 2}).scan(str(path))
+
+    limit_checks = [check for check in result.checks if check.name == "Compressed Wrapper Decompression Limits"]
+    assert limit_checks and limit_checks[0].status == CheckStatus.FAILED
+    assert "member count exceeded limit (3 > 2)" in limit_checks[0].message.lower()
+    assert "analysis incomplete" in limit_checks[0].message.lower()
+    assert limit_checks[0].severity == IssueSeverity.INFO
+    assert limit_checks[0].details["max_compressed_members"] == 2
+    assert limit_checks[0].details["scan_outcome_reason"] == "compressed_member_limit_exceeded"
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["scan_outcome_reasons"] == ["compressed_member_limit_exceeded"]
+    assert result.success is False
+
+
+def test_compressed_scanner_excess_members_are_exit2_and_not_cached(tmp_path: Path) -> None:
+    path = tmp_path / "too_many_members.pkl.zlib"
+    path.write_bytes(zlib.compress(b"a") + zlib.compress(b"b") + zlib.compress(b"c"))
+
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+            compressed_max_members=2,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+            compressed_max_members=2,
+        )
+
+        for aggregate in (first, second):
+            assert aggregate.success is False
+            assert determine_exit_code(aggregate) == 2
+            assert any("member count exceeded limit (3 > 2)" in issue.message.lower() for issue in aggregate.issues)
+        assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_compressed_scanner_keeps_split_pickle_members_clean(tmp_path: Path) -> None:
+    payload = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+    split_at = len(payload) // 2
+    path = tmp_path / "split.pkl.gz"
+    path.write_bytes(gzip.compress(payload[:split_at]) + gzip.compress(payload[split_at:]))
+
+    result = CompressedScanner().scan(str(path))
+
+    assert result.success is True
+    assert result.metadata["compressed_member_count"] == 2
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert not any(check.name == "Compressed Wrapper Member Scanner Routing" for check in result.checks)
+
+
+def test_compressed_scanner_still_scans_later_pickle_member_after_fragment_filter(tmp_path: Path) -> None:
+    safe_pickle = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+    malicious_pickle = pickle.dumps(_MaliciousPayload(), protocol=4)
+    path = tmp_path / "safe_then_malicious.pkl.gz"
+    path.write_bytes(gzip.compress(safe_pickle) + gzip.compress(malicious_pickle))
+
+    result = CompressedScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["compressed_member_count"] == 2
+    critical_issues = [issue for issue in result.issues if issue.severity == IssueSeverity.CRITICAL]
+    assert critical_issues
+    assert any(issue.location == f"{path} -> safe_then_malicious.pkl#member-2" for issue in critical_issues)
+
+
+def test_read_lz4_chunk_stream_splits_members_across_chunk_boundary() -> None:
+    fake_lz4_frame = _FakeLz4ChunkModule({b"A": b"a", b"B": b"b"})
+    destination = io.BytesIO()
+    member_boundaries: list[None] = []
+
+    total_out = CompressedScanner._read_lz4_chunk_stream_with_limits(
+        source=io.BytesIO(_LZ4_FRAME_MAGIC + b"A" + _LZ4_FRAME_MAGIC + b"B"),
+        destination=destination,
+        lz4_frame=fake_lz4_frame,
+        max_decompressed_bytes=1024,
+        max_ratio=1000.0,
+        compressed_size=10,
+        chunk_size=len(_LZ4_FRAME_MAGIC) + 1,
+        on_new_member=lambda: member_boundaries.append(None),
+    )
+
+    assert total_out == 2
+    assert destination.getvalue() == b"ab"
+    assert len(member_boundaries) == 1
 
 
 def test_compressed_scanner_rejects_raw_trailer_after_lz4_frame(
