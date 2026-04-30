@@ -411,6 +411,21 @@ class JaxCheckpointScanner(BaseScanner):
             )
             finding_budget.recorded_findings += 1
 
+    def scan_pickle_pattern_text(self, path: str, text: str) -> ScanResult:
+        """Run the JAX-specific pickle text checks on already-read data."""
+        result = self._create_result()
+        self._add_suspicious_pattern_checks(
+            text,
+            context="pickle_checkpoint",
+            check_name="JAX Pattern Security Check",
+            message_prefix="Suspicious JAX pattern in pickle",
+            location=path,
+            result=result,
+            finding_budget=_PatternFindingBudget(self.max_metadata_pattern_findings),
+        )
+        result.finish(success=True)
+        return result
+
     @staticmethod
     def _parse_pickle_global_reference(arg: str) -> tuple[str, str] | None:
         """Parse pickle GLOBAL/INST opcode args into ``(module, name)``."""
@@ -910,17 +925,7 @@ class JaxCheckpointScanner(BaseScanner):
                 if not pickle_prefix_truncated:
                     raise
 
-            # Check for JAX-specific suspicious content
-            data_str = data.decode("utf-8", errors="ignore")
-            self._add_suspicious_pattern_checks(
-                data_str,
-                context="pickle_checkpoint",
-                check_name="JAX Pattern Security Check",
-                message_prefix="Suspicious JAX pattern in pickle",
-                location=path,
-                result=result,
-                finding_budget=_PatternFindingBudget(self.max_metadata_pattern_findings),
-            )
+            result.merge(self.scan_pickle_pattern_text(path, data.decode("utf-8", errors="ignore")))
 
         except Exception as e:
             result.add_check(
