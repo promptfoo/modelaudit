@@ -225,10 +225,12 @@ class PickleScanner:
             entries = _bounded_zip_entries(archive, source=source, size=size)
             if isinstance(entries, PickleReport):
                 return entries
-            if not _is_pytorch_zip_archive(entries):
+            if not _has_pytorch_zip_metadata(entries):
                 return None
 
             pickle_entries, discovery_notices = _discover_pytorch_zip_pickle_entries(archive, entries, source=source)
+            if not _is_pytorch_zip_archive(entries, discovered_pickle_entries=pickle_entries):
+                return None
             if not pickle_entries:
                 return _pytorch_zip_notice_report(
                     source=source,
@@ -385,16 +387,24 @@ def _bounded_zip_entries(
     return entries
 
 
-def _is_pytorch_zip_archive(entries: list[zipfile.ZipInfo]) -> bool:
+def _has_pytorch_zip_metadata(entries: list[zipfile.ZipInfo]) -> bool:
+    names = [entry.filename for entry in entries if not entry.is_dir()]
+    return any(Path(name).name in _PYTORCH_ZIP_METADATA_BASENAMES for name in names)
+
+
+def _is_pytorch_zip_archive(
+    entries: list[zipfile.ZipInfo],
+    *,
+    discovered_pickle_entries: list[zipfile.ZipInfo] | None = None,
+) -> bool:
     names = [entry.filename for entry in entries if not entry.is_dir()]
     has_data_pickle = any(_is_data_pickle_member(name) for name in names)
-    has_metadata_marker = any(Path(name).name in _PYTORCH_ZIP_METADATA_BASENAMES for name in names)
-    if not has_metadata_marker:
+    if not _has_pytorch_zip_metadata(entries):
         return False
     if has_data_pickle:
         return True
     has_pickle_members = any(name.lower().endswith(_PICKLE_MEMBER_SUFFIXES) for name in names)
-    return has_pickle_members
+    return has_pickle_members or bool(discovered_pickle_entries)
 
 
 def _discover_pytorch_zip_pickle_entries(
@@ -948,25 +958,37 @@ def _report_from_native_dict(raw_report: Mapping[str, Any]) -> PickleReport:
 
 def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     import_references = report.metadata.get("import_references")
-    callable_invocations = report.metadata.get("callable_invocations")
+    callable_invocations = report.metadata.get("callable_invocations", ())
     call_graph_limit_exceeded = has_unanalyzed_call_graph_import_references(import_references)
+    enrichment_errors: list[tuple[str, Exception]] = []
     try:
         call_graph_findings = find_dangerous_call_graphs(import_references, callable_invocations)
-    except Exception:
+    except Exception as error:
         call_graph_findings = ()
+        enrichment_errors.append(("python_call_graph", error))
     try:
-        startup_hook_write_findings = find_startup_hook_write_call_graphs(import_references)
-    except Exception:
+        startup_hook_write_findings = find_startup_hook_write_call_graphs(
+            import_references,
+            callable_invocations,
+        )
+    except Exception as error:
         startup_hook_write_findings = ()
+        enrichment_errors.append(("python_call_graph_startup_hook_write", error))
     try:
         unanalyzed_references = find_unanalyzed_callable_call_graph_references(callable_invocations)
-    except Exception:
+    except Exception as error:
         unanalyzed_references = ()
+        enrichment_errors.append(("python_call_graph_source_unavailable", error))
 
     updated_report = (
         _with_unanalyzed_call_graph_notices(report, unanalyzed_references) if unanalyzed_references else report
     )
-    if not call_graph_findings and not startup_hook_write_findings and not call_graph_limit_exceeded:
+    if (
+        not call_graph_findings
+        and not startup_hook_write_findings
+        and not call_graph_limit_exceeded
+        and not enrichment_errors
+    ):
         return updated_report
 
     existing_critical_globals = {
@@ -991,19 +1013,56 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         else ()
     )
     additional_findings = (*rce_findings, *startup_findings, *limit_findings)
-    if not additional_findings:
-        return updated_report
+    updated_report = (
+        PickleReport(
+            source=updated_report.source,
+            status=updated_report.status,
+            verdict=SafetyVerdict.MALICIOUS,
+            findings=(*updated_report.findings, *additional_findings),
+            notices=updated_report.notices,
+            errors=updated_report.errors,
+            coverage=updated_report.coverage,
+            metadata=updated_report.to_dict()["metadata"],
+            duration_s=updated_report.duration_s,
+        )
+        if additional_findings
+        else updated_report
+    )
+    return (
+        _with_call_graph_enrichment_errors(updated_report, tuple(enrichment_errors))
+        if enrichment_errors
+        else updated_report
+    )
 
+
+def _with_call_graph_enrichment_errors(
+    report: PickleReport,
+    enrichment_errors: tuple[tuple[str, Exception], ...],
+) -> PickleReport:
+    errors = (
+        *report.errors,
+        *(
+            ScanError(
+                message=f"Python call-graph analysis could not complete: {error!s}",
+                category="call_graph_analysis_error",
+                location=report.source,
+                exception_type=type(error).__name__,
+                details={"analysis": analysis, "analysis_incomplete": True},
+            )
+            for analysis, error in enrichment_errors
+        ),
+    )
+    metadata = {**report.to_dict()["metadata"], "analysis_incomplete": True}
     return PickleReport(
-        source=updated_report.source,
-        status=updated_report.status,
-        verdict=SafetyVerdict.MALICIOUS,
-        findings=(*updated_report.findings, *additional_findings),
-        notices=updated_report.notices,
-        errors=updated_report.errors,
-        coverage=updated_report.coverage,
-        metadata=updated_report.to_dict()["metadata"],
-        duration_s=updated_report.duration_s,
+        source=report.source,
+        status=ScanStatus.INCONCLUSIVE if report.status == ScanStatus.COMPLETE else report.status,
+        verdict=SafetyVerdict.UNKNOWN if report.verdict == SafetyVerdict.CLEAN else report.verdict,
+        findings=report.findings,
+        notices=report.notices,
+        errors=errors,
+        coverage=report.coverage,
+        metadata=metadata,
+        duration_s=report.duration_s,
     )
 
 
