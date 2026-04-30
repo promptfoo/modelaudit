@@ -320,6 +320,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** fail closed on malformed nested XGBoost JSON structures that
+  would otherwise skip booster or tree validation.
 - **security:** require the legacy XGBoost binary signature instead of
   accepting marker-shaped text payloads as valid `.bst` models.
 - **security:** validate late XGBoost trees instead of sampling only the first

@@ -15,7 +15,7 @@ import pickle
 import struct
 import subprocess as real_subprocess
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import ANY, Mock, patch
@@ -355,6 +355,97 @@ class TestXGBoostJSONScanning:
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "xgboost_json_parse_failed" in result.metadata["scan_outcome_reasons"]
+
+    @pytest.mark.parametrize(
+        ("field", "mutate_model"),
+        [
+            (
+                "learner.gradient_booster",
+                lambda payload: payload["learner"].update({"gradient_booster": "oops"}),
+            ),
+            (
+                "learner.gradient_booster",
+                lambda payload: payload["learner"].update({"gradient_booster": None}),
+            ),
+            (
+                "learner.gradient_booster.model",
+                lambda payload: payload["learner"]["gradient_booster"].update({"model": "oops"}),
+            ),
+            (
+                "learner.gradient_booster.model",
+                lambda payload: payload["learner"]["gradient_booster"].update({"model": None}),
+            ),
+            (
+                "learner.gradient_booster.model.trees",
+                lambda payload: payload["learner"]["gradient_booster"]["model"].update({"trees": "oops"}),
+            ),
+            (
+                "learner.gradient_booster.model.trees[0].children",
+                lambda payload: payload["learner"]["gradient_booster"]["model"]["trees"][0].update(
+                    {"left_children": "oops"}
+                ),
+            ),
+            (
+                "learner.gradient_booster.model.trees[0].children",
+                lambda payload: payload["learner"]["gradient_booster"]["model"]["trees"][0].update(
+                    {"left_children": ["1", -1, -1]}
+                ),
+            ),
+            (
+                "learner.gradient_booster.model.trees[0].children",
+                lambda payload: payload["learner"]["gradient_booster"]["model"]["trees"][0].update(
+                    {"left_children": [1.9, -1, -1]}
+                ),
+            ),
+            (
+                "learner.gradient_booster.model.trees[0].children",
+                lambda payload: payload["learner"]["gradient_booster"]["model"]["trees"][0].update(
+                    {"left_children": [True, -1, -1]}
+                ),
+            ),
+            (
+                "learner.gradient_booster.model.trees[0].children",
+                lambda payload: payload["learner"]["gradient_booster"]["model"]["trees"][0].update(
+                    {"left_children": [99, -1, -1]}
+                ),
+            ),
+        ],
+    )
+    def test_malformed_nested_json_is_inconclusive(
+        self,
+        temp_dir: Path,
+        valid_xgboost_json: dict[str, Any],
+        field: str,
+        mutate_model: Callable[[dict[str, Any]], None],
+    ) -> None:
+        """Malformed nested fields should not disappear behind a clean JSON scan."""
+        mutate_model(valid_xgboost_json)
+        json_file = temp_dir / "malformed_nested.json"
+        json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
+
+        result = XGBoostScanner().scan(str(json_file))
+
+        checks = [check for check in result.checks if check.name == "XGBoost JSON Structure Validation"]
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_json_structure_invalid" in result.metadata["scan_outcome_reasons"]
+        assert any(check.details["field"] == field for check in checks)
+
+    def test_json_structure_validation_aggregates_many_invalid_trees(
+        self, temp_dir: Path, valid_xgboost_json: dict[str, Any]
+    ) -> None:
+        """Repeated malformed trees should collapse to one bounded finding."""
+        valid_xgboost_json["learner"]["gradient_booster"]["model"]["trees"] = ["oops"] * 25
+        json_file = temp_dir / "many_malformed_trees.json"
+        json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
+
+        result = XGBoostScanner().scan(str(json_file))
+
+        checks = [check for check in result.checks if check.name == "XGBoost JSON Structure Validation"]
+        assert len(checks) == 1
+        assert checks[0].details["invalid_count"] == 25
+        assert checks[0].details["aggregated"] is True
+        assert len(checks[0].details["examples"]) == 10
 
     def test_malformed_xgboost_json_candidate_is_routed(self, temp_dir: Path) -> None:
         """Malformed XGBoost-shaped JSON should reach the fail-closed parser path."""
@@ -929,6 +1020,29 @@ class TestXGBoostBinaryScanning:
 
 class TestXGBoostFailClosedEndToEnd:
     """Test CLI/core-visible XGBoost fail-closed semantics."""
+
+    def test_malformed_nested_xgboost_json_core_fails_closed_and_is_uncached(
+        self, tmp_path: Path, valid_xgboost_json: dict[str, Any]
+    ) -> None:
+        valid_xgboost_json["learner"]["gradient_booster"] = None
+        json_file = tmp_path / "nested.json"
+        json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
+        cache_dir = tmp_path / "cache"
+
+        reset_cache_manager()
+        try:
+            first, second = _scan_twice_with_cache(json_file, cache_dir)
+
+            for result in (first, second):
+                assert result.success is False
+                assert determine_exit_code(result) == 2
+                assert "xgboost" in result.scanner_names
+                _assert_inconclusive_metadata(result, json_file, "xgboost_json_structure_invalid")
+                assert any("Invalid XGBoost JSON structure" in str(issue.message) for issue in result.issues)
+
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
 
     def test_malformed_xgboost_json_core_fails_closed_and_is_uncached(self, tmp_path: Path) -> None:
         json_file = tmp_path / "booster.json"
