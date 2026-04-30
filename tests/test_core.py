@@ -15,7 +15,7 @@ import pytest
 from modelaudit import core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import scan_file
-from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from tests.helpers import create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
@@ -619,6 +619,28 @@ def test_scan_file_routes_raw_pickle_torch_suffix_collisions_to_pickle(
     assert result.success is True
 
 
+def test_scan_file_routes_jax_pickles_through_jax_specific_analysis(tmp_path: Path) -> None:
+    model_path = tmp_path / "state.pickle"
+    model_path.write_bytes(
+        pickle.dumps(
+            {
+                "framework": "jax",
+                "payload": "jax.experimental.io_callback",
+            }
+        )
+    )
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    assert any(
+        check.name == "JAX Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["pattern"] == r"jax\.experimental\.io_callback"
+        for check in result.checks
+    )
+
+
 def test_scan_file_routes_raw_bin_without_zip_structure_to_pytorch_binary(tmp_path: Path) -> None:
     model_path = tmp_path / "weights.bin"
     model_path.write_bytes(b"\x00" * 128)
@@ -803,6 +825,136 @@ def test_scan_file_does_not_route_incidental_onnx_pb_string(tmp_path: Path) -> N
     assert not any(check.name == "Python Operator Detection" for check in result.checks)
 
 
+def test_scan_file_fails_closed_when_recognized_format_scanner_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unavailable_onnx = tmp_path / "model.onnx"
+    unavailable_onnx.write_bytes(b"recognized-format")
+
+    monkeypatch.setattr(core_module, "detect_file_format", lambda _path: "onnx")
+    monkeypatch.setattr(core_module, "detect_file_format_from_magic", lambda _path: "onnx")
+    monkeypatch.setattr(core_module, "detect_format_from_extension", lambda _path: "onnx")
+    monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(core_module._registry, "get_scanner_for_path", lambda *_args, **_kwargs: None)
+
+    result = scan_file(str(unavailable_onnx))
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.has_errors is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+    assert "recognized_format_scanner_unavailable" in result.metadata["scan_outcome_reasons"]
+
+    check = next(check for check in result.checks if check.name == "Format Detection")
+    assert check.severity == IssueSeverity.INFO
+    assert "Recognized format could not be scanned" in check.message
+    assert check.details["format"] == "onnx"
+    assert check.details["preferred_scanner_id"] == "onnx"
+
+    aggregate = core_module.scan_model_directory_or_file(str(unavailable_onnx))
+    assert aggregate.success is False
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_does_not_fail_closed_for_extension_only_recognized_format(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generic_pb = tmp_path / "metadata.pb"
+    generic_pb.write_bytes(b"plain protobuf-ish bytes")
+
+    monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(core_module._registry, "get_scanner_for_path", lambda *_args, **_kwargs: None)
+
+    result = scan_file(str(generic_pb))
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != "inconclusive"
+    assert not any(check.name == "Format Detection" for check in result.checks)
+
+
+def test_scan_file_unavailable_recognized_format_result_is_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unavailable_onnx = tmp_path / "model.onnx"
+    unavailable_onnx.write_bytes(b"recognized-format")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    monkeypatch.setattr(core_module, "detect_file_format", lambda _path: "onnx")
+    monkeypatch.setattr(core_module, "detect_file_format_from_magic", lambda _path: "onnx")
+    monkeypatch.setattr(core_module, "detect_format_from_extension", lambda _path: "onnx")
+    monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(core_module._registry, "get_scanner_for_path", lambda *_args, **_kwargs: None)
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(unavailable_onnx), config=config)
+        second = scan_file(str(unavailable_onnx), config=config)
+
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert second.metadata["scan_outcome"] == "inconclusive"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_fails_closed_when_xml_root_is_beyond_bounded_probe(tmp_path: Path) -> None:
+    ambiguous_xml = tmp_path / "payload.txt"
+    ambiguous_xml.write_text(
+        "<?xml version='1.0'?><!--" + ("x" * ((1024 * 1024) + 64)) + "--><PMML version='4.4'></PMML>",
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(ambiguous_xml), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["operational_error_reason"] == "xml_model_routing_incomplete"
+    check = next(check for check in result.checks if check.name == "XML Model Routing")
+    assert "bounded probe ended before the first structural root element" in check.message
+
+
+def test_scan_file_incomplete_xml_routing_result_is_not_cached(tmp_path: Path) -> None:
+    ambiguous_xml = tmp_path / "payload.txt"
+    ambiguous_xml.write_text(
+        "<?xml version='1.0'?><!--" + ("x" * ((1024 * 1024) + 64)) + "--><PMML version='4.4'></PMML>",
+        encoding="utf-8",
+    )
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(ambiguous_xml), config=config)
+        second = scan_file(str(ambiguous_xml), config=config)
+
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert second.metadata["scan_outcome"] == "inconclusive"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 def test_scan_file_ignores_benign_onnx_token_near_match(tmp_path: Path) -> None:
     near_match = tmp_path / "note.payload"
     near_match.write_bytes(b"this documentation mentions onnx but is not a model")
@@ -917,3 +1069,23 @@ def test_scan_file_routes_model_config_json_to_manifest_scanner(tmp_path: Path) 
 
     assert result.scanner_name == "manifest"
     assert result.success is True
+
+
+def test_scan_file_routes_manifest_owned_chat_templates_through_jinja_analysis(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "config.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+            }
+        )
+    )
+
+    result = scan_file(str(manifest_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "manifest"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from modelaudit import core
 from modelaudit.scanners import get_scanner_for_file
-from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.r_serialized_scanner import RSerializedScanner
 from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension
 
@@ -92,6 +92,17 @@ def test_scan_benign_rds_model_does_not_raise_critical(tmp_path: Path) -> None:
     symbol_checks = _check_by_name(result, "Executable Symbol Context Analysis")
     assert len(symbol_checks) == 1
     assert symbol_checks[0].status == CheckStatus.PASSED
+
+
+def test_scan_bounded_r_serialized_payload_is_inconclusive(tmp_path: Path) -> None:
+    path = tmp_path / "bounded.rds"
+    _write_raw_r_serialized(path, "safe\n" * 64)
+
+    result = RSerializedScanner(config={"r_max_scan_bytes": 32}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "r_serialized_byte_ceiling_incomplete" in result.metadata["scan_outcome_reasons"]
 
 
 def test_scan_benign_rdata_workspace_passes_signature_and_context_checks(tmp_path: Path) -> None:
