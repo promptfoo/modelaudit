@@ -162,6 +162,7 @@ class ScanResult:
         self.success: bool = True
         self.metadata: dict[str, Any] = {}
         self._metadata_restored_critical: bool = False
+        self._merged_children_success: bool = True
 
     def add_check(
         self,
@@ -317,6 +318,8 @@ class ScanResult:
         self.issues.extend(other.issues)
         self.checks.extend(other.checks)  # Merge checks as well
         self.bytes_scanned += other.bytes_scanned
+        self._merged_children_success = self._merged_children_success and other.success
+        self.success = self.success and other.success
         # Merge metadata dictionaries
         for key, value in other.metadata.items():
             if key in self.metadata and isinstance(self.metadata[key], dict) and isinstance(value, dict):
@@ -324,11 +327,15 @@ class ScanResult:
             else:
                 self.metadata[key] = value
 
+    def trust_merged_child_failures(self) -> None:
+        """Allow a parent scanner to explicitly accept child failures it has reclassified as benign."""
+        self._merged_children_success = True
+
     def finish(self, success: bool = True) -> None:
         """Mark the scan as finished"""
         restored_critical = self._restore_result_metadata_whitelist_downgrades()
         self.end_time = time.time()
-        self.success = success
+        self.success = success and self._merged_children_success
         if (restored_critical or self._metadata_restored_critical) and self.has_errors:
             self.success = False
 

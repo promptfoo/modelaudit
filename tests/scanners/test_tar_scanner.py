@@ -199,6 +199,25 @@ class TestTarScanner:
         assert python_checks[0].rule_code == "S101"
         assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
+    def test_scan_tar_flags_concatenated_getattr_name_dangerous_python_member(self, tmp_path: Path) -> None:
+        """Static string concatenation should not hide risky getattr targets."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = b"import os\ngetattr(os, 'sys' + 'tem')('echo hidden')\n"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].severity == IssueSeverity.WARNING
+        assert python_checks[0].rule_code == "S101"
+        assert python_checks[0].details["reason"] == "high-risk calls: os.system"
+
     def test_scan_tar_flags_rebound_dangerous_python_member(self, tmp_path: Path) -> None:
         """Callable rebindings should not bypass generic TAR Python member scanning."""
         archive_path = tmp_path / "model_bundle.tar"
@@ -436,6 +455,27 @@ class TestTarScanner:
         assert len(executable_checks) == 1
         assert executable_checks[0].severity == IssueSeverity.WARNING
         assert executable_checks[0].details["entry"] == "bin/run.sh"
+
+    def test_scan_tar_flags_extensionless_executable_member(self, tmp_path: Path) -> None:
+        """TAR archives should flag strong executable signatures without suffix help."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = b"\x7fELF" + b"\x00" * 64
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("bin/runme")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        executable_checks = [
+            check
+            for check in result.checks
+            if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
+        ]
+        assert len(executable_checks) == 1
+        assert executable_checks[0].severity == IssueSeverity.WARNING
+        assert executable_checks[0].details["entry"] == "bin/runme"
 
     @pytest.mark.parametrize(
         ("source", "expected_rule_code", "expected_call"),

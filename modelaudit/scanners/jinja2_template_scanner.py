@@ -232,8 +232,7 @@ class Jinja2TemplateScanner(BaseScanner):
                 result.finish(success=True)
                 return result
 
-            self._analyze_extracted_templates(result, path, context, templates, file_size)
-            return result
+            return self._scan_extracted_templates(path, templates, context, result=result, file_size=file_size)
 
         except Exception as e:
             import traceback
@@ -258,11 +257,10 @@ class Jinja2TemplateScanner(BaseScanner):
             return result
 
     def scan_extracted_templates(self, path: str, templates: dict[str, str]) -> ScanResult:
-        """Analyze already-extracted templates with normal Jinja reporting."""
+        """Analyze templates that were already extracted by another structured scanner."""
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
-
         context = self._determine_context(path)
         result.metadata["ml_context"] = {
             "framework": context.framework,
@@ -270,8 +268,8 @@ class Jinja2TemplateScanner(BaseScanner):
             "is_tokenizer": context.is_tokenizer,
             "confidence": context.confidence,
         }
-        bounded_templates = {}
-        oversized_template_locations = []
+        bounded_templates: dict[str, str] = {}
+        oversized_template_locations: list[str] = []
         for template_location, template_content in templates.items():
             if len(template_content) <= self.max_template_size:
                 bounded_templates[template_location] = template_content
@@ -294,17 +292,17 @@ class Jinja2TemplateScanner(BaseScanner):
                 },
             )
 
-        self._analyze_extracted_templates(result, path, context, bounded_templates, file_size)
-        return result
+        return self._scan_extracted_templates(path, bounded_templates, context, result=result, file_size=file_size)
 
-    def _analyze_extracted_templates(
+    def _scan_extracted_templates(
         self,
-        result: ScanResult,
         path: str,
-        context: MLContext,
         templates: dict[str, str],
+        context: MLContext,
+        *,
+        result: ScanResult,
         file_size: int,
-    ) -> None:
+    ) -> ScanResult:
         total_detections = 0
         for template_location, template_content in templates.items():
             detections = self._analyze_template(template_content, context, f"{path}:{template_location}")
@@ -355,6 +353,7 @@ class Jinja2TemplateScanner(BaseScanner):
 
         result.bytes_scanned = file_size
         self._finish_scan_result(result)
+        return result
 
     def _mark_inconclusive_scan_result(
         self,
