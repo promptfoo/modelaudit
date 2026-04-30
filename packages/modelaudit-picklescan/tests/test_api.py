@@ -1841,6 +1841,51 @@ def test_scan_bytes_post_budget_tail_detects_default_protocol_stack_global() -> 
     )
 
 
+def test_scan_bytes_post_budget_tail_resynchronizes_after_malformed_bytes() -> None:
+    payload = b"\x80\x04\x88\x88\xff" + pickle.dumps(MaliciousPayload(), protocol=4)[2:]
+
+    report = scan_bytes(
+        payload,
+        source="budget-malformed-default-protocol-stack-global.pkl",
+        options=ScanOptions(max_opcodes=2, post_budget_scan_bytes=4096),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert any(
+        finding.rule_code == "POST_BUDGET_GLOBAL"
+        and finding.severity == Severity.CRITICAL
+        and f"{finding.details.get('module')}.{finding.details.get('name')}" in SYSTEM_GLOBALS
+        for finding in report.findings
+    )
+
+
+def test_scan_bytes_post_budget_tail_does_not_resynchronize_inside_truncated_literals() -> None:
+    inert_inner_bytes = b"\x8c\nsubprocess\x94\x8c\x03run\x94\x93)R."
+    payload = (
+        b"\x80\x04\x88\x88X"
+        + (64).to_bytes(4, "little")
+        + inert_inner_bytes
+        + (b"A" * (64 - len(inert_inner_bytes)))
+        + b"."
+    )
+
+    report = scan_bytes(
+        payload,
+        source="budget-truncated-literal.pkl",
+        options=ScanOptions(max_opcodes=2, post_budget_scan_bytes=32),
+    )
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert not any(
+        finding.rule_code == "POST_BUDGET_GLOBAL"
+        and finding.details.get("module") == "subprocess"
+        and finding.details.get("name") == "run"
+        for finding in report.findings
+    )
+
+
 @pytest.mark.parametrize(
     "payload_suffix",
     [

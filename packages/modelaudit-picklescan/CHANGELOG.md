@@ -143,6 +143,8 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Fail closed when a whole-pass Python call-graph enrichment step raises.
+- Resynchronize bounded post-budget replay after malformed bytes so later
+  self-contained modern globals still surface critical findings.
 - Require actual callable invocations before pairing startup-hook opener and
   writer imports, avoiding critical findings for pickles that only reconstruct
   those function objects.
