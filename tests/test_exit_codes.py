@@ -1,5 +1,6 @@
 """Tests specifically for exit code logic."""
 
+import pickle
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -474,3 +475,26 @@ def test_scan_model_directory_or_file_inconclusive_pickle_budget_returns_exit_co
     assert results.has_errors is False
     assert results.success is False
     assert determine_exit_code(results) == 2
+
+
+def test_directory_total_size_limit_returns_exit_code_2(tmp_path: Path) -> None:
+    """Early directory termination from max_total_size should fail closed."""
+    for filename, payload in [
+        ("a.pkl", {"data": "x" * 100}),
+        ("b.pkl", {"data": "y" * 100}),
+        ("c.pkl", {"data": "z" * 100}),
+    ]:
+        path = tmp_path / filename
+        path.write_bytes(pickle.dumps(payload))
+
+    results = scan_model_directory_or_file(str(tmp_path), max_total_size=150, cache_enabled=False)
+
+    assert results.files_scanned == 2
+    assert results.success is False
+    assert results.has_errors is True
+    assert determine_exit_code(results) == 2
+    assert any(
+        issue.message == "Scan terminated early due to total size limit"
+        and issue.details.get("analysis_incomplete") is True
+        for issue in results.issues
+    )

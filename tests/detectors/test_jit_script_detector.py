@@ -1,5 +1,7 @@
 """Tests for JIT/Script code execution detection."""
 
+from pathlib import Path
+
 from modelaudit.detectors.jit_script import JITScriptDetector, detect_jit_script_risks
 
 
@@ -170,6 +172,59 @@ class TestJITScriptDetector:
         onnx_findings = detector.scan_model(onnx_data, "unknown")
         assert isinstance(onnx_findings, list)
 
+    def test_scan_model_detects_unmarked_dangerous_python_source(self) -> None:
+        detector = JITScriptDetector()
+        data = b"""
+        def payload():
+            import os
+            return eval("1 + 1") or os.system("id")
+        """
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
+        assert any(f.type == "dangerous_builtin" and f.builtin == "eval" for f in findings)
+
+    def test_scan_model_ignores_unmarked_benign_python_source(self) -> None:
+        detector = JITScriptDetector()
+        data = b"""
+        def normalize(values):
+            total = sum(values)
+            return [value / total for value in values]
+        """
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert findings == []
+
+    def test_scan_model_ignores_non_source_dangerous_text(self) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(b"metadata says eval( is unsupported", "pytorch", "payload.bin")
+
+        assert findings == []
+
+    def test_scan_model_detects_unmarked_module_scope_python_source(self) -> None:
+        detector = JITScriptDetector()
+        findings = detector.scan_model(b"import os\nos.system('id')\n", "pytorch", "payload.bin")
+
+        assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
+
+    def test_scan_model_detects_late_unmarked_module_scope_python_source(self) -> None:
+        detector = JITScriptDetector()
+        data = b"# pad\n" * 200000 + b"import os\nos.system('id')\n"
+
+        findings = detector.scan_model(data, "pytorch", "payload.bin")
+
+        assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
+
+    def test_scan_model_detects_unmarked_from_import_source(self) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(b"from os import system as run\nrun('id')\n", "pytorch", "payload.bin")
+
+        assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
+
     def test_strict_mode(self) -> None:
         """Test strict mode flags any JIT usage."""
         detector_normal = JITScriptDetector({"strict_mode": False})
@@ -242,6 +297,20 @@ class TestDetectJITScriptRisks:
         findings = detect_jit_script_risks(str(test_file))
         assert len(findings) > 0
         assert any("torch.ops.aten.system" in str(f) for f in findings)
+
+    def test_scan_file_detects_unmarked_dangerous_python_source(self, tmp_path: Path) -> None:
+        test_file = tmp_path / "payload.bin"
+        test_file.write_bytes(
+            b"""
+            def payload():
+                import os
+                return os.system("id")
+            """
+        )
+
+        findings = detect_jit_script_risks(str(test_file))
+
+        assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
 
     def test_file_not_found(self):
         """Test handling of non-existent files."""

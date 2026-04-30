@@ -210,7 +210,9 @@ class CatBoostScanner(BaseScanner):
 
         self._analyze_text_fragments(extracted_strings, result, path)
 
-        result.finish(success=not result.has_errors)
+        result.finish(
+            success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
+        )
         return result
 
     def _mark_inconclusive_scan_result(self, result: ScanResult, reason: str) -> None:
@@ -289,10 +291,19 @@ class CatBoostScanner(BaseScanner):
             trailing_bytes_to_read = min(trailing_total, self.trailing_scan_budget)
             trailing_blob = f.read(trailing_bytes_to_read)
 
+            analysis_incomplete = core_remaining > 0 or trailing_total > trailing_bytes_to_read
+            if analysis_incomplete:
+                self._mark_inconclusive_scan_result(result, "catboost_bounded_parse_incomplete")
+
             result.add_check(
                 name="CatBoost Bounded Parse Check",
-                passed=True,
-                message="CatBoost parsing completed within configured byte budgets",
+                passed=not analysis_incomplete,
+                message=(
+                    "CatBoost parsing stopped at configured byte budgets"
+                    if analysis_incomplete
+                    else "CatBoost parsing completed within configured byte budgets"
+                ),
+                severity=IssueSeverity.INFO if analysis_incomplete else None,
                 location=path,
                 details={
                     "core_scan_budget": self.core_scan_budget,
@@ -301,6 +312,7 @@ class CatBoostScanner(BaseScanner):
                     "core_bytes_skipped": core_remaining,
                     "trailing_bytes_scanned": trailing_bytes_to_read,
                     "trailing_bytes_skipped": max(0, trailing_total - trailing_bytes_to_read),
+                    "analysis_incomplete": analysis_incomplete,
                 },
             )
 
