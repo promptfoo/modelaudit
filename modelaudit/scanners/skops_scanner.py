@@ -6,6 +6,7 @@ contain critical vulnerabilities (CVE-2025-54412, CVE-2025-54413, CVE-2025-54886
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import zipfile
@@ -29,6 +30,9 @@ class SkopsScanner(BaseScanner):
     _BAD_ZIP_REASON: ClassVar[str] = "skops_bad_zip_file"
     _FILE_COUNT_LIMIT_REASON: ClassVar[str] = "skops_archive_file_count_limited"
     _UNCOMPRESSED_SIZE_LIMIT_REASON: ClassVar[str] = "skops_archive_uncompressed_size_limited"
+    _STRUCTURED_JSON_PARSE_REASON: ClassVar[str] = "skops_structured_json_parse_failed"
+    _CVE_54412_LOADER: ClassVar[str] = "OperatorFuncNode"
+    _CVE_54413_LOADER: ClassVar[str] = "MethodNode"
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -114,50 +118,18 @@ class SkopsScanner(BaseScanner):
 
         return is_skops_archive(path)
 
-    def _detect_cve_2025_54412(
-        self, zip_file: zipfile.ZipFile, result: ScanResult, zip_path: str, file_list: list[str]
-    ) -> None:
+    def _detect_cve_2025_54412(self, zip_file: zipfile.ZipFile, result: ScanResult, zip_path: str) -> None:
         """Detect CVE-2025-54412: OperatorFuncNode trusted-type confusion.
 
         This CVE allows arbitrary code execution through malicious OperatorFuncNode
         objects that bypass trusted type validation.
         """
-        # Check for OperatorFuncNode patterns in file structure and content.
-        # NOTE: __reduce__ and get_state were removed because they are standard
-        # Python serialization methods used by ALL sklearn Cython types
-        # (e.g., sklearn.tree._tree.Tree). Only flag patterns specific to the
-        # actual CVE-2025-54412 exploit (OperatorFuncNode abuse).
-        suspicious_patterns = [
-            "OperatorFuncNode",
-            "operator.func",
-            "trusted_types",
-        ]
-
-        # Binary patterns for content scanning
-        suspicious_binary_patterns = [
-            b"OperatorFuncNode",
-            b"operator.func",
-            b"trusted_types",
-        ]
-
-        # Look for suspicious patterns in ZIP file names
-        found_patterns = []
-        for file_name in file_list:
-            for pattern in suspicious_patterns:
-                if pattern.lower() in file_name.lower():
-                    found_patterns.append(f"filename: {pattern} in {file_name}")
-
-        # Scan file contents for suspicious patterns
-        for file_info in zip_file.filelist:
-            with suppress(Exception):
-                content = self._read_zip_entry_safely(zip_file, file_info, result=result, zip_path=zip_path)
-                if content is None:
-                    continue
-                for binary_pattern in suspicious_binary_patterns:
-                    if binary_pattern in content:
-                        found_patterns.append(
-                            f"content: {binary_pattern.decode('utf-8', errors='ignore')} in {file_info.filename}"
-                        )
+        found_patterns = self._find_structured_loader_references(
+            zip_file,
+            result,
+            zip_path,
+            loader_name=self._CVE_54412_LOADER,
+        )
 
         if found_patterns:
             result.add_check(
@@ -182,47 +154,17 @@ class SkopsScanner(BaseScanner):
                 ),
             )
 
-    def _detect_cve_2025_54413(
-        self, zip_file: zipfile.ZipFile, result: ScanResult, zip_path: str, file_list: list[str]
-    ) -> None:
+    def _detect_cve_2025_54413(self, zip_file: zipfile.ZipFile, result: ScanResult, zip_path: str) -> None:
         """Detect CVE-2025-54413: MethodNode inconsistency → dangerous attribute access.
 
         This CVE allows dangerous attribute access through inconsistent MethodNode objects.
         """
-        suspicious_patterns = [
-            "MethodNode",
-            "__getattr__",
-            "__setattr__",
-            "method_node",
-            "getattr",
-        ]
-
-        # Binary patterns for content scanning
-        suspicious_binary_patterns = [
-            b"MethodNode",
-            b"__getattr__",
-            b"__setattr__",
-            b"method_node",
-        ]
-
-        # Look for suspicious patterns in ZIP file names
-        found_patterns = []
-        for file_name in file_list:
-            for pattern in suspicious_patterns:
-                if pattern.lower() in file_name.lower():
-                    found_patterns.append(f"filename: {pattern} in {file_name}")
-
-        # Scan file contents for suspicious patterns
-        for file_info in zip_file.filelist:
-            with suppress(Exception):
-                content = self._read_zip_entry_safely(zip_file, file_info, result=result, zip_path=zip_path)
-                if content is None:
-                    continue
-                for binary_pattern in suspicious_binary_patterns:
-                    if binary_pattern in content:
-                        found_patterns.append(
-                            f"content: {binary_pattern.decode('utf-8', errors='ignore')} in {file_info.filename}"
-                        )
+        found_patterns = self._find_structured_loader_references(
+            zip_file,
+            result,
+            zip_path,
+            loader_name=self._CVE_54413_LOADER,
+        )
 
         if found_patterns:
             result.add_check(
@@ -363,6 +305,63 @@ class SkopsScanner(BaseScanner):
             return True
 
         return bool(cls._CARD_GET_MODEL_PATTERN.search(content) and cls._CARD_JOBLIB_FALLBACK_PATTERN.search(content))
+
+    @staticmethod
+    def _contains_malicious_loader_state(value: Any, loader_name: str) -> bool:
+        """Return whether decoded Skops JSON contains an exploit-shaped loader node."""
+        if isinstance(value, dict):
+            if value.get("__loader__") == loader_name:
+                if loader_name == SkopsScanner._CVE_54412_LOADER:
+                    return value.get("__module__") != "operator"
+                if loader_name == SkopsScanner._CVE_54413_LOADER:
+                    content = value.get("content")
+                    obj = content.get("obj") if isinstance(content, dict) else None
+                    if isinstance(obj, dict):
+                        return value.get("__module__") != obj.get("__module__") or value.get("__class__") != obj.get(
+                            "__class__"
+                        )
+            return any(SkopsScanner._contains_malicious_loader_state(child, loader_name) for child in value.values())
+        elif isinstance(value, list):
+            return any(SkopsScanner._contains_malicious_loader_state(child, loader_name) for child in value)
+        return False
+
+    def _find_structured_loader_references(
+        self,
+        zip_file: zipfile.ZipFile,
+        result: ScanResult,
+        zip_path: str,
+        *,
+        loader_name: str,
+    ) -> list[str]:
+        """Find exploit-shaped loader states inside authoritative Skops schema documents."""
+        matches: list[str] = []
+        for file_info in zip_file.filelist:
+            raw_content = self._read_zip_entry_safely(zip_file, file_info, result=result, zip_path=zip_path)
+            if raw_content is None or not self._is_skops_metadata(file_info.filename):
+                continue
+            try:
+                decoded = json.loads(raw_content)
+            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+                if not any(
+                    check.name == "Skops Structured JSON Parse Check"
+                    and check.details.get("entry") == file_info.filename
+                    for check in result.checks
+                ):
+                    result.add_check(
+                        name="Skops Structured JSON Parse Check",
+                        passed=False,
+                        message=f"Unable to parse Skops JSON entry {file_info.filename}: {exc}",
+                        severity=IssueSeverity.WARNING,
+                        location=f"{zip_path}:{file_info.filename}",
+                        details={"entry": file_info.filename},
+                        why="Structured Skops loader inspection was incomplete for this archive member.",
+                    )
+                mark_archive_scan_incomplete(result, self._STRUCTURED_JSON_PARSE_REASON)
+                continue
+
+            if self._contains_malicious_loader_state(decoded, loader_name):
+                matches.append(f"loader: {loader_name} in {file_info.filename}")
+        return matches
 
     def _check_unsafe_joblib_fallback(self, zip_file: zipfile.ZipFile, result: ScanResult, zip_path: str) -> None:
         """Check for unsafe joblib fallback patterns in skops files."""
@@ -511,8 +510,8 @@ class SkopsScanner(BaseScanner):
                     return result
 
                 # Run CVE detection checks (with content analysis)
-                self._detect_cve_2025_54412(zip_file, result, path, file_list)
-                self._detect_cve_2025_54413(zip_file, result, path, file_list)
+                self._detect_cve_2025_54412(zip_file, result, path)
+                self._detect_cve_2025_54413(zip_file, result, path)
                 self._detect_cve_2025_54886(zip_file, result, path)
 
                 # Check protocol version
