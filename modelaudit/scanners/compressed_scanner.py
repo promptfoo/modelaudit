@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from .. import core
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils.file._compression import is_zlib_header
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
@@ -21,6 +22,10 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 
 class _DecompressionLimitExceeded(ValueError):
     """Raised when decompression policies are exceeded."""
+
+
+class _CompressedMemberLimitExceeded(_DecompressionLimitExceeded):
+    """Raised when concatenated-member fan-out exceeds the scan budget."""
 
 
 class _CorruptStreamError(ValueError):
@@ -44,7 +49,7 @@ class _DecompressedOutputSink:
     def _open_member_file(self, suffix: str) -> Any:
         next_member_count = len(self.member_paths) + 1
         if next_member_count > self.max_members:
-            raise _DecompressionLimitExceeded(
+            raise _CompressedMemberLimitExceeded(
                 f"Compressed member count exceeded limit ({next_member_count} > {self.max_members})",
             )
         member_fd, member_path = tempfile.mkstemp(suffix=suffix)
@@ -97,6 +102,7 @@ class CompressedScanner(BaseScanner):
     DEFAULT_MAX_DEPTH: ClassVar[int] = 3
     DEFAULT_MAX_MEMBERS: ClassVar[int] = 1000
     DEFAULT_CHUNK_SIZE: ClassVar[int] = 64 * 1024
+    _MEMBER_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_member_limit_exceeded"
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -528,6 +534,8 @@ class CompressedScanner(BaseScanner):
                     break
 
                 if frame_eof:
+                    if on_new_member is not None:
+                        on_new_member()
                     context = create_context()
                     frame_eof = False
 
@@ -673,6 +681,17 @@ class CompressedScanner(BaseScanner):
             else:
                 check.details = {"compressed_wrapper": provenance}
 
+    @staticmethod
+    def _is_transport_fragment_member(inner_result: ScanResult, member_result: ScanResult) -> bool:
+        """Return whether a member rescan only proves transport fragmentation."""
+        return (
+            inner_result.success is True
+            and member_result.success is False
+            and member_result.scanner_name == inner_result.scanner_name
+            and member_result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            and not any(issue.severity == IssueSeverity.CRITICAL for issue in member_result.issues)
+        )
+
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
@@ -805,6 +824,8 @@ class CompressedScanner(BaseScanner):
             if len(member_temp_paths) > 1:
                 for member_index, member_temp_path in enumerate(member_temp_paths, start=1):
                     member_result = core.scan_file(member_temp_path, nested_config)
+                    if self._is_transport_fragment_member(inner_result, member_result):
+                        continue
                     member_provenance = f"{provenance}#member-{member_index}"
                     self._rewrite_inner_locations(member_result, member_temp_path, member_provenance)
                     result.add_check(
@@ -828,6 +849,25 @@ class CompressedScanner(BaseScanner):
                 severity=IssueSeverity.INFO,
                 location=path,
                 details={"codec": expected_codec, "missing_dependency": "lz4"},
+            )
+            result.finish(success=False)
+            return result
+        except _CompressedMemberLimitExceeded as exc:
+            mark_inconclusive_scan_result(result, self._MEMBER_LIMIT_INCONCLUSIVE_REASON)
+            result.add_check(
+                name="Compressed Wrapper Decompression Limits",
+                passed=False,
+                message=f"{exc}; analysis incomplete",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "codec": expected_codec,
+                    "max_decompressed_bytes": self.max_decompressed_bytes,
+                    "max_decompression_ratio": self.max_decompression_ratio,
+                    "max_compressed_members": self.max_members,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self._MEMBER_LIMIT_INCONCLUSIVE_REASON,
+                },
             )
             result.finish(success=False)
             return result
