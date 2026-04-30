@@ -151,6 +151,7 @@ fn record_post_budget_opcode_stream(
     while index < tail.len() {
         let parsed = match parse_opcode(tail, index, tail.len()) {
             Ok(parsed) => parsed,
+            Err(error) if error.report_index == Some(tail.len()) => break,
             Err(_) => {
                 stack.clear();
                 memo_overlay.clear();
