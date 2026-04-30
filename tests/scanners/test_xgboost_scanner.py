@@ -606,32 +606,86 @@ class TestXGBoostJSONScanning:
 
     def test_feature_names_metadata_does_not_false_positive(
         self,
-        temp_dir: Path,
+        tmp_path: Path,
         valid_xgboost_json: dict[str, Any],
     ) -> None:
         """Feature labels are inert metadata, not executable JSON content."""
         valid_xgboost_json["learner"]["feature_names"] = ["system(cpu)"]
-        json_file = temp_dir / "feature_names.json"
+        json_file = tmp_path / "feature_names.json"
         json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
 
         result = XGBoostScanner().scan(str(json_file))
 
         assert result.success is True
-        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert not any(
+            check.name == "JSON Content Analysis" and check.status == CheckStatus.FAILED for check in result.checks
+        )
 
     def test_system_call_outside_feature_names_still_detected(
         self,
-        temp_dir: Path,
+        tmp_path: Path,
         valid_xgboost_json: dict[str, Any],
     ) -> None:
         """The feature-name exemption must not suppress real payload fields."""
         valid_xgboost_json["learner"]["malicious_code"] = "system(cpu)"
-        json_file = temp_dir / "malicious_field.json"
+        json_file = tmp_path / "malicious_field.json"
         json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
 
         result = XGBoostScanner().scan(str(json_file))
 
-        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert any(
+            check.name == "JSON Content Analysis"
+            and check.status == CheckStatus.FAILED
+            and "System call in JSON" in check.message
+            for check in result.checks
+        )
+
+    def test_nested_feature_names_lookalike_still_detected(
+        self,
+        tmp_path: Path,
+        valid_xgboost_json: dict[str, Any],
+    ) -> None:
+        """Only the canonical metadata path should receive the exemption."""
+        valid_xgboost_json["learner"] = [{"feature_names": "system(cpu)"}]
+        json_file = tmp_path / "nested_feature_names.json"
+        json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
+
+        result = XGBoostScanner().scan(str(json_file))
+
+        assert any(
+            check.name == "JSON Content Analysis"
+            and check.status == CheckStatus.FAILED
+            and "System call in JSON" in check.message
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "feature_names",
+        [
+            "system(cpu)",
+            {"payload": "system(cpu)"},
+            [{"payload": "system(cpu)"}],
+        ],
+    )
+    def test_malformed_feature_names_values_still_detected(
+        self,
+        tmp_path: Path,
+        valid_xgboost_json: dict[str, Any],
+        feature_names: Any,
+    ) -> None:
+        """Only valid inert feature-label arrays should receive the exemption."""
+        valid_xgboost_json["learner"]["feature_names"] = feature_names
+        json_file = tmp_path / "malformed_feature_names.json"
+        json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
+
+        result = XGBoostScanner().scan(str(json_file))
+
+        assert any(
+            check.name == "JSON Content Analysis"
+            and check.status == CheckStatus.FAILED
+            and "System call in JSON" in check.message
+            for check in result.checks
+        )
 
 
 @pytest.mark.skipif(not hasattr(pytest, "importorskip"), reason="pytest.importorskip not available")
