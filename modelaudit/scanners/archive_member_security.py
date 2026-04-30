@@ -6,7 +6,7 @@ import ast
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from ._archive_outcomes import mark_archive_scan_incomplete
 from .base import IssueSeverity
@@ -27,6 +27,29 @@ _EXECUTABLE_ARCHIVE_MEMBER_SUFFIXES = (
     ".bat",
     ".ps1",
 )
+_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES = 1024
+_PORTABLE_EXECUTABLE_POINTER_OFFSET = 0x3C
+_PORTABLE_EXECUTABLE_MIN_HEADER_OFFSET = 0x40
+_PORTABLE_EXECUTABLE_MAX_HEADER_OFFSET = 1024 * 1024
+_PORTABLE_EXECUTABLE_SIGNATURE = b"PE\x00\x00"
+_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_PREFIXES = (
+    b"\x7fELF",
+    b"\xfe\xed\xfa\xce",
+    b"\xfe\xed\xfa\xcf",
+    b"\xcf\xfa\xed\xfe",
+    b"\xce\xfa\xed\xfe",
+    b"#!",
+)
+_MACHO_FAT_MAGIC_32_BE = b"\xca\xfe\xba\xbe"
+_MACHO_FAT_MAGIC_32_LE = b"\xbe\xba\xfe\xca"
+_MACHO_FAT_MAGIC_64_BE = b"\xca\xfe\xba\xbf"
+_MACHO_FAT_MAGIC_64_LE = b"\xbf\xba\xfe\xca"
+_MACHO_FAT_MAGICS = {
+    _MACHO_FAT_MAGIC_32_BE,
+    _MACHO_FAT_MAGIC_32_LE,
+    _MACHO_FAT_MAGIC_64_BE,
+    _MACHO_FAT_MAGIC_64_LE,
+}
 _VERSIONED_SHARED_OBJECT_SUFFIX_RE = re.compile(r"\.so(?:\.[0-9]+)+$")
 _PYTHON_ARCHIVE_MEMBER_SUFFIXES = (".py", ".pyw")
 _HIGH_RISK_PYTHON_CALLS = {
@@ -104,6 +127,64 @@ def is_executable_archive_member_name(member_name: str) -> bool:
     return normalized_name.endswith(_EXECUTABLE_ARCHIVE_MEMBER_SUFFIXES) or bool(
         _VERSIONED_SHARED_OBJECT_SUFFIX_RE.search(normalized_name)
     )
+
+
+def _looks_like_portable_executable(prefix: bytes, *, path: str) -> bool:
+    if not prefix.startswith(b"MZ"):
+        return False
+    if b"This program cannot be run in DOS mode" in prefix[:512]:
+        return True
+    if len(prefix) < _PORTABLE_EXECUTABLE_MIN_HEADER_OFFSET:
+        return False
+
+    pe_offset = int.from_bytes(
+        prefix[_PORTABLE_EXECUTABLE_POINTER_OFFSET : _PORTABLE_EXECUTABLE_POINTER_OFFSET + 4],
+        "little",
+        signed=False,
+    )
+    if not _PORTABLE_EXECUTABLE_MIN_HEADER_OFFSET <= pe_offset <= _PORTABLE_EXECUTABLE_MAX_HEADER_OFFSET:
+        return False
+
+    if pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE) <= len(prefix):
+        return prefix[pe_offset : pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE)] == _PORTABLE_EXECUTABLE_SIGNATURE
+
+    try:
+        with open(path, "rb") as member_file:
+            member_file.seek(pe_offset)
+            return member_file.read(len(_PORTABLE_EXECUTABLE_SIGNATURE)) == _PORTABLE_EXECUTABLE_SIGNATURE
+    except OSError:
+        return False
+
+
+def _looks_like_macho_fat_binary(prefix: bytes) -> bool:
+    magic = prefix[:4]
+    if magic not in _MACHO_FAT_MAGICS or len(prefix) < 8:
+        return False
+
+    byteorder: Literal["big", "little"] = (
+        "big" if magic in {_MACHO_FAT_MAGIC_32_BE, _MACHO_FAT_MAGIC_64_BE} else "little"
+    )
+    arch_count = int.from_bytes(prefix[4:8], byteorder, signed=False)
+    if not 1 <= arch_count <= 128:
+        return False
+
+    arch_entry_size = 32 if magic in {_MACHO_FAT_MAGIC_64_BE, _MACHO_FAT_MAGIC_64_LE} else 20
+    return len(prefix) >= 8 + (arch_count * arch_entry_size)
+
+
+def is_executable_archive_member_content(path: str) -> bool:
+    """Return True when a member begins with a strong executable signature."""
+    try:
+        with open(path, "rb") as member_file:
+            prefix = member_file.read(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES)
+    except OSError:
+        return False
+
+    if prefix.startswith(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_PREFIXES):
+        return True
+    if _looks_like_macho_fat_binary(prefix):
+        return True
+    return _looks_like_portable_executable(prefix, path=path)
 
 
 def is_python_archive_member_name(member_name: str) -> bool:
@@ -672,7 +753,7 @@ def scan_archive_member_for_known_risks(
             )
         return
 
-    if is_executable_archive_member_name(normalized_lower):
+    if is_executable_archive_member_name(normalized_lower) or is_executable_archive_member_content(tmp_path):
         result.add_check(
             name=_EXECUTABLE_MEMBER_CHECK_NAME,
             passed=False,

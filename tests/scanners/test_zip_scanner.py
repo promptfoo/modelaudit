@@ -517,6 +517,96 @@ def test_scan_npz_flags_executable_member(tmp_path: Path) -> None:
     assert executable_checks[0].details["entry"] == "bin/run.sh"
 
 
+def test_scan_npz_flags_extensionless_executable_member(tmp_path: Path) -> None:
+    """Executable payloads should not need a helpful suffix inside ZIP-like archives."""
+    archive_path = tmp_path / "model_bundle.npz"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("bin/runme", b"\x7fELF" + b"\x00" * 64)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    executable_checks = [
+        check
+        for check in result.checks
+        if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert len(executable_checks) == 1
+    assert executable_checks[0].severity == IssueSeverity.WARNING
+    assert executable_checks[0].details["entry"] == "bin/runme"
+
+
+def test_scan_npz_ignores_extensionless_executable_near_match(tmp_path: Path) -> None:
+    """Near-match member bytes should not become executable findings."""
+    archive_path = tmp_path / "model_bundle.npz"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("bin/runme", b"\x7fELG" + b"\x00" * 64)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(check.name == "Executable Archive Member Detection" for check in result.checks)
+
+
+def test_scan_npz_ignores_java_class_header_near_match(tmp_path: Path) -> None:
+    """Java class files should not be mistaken for Mach-O fat binaries."""
+    archive_path = tmp_path / "model_bundle.npz"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("Foo.class", b"\xca\xfe\xba\xbe\x00\x00\x00\x3d" + b"\x00" * 64)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(check.name == "Executable Archive Member Detection" for check in result.checks)
+
+
+def test_scan_npz_flags_extensionless_pe_member_with_late_header(tmp_path: Path) -> None:
+    """Extensionless PEs with large DOS stubs should still be detected by content."""
+    archive_path = tmp_path / "model_bundle.npz"
+    payload = bytearray(2048)
+    payload[:2] = b"MZ"
+    payload[0x3C:0x40] = (1536).to_bytes(4, "little")
+    payload[1536:1540] = b"PE\x00\x00"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("bin/runme", payload)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    executable_checks = [
+        check
+        for check in result.checks
+        if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert len(executable_checks) == 1
+    assert executable_checks[0].details["entry"] == "bin/runme"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\xca\xfe\xba\xbf" + (1).to_bytes(4, "big") + b"\x00" * 64,
+        b"\xbf\xba\xfe\xca" + (1).to_bytes(4, "little") + b"\x00" * 64,
+    ],
+)
+def test_scan_npz_flags_extensionless_macho_fat64_members(tmp_path: Path, payload: bytes) -> None:
+    """ZIP-like archives should flag both endian variants of Mach-O fat64 binaries."""
+    archive_path = tmp_path / "model_bundle.npz"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("bin/runme", payload)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    executable_checks = [
+        check
+        for check in result.checks
+        if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert len(executable_checks) == 1
+    assert executable_checks[0].details["entry"] == "bin/runme"
+
+
 def test_scan_npz_ignores_numpy_member_near_python_suffix(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.npz"
     with zipfile.ZipFile(archive_path, "w") as archive:

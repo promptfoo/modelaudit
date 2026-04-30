@@ -311,6 +311,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **security:** detect strong executable headers in generic archive members even
+  when the payload has no executable-looking suffix.
 - **routing:** preserve renamed OpenVINO and PMML XML models with long benign
   prologs during content-based directory filtering.
 - **security:** resolve compile-time string concatenation in archive-member `getattr` calls so high-risk targets like `os.system` cannot hide behind split literals
