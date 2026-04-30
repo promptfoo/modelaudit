@@ -6,22 +6,19 @@ import importlib
 import io
 import os
 import pickle
+import py_compile
 import subprocess
 import sys
 import zipfile
+from importlib.machinery import ModuleSpec
 from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
 
-from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, Severity, scan_bytes
+import modelaudit_picklescan.call_graph as call_graph
+from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, ScanStatus, Severity, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
-from modelaudit_picklescan.call_graph import (
-    _call_graph_entrypoints,
-    _calls_for_function,
-    _find_sink_path,
-    find_dangerous_call_graphs,
-)
 
 pytestmark = pytest.mark.skipif(
     find_spec(_RUST_EXTENSION_MODULE) is None,
@@ -40,6 +37,12 @@ def _unicode_operand(value: str) -> bytes:
     if len(data) <= 0xFF:
         return _short_binunicode(data)
     return b"X" + len(data).to_bytes(4, "little") + data
+
+
+def _bytes_operand(value: bytes) -> bytes:
+    if len(value) <= 0xFF:
+        return b"C" + bytes([len(value)]) + value
+    return b"B" + len(value).to_bytes(4, "little") + value
 
 
 def _global_operand(module: str, name: str) -> bytes:
@@ -676,7 +679,12 @@ def _duplicate_callable_invocation_budget_payload(repetitions: int) -> bytes:
     return b"".join(parts)
 
 
-def _builtins_help_defaultdict_format_map_payload(*, lookup: bool, format_string: str = "{x}") -> bytes:
+def _builtins_help_defaultdict_format_map_payload(
+    *,
+    lookup: bool,
+    format_string: str = "{x}",
+    format_operand: bytes | None = None,
+) -> bytes:
     parts = [
         b"\x80\x04",
         _global_operand("collections", "defaultdict"),
@@ -689,12 +697,28 @@ def _builtins_help_defaultdict_format_map_payload(*, lookup: bool, format_string
                 b"\x94",
                 b"0",
                 _global_operand("builtins", "str.format_map"),
-                _args_tuple(_unicode_operand(format_string), b"h\x00"),
+                _args_tuple(format_operand or _unicode_operand(format_string), b"h\x00"),
                 b"R",
             ]
         )
     parts.append(b".")
     return b"".join(parts)
+
+
+def _builtins_help_defaultdict_str_format_payload(format_string: str, *format_arguments: bytes) -> bytes:
+    return b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("collections", "defaultdict"),
+            _global_operand("builtins", "help"),
+            b"\x85R",
+            b"\x94",
+            b"0",
+            _global_operand("builtins", "str.format"),
+            _args_tuple(_unicode_operand(format_string), *format_arguments),
+            b"R.",
+        ]
+    )
 
 
 def _builtins_help_defaultdict_operator_mod_payload(
@@ -916,7 +940,7 @@ def _ipaddress_format_payload() -> bytes:
     )
 
 
-def _ipaddress_str_format_payload(format_string: str = "{:b}") -> bytes:
+def _ipaddress_str_format_payload(format_string: str = "{:b}", *, format_operand: bytes | None = None) -> bytes:
     return b"".join(
         [
             b"\x80\x04",
@@ -926,7 +950,7 @@ def _ipaddress_str_format_payload(format_string: str = "{:b}") -> bytes:
             b"\x94",
             b"0",
             _global_operand("builtins", "str.format"),
-            _args_tuple(_unicode_operand(format_string), b"h\x00"),
+            _args_tuple(format_operand or _unicode_operand(format_string), b"h\x00"),
             b"R.",
         ]
     )
@@ -967,6 +991,21 @@ def _has_critical_call_graph_finding(report: PickleReport, module: str, name: st
         and finding.details.get("name") == name
         and finding.details.get("sink") == sink
         for finding in report.findings
+    )
+
+
+def _has_call_graph_source_unavailable_notice(
+    report: PickleReport,
+    module: str,
+    name: str,
+    reason: str,
+) -> bool:
+    return any(
+        notice.code == "call_graph_source_unavailable"
+        and notice.details.get("module") == module
+        and notice.details.get("name") == name
+        and notice.details.get("reason") == reason
+        for notice in report.notices
     )
 
 
@@ -1219,15 +1258,15 @@ def test_scan_bytes_preserves_nested_signature_execution_calls(
 def test_call_graph_models_site_customization_import_statements(helper_name: str) -> None:
     function_name = f"site.{helper_name}"
 
-    assert "builtins.__import__" in (_calls_for_function(function_name) or ())
-    assert _find_sink_path(function_name) == (function_name, "builtins.__import__")
+    assert "builtins.__import__" in (call_graph._calls_for_function(function_name) or ())
+    assert call_graph._find_sink_path(function_name) == (function_name, "builtins.__import__")
 
 
 def test_call_graph_models_direct_shadowable_function_body_imports() -> None:
-    calls = _calls_for_function("base64.main") or ()
+    calls = call_graph._calls_for_function("base64.main") or ()
 
     assert "builtins.__import__" in calls
-    assert _find_sink_path("base64.main") == ("base64.main", "builtins.__import__")
+    assert call_graph._find_sink_path("base64.main") == ("base64.main", "builtins.__import__")
 
 
 def test_call_graph_keeps_module_dict_dotted_lookup_clean(
@@ -1246,7 +1285,7 @@ def test_call_graph_keeps_module_dict_dotted_lookup_clean(
     _clear_call_graph_caches()
 
     try:
-        findings = find_dangerous_call_graphs(
+        findings = call_graph.find_dangerous_call_graphs(
             [{"module": module_name, "name": "__dict__.values", "import_reference": f"{module_name}.__dict__.values"}]
         )
     finally:
@@ -1271,7 +1310,7 @@ def test_call_graph_models_missing_dotted_dunder_module_getattr(
     _clear_call_graph_caches()
 
     try:
-        findings = find_dangerous_call_graphs(
+        findings = call_graph.find_dangerous_call_graphs(
             [
                 {
                     "module": module_name,
@@ -1289,11 +1328,186 @@ def test_call_graph_models_missing_dotted_dunder_module_getattr(
     )
 
 
+def test_scan_bytes_marks_zipimported_invoked_call_graph_source_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_tp_zip_call_graph_source"
+    module_zip = tmp_path / "modules.zip"
+    with zipfile.ZipFile(module_zip, "w") as archive:
+        archive.writestr(
+            f"{module_name}.py",
+            "import os\n\ndef invoke(command):\n    return os.system(command)\n",
+        )
+    monkeypatch.syspath_prepend(str(module_zip))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            _global_call_payload(module_name, "invoke", _unicode_operand("echo hidden")),
+            source="zipimport-call-graph-source.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
+
+
+def test_scan_bytes_marks_zipimported_dotted_source_unavailable_without_parent_import(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package_name = "modelaudit_tp_zip_parent_probe"
+    module_name = f"{package_name}.child"
+    marker = tmp_path / "parent_imported"
+    module_zip = tmp_path / "modules.zip"
+    with zipfile.ZipFile(module_zip, "w") as archive:
+        archive.writestr(
+            f"{package_name}/__init__.py",
+            f"from pathlib import Path\nPath({str(marker)!r}).write_text('imported')\n",
+        )
+        archive.writestr(
+            f"{package_name}/child.py",
+            "def invoke(command):\n    return command\n",
+        )
+    monkeypatch.syspath_prepend(str(module_zip))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            _global_call_payload(module_name, "invoke", _unicode_operand("echo hidden")),
+            source="zipimport-dotted-call-graph-source.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
+    assert not marker.exists()
+
+
+def test_scan_bytes_marks_lookup_failures_as_unanalyzable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_tp_lookup_failure_probe"
+
+    def raise_lookup_failure(_: str) -> None:
+        raise RuntimeError("lookup failed")
+
+    monkeypatch.setattr(call_graph, "_find_module_spec_without_imports", raise_lookup_failure)
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            _global_call_payload(module_name, "invoke", _unicode_operand("echo hidden")),
+            source="lookup-failure-call-graph-source.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
+
+
+def test_scan_bytes_marks_custom_meta_path_specs_as_unanalyzable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_name = "modelaudit_tp_meta_path_spec_probe"
+
+    class CustomMetaPathFinder:
+        @staticmethod
+        def find_spec(fullname: str, path: object | None = None) -> ModuleSpec | None:
+            del path
+            if fullname == module_name:
+                return ModuleSpec(fullname, loader=None, origin="custom://module")
+            return None
+
+    monkeypatch.setattr(sys, "meta_path", [CustomMetaPathFinder(), *sys.meta_path])
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            _global_call_payload(module_name, "invoke", _unicode_operand("echo hidden")),
+            source="meta-path-spec-call-graph-source.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
+
+
+def test_scan_bytes_marks_bytecode_only_invoked_call_graph_source_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_bytecode_only_call_graph_source"
+    source_path = module_dir / f"{module_name}.py"
+    source_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
+    py_compile.compile(str(source_path), cfile=str(module_dir / f"{module_name}.pyc"), doraise=True)
+    source_path.unlink()
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            _global_call_payload(module_name, "invoke", _unicode_operand("echo hidden")),
+            source="bytecode-only-call-graph-source.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert _has_call_graph_source_unavailable_notice(report, module_name, "invoke", "source_unavailable")
+
+
+def test_scan_bytes_refreshes_call_graph_after_source_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_rewritten_call_graph_source"
+    module_path = module_dir / f"{module_name}.py"
+    module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+    payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo rewritten"))
+
+    try:
+        safe_report = scan_bytes(payload, source="rewritten-call-graph-safe.pkl")
+
+        module_path.write_text(
+            "import os\n\ndef invoke(command):\n    return os.system(command)\n",
+            encoding="utf-8",
+        )
+        importlib.invalidate_caches()
+        dangerous_report = scan_bytes(payload, source="rewritten-call-graph-dangerous.pkl")
+    finally:
+        _clear_call_graph_caches()
+
+    assert safe_report.verdict == SafetyVerdict.CLEAN
+    assert dangerous_report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(dangerous_report, module_name, "invoke", "os.system")
+
+
 def test_call_graph_propagates_wrapper_import_execution_fallbacks() -> None:
-    calls = _calls_for_function("platform.mac_ver") or ()
+    calls = call_graph._calls_for_function("platform.mac_ver") or ()
 
     assert "platform._mac_ver_xml" in calls
-    assert _find_sink_path("platform.mac_ver") == (
+    assert call_graph._find_sink_path("platform.mac_ver") == (
         "platform.mac_ver",
         "platform._mac_ver_xml",
         "builtins.__import__",
@@ -1301,17 +1515,17 @@ def test_call_graph_propagates_wrapper_import_execution_fallbacks() -> None:
 
 
 def test_call_graph_ignores_imports_inside_nested_functions_until_called() -> None:
-    calls = _calls_for_function("site.enablerlcompleter") or ()
+    calls = call_graph._calls_for_function("site.enablerlcompleter") or ()
 
     assert "builtins.__import__" not in calls
-    assert _find_sink_path("site.enablerlcompleter") is None
+    assert call_graph._find_sink_path("site.enablerlcompleter") is None
 
 
 def test_call_graph_models_getattr_default_callable_fallbacks() -> None:
-    calls = _calls_for_function("platform._Processor.get") or ()
+    calls = call_graph._calls_for_function("platform._Processor.get") or ()
 
     assert "platform._Processor.from_subprocess" in calls
-    assert _find_sink_path("platform._Processor.get") == (
+    assert call_graph._find_sink_path("platform._Processor.get") == (
         "platform._Processor.get",
         "platform._Processor.from_subprocess",
         "subprocess.check_output",
@@ -1322,10 +1536,10 @@ def test_call_graph_models_version_gated_typing_extensions_definitions() -> None
     pytest.importorskip("typing_extensions")
 
     function_name = "typing_extensions.get_type_hints"
-    calls = _calls_for_function(function_name) or ()
-    path = _find_sink_path(function_name)
+    calls = call_graph._calls_for_function(function_name) or ()
+    path = call_graph._find_sink_path(function_name)
 
-    assert _call_graph_entrypoints(function_name) == (function_name,)
+    assert call_graph._call_graph_entrypoints(function_name) == (function_name,)
     assert "typing.get_type_hints" in calls
     assert path is not None
     assert path[0] == function_name
@@ -1341,10 +1555,10 @@ def test_call_graph_models_required_arg_imports_when_pickle_supplies_args() -> N
         }
     ]
 
-    assert _find_sink_path("_pyio._open_code_with_warning") is None
-    assert find_dangerous_call_graphs(import_references) == ()
+    assert call_graph._find_sink_path("_pyio._open_code_with_warning") is None
+    assert call_graph.find_dangerous_call_graphs(import_references) == ()
     assert (
-        find_dangerous_call_graphs(
+        call_graph.find_dangerous_call_graphs(
             import_references,
             [
                 {
@@ -1357,7 +1571,7 @@ def test_call_graph_models_required_arg_imports_when_pickle_supplies_args() -> N
         == ()
     )
 
-    findings = find_dangerous_call_graphs(
+    findings = call_graph.find_dangerous_call_graphs(
         import_references,
         [
             {
@@ -1397,9 +1611,9 @@ def test_call_graph_models_constructed_callable_instance_invocations() -> None:
         },
     ]
 
-    assert find_dangerous_call_graphs(import_references, constructor_only_invocations) == ()
+    assert call_graph.find_dangerous_call_graphs(import_references, constructor_only_invocations) == ()
 
-    findings = find_dangerous_call_graphs(import_references, callable_instance_invocations)
+    findings = call_graph.find_dangerous_call_graphs(import_references, callable_instance_invocations)
 
     assert len(findings) == 1
     assert findings[0].module == "_sitebuiltins"
@@ -1424,9 +1638,9 @@ def test_call_graph_models_builtins_help_singleton_invocations() -> None:
         }
     ]
 
-    assert find_dangerous_call_graphs(import_references) == ()
+    assert call_graph.find_dangerous_call_graphs(import_references) == ()
 
-    findings = find_dangerous_call_graphs(import_references, help_invocations)
+    findings = call_graph.find_dangerous_call_graphs(import_references, help_invocations)
 
     assert len(findings) == 1
     assert findings[0].module == "_sitebuiltins"
@@ -1493,7 +1707,7 @@ def test_call_graph_analyzes_shadowed_torch_storage_persistent_id_reference(
     _clear_call_graph_caches()
 
     try:
-        findings = find_dangerous_call_graphs(
+        findings = call_graph.find_dangerous_call_graphs(
             [
                 {
                     "module": "torch",
@@ -1533,7 +1747,7 @@ def test_call_graph_keeps_setstate_entrypoint_for_unknown_newobj_invocation(
     _clear_call_graph_caches()
 
     try:
-        findings = find_dangerous_call_graphs(
+        findings = call_graph.find_dangerous_call_graphs(
             [],
             [
                 {
@@ -1615,9 +1829,9 @@ def test_call_graph_models_builtin_format_protocol_dispatch_invocations() -> Non
         },
     ]
 
-    assert find_dangerous_call_graphs(import_references, direct_invocations) == ()
+    assert call_graph.find_dangerous_call_graphs(import_references, direct_invocations) == ()
 
-    findings = find_dangerous_call_graphs(import_references, protocol_invocations)
+    findings = call_graph.find_dangerous_call_graphs(import_references, protocol_invocations)
 
     assert len(findings) == 1
     assert findings[0].module == "ipaddress"
@@ -1660,9 +1874,9 @@ def test_call_graph_models_str_format_protocol_dispatch_invocations() -> None:
         },
     ]
 
-    assert find_dangerous_call_graphs(import_references, direct_invocations) == ()
+    assert call_graph.find_dangerous_call_graphs(import_references, direct_invocations) == ()
 
-    findings = find_dangerous_call_graphs(import_references, protocol_invocations)
+    findings = call_graph.find_dangerous_call_graphs(import_references, protocol_invocations)
 
     assert len(findings) == 1
     assert findings[0].module == "ipaddress"
@@ -6122,6 +6336,73 @@ def test_scan_bytes_keeps_format_map_defaultdict_without_live_fields_clean(forma
 
     report = scan_bytes(payload, source="format-map-defaultdict-no-live-field.pkl")
 
+
+@pytest.mark.parametrize(
+    ("format_string", "format_arguments"),
+    [
+        ("{0[x]}", (b"h\x00",)),
+        ("{[x]}", (b"h\x00",)),
+        ("{0:{1[x]}}", (_unicode_operand("safe"), b"h\x00")),
+        ("{0!r:{1[x]}}", (_unicode_operand("safe"), b"h\x00")),
+        ("{[x]} {0}", (b"h\x00",)),
+        ("{[x]} }", (b"h\x00",)),
+    ],
+)
+def test_scan_bytes_blocks_str_format_defaultdict_factory_rce(
+    format_string: str,
+    format_arguments: tuple[bytes, ...],
+) -> None:
+    payload = _builtins_help_defaultdict_str_format_payload(format_string, *format_arguments)
+
+    report = scan_bytes(payload, source="str-format-defaultdict-factory-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+
+@pytest.mark.parametrize(
+    ("format_string", "format_arguments"),
+    [
+        ("{}", (b"h\x00",)),
+        ("{0} {[x]}", (_unicode_operand("safe"), b"h\x00")),
+    ],
+)
+def test_scan_bytes_keeps_non_lookup_str_format_defaultdict_cases_clean(
+    format_string: str,
+    format_arguments: tuple[bytes, ...],
+) -> None:
+    payload = _builtins_help_defaultdict_str_format_payload(format_string, *format_arguments)
+
+    report = scan_bytes(payload, source="str-format-defaultdict-no-lookup.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+
+def test_scan_bytes_keeps_format_map_defaultdict_bytes_receiver_clean() -> None:
+    payload = _builtins_help_defaultdict_format_map_payload(
+        lookup=True,
+        format_operand=_bytes_operand(b"{x}"),
+    )
+
+    report = scan_bytes(payload, source="format-map-defaultdict-bytes-receiver.pkl")
+
     assert report.verdict == SafetyVerdict.CLEAN
     assert not any(
         invocation.get("module") == "builtins"
@@ -6625,6 +6906,20 @@ def test_scan_bytes_keeps_ipaddress_str_format_without_live_fields_clean() -> No
     payload = _ipaddress_str_format_payload("plain text")
 
     report = scan_bytes(payload, source="ipaddress-str-format-no-live-field.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "ipaddress"
+        and invocation.get("name") == "IPv4Address.__format__"
+        and invocation.get("positional_arg_count") == 1
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+
+def test_scan_bytes_keeps_ipaddress_str_format_bytes_receiver_clean() -> None:
+    payload = _ipaddress_str_format_payload(format_operand=_bytes_operand(b"{:b}"))
+
+    report = scan_bytes(payload, source="ipaddress-str-format-bytes-receiver.pkl")
 
     assert report.verdict == SafetyVerdict.CLEAN
     assert not any(

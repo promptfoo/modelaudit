@@ -247,6 +247,69 @@ def test_manifest_scanner_url_shortener_flagged(tmp_path):
     assert "bit.ly" in failed_url_checks[0].details.get("url", "")
 
 
+def test_manifest_scanner_delegates_malicious_chat_templates_to_jinja_analysis(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner().scan(str(config_path))
+
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_manifest_scanner_keeps_benign_chat_templates_clean(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "chat_template": "{% for message in messages %}{{ message['content'] }}{% endfor %}",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner().scan(str(config_path))
+
+    assert any(check.name == "Jinja2 SSTI Analysis" and check.status == CheckStatus.PASSED for check in result.checks)
+    assert not any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_manifest_scanner_delegates_templates_from_parsed_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text('{"chat_template": "{{ harmless }}"}', encoding="utf-8")
+    captured: dict[str, dict[str, str]] = {}
+
+    def capture_templates(self: object, path: str, templates: dict[str, str]) -> ScanResult:
+        captured[path] = templates
+        return ScanResult("jinja2_template")
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.jinja2_template_scanner.Jinja2TemplateScanner.scan_extracted_templates",
+        capture_templates,
+    )
+
+    ManifestScanner().scan(str(config_path))
+
+    assert captured[str(config_path)] == {"chat_template": "{{ harmless }}"}
+
+
 def test_manifest_scanner_redacts_untrusted_url_credentials(tmp_path: Path) -> None:
     """Untrusted URL findings should not store userinfo, query strings, or fragments."""
     test_file = tmp_path / "config.json"
