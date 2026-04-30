@@ -10,10 +10,13 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from ._evidence_redaction import redact_evidence_string
-from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 LLAMAFILE_MARKER = b"llamafile"
+LLAMAFILE_ROUTE_SCAN_BYTES = 8 * 1024 * 1024
+LLAMAFILE_ROUTE_TAIL_SCAN_BYTES = 2 * 1024 * 1024
 GGUF_MARKER = b"GGUF"
+LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON = "llamafile_payload_scan_limited"
 
 ELF_MAGIC = b"\x7fELF"
 PE_MAGIC = b"MZ"
@@ -135,13 +138,19 @@ class LlamafileScanner(BaseScanner):
             return False
 
         try:
-            head = cls._read_prefix(path_obj, 2 * 1024 * 1024)
-            tail = cls._read_suffix(path_obj, 2 * 1024 * 1024)
+            marker_offset = cls._find_casefolded_marker_offset(
+                path_obj,
+                LLAMAFILE_MARKER,
+                LLAMAFILE_ROUTE_SCAN_BYTES,
+            )
+            if marker_offset is None:
+                tail = cls._read_suffix(path_obj, LLAMAFILE_ROUTE_TAIL_SCAN_BYTES).lower()
+                tail_marker_index = tail.find(LLAMAFILE_MARKER)
+                marker_offset = tail_marker_index if tail_marker_index != -1 else None
         except OSError:
             return False
 
-        marker_blob = (head + tail).lower()
-        return LLAMAFILE_MARKER in marker_blob
+        return marker_offset is not None
 
     @classmethod
     def _detect_executable_format(cls, path: Path) -> str | None:
@@ -220,7 +229,9 @@ class LlamafileScanner(BaseScanner):
         payload_bytes_scanned = self._scan_embedded_payload(path_obj, result)
         result.bytes_scanned += payload_bytes_scanned
 
-        result.finish(success=not result.has_errors)
+        result.finish(
+            success=not result.has_errors and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        )
         return result
 
     @staticmethod
@@ -295,13 +306,23 @@ class LlamafileScanner(BaseScanner):
     def _scan_embedded_payload(self, path: Path, result: ScanResult) -> int:
         gguf_offset = self._find_marker_offset(path, GGUF_MARKER, self.max_payload_scan_bytes)
         if gguf_offset is None:
+            file_size = self.get_file_size(str(path))
+            details = {"max_scan_bytes": self.max_payload_scan_bytes}
+            if file_size > self.max_payload_scan_bytes:
+                self._mark_inconclusive(result, LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON)
+                details["analysis_incomplete"] = True
+                details["file_size"] = file_size
             result.add_check(
                 name="Llamafile Embedded Payload Detection",
                 passed=False,
-                message="No embedded GGUF payload marker found within bounded scan window",
+                message=(
+                    "No embedded GGUF payload marker found before bounded scan window ended"
+                    if file_size > self.max_payload_scan_bytes
+                    else "No embedded GGUF payload marker found within bounded scan window"
+                ),
                 severity=IssueSeverity.INFO,
                 location=str(path),
-                details={"max_scan_bytes": self.max_payload_scan_bytes},
+                details=details,
             )
             return 0
 
@@ -393,6 +414,19 @@ class LlamafileScanner(BaseScanner):
                 why=check.why,
             )
 
+    @staticmethod
+    def _mark_inconclusive(result: ScanResult, reason: str) -> None:
+        """Mark bounded Llamafile payload analysis as explicitly incomplete."""
+        result.metadata["analysis_incomplete"] = True
+        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+
+        reasons = result.metadata.get("scan_outcome_reasons")
+        if not isinstance(reasons, list):
+            reasons = []
+            result.metadata["scan_outcome_reasons"] = reasons
+        if reason not in reasons:
+            reasons.append(reason)
+
     def _carve_payload(self, path: Path, offset: int, size: int) -> Path | None:
         try:
             with tempfile.NamedTemporaryFile(prefix="llamafile-payload-", suffix=".gguf", delete=False) as handle:
@@ -427,6 +461,32 @@ class LlamafileScanner(BaseScanner):
 
                 haystack = carry + chunk
                 relative_index = haystack.find(marker)
+                if relative_index != -1:
+                    return scanned - len(carry) + relative_index
+
+                carry = haystack[-overlap:] if overlap > 0 else b""
+                scanned += len(chunk)
+
+        return None
+
+    @staticmethod
+    def _find_casefolded_marker_offset(path: Path, marker: bytes, max_scan_bytes: int) -> int | None:
+        marker_len = len(marker)
+        search_limit = min(path.stat().st_size, max_scan_bytes)
+        overlap = marker_len - 1
+        scanned = 0
+        carry = b""
+        normalized_marker = marker.lower()
+
+        with path.open("rb") as handle:
+            while scanned < search_limit:
+                to_read = min(1024 * 1024, search_limit - scanned)
+                chunk = handle.read(to_read)
+                if not chunk:
+                    break
+
+                haystack = carry + chunk.lower()
+                relative_index = haystack.find(normalized_marker)
                 if relative_index != -1:
                     return scanned - len(carry) + relative_index
 

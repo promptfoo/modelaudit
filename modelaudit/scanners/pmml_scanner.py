@@ -31,7 +31,7 @@ SUSPICIOUS_PATTERNS = [
     r"\b(?:from\s+subprocess\s+import|import\s+subprocess)\b",
     r"\bsubprocess\s*\.\s*(?:popen|run|call|check_call|check_output|getoutput|getstatusoutput)\s*\(",
     r"__import__",
-    r"system\s*\(",
+    r"\bsystem\s*\(",
 ]
 URL_PATTERNS = ["http://", "https://", "file://", "ftp://"]
 BENIGN_DOCUMENTATION_URL_PATTERNS = frozenset({"http://", "https://"})

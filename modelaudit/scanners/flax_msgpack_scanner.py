@@ -199,7 +199,7 @@ class FlaxMsgpackScanner(BaseScanner):
         ext = os.path.splitext(path)[1].lower()
 
         # Check file extension first
-        if ext in cls.supported_extensions and HAS_MSGPACK:
+        if ext in cls.supported_extensions:
             return True
 
         # For files without clear extensions, check if they might be msgpack

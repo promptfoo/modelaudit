@@ -90,12 +90,14 @@ class TestSkopsScannerCanHandle:
 class TestSkopsScannerCVE2025_54412:
     """Test CVE-2025-54412: OperatorFuncNode trusted-type confusion detection."""
 
-    def test_detects_operatorfuncnode_pattern(self, tmp_path: Path) -> None:
-        """Test detection of OperatorFuncNode pattern in file names."""
+    def test_detects_malicious_operatorfuncnode_loader(self, tmp_path: Path) -> None:
+        """OperatorFuncNode nodes outside the operator module should be detected."""
         skops_file = tmp_path / "malicious.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
-            zf.writestr("OperatorFuncNode_exploit.json", '{"type": "exploit"}')
-            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr(
+                "schema.json",
+                '{"__loader__": "OperatorFuncNode", "__module__": "builtins", "__class__": "eval"}',
+            )
 
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
@@ -143,16 +145,35 @@ class TestSkopsScannerCVE2025_54412:
         failed = [c for c in cve_54412_checks if c.status == CheckStatus.FAILED]
         assert len(failed) == 0
 
+    def test_valid_operatorfuncnode_loader_is_not_flagged(self, tmp_path: Path) -> None:
+        """Legitimate operator helper nodes are part of normal Skops schemas."""
+        skops_file = tmp_path / "benign_operator.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr(
+                "schema.json",
+                '{"__loader__": "OperatorFuncNode", "__module__": "operator", "__class__": "methodcaller"}',
+            )
+
+        result = SkopsScanner().scan(str(skops_file))
+
+        cve_checks = [c for c in result.checks if "CVE-2025-54412" in c.name]
+        assert not [c for c in cve_checks if c.status == CheckStatus.FAILED]
+
 
 class TestSkopsScannerCVE2025_54413:
     """Test CVE-2025-54413: MethodNode inconsistency detection."""
 
-    def test_detects_methodnode_pattern(self, tmp_path: Path) -> None:
-        """Test detection of MethodNode pattern in file names."""
+    def test_detects_malicious_methodnode_loader(self, tmp_path: Path) -> None:
+        """MethodNode nodes whose wrapped object type disagrees should be detected."""
         skops_file = tmp_path / "malicious.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
-            zf.writestr("MethodNode_accessor.json", '{"type": "method"}')
-            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr(
+                "schema.json",
+                (
+                    '{"__loader__": "MethodNode", "__module__": "builtins", "__class__": "str", '
+                    '"content": {"obj": {"__module__": "os", "__class__": "system"}}}'
+                ),
+            )
 
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
@@ -163,8 +184,8 @@ class TestSkopsScannerCVE2025_54413:
         assert cve_checks[0].status == CheckStatus.FAILED
         assert cve_checks[0].severity == IssueSeverity.CRITICAL
 
-    def test_detects_getattr_pattern(self, tmp_path: Path) -> None:
-        """Test detection of __getattr__ pattern."""
+    def test_getattr_filename_without_methodnode_loader_is_not_flagged(self, tmp_path: Path) -> None:
+        """Plain filenames should not stand in for structured MethodNode entries."""
         skops_file = tmp_path / "malicious.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
             zf.writestr("__getattr__hook.py", "malicious code")
@@ -173,11 +194,26 @@ class TestSkopsScannerCVE2025_54413:
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
 
-        assert result.success is False
         cve_checks = [c for c in result.checks if "CVE-2025-54413" in c.name]
-        assert len(cve_checks) > 0
-        assert cve_checks[0].status == CheckStatus.FAILED
-        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert not [c for c in cve_checks if c.status == CheckStatus.FAILED]
+
+    def test_valid_methodnode_loader_is_not_flagged(self, tmp_path: Path) -> None:
+        """Legitimate bound-method nodes keep their wrapped object type aligned."""
+        skops_file = tmp_path / "benign_method.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr(
+                "schema.json",
+                (
+                    '{"__loader__": "MethodNode", "__module__": "sklearn.preprocessing", '
+                    '"__class__": "FunctionTransformer", "content": {"obj": {'
+                    '"__module__": "sklearn.preprocessing", "__class__": "FunctionTransformer"}}}'
+                ),
+            )
+
+        result = SkopsScanner().scan(str(skops_file))
+
+        cve_checks = [c for c in result.checks if "CVE-2025-54413" in c.name]
+        assert not [c for c in cve_checks if c.status == CheckStatus.FAILED]
 
 
 class TestSkopsScannerCVE2025_54886:
@@ -423,6 +459,79 @@ class TestSkopsScannerEdgeCases:
         size_checks = [c for c in result.checks if "Archive Uncompressed Size Limit" in c.name]
         assert len(size_checks) > 0
         assert size_checks[0].status == CheckStatus.FAILED
+
+    @pytest.mark.parametrize(
+        ("entry_name", "payload"),
+        [
+            ("schema.json", b"\xff\xfe\xfd"),
+            ("schema", b'{"__loader__": "OperatorFuncNode"'),
+        ],
+    )
+    def test_unparseable_structured_json_marks_scan_incomplete(
+        self,
+        tmp_path: Path,
+        entry_name: str,
+        payload: bytes,
+    ) -> None:
+        """Unreadable loader JSON should fail closed instead of suppressing CVE coverage."""
+        skops_file = tmp_path / "unparseable.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr(entry_name, payload)
+
+        result = SkopsScanner().scan(str(skops_file))
+
+        assert result.success is False
+        _assert_inconclusive_reason(result.metadata, "skops_structured_json_parse_failed")
+        parse_checks = [check for check in result.checks if check.name == "Skops Structured JSON Parse Check"]
+        assert len(parse_checks) == 1
+        assert parse_checks[0].status == CheckStatus.FAILED
+        assert parse_checks[0].details["entry"] == entry_name
+
+    @pytest.mark.parametrize(
+        ("loader_name", "payload"),
+        [
+            (
+                "OperatorFuncNode",
+                b'\xef\xbb\xbf{"__loader__":"OperatorFuncNode","__module__":"builtins","__class__":"eval"}',
+            ),
+            (
+                "MethodNode",
+                (
+                    '{"__loader__":"MethodNode","__module__":"builtins","__class__":"str",'
+                    '"content":{"obj":{"__module__":"os","__class__":"system"}}}'
+                ).encode("utf-16"),
+            ),
+        ],
+    )
+    def test_structured_loader_detection_matches_json_bytes_encodings(
+        self,
+        tmp_path: Path,
+        loader_name: str,
+        payload: bytes,
+    ) -> None:
+        """Loader detection should follow json.loads(bytes) encoding support."""
+        skops_file = tmp_path / "encoded_loader.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr("schema.json", payload)
+
+        result = SkopsScanner().scan(str(skops_file))
+
+        cve_name = "CVE-2025-54412" if loader_name == "OperatorFuncNode" else "CVE-2025-54413"
+        assert any(
+            check.name == f"{cve_name} Detection" and check.status == CheckStatus.FAILED for check in result.checks
+        )
+
+    def test_non_schema_json_parse_failures_do_not_mark_scan_incomplete(self, tmp_path: Path) -> None:
+        """Auxiliary JSON members are not authoritative Skops metadata."""
+        skops_file = tmp_path / "auxiliary_json.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("metadata.json", b'{"broken":')
+
+        result = SkopsScanner().scan(str(skops_file))
+
+        assert result.success is True
+        assert "scan_outcome" not in result.metadata
 
     def test_oversized_readme_entry_marks_scan_incomplete(self, tmp_path: Path) -> None:
         """Oversized archive entries should fail closed when bounded reads skip them."""
@@ -681,13 +790,18 @@ class TestSkopsScannerMultipleCVEs:
         """Test that scanner can detect multiple CVEs in one file."""
         skops_file = tmp_path / "multi_exploit.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
-            # CVE-2025-54412 pattern
-            zf.writestr("OperatorFuncNode.json", '{"exploit": true}')
-            # CVE-2025-54413 pattern
-            zf.writestr("MethodNode_hook.py", "malicious")
+            zf.writestr(
+                "schema.json",
+                (
+                    '{"items": ['
+                    '{"__loader__": "OperatorFuncNode", "__module__": "builtins", "__class__": "eval"},'
+                    '{"__loader__": "MethodNode", "__module__": "builtins", "__class__": "str", '
+                    '"content": {"obj": {"__module__": "os", "__class__": "system"}}}'
+                    "]}"
+                ),
+            )
             # CVE-2025-54886 pattern
             zf.writestr("model_card.md", "use get_model() with joblib fallback")
-            zf.writestr("schema.json", '{"version": "1.0"}')
 
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
@@ -716,8 +830,10 @@ class TestSkopsScannerCVEDetails:
         """Test that CVE checks include all required detail fields."""
         skops_file = tmp_path / "malicious.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
-            zf.writestr("OperatorFuncNode.json", '{"exploit": true}')
-            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr(
+                "schema.json",
+                '{"__loader__": "OperatorFuncNode", "__module__": "builtins", "__class__": "eval"}',
+            )
 
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
