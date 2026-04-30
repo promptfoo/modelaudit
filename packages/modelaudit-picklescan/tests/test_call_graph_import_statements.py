@@ -6336,6 +6336,14 @@ def test_scan_bytes_keeps_format_map_defaultdict_without_live_fields_clean(forma
 
     report = scan_bytes(payload, source="format-map-defaultdict-no-live-field.pkl")
 
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+
 
 @pytest.mark.parametrize(
     ("format_string", "format_arguments"),
