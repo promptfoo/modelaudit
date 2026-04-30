@@ -36,6 +36,7 @@ from modelaudit_picklescan import (
     scan_bytes,
     scan_file,
 )
+from modelaudit_picklescan.call_graph import find_startup_hook_write_call_graphs
 
 
 def _expected_system_global() -> str:
@@ -3387,13 +3388,13 @@ def test_with_call_graph_findings_ignores_uninvoked_click_startup_hook_paths() -
     assert updated.findings == ()
 
 
-def test_with_call_graph_findings_promotes_click_startup_hook_paths_when_invocations_truncated() -> None:
+def test_with_call_graph_findings_ignores_click_startup_hook_paths_when_invocations_truncated() -> None:
     pytest.importorskip("click")
 
     report = PickleReport(
         source="click-startup-hook-truncated-invocations.pkl",
-        status=ScanStatus.COMPLETE,
-        verdict=SafetyVerdict.CLEAN,
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
         metadata={
             "import_references": (
                 {"module": "click", "name": "open_file"},
@@ -3406,11 +3407,38 @@ def test_with_call_graph_findings_promotes_click_startup_hook_paths_when_invocat
 
     updated = package_api._with_call_graph_findings(report)
 
+    assert updated is report
+    assert updated.verdict == SafetyVerdict.UNKNOWN
+    assert updated.findings == ()
+
+
+def test_with_call_graph_findings_keeps_late_click_startup_hook_invocations() -> None:
+    pytest.importorskip("click")
+
+    report = PickleReport(
+        source="click-startup-hook-late-invocations.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={
+            "import_references": (
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            ),
+            "callable_invocations": (
+                *({"module": "module", "name": f"call_{index}"} for index in range(32)),
+                {"module": "click", "name": "open_file"},
+                {"module": "click", "name": "echo"},
+            ),
+        },
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
     assert updated.verdict == SafetyVerdict.MALICIOUS
     assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH_FILE_WRITE" for finding in updated.findings)
 
 
-def test_with_call_graph_findings_promotes_click_startup_hook_paths_when_scan_is_inconclusive() -> None:
+def test_with_call_graph_findings_ignores_click_startup_hook_paths_when_scan_is_inconclusive() -> None:
     pytest.importorskip("click")
 
     report = PickleReport(
@@ -3428,8 +3456,24 @@ def test_with_call_graph_findings_promotes_click_startup_hook_paths_when_scan_is
 
     updated = package_api._with_call_graph_findings(report)
 
-    assert updated.verdict == SafetyVerdict.MALICIOUS
-    assert any(finding.rule_code == "DANGEROUS_CALL_GRAPH_FILE_WRITE" for finding in updated.findings)
+    assert updated is report
+    assert updated.verdict == SafetyVerdict.UNKNOWN
+    assert updated.findings == ()
+
+
+def test_find_startup_hook_write_call_graphs_preserves_legacy_import_only_calls() -> None:
+    pytest.importorskip("click")
+
+    findings = find_startup_hook_write_call_graphs(
+        (
+            {"module": "click", "name": "open_file"},
+            {"module": "click", "name": "echo"},
+        )
+    )
+
+    assert len(findings) == 1
+    assert findings[0].opener_import_reference == "click.open_file"
+    assert findings[0].writer_import_reference == "click.echo"
 
 
 def test_scan_bytes_keeps_import_only_click_startup_hook_paths_clean() -> None:
@@ -3460,6 +3504,23 @@ def test_scan_bytes_keeps_import_only_click_startup_hook_paths_clean() -> None:
             "is_dangerous": False,
         },
     )
+    assert report.metadata["callable_invocations"] == ()
+
+
+def test_scan_bytes_keeps_import_only_click_startup_hook_paths_unknown_after_benign_follow_on() -> None:
+    pytest.importorskip("click")
+
+    payload = (
+        b"\x80\x04cclick\nopen_file\ncclick\necho\n\x86."
+        + (b"\x00" * 4096)
+        + pickle.dumps({"benign": True}, protocol=4)
+    )
+
+    report = scan_bytes(payload, source="click-startup-hook-import-only-follow-on.pkl")
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.verdict == SafetyVerdict.UNKNOWN
+    assert report.findings == ()
     assert report.metadata["callable_invocations"] == ()
 
 

@@ -3969,6 +3969,9 @@ impl<'a> ScanState<'a> {
         if self.callable_invocations_truncated {
             return;
         }
+        if self.status.is_complete() {
+            self.status = ScanStatus::Inconclusive;
+        }
         self.callable_invocations_truncated = true;
         self.add_notice(Notice {
             message: "Callable invocation metadata exceeded the scanner reporting limit"
@@ -4558,25 +4561,31 @@ impl<'a> ScanState<'a> {
             self.record_callable_invocations_truncated_notice();
         }
         for invocation in follow_on_invocations {
-            if self.callable_invocations.len() < MAX_IMPORT_REFERENCES
-                && self.remember_callable_invocation_details(&invocation)
-            {
-                self.callable_invocations.push(invocation);
-            } else if self.callable_invocations.len() >= MAX_IMPORT_REFERENCES {
-                self.record_callable_invocations_truncated_notice();
+            let Some(invocation_key) = Self::callable_invocation_detail_key(&invocation) else {
+                continue;
+            };
+            if self.callable_invocation_keys.contains(&invocation_key) {
+                continue;
             }
+            if self.callable_invocations.len() >= MAX_IMPORT_REFERENCES {
+                self.record_callable_invocations_truncated_notice();
+                continue;
+            }
+            self.callable_invocation_keys.insert(invocation_key);
+            self.callable_invocations.push(invocation);
         }
     }
 
-    fn remember_callable_invocation_details(&mut self, details: &[(String, DetailValue)]) -> bool {
+    fn callable_invocation_detail_key(
+        details: &[(String, DetailValue)],
+    ) -> Option<(String, String, Option<usize>)> {
         let module = detail_string(details, "module").unwrap_or_default();
         let name = detail_string(details, "name").unwrap_or_default();
         if module.is_empty() || name.is_empty() {
-            return false;
+            return None;
         }
         let positional_arg_count = detail_usize(details, "positional_arg_count");
-        self.callable_invocation_keys
-            .insert((module, name, positional_arg_count))
+        Some((module, name, positional_arg_count))
     }
 
     fn coalesce_redundant_global_findings(&mut self) {
@@ -5694,6 +5703,7 @@ mod tests {
         }
 
         assert_eq!(scan.callable_invocations.len(), MAX_IMPORT_REFERENCES);
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
         assert_eq!(
             scan.notices
                 .iter()
@@ -5730,6 +5740,50 @@ mod tests {
             .notices
             .iter()
             .any(|notice| notice.code == Some("callable_invocations_truncated")));
+    }
+
+    #[test]
+    fn follow_on_duplicate_callable_invocations_do_not_mark_metadata_truncated() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "follow-on-duplicate-invocation.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+
+        for index in 0..MAX_IMPORT_REFERENCES {
+            let invocation = ScanState::callable_invocation(
+                GlobalRef {
+                    module: "module".to_string(),
+                    name: format!("call_{index}"),
+                    position: index,
+                    malformed: false,
+                },
+                "REDUCE",
+                index,
+                Some(0),
+            );
+            scan.push_callable_invocation(&invocation);
+        }
+
+        scan.merge_follow_on_callable_invocations(
+            vec![scan.callable_invocations[0].clone()],
+            false,
+        );
+
+        assert!(!scan.callable_invocations_truncated);
+        assert_eq!(scan.status, ScanStatus::Complete);
     }
 
     #[test]

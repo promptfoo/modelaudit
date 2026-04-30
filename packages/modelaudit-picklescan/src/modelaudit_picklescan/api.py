@@ -946,10 +946,7 @@ def _report_from_native_dict(raw_report: Mapping[str, Any]) -> PickleReport:
 
 def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     import_references = report.metadata.get("import_references")
-    callable_invocations = report.metadata.get("callable_invocations")
-    callable_invocations_complete = (
-        report.status == ScanStatus.COMPLETE and report.metadata.get("callable_invocations_truncated") is not True
-    )
+    callable_invocations = report.metadata.get("callable_invocations", ())
     call_graph_limit_exceeded = has_unanalyzed_call_graph_import_references(import_references)
     try:
         call_graph_findings = find_dangerous_call_graphs(import_references, callable_invocations)
@@ -959,7 +956,6 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
         startup_hook_write_findings = find_startup_hook_write_call_graphs(
             import_references,
             callable_invocations,
-            callable_invocations_complete=callable_invocations_complete,
         )
     except Exception:
         startup_hook_write_findings = ()

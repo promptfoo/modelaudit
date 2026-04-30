@@ -326,12 +326,13 @@ def find_startup_hook_write_call_graphs(
         (str(reference.get("module", "")), str(reference.get("name", "")))
         for reference in _iter_callable_invocation_references(callable_invocations)
     }
+    require_invocations = callable_invocations is not None and callable_invocations_complete
     for reference in _iter_import_references(import_references):
         module = str(reference.get("module", ""))
         name = str(reference.get("name", ""))
         if not module or not name or (module, name) in seen:
             continue
-        if callable_invocations_complete and (module, name) not in invoked_references:
+        if require_invocations and (module, name) not in invoked_references:
             continue
         seen.add((module, name))
 
@@ -524,8 +525,6 @@ def _iter_callable_invocation_references(callable_invocations: object | None) ->
             reference["name"] = reference_name
             reference["import_reference"] = f"{reference_module}.{reference_name}"
             normalized.append(reference)
-            if len(normalized) >= _MAX_IMPORT_REFERENCES:
-                return tuple(normalized)
     return tuple(normalized)
 
 
