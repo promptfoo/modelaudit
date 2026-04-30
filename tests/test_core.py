@@ -954,6 +954,15 @@ def test_scan_file_routes_middle_marker_llamafile_exe(tmp_path: Path) -> None:
     assert result.scanner_name == "llamafile"
 
 
+def test_scan_file_routes_tail_marker_llamafile_exe(tmp_path: Path) -> None:
+    tail_marker = tmp_path / "tail-marker.exe"
+    tail_marker.write_bytes(b"MZ" + b"\x00" * 62 + b"A" * ((8 * 1024 * 1024) + 64) + b"llamafile runtime")
+
+    result = scan_file(str(tail_marker))
+
+    assert result.scanner_name == "llamafile"
+
+
 def test_scan_file_routes_misnamed_onnx_by_header(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     disguised_onnx = tmp_path / "model.payload"

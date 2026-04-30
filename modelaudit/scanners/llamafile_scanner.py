@@ -14,6 +14,7 @@ from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeve
 
 LLAMAFILE_MARKER = b"llamafile"
 LLAMAFILE_ROUTE_SCAN_BYTES = 8 * 1024 * 1024
+LLAMAFILE_ROUTE_TAIL_SCAN_BYTES = 2 * 1024 * 1024
 GGUF_MARKER = b"GGUF"
 LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON = "llamafile_payload_scan_limited"
 
@@ -142,6 +143,10 @@ class LlamafileScanner(BaseScanner):
                 LLAMAFILE_MARKER,
                 LLAMAFILE_ROUTE_SCAN_BYTES,
             )
+            if marker_offset is None:
+                tail = cls._read_suffix(path_obj, LLAMAFILE_ROUTE_TAIL_SCAN_BYTES).lower()
+                tail_marker_index = tail.find(LLAMAFILE_MARKER)
+                marker_offset = tail_marker_index if tail_marker_index != -1 else None
         except OSError:
             return False
 
