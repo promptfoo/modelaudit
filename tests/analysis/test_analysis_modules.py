@@ -219,3 +219,38 @@ class TestAnalysisModules:
         assert result.risk_level == "high"
         assert result.is_suspicious is True
         assert "Pattern appears safe in current context" not in result.recommendations
+
+    def test_integrated_entropy_does_not_upgrade_exact_dangerous_literals(self) -> None:
+        """Weight-like bytes with an exact sink literal must not get skip confidence."""
+        import numpy as np
+
+        from modelaudit.analysis import IntegratedAnalyzer
+
+        np.random.seed(42)
+        weights = np.random.normal(0, 0.2, 1000).astype(np.float32)
+        data = weights.tobytes() + b"os.system"
+
+        result = IntegratedAnalyzer()._analyze_entropy(data, "os.system")
+
+        assert result["data_type"] == "ml_weights"
+        assert result["confidence"] == 0.85
+        assert "Pattern search not recommended for this data type" not in result["reasoning"]
+
+    def test_integrated_analyzer_ignores_attacker_controlled_filename_context(self) -> None:
+        """Filename text should not change framework-pattern confidence."""
+        from modelaudit.analysis import IntegratedAnalyzer
+        from modelaudit.analysis.unified_context import UnifiedMLContext
+
+        analyzer = IntegratedAnalyzer()
+        normal_context = UnifiedMLContext(Path("payload.py"), 1024, "python", primary_framework="pytorch")
+        spoofed_context = UnifiedMLContext(
+            Path("samples/eval_bucket/validate_payload.py"),
+            1024,
+            "python",
+            primary_framework="pytorch",
+        )
+
+        normal = analyzer._analyze_framework_patterns("eval", "code_execution", normal_context)
+        spoofed = analyzer._analyze_framework_patterns("eval", "code_execution", spoofed_context)
+
+        assert spoofed == normal

@@ -10,6 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - correct analysis suspiciousness scoring and alias-aware semantic risk handling
+- harden detector heuristics against comment padding, byte-backed credentials, unmarked Python blobs, and spoofed network context
+- fail closed when bounded scanner windows leave relevant model content uninspected
+- fail closed when TorchServe MAR limits leave manifest-referenced payloads unscanned
+- recurse into nested ZIP members inside PyTorch archives and fail closed when compression-ratio guards leave members unscanned
+- preserve large Office-like ZIPs when prefilter inspection is incomplete
+- fail closed when directory scans stop at the total-size budget
+- restrict Hugging Face bookkeeping filename skips to recognized cache layouts
+- preserve unsuccessful child results after scan-result merges
+- preserve supported payloads hidden behind default directory-skip names
 
 ## [0.2.42](https://github.com/promptfoo/modelaudit/compare/v0.2.41...v0.2.42) (2026-04-27)
 
@@ -103,6 +112,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **security:** run JAX checkpoint analysis for JAX-like pickle payloads that
+  stay on the primary pickle scanner path
 - **security:** detect `mailcap.findmatch` pickle call targets that can execute
   attacker-controlled mailcap `test` commands on Python versions that still
   provide `mailcap`
@@ -299,6 +310,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **docs:** narrow public scan-coverage wording so unsupported or merely discovered formats are not over-promised
+- **analysis:** keep exact dangerous literals visible even when surrounding bytes look like ML weights
+- **analysis:** stop attacker-controlled file and directory names from suppressing dangerous framework-pattern findings
+- **security:** detect dangerous marker-free Python source blobs through the public JIT path so disguised archive members are still analyzed
+- **security:** mark ONNX scans inconclusive when raw JIT/script or network
+  detector analysis cannot complete instead of treating detector failures as
+  clean passes.
+- **security:** run Jinja template analysis for manifest-owned configs that carry
+  embedded chat-template fields.
 - **pickle:** detect stdlib filesystem probe and process-state callables such as `pathlib` metadata methods, `decimal.setcontext`, and `gc.disable` during pickle scans, while keeping local container mutations clean and covering public `operator.setitem` registry poisoning plus target-aware `operator.imul` warning-filter mutation.
 - **pickle:** detect public `operator.setitem` pickle calls, keep callable
   invocation aliases ahead of import-reference budget exhaustion, dedupe repeated
