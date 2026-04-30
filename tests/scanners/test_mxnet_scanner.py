@@ -119,6 +119,30 @@ def test_mxnet_scanner_reports_missing_companion_files(tmp_path: Path) -> None:
     assert any("No matching MXNet symbol companion file found" in issue.message for issue in params_result.issues)
 
 
+def test_directory_scan_preserves_path_sensitive_companion_metadata(tmp_path: Path) -> None:
+    with_params_dir = tmp_path / "with_params"
+    without_params_dir = tmp_path / "without_params"
+    with_params_dir.mkdir()
+    without_params_dir.mkdir()
+
+    with_params_symbol = with_params_dir / "net-symbol.json"
+    without_params_symbol = without_params_dir / "net-symbol.json"
+    _write_symbol_file(with_params_symbol)
+    _write_symbol_file(without_params_symbol)
+    _write_params_file(with_params_dir / "net-0000.params")
+
+    result = scan_model_directory_or_file(str(tmp_path), cache_enabled=False, skip_file_types=False)
+
+    assert result.file_metadata[str(with_params_symbol)]["has_params_companion"] is True
+    assert result.file_metadata[str(without_params_symbol)]["has_params_companion"] is False
+    missing_companion_checks = [
+        check
+        for check in result.checks
+        if check.name == "MXNet Companion Artifact Check" and check.status.value == "failed"
+    ]
+    assert {check.location for check in missing_companion_checks} == {str(without_params_symbol)}
+
+
 def test_mxnet_scanner_detects_suspicious_custom_operator_reference(tmp_path: Path) -> None:
     symbol_path = tmp_path / "unsafe-symbol.json"
     params_path = tmp_path / "unsafe-0000.params"

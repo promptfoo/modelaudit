@@ -284,6 +284,54 @@ class TestDirectoryFileFiltering:
         assert "unknown" not in results.scanner_names
         assert not any("Unknown or unhandled format" in issue.message for issue in results.issues)
 
+    def test_disguised_pmml_with_long_prolog_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should preserve renamed PMML files after long XML prologs."""
+        disguised_pmml = tmp_path / "payload.txt"
+        disguised_pmml.write_text(
+            f"""<?xml version='1.0'?>
+<!--{"x" * 1024}-->
+<!DOCTYPE pmml [ <!ENTITY xxe SYSTEM 'file:///tmp/modelaudit-test-secret'> ]>
+<PMML version='4.4'></PMML>
+""",
+            encoding="utf-8",
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "pmml" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any("DOCTYPE declaration" in issue.message for issue in results.issues)
+
+    def test_benign_xml_with_long_prolog_remains_skipped(self, tmp_path: Path) -> None:
+        """Long-prolog non-model XML under skipped suffixes should stay skipped."""
+        benign_xml = tmp_path / "notes.txt"
+        benign_xml.write_text(
+            f"<?xml version='1.0'?><!--{'x' * 1024}--><project><model name='safe'/></project>",
+            encoding="utf-8",
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
+
+    def test_disguised_pmml_with_oversized_doctype_subset_fails_closed(self, tmp_path: Path) -> None:
+        """Incomplete oversized XML prologs should fail closed instead of guessing a model root."""
+        disguised_pmml = tmp_path / "payload.txt"
+        disguised_pmml.write_text(
+            "<?xml version='1.0'?><!DOCTYPE PMML [" + ("x" * ((1024 * 1024) + 64)) + "]><PMML version='4.4'></PMML>",
+            encoding="utf-8",
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert results["success"] is False
+        assert determine_exit_code(results) == 2
+        assert any(
+            "bounded probe ended before the first structural root element" in check.message for check in results.checks
+        )
+
     def test_rar_archive_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
         """RAR archives should be recognized and fail closed instead of being skipped."""
         rar_path = tmp_path / "archive.rar"
