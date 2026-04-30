@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve supported payloads hidden behind default directory-skip names
 - use bounded raw Jinja fallback windows and fail closed when PyYAML is
   unavailable for YAML template configs
+- let extensionless file scanners participate in local file selection so
+  supported extensionless Llamafiles do not fall through to clean unknown
+  results
 
 ## [0.2.42](https://github.com/promptfoo/modelaudit/compare/v0.2.41...v0.2.42) (2026-04-27)
 
