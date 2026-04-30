@@ -207,6 +207,56 @@ def test_scan_zip_flags_aliased_getattr_helper_dangerous_python_member(tmp_path:
     assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
 
+def test_scan_zip_flags_concatenated_getattr_name_dangerous_python_member(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import os\ngetattr(os, 'sys' + 'tem')('echo hidden')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].severity == IssueSeverity.WARNING
+    assert python_checks[0].rule_code == "S101"
+    assert python_checks[0].details["reason"] == "high-risk calls: os.system"
+
+
+def test_scan_zip_bounds_large_concatenated_getattr_names(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    padding = " + ".join(["''"] * 300)
+    source = f"import os\ngetattr(os, 'sys' + {padding} + 'tem')('echo hidden')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_zip_flags_padded_split_literal_getattr_name(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    padding = " + ".join(["''"] * 160)
+    source = f"import os\ngetattr(os, 'sys' + {padding} + 'tem')('echo hidden')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert any(
+        check.name == "Python Archive Member Security"
+        and check.status == CheckStatus.FAILED
+        and check.details["reason"] == "high-risk calls: os.system"
+        for check in result.checks
+    )
+
+
 def test_scan_zip_flags_rebound_dangerous_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = "import subprocess\nrunner = subprocess.run\nrunner(['echo', 'hidden'], check=False)\n"
