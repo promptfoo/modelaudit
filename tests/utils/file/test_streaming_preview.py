@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import fsspec
 import pytest
 from fsspec.implementations.local import LocalFileSystem
@@ -25,5 +27,19 @@ def test_get_streaming_preview_avoids_false_positive(tmp_path, monkeypatch):
     file_path = tmp_path / "not_onnx.bin"
     file_path.write_bytes(b"\x08\x08random")
     preview = streaming.get_streaming_preview(f"file://{file_path}")
+    assert preview is not None
+    assert preview["detected_format"] is None
+
+
+def test_get_streaming_preview_rejects_pk_prefix_near_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_local(monkeypatch)
+    file_path = tmp_path / "not_zip.bin"
+    file_path.write_bytes(b"PKNOPE harmless text")
+
+    preview = streaming.get_streaming_preview(f"file://{file_path}")
+
     assert preview is not None
     assert preview["detected_format"] is None
