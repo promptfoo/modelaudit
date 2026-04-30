@@ -23,11 +23,12 @@ import json
 import logging
 import os
 import re
+import struct
 import subprocess
 import sys
 import tempfile
 from contextlib import suppress
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
@@ -242,9 +243,14 @@ class XGBoostScanner(BaseScanner):
         b"dart",
     )
     _BINARY_MIN_STRUCTURE_BYTES: ClassVar[int] = 32
+    _LEGACY_HEADER_BYTES: ClassVar[int] = 136
+    _BINARY_SIGNATURE: ClassVar[bytes] = b"binf"
+    _MAX_LEGACY_HEADER_MAJOR_VERSION: ClassVar[int] = 3
+    _MAX_LEGACY_HEADER_MINOR_VERSION: ClassVar[int] = 100
     _INCONCLUSIVE_REASONS: ClassVar[dict[str, str]] = {
         "json_parse_failed": "xgboost_json_parse_failed",
         "json_analysis_failed": "xgboost_json_analysis_failed",
+        "json_structure_invalid": "xgboost_json_structure_invalid",
         "ubj_dependency_missing": "xgboost_ubj_dependency_missing",
         "ubj_analysis_failed": "xgboost_ubj_analysis_failed",
         "binary_empty": "xgboost_binary_empty",
@@ -614,12 +620,36 @@ class XGBoostScanner(BaseScanner):
         """Validate XGBoost learner parameters for suspicious values."""
         # Check for gradient booster
         gradient_booster = learner.get("gradient_booster")
-        if gradient_booster and isinstance(gradient_booster, dict):
+        if "gradient_booster" in learner and not isinstance(gradient_booster, dict):
+            self._record_invalid_json_structure(
+                result,
+                path,
+                field="learner.gradient_booster",
+                expected_type="dict",
+                value=gradient_booster,
+            )
+        elif isinstance(gradient_booster, dict):
             model = gradient_booster.get("model")
-            if model and isinstance(model, dict):
+            if "model" in gradient_booster and not isinstance(model, dict):
+                self._record_invalid_json_structure(
+                    result,
+                    path,
+                    field="learner.gradient_booster.model",
+                    expected_type="dict",
+                    value=model,
+                )
+            elif isinstance(model, dict):
                 # Check number of trees
                 trees = model.get("trees", [])
-                if isinstance(trees, list):
+                if not isinstance(trees, list):
+                    self._record_invalid_json_structure(
+                        result,
+                        path,
+                        field="learner.gradient_booster.model.trees",
+                        expected_type="list",
+                        value=trees,
+                    )
+                else:
                     num_trees = len(trees)
                     if num_trees > self.max_num_trees:
                         result.add_check(
@@ -634,41 +664,179 @@ class XGBoostScanner(BaseScanner):
                             ),
                         )
 
-                    # Check individual tree structures
-                    self._validate_tree_structures(trees[:10], result, path)  # Sample first 10 trees
+                    self._validate_tree_structures(trees, result, path)
 
         # Check learner model parameters
         params = learner.get("learner_model_param", {})
         if isinstance(params, dict):
             self._validate_model_parameters(params, result, path)
 
-    def _validate_tree_structures(self, trees: list[dict[str, Any]], result: ScanResult, path: str) -> None:
+    def _validate_tree_structures(self, trees: list[Any], result: ScanResult, path: str) -> None:
         """Validate individual tree structures for anomalies."""
+        invalid_tree_count = 0
+        invalid_tree_examples: list[dict[str, str]] = []
+        over_depth_trees: list[tuple[int, int]] = []
         for i, tree in enumerate(trees):
+            if not isinstance(tree, dict):
+                invalid_tree_count = self._collect_invalid_tree_structure(
+                    invalid_tree_examples,
+                    invalid_tree_count,
+                    field=f"learner.gradient_booster.model.trees[{i}]",
+                    expected_type="dict",
+                    value=tree,
+                )
+                continue
+
             left_children = tree.get("left_children")
             right_children = tree.get("right_children")
             if not isinstance(left_children, list) or not isinstance(right_children, list):
+                invalid_tree_count = self._collect_invalid_tree_structure(
+                    invalid_tree_examples,
+                    invalid_tree_count,
+                    field=f"learner.gradient_booster.model.trees[{i}].children",
+                    expected_type="list",
+                    value={"left_children": left_children, "right_children": right_children},
+                )
                 continue
             if len(left_children) != len(right_children) or len(left_children) == 0:
-                continue
-
-            try:
-                left = [int(child) for child in left_children]
-                right = [int(child) for child in right_children]
-            except (ValueError, TypeError):
-                continue
-
-            depth = self._compute_tree_depth(left, right)
-            if depth > self.max_tree_depth:
-                result.add_check(
-                    name="Tree Depth Validation",
-                    passed=False,
-                    message=f"Tree {i} has deep structure: depth {depth} (threshold: {self.max_tree_depth})",
-                    severity=IssueSeverity.INFO,
-                    location=path,
-                    details={"tree_index": i, "depth": depth, "max_depth": self.max_tree_depth},
-                    why="Deep trees may impact performance but can be legitimate in complex models",
+                invalid_tree_count = self._collect_invalid_tree_structure(
+                    invalid_tree_examples,
+                    invalid_tree_count,
+                    field=f"learner.gradient_booster.model.trees[{i}].children",
+                    expected_type="same-length non-empty lists",
+                    value={"left_children": left_children, "right_children": right_children},
                 )
+                continue
+
+            if not self._child_indices_are_valid(left_children, right_children):
+                invalid_tree_count = self._collect_invalid_tree_structure(
+                    invalid_tree_examples,
+                    invalid_tree_count,
+                    field=f"learner.gradient_booster.model.trees[{i}].children",
+                    expected_type="in-range integer child indices",
+                    value={"left_children": left_children, "right_children": right_children},
+                )
+                continue
+
+            depth = self._compute_tree_depth(cast(list[int], left_children), cast(list[int], right_children))
+            if depth > self.max_tree_depth:
+                over_depth_trees.append((i, depth))
+
+        if invalid_tree_count:
+            self._record_invalid_tree_structures(result, path, invalid_tree_count, invalid_tree_examples)
+
+        if not over_depth_trees:
+            return
+
+        first_tree_index, first_depth = over_depth_trees[0]
+        max_observed_depth = max(depth for _, depth in over_depth_trees)
+        example_trees = [{"tree_index": tree_index, "depth": depth} for tree_index, depth in over_depth_trees[:10]]
+        result.add_check(
+            name="Tree Depth Validation",
+            passed=False,
+            message=(
+                f"{len(over_depth_trees)} tree(s) have deep structure; "
+                f"first is tree {first_tree_index} at depth {first_depth} "
+                f"(threshold: {self.max_tree_depth})"
+            ),
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "tree_index": first_tree_index,
+                "depth": first_depth,
+                "max_depth": self.max_tree_depth,
+                "max_observed_depth": max_observed_depth,
+                "tree_count": len(over_depth_trees),
+                "examples": example_trees,
+                "aggregated": True,
+            },
+            why="Deep trees may impact performance but can be legitimate in complex models",
+        )
+
+    @staticmethod
+    def _child_indices_are_valid(left_children: list[Any], right_children: list[Any]) -> bool:
+        child_count = len(left_children)
+        for children in (left_children, right_children):
+            for child in children:
+                if type(child) is not int:
+                    return False
+                if child < -1 or child >= child_count:
+                    return False
+        return True
+
+    @staticmethod
+    def _invalid_json_structure_detail(*, field: str, expected_type: str, value: Any) -> dict[str, str]:
+        return {
+            "field": field,
+            "expected_type": expected_type,
+            "actual_type": type(value).__name__,
+        }
+
+    def _collect_invalid_tree_structure(
+        self,
+        examples: list[dict[str, str]],
+        invalid_count: int,
+        *,
+        field: str,
+        expected_type: str,
+        value: Any,
+    ) -> int:
+        if len(examples) < 10:
+            examples.append(self._invalid_json_structure_detail(field=field, expected_type=expected_type, value=value))
+        return invalid_count + 1
+
+    def _record_invalid_tree_structures(
+        self,
+        result: ScanResult,
+        path: str,
+        invalid_count: int,
+        examples: list[dict[str, str]],
+    ) -> None:
+        first_invalid = examples[0]
+        result.add_check(
+            name="XGBoost JSON Structure Validation",
+            passed=False,
+            message=(
+                f"Invalid XGBoost JSON structure at {first_invalid['field']}"
+                if invalid_count == 1
+                else (f"{invalid_count} invalid XGBoost tree structure(s); first at {first_invalid['field']}")
+            ),
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                **first_invalid,
+                "invalid_count": invalid_count,
+                "examples": examples,
+                "aggregated": invalid_count > 1,
+            },
+            why="Malformed XGBoost JSON structure prevents complete model validation",
+        )
+        self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["json_structure_invalid"])
+
+    def _record_invalid_json_structure(
+        self,
+        result: ScanResult,
+        path: str,
+        *,
+        field: str,
+        expected_type: str,
+        value: Any,
+    ) -> None:
+        detail = self._invalid_json_structure_detail(
+            field=field,
+            expected_type=expected_type,
+            value=value,
+        )
+        result.add_check(
+            name="XGBoost JSON Structure Validation",
+            passed=False,
+            message=f"Invalid XGBoost JSON structure at {field}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details=detail,
+            why="Malformed XGBoost JSON structure prevents complete model validation",
+        )
+        self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["json_structure_invalid"])
 
     @staticmethod
     def _compute_tree_depth(left_children: list[int], right_children: list[int]) -> int:
@@ -793,12 +961,43 @@ class XGBoostScanner(BaseScanner):
         except OSError:
             return False
 
+    @classmethod
+    def _looks_like_headerless_legacy_binary(cls, header: bytes) -> bool:
+        """Recognize the older legacy payload header written before `binf` existed."""
+        if len(header) < cls._LEGACY_HEADER_BYTES:
+            return False
+
+        try:
+            (
+                base_score,
+                num_feature,
+                num_class,
+                contain_extra_attrs,
+                contain_eval_metrics,
+                major_version,
+                minor_version,
+            ) = struct.unpack("<fIiiiII", header[:28])
+        except struct.error:
+            return False
+
+        reserved = header[28 : cls._LEGACY_HEADER_BYTES]
+        return (
+            0.0 <= base_score <= 1.0
+            and 0 <= num_feature <= 1_000_000
+            and 0 <= num_class <= 100_000
+            and contain_extra_attrs in {0, 1}
+            and contain_eval_metrics in {0, 1}
+            and 0 <= major_version <= cls._MAX_LEGACY_HEADER_MAJOR_VERSION
+            and 0 <= minor_version <= cls._MAX_LEGACY_HEADER_MINOR_VERSION
+            and not any(reserved)
+        )
+
     def _validate_binary_structure(self, path: str, result: ScanResult) -> None:
         """Validate XGBoost binary file structure."""
         try:
             with open(path, "rb") as f:
                 # Read first few bytes to check for basic structure
-                header = f.read(64)
+                header = f.read(self._LEGACY_HEADER_BYTES)
 
                 if len(header) < self._BINARY_MIN_STRUCTURE_BYTES:
                     result.add_check(
@@ -815,13 +1014,15 @@ class XGBoostScanner(BaseScanner):
                     )
                     return
 
-                # Check for readable strings that typically appear in XGBoost models
+                # The legacy binary format starts with `binf`; marker strings
+                # alone can be planted in arbitrary text payloads.
                 header_str = header.decode("utf-8", errors="ignore")
-                expected_patterns = ["binf", "gbtree", "gblinear", "dart", "reg:", "binary:", "multi:"]
+                expected_patterns = ["gbtree", "gblinear", "dart", "reg:", "binary:", "multi:"]
+                patterns_found = [pattern for pattern in expected_patterns if pattern in header_str.lower()]
+                has_binary_signature = header.startswith(self._BINARY_SIGNATURE)
+                has_headerless_legacy_structure = self._looks_like_headerless_legacy_binary(header)
 
-                has_expected_pattern = any(pattern in header_str.lower() for pattern in expected_patterns)
-
-                if not has_expected_pattern:
+                if not has_binary_signature and not has_headerless_legacy_structure:
                     # Check if it looks like binary data or something else
                     if all(b < 32 or b > 126 for b in header[:16]):
                         result.add_check(
@@ -840,23 +1041,41 @@ class XGBoostScanner(BaseScanner):
                         result.add_check(
                             name="Binary Structure Validation",
                             passed=False,
-                            message="File does not contain expected XGBoost binary model markers",
+                            message="File does not start with the expected XGBoost binary signature",
                             severity=IssueSeverity.INFO,
                             location=path,
-                            details={"expected_patterns": expected_patterns},
-                            why="Missing XGBoost markers may indicate a truncated, corrupted, or mislabeled model file",
+                            details={
+                                "expected_signature": self._BINARY_SIGNATURE.decode("ascii"),
+                                "text_markers_found": patterns_found,
+                            },
+                            why=(
+                                "Missing the XGBoost binary signature may indicate a truncated, corrupted, "
+                                "or mislabeled model file"
+                            ),
                         )
                     if not self.enable_xgb_loading:
                         self._mark_inconclusive_scan_result(
                             result, self._INCONCLUSIVE_REASONS["binary_structure_unrecognized"]
                         )
                 else:
+                    binary_format = "binf" if has_binary_signature else "headerless_legacy"
                     result.add_check(
                         name="XGBoost Binary Pattern Check",
                         passed=True,
-                        message="Found expected XGBoost patterns in binary file",
+                        message=(
+                            "Found expected XGBoost binary signature"
+                            if has_binary_signature
+                            else "Found plausible headerless XGBoost legacy binary structure"
+                        ),
                         location=path,
-                        details={"patterns_found": [p for p in expected_patterns if p in header_str.lower()]},
+                        details={
+                            "binary_format": binary_format,
+                            "patterns_found": (
+                                [self._BINARY_SIGNATURE.decode("ascii"), *patterns_found]
+                                if has_binary_signature
+                                else patterns_found
+                            ),
+                        },
                     )
 
         except Exception as e:
