@@ -538,6 +538,14 @@ class Jinja2TemplateScanner(BaseScanner):
         extraction_failures: list[dict[str, Any]] = []
 
         if not HAS_YAML:
+            extraction_failures.append(
+                {
+                    "format": "yaml",
+                    "reason": "jinja2_yaml_dependency_unavailable",
+                    "required_package": "PyYAML",
+                }
+            )
+            self._extract_raw_template_fallback(path, templates, "raw_yaml_dependency_fallback")
             return templates, extraction_failures
 
         try:
