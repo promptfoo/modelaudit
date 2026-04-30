@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   results
 - fail closed when PyTorch ZIP tensor-metadata validation can only inspect a
   bounded pickle prefix or cannot complete member analysis
+- preserve and scan concatenated compressed-wrapper member boundaries so a
+  benign first member cannot hide later malicious payloads
 
 ## [0.2.42](https://github.com/promptfoo/modelaudit/compare/v0.2.41...v0.2.42) (2026-04-27)
 
