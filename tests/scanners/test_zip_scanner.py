@@ -767,6 +767,86 @@ def test_scan_nested_file_header_routed_generic_suffix_can_report_findings(
     assert result.has_errors is False
 
 
+def test_scan_nested_file_fails_closed_when_recognized_header_scanner_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted_member = tmp_path / "member.dat"
+    extracted_member.write_bytes(b"header-routed model payload")
+
+    monkeypatch.setattr(archive_dispatch, "detect_file_format", lambda _path: "header_only_model")
+    monkeypatch.setattr(archive_dispatch, "detect_file_format_from_magic", lambda _path: "header_only_model")
+    monkeypatch.setitem(
+        archive_dispatch._HEADER_FORMAT_TO_SCANNER_ID,
+        "header_only_model",
+        "header_only_scanner",
+    )
+    monkeypatch.setattr(_registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(_registry, "get_scanner_for_path", lambda _path: None)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.has_errors is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+    assert "recognized_format_scanner_unavailable" in result.metadata["scan_outcome_reasons"]
+
+    check = next(check for check in result.checks if check.name == "Format Detection")
+    assert check.severity == IssueSeverity.INFO
+    assert "Recognized format could not be scanned" in check.message
+    assert check.details["format"] == "header_only_model"
+    assert check.details["preferred_scanner_id"] == "header_only_scanner"
+
+
+def test_scan_nested_file_does_not_fail_closed_for_extension_only_member(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted_member = tmp_path / "metadata.pb"
+    extracted_member.write_bytes(b"plain protobuf-ish bytes")
+
+    monkeypatch.setattr(_registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(_registry, "get_scanner_for_path", lambda _path: None)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+    assert not any(check.name == "Format Detection" for check in result.checks)
+
+
+def test_scan_zip_fails_closed_when_nested_recognized_header_scanner_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("member.dat", b"header-routed model payload")
+
+    monkeypatch.setattr(archive_dispatch, "detect_file_format", lambda _path: "header_only_model")
+    monkeypatch.setattr(archive_dispatch, "detect_file_format_from_magic", lambda _path: "header_only_model")
+    monkeypatch.setitem(
+        archive_dispatch._HEADER_FORMAT_TO_SCANNER_ID,
+        "header_only_model",
+        "header_only_scanner",
+    )
+    monkeypatch.setattr(_registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(_registry, "get_scanner_for_path", lambda _path: None)
+
+    result = ZipScanner({"cache_enabled": False}).scan(str(archive_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    nested_check = next(check for check in result.checks if check.name == "Format Detection")
+    assert nested_check.location == f"{archive_path}:member.dat"
+
+
 class TestZipScanner:
     """Test the ZIP scanner"""
 

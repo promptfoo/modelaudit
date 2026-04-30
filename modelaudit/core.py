@@ -4,7 +4,6 @@ import hashlib
 import logging
 import os
 import time
-from collections import defaultdict
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -57,7 +56,12 @@ from modelaudit.utils.helpers.types import (
     ProgressCallback,
 )
 from modelaudit.utils.lfs import check_lfs_pointer, get_lfs_issue_details, get_lfs_remediation_steps
-from modelaudit.utils.sources._huggingface_cache import _find_hf_cache_root, _path_has_part, _resolve_hf_cache_path
+from modelaudit.utils.sources._huggingface_cache import (
+    _find_hf_cache_root,
+    _get_hf_cache_roots,
+    _path_has_part,
+    _resolve_hf_cache_path,
+)
 
 logger = logging.getLogger("modelaudit.core")
 
@@ -81,6 +85,7 @@ _COMPRESSED_HEADER_FORMATS = frozenset({"compressed", "gzip", "bzip2", "xz", "lz
 _R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
 _XGBOOST_BINARY_EXTENSIONS = frozenset({".bst"})
 _XGBOOST_PICKLE_SPOOF_REASON = "xgboost_binary_pickle_spoof"
+_RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
 
 
 def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
@@ -165,6 +170,30 @@ def _mark_xgboost_pickle_extension_spoof(result: ScanResult, path: str, ext: str
     result.success = False
 
 
+def _make_unavailable_recognized_format_result(path: str, format_: str, scanner_id: str | None) -> ScanResult:
+    """Fail closed when routing recognizes a format but no scanner can analyze it."""
+    result = ScanResult(scanner_name="unknown")
+    details: dict[str, Any] = {"format": format_, "path": path}
+    if scanner_id:
+        details["preferred_scanner_id"] = scanner_id
+        scanner_load_error = _registry.get_failed_scanners().get(scanner_id)
+        if scanner_load_error:
+            details["scanner_load_error"] = scanner_load_error
+
+    result.add_check(
+        name="Format Detection",
+        passed=False,
+        message="Recognized format could not be scanned because no scanner was available",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details=details,
+    )
+    _mark_inconclusive_scan_outcome(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
+    _mark_operational_scan_error(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
+    result.finish(success=False)
+    return result
+
+
 def _calculate_file_hash(file_path: str) -> str:
     """Calculate SHA256 hash of a file for deduplication purposes.
 
@@ -179,35 +208,27 @@ def _calculate_file_hash(file_path: str) -> str:
     return hash_sha256.hexdigest()
 
 
-def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
-    """Group files by their content hash to avoid scanning duplicates.
+def _hash_files_by_path(file_paths: list[str]) -> dict[str, str]:
+    """Hash files individually so scan results stay path-specific.
 
     Args:
         file_paths: List of file paths to group
 
     Returns:
-        Dictionary mapping content hash to list of file paths with that content
+        Dictionary mapping each file path to its content hash. Files that fail to
+        hash get unique placeholder values so they still scan independently.
     """
-    content_groups: dict[str, list[str]] = defaultdict(list)
+    content_hashes: dict[str, str] = {}
 
     for file_path in file_paths:
         try:
-            content_hash = _calculate_file_hash(file_path)
-            content_groups[content_hash].append(file_path)
+            content_hashes[file_path] = _calculate_file_hash(file_path)
         except Exception as e:
             # Log error but continue with other files to prevent single I/O failure from aborting entire scan
             logger.warning(f"Failed to hash file {file_path}: {e}. Skipping deduplication for this file.")
-            # Add file with unique hash to ensure it gets scanned independently
-            content_groups[f"unhashable_{id(file_path)}"].append(file_path)
+            content_hashes[file_path] = f"unhashable_{id(file_path)}"
 
-    # Log information about duplicate content found
-    for content_hash, paths in content_groups.items():
-        if len(paths) > 1:
-            logger.debug(f"Found {len(paths)} files with identical content (hash: {content_hash[:16]})")
-            for path in paths:
-                logger.debug(f"  - {path}")
-
-    return dict(content_groups)
+    return content_hashes
 
 
 def _resolve_directory_scan_target(
@@ -350,9 +371,9 @@ def scan_model_directory_or_file(
 
             scanner = get_scanner_for_file(stream_url, config=config)
             if scanner:
-                scan_result, was_complete = stream_analyze_file(stream_url, scanner)
+                scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:
-                    if not was_complete:
+                    if not analysis_complete:
                         _mark_inconclusive_scan_outcome(scan_result, "streaming_analysis_incomplete")
                     results.files_scanned += 1
 
@@ -362,10 +383,10 @@ def scan_model_directory_or_file(
                     # Add asset
                     _add_asset_to_results(results, stream_url, scan_result)
 
-                    if not was_complete:
+                    if not analysis_complete:
                         _add_issue_to_model(
                             results,
-                            "Streaming analysis was partial - only analyzed file header",
+                            "Streaming analysis incomplete - full scanner coverage was not available",
                             severity=IssueSeverity.INFO.value,
                             location=stream_url,
                             details={"analysis_complete": False},
@@ -489,19 +510,23 @@ def scan_model_directory_or_file(
                         # Add to files to scan list instead of scanning immediately
                         files_to_scan.append(target_str)
 
-            # Second pass: group files by content and scan unique content only once
+            # Second pass: scan every path independently. Some scanners depend on
+            # parent paths or sibling files, so content equality alone is not a
+            # safe proxy for scan-result equality.
             if files_to_scan:
-                content_groups = _group_files_by_content(files_to_scan)
-                content_processed = 0
+                content_hashes = _hash_files_by_path(files_to_scan)
+                duplicate_paths_by_hash: dict[str, list[str]] = {}
+                for file_path, content_hash in content_hashes.items():
+                    if not content_hash.startswith("unhashable_"):
+                        duplicate_paths_by_hash.setdefault(content_hash, []).append(file_path)
+                recorded_content_hashes: set[str] = set()
 
-                for content_hash, file_paths in content_groups.items():
+                for representative_file, content_hash in content_hashes.items():
                     # Collect valid content hashes for aggregate hash computation
                     # Skip "unhashable_" prefix entries (those are placeholder hashes for files that failed to hash)
-                    if not content_hash.startswith("unhashable_"):
+                    if not content_hash.startswith("unhashable_") and content_hash not in recorded_content_hashes:
                         file_hashes.append(content_hash)
-
-                    # Scan the first file in each content group (representative)
-                    representative_file = file_paths[0]
+                        recorded_content_hashes.add(content_hash)
 
                     # Check for interrupts
                     check_interrupted()
@@ -514,14 +539,12 @@ def scan_model_directory_or_file(
                     if progress_callback:
                         if total_files is not None and total_files > 0:
                             progress_callback(
-                                f"Scanning file {processed_files + 1}/{total_files}: "
-                                f"{Path(representative_file).name} ({len(file_paths)} copies)",
+                                f"Scanning file {processed_files + 1}/{total_files}: {Path(representative_file).name}",
                                 processed_files / total_files * 100,
                             )
                         else:
                             progress_callback(
-                                f"Scanning file {processed_files + 1}: "
-                                f"{Path(representative_file).name} ({len(file_paths)} copies)",
+                                f"Scanning file {processed_files + 1}: {Path(representative_file).name}",
                                 0.0,
                             )
 
@@ -534,9 +557,8 @@ def scan_model_directory_or_file(
                         if _scan_result_has_operational_error(file_result):
                             scan_metadata["has_operational_errors"] = True
                         results.bytes_scanned += file_result.bytes_scanned
-                        results.files_scanned += len(file_paths)  # Count all copies
-                        processed_files += len(file_paths)  # Count all copies for progress
-                        content_processed += 1
+                        results.files_scanned += 1
+                        processed_files += 1
 
                         # Add scanner to tracking list (different from scanner_names)
                         scanner_name = file_result.scanner_name
@@ -550,7 +572,7 @@ def scan_model_directory_or_file(
                         if scanner_name and scanner_name not in results.scanner_names and scanner_name != "unknown":
                             results.scanner_names.append(scanner_name)
 
-                        # Add issues for each file path that shares this content using Pydantic models
+                        # Add issues from this path-specific scan using Pydantic models
                         for issue in file_result.issues:
                             issue_dict = issue.to_dict() if hasattr(issue, "to_dict") else issue
                             if isinstance(issue_dict, dict):
@@ -580,19 +602,13 @@ def scan_model_directory_or_file(
                                 if not issue_dict.get("location"):
                                     issue_dict["location"] = representative_file
 
-                                if len(file_paths) > 1:
-                                    if "details" not in issue_dict:
-                                        issue_dict["details"] = {}
-                                    issue_dict["details"]["duplicate_files"] = file_paths
-                                    issue_dict["details"]["content_hash"] = content_hash
-
                                 # Ensure timestamp is present
                                 if "timestamp" not in issue_dict:
                                     issue_dict["timestamp"] = time.time()
 
                                 results.issues.append(Issue(**issue_dict))
 
-                        # Add checks for each file path that shares this content using Pydantic models
+                        # Add checks from this path-specific scan using Pydantic models
                         if hasattr(file_result, "checks"):
                             from .models import Check
 
@@ -602,38 +618,30 @@ def scan_model_directory_or_file(
                                     if not check_dict.get("location"):
                                         check_dict["location"] = representative_file
 
-                                    if len(file_paths) > 1:
-                                        if "details" not in check_dict:
-                                            check_dict["details"] = {}
-                                        check_dict["details"]["duplicate_files"] = file_paths
-                                        check_dict["details"]["content_hash"] = content_hash
-
                                     # Ensure timestamp is present
                                     if "timestamp" not in check_dict:
                                         check_dict["timestamp"] = time.time()
 
                                     results.checks.append(Check(**check_dict))
 
-                        # Add assets for all file paths that share this content
-                        for file_path in file_paths:
-                            _add_asset_to_results(results, file_path, file_result)
+                        _add_asset_to_results(results, representative_file, file_result)
 
-                            # Add metadata for all file paths using Pydantic models
-                            license_metadata = collect_license_metadata(file_path)
-                            combined_metadata = {**file_result.metadata, **license_metadata}
-                            # Add information about content deduplication
-                            combined_metadata["content_hash"] = content_hash
-                            combined_metadata["duplicate_files"] = file_paths if len(file_paths) > 1 else None
+                        # Add metadata for this path using Pydantic models
+                        license_metadata = collect_license_metadata(representative_file)
+                        combined_metadata = {**file_result.metadata, **license_metadata}
+                        combined_metadata["content_hash"] = content_hash
+                        duplicate_files = duplicate_paths_by_hash.get(content_hash, [])
+                        combined_metadata["duplicate_files"] = duplicate_files if len(duplicate_files) > 1 else None
 
-                            # Convert ml_context if present
-                            if "ml_context" in combined_metadata and isinstance(combined_metadata["ml_context"], dict):
-                                from .models import MLContextModel
+                        # Convert ml_context if present
+                        if "ml_context" in combined_metadata and isinstance(combined_metadata["ml_context"], dict):
+                            from .models import MLContextModel
 
-                                combined_metadata["ml_context"] = MLContextModel(**combined_metadata["ml_context"])
+                            combined_metadata["ml_context"] = MLContextModel(**combined_metadata["ml_context"])
 
-                            from .models import FileMetadataModel
+                        from .models import FileMetadataModel
 
-                            results.file_metadata[file_path] = FileMetadataModel(**combined_metadata)
+                        results.file_metadata[representative_file] = FileMetadataModel(**combined_metadata)
 
                         if max_total_size > 0 and results.bytes_scanned > max_total_size:
                             _add_issue_to_model(
@@ -650,16 +658,14 @@ def scan_model_directory_or_file(
                         logger.warning(f"Error scanning file {representative_file}: {e!s}")
                         scan_metadata["success"] = False
 
-                        # Add error for all files that share this content
-                        for file_path in file_paths:
-                            _add_issue_to_model(
-                                results,
-                                f"Error scanning file: {e!s}",
-                                severity=IssueSeverity.INFO.value,
-                                location=file_path,
-                                details={"exception_type": type(e).__name__},
-                            )
-                            _add_error_asset_to_results(results, file_path)
+                        _add_issue_to_model(
+                            results,
+                            f"Error scanning file: {e!s}",
+                            severity=IssueSeverity.INFO.value,
+                            location=representative_file,
+                            details={"exception_type": type(e).__name__},
+                        )
+                        _add_error_asset_to_results(results, representative_file)
 
             # Final progress update for directory scan
             if progress_callback and not limit_reached and total_files is not None and total_files > 0:
@@ -670,12 +676,14 @@ def scan_model_directory_or_file(
             # Stop scanning if size limit reached
             if limit_reached:
                 logger.warning("Scan terminated early due to total size limit")
+                scan_metadata["success"] = False
+                scan_metadata["has_operational_errors"] = True
                 _add_issue_to_model(
                     results,
                     "Scan terminated early due to total size limit",
                     severity=IssueSeverity.INFO.value,
                     location=path,
-                    details={"max_total_size": max_total_size},
+                    details={"max_total_size": max_total_size, "analysis_incomplete": True},
                 )
         else:
             # Scan a single file or DVC pointer
@@ -798,6 +806,71 @@ def scan_model_directory_or_file(
 # _should_skip_file has been moved to utils.file_filter module
 
 
+def _is_hf_hub_bookkeeping_path(path_obj: Path) -> bool:
+    """Return True for files stored under known HuggingFace hub bookkeeping directories."""
+    hf_cache_root = _find_hf_cache_root(path_obj)
+    if hf_cache_root is None:
+        return False
+
+    try:
+        relative_parts = _resolve_hf_cache_path(path_obj).relative_to(hf_cache_root).parts
+    except ValueError:
+        return False
+
+    return bool(relative_parts and relative_parts[0] in {"snapshots", "blobs", "refs"})
+
+
+def _is_hf_download_bookkeeping_path(path_obj: Path) -> bool:
+    """Return True for files stored in HuggingFace download bookkeeping directories."""
+    import os
+
+    resolved_parent = _resolve_hf_cache_path(path_obj.parent)
+    configured_download_roots = {
+        _resolve_hf_cache_path(root.parent / "download")
+        for root in _get_hf_cache_roots()
+        if root.parent.name.lower() == "huggingface"
+    }
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        configured_download_roots.add(_resolve_hf_cache_path(Path(hf_home) / "download"))
+    if resolved_parent in configured_download_roots:
+        return True
+
+    # Local snapshot downloads keep bookkeeping under the downloaded model
+    # directory rather than the global cache root.
+    parts = resolved_parent.parts
+    if len(parts) < 3 or tuple(part.lower() for part in parts[-3:]) != (".cache", "huggingface", "download"):
+        return False
+
+    local_model_root = resolved_parent.parents[2]
+    try:
+        has_local_model_assets = any(child.is_file() for child in local_model_root.iterdir() if child.name != ".cache")
+    except OSError:
+        return False
+    return has_local_model_assets and _is_benign_local_hf_download_bookkeeping_file(path_obj)
+
+
+def _is_benign_local_hf_download_bookkeeping_file(path_obj: Path) -> bool:
+    """Return True only for local download bookkeeping files that do not look scannable."""
+    import json
+
+    filename = path_obj.name
+    try:
+        if detect_file_format(str(path_obj)) != "unknown":
+            return False
+        if filename.endswith(".lock"):
+            return path_obj.stat().st_size == 0
+        if filename.endswith(".metadata"):
+            with path_obj.open(encoding="utf-8") as handle:
+                return isinstance(json.load(handle), dict)
+        if filename in {".gitignore", ".gitattributes"}:
+            content = path_obj.read_text(encoding="utf-8")
+            return "\x00" not in content and len(content) <= 64 * 1024
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return False
+
+
 def _is_huggingface_cache_file(path: str) -> bool:
     """
     Check if a file is a HuggingFace cache/metadata file that should be skipped.
@@ -813,32 +886,23 @@ def _is_huggingface_cache_file(path: str) -> bool:
     filename = os.path.basename(path)
     path_obj = Path(path)
 
-    # Download lock files are HuggingFace bookkeeping files regardless of cache layout.
+    is_hf_bookkeeping_path = _is_hf_hub_bookkeeping_path(path_obj) or _is_hf_download_bookkeeping_path(path_obj)
+
+    # Only trust bookkeeping-shaped filenames when they actually live in a
+    # recognized HuggingFace cache layout.
     if filename.endswith(".lock"):
-        return True
+        return is_hf_bookkeeping_path
 
     # Only skip HuggingFace .metadata files in known cache/download layouts.
     if filename.endswith(".metadata"):
-        hf_cache_root = _find_hf_cache_root(path_obj)
-        if hf_cache_root is not None and hf_cache_root.parent.name.lower() == "hub":
-            try:
-                relative_parts = _resolve_hf_cache_path(path_obj).relative_to(hf_cache_root).parts
-            except ValueError:
-                relative_parts = ()
-
-            if relative_parts and relative_parts[0] in {"snapshots", "blobs", "refs"}:
-                return True
-
-        normalized_parts = [part.lower() for part in path_obj.parent.parts]
-        if len(normalized_parts) >= 3 and normalized_parts[-3:] == [".cache", "huggingface", "download"]:
-            return True
+        return is_hf_bookkeeping_path
 
     # Check for specific HuggingFace cache metadata files
     # We no longer skip all HuggingFace cache files since we handle symlinks properly now
 
     # Check for Git-related files that are commonly cached
     if filename in [".gitignore", ".gitattributes"]:
-        return True
+        return is_hf_bookkeeping_path
 
     if filename in ["main", "HEAD"]:
         hf_cache_root = _find_hf_cache_root(path_obj)
@@ -1148,20 +1212,12 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                         result.bytes_scanned = file_size
                     return result
 
-            format_ = header_format
-            sr = ScanResult(scanner_name="unknown")
-            if format_ == "unknown":
+            if magic_format == "unknown":
                 # Not a recognized model format — skip silently
+                sr = ScanResult(scanner_name="unknown")
                 logger.debug(f"Skipping unrecognized format file: {path}")
             else:
-                # Known format but no scanner available
-                sr.add_check(
-                    name="Format Detection",
-                    passed=False,
-                    message=f"Unknown or unhandled format: {format_}",
-                    severity=IssueSeverity.DEBUG,
-                    details={"format": format_, "path": path},
-                )
+                sr = _make_unavailable_recognized_format_result(path, magic_format, scanner_id)
             result = sr
 
     if is_xgboost_pickle_spoof:

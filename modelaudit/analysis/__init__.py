@@ -2,7 +2,6 @@
 
 This package contains modules for analyzing ML models and detecting framework-specific patterns:
 - anomaly_detector.py - Statistical anomaly detection
-- enhanced_pattern_detector.py - Advanced pattern matching
 - entropy_analyzer.py - Entropy-based analysis
 - framework_patterns.py - ML framework detection patterns and heuristics
 - integrated_analyzer.py - Combined analysis techniques
