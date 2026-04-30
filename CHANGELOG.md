@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- harden detector heuristics against comment padding, byte-backed credentials, unmarked Python blobs, and spoofed network context
 - fail closed when bounded scanner windows leave relevant model content uninspected
 - fail closed when TorchServe MAR limits leave manifest-referenced payloads unscanned
 - recurse into nested ZIP members inside PyTorch archives and fail closed when compression-ratio guards leave members unscanned
