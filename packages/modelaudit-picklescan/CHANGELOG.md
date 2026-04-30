@@ -5,6 +5,12 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Bug Fixes
+
+- detect dangerous positional lookups inside `str.format` replacement fields
+
 ## [0.1.3](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.2...modelaudit-picklescan-v0.1.3) (2026-04-27)
 
 ### Bug Fixes
@@ -137,6 +143,11 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Fail closed when a whole-pass Python call-graph enrichment step raises.
+- Require actual callable invocations before pairing startup-hook opener and
+  writer imports, avoiding critical findings for pickles that only reconstruct
+  those function objects.
+- Mark invoked call-graph targets as incomplete when Python source cannot be
+  analyzed, and refresh source-derived call-graph caches between scans.
 - Detect additional stdlib callable pickle targets that can access files,
   mutate registries, suppress diagnostics, or change process state, including
   Python 3.13 `pathlib._local` concrete path aliases, public `operator.setitem`

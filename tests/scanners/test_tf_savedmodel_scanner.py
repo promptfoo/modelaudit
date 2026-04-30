@@ -7,7 +7,7 @@ import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
+from modelaudit.scanners.tf_savedmodel_scanner import _ASSET_PROBE_BYTES, TensorFlowSavedModelScanner
 from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as has_tf_protos
 
@@ -596,6 +596,21 @@ def test_savedmodel_assets_benign_text_file_passes(tmp_path: Path) -> None:
     asset_checks = [check for check in result.checks if check.name == "SavedModel Assets Security Check"]
 
     assert asset_checks == []
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_large_unclassified_asset_marks_scan_inconclusive(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "large.dat"
+    asset_path.write_bytes(b"A" * (_ASSET_PROBE_BYTES + 1))
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    probe_checks = [check for check in result.checks if check.name == "SavedModel Asset Probe Limit"]
+    assert len(probe_checks) == 1
+    assert probe_checks[0].details["analysis_incomplete"] is True
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")

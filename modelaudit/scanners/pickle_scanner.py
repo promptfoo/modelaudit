@@ -18,7 +18,7 @@ from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 from modelaudit.utils.helpers.code_validation import validate_python_syntax
 
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 from .picklescan_adapter import pickle_report_to_scan_result, scan_options_from_config
 
 _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES = 64 * 1024
@@ -2432,5 +2432,44 @@ class PickleScanner(BaseScanner):
             return result
 
         self._add_root_legacy_metadata_detectors(result, path)
+        self._scan_jax_checkpoint_patterns_if_needed(path, file_size, result)
         self._finish_after_wrapper_analysis(result, base_success=scan_result.success)
         return result
+
+    def _scan_jax_checkpoint_patterns_if_needed(self, path: str, file_size: int, result: ScanResult) -> None:
+        from .jax_checkpoint_scanner import JaxCheckpointScanner
+
+        jax_scanner = JaxCheckpointScanner(config=self.config)
+        read_limit = min(file_size, jax_scanner.max_pickle_scan_bytes)
+        with open(path, "rb") as handle:
+            data = handle.read(read_limit + 1)
+
+        decoded_text = data[: jax_scanner.max_pickle_scan_bytes].decode("utf-8", errors="ignore")
+        jax_result = jax_scanner.scan_pickle_pattern_text(
+            path,
+            decoded_text,
+        )
+        has_jax_context = any(indicator in decoded_text.lower() for indicator in jax_scanner._JAX_INDICATORS)
+        has_jax_findings = any(
+            check.name == "JAX Pattern Security Check" and check.status == CheckStatus.FAILED
+            for check in jax_result.checks
+        )
+        if len(data) > jax_scanner.max_pickle_scan_bytes:
+            result.metadata["analysis_incomplete"] = True
+            result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+            scan_outcome_reasons = result.metadata.setdefault("scan_outcome_reasons", [])
+            if isinstance(scan_outcome_reasons, list) and "jax_pickle_scan_limit_exceeded" not in scan_outcome_reasons:
+                scan_outcome_reasons.append("jax_pickle_scan_limit_exceeded")
+            jax_result.add_check(
+                name="Pickle Checkpoint Prefix Scan Limit",
+                passed=False,
+                message=(
+                    f"Only the first {jax_scanner.max_pickle_scan_bytes} bytes of the pickle checkpoint were "
+                    "inspected for opcode patterns"
+                ),
+                severity=IssueSeverity.WARNING if has_jax_context or has_jax_findings else IssueSeverity.INFO,
+                location=path,
+                details={"max_pickle_scan_bytes": jax_scanner.max_pickle_scan_bytes},
+                rule_code="S902",
+            )
+        result.merge(jax_result)
