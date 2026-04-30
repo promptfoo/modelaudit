@@ -448,6 +448,7 @@ pub(crate) struct ScanState<'a> {
     seen_notice_keys: HashSet<NoticeDedupeKey>,
     seen_global_reference_keys: HashSet<GlobalReferenceDedupeKey>,
     import_references_truncated: bool,
+    callable_invocations_truncated: bool,
 }
 
 impl<'a> ScanState<'a> {
@@ -500,6 +501,7 @@ impl<'a> ScanState<'a> {
             seen_notice_keys: HashSet::new(),
             seen_global_reference_keys: HashSet::new(),
             import_references_truncated: false,
+            callable_invocations_truncated: false,
         }
     }
 
@@ -4093,9 +4095,11 @@ impl<'a> ScanState<'a> {
             invocation.reference.name.clone(),
             invocation.positional_arg_count,
         );
-        if self.callable_invocation_keys.contains(&dedupe_key)
-            || self.callable_invocations.len() >= MAX_IMPORT_REFERENCES
-        {
+        if self.callable_invocation_keys.contains(&dedupe_key) {
+            return;
+        }
+        if self.callable_invocations.len() >= MAX_IMPORT_REFERENCES {
+            self.record_callable_invocations_truncated_notice();
             return;
         }
         self.callable_invocation_keys.insert(dedupe_key);
@@ -4131,6 +4135,30 @@ impl<'a> ScanState<'a> {
             ));
         }
         self.callable_invocations.push(details);
+    }
+
+    fn record_callable_invocations_truncated_notice(&mut self) {
+        if self.callable_invocations_truncated {
+            return;
+        }
+        if self.status.is_complete() {
+            self.status = ScanStatus::Inconclusive;
+        }
+        self.callable_invocations_truncated = true;
+        self.add_notice(Notice {
+            message: "Callable invocation metadata exceeded the scanner reporting limit"
+                .to_string(),
+            severity: "info",
+            location: Some(self.source.clone()),
+            code: Some("callable_invocations_truncated"),
+            details: vec![
+                (
+                    "max_callable_invocations".to_string(),
+                    DetailValue::UInt(MAX_IMPORT_REFERENCES as u64),
+                ),
+                ("analysis_incomplete".to_string(), DetailValue::Bool(true)),
+            ],
+        });
     }
 
     fn rebuild_seen_notice_keys(&mut self) {
@@ -4669,13 +4697,10 @@ impl<'a> ScanState<'a> {
             for reference in follow_on_scan.import_references {
                 self.push_import_reference(reference);
             }
-            for invocation in follow_on_scan.callable_invocations {
-                if self.callable_invocations.len() < MAX_IMPORT_REFERENCES
-                    && self.remember_callable_invocation_details(&invocation)
-                {
-                    self.callable_invocations.push(invocation);
-                }
-            }
+            self.merge_follow_on_callable_invocations(
+                follow_on_scan.callable_invocations,
+                follow_on_scan.callable_invocations_truncated,
+            );
             if had_findings {
                 self.add_notice(Notice {
                     message: "Follow-on pickle stream detected after malformed padding".to_string(),
@@ -4699,15 +4724,40 @@ impl<'a> ScanState<'a> {
         }
     }
 
-    fn remember_callable_invocation_details(&mut self, details: &[(String, DetailValue)]) -> bool {
+    fn merge_follow_on_callable_invocations(
+        &mut self,
+        follow_on_invocations: Vec<Vec<(String, DetailValue)>>,
+        follow_on_invocations_truncated: bool,
+    ) {
+        if follow_on_invocations_truncated {
+            self.record_callable_invocations_truncated_notice();
+        }
+        for invocation in follow_on_invocations {
+            let Some(invocation_key) = Self::callable_invocation_detail_key(&invocation) else {
+                continue;
+            };
+            if self.callable_invocation_keys.contains(&invocation_key) {
+                continue;
+            }
+            if self.callable_invocations.len() >= MAX_IMPORT_REFERENCES {
+                self.record_callable_invocations_truncated_notice();
+                continue;
+            }
+            self.callable_invocation_keys.insert(invocation_key);
+            self.callable_invocations.push(invocation);
+        }
+    }
+
+    fn callable_invocation_detail_key(
+        details: &[(String, DetailValue)],
+    ) -> Option<(String, String, Option<usize>)> {
         let module = detail_string(details, "module").unwrap_or_default();
         let name = detail_string(details, "name").unwrap_or_default();
         if module.is_empty() || name.is_empty() {
-            return false;
+            return None;
         }
         let positional_arg_count = detail_usize(details, "positional_arg_count");
-        self.callable_invocation_keys
-            .insert((module, name, positional_arg_count))
+        Some((module, name, positional_arg_count))
     }
 
     fn coalesce_redundant_global_findings(&mut self) {
@@ -4829,6 +4879,10 @@ impl<'a> ScanState<'a> {
             callable_invocations.append(DetailValue::Dict(invocation.clone()).to_py_object(py)?)?;
         }
         metadata.set_item("callable_invocations", callable_invocations)?;
+        metadata.set_item(
+            "callable_invocations_truncated",
+            self.callable_invocations_truncated,
+        )?;
         if !self.protocols.is_empty() {
             metadata.set_item("protocols", &self.protocols)?;
         }
@@ -5783,6 +5837,125 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn callable_invocation_metadata_is_capped_with_notice() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "callable-invocation-cap.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+
+        for index in 0..=MAX_IMPORT_REFERENCES {
+            let invocation = ScanState::callable_invocation(
+                GlobalRef {
+                    module: "module".to_string(),
+                    name: format!("call_{index}"),
+                    position: index,
+                    malformed: false,
+                },
+                "REDUCE",
+                index,
+                Some(0),
+            );
+            scan.push_callable_invocation(&invocation);
+        }
+
+        assert_eq!(scan.callable_invocations.len(), MAX_IMPORT_REFERENCES);
+        assert_eq!(scan.status, ScanStatus::Inconclusive);
+        assert_eq!(
+            scan.notices
+                .iter()
+                .filter(|notice| notice.code == Some("callable_invocations_truncated"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn follow_on_callable_invocation_truncation_is_propagated() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "follow-on-truncated-invocations.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+
+        scan.merge_follow_on_callable_invocations(Vec::new(), true);
+
+        assert!(scan.callable_invocations_truncated);
+        assert!(scan
+            .notices
+            .iter()
+            .any(|notice| notice.code == Some("callable_invocations_truncated")));
+    }
+
+    #[test]
+    fn follow_on_duplicate_callable_invocations_do_not_mark_metadata_truncated() {
+        let options = ScanOptions {
+            timeout_s: DEFAULT_TIMEOUT_S,
+            max_opcodes: DEFAULT_MAX_OPCODES,
+            post_budget_scan_bytes: DEFAULT_POST_BUDGET_SCAN_BYTES,
+            max_string_literal_scan_chars: DEFAULT_MAX_STRING_LITERAL_SCAN_CHARS,
+            max_nested_pickle_bytes: DEFAULT_MAX_NESTED_PICKLE_BYTES,
+            max_nested_depth: DEFAULT_MAX_NESTED_DEPTH,
+        };
+        let mut scan = ScanState::new(
+            "follow-on-duplicate-invocation.pkl".to_string(),
+            b"",
+            &options,
+            Some(0),
+            0,
+            0,
+            None,
+        );
+
+        for index in 0..MAX_IMPORT_REFERENCES {
+            let invocation = ScanState::callable_invocation(
+                GlobalRef {
+                    module: "module".to_string(),
+                    name: format!("call_{index}"),
+                    position: index,
+                    malformed: false,
+                },
+                "REDUCE",
+                index,
+                Some(0),
+            );
+            scan.push_callable_invocation(&invocation);
+        }
+
+        scan.merge_follow_on_callable_invocations(
+            vec![scan.callable_invocations[0].clone()],
+            false,
+        );
+
+        assert!(!scan.callable_invocations_truncated);
+        assert_eq!(scan.status, ScanStatus::Complete);
     }
 
     #[test]

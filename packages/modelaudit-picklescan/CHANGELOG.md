@@ -142,6 +142,9 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Require actual callable invocations before pairing startup-hook opener and
+  writer imports, avoiding critical findings for pickles that only reconstruct
+  those function objects.
 - Mark invoked call-graph targets as incomplete when Python source cannot be
   analyzed, and refresh source-derived call-graph caches between scans.
 - Detect additional stdlib callable pickle targets that can access files,
