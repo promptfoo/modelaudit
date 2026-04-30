@@ -147,14 +147,13 @@ def _find_suspicious_target_pattern(target: str) -> str | None:
 
 
 def _find_suspicious_safe_prefixed_target_pattern(target: str) -> str | None:
-    """Return suspicious whole components that should not be trusted by namespace."""
-    for component in target.split("."):
-        component_lower = component.lower()
-        if component_lower in _SUSPICIOUS_TARGET_PATTERNS:
-            return component_lower
-        for pattern in _SUSPICIOUS_TARGET_PATTERNS:
-            if component_lower.startswith(pattern) and component_lower[len(pattern) :].isdigit():
-                return pattern
+    """Return a suspicious safe-prefixed callable leaf, if present."""
+    leaf = target.rsplit(".", maxsplit=1)[-1].lower()
+    if leaf in _SUSPICIOUS_TARGET_PATTERNS:
+        return leaf
+    for pattern in _SUSPICIOUS_TARGET_PATTERNS:
+        if leaf.startswith(pattern) and leaf[len(pattern) :].isdigit():
+            return pattern
     return None
 
 

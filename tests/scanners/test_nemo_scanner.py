@@ -913,6 +913,18 @@ class TestCVE202523304HydraTarget:
         assert len(suspicious_checks) == 1
         assert suspicious_checks[0].details["pattern"] == "system"
 
+    def test_safe_prefix_ignores_suspicious_intermediate_component(self, tmp_path: Path) -> None:
+        """Namespace segments alone should not make an otherwise safe callable suspicious."""
+        config = {
+            "model": {"_target_": "nemo.eval.Factory"},
+        }
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        cve_checks = [c for c in result.checks if "CVE-2025-23304" in c.name]
+        assert len(cve_checks) == 0
+
     def test_nested_target_detected(self, tmp_path):
         """Deeply nested _target_ should still be found."""
         config = {
