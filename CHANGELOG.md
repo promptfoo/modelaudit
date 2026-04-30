@@ -320,6 +320,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **routing:** require recognized ZIP signatures before classifying files or
+  streaming previews as archives, so benign `PK*` near-matches stay unclassified
 - **xgboost:** avoid flagging inert `feature_names` metadata as executable JSON
   content.
 - **pmml:** avoid flagging benign `ecosystem()` prose as a `system(...)` call.

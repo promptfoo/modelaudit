@@ -13,6 +13,8 @@ if TYPE_CHECKING:
     from modelaudit.scanners.base import BaseScanner
 from modelaudit.utils.sources.cloud_storage import get_fs_protocol
 
+from .detection import _has_zip_magic
+
 
 def can_stream_analyze(url: str, scanner: "BaseScanner") -> bool:
     """Check if a file can be analyzed via streaming."""
@@ -281,7 +283,7 @@ def get_streaming_preview(url: str, max_bytes: int = 1024) -> dict[str, Any] | N
         if header.startswith(b"\x80"):
             preview["detected_format"] = "pickle"
             preview["pickle_protocol"] = header[1] if len(header) > 1 else "unknown"
-        elif header.startswith(b"PK"):
+        elif _has_zip_magic(header):
             preview["detected_format"] = "zip (possibly pytorch/tensorflow)"
         elif b"HDF" in header[:10]:
             preview["detected_format"] = "HDF5 (keras/tensorflow)"
