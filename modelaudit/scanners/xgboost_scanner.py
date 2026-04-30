@@ -28,7 +28,7 @@ import subprocess
 import sys
 import tempfile
 from contextlib import suppress
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
@@ -619,7 +619,7 @@ class XGBoostScanner(BaseScanner):
         """Validate XGBoost learner parameters for suspicious values."""
         # Check for gradient booster
         gradient_booster = learner.get("gradient_booster")
-        if gradient_booster is not None and not isinstance(gradient_booster, dict):
+        if "gradient_booster" in learner and not isinstance(gradient_booster, dict):
             self._record_invalid_json_structure(
                 result,
                 path,
@@ -629,7 +629,7 @@ class XGBoostScanner(BaseScanner):
             )
         elif isinstance(gradient_booster, dict):
             model = gradient_booster.get("model")
-            if model is not None and not isinstance(model, dict):
+            if "model" in gradient_booster and not isinstance(model, dict):
                 self._record_invalid_json_structure(
                     result,
                     path,
@@ -672,55 +672,56 @@ class XGBoostScanner(BaseScanner):
 
     def _validate_tree_structures(self, trees: list[Any], result: ScanResult, path: str) -> None:
         """Validate individual tree structures for anomalies."""
+        invalid_tree_structures: list[dict[str, str]] = []
         over_depth_trees: list[tuple[int, int]] = []
         for i, tree in enumerate(trees):
             if not isinstance(tree, dict):
-                self._record_invalid_json_structure(
-                    result,
-                    path,
-                    field=f"learner.gradient_booster.model.trees[{i}]",
-                    expected_type="dict",
-                    value=tree,
+                invalid_tree_structures.append(
+                    self._invalid_json_structure_detail(
+                        field=f"learner.gradient_booster.model.trees[{i}]",
+                        expected_type="dict",
+                        value=tree,
+                    )
                 )
                 continue
 
             left_children = tree.get("left_children")
             right_children = tree.get("right_children")
             if not isinstance(left_children, list) or not isinstance(right_children, list):
-                self._record_invalid_json_structure(
-                    result,
-                    path,
-                    field=f"learner.gradient_booster.model.trees[{i}].children",
-                    expected_type="list",
-                    value={"left_children": left_children, "right_children": right_children},
+                invalid_tree_structures.append(
+                    self._invalid_json_structure_detail(
+                        field=f"learner.gradient_booster.model.trees[{i}].children",
+                        expected_type="list",
+                        value={"left_children": left_children, "right_children": right_children},
+                    )
                 )
                 continue
             if len(left_children) != len(right_children) or len(left_children) == 0:
-                self._record_invalid_json_structure(
-                    result,
-                    path,
-                    field=f"learner.gradient_booster.model.trees[{i}].children",
-                    expected_type="same-length non-empty lists",
-                    value={"left_children": left_children, "right_children": right_children},
+                invalid_tree_structures.append(
+                    self._invalid_json_structure_detail(
+                        field=f"learner.gradient_booster.model.trees[{i}].children",
+                        expected_type="same-length non-empty lists",
+                        value={"left_children": left_children, "right_children": right_children},
+                    )
                 )
                 continue
 
-            try:
-                left = [int(child) for child in left_children]
-                right = [int(child) for child in right_children]
-            except (ValueError, TypeError):
-                self._record_invalid_json_structure(
-                    result,
-                    path,
-                    field=f"learner.gradient_booster.model.trees[{i}].children",
-                    expected_type="integer child indices",
-                    value={"left_children": left_children, "right_children": right_children},
+            if not self._child_indices_are_valid(left_children, right_children):
+                invalid_tree_structures.append(
+                    self._invalid_json_structure_detail(
+                        field=f"learner.gradient_booster.model.trees[{i}].children",
+                        expected_type="in-range integer child indices",
+                        value={"left_children": left_children, "right_children": right_children},
+                    )
                 )
                 continue
 
-            depth = self._compute_tree_depth(left, right)
+            depth = self._compute_tree_depth(cast(list[int], left_children), cast(list[int], right_children))
             if depth > self.max_tree_depth:
                 over_depth_trees.append((i, depth))
+
+        if invalid_tree_structures:
+            self._record_invalid_tree_structures(result, path, invalid_tree_structures)
 
         if not over_depth_trees:
             return
@@ -750,6 +751,51 @@ class XGBoostScanner(BaseScanner):
             why="Deep trees may impact performance but can be legitimate in complex models",
         )
 
+    @staticmethod
+    def _child_indices_are_valid(left_children: list[Any], right_children: list[Any]) -> bool:
+        child_count = len(left_children)
+        for child in [*left_children, *right_children]:
+            if type(child) is not int:
+                return False
+            if child < -1 or child >= child_count:
+                return False
+        return True
+
+    @staticmethod
+    def _invalid_json_structure_detail(*, field: str, expected_type: str, value: Any) -> dict[str, str]:
+        return {
+            "field": field,
+            "expected_type": expected_type,
+            "actual_type": type(value).__name__,
+        }
+
+    def _record_invalid_tree_structures(
+        self,
+        result: ScanResult,
+        path: str,
+        invalid_structures: list[dict[str, str]],
+    ) -> None:
+        first_invalid = invalid_structures[0]
+        result.add_check(
+            name="XGBoost JSON Structure Validation",
+            passed=False,
+            message=(
+                f"Invalid XGBoost JSON structure at {first_invalid['field']}"
+                if len(invalid_structures) == 1
+                else (f"{len(invalid_structures)} invalid XGBoost tree structure(s); first at {first_invalid['field']}")
+            ),
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                **first_invalid,
+                "invalid_count": len(invalid_structures),
+                "examples": invalid_structures[:10],
+                "aggregated": len(invalid_structures) > 1,
+            },
+            why="Malformed XGBoost JSON structure prevents complete model validation",
+        )
+        self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["json_structure_invalid"])
+
     def _record_invalid_json_structure(
         self,
         result: ScanResult,
@@ -759,17 +805,18 @@ class XGBoostScanner(BaseScanner):
         expected_type: str,
         value: Any,
     ) -> None:
+        detail = self._invalid_json_structure_detail(
+            field=field,
+            expected_type=expected_type,
+            value=value,
+        )
         result.add_check(
             name="XGBoost JSON Structure Validation",
             passed=False,
             message=f"Invalid XGBoost JSON structure at {field}",
             severity=IssueSeverity.INFO,
             location=path,
-            details={
-                "field": field,
-                "expected_type": expected_type,
-                "actual_type": type(value).__name__,
-            },
+            details=detail,
             why="Malformed XGBoost JSON structure prevents complete model validation",
         )
         self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["json_structure_invalid"])
