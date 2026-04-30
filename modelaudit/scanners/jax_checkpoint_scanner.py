@@ -56,9 +56,7 @@ class JaxCheckpointScanner(BaseScanner):
         "jaxlib",
         "device_array",
     )
-    _JAX_INDICATOR_PATTERNS: ClassVar[tuple[re.Pattern[str], ...]] = tuple(
-        re.compile(rf"(?<![a-z]){re.escape(indicator)}", re.IGNORECASE) for indicator in _JAX_INDICATORS
-    )
+    _NON_JAX_NEAR_MATCH_PREFIXES: ClassVar[frozenset[str]] = frozenset({"a"})
     _DOCUMENTATION_CONTEXT_HINTS: ClassVar[frozenset[str]] = frozenset(
         {
             "description",
@@ -494,8 +492,10 @@ class JaxCheckpointScanner(BaseScanner):
             with open(path, "rb") as f:
                 header = f.read(512)
 
-            # Check for pickle format with JAX indicators
-            if header.startswith(b"\x80"):  # Pickle protocol
+            # Check for pickle formats with JAX indicators. Protocol 0 pickles
+            # are textual and can begin directly with a string opcode such as
+            # `Vjax`, so they do not have the binary protocol marker.
+            if header.startswith(b"\x80") or header[:1] in b"(cdgINRSUV":
                 # Read more to check for JAX-specific content
                 with suppress(Exception):
                     with open(path, "rb") as f:
@@ -542,7 +542,15 @@ class JaxCheckpointScanner(BaseScanner):
     @classmethod
     def _contains_jax_indicator(cls, text: str) -> bool:
         """Return True when text contains a JAX-family indicator that is not a suffix."""
-        return any(pattern.search(text) for pattern in cls._JAX_INDICATOR_PATTERNS)
+        lowered_text = text.lower()
+        for indicator in cls._JAX_INDICATORS:
+            start = 0
+            while (index := lowered_text.find(indicator, start)) != -1:
+                prefix = lowered_text[index - 1] if index > 0 else ""
+                if prefix not in cls._NON_JAX_NEAR_MATCH_PREFIXES:
+                    return True
+                start = index + 1
+        return False
 
     def _scan_orbax_checkpoint(self, path: str, result: ScanResult) -> None:
         """Scan Orbax checkpoint directory."""
