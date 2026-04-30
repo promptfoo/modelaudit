@@ -2424,27 +2424,31 @@ class PyTorchZipScanner(BaseScanner):
         # Parse pickle to look for tensor rebuild patterns and cross-reference storage
         # Use bounded reads to avoid memory spikes on large pickle entries
         max_pkl_read = 10 * 1024 * 1024  # 10 MB limit for metadata validation
+        trusted_storage_data_pkl_members = self._trusted_pytorch_storage_data_pkl_members(safe_entries)
         for pkl_info in pickle_files:
             pkl_name = self._get_zip_member_name(pkl_info)
+            normalized_name = pkl_name.replace("\\", "/").lstrip("/")
+            is_trusted_storage_data_pkl = normalized_name in trusted_storage_data_pkl_members
             try:
                 if pkl_info.file_size > max_pkl_read:
-                    mark_inconclusive_scan_result(result, "pytorch_zip_tensor_metadata_validation_truncated")
-                    result.add_check(
-                        name="CVE-2026-24747 Tensor Metadata Validation",
-                        passed=False,
-                        message=(
-                            f"Tensor metadata validation only inspected the first {max_pkl_read} bytes "
-                            f"of oversized pickle member {pkl_name}"
-                        ),
-                        severity=IssueSeverity.INFO,
-                        location=f"{path}:{pkl_name}",
-                        details={
-                            "cve_id": self.CVE_2026_24747_ID,
-                            "analysis_incomplete": True,
-                            "member_size": pkl_info.file_size,
-                            "max_read_bytes": max_pkl_read,
-                        },
-                    )
+                    if is_trusted_storage_data_pkl:
+                        mark_inconclusive_scan_result(result, "pytorch_zip_tensor_metadata_validation_truncated")
+                        result.add_check(
+                            name="CVE-2026-24747 Tensor Metadata Validation",
+                            passed=False,
+                            message=(
+                                f"Tensor metadata validation only inspected the first {max_pkl_read} bytes "
+                                f"of oversized pickle member {pkl_name}"
+                            ),
+                            severity=IssueSeverity.INFO,
+                            location=f"{path}:{pkl_name}",
+                            details={
+                                "cve_id": self.CVE_2026_24747_ID,
+                                "analysis_incomplete": True,
+                                "member_size": pkl_info.file_size,
+                                "max_read_bytes": max_pkl_read,
+                            },
+                        )
                     pkl_data = self._read_member_prefix(
                         zip_file,
                         pkl_info,
@@ -2460,7 +2464,7 @@ class PyTorchZipScanner(BaseScanner):
                         result=result,
                     )
                 mismatches, parse_complete = self._check_tensor_storage_mismatches(pkl_data, data_blob_sizes)
-                if not parse_complete and pkl_info.file_size <= max_pkl_read:
+                if not parse_complete and pkl_info.file_size <= max_pkl_read and is_trusted_storage_data_pkl:
                     mark_inconclusive_scan_result(result, "pytorch_zip_tensor_metadata_validation_failed")
                     result.add_check(
                         name="CVE-2026-24747 Tensor Metadata Validation",
