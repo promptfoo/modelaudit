@@ -633,8 +633,7 @@ class XGBoostScanner(BaseScanner):
                             ),
                         )
 
-                    # Check individual tree structures
-                    self._validate_tree_structures(trees[:10], result, path)  # Sample first 10 trees
+                    self._validate_tree_structures(trees, result, path)
 
         # Check learner model parameters
         params = learner.get("learner_model_param", {})
@@ -643,6 +642,7 @@ class XGBoostScanner(BaseScanner):
 
     def _validate_tree_structures(self, trees: list[dict[str, Any]], result: ScanResult, path: str) -> None:
         """Validate individual tree structures for anomalies."""
+        over_depth_trees: list[tuple[int, int]] = []
         for i, tree in enumerate(trees):
             left_children = tree.get("left_children")
             right_children = tree.get("right_children")
@@ -659,15 +659,35 @@ class XGBoostScanner(BaseScanner):
 
             depth = self._compute_tree_depth(left, right)
             if depth > self.max_tree_depth:
-                result.add_check(
-                    name="Tree Depth Validation",
-                    passed=False,
-                    message=f"Tree {i} has deep structure: depth {depth} (threshold: {self.max_tree_depth})",
-                    severity=IssueSeverity.INFO,
-                    location=path,
-                    details={"tree_index": i, "depth": depth, "max_depth": self.max_tree_depth},
-                    why="Deep trees may impact performance but can be legitimate in complex models",
-                )
+                over_depth_trees.append((i, depth))
+
+        if not over_depth_trees:
+            return
+
+        first_tree_index, first_depth = over_depth_trees[0]
+        max_observed_depth = max(depth for _, depth in over_depth_trees)
+        example_trees = [{"tree_index": tree_index, "depth": depth} for tree_index, depth in over_depth_trees[:10]]
+        result.add_check(
+            name="Tree Depth Validation",
+            passed=False,
+            message=(
+                f"{len(over_depth_trees)} tree(s) have deep structure; "
+                f"first is tree {first_tree_index} at depth {first_depth} "
+                f"(threshold: {self.max_tree_depth})"
+            ),
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "tree_index": first_tree_index,
+                "depth": first_depth,
+                "max_depth": self.max_tree_depth,
+                "max_observed_depth": max_observed_depth,
+                "tree_count": len(over_depth_trees),
+                "examples": example_trees,
+                "aggregated": True,
+            },
+            why="Deep trees may impact performance but can be legitimate in complex models",
+        )
 
     @staticmethod
     def _compute_tree_depth(left_children: list[int], right_children: list[int]) -> int:
