@@ -13,6 +13,8 @@ from ._evidence_redaction import redact_evidence_string
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
 LLAMAFILE_MARKER = b"llamafile"
+LLAMAFILE_ROUTE_SCAN_BYTES = 8 * 1024 * 1024
+LLAMAFILE_ROUTE_TAIL_SCAN_BYTES = 2 * 1024 * 1024
 GGUF_MARKER = b"GGUF"
 LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON = "llamafile_payload_scan_limited"
 
@@ -136,13 +138,19 @@ class LlamafileScanner(BaseScanner):
             return False
 
         try:
-            head = cls._read_prefix(path_obj, 2 * 1024 * 1024)
-            tail = cls._read_suffix(path_obj, 2 * 1024 * 1024)
+            marker_offset = cls._find_casefolded_marker_offset(
+                path_obj,
+                LLAMAFILE_MARKER,
+                LLAMAFILE_ROUTE_SCAN_BYTES,
+            )
+            if marker_offset is None:
+                tail = cls._read_suffix(path_obj, LLAMAFILE_ROUTE_TAIL_SCAN_BYTES).lower()
+                tail_marker_index = tail.find(LLAMAFILE_MARKER)
+                marker_offset = tail_marker_index if tail_marker_index != -1 else None
         except OSError:
             return False
 
-        marker_blob = (head + tail).lower()
-        return LLAMAFILE_MARKER in marker_blob
+        return marker_offset is not None
 
     @classmethod
     def _detect_executable_format(cls, path: Path) -> str | None:
@@ -453,6 +461,32 @@ class LlamafileScanner(BaseScanner):
 
                 haystack = carry + chunk
                 relative_index = haystack.find(marker)
+                if relative_index != -1:
+                    return scanned - len(carry) + relative_index
+
+                carry = haystack[-overlap:] if overlap > 0 else b""
+                scanned += len(chunk)
+
+        return None
+
+    @staticmethod
+    def _find_casefolded_marker_offset(path: Path, marker: bytes, max_scan_bytes: int) -> int | None:
+        marker_len = len(marker)
+        search_limit = min(path.stat().st_size, max_scan_bytes)
+        overlap = marker_len - 1
+        scanned = 0
+        carry = b""
+        normalized_marker = marker.lower()
+
+        with path.open("rb") as handle:
+            while scanned < search_limit:
+                to_read = min(1024 * 1024, search_limit - scanned)
+                chunk = handle.read(to_read)
+                if not chunk:
+                    break
+
+                haystack = carry + chunk.lower()
+                relative_index = haystack.find(normalized_marker)
                 if relative_index != -1:
                     return scanned - len(carry) + relative_index
 

