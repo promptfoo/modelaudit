@@ -228,11 +228,44 @@ def test_gguf_scanner_delegates_malicious_chat_templates_to_jinja_analysis(tmp_p
     )
 
 
+def test_gguf_scanner_delegates_named_chat_templates_to_jinja_analysis(tmp_path: Path) -> None:
+    path = create_mock_gguf(
+        tmp_path / "malicious-named-template.gguf",
+        metadata={"tokenizer.chat_template.tool": "{{ ''.__class__.__mro__[1].__subclasses__() }}"},
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    assert any(
+        check.name == "Jinja2 Template Injection Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details["template_location"] == "tokenizer.chat_template.tool"
+        for check in result.checks
+    )
+
+
 def test_gguf_scanner_keeps_benign_chat_templates_clean(tmp_path: Path) -> None:
     path = create_mock_gguf(
         tmp_path / "benign.gguf",
         metadata={
             "tokenizer.chat_template": "{% for message in messages %}{{ message['content'] }}{% endfor %}",
+        },
+    )
+
+    result = GgufScanner().scan(str(path))
+
+    assert any(check.name == "Jinja2 SSTI Analysis" and check.status == CheckStatus.PASSED for check in result.checks)
+    assert not any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_gguf_scanner_keeps_benign_macro_chat_templates_clean(tmp_path: Path) -> None:
+    path = create_mock_gguf(
+        tmp_path / "benign-macro.gguf",
+        metadata={
+            "tokenizer.chat_template": "{% macro render(message) %}{{ message['content'] }}{% endmacro %}",
         },
     )
 
@@ -263,6 +296,7 @@ def test_gguf_scanner_fails_closed_on_oversized_chat_templates(tmp_path: Path) -
         and check.details["reason"] == "jinja2_template_size_limit_exceeded"
         for check in direct.checks
     )
+    assert not any(check.name == "Jinja2 SSTI Analysis" for check in direct.checks)
     _assert_inconclusive_exit2(aggregate, "jinja2_template_size_limit_exceeded")
 
 

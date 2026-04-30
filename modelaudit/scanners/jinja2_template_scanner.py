@@ -262,6 +262,8 @@ class Jinja2TemplateScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
         context = self._determine_context(path)
+        if any("chat_template" in template_location.lower() for template_location in templates):
+            context.is_chat_template = True
         result.metadata["ml_context"] = {
             "framework": context.framework,
             "file_type": context.file_type,
@@ -291,6 +293,11 @@ class Jinja2TemplateScanner(BaseScanner):
                     "skipped_template_locations": oversized_template_locations,
                 },
             )
+
+        if not bounded_templates:
+            result.bytes_scanned = file_size
+            self._finish_scan_result(result)
+            return result
 
         return self._scan_extracted_templates(path, bounded_templates, context, result=result, file_size=file_size)
 
@@ -781,10 +788,12 @@ class Jinja2TemplateScanner(BaseScanner):
 
     def _is_common_ml_pattern(self, match_text: str, context: MLContext) -> bool:
         """Check if match is a common, benign ML pattern"""
+        match_lower = match_text.lower()
+        if context.is_chat_template and match_lower.startswith("{% macro "):
+            return True
+
         if not context.framework:
             return False
-
-        match_lower = match_text.lower()
 
         # Common HuggingFace chat template patterns
         if context.framework == "huggingface":

@@ -625,8 +625,14 @@ class GgufScanner(BaseScanner):
         raise ValueError(f"Unknown metadata type {vtype}")
 
     def _scan_embedded_chat_template(self, metadata: dict[str, Any], result: ScanResult) -> None:
-        template = metadata.get("tokenizer.chat_template")
-        if not isinstance(template, str) or not template.strip():
+        templates = {
+            key: value
+            for key, value in metadata.items()
+            if (key == "tokenizer.chat_template" or key.startswith("tokenizer.chat_template."))
+            and isinstance(value, str)
+            and value.strip()
+        }
+        if not templates:
             return
 
         from .jinja2_template_scanner import Jinja2TemplateScanner
@@ -634,7 +640,7 @@ class GgufScanner(BaseScanner):
         result.merge(
             Jinja2TemplateScanner(config=self.config).scan_extracted_templates(
                 self.current_file_path,
-                {"tokenizer.chat_template": template},
+                templates,
             )
         )
 
