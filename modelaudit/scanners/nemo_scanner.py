@@ -146,6 +146,17 @@ def _find_suspicious_target_pattern(target: str) -> str | None:
     return None
 
 
+def _find_suspicious_safe_prefixed_target_pattern(target: str) -> str | None:
+    """Return a suspicious safe-prefixed callable leaf, if present."""
+    leaf = target.rsplit(".", maxsplit=1)[-1].lower()
+    if leaf in _SUSPICIOUS_TARGET_PATTERNS:
+        return leaf
+    for pattern in _SUSPICIOUS_TARGET_PATTERNS:
+        if leaf.startswith(pattern) and leaf[len(pattern) :].isdigit():
+            return pattern
+    return None
+
+
 def _is_runtime_truthy(value: Any) -> bool:
     """Return whether a Hydra argument would be truthy when passed to Python."""
     return bool(value)
@@ -966,9 +977,19 @@ class NemoScanner(BaseScanner):
             )
             return
 
-        # Check safe prefixes BEFORE suspicious patterns to avoid
-        # false positives on legitimate targets like nemo.eval_utils
+        # Trusted namespaces can still hide obviously dangerous leaf names.
         if any(target.startswith(prefix) for prefix in _SAFE_TARGET_PREFIXES):
+            pattern = _find_suspicious_safe_prefixed_target_pattern(target)
+            if pattern is not None:
+                self._add_suspicious_target_check(
+                    target,
+                    pattern,
+                    config_path,
+                    config_name,
+                    archive_path,
+                    result,
+                )
+                return
             result.add_check(
                 name="Hydra _target_ Safety Check",
                 passed=True,
@@ -981,28 +1002,7 @@ class NemoScanner(BaseScanner):
         # Check for suspicious patterns in target (only for non-safe targets)
         pattern = _find_suspicious_target_pattern(target)
         if pattern is not None:
-            result.add_check(
-                name=f"{CVE_2025_23304_ID}: Suspicious Hydra _target_",
-                passed=False,
-                message=(
-                    f"{CVE_2025_23304_ID}: Suspicious _target_ "
-                    f"'{target}' (contains '{pattern}') at "
-                    f"{config_path} in {config_name}"
-                ),
-                severity=IssueSeverity.CRITICAL,
-                location=f"{archive_path}:{config_name}",
-                details={
-                    "target": target,
-                    "pattern": pattern,
-                    "config_path": config_path,
-                    "config_file": config_name,
-                    "cve_id": CVE_2025_23304_ID,
-                    "cvss": CVE_2025_23304_CVSS,
-                    "cwe": CVE_2025_23304_CWE,
-                    "description": CVE_2025_23304_DESCRIPTION,
-                    "remediation": CVE_2025_23304_REMEDIATION,
-                },
-            )
+            self._add_suspicious_target_check(target, pattern, config_path, config_name, archive_path, result)
             return
 
         # Unknown target - flag for review
@@ -1016,6 +1016,38 @@ class NemoScanner(BaseScanner):
                 "target": target,
                 "config_path": config_path,
                 "config_file": config_name,
+            },
+        )
+
+    def _add_suspicious_target_check(
+        self,
+        target: str,
+        pattern: str,
+        config_path: str,
+        config_name: str,
+        archive_path: str,
+        result: ScanResult,
+    ) -> None:
+        result.add_check(
+            name=f"{CVE_2025_23304_ID}: Suspicious Hydra _target_",
+            passed=False,
+            message=(
+                f"{CVE_2025_23304_ID}: Suspicious _target_ "
+                f"'{target}' (contains '{pattern}') at "
+                f"{config_path} in {config_name}"
+            ),
+            severity=IssueSeverity.CRITICAL,
+            location=f"{archive_path}:{config_name}",
+            details={
+                "target": target,
+                "pattern": pattern,
+                "config_path": config_path,
+                "config_file": config_name,
+                "cve_id": CVE_2025_23304_ID,
+                "cvss": CVE_2025_23304_CVSS,
+                "cwe": CVE_2025_23304_CWE,
+                "description": CVE_2025_23304_DESCRIPTION,
+                "remediation": CVE_2025_23304_REMEDIATION,
             },
         )
 

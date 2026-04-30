@@ -56,6 +56,7 @@ class JaxCheckpointScanner(BaseScanner):
         "jaxlib",
         "device_array",
     )
+    _NON_JAX_NEAR_MATCH_PREFIXES: ClassVar[frozenset[str]] = frozenset({"a"})
     _DOCUMENTATION_CONTEXT_HINTS: ClassVar[frozenset[str]] = frozenset(
         {
             "description",
@@ -491,27 +492,27 @@ class JaxCheckpointScanner(BaseScanner):
             with open(path, "rb") as f:
                 header = f.read(512)
 
-            # Check for pickle format with JAX indicators
-            if header.startswith(b"\x80"):  # Pickle protocol
+            # Check for pickle formats with JAX indicators. Protocol 0 pickles
+            # are textual and can begin directly with a string opcode such as
+            # `Vjax`, so they do not have the binary protocol marker.
+            if header.startswith(b"\x80") or header[:1] in b"(cdgINRSUV":
                 # Read more to check for JAX-specific content
                 with suppress(Exception):
                     with open(path, "rb") as f:
                         data = f.read(8192)  # Read first 8KB
                         data_str = data.decode("utf-8", errors="ignore").lower()
 
-                    return any(indicator in data_str for indicator in cls._JAX_INDICATORS)
+                    return cls._contains_jax_indicator(data_str)
 
             decoded_header = header.decode("utf-8", errors="ignore").lower()
 
             # Check for JSON metadata files, including extensionful `.checkpoint`
             # files that contain JAX/Orbax metadata rather than pickle bytes.
             if cls._header_looks_like_json(header):
-                return any(
-                    indicator in decoded_header for indicator in cls._JAX_INDICATORS
-                ) or cls._file_contains_jax_indicator(path)
+                return cls._contains_jax_indicator(decoded_header) or cls._file_contains_jax_indicator(path)
 
             # Check for NumPy files in JAX context
-            if header.startswith(b"\x93NUMPY") and "jax" in path.lower():
+            if header.startswith(b"\x93NUMPY") and cls._contains_jax_indicator(path.lower()):
                 return True
 
         except Exception:
@@ -530,12 +531,25 @@ class JaxCheckpointScanner(BaseScanner):
                 while chunk := f.read(cls._JAX_INDICATOR_SCAN_CHUNK_BYTES):
                     decoded_chunk = chunk.decode("utf-8", errors="ignore").lower()
                     search_text = chunk_tail + decoded_chunk
-                    if any(indicator in search_text for indicator in cls._JAX_INDICATORS):
+                    if cls._contains_jax_indicator(search_text):
                         return True
                     chunk_tail = search_text[-tail_length:]
         except Exception:
             return False
 
+        return False
+
+    @classmethod
+    def _contains_jax_indicator(cls, text: str) -> bool:
+        """Return True when text contains a JAX-family indicator that is not a suffix."""
+        lowered_text = text.lower()
+        for indicator in cls._JAX_INDICATORS:
+            start = 0
+            while (index := lowered_text.find(indicator, start)) != -1:
+                prefix = lowered_text[index - 1] if index > 0 else ""
+                if prefix not in cls._NON_JAX_NEAR_MATCH_PREFIXES:
+                    return True
+                start = index + 1
         return False
 
     def _scan_orbax_checkpoint(self, path: str, result: ScanResult) -> None:
