@@ -4168,7 +4168,26 @@ def test_scan_bytes_marks_late_base64_nested_pickle_inside_budget_as_incomplete(
     assert report.status == ScanStatus.INCONCLUSIVE
     assert report.verdict == SafetyVerdict.UNKNOWN
     assert report.findings == ()
-    assert any(notice.code == "literal_scan_truncated" for notice in report.notices)
+    assert any(
+        notice.code == "literal_scan_truncated"
+        and notice.message == "String literal scan truncated at configured limit"
+        for notice in report.notices
+    )
+
+
+def test_scan_bytes_keeps_normalized_whole_base64_nested_literal_complete() -> None:
+    nested_payload = pickle.dumps({"inner": b"A" * 800_000}, protocol=4)
+    encoded_payload = base64.b64encode(nested_payload).decode("ascii") + "\n"
+
+    report = scan_bytes(
+        pickle.dumps({"outer": encoded_payload}, protocol=4),
+        source="whole-base64-nested-with-trailing-whitespace.pkl",
+    )
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert any(notice.code == "encoded_nested_payload_detected" for notice in report.notices)
+    assert not any(notice.code == "literal_scan_truncated" for notice in report.notices)
 
 
 def test_scan_bytes_ignores_invalid_base64_nested_pickle_near_match_hidden_inside_large_literal() -> None:
