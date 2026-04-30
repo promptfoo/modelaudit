@@ -17,6 +17,7 @@ from pathlib import PurePosixPath
 from typing import Any, ClassVar
 from urllib.parse import urlparse, urlunparse
 
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_locations import rewrite_extracted_member_location
@@ -251,7 +252,9 @@ class TorchServeMarScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        result.finish(success=not result.has_errors)
+        result.finish(
+            success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors
+        )
         return result
 
     def _read_member_bounded(
@@ -1324,6 +1327,19 @@ class TorchServeMarScanner(BaseScanner):
             for path in manifest_context.get("serialized_paths", [])
             if self._is_path_like_reference("serializedFile", path)
         }
+        archive_member_names = {
+            self._normalize_member_name(info.filename)
+            for info in member_infos
+            if info.filename and not info.filename.endswith("/")
+        }
+        referenced_payloads = {
+            self._normalize_member_name(path)
+            for field, path in manifest_context.get("path_references", [])
+            if field in {"serializedFile", "extraFiles"}
+            and self._is_path_like_reference(field, path)
+            and self._normalize_member_name(path) in archive_member_names
+        }
+        scanned_referenced_payloads: set[str] = set()
         serialized_findings: dict[str, list[IssueSeverity]] = {}
 
         total_entries = len(member_infos)
@@ -1336,8 +1352,9 @@ class TorchServeMarScanner(BaseScanner):
                 ),
                 severity=IssueSeverity.WARNING,
                 location=archive_path,
-                details={"entry_count": total_entries, "max_entries": self.max_entries},
+                details={"entry_count": total_entries, "max_entries": self.max_entries, "analysis_incomplete": True},
             )
+            mark_inconclusive_scan_result(result, "torchserve_mar_entry_limit")
             entries_to_process = member_infos[: self.max_entries]
         else:
             result.add_check(
@@ -1385,8 +1402,10 @@ class TorchServeMarScanner(BaseScanner):
                     details={
                         "processed_uncompressed": processed_uncompressed,
                         "max_uncompressed_bytes": self.max_uncompressed_bytes,
+                        "analysis_incomplete": True,
                     },
                 )
+                mark_inconclusive_scan_result(result, "torchserve_mar_uncompressed_budget")
                 break
 
             if member_info.compress_size > 0:
@@ -1465,8 +1484,13 @@ class TorchServeMarScanner(BaseScanner):
                     message=str(exc),
                     severity=IssueSeverity.WARNING,
                     location=f"{archive_path}:{member_name}",
-                    details={"entry": member_name, "max_member_bytes": self.max_member_bytes},
+                    details={
+                        "entry": member_name,
+                        "max_member_bytes": self.max_member_bytes,
+                        "analysis_incomplete": True,
+                    },
                 )
+                mark_inconclusive_scan_result(result, "torchserve_mar_member_size_limit")
                 continue
             except Exception as exc:
                 result.add_check(
@@ -1475,8 +1499,13 @@ class TorchServeMarScanner(BaseScanner):
                     message=f"Failed to extract archive member for scanning: {exc!s}",
                     severity=IssueSeverity.WARNING,
                     location=f"{archive_path}:{member_name}",
-                    details={"entry": member_name, "exception_type": type(exc).__name__},
+                    details={
+                        "entry": member_name,
+                        "exception_type": type(exc).__name__,
+                        "analysis_incomplete": True,
+                    },
                 )
+                mark_inconclusive_scan_result(result, "torchserve_mar_member_extraction_failed")
                 continue
 
             try:
@@ -1500,6 +1529,9 @@ class TorchServeMarScanner(BaseScanner):
 
                 if file_result.scanner_name == "unknown":
                     result.bytes_scanned += total_size
+
+                if normalized_member in referenced_payloads:
+                    scanned_referenced_payloads.add(normalized_member)
 
                 if normalized_member in serialized_refs:
                     severities = [
@@ -1526,7 +1558,22 @@ class TorchServeMarScanner(BaseScanner):
             result=result,
         )
 
-        if serialized_refs:
+        unscanned_referenced_payloads = referenced_payloads - scanned_referenced_payloads
+        if unscanned_referenced_payloads:
+            mark_inconclusive_scan_result(result, "torchserve_mar_manifest_payload_scan_incomplete")
+            result.add_check(
+                name="TorchServe Manifest Referenced Payload Coverage",
+                passed=False,
+                message="Manifest-referenced payloads were not fully scanned",
+                severity=IssueSeverity.INFO,
+                location=archive_path,
+                details={
+                    "unscanned_payload_members": sorted(unscanned_referenced_payloads),
+                    "analysis_incomplete": True,
+                },
+            )
+
+        if serialized_refs and not (serialized_refs - scanned_referenced_payloads):
             if serialized_findings:
                 highest_severity = IssueSeverity.WARNING
                 if any(

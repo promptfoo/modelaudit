@@ -12,7 +12,8 @@ from pathlib import Path
 
 import pytest
 
-from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_model_directory_or_file
+from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
 
 
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
@@ -217,6 +218,30 @@ class TestDirectoryFileFiltering:
         assert results["files_scanned"] == 1
         assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
 
+    @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
+    def test_disguised_pickle_with_default_hidden_or_basename_skip_is_scanned(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        """Default hidden/basename filters must not suppress supported payload content."""
+
+        class DangerousPayload:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo directory-hidden-filter-test",))
+
+        safe_payload = tmp_path / "safe.pkl"
+        disguised_payload = tmp_path / filename
+        safe_payload.write_bytes(pickle.dumps({"safe": True}))
+        disguised_payload.write_bytes(pickle.dumps(DangerousPayload()))
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 2
+        assert any(filename in (issue.location or "") for issue in results.issues)
+
     def test_real_images_remain_skipped(self, tmp_path: Path) -> None:
         """Content sniffing should not promote ordinary media files into the scan set."""
         image_path = tmp_path / "cover.jpg"
@@ -258,6 +283,54 @@ class TestDirectoryFileFiltering:
         assert "sevenzip" in results.scanner_names
         assert "unknown" not in results.scanner_names
         assert not any("Unknown or unhandled format" in issue.message for issue in results.issues)
+
+    def test_disguised_pmml_with_long_prolog_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should preserve renamed PMML files after long XML prologs."""
+        disguised_pmml = tmp_path / "payload.txt"
+        disguised_pmml.write_text(
+            f"""<?xml version='1.0'?>
+<!--{"x" * 1024}-->
+<!DOCTYPE pmml [ <!ENTITY xxe SYSTEM 'file:///tmp/modelaudit-test-secret'> ]>
+<PMML version='4.4'></PMML>
+""",
+            encoding="utf-8",
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "pmml" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any("DOCTYPE declaration" in issue.message for issue in results.issues)
+
+    def test_benign_xml_with_long_prolog_remains_skipped(self, tmp_path: Path) -> None:
+        """Long-prolog non-model XML under skipped suffixes should stay skipped."""
+        benign_xml = tmp_path / "notes.txt"
+        benign_xml.write_text(
+            f"<?xml version='1.0'?><!--{'x' * 1024}--><project><model name='safe'/></project>",
+            encoding="utf-8",
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
+
+    def test_disguised_pmml_with_oversized_doctype_subset_fails_closed(self, tmp_path: Path) -> None:
+        """Incomplete oversized XML prologs should fail closed instead of guessing a model root."""
+        disguised_pmml = tmp_path / "payload.txt"
+        disguised_pmml.write_text(
+            "<?xml version='1.0'?><!DOCTYPE PMML [" + ("x" * ((1024 * 1024) + 64)) + "]><PMML version='4.4'></PMML>",
+            encoding="utf-8",
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert results["success"] is False
+        assert determine_exit_code(results) == 2
+        assert any(
+            "bounded probe ended before the first structural root element" in check.message for check in results.checks
+        )
 
     def test_rar_archive_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
         """RAR archives should be recognized and fail closed instead of being skipped."""
@@ -345,6 +418,29 @@ class TestDirectoryFileFiltering:
         assert "zip" in results.scanner_names
         assert any("word/embeddings/oleObject1.bin" in (issue.location or "") for issue in results.issues)
 
+    def test_large_docx_with_late_pickle_payload_is_scanned(self, tmp_path: Path) -> None:
+        """Late model payloads in Office-like ZIPs must survive bounded prefiltering."""
+        docx_path = tmp_path / "late-payload.docx"
+
+        class DangerousPayload:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo late-office-prefilter-test",))
+
+        with zipfile.ZipFile(docx_path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types></Types>")
+            archive.writestr("word/document.xml", "<w:document></w:document>")
+            for index in range(_ZIP_MEMBER_SNIFF_LIMIT):
+                archive.writestr(f"docs/{index}.txt", "filler")
+            archive.writestr("payload.pkl", pickle.dumps(DangerousPayload(), protocol=4))
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "zip" in results.scanner_names
+        assert any("payload.pkl" in (issue.location or "") for issue in results.issues)
+
     def test_config_only_keras_zip_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         """Directory prefilter should preserve Keras ZIPs identified by config structure."""
         keras_zip = tmp_path / "model.jpg"
@@ -392,6 +488,103 @@ class TestDirectoryFileFiltering:
         assert _is_huggingface_cache_file(str(local_snapshots_metadata)) is False
         assert _is_huggingface_cache_file(str(hf_cache_metadata)) is True
         assert _is_huggingface_cache_file(str(hf_download_metadata)) is True
+
+    def test_bookkeeping_filenames_only_skip_inside_huggingface_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Local files with bookkeeping-looking names must still be scanned."""
+        hf_home = tmp_path / ".cache" / "huggingface"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+
+        local_lock = tmp_path / "payload.pkl.lock"
+        local_gitignore = tmp_path / ".gitignore"
+        local_gitattributes = tmp_path / ".gitattributes"
+        hf_cache_lock = hf_home / "hub" / "models--org--repo" / "snapshots" / "abc123" / "payload.pkl.lock"
+        hf_download_gitignore = hf_home / "download" / ".gitignore"
+        hf_download_gitattributes = hf_home / "download" / ".gitattributes"
+
+        assert _is_huggingface_cache_file(str(local_lock)) is False
+        assert _is_huggingface_cache_file(str(local_gitignore)) is False
+        assert _is_huggingface_cache_file(str(local_gitattributes)) is False
+        assert _is_huggingface_cache_file(str(hf_cache_lock)) is True
+        assert _is_huggingface_cache_file(str(hf_download_gitignore)) is True
+        assert _is_huggingface_cache_file(str(hf_download_gitattributes)) is True
+
+    def test_custom_hf_hub_cache_root_skips_hub_bookkeeping(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Custom HF_HUB_CACHE roots do not need to be named hub."""
+        custom_hub = tmp_path / "custom-cache-root"
+        monkeypatch.setenv("HF_HUB_CACHE", str(custom_hub))
+        lock_path = custom_hub / "models--org--repo" / "snapshots" / "abc123" / "payload.pkl.lock"
+
+        assert _is_huggingface_cache_file(str(lock_path)) is True
+
+    def test_download_bookkeeping_requires_configured_hf_home(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Suffix-shaped local paths must not be trusted as HF downloads."""
+        hf_home = tmp_path / "real-home"
+        monkeypatch.setenv("HF_HOME", str(hf_home))
+        trusted_gitignore = hf_home / "download" / ".gitignore"
+        spoofed_gitignore = tmp_path / "project" / ".cache" / "huggingface" / "download" / ".gitignore"
+
+        assert _is_huggingface_cache_file(str(trusted_gitignore)) is True
+        assert _is_huggingface_cache_file(str(spoofed_gitignore)) is False
+
+    def test_local_download_bookkeeping_skips_when_model_root_has_assets(self, tmp_path: Path) -> None:
+        """Downloaded model directories retain their local HF bookkeeping skip."""
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type":"gpt2"}')
+        local_gitignore = model_dir / ".cache" / "huggingface" / "download" / ".gitignore"
+        local_gitignore.parent.mkdir(parents=True)
+        local_gitignore.write_text("*\n")
+
+        assert _is_huggingface_cache_file(str(local_gitignore)) is True
+
+    @pytest.mark.parametrize("filename", ["payload.pkl.lock", ".gitignore", ".gitattributes"])
+    def test_local_download_bookkeeping_rejects_spoofed_payloads(self, tmp_path: Path, filename: str) -> None:
+        """Local cache-looking paths must not skip pickle payloads."""
+
+        class DangerousPayload:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo spoofed-local-bookkeeping-test",))
+
+        model_dir = tmp_path / "downloaded-model"
+        model_dir.mkdir()
+        (model_dir / "config.json").write_text('{"model_type":"gpt2"}')
+        payload = model_dir / ".cache" / "huggingface" / "download" / filename
+        payload.parent.mkdir(parents=True)
+        payload.write_bytes(pickle.dumps(DangerousPayload(), protocol=0))
+
+        assert _is_huggingface_cache_file(str(payload)) is False
+
+    @pytest.mark.parametrize("filename", ["payload.pkl.lock", ".gitignore", ".gitattributes"])
+    def test_direct_scans_do_not_skip_local_bookkeeping_filenames(self, tmp_path: Path, filename: str) -> None:
+        """A malicious local file should not become trusted because of its basename."""
+
+        class DangerousPayload:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo direct-scan-bookkeeping-test",))
+
+        payload = tmp_path / filename
+        payload.write_bytes(pickle.dumps(DangerousPayload()))
+
+        result = scan_file(str(payload))
+
+        assert result.scanner_name != "skipped"
+        assert any(issue.severity.value == "critical" for issue in result.issues)
 
     def test_huggingface_cache_metadata_skip_uses_resolved_cache_root(
         self,

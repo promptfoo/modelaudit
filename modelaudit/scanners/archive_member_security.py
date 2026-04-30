@@ -177,12 +177,39 @@ def _apply_aliases(call_name: str, alias_scopes: _AliasScopes) -> frozenset[str]
     return frozenset(f"{resolved_head}.{suffix}" for resolved_head in resolved_heads)
 
 
+_MAX_STATIC_STRING_LENGTH = 1024
+_MAX_STATIC_STRING_PARTS = 256
+
+
+def _resolve_static_string(node: ast.AST) -> str | None:
+    """Resolve bounded compile-time string expressions used in attribute lookups."""
+    pending = [node]
+    parts: list[str] = []
+    part_count = 0
+    total_length = 0
+
+    while pending:
+        current = pending.pop()
+        if isinstance(current, ast.BinOp) and isinstance(current.op, ast.Add):
+            pending.extend([current.right, current.left])
+            continue
+        if not isinstance(current, ast.Constant) or not isinstance(current.value, str):
+            return None
+
+        part_count += 1
+        if part_count > _MAX_STATIC_STRING_PARTS:
+            return None
+        total_length += len(current.value)
+        if total_length > _MAX_STATIC_STRING_LENGTH:
+            return None
+        parts.append(current.value)
+
+    return "".join(parts)
+
+
 def _resolve_getattr_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    # Only literal-string attribute names are resolved. Payloads that build the
-    # attribute name at runtime (``getattr(os, "sys" + "tem")``) need constant
-    # folding we deliberately do not perform here — the complexity is not
-    # worth chasing every string-arithmetic trick, and such payloads typically
-    # still trip pickle or runtime detectors elsewhere in the pipeline.
+    # Resolve literal names and compile-time string concatenation. Runtime-built
+    # names still fall outside this static member analysis by design.
     if isinstance(node, ast.Attribute) and node.attr == "__call__":
         return _resolve_getattr_call_names(node.value, alias_scopes)
 
@@ -212,13 +239,14 @@ def _resolve_getattr_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> fr
     if target_root is None:
         return None
 
-    if not isinstance(attr_name_node, ast.Constant) or not isinstance(attr_name_node.value, str):
+    attr_name = _resolve_static_string(attr_name_node)
+    if attr_name is None:
         return None
 
     resolved_target_roots = _apply_aliases(target_root, alias_scopes)
     if resolved_target_roots is None:
         return None
-    return frozenset(f"{resolved_target_root}.{attr_name_node.value}" for resolved_target_root in resolved_target_roots)
+    return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
 
 
 def _resolve_static_reference_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
