@@ -320,6 +320,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **llamafile:** fail closed when bounded embedded-payload scanning stops before
+  covering the full executable
 - **skops:** require exploit-shaped structured loader nodes for CVE-2025-54412
   and CVE-2025-54413 checks so inert prose, filenames, and valid loader nodes do
   not become critical findings
