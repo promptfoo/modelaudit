@@ -10,12 +10,14 @@ from modelaudit.scanners.skops_scanner import SkopsScanner
 class TestSkopsScannerContentAnalysis:
     """Test content-based CVE detection (not just filename patterns)."""
 
-    def test_detects_operatorfuncnode_in_content(self, tmp_path: Path) -> None:
-        """Test detection of structured OperatorFuncNode content."""
+    def test_detects_malicious_operatorfuncnode_in_schema(self, tmp_path: Path) -> None:
+        """Test detection of exploit-shaped OperatorFuncNode schema content."""
         skops_file = tmp_path / "model.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
-            zf.writestr("data.json", '{"__loader__": "OperatorFuncNode"}')
-            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr(
+                "schema.json",
+                '{"__loader__": "OperatorFuncNode", "__module__": "builtins", "__class__": "eval"}',
+            )
 
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
@@ -30,12 +32,17 @@ class TestSkopsScannerContentAnalysis:
         patterns_matched = details.get("patterns_matched", [])
         assert any("loader:" in p for p in patterns_matched)
 
-    def test_detects_methodnode_in_content(self, tmp_path: Path) -> None:
-        """Test detection of structured MethodNode content."""
+    def test_detects_malicious_methodnode_in_schema(self, tmp_path: Path) -> None:
+        """Test detection of exploit-shaped MethodNode schema content."""
         skops_file = tmp_path / "model.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
-            zf.writestr("tree.json", '{"__loader__": "MethodNode"}')
-            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr(
+                "schema.json",
+                (
+                    '{"__loader__": "MethodNode", "__module__": "builtins", "__class__": "str", '
+                    '"content": {"obj": {"__module__": "os", "__class__": "system"}}}'
+                ),
+            )
 
         scanner = SkopsScanner()
         result = scanner.scan(str(skops_file))
@@ -106,3 +113,26 @@ class TestSkopsScannerContentAnalysis:
 
         cve_checks = [c for c in result.checks if "CVE-2025-54412" in c.name]
         assert not [c for c in cve_checks if c.status == CheckStatus.FAILED]
+
+    def test_valid_loader_nodes_are_not_flagged(self, tmp_path: Path) -> None:
+        """Normal Skops loader nodes should not be treated as exploit payloads."""
+        skops_file = tmp_path / "benign_loaders.skops"
+        with zipfile.ZipFile(skops_file, "w") as zf:
+            zf.writestr(
+                "schema.json",
+                (
+                    '{"items": ['
+                    '{"__loader__": "OperatorFuncNode", "__module__": "operator", "__class__": "methodcaller"},'
+                    '{"__loader__": "MethodNode", "__module__": "sklearn.preprocessing", '
+                    '"__class__": "FunctionTransformer", "content": {"obj": {'
+                    '"__module__": "sklearn.preprocessing", "__class__": "FunctionTransformer"}}}'
+                    "]}"
+                ),
+            )
+
+        result = SkopsScanner().scan(str(skops_file))
+
+        cve_54412 = [c for c in result.checks if "CVE-2025-54412" in c.name and c.status == CheckStatus.FAILED]
+        cve_54413 = [c for c in result.checks if "CVE-2025-54413" in c.name and c.status == CheckStatus.FAILED]
+        assert cve_54412 == []
+        assert cve_54413 == []

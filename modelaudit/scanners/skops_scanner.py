@@ -30,6 +30,7 @@ class SkopsScanner(BaseScanner):
     _BAD_ZIP_REASON: ClassVar[str] = "skops_bad_zip_file"
     _FILE_COUNT_LIMIT_REASON: ClassVar[str] = "skops_archive_file_count_limited"
     _UNCOMPRESSED_SIZE_LIMIT_REASON: ClassVar[str] = "skops_archive_uncompressed_size_limited"
+    _STRUCTURED_JSON_PARSE_REASON: ClassVar[str] = "skops_structured_json_parse_failed"
     _CVE_54412_LOADER: ClassVar[str] = "OperatorFuncNode"
     _CVE_54413_LOADER: ClassVar[str] = "MethodNode"
 
@@ -306,14 +307,22 @@ class SkopsScanner(BaseScanner):
         return bool(cls._CARD_GET_MODEL_PATTERN.search(content) and cls._CARD_JOBLIB_FALLBACK_PATTERN.search(content))
 
     @staticmethod
-    def _contains_structured_loader(value: Any, loader_name: str) -> bool:
-        """Return whether decoded Skops JSON contains a loader node."""
+    def _contains_malicious_loader_state(value: Any, loader_name: str) -> bool:
+        """Return whether decoded Skops JSON contains an exploit-shaped loader node."""
         if isinstance(value, dict):
             if value.get("__loader__") == loader_name:
-                return True
-            return any(SkopsScanner._contains_structured_loader(child, loader_name) for child in value.values())
+                if loader_name == SkopsScanner._CVE_54412_LOADER:
+                    return value.get("__module__") != "operator"
+                if loader_name == SkopsScanner._CVE_54413_LOADER:
+                    content = value.get("content")
+                    obj = content.get("obj") if isinstance(content, dict) else None
+                    if isinstance(obj, dict):
+                        return value.get("__module__") != obj.get("__module__") or value.get("__class__") != obj.get(
+                            "__class__"
+                        )
+            return any(SkopsScanner._contains_malicious_loader_state(child, loader_name) for child in value.values())
         elif isinstance(value, list):
-            return any(SkopsScanner._contains_structured_loader(child, loader_name) for child in value)
+            return any(SkopsScanner._contains_malicious_loader_state(child, loader_name) for child in value)
         return False
 
     def _find_structured_loader_references(
@@ -324,17 +333,34 @@ class SkopsScanner(BaseScanner):
         *,
         loader_name: str,
     ) -> list[str]:
-        """Find loader references inside decoded Skops JSON documents."""
+        """Find exploit-shaped loader states inside authoritative Skops schema documents."""
         matches: list[str] = []
         for file_info in zip_file.filelist:
-            with suppress(Exception):
-                raw_content = self._read_zip_entry_safely(zip_file, file_info, result=result, zip_path=zip_path)
-                if raw_content is None:
-                    continue
+            raw_content = self._read_zip_entry_safely(zip_file, file_info, result=result, zip_path=zip_path)
+            if raw_content is None or not self._is_skops_metadata(file_info.filename):
+                continue
+            try:
+                decoded = json.loads(raw_content)
+            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+                if not any(
+                    check.name == "Skops Structured JSON Parse Check"
+                    and check.details.get("entry") == file_info.filename
+                    for check in result.checks
+                ):
+                    result.add_check(
+                        name="Skops Structured JSON Parse Check",
+                        passed=False,
+                        message=f"Unable to parse Skops JSON entry {file_info.filename}: {exc}",
+                        severity=IssueSeverity.WARNING,
+                        location=f"{zip_path}:{file_info.filename}",
+                        details={"entry": file_info.filename},
+                        why="Structured Skops loader inspection was incomplete for this archive member.",
+                    )
+                mark_archive_scan_incomplete(result, self._STRUCTURED_JSON_PARSE_REASON)
+                continue
 
-                decoded = json.loads(raw_content.decode("utf-8"))
-                if self._contains_structured_loader(decoded, loader_name):
-                    matches.append(f"loader: {loader_name} in {file_info.filename}")
+            if self._contains_malicious_loader_state(decoded, loader_name):
+                matches.append(f"loader: {loader_name} in {file_info.filename}")
         return matches
 
     def _check_unsafe_joblib_fallback(self, zip_file: zipfile.ZipFile, result: ScanResult, zip_path: str) -> None:
