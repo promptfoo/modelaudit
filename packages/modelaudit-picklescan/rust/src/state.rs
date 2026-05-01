@@ -55,6 +55,11 @@ enum FormatFieldNumbering {
     Auto,
     Manual,
 }
+
+enum StrFormatRootItemLookup<'a> {
+    Invalid,
+    Key(Option<&'a str>),
+}
 const TIME_CHECK_INTERVAL_OPCODES: usize = 4096;
 const MAX_IMPORT_REFERENCES: usize = 10_000;
 
@@ -2203,10 +2208,11 @@ impl<'a> ScanState<'a> {
 
         if has_item_lookup {
             if let Some(index) = positional_index {
-                lookups.push((
-                    index,
-                    Self::str_format_root_item_key(field_name, root_end).map(str::to_string),
-                ));
+                if let StrFormatRootItemLookup::Key(key) =
+                    Self::str_format_root_item_key(field_name, root_end)
+                {
+                    lookups.push((index, key.map(str::to_string)));
+                }
             }
         }
 
@@ -2222,13 +2228,26 @@ impl<'a> ScanState<'a> {
         Some(())
     }
 
-    fn str_format_root_item_key(field_name: &str, root_end: usize) -> Option<&str> {
-        let suffix = field_name.get(root_end..)?;
-        let key = suffix.strip_prefix('[')?.split_once(']')?.0;
-        if key.is_empty() || Self::parse_str_format_decimal_index(key).is_some() {
-            None
+    fn str_format_root_item_key(field_name: &str, root_end: usize) -> StrFormatRootItemLookup<'_> {
+        let Some(suffix) = field_name.get(root_end..) else {
+            return StrFormatRootItemLookup::Invalid;
+        };
+        let Some((key, _)) = suffix
+            .strip_prefix('[')
+            .and_then(|value| value.split_once(']'))
+        else {
+            return StrFormatRootItemLookup::Invalid;
+        };
+        if key.is_empty() {
+            StrFormatRootItemLookup::Key(None)
+        } else if Self::is_str_format_decimal_syntax(key) {
+            if Self::parse_str_format_decimal_index(key).is_some() {
+                StrFormatRootItemLookup::Key(None)
+            } else {
+                StrFormatRootItemLookup::Invalid
+            }
         } else {
-            Some(key)
+            StrFormatRootItemLookup::Key(Some(key))
         }
     }
 
@@ -2240,7 +2259,14 @@ impl<'a> ScanState<'a> {
             let digit = usize::try_from(Self::str_format_decimal_digit_value(ch)?).ok()?;
             index = index.checked_mul(10)?.checked_add(digit)?;
         }
-        Some(index)
+        (index <= isize::MAX as usize).then_some(index)
+    }
+
+    fn is_str_format_decimal_syntax(value: &str) -> bool {
+        !value.is_empty()
+            && value
+                .chars()
+                .all(|ch| Self::str_format_decimal_digit_value(ch).is_some())
     }
 
     fn str_format_decimal_digit_value(ch: char) -> Option<u32> {
