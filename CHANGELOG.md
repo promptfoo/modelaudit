@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - block additional eager `statistics` consumers in picklescan call-graph analysis
+- avoid picklescan false positives for inert metadata under dangerous dotted globals
 - preserve path-sensitive scan results while hashing duplicate directory contents
 - correct analysis suspiciousness scoring and alias-aware semantic risk handling
 - harden detector heuristics against comment padding, byte-backed credentials, unmarked Python blobs, and spoofed network context
