@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
 use crate::expansion::{
@@ -39,12 +40,27 @@ use crate::strings::{is_repeated_single_byte, suspicious_string_matches};
 const MIN_SUSPICIOUS_LITERAL_SCAN_WINDOW_CHARS: usize = 8192;
 const SUSPICIOUS_LITERAL_SCAN_OVERLAP_CHARS: usize = 4096;
 const MAX_STR_FORMAT_FIELD_NESTING: usize = 4;
+static RUNTIME_PYTHON_MINOR_VERSION: AtomicU8 = AtomicU8::new(13);
+const STR_FORMAT_DECIMAL_ZERO_CODEPOINTS: &[u32] = &[
+    0x0030, 0x0660, 0x06F0, 0x07C0, 0x0966, 0x09E6, 0x0A66, 0x0AE6, 0x0B66, 0x0BE6, 0x0C66, 0x0CE6,
+    0x0D66, 0x0DE6, 0x0E50, 0x0ED0, 0x0F20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80,
+    0x1A90, 0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0,
+    0xFF10, 0x104A0, 0x10D30, 0x11066, 0x110F0, 0x11136, 0x111D0, 0x112F0, 0x11450, 0x114D0,
+    0x11650, 0x116C0, 0x11730, 0x118E0, 0x11950, 0x11C50, 0x11D50, 0x11DA0, 0x16A60, 0x16B50,
+    0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140, 0x1E2F0, 0x1E950, 0x1FBF0,
+];
+const PYTHON_3_12_PLUS_STR_FORMAT_DECIMAL_ZERO_CODEPOINTS: &[u32] = &[0x11F50, 0x16AC0, 0x1E4F0];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FormatFieldNumbering {
     Unset,
     Auto,
     Manual,
+}
+
+enum StrFormatRootItemLookup<'a> {
+    Invalid,
+    Key(Option<&'a str>),
 }
 const TIME_CHECK_INTERVAL_OPCODES: usize = 4096;
 const MAX_IMPORT_REFERENCES: usize = 10_000;
@@ -473,6 +489,10 @@ pub(crate) struct ScanState<'a> {
 }
 
 impl<'a> ScanState<'a> {
+    pub(crate) fn set_runtime_python_minor_version(minor: u8) {
+        RUNTIME_PYTHON_MINOR_VERSION.store(minor, Ordering::Relaxed);
+    }
+
     pub(crate) fn new(
         source: String,
         payload: &'a [u8],
@@ -2068,12 +2088,12 @@ impl<'a> ScanState<'a> {
         let Some(format_string) = resolve_global_operand(arguments.first(), self.payload) else {
             return invocations;
         };
-        let lookup_indices = Self::str_format_positional_lookup_indices(&format_string);
+        let lookups = Self::str_format_positional_lookups(&format_string);
 
-        for index in lookup_indices {
+        for (index, key) in lookups {
             invocations.extend(self.mapping_lookup_invocations(
                 arguments.get(index + 1),
-                None,
+                key.as_deref(),
                 op_name,
                 position,
             ));
@@ -2081,18 +2101,18 @@ impl<'a> ScanState<'a> {
         invocations
     }
 
-    fn str_format_positional_lookup_indices(format_string: &str) -> Vec<usize> {
+    fn str_format_positional_lookups(format_string: &str) -> Vec<(usize, Option<String>)> {
         let mut numbering = FormatFieldNumbering::Unset;
         let mut next_auto_index = 0;
-        let mut lookup_indices = Vec::new();
+        let mut lookups = Vec::new();
         let _ = Self::collect_str_format_lookup_indices(
             format_string,
             0,
             &mut numbering,
             &mut next_auto_index,
-            &mut lookup_indices,
+            &mut lookups,
         );
-        lookup_indices
+        lookups
     }
 
     fn collect_str_format_lookup_indices(
@@ -2100,7 +2120,7 @@ impl<'a> ScanState<'a> {
         depth: usize,
         numbering: &mut FormatFieldNumbering,
         next_auto_index: &mut usize,
-        lookup_indices: &mut Vec<usize>,
+        lookups: &mut Vec<(usize, Option<String>)>,
     ) -> Option<()> {
         if depth > MAX_STR_FORMAT_FIELD_NESTING {
             return Some(());
@@ -2121,7 +2141,7 @@ impl<'a> ScanState<'a> {
                         depth,
                         numbering,
                         next_auto_index,
-                        lookup_indices,
+                        lookups,
                     )?;
                     cursor = next_cursor;
                 }
@@ -2167,7 +2187,7 @@ impl<'a> ScanState<'a> {
         depth: usize,
         numbering: &mut FormatFieldNumbering,
         next_auto_index: &mut usize,
-        lookup_indices: &mut Vec<usize>,
+        lookups: &mut Vec<(usize, Option<String>)>,
     ) -> Option<()> {
         let bytes = field.as_bytes();
         let mut delimiter_index = bytes.len();
@@ -2203,19 +2223,23 @@ impl<'a> ScanState<'a> {
             let index = *next_auto_index;
             *next_auto_index += 1;
             Some(index)
-        } else if root.bytes().all(|byte| byte.is_ascii_digit()) {
+        } else if let Some(index) = Self::parse_str_format_decimal_index(root) {
             if *numbering == FormatFieldNumbering::Auto {
                 return None;
             }
             *numbering = FormatFieldNumbering::Manual;
-            root.parse::<usize>().ok()
+            Some(index)
         } else {
             None
         };
 
         if has_item_lookup {
             if let Some(index) = positional_index {
-                lookup_indices.push(index);
+                if let StrFormatRootItemLookup::Key(key) =
+                    Self::str_format_root_item_key(field_name, root_end)
+                {
+                    lookups.push((index, key.map(str::to_string)));
+                }
             }
         }
 
@@ -2225,10 +2249,78 @@ impl<'a> ScanState<'a> {
                 depth + 1,
                 numbering,
                 next_auto_index,
-                lookup_indices,
+                lookups,
             )?;
         }
         Some(())
+    }
+
+    fn str_format_root_item_key(field_name: &str, root_end: usize) -> StrFormatRootItemLookup<'_> {
+        let Some(suffix) = field_name.get(root_end..) else {
+            return StrFormatRootItemLookup::Invalid;
+        };
+        let Some((key, _)) = suffix
+            .strip_prefix('[')
+            .and_then(|value| value.split_once(']'))
+        else {
+            return StrFormatRootItemLookup::Invalid;
+        };
+        if key.is_empty() {
+            StrFormatRootItemLookup::Key(None)
+        } else if Self::is_str_format_decimal_syntax(key) {
+            if Self::parse_str_format_decimal_index(key).is_some() {
+                StrFormatRootItemLookup::Key(None)
+            } else {
+                StrFormatRootItemLookup::Invalid
+            }
+        } else {
+            StrFormatRootItemLookup::Key(Some(key))
+        }
+    }
+
+    fn parse_str_format_decimal_index(value: &str) -> Option<usize> {
+        let mut chars = value.chars();
+        let first = chars.next()?;
+        let mut index = usize::try_from(Self::str_format_decimal_digit_value(first)?).ok()?;
+        for ch in chars {
+            let digit = usize::try_from(Self::str_format_decimal_digit_value(ch)?).ok()?;
+            index = index.checked_mul(10)?.checked_add(digit)?;
+        }
+        (index <= isize::MAX as usize).then_some(index)
+    }
+
+    fn is_str_format_decimal_syntax(value: &str) -> bool {
+        !value.is_empty()
+            && value
+                .chars()
+                .all(|ch| Self::str_format_decimal_digit_value(ch).is_some())
+    }
+
+    fn str_format_decimal_digit_value(ch: char) -> Option<u32> {
+        let codepoint = ch as u32;
+        Self::str_format_decimal_digit_value_in_ranges(
+            codepoint,
+            STR_FORMAT_DECIMAL_ZERO_CODEPOINTS,
+        )
+        .or_else(|| {
+            (RUNTIME_PYTHON_MINOR_VERSION.load(Ordering::Relaxed) >= 12)
+                .then(|| {
+                    Self::str_format_decimal_digit_value_in_ranges(
+                        codepoint,
+                        PYTHON_3_12_PLUS_STR_FORMAT_DECIMAL_ZERO_CODEPOINTS,
+                    )
+                })
+                .flatten()
+        })
+    }
+
+    fn str_format_decimal_digit_value_in_ranges(
+        codepoint: u32,
+        zero_codepoints: &[u32],
+    ) -> Option<u32> {
+        zero_codepoints.iter().find_map(|zero| {
+            (codepoint >= *zero && codepoint < *zero + 10).then_some(codepoint - *zero)
+        })
     }
 
     fn str_format_map_invocations(

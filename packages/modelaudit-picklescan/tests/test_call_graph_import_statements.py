@@ -898,6 +898,34 @@ def _chainmap_shadowed_defaultdict_getitem_payload() -> bytes:
     )
 
 
+def _chainmap_defaultdict_str_format_payload(*, key: str, format_string: str) -> bytes:
+    return b"".join(
+        [
+            b"\x80\x04",
+            b"}",
+            b"\x94",
+            _unicode_operand(key),
+            _unicode_operand("safe"),
+            b"s",
+            b"0",
+            _global_operand("collections", "defaultdict"),
+            _global_operand("builtins", "help"),
+            b"\x85R",
+            b"\x94",
+            b"0",
+            _global_operand("collections", "ChainMap"),
+            b"h\x00",
+            b"h\x01",
+            b"\x86R",
+            b"\x94",
+            b"0",
+            _global_operand("builtins", "str.format"),
+            _args_tuple(_unicode_operand(format_string), b"h\x02"),
+            b"R.",
+        ]
+    )
+
+
 def _deep_mapping_proxy_defaultdict_getitem_payload(depth: int) -> bytes:
     if not 1 <= depth <= 255:
         raise ValueError("depth must fit one-byte memo references")
@@ -6659,6 +6687,336 @@ def test_scan_bytes_keeps_non_lookup_str_format_defaultdict_cases_clean(
         and invocation.get("positional_arg_count") == 0
         for invocation in report.metadata.get("callable_invocations", [])
     )
+
+
+def test_scan_bytes_keeps_str_format_chainmap_shadowed_defaultdict_lookup_clean(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "str_format_chainmap_shadowed_defaultdict_marker"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('pydoc-owned')\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+    payload = _chainmap_defaultdict_str_format_payload(key="present", format_string="{0[present]}")
+
+    report = scan_bytes(payload, source="str-format-chainmap-shadowed-defaultdict-lookup.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != "safe":
+    raise SystemExit(f"expected shadowed ChainMap value, got {result!r}")
+if marker.exists():
+    raise SystemExit("default factory unexpectedly imported pydoc")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+
+
+def test_scan_bytes_blocks_str_format_unicode_decimal_chainmap_lookup_rce(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "str_format_unicode_decimal_chainmap_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+    payload = _chainmap_defaultdict_str_format_payload(key="١٢", format_string="{0[١٢]}")
+
+    report = scan_bytes(payload, source="str-format-unicode-decimal-chainmap-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != "factory-value":
+    raise SystemExit(f"expected factory value result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+def test_scan_bytes_keeps_str_format_oversized_decimal_chainmap_lookup_clean(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "str_format_oversized_decimal_chainmap_marker"
+    oversized_decimal_key = str(2**64)
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('pydoc-owned')\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+    payload = _chainmap_defaultdict_str_format_payload(
+        key=oversized_decimal_key,
+        format_string=f"{{0[{oversized_decimal_key}]}}",
+    )
+
+    report = scan_bytes(payload, source="str-format-oversized-decimal-chainmap-clean.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+try:
+    pickle.loads(payload)
+except ValueError as exc:
+    if str(exc) != "Too many decimal digits in format string":
+        raise
+else:
+    raise SystemExit("expected oversized decimal field to raise ValueError")
+if marker.exists():
+    raise SystemExit("default factory unexpectedly imported pydoc")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="newer Unicode decimal digit is unsupported before Python 3.12")
+def test_scan_bytes_blocks_str_format_newer_unicode_decimal_chainmap_lookup_rce(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "str_format_newer_unicode_decimal_chainmap_marker"
+    marker_content = "pydoc-owned"
+    newer_decimal_key = "\U00011f50"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+    payload = _chainmap_defaultdict_str_format_payload(
+        key=newer_decimal_key,
+        format_string=f"{{0[{newer_decimal_key}]}}",
+    )
+
+    report = scan_bytes(payload, source="str-format-newer-unicode-decimal-chainmap-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(sys.version_info >= (3, 12), reason="newer Unicode decimal digit is supported from Python 3.12")
+def test_scan_bytes_keeps_str_format_newer_unicode_decimal_chainmap_lookup_clean(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "str_format_newer_unicode_decimal_chainmap_clean_marker"
+    newer_decimal_key = "\U00011f50"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('pydoc-owned')\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+    payload = _chainmap_defaultdict_str_format_payload(
+        key=newer_decimal_key,
+        format_string=f"{{0[{newer_decimal_key}]}}",
+    )
+
+    report = scan_bytes(payload, source="str-format-newer-unicode-decimal-chainmap-clean.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != "safe":
+    raise SystemExit(f"expected shadowed ChainMap value, got {result!r}")
+if marker.exists():
+    raise SystemExit("default factory unexpectedly imported pydoc")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="newer Unicode decimal digit is unsupported before Python 3.12")
+def test_scan_bytes_runtime_blocks_str_format_newer_unicode_decimal_chainmap_lookup_rce(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "str_format_newer_unicode_decimal_chainmap_runtime_marker"
+    marker_content = "pydoc-owned"
+    newer_decimal_key = "\U00011f50"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+    payload = _chainmap_defaultdict_str_format_payload(
+        key=newer_decimal_key,
+        format_string=f"{{0[{newer_decimal_key}]}}",
+    )
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != "factory-value":
+    raise SystemExit(f"expected factory value result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
 
 
 def test_scan_bytes_keeps_format_map_defaultdict_bytes_receiver_clean() -> None:
