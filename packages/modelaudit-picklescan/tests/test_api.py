@@ -2191,6 +2191,20 @@ def test_scan_bytes_can_decode_stack_global_from_memoized_operands() -> None:
     assert any("posix.system" in finding.message for finding in report.findings)
 
 
+@pytest.mark.parametrize(
+    "name",
+    ["eval.__doc__", "eval.__name__", "eval.__module__", "eval.__qualname__"],
+)
+def test_scan_bytes_keeps_stack_global_metadata_attributes_clean(name: str) -> None:
+    payload = b"\x80\x04" + _short_binunicode(b"builtins") + _short_binunicode(name.encode()) + b"\x93."
+
+    report = scan_bytes(payload, source=f"{name}.pkl")
+
+    assert report.status == ScanStatus.COMPLETE
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert report.findings == ()
+
+
 def test_scan_bytes_warns_on_functools_partial_without_marking_benign_partial_malicious() -> None:
     payload = pickle.dumps(functools.partial(int, base=10), protocol=4)
 
