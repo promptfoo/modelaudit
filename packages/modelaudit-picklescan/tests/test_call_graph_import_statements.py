@@ -6647,9 +6647,26 @@ def test_scan_bytes_blocks_str_format_newer_unicode_decimal_chainmap_lookup_rce(
     )
 
     assert not marker.exists()
-    if sys.version_info < (3, 12):
-        return
 
+
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="newer Unicode decimal digit is unsupported before Python 3.12")
+def test_scan_bytes_runtime_blocks_str_format_newer_unicode_decimal_chainmap_lookup_rce(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "str_format_newer_unicode_decimal_chainmap_runtime_marker"
+    marker_content = "pydoc-owned"
+    newer_decimal_key = "\U00011f50"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+    payload = _chainmap_defaultdict_str_format_payload(
+        key=newer_decimal_key,
+        format_string=f"{{0[{newer_decimal_key}]}}",
+    )
     child_code = """
 import pickle
 import sys
