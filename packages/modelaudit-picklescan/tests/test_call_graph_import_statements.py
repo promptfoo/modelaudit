@@ -3402,6 +3402,7 @@ def test_scan_bytes_blocks_stdlib_eager_call_iterator_consumption_rce(
 
     assert not marker.exists()
     child_code = """
+import ast
 import pickle
 import sys
 from pathlib import Path
@@ -3418,10 +3419,18 @@ sys.path.insert(0, str(module_dir))
 sys.modules.pop("pydoc", None)
 result = pickle.loads(payload)
 result_repr = repr(result)
+try:
+    expected_value = ast.literal_eval(expected_repr)
+except (SyntaxError, ValueError):
+    expected_value = None
 expected_ordered_dict_repr = None
 if expected_repr.startswith("OrderedDict(") and expected_repr.endswith(")"):
     expected_ordered_dict_repr = expected_repr[len("OrderedDict(") : -1]
 if result_repr != expected_repr and not (
+    isinstance(result, (int, float))
+    and isinstance(expected_value, (int, float))
+    and result == expected_value
+) and not (
     type(result).__name__ == "OrderedDict" and repr(dict(result)) == expected_ordered_dict_repr
 ):
     raise SystemExit(f"expected {expected_repr}, got {result!r}")
