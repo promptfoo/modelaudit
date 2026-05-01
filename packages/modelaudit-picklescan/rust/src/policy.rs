@@ -46,6 +46,9 @@ fn strip_wrapper_global_suffix(name: &str) -> Option<&str> {
 fn dangerous_global_prefix_severity(module: &str, name: &str) -> Option<&'static str> {
     let parts = name.split('.').collect::<Vec<_>>();
     for split in 1..parts.len() {
+        if is_inert_global_metadata_tail(&parts[split..]) {
+            continue;
+        }
         let candidate = parts[..split].join(".");
         if let Some(severity) = direct_global_severity_without_wrapper_alias(module, &candidate)
             .or_else(|| wrapper_global_alias_severity(module, &candidate))
@@ -54,6 +57,13 @@ fn dangerous_global_prefix_severity(module: &str, name: &str) -> Option<&'static
         }
     }
     None
+}
+
+fn is_inert_global_metadata_tail(parts: &[&str]) -> bool {
+    matches!(
+        parts,
+        ["__doc__"] | ["__name__"] | ["__module__"] | ["__qualname__"]
+    )
 }
 
 fn direct_global_severity_without_wrapper_alias(module: &str, name: &str) -> Option<&'static str> {
@@ -665,6 +675,18 @@ mod tests {
         );
         assert_eq!(global_severity("statistics", "mean.__self__"), None);
         assert_eq!(global_severity("statistics", "mean.subclasses"), None);
+        for name in [
+            "eval.__doc__",
+            "eval.__name__",
+            "eval.__module__",
+            "eval.__qualname__",
+        ] {
+            assert_eq!(global_severity("builtins", name), None);
+        }
+        assert_eq!(
+            global_severity("builtins", "eval.__repr__.__self__"),
+            Some("critical")
+        );
         assert_eq!(global_severity("os.path", "__call__"), None);
         assert_eq!(global_severity("os.path", "__get__"), None);
         assert_eq!(global_severity("os.path", "__get__.__self__"), None);

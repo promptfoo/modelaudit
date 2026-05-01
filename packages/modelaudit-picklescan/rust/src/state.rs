@@ -117,8 +117,29 @@ const EXACT_ARITY_STDLIB_EAGER_ITERABLE_CONSUMERS: &[(&str, &str, usize, usize)]
     ("heapq", "nsmallest", 3, 1),
     ("math", "fsum", 1, 0),
     ("math", "prod", 1, 0),
+    ("statistics", "fmean", 1, 0),
+    ("statistics", "fmean", 2, 0),
+    ("statistics", "fmean", 2, 1),
+    ("statistics", "geometric_mean", 1, 0),
+    ("statistics", "harmonic_mean", 1, 0),
+    ("statistics", "harmonic_mean", 2, 0),
+    ("statistics", "harmonic_mean", 2, 1),
     ("statistics", "mean", 1, 0),
     ("statistics", "median", 1, 0),
+    ("statistics", "median_grouped", 1, 0),
+    ("statistics", "median_grouped", 2, 0),
+    ("statistics", "median_high", 1, 0),
+    ("statistics", "median_low", 1, 0),
+    ("statistics", "mode", 1, 0),
+    ("statistics", "multimode", 1, 0),
+    ("statistics", "pstdev", 1, 0),
+    ("statistics", "pstdev", 2, 0),
+    ("statistics", "pvariance", 1, 0),
+    ("statistics", "pvariance", 2, 0),
+    ("statistics", "stdev", 1, 0),
+    ("statistics", "stdev", 2, 0),
+    ("statistics", "variance", 1, 0),
+    ("statistics", "variance", 2, 0),
     ("weakref", "WeakKeyDictionary", 1, 0),
     ("weakref", "WeakSet", 1, 0),
     ("weakref", "WeakValueDictionary", 1, 0),
@@ -2765,17 +2786,18 @@ impl<'a> ScanState<'a> {
         name: &str,
         arguments: &'b [StackValue],
     ) -> Option<&'b GlobalRef> {
-        let (_, _, _, consumed_arg_index) =
-            consumers
-                .iter()
-                .find(|(consumer_module, consumer_name, arity, _)| {
-                    Self::consumer_module_matches(module, consumer_module)
-                        && *consumer_name == name
-                        && *arity == arguments.len()
-                })?;
-        arguments
-            .get(*consumed_arg_index)
-            .and_then(Self::call_iterator_callable_ref)
+        consumers
+            .iter()
+            .filter(|(consumer_module, consumer_name, arity, _)| {
+                Self::consumer_module_matches(module, consumer_module)
+                    && *consumer_name == name
+                    && *arity == arguments.len()
+            })
+            .find_map(|(_, _, _, consumed_arg_index)| {
+                arguments
+                    .get(*consumed_arg_index)
+                    .and_then(Self::call_iterator_callable_ref)
+            })
     }
 
     fn consumer_module_matches(module: &str, expected: &str) -> bool {
