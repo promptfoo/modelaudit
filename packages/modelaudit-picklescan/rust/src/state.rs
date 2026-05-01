@@ -2282,6 +2282,9 @@ impl<'a> ScanState<'a> {
         let mut path = Vec::new();
 
         while !remaining.is_empty() {
+            if remaining.starts_with('.') {
+                break;
+            }
             let Some(after_open) = remaining.strip_prefix('[') else {
                 return StrFormatRootItemLookup::Invalid;
             };
@@ -2460,7 +2463,7 @@ impl<'a> ScanState<'a> {
         position: usize,
     ) -> Vec<CallableInvocation> {
         let Some(MappingLookup::Found(default_factory)) =
-            Self::mapping_lookup_default_factory(mapping, key)
+            self.mapping_lookup_default_factory(mapping, key)
         else {
             return Vec::new();
         };
@@ -2479,7 +2482,7 @@ impl<'a> ScanState<'a> {
         position: usize,
     ) -> Vec<CallableInvocation> {
         let Some(MappingLookup::Found(default_factory)) =
-            Self::mapping_lookup_default_factory_path(mapping, path)
+            self.mapping_lookup_default_factory_path(mapping, path)
         else {
             return Vec::new();
         };
@@ -2491,20 +2494,23 @@ impl<'a> ScanState<'a> {
     }
 
     fn mapping_lookup_default_factory<'b>(
+        &'b self,
         mapping: Option<&'b StackValue>,
         key: Option<&str>,
     ) -> Option<MappingLookup<'b>> {
-        Self::mapping_lookup_default_factory_inner(mapping?, key)
+        self.mapping_lookup_default_factory_inner(mapping?, key)
     }
 
     fn mapping_lookup_default_factory_path<'b>(
+        &'b self,
         mapping: Option<&'b StackValue>,
         path: &[Option<String>],
     ) -> Option<MappingLookup<'b>> {
-        Self::mapping_lookup_default_factory_path_inner(mapping?, path)
+        self.mapping_lookup_default_factory_path_inner(mapping?, path)
     }
 
     fn mapping_lookup_default_factory_inner<'b>(
+        &'b self,
         mapping: &'b StackValue,
         key: Option<&str>,
     ) -> Option<MappingLookup<'b>> {
@@ -2512,7 +2518,11 @@ impl<'a> ScanState<'a> {
             StackValue::DefaultDict { default_factory } => {
                 Some(MappingLookup::Found(default_factory))
             }
-            StackValue::TrackedDict { entries, .. } => {
+            StackValue::TrackedDict {
+                entries,
+                memo_index,
+            } => {
+                let entries = self.current_tracked_dict_entries(entries, *memo_index);
                 if key.is_some_and(|key| entries.iter().any(|(candidate, _)| candidate == key)) {
                     Some(MappingLookup::Shadowed)
                 } else {
@@ -2524,7 +2534,7 @@ impl<'a> ScanState<'a> {
                 mappings,
             } if reference.module == "collections" && reference.name == "ChainMap" => {
                 for mapping in mappings {
-                    match Self::mapping_lookup_default_factory_inner(mapping, key) {
+                    match self.mapping_lookup_default_factory_inner(mapping, key) {
                         Some(MappingLookup::Found(default_factory)) => {
                             return Some(MappingLookup::Found(default_factory));
                         }
@@ -2539,12 +2549,13 @@ impl<'a> ScanState<'a> {
                 mappings,
             } if reference.module == "types" && reference.name == "MappingProxyType" => mappings
                 .first()
-                .and_then(|mapping| Self::mapping_lookup_default_factory_inner(mapping, key)),
+                .and_then(|mapping| self.mapping_lookup_default_factory_inner(mapping, key)),
             _ => None,
         }
     }
 
     fn mapping_lookup_default_factory_path_inner<'b>(
+        &'b self,
         mapping: &'b StackValue,
         path: &[Option<String>],
     ) -> Option<MappingLookup<'b>> {
@@ -2552,14 +2563,18 @@ impl<'a> ScanState<'a> {
             StackValue::DefaultDict { default_factory } => {
                 Some(MappingLookup::Found(default_factory))
             }
-            StackValue::TrackedDict { entries, .. } => {
+            StackValue::TrackedDict {
+                entries,
+                memo_index,
+            } => {
+                let entries = self.current_tracked_dict_entries(entries, *memo_index);
                 let (key, remaining_path) = path.split_first()?;
                 let key = key.as_deref()?;
                 let (_, value) = entries.iter().find(|(candidate, _)| candidate == key)?;
                 if remaining_path.is_empty() {
                     Some(MappingLookup::Shadowed)
                 } else {
-                    Self::mapping_lookup_default_factory_path_inner(value, remaining_path)
+                    self.mapping_lookup_default_factory_path_inner(value, remaining_path)
                 }
             }
             StackValue::MappingWrapper {
@@ -2567,7 +2582,7 @@ impl<'a> ScanState<'a> {
                 mappings,
             } if reference.module == "collections" && reference.name == "ChainMap" => {
                 for mapping in mappings {
-                    match Self::mapping_lookup_default_factory_path_inner(mapping, path) {
+                    match self.mapping_lookup_default_factory_path_inner(mapping, path) {
                         Some(MappingLookup::Found(default_factory)) => {
                             return Some(MappingLookup::Found(default_factory));
                         }
@@ -2582,9 +2597,23 @@ impl<'a> ScanState<'a> {
                 mappings,
             } if reference.module == "types" && reference.name == "MappingProxyType" => mappings
                 .first()
-                .and_then(|mapping| Self::mapping_lookup_default_factory_path_inner(mapping, path)),
+                .and_then(|mapping| self.mapping_lookup_default_factory_path_inner(mapping, path)),
             _ => None,
         }
+    }
+
+    fn current_tracked_dict_entries<'b>(
+        &'b self,
+        entries: &'b [(String, StackValue)],
+        memo_index: Option<i64>,
+    ) -> &'b [(String, StackValue)] {
+        memo_index
+            .and_then(|index| self.memo.get(&index))
+            .and_then(|value| match value {
+                StackValue::TrackedDict { entries, .. } => Some(entries.as_slice()),
+                _ => None,
+            })
+            .unwrap_or(entries)
     }
 
     fn formatter_vformat_invocations(
@@ -3171,7 +3200,7 @@ impl<'a> ScanState<'a> {
             .get(1)
             .and_then(|value| stack_value_string(value, self.payload));
         let Some(MappingLookup::Found(default_factory)) =
-            Self::mapping_lookup_default_factory(argument_values.first(), key.as_deref())
+            self.mapping_lookup_default_factory(argument_values.first(), key.as_deref())
         else {
             return Vec::new();
         };
@@ -3318,7 +3347,7 @@ impl<'a> ScanState<'a> {
             self.stack.push(defaultdict);
             return;
         }
-        if let Some(mapping_wrapper) = Self::mapping_wrapper_result(values) {
+        if let Some(mapping_wrapper) = self.mapping_wrapper_result(values) {
             self.stack.push(mapping_wrapper);
             return;
         }
@@ -3709,7 +3738,7 @@ impl<'a> ScanState<'a> {
         Some(StackValue::DefaultDict { default_factory })
     }
 
-    fn mapping_wrapper_result(values: &[StackValue]) -> Option<StackValue> {
+    fn mapping_wrapper_result(&self, values: &[StackValue]) -> Option<StackValue> {
         let Some(StackValue::Global(callable_reference)) = values.first() else {
             return None;
         };
@@ -3733,7 +3762,7 @@ impl<'a> ScanState<'a> {
 
         if mappings
             .iter()
-            .all(|mapping| !Self::mapping_may_contain_default_factory(mapping))
+            .all(|mapping| !self.mapping_may_contain_default_factory(mapping))
         {
             return None;
         }
@@ -3744,15 +3773,19 @@ impl<'a> ScanState<'a> {
         })
     }
 
-    fn mapping_may_contain_default_factory(mapping: &StackValue) -> bool {
+    fn mapping_may_contain_default_factory(&self, mapping: &StackValue) -> bool {
         match mapping {
             StackValue::DefaultDict { .. } => true,
-            StackValue::TrackedDict { entries, .. } => entries
+            StackValue::TrackedDict {
+                entries,
+                memo_index,
+            } => self
+                .current_tracked_dict_entries(entries, *memo_index)
                 .iter()
-                .any(|(_, value)| Self::mapping_may_contain_default_factory(value)),
+                .any(|(_, value)| self.mapping_may_contain_default_factory(value)),
             StackValue::MappingWrapper { mappings, .. } => mappings
                 .iter()
-                .any(Self::mapping_may_contain_default_factory),
+                .any(|mapping| self.mapping_may_contain_default_factory(mapping)),
             _ => false,
         }
     }

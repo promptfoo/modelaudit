@@ -1024,6 +1024,33 @@ def _nested_wrapped_defaultdict_str_format_payload(wrapper_module: str, wrapper_
     )
 
 
+def _memoized_nested_defaultdict_str_format_payload() -> bytes:
+    return b"".join(
+        [
+            b"\x80\x04",
+            b"}",
+            b"\x94",
+            b"0",
+            b"}",
+            b"\x94",
+            _unicode_operand("present"),
+            b"h\x00",
+            b"s",
+            b"0",
+            b"h\x00",
+            _unicode_operand("nested"),
+            _global_operand("collections", "defaultdict"),
+            _global_operand("builtins", "help"),
+            b"\x85R",
+            b"s",
+            b"0",
+            _global_operand("builtins", "str.format"),
+            _args_tuple(_unicode_operand("{0[present][nested][missing]}"), b"h\x01"),
+            b"R.",
+        ]
+    )
+
+
 def _deep_mapping_proxy_defaultdict_getitem_payload(depth: int) -> bytes:
     if not 1 <= depth <= 255:
         raise ValueError("depth must fit one-byte memo references")
@@ -6733,6 +6760,7 @@ def test_scan_bytes_keeps_format_map_defaultdict_without_live_fields_clean(forma
     ("format_string", "format_arguments"),
     [
         ("{0[x]}", (b"h\x00",)),
+        ("{0[x].upper}", (b"h\x00",)),
         ("{[x]}", (b"h\x00",)),
         ("{0:{1[x]}}", (_unicode_operand("safe"), b"h\x00")),
         ("{0!r:{1[x]}}", (_unicode_operand("safe"), b"h\x00")),
@@ -7073,6 +7101,72 @@ def test_scan_bytes_blocks_nested_wrapped_str_format_defaultdict_lookup_rce(
     payload = _nested_wrapped_defaultdict_str_format_payload(wrapper_module, wrapper_name)
 
     report = scan_bytes(payload, source=f"nested-{wrapper_name.lower()}-str-format-defaultdict-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != "factory-value":
+    raise SystemExit(f"expected factory value result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+def test_scan_bytes_blocks_memoized_nested_str_format_defaultdict_lookup_rce(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "memoized_nested_str_format_defaultdict_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+    payload = _memoized_nested_defaultdict_str_format_payload()
+
+    report = scan_bytes(payload, source="memoized-nested-str-format-defaultdict-rce.pkl")
 
     assert report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_call_graph_finding(
