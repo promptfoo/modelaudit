@@ -3294,6 +3294,21 @@ if marker.read_text() != marker_content:
             "['owned-value']",
         ),
         (
+            _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "fmean", b"h\x00"),
+            "[7, 'stop']",
+            "7.0",
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "geometric_mean", b"h\x00"),
+            "[7, 'stop']",
+            "6.999999999999999",
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "harmonic_mean", b"h\x00"),
+            "[7, 'stop']",
+            "7",
+        ),
+        (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "mean", b"h\x00"),
             "[7, 'stop']",
             "7",
@@ -3302,6 +3317,51 @@ if marker.read_text() != marker_content:
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "median", b"h\x00"),
             "[7, 'stop']",
             "7",
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "median_grouped", b"h\x00"),
+            "[7, 'stop']",
+            "7.0",
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "median_high", b"h\x00"),
+            "[7, 'stop']",
+            "7",
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "median_low", b"h\x00"),
+            "[7, 'stop']",
+            "7",
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "mode", b"h\x00"),
+            "[7, 7, 'stop']",
+            "7",
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "multimode", b"h\x00"),
+            "[7, 7, 'stop']",
+            "[7]",
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "pstdev", b"h\x00"),
+            "[7, 7, 'stop']",
+            "0.0",
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "pvariance", b"h\x00"),
+            "[7, 7, 'stop']",
+            "0",
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "stdev", b"h\x00"),
+            "[7, 7, 'stop']",
+            "0.0",
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "variance", b"h\x00"),
+            "[7, 7, 'stop']",
+            "0",
         ),
     ],
 )

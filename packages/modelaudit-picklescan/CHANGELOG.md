@@ -9,6 +9,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- block additional eager `statistics` consumers in call-graph analysis
 - detect dangerous positional lookups inside `str.format` replacement fields
 - recognize PyTorch ZIP archives that contain only hidden pickle members
 
