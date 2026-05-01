@@ -926,6 +926,104 @@ def _chainmap_defaultdict_str_format_payload(*, key: str, format_string: str) ->
     )
 
 
+def _nested_defaultdict_str_format_payload() -> bytes:
+    return b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("collections", "defaultdict"),
+            _global_operand("builtins", "help"),
+            b"\x85R",
+            b"\x94",
+            b"0",
+            b"}",
+            b"\x94",
+            _unicode_operand("present"),
+            b"h\x00",
+            b"s",
+            b"0",
+            _global_operand("builtins", "str.format"),
+            _args_tuple(_unicode_operand("{0[present][missing]}"), b"h\x01"),
+            b"R.",
+        ]
+    )
+
+
+def _nested_defaultdict_format_map_payload() -> bytes:
+    return b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("collections", "defaultdict"),
+            _global_operand("builtins", "help"),
+            b"\x85R",
+            b"\x94",
+            b"0",
+            b"}",
+            b"\x94",
+            _unicode_operand("present"),
+            b"h\x00",
+            b"s",
+            b"0",
+            _global_operand("builtins", "str.format_map"),
+            _args_tuple(_unicode_operand("{present[missing]}"), b"h\x01"),
+            b"R.",
+        ]
+    )
+
+
+def _nested_defaultdict_formatter_payload(method_name: str) -> bytes:
+    parts = [
+        b"\x80\x04",
+        _global_operand("string", "Formatter"),
+        b")R",
+        b"\x94",
+        b"0",
+        _global_operand("collections", "defaultdict"),
+        _global_operand("builtins", "help"),
+        b"\x85R",
+        b"\x94",
+        b"0",
+        b"}",
+        b"\x94",
+        _unicode_operand("present"),
+        b"h\x01",
+        b"s",
+        b"0",
+        _global_operand("string", f"Formatter.{method_name}"),
+    ]
+    arguments = [b"h\x00", _unicode_operand("{present[missing]}"), b"N", b"h\x02"]
+    if method_name == "_vformat":
+        arguments.extend([b"\x8f", b"K\x02"])
+    parts.extend([_args_tuple(*arguments), b"R."])
+    return b"".join(parts)
+
+
+def _nested_wrapped_defaultdict_str_format_payload(wrapper_module: str, wrapper_name: str) -> bytes:
+    return b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("collections", "defaultdict"),
+            _global_operand("builtins", "help"),
+            b"\x85R",
+            b"\x94",
+            b"0",
+            b"}",
+            b"\x94",
+            _unicode_operand("present"),
+            b"h\x00",
+            b"s",
+            b"0",
+            _global_operand(wrapper_module, wrapper_name),
+            _args_tuple(b"h\x01"),
+            b"R",
+            b"\x94",
+            b"0",
+            _global_operand("builtins", "str.format"),
+            _args_tuple(_unicode_operand("{0[present][missing]}"), b"h\x02"),
+            b"R.",
+        ]
+    )
+
+
 def _deep_mapping_proxy_defaultdict_getitem_payload(depth: int) -> bytes:
     if not 1 <= depth <= 255:
         raise ValueError("depth must fit one-byte memo references")
@@ -6740,6 +6838,290 @@ if marker.exists():
     )
     assert result.returncode == 0, result.stderr
     assert not marker.exists()
+
+
+def test_scan_bytes_blocks_nested_str_format_defaultdict_lookup_rce(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "nested_str_format_defaultdict_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+    payload = _nested_defaultdict_str_format_payload()
+
+    report = scan_bytes(payload, source="nested-str-format-defaultdict-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != "factory-value":
+    raise SystemExit(f"expected factory value result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+def test_scan_bytes_blocks_nested_format_map_defaultdict_lookup_rce(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "nested_format_map_defaultdict_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+    payload = _nested_defaultdict_format_map_payload()
+
+    report = scan_bytes(payload, source="nested-format-map-defaultdict-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != "factory-value":
+    raise SystemExit(f"expected factory value result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+@pytest.mark.parametrize("method_name", ["vformat", "_vformat"])
+def test_scan_bytes_blocks_nested_formatter_defaultdict_lookup_rce(tmp_path: Path, method_name: str) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / f"nested_formatter_{method_name}_defaultdict_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+    payload = _nested_defaultdict_formatter_payload(method_name)
+
+    report = scan_bytes(payload, source=f"nested-formatter-{method_name}-defaultdict-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    expected_result = "('factory-value', 0)" if method_name == "_vformat" else "'factory-value'"
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+expected_result = sys.argv[5]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if repr(result) != expected_result:
+    raise SystemExit(f"expected factory value result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            str(module_dir),
+            str(marker),
+            payload.hex(),
+            marker_content,
+            expected_result,
+        ],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+@pytest.mark.parametrize(
+    ("wrapper_module", "wrapper_name"),
+    [("collections", "ChainMap"), ("types", "MappingProxyType")],
+)
+def test_scan_bytes_blocks_nested_wrapped_str_format_defaultdict_lookup_rce(
+    tmp_path: Path,
+    wrapper_module: str,
+    wrapper_name: str,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / f"nested_{wrapper_name.lower()}_str_format_defaultdict_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+    payload = _nested_wrapped_defaultdict_str_format_payload(wrapper_module, wrapper_name)
+
+    report = scan_bytes(payload, source=f"nested-{wrapper_name.lower()}-str-format-defaultdict-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != "factory-value":
+    raise SystemExit(f"expected factory value result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
 
 
 def test_scan_bytes_blocks_str_format_unicode_decimal_chainmap_lookup_rce(tmp_path: Path) -> None:

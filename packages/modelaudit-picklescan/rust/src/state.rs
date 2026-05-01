@@ -58,9 +58,9 @@ enum FormatFieldNumbering {
     Manual,
 }
 
-enum StrFormatRootItemLookup<'a> {
+enum StrFormatRootItemLookup {
     Invalid,
-    Key(Option<&'a str>),
+    Path(Vec<Option<String>>),
 }
 const TIME_CHECK_INTERVAL_OPCODES: usize = 4096;
 const MAX_IMPORT_REFERENCES: usize = 10_000;
@@ -883,7 +883,7 @@ impl<'a> ScanState<'a> {
             }
             "EMPTY_DICT" => {
                 self.stack.push(StackValue::TrackedDict {
-                    keys: Vec::new(),
+                    entries: Vec::new(),
                     memo_index: None,
                 });
             }
@@ -1253,61 +1253,76 @@ impl<'a> ScanState<'a> {
     }
 
     fn apply_setitem(&mut self) {
-        let _value = self.pop_value_operand_preserving_mark();
+        let value = self.pop_value_operand_preserving_mark();
         let key = self.pop_value_operand_preserving_mark();
-        if let Some(key) = key
-            .as_ref()
-            .and_then(|value| stack_value_string(value, self.payload))
-        {
-            self.record_top_tracked_dict_key(key.as_ref());
+        if let (Some(key), Some(value)) = (
+            key.as_ref()
+                .and_then(|value| stack_value_string(value, self.payload)),
+            value,
+        ) {
+            self.record_top_tracked_dict_entry(key.as_ref(), value);
         }
     }
 
     fn apply_setitems(&mut self, values: &[StackValue]) {
         for pair in values.chunks_exact(2) {
-            if let Some(key) = pair
-                .first()
-                .and_then(|value| stack_value_string(value, self.payload))
-            {
-                self.record_top_tracked_dict_key(key.as_ref());
+            if let (Some(key), Some(value)) = (
+                pair.first()
+                    .and_then(|value| stack_value_string(value, self.payload)),
+                pair.get(1),
+            ) {
+                self.record_top_tracked_dict_entry(key.as_ref(), value.clone());
             }
         }
     }
 
     fn tracked_dict_from_values(&self, values: &[StackValue]) -> StackValue {
-        let mut keys = Vec::new();
+        let mut entries = Vec::new();
         for pair in values.chunks_exact(2) {
-            if let Some(key) = pair
-                .first()
-                .and_then(|value| stack_value_string(value, self.payload))
-            {
-                Self::insert_tracked_dict_key(&mut keys, key);
+            if let (Some(key), Some(value)) = (
+                pair.first()
+                    .and_then(|value| stack_value_string(value, self.payload)),
+                pair.get(1),
+            ) {
+                Self::insert_tracked_dict_entry(&mut entries, key, value.clone());
             }
         }
         StackValue::TrackedDict {
-            keys,
+            entries,
             memo_index: None,
         }
     }
 
-    fn record_top_tracked_dict_key(&mut self, key: &str) {
+    fn record_top_tracked_dict_entry(&mut self, key: &str, value: StackValue) {
         let memo_index = match self.stack.last_mut() {
-            Some(StackValue::TrackedDict { keys, memo_index }) => {
-                Self::insert_tracked_dict_key(keys, key.to_string());
+            Some(StackValue::TrackedDict {
+                entries,
+                memo_index,
+            }) => {
+                Self::insert_tracked_dict_entry(entries, key.to_string(), value.clone());
                 *memo_index
             }
             _ => None,
         };
         if let Some(memo_index) = memo_index {
-            if let Some(StackValue::TrackedDict { keys, .. }) = self.memo.get_mut(&memo_index) {
-                Self::insert_tracked_dict_key(keys, key.to_string());
+            if let Some(StackValue::TrackedDict { entries, .. }) = self.memo.get_mut(&memo_index) {
+                Self::insert_tracked_dict_entry(entries, key.to_string(), value);
             }
         }
     }
 
-    fn insert_tracked_dict_key(keys: &mut Vec<String>, key: String) {
-        if !keys.iter().any(|existing| existing == &key) {
-            keys.push(key);
+    fn insert_tracked_dict_entry(
+        entries: &mut Vec<(String, StackValue)>,
+        key: String,
+        value: StackValue,
+    ) {
+        if let Some((_, existing_value)) = entries
+            .iter_mut()
+            .find(|(existing_key, _)| existing_key == &key)
+        {
+            *existing_value = value;
+        } else {
+            entries.push((key, value));
         }
     }
 
@@ -2090,10 +2105,10 @@ impl<'a> ScanState<'a> {
         };
         let lookups = Self::str_format_positional_lookups(&format_string);
 
-        for (index, key) in lookups {
-            invocations.extend(self.mapping_lookup_invocations(
+        for (index, path) in lookups {
+            invocations.extend(self.mapping_lookup_path_invocations(
                 arguments.get(index + 1),
-                key.as_deref(),
+                &path,
                 op_name,
                 position,
             ));
@@ -2101,7 +2116,7 @@ impl<'a> ScanState<'a> {
         invocations
     }
 
-    fn str_format_positional_lookups(format_string: &str) -> Vec<(usize, Option<String>)> {
+    fn str_format_positional_lookups(format_string: &str) -> Vec<(usize, Vec<Option<String>>)> {
         let mut numbering = FormatFieldNumbering::Unset;
         let mut next_auto_index = 0;
         let mut lookups = Vec::new();
@@ -2120,7 +2135,7 @@ impl<'a> ScanState<'a> {
         depth: usize,
         numbering: &mut FormatFieldNumbering,
         next_auto_index: &mut usize,
-        lookups: &mut Vec<(usize, Option<String>)>,
+        lookups: &mut Vec<(usize, Vec<Option<String>>)>,
     ) -> Option<()> {
         if depth > MAX_STR_FORMAT_FIELD_NESTING {
             return Some(());
@@ -2187,30 +2202,9 @@ impl<'a> ScanState<'a> {
         depth: usize,
         numbering: &mut FormatFieldNumbering,
         next_auto_index: &mut usize,
-        lookups: &mut Vec<(usize, Option<String>)>,
+        lookups: &mut Vec<(usize, Vec<Option<String>>)>,
     ) -> Option<()> {
-        let bytes = field.as_bytes();
-        let mut delimiter_index = bytes.len();
-        let mut format_spec_index = None;
-        let mut item_depth = 0usize;
-        for (index, byte) in bytes.iter().enumerate() {
-            match byte {
-                b'[' => item_depth += 1,
-                b']' if item_depth > 0 => item_depth -= 1,
-                b'!' | b':' if item_depth == 0 => {
-                    if delimiter_index == bytes.len() {
-                        delimiter_index = index;
-                    }
-                    if *byte == b':' {
-                        format_spec_index = Some(index + 1);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let field_name = &field[..delimiter_index];
+        let (field_name, format_spec_index) = Self::str_format_field_name_and_spec(field);
         let root_end = field_name.find(['[', '.']).unwrap_or(field_name.len());
         let root = &field_name[..root_end];
         let has_item_lookup = field_name[root_end..].contains('[');
@@ -2235,10 +2229,10 @@ impl<'a> ScanState<'a> {
 
         if has_item_lookup {
             if let Some(index) = positional_index {
-                if let StrFormatRootItemLookup::Key(key) =
+                if let StrFormatRootItemLookup::Path(path) =
                     Self::str_format_root_item_key(field_name, root_end)
                 {
-                    lookups.push((index, key.map(str::to_string)));
+                    lookups.push((index, path));
                 }
             }
         }
@@ -2255,26 +2249,63 @@ impl<'a> ScanState<'a> {
         Some(())
     }
 
-    fn str_format_root_item_key(field_name: &str, root_end: usize) -> StrFormatRootItemLookup<'_> {
+    fn str_format_field_name_and_spec(field: &str) -> (&str, Option<usize>) {
+        let bytes = field.as_bytes();
+        let mut delimiter_index = bytes.len();
+        let mut format_spec_index = None;
+        let mut item_depth = 0usize;
+        for (index, byte) in bytes.iter().enumerate() {
+            match byte {
+                b'[' => item_depth += 1,
+                b']' if item_depth > 0 => item_depth -= 1,
+                b'!' | b':' if item_depth == 0 => {
+                    if delimiter_index == bytes.len() {
+                        delimiter_index = index;
+                    }
+                    if *byte == b':' {
+                        format_spec_index = Some(index + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        (&field[..delimiter_index], format_spec_index)
+    }
+
+    fn str_format_root_item_key(field_name: &str, root_end: usize) -> StrFormatRootItemLookup {
         let Some(suffix) = field_name.get(root_end..) else {
             return StrFormatRootItemLookup::Invalid;
         };
-        let Some((key, _)) = suffix
-            .strip_prefix('[')
-            .and_then(|value| value.split_once(']'))
-        else {
-            return StrFormatRootItemLookup::Invalid;
-        };
-        if key.is_empty() {
-            StrFormatRootItemLookup::Key(None)
-        } else if Self::is_str_format_decimal_syntax(key) {
-            if Self::parse_str_format_decimal_index(key).is_some() {
-                StrFormatRootItemLookup::Key(None)
+        let mut remaining = suffix;
+        let mut path = Vec::new();
+
+        while !remaining.is_empty() {
+            let Some(after_open) = remaining.strip_prefix('[') else {
+                return StrFormatRootItemLookup::Invalid;
+            };
+            let Some((key, after_close)) = after_open.split_once(']') else {
+                return StrFormatRootItemLookup::Invalid;
+            };
+            if key.is_empty() {
+                path.push(None);
+            } else if Self::is_str_format_decimal_syntax(key) {
+                if Self::parse_str_format_decimal_index(key).is_some() {
+                    path.push(None);
+                } else {
+                    return StrFormatRootItemLookup::Invalid;
+                }
             } else {
-                StrFormatRootItemLookup::Invalid
+                path.push(Some(key.to_string()));
             }
+            remaining = after_close;
+        }
+
+        if path.is_empty() {
+            StrFormatRootItemLookup::Invalid
         } else {
-            StrFormatRootItemLookup::Key(Some(key))
+            StrFormatRootItemLookup::Path(path)
         }
     }
 
@@ -2332,7 +2363,79 @@ impl<'a> ScanState<'a> {
         if arguments.len() != 2 || !self.brace_format_string_may_use_field(arguments.first()) {
             return Vec::new();
         }
-        self.mapping_lookup_invocations(arguments.get(1), None, op_name, position)
+        let Some(format_string) = resolve_global_operand(arguments.first(), self.payload) else {
+            return self.mapping_lookup_invocations(arguments.get(1), None, op_name, position);
+        };
+        Self::str_format_named_lookups(&format_string)
+            .into_iter()
+            .flat_map(|path| {
+                self.mapping_lookup_path_invocations(arguments.get(1), &path, op_name, position)
+            })
+            .collect()
+    }
+
+    fn str_format_named_lookups(format_string: &str) -> Vec<Vec<Option<String>>> {
+        let mut lookups = Vec::new();
+        let _ = Self::collect_str_format_named_lookup_paths(format_string, 0, &mut lookups);
+        lookups
+    }
+
+    fn collect_str_format_named_lookup_paths(
+        format_string: &str,
+        depth: usize,
+        lookups: &mut Vec<Vec<Option<String>>>,
+    ) -> Option<()> {
+        if depth > MAX_STR_FORMAT_FIELD_NESTING {
+            return Some(());
+        }
+
+        let bytes = format_string.as_bytes();
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'{' if bytes.get(cursor + 1) == Some(&b'{') => {
+                    cursor += 2;
+                }
+                b'{' => {
+                    let (field, next_cursor) =
+                        Self::extract_str_format_field(format_string, cursor + 1)?;
+                    Self::collect_str_format_field_named_lookup_paths(field, depth, lookups)?;
+                    cursor = next_cursor;
+                }
+                b'}' if bytes.get(cursor + 1) == Some(&b'}') => {
+                    cursor += 2;
+                }
+                b'}' => return None,
+                _ => cursor += 1,
+            }
+        }
+        Some(())
+    }
+
+    fn collect_str_format_field_named_lookup_paths(
+        field: &str,
+        depth: usize,
+        lookups: &mut Vec<Vec<Option<String>>>,
+    ) -> Option<()> {
+        let (field_name, format_spec_index) = Self::str_format_field_name_and_spec(field);
+        let root_end = field_name.find(['[', '.']).unwrap_or(field_name.len());
+        let root = &field_name[..root_end];
+        if !root.is_empty() && Self::parse_str_format_decimal_index(root).is_none() {
+            let mut path = vec![Some(root.to_string())];
+            if field_name[root_end..].contains('[') {
+                if let StrFormatRootItemLookup::Path(item_path) =
+                    Self::str_format_root_item_key(field_name, root_end)
+                {
+                    path.extend(item_path);
+                }
+            }
+            lookups.push(path);
+        }
+
+        if let Some(spec_start) = format_spec_index {
+            Self::collect_str_format_named_lookup_paths(&field[spec_start..], depth + 1, lookups)?;
+        }
+        Some(())
     }
 
     fn operator_mod_invocations(
@@ -2368,11 +2471,37 @@ impl<'a> ScanState<'a> {
         )]
     }
 
+    fn mapping_lookup_path_invocations(
+        &self,
+        mapping: Option<&StackValue>,
+        path: &[Option<String>],
+        op_name: &'static str,
+        position: usize,
+    ) -> Vec<CallableInvocation> {
+        let Some(MappingLookup::Found(default_factory)) =
+            Self::mapping_lookup_default_factory_path(mapping, path)
+        else {
+            return Vec::new();
+        };
+        vec![Self::zero_arg_invocation(
+            default_factory,
+            op_name,
+            position,
+        )]
+    }
+
     fn mapping_lookup_default_factory<'b>(
         mapping: Option<&'b StackValue>,
         key: Option<&str>,
     ) -> Option<MappingLookup<'b>> {
         Self::mapping_lookup_default_factory_inner(mapping?, key)
+    }
+
+    fn mapping_lookup_default_factory_path<'b>(
+        mapping: Option<&'b StackValue>,
+        path: &[Option<String>],
+    ) -> Option<MappingLookup<'b>> {
+        Self::mapping_lookup_default_factory_path_inner(mapping?, path)
     }
 
     fn mapping_lookup_default_factory_inner<'b>(
@@ -2383,8 +2512,8 @@ impl<'a> ScanState<'a> {
             StackValue::DefaultDict { default_factory } => {
                 Some(MappingLookup::Found(default_factory))
             }
-            StackValue::TrackedDict { keys, .. } => {
-                if key.is_some_and(|key| keys.iter().any(|candidate| candidate == key)) {
+            StackValue::TrackedDict { entries, .. } => {
+                if key.is_some_and(|key| entries.iter().any(|(candidate, _)| candidate == key)) {
                     Some(MappingLookup::Shadowed)
                 } else {
                     None
@@ -2411,6 +2540,49 @@ impl<'a> ScanState<'a> {
             } if reference.module == "types" && reference.name == "MappingProxyType" => mappings
                 .first()
                 .and_then(|mapping| Self::mapping_lookup_default_factory_inner(mapping, key)),
+            _ => None,
+        }
+    }
+
+    fn mapping_lookup_default_factory_path_inner<'b>(
+        mapping: &'b StackValue,
+        path: &[Option<String>],
+    ) -> Option<MappingLookup<'b>> {
+        match mapping {
+            StackValue::DefaultDict { default_factory } => {
+                Some(MappingLookup::Found(default_factory))
+            }
+            StackValue::TrackedDict { entries, .. } => {
+                let (key, remaining_path) = path.split_first()?;
+                let key = key.as_deref()?;
+                let (_, value) = entries.iter().find(|(candidate, _)| candidate == key)?;
+                if remaining_path.is_empty() {
+                    Some(MappingLookup::Shadowed)
+                } else {
+                    Self::mapping_lookup_default_factory_path_inner(value, remaining_path)
+                }
+            }
+            StackValue::MappingWrapper {
+                reference,
+                mappings,
+            } if reference.module == "collections" && reference.name == "ChainMap" => {
+                for mapping in mappings {
+                    match Self::mapping_lookup_default_factory_path_inner(mapping, path) {
+                        Some(MappingLookup::Found(default_factory)) => {
+                            return Some(MappingLookup::Found(default_factory));
+                        }
+                        Some(MappingLookup::Shadowed) => return Some(MappingLookup::Shadowed),
+                        None => {}
+                    }
+                }
+                None
+            }
+            StackValue::MappingWrapper {
+                reference,
+                mappings,
+            } if reference.module == "types" && reference.name == "MappingProxyType" => mappings
+                .first()
+                .and_then(|mapping| Self::mapping_lookup_default_factory_path_inner(mapping, path)),
             _ => None,
         }
     }
@@ -2445,7 +2617,15 @@ impl<'a> ScanState<'a> {
         {
             return Vec::new();
         }
-        self.mapping_lookup_invocations(arguments.get(3), None, op_name, position)
+        let Some(format_string) = resolve_global_operand(arguments.get(1), self.payload) else {
+            return self.mapping_lookup_invocations(arguments.get(3), None, op_name, position);
+        };
+        Self::str_format_named_lookups(&format_string)
+            .into_iter()
+            .flat_map(|path| {
+                self.mapping_lookup_path_invocations(arguments.get(3), &path, op_name, position)
+            })
+            .collect()
     }
 
     fn template_substitute_invocations(
@@ -3076,8 +3256,8 @@ impl<'a> ScanState<'a> {
                 callbacks.memo_index = Some(index);
                 StackValue::FutureCallbacks(callbacks)
             }
-            StackValue::TrackedDict { keys, .. } => StackValue::TrackedDict {
-                keys,
+            StackValue::TrackedDict { entries, .. } => StackValue::TrackedDict {
+                entries,
                 memo_index: Some(index),
             },
             value => value,
@@ -3553,7 +3733,7 @@ impl<'a> ScanState<'a> {
 
         if mappings
             .iter()
-            .all(|mapping| Self::mapping_lookup_default_factory(Some(mapping), None).is_none())
+            .all(|mapping| !Self::mapping_may_contain_default_factory(mapping))
         {
             return None;
         }
@@ -3562,6 +3742,19 @@ impl<'a> ScanState<'a> {
             reference: callable_reference.clone(),
             mappings,
         })
+    }
+
+    fn mapping_may_contain_default_factory(mapping: &StackValue) -> bool {
+        match mapping {
+            StackValue::DefaultDict { .. } => true,
+            StackValue::TrackedDict { entries, .. } => entries
+                .iter()
+                .any(|(_, value)| Self::mapping_may_contain_default_factory(value)),
+            StackValue::MappingWrapper { mappings, .. } => mappings
+                .iter()
+                .any(Self::mapping_may_contain_default_factory),
+            _ => false,
+        }
     }
 
     fn callable_reference_from_value(value: Option<&StackValue>) -> Option<GlobalRef> {

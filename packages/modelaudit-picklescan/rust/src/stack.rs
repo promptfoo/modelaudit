@@ -58,7 +58,7 @@ pub(crate) enum StackValue {
         default_factory: GlobalRef,
     },
     TrackedDict {
-        keys: Vec<String>,
+        entries: Vec<(String, StackValue)>,
         memo_index: Option<i64>,
     },
     MappingWrapper {
@@ -116,8 +116,10 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
         Some(StackValue::DefaultDict { default_factory }) => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
-        Some(StackValue::TrackedDict { keys, .. }) if keys.is_empty() => "dict:{}".to_string(),
-        Some(StackValue::TrackedDict { keys, .. }) => format!("dict(keys={})", keys.len()),
+        Some(StackValue::TrackedDict { entries, .. }) if entries.is_empty() => {
+            "dict:{}".to_string()
+        }
+        Some(StackValue::TrackedDict { entries, .. }) => format!("dict(keys={})", entries.len()),
         Some(StackValue::MappingWrapper {
             reference,
             mappings,
@@ -221,8 +223,8 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
         StackValue::DefaultDict { default_factory } => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
-        StackValue::TrackedDict { keys, .. } if keys.is_empty() => "dict:{}".to_string(),
-        StackValue::TrackedDict { keys, .. } => format!("dict(keys={})", keys.len()),
+        StackValue::TrackedDict { entries, .. } if entries.is_empty() => "dict:{}".to_string(),
+        StackValue::TrackedDict { entries, .. } => format!("dict(keys={})", entries.len()),
         StackValue::MappingWrapper {
             reference,
             mappings,
