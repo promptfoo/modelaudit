@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- detect nested brace-format lookups that reach tracked `defaultdict` factories
 - avoid `str.format` picklescan false positives when a `ChainMap` shadows a `defaultdict`
 - block `statistics.quantiles` call-iterator consumption in picklescan call-graph analysis
 - block additional eager `statistics` consumers in picklescan call-graph analysis
