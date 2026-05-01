@@ -3552,6 +3552,12 @@ if marker.read_text() != marker_content:
             False,
         ),
         (
+            _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "quantiles", b"h\x00"),
+            "[7, 8, 'stop']",
+            "[6.75, 7.5, 8.25]",
+            False,
+        ),
+        (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "pstdev", b"h\x00"),
             "[7, 7, 'stop']",
             "0.0",
