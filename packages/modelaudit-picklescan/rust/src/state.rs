@@ -132,6 +132,7 @@ const EXACT_ARITY_STDLIB_EAGER_ITERABLE_CONSUMERS: &[(&str, &str, usize, usize)]
     ("statistics", "median_low", 1, 0),
     ("statistics", "mode", 1, 0),
     ("statistics", "multimode", 1, 0),
+    ("statistics", "quantiles", 1, 0),
     ("statistics", "pstdev", 1, 0),
     ("statistics", "pstdev", 2, 0),
     ("statistics", "pvariance", 1, 0),

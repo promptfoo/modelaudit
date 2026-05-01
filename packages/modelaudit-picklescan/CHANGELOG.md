@@ -10,6 +10,7 @@ and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - avoid `str.format` false positives when a `ChainMap` shadows a `defaultdict`
+- block `statistics.quantiles` call-iterator consumption in call-graph analysis
 - block additional eager `statistics` consumers in call-graph analysis
 - avoid false positives for inert metadata under dangerous dotted globals
 - detect dangerous positional lookups inside `str.format` replacement fields
