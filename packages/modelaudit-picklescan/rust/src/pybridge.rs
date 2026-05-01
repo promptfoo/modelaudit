@@ -20,6 +20,7 @@ pub(crate) fn scan_bytes(
     let options = ScanOptions::from_py(options)?;
     let source = source.to_string();
     let started_at = Instant::now();
+    ScanState::set_runtime_python_minor_version(py.version_info().minor);
     let mut scan = ScanState::new(
         source,
         payload.as_ref(),

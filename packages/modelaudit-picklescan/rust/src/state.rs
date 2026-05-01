@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
 use crate::expansion::{
@@ -39,15 +40,16 @@ use crate::strings::{is_repeated_single_byte, suspicious_string_matches};
 const MIN_SUSPICIOUS_LITERAL_SCAN_WINDOW_CHARS: usize = 8192;
 const SUSPICIOUS_LITERAL_SCAN_OVERLAP_CHARS: usize = 4096;
 const MAX_STR_FORMAT_FIELD_NESTING: usize = 4;
+static RUNTIME_PYTHON_MINOR_VERSION: AtomicU8 = AtomicU8::new(13);
 const STR_FORMAT_DECIMAL_ZERO_CODEPOINTS: &[u32] = &[
     0x0030, 0x0660, 0x06F0, 0x07C0, 0x0966, 0x09E6, 0x0A66, 0x0AE6, 0x0B66, 0x0BE6, 0x0C66, 0x0CE6,
     0x0D66, 0x0DE6, 0x0E50, 0x0ED0, 0x0F20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80,
     0x1A90, 0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0,
     0xFF10, 0x104A0, 0x10D30, 0x11066, 0x110F0, 0x11136, 0x111D0, 0x112F0, 0x11450, 0x114D0,
-    0x11650, 0x116C0, 0x11730, 0x118E0, 0x11950, 0x11C50, 0x11D50, 0x11DA0, 0x11F50, 0x16A60,
-    0x16AC0, 0x16B50, 0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140, 0x1E2F0, 0x1E4F0,
-    0x1E950, 0x1FBF0,
+    0x11650, 0x116C0, 0x11730, 0x118E0, 0x11950, 0x11C50, 0x11D50, 0x11DA0, 0x16A60, 0x16B50,
+    0x1D7CE, 0x1D7D8, 0x1D7E2, 0x1D7EC, 0x1D7F6, 0x1E140, 0x1E2F0, 0x1E950, 0x1FBF0,
 ];
+const PYTHON_3_12_PLUS_STR_FORMAT_DECIMAL_ZERO_CODEPOINTS: &[u32] = &[0x11F50, 0x16AC0, 0x1E4F0];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FormatFieldNumbering {
@@ -466,6 +468,10 @@ pub(crate) struct ScanState<'a> {
 }
 
 impl<'a> ScanState<'a> {
+    pub(crate) fn set_runtime_python_minor_version(minor: u8) {
+        RUNTIME_PYTHON_MINOR_VERSION.store(minor, Ordering::Relaxed);
+    }
+
     pub(crate) fn new(
         source: String,
         payload: &'a [u8],
@@ -2271,7 +2277,27 @@ impl<'a> ScanState<'a> {
 
     fn str_format_decimal_digit_value(ch: char) -> Option<u32> {
         let codepoint = ch as u32;
-        STR_FORMAT_DECIMAL_ZERO_CODEPOINTS.iter().find_map(|zero| {
+        Self::str_format_decimal_digit_value_in_ranges(
+            codepoint,
+            STR_FORMAT_DECIMAL_ZERO_CODEPOINTS,
+        )
+        .or_else(|| {
+            (RUNTIME_PYTHON_MINOR_VERSION.load(Ordering::Relaxed) >= 12)
+                .then(|| {
+                    Self::str_format_decimal_digit_value_in_ranges(
+                        codepoint,
+                        PYTHON_3_12_PLUS_STR_FORMAT_DECIMAL_ZERO_CODEPOINTS,
+                    )
+                })
+                .flatten()
+        })
+    }
+
+    fn str_format_decimal_digit_value_in_ranges(
+        codepoint: u32,
+        zero_codepoints: &[u32],
+    ) -> Option<u32> {
+        zero_codepoints.iter().find_map(|zero| {
             (codepoint >= *zero && codepoint < *zero + 10).then_some(codepoint - *zero)
         })
     }
