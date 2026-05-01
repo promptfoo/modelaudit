@@ -57,6 +57,12 @@ def _args_tuple(*arg_operands: bytes) -> bytes:
     return b"(" + b"".join(arg_operands) + b"t"
 
 
+def _singleton_small_int_tuple_operand(value: int) -> bytes:
+    if not 0 <= value <= 0xFF:
+        raise ValueError("singleton int tuple helper accepts one-byte positive ints")
+    return bytes([ord("K"), value, 0x85])
+
+
 def _global_call_payload(module: str, name: str, *arg_operands: bytes) -> bytes:
     return b"".join([b"\x80\x04", _global_operand(module, name), _args_tuple(*arg_operands), b"R."])
 
@@ -3236,82 +3242,97 @@ if marker.read_text() != marker_content:
 
 
 @pytest.mark.parametrize(
-    ("payload", "values_literal", "expected_repr"),
+    ("payload", "values_literal", "expected_repr", "requires_python311"),
     [
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("array", "array", _unicode_operand("i"), b"h\x00"),
             "[7, 'stop']",
             "array('i', [7])",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("collections", "Counter", b"h\x00"),
             "['owned-value', 'stop']",
             "Counter({'owned-value': 1})",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("collections", "OrderedDict", b"h\x00"),
             "[('owned-key', 'owned-value'), 'stop']",
             "OrderedDict({'owned-key': 'owned-value'})",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("collections", "UserDict", b"h\x00"),
             "[('owned-key', 'owned-value'), 'stop']",
             "{'owned-key': 'owned-value'}",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("collections", "UserList", b"h\x00"),
             "['owned-value', 'stop']",
             "['owned-value']",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("math", "prod", b"h\x00"),
             "[7, 'stop']",
             "7",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("math", "fsum", b"h\x00"),
             "[7, 'stop']",
             "7.0",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("heapq", "nlargest", b"K\x01", b"h\x00"),
             "['owned-value', 'stop']",
             "['owned-value']",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("heapq", "nlargest", b"K\x01", b"h\x00", b"N"),
             "['owned-value', 'stop']",
             "['owned-value']",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("heapq", "nsmallest", b"K\x01", b"h\x00"),
             "['owned-value', 'stop']",
             "['owned-value']",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("heapq", "nsmallest", b"K\x01", b"h\x00", b"N"),
             "['owned-value', 'stop']",
             "['owned-value']",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "fmean", b"h\x00"),
             "[7, 'stop']",
             "7.0",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "fmean", b"h\x00", b"N"),
             "[7, 'stop']",
             "7.0",
+            True,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "geometric_mean", b"h\x00"),
             "[7, 'stop']",
             "6.999999999999999",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "harmonic_mean", b"h\x00"),
             "[7, 'stop']",
             "7",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload(
@@ -3322,21 +3343,25 @@ if marker.read_text() != marker_content:
             ),
             "[7, 'stop']",
             "7",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "mean", b"h\x00"),
             "[7, 'stop']",
             "7",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "median", b"h\x00"),
             "[7, 'stop']",
             "7",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "median_grouped", b"h\x00"),
             "[7, 'stop']",
             "7.0",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload(
@@ -3347,66 +3372,79 @@ if marker.read_text() != marker_content:
             ),
             "[7, 'stop']",
             "7.0",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "median_high", b"h\x00"),
             "[7, 'stop']",
             "7",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "median_low", b"h\x00"),
             "[7, 'stop']",
             "7",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "mode", b"h\x00"),
             "[7, 7, 'stop']",
             "7",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "multimode", b"h\x00"),
             "[7, 7, 'stop']",
             "[7]",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "pstdev", b"h\x00"),
             "[7, 7, 'stop']",
             "0.0",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "pstdev", b"h\x00", b"N"),
             "[7, 7, 'stop']",
             "0.0",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "pvariance", b"h\x00"),
             "[7, 7, 'stop']",
             "0",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "pvariance", b"h\x00", b"N"),
             "[7, 7, 'stop']",
             "0",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "stdev", b"h\x00"),
             "[7, 7, 'stop']",
             "0.0",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "stdev", b"h\x00", b"N"),
             "[7, 7, 'stop']",
             "0.0",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "variance", b"h\x00"),
             "[7, 7, 'stop']",
             "0",
+            False,
         ),
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("statistics", "variance", b"h\x00", b"N"),
             "[7, 7, 'stop']",
             "0",
+            False,
         ),
     ],
 )
@@ -3415,6 +3453,7 @@ def test_scan_bytes_blocks_stdlib_eager_call_iterator_consumption_rce(
     payload: bytes,
     values_literal: str,
     expected_repr: str,
+    requires_python311: bool,
 ) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
@@ -3446,6 +3485,8 @@ def test_scan_bytes_blocks_stdlib_eager_call_iterator_consumption_rce(
     )
 
     assert not marker.exists()
+    if requires_python311 and sys.version_info < (3, 11):
+        return
     child_code = """
 import ast
 import pickle
@@ -3478,6 +3519,109 @@ if result_repr != expected_repr and not (
 ) and not (
     type(result).__name__ == "OrderedDict" and repr(dict(result)) == expected_ordered_dict_repr
 ):
+    raise SystemExit(f"expected {expected_repr}, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content, expected_repr],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
+@pytest.mark.parametrize(
+    ("payload", "values_literal", "expected_repr", "requires_python311"),
+    [
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload(
+                "statistics",
+                "fmean",
+                _singleton_small_int_tuple_operand(7),
+                b"h\x00",
+            ),
+            "[1, 'stop']",
+            "7.0",
+            True,
+        ),
+        (
+            _builtins_help_call_iterator_stdlib_materializer_payload(
+                "statistics",
+                "harmonic_mean",
+                _singleton_small_int_tuple_operand(7),
+                b"h\x00",
+            ),
+            "[1, 'stop']",
+            "7.0",
+            False,
+        ),
+    ],
+)
+def test_scan_bytes_blocks_weighted_statistics_call_iterator_consumption_rce(
+    tmp_path: Path,
+    payload: bytes,
+    values_literal: str,
+    expected_repr: str,
+    requires_python311: bool,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "weighted_statistics_call_iterator_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        f"_values = {values_literal}\n"
+        "def help(*args, **kwargs):\n"
+        "    return _values.pop(0) if _values else 'stop'\n",
+        encoding="utf-8",
+    )
+
+    report = scan_bytes(payload, source="weighted-statistics-call-iterator-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    if requires_python311 and sys.version_info < (3, 11):
+        return
+
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+expected_repr = sys.argv[5]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if repr(result) != expected_repr:
     raise SystemExit(f"expected {expected_repr}, got {result!r}")
 if not marker.exists():
     raise SystemExit("marker was not written")
