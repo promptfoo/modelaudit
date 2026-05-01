@@ -892,6 +892,34 @@ def _chainmap_shadowed_defaultdict_getitem_payload() -> bytes:
     )
 
 
+def _chainmap_shadowed_defaultdict_str_format_payload() -> bytes:
+    return b"".join(
+        [
+            b"\x80\x04",
+            b"}",
+            b"\x94",
+            _unicode_operand("present"),
+            _unicode_operand("safe"),
+            b"s",
+            b"0",
+            _global_operand("collections", "defaultdict"),
+            _global_operand("builtins", "help"),
+            b"\x85R",
+            b"\x94",
+            b"0",
+            _global_operand("collections", "ChainMap"),
+            b"h\x00",
+            b"h\x01",
+            b"\x86R",
+            b"\x94",
+            b"0",
+            _global_operand("builtins", "str.format"),
+            _args_tuple(_unicode_operand("{0[present]}"), b"h\x02"),
+            b"R.",
+        ]
+    )
+
+
 def _deep_mapping_proxy_defaultdict_getitem_payload(depth: int) -> bytes:
     if not 1 <= depth <= 255:
         raise ValueError("depth must fit one-byte memo references")
@@ -6401,6 +6429,59 @@ def test_scan_bytes_keeps_non_lookup_str_format_defaultdict_cases_clean(
         and invocation.get("positional_arg_count") == 0
         for invocation in report.metadata.get("callable_invocations", [])
     )
+
+
+def test_scan_bytes_keeps_str_format_chainmap_shadowed_defaultdict_lookup_clean(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "str_format_chainmap_shadowed_defaultdict_marker"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('pydoc-owned')\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+    payload = _chainmap_shadowed_defaultdict_str_format_payload()
+
+    report = scan_bytes(payload, source="str-format-chainmap-shadowed-defaultdict-lookup.pkl")
+
+    assert report.verdict == SafetyVerdict.CLEAN
+    assert not any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != "safe":
+    raise SystemExit(f"expected shadowed ChainMap value, got {result!r}")
+if marker.exists():
+    raise SystemExit("default factory unexpectedly imported pydoc")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
 
 
 def test_scan_bytes_keeps_format_map_defaultdict_bytes_receiver_clean() -> None:

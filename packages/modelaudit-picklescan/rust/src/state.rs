@@ -2047,12 +2047,12 @@ impl<'a> ScanState<'a> {
         let Some(format_string) = resolve_global_operand(arguments.first(), self.payload) else {
             return invocations;
         };
-        let lookup_indices = Self::str_format_positional_lookup_indices(&format_string);
+        let lookups = Self::str_format_positional_lookups(&format_string);
 
-        for index in lookup_indices {
+        for (index, key) in lookups {
             invocations.extend(self.mapping_lookup_invocations(
                 arguments.get(index + 1),
-                None,
+                key.as_deref(),
                 op_name,
                 position,
             ));
@@ -2060,18 +2060,18 @@ impl<'a> ScanState<'a> {
         invocations
     }
 
-    fn str_format_positional_lookup_indices(format_string: &str) -> Vec<usize> {
+    fn str_format_positional_lookups(format_string: &str) -> Vec<(usize, Option<String>)> {
         let mut numbering = FormatFieldNumbering::Unset;
         let mut next_auto_index = 0;
-        let mut lookup_indices = Vec::new();
+        let mut lookups = Vec::new();
         let _ = Self::collect_str_format_lookup_indices(
             format_string,
             0,
             &mut numbering,
             &mut next_auto_index,
-            &mut lookup_indices,
+            &mut lookups,
         );
-        lookup_indices
+        lookups
     }
 
     fn collect_str_format_lookup_indices(
@@ -2079,7 +2079,7 @@ impl<'a> ScanState<'a> {
         depth: usize,
         numbering: &mut FormatFieldNumbering,
         next_auto_index: &mut usize,
-        lookup_indices: &mut Vec<usize>,
+        lookups: &mut Vec<(usize, Option<String>)>,
     ) -> Option<()> {
         if depth > MAX_STR_FORMAT_FIELD_NESTING {
             return Some(());
@@ -2100,7 +2100,7 @@ impl<'a> ScanState<'a> {
                         depth,
                         numbering,
                         next_auto_index,
-                        lookup_indices,
+                        lookups,
                     )?;
                     cursor = next_cursor;
                 }
@@ -2146,7 +2146,7 @@ impl<'a> ScanState<'a> {
         depth: usize,
         numbering: &mut FormatFieldNumbering,
         next_auto_index: &mut usize,
-        lookup_indices: &mut Vec<usize>,
+        lookups: &mut Vec<(usize, Option<String>)>,
     ) -> Option<()> {
         let bytes = field.as_bytes();
         let mut delimiter_index = bytes.len();
@@ -2194,7 +2194,10 @@ impl<'a> ScanState<'a> {
 
         if has_item_lookup {
             if let Some(index) = positional_index {
-                lookup_indices.push(index);
+                lookups.push((
+                    index,
+                    Self::str_format_root_item_key(field_name, root_end).map(str::to_string),
+                ));
             }
         }
 
@@ -2204,10 +2207,20 @@ impl<'a> ScanState<'a> {
                 depth + 1,
                 numbering,
                 next_auto_index,
-                lookup_indices,
+                lookups,
             )?;
         }
         Some(())
+    }
+
+    fn str_format_root_item_key(field_name: &str, root_end: usize) -> Option<&str> {
+        let suffix = field_name.get(root_end..)?;
+        let key = suffix.strip_prefix('[')?.split_once(']')?.0;
+        if key.is_empty() || key.bytes().all(|byte| byte.is_ascii_digit()) {
+            None
+        } else {
+            Some(key)
+        }
     }
 
     fn str_format_map_invocations(
