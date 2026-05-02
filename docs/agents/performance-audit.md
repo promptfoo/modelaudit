@@ -951,6 +951,22 @@ Priority 1:
 - Notes:
   - this is a scanner-local cleanup for models with many function references; the broad non-slow suite still has a separate noisy picklescan timing guard on this machine
 
+### 2026-05-02 - Shared Jinja scanner pattern set
+
+- PR:
+  - `#1184`
+- Change:
+  - Jinja SSTI regexes are now compiled once at module load and reused across fresh scanner instances
+  - this removes repeated static setup from the per-file scanner-construction path
+- Targeted regression:
+  - `tests/scanners/test_jinja2_template_scanner.py::test_jinja_scanner_reuses_precompiled_patterns`
+- Benchmarks:
+  - `2,000` `Jinja2TemplateScanner()` constructions:
+    - before: `0.078247s` median
+    - after: `0.000606s` median
+- Notes:
+  - this is a many-file routing win because `get_scanner_for_file()` creates a fresh scanner instance for each matched path
+
 ### 2026-05-01 - Shared C2 payload lowercase view
 
 - PR:
