@@ -1497,6 +1497,28 @@ def test_pickle_scanner_delegates_jax_patterns_for_pkl_suffixes(tmp_path: Path) 
     )
 
 
+def test_pickle_scanner_skips_jax_delegation_for_complete_non_jax_payloads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "plain_state.pkl"
+    payload = pickle.dumps({"payload": "ordinary pickle state"})
+    path.write_bytes(payload)
+
+    scanner = PickleScanner()
+    result = scanner._create_result()
+
+    def fail_if_called(path: str, text: str) -> ScanResult:
+        raise AssertionError("JAX checkpoint delegation should be skipped")
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.jax_checkpoint_scanner.JaxCheckpointScanner.scan_pickle_pattern_text",
+        fail_if_called,
+    )
+
+    scanner._scan_jax_checkpoint_patterns_if_needed(str(path), len(payload), payload, result)
+
+
 def test_pickle_scanner_uses_jax_window_beyond_root_raw_scan_limit(tmp_path: Path) -> None:
     path = tmp_path / "late-jax.pkl"
     path.write_bytes(pickle.dumps({"padding": "a" * 256, "payload": "jax.experimental.io_callback"}))
