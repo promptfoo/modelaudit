@@ -1359,6 +1359,26 @@ def test_directory_child_probe_stops_at_limit(monkeypatch: pytest.MonkeyPatch, t
     )
 
 
+def test_directory_file_probe_stops_after_limit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def bounded_rglob(self: Path, pattern: str) -> Iterator[Path]:
+        assert pattern == "*"
+        for index in range(core_module._DIRECTORY_PRECOUNT_CHILD_LIMIT + 1):
+            child = self / f"child_{index}.pkl"
+            child.touch()
+            yield child
+        raise AssertionError("directory file probe consumed past its limit")
+
+    monkeypatch.setattr(Path, "rglob", bounded_rglob)
+
+    assert (
+        core_module._count_files_up_to(
+            tmp_path,
+            core_module._DIRECTORY_PRECOUNT_CHILD_LIMIT,
+        )
+        is None
+    )
+
+
 def test_scan_file_routes_manifest_owned_chat_templates_through_jinja_analysis(tmp_path: Path) -> None:
     manifest_path = tmp_path / "config.json"
     manifest_path.write_text(

@@ -77,6 +77,12 @@ def _count_immediate_children_up_to(path: Path, limit: int) -> int:
     return sum(1 for _child in itertools.islice(path.iterdir(), limit))
 
 
+def _count_files_up_to(path: Path, limit: int) -> int | None:
+    """Return an exact recursive file count only while it stays within `limit`."""
+    count = sum(1 for candidate in itertools.islice((item for item in path.rglob("*") if item.is_file()), limit + 1))
+    return None if count > limit else count
+
+
 _add_issue_to_model = core_results.add_issue_to_model
 _add_scan_result_to_model = core_results.add_scan_result_to_model
 _consolidate_checks = core_results.consolidate_checks
@@ -466,7 +472,7 @@ def scan_model_directory_or_file(
                 )
                 # Only run the recursive count for narrower roots.
                 if immediate_children < _DIRECTORY_PRECOUNT_CHILD_LIMIT:
-                    total_files = sum(1 for _ in Path(path).rglob("*") if _.is_file())
+                    total_files = _count_files_up_to(Path(path), _DIRECTORY_PRECOUNT_CHILD_LIMIT)
             except (OSError, PermissionError):
                 # If we can't count, just proceed without progress percentage
                 total_files = None
