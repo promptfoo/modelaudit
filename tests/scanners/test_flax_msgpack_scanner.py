@@ -10,7 +10,7 @@ pytest.importorskip("msgpack")
 import msgpack
 
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner
+from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner, _matching_jax_transforms
 
 
 def create_msgpack_file(path: Path, data: Any) -> None:
@@ -28,6 +28,26 @@ def create_malicious_msgpack_file(path):
         "suspicious_blob": b"eval(compile('malicious code', 'string', 'exec'))" * 1000,
     }
     create_msgpack_file(path, malicious_data)
+
+
+class _LowerCountingText(str):
+    lower_calls: int
+
+    def __new__(cls, value: str) -> "_LowerCountingText":
+        instance = super().__new__(cls, value)
+        instance.lower_calls = 0
+        return instance
+
+    def lower(self) -> str:
+        self.lower_calls += 1
+        return super().lower()
+
+
+def test_matching_jax_transforms_reuses_lowered_value_text() -> None:
+    value = _LowerCountingText("dynamic_eval payload")
+
+    assert _matching_jax_transforms("weights", value) == ["dynamic_eval"]
+    assert value.lower_calls == 1
 
 
 def test_flax_msgpack_valid_checkpoint(tmp_path):

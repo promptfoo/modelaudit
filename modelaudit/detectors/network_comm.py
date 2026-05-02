@@ -862,32 +862,35 @@ class NetworkCommDetector:
 
     def _scan_cc_patterns(self, data: bytes, context: str) -> None:
         """Scan for command & control patterns."""
+        lowered_data = data.lower()
         for pattern in self.cc_patterns:
-            if pattern in data.lower():
-                # Get context
-                idx = data.lower().find(pattern)
-                start = max(0, idx - 30)
-                end = min(len(data), idx + len(pattern) + 30)
-                snippet = data[start:end].decode("utf-8", errors="ignore")
+            idx = lowered_data.find(pattern)
+            if idx < 0:
+                continue
 
-                confidence = 0.8
-                severity = "CRITICAL"
+            # Get context
+            start = max(0, idx - 30)
+            end = min(len(data), idx + len(pattern) + 30)
+            snippet = data[start:end].decode("utf-8", errors="ignore")
 
-                # Very suspicious patterns
-                if pattern in [b"malware", b"backdoor", b"trojan", b"botnet"]:
-                    confidence = 0.95
+            confidence = 0.8
+            severity = "CRITICAL"
 
-                self.findings.append(
-                    {
-                        "type": "cc_pattern",
-                        "severity": severity,
-                        "confidence": confidence,
-                        "message": f"C&C pattern detected: {pattern.decode()}",
-                        "pattern": pattern.decode(),
-                        "snippet": snippet,
-                        "context": context,
-                    }
-                )
+            # Very suspicious patterns
+            if pattern in [b"malware", b"backdoor", b"trojan", b"botnet"]:
+                confidence = 0.95
+
+            self.findings.append(
+                {
+                    "type": "cc_pattern",
+                    "severity": severity,
+                    "confidence": confidence,
+                    "message": f"C&C pattern detected: {pattern.decode()}",
+                    "pattern": pattern.decode(),
+                    "snippet": snippet,
+                    "context": context,
+                }
+            )
 
     def _scan_suspicious_ports(self, data: bytes, context: str) -> None:
         """Scan for references to suspicious ports."""
@@ -994,8 +997,12 @@ class NetworkCommDetector:
 
     def _check_blacklist(self, data: bytes, context: str) -> None:
         """Check against blacklisted domains/IPs."""
+        if not self.blacklisted_domains:
+            return
+
+        lowered_data = data.lower()
         for blacklisted in self.blacklisted_domains:
-            if blacklisted in data.lower():
+            if blacklisted in lowered_data:
                 self.findings.append(
                     {
                         "type": "blacklisted_domain",
