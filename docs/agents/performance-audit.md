@@ -1199,6 +1199,28 @@ Priority 1:
 - Decision:
   - do not land the change; the benefit only appeared on the no-match path and reversed on the URL-heavy case that matters more for this scanner
 
+### 2026-05-02 - Metadata secret-pattern precompile
+
+- Hypothesis:
+  - precompile the metadata secret-pattern bank instead of rebuilding the literal regex list inside each document scan
+- Result:
+  - controlled no-match README workload after testing the real helper shape:
+    - literal regex path: `1.626721s` median
+    - precompiled pattern bank: `1.936317s` median
+- Decision:
+  - do not land the change; once Python's regex cache and the actual helper structure were included, the precompiled path regressed
+
+### 2026-05-02 - Metadata `can_handle()` README-name set
+
+- Hypothesis:
+  - replace the per-call README-name list with a shared `frozenset`
+- Result:
+  - synthetic mixed path list:
+    - current list path: `0.205046s` median
+    - shared set path: `0.220426s` median
+- Decision:
+  - do not land the change; the current tiny list is already cheap enough that the shared-set form was slower in the measured route
+
 ### 2026-05-02 - Generic ZIP config-name lowercase reuse
 
 - Hypothesis:
