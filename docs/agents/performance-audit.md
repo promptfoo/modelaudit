@@ -1,0 +1,686 @@
+# Performance Audit
+
+Status: active audit started 2026-05-01
+
+## Goals
+
+- Explain where scan wall time goes for representative workloads.
+- Separate necessary security cost from avoidable repeated work.
+- Record reproducible measurements before changing behavior.
+- Build a ranked implementation plan with correctness constraints.
+
+## Current Measurement Setup
+
+- Host: local developer machine, macOS, Python 3.12 via `uv run`
+- Telemetry disabled for benchmarks with `PROMPTFOO_DISABLE_TELEMETRY=1`
+- Cache disabled unless a benchmark explicitly measures cache behavior
+- Profiles collected with `cProfile`
+- Existing benchmark surfaces:
+  - `tests/benchmarks/test_scan_benchmarks.py`
+  - `tests/benchmarks/test_picklescan_benchmarks.py`
+  - `tests/test_performance_benchmarks.py`
+
+## Initial Baseline
+
+| Scenario | Wall time | Notes |
+| --- | ---: | --- |
+| `tests/assets` warm directory scan | `1.841717s` median | `90` scanned files, `2,052,565` bytes |
+| same corpus with call-graph cache clearing monkeypatched out | `0.813108s` | controlled experiment only |
+| `tests/assets/samples/pickles/safe_large_model.pkl` | `0.047192s` median | `562,936` bytes |
+| `tests/assets/scenarios/license_scenarios/agpl_component/agpl_model.pkl` | `0.292767s` median | nested-pickle-heavy |
+| `tests/assets/samples/pickles/dill_func.pkl` | `0.519226s` median | imported-function call-graph-heavy |
+| synthetic `64 MiB` `.dat` single-file scan | `0.295140s` median | dominated by license metadata scan |
+| synthetic `64 MiB` `.safetensors` single-file scan | `0.182532s` median | scanner integrity hashing dominates |
+| synthetic `64 MiB` manifest-style `.json` single-file scan | `0.056719s` median | repeated reads exist, but not a top hotspot on local SSD |
+| synthetic `64 MiB` `.safetensors` cache miss | `0.564129s` | cache hashing adds another full-file pass |
+| synthetic `64 MiB` `.safetensors` cache hit | `0.083838s` | cache helps repeated scans materially |
+| synthetic `2000` empty `.dat` files | `3.748604s` median | many-file overhead even when payload bytes are zero |
+| synthetic `500` tiny `.pkl` files | `1.264593s` median | per-file routing/scanner overhead |
+| synthetic `32` duplicate `safe_large_model.pkl` files | `1.519745s` median | repeated per-file scanner work despite identical bytes |
+
+Benchmark artifacts:
+
+- Manual canonical harness output: `/tmp/modelaudit-perf-audit-baseline.json`
+- Per-file fixture timing output: `/tmp/modelaudit-perf-per-file.json`
+- `scripts/profile_scan.py` outputs:
+  - `/tmp/modelaudit-profile-assets.{json,pstats}`
+  - `/tmp/modelaudit-profile-dill.{json,pstats}`
+  - `/tmp/modelaudit-profile-safe-large.{json,pstats}`
+- Existing `pytest-benchmark` suites currently skip on Python `3.12` because the global test allowlist in `tests/conftest.py` excludes the benchmark files on reduced-version lanes. Running with `uv run --with pytest-benchmark ...` installs the plugin, but the tests still skip under the repo's current lane policy.
+
+Slowest fixture files in the current corpus:
+
+| File | Median wall time | Notes |
+| --- | ---: | --- |
+| `tests/assets/samples/pickles/dill_func.pkl` | `0.523042s` | imported-function call-graph-heavy |
+| `tests/assets/scenarios/license_scenarios/agpl_component/agpl_model.pkl` | `0.288373s` | nested-pickle-heavy |
+| `tests/assets/exploits/exploit7_nested_collections.pkl` | `0.152323s` | tiny file, expensive enrichment |
+| `tests/assets/exploits/exploit9_manual_construction.pkl` | `0.102370s` | tiny file, expensive enrichment |
+| `tests/assets/exploits/exploit_ultimate_50pct.pkl` | `0.101479s` | tiny file, expensive enrichment |
+
+## Initial Hotspots
+
+### 1. Pickle call-graph enrichment
+
+- Directory `cProfile` showed most warm corpus time under:
+  - `modelaudit_picklescan.call_graph.find_dangerous_call_graphs`
+  - `modelaudit_picklescan.call_graph.find_startup_hook_write_call_graphs`
+  - repeated `ast.parse` and AST walks
+- `find_dangerous_call_graphs()` and `find_startup_hook_write_call_graphs()` both clear the same source-sensitive caches before work.
+- A controlled monkeypatch preserving those caches reduced the warm corpus scan from `2.016631s` to `0.813108s`.
+
+Plan:
+
+1. Add benchmark coverage that isolates call-graph enrichment across repeated pickle scans.
+2. Replace unconditional cache clearing with source-fingerprint invalidation or an explicit per-enrichment cache context.
+3. Make the three enrichment passes share one cache lifetime.
+4. Keep tests that prove edits to source files are observed when they should be.
+
+Expected upside:
+
+- Largest measured win so far for mixed pickle-heavy workloads.
+
+Correctness constraints:
+
+- Do not let stale source analysis hide newly added dangerous behavior.
+- Preserve behavior when modules are monkeypatched or temp source files change during tests.
+
+### 2. Repeated full-file hashing
+
+- Top-level scans hash files for aggregate content hashes.
+- Several scanners independently compute MD5, SHA256, and SHA512 integrity hashes.
+- Cache storage and content-hash cache keys can add more full-file hashing.
+- `64 MiB` safetensors profile:
+  - scanner integrity hashing: about `0.154s`
+  - core SHA256: about `0.035s`
+  - cache miss path: `0.564129s` total vs `0.181035s` without cache
+
+Plan:
+
+1. Inventory every hash consumer and the exact algorithms it needs.
+2. Reuse scanner-emitted complete hashes for aggregate results when the bytes match the scanned asset.
+3. Reuse one digest pass across cache metadata and scanner metadata where possible.
+4. Revisit whether every scanner needs MD5, SHA256, and SHA512 on every invocation.
+5. Benchmark larger files and cache miss/hit behavior before and after.
+
+Expected upside:
+
+- Strong improvement for large single-file models and repeated cache-enabled scans.
+
+Correctness constraints:
+
+- Preserve archive-wrapper semantics where nested-member hashes differ from top-level asset hashes.
+- Do not weaken integrity guarantees silently.
+
+### 3. License metadata scanning
+
+- Single-file scans call `collect_license_metadata()` for every asset.
+- Large text-like files with few or no newlines can cause a near full-file read while gathering only the first `50` logical lines.
+- On a synthetic `64 MiB` one-line `.dat`, `collect_license_metadata()` consumed about `0.275s` of a `0.317s` profile.
+- Directory scans also call `find_license_files()` once per scanned asset; on `2000` empty `.dat` files, this repeated nearby-license walk consumed about `3.391s` inside `collect_license_metadata()`.
+- The final `check_commercial_use_warnings()` pass can become quadratic for same-directory inputs because `detect_unlicensed_datasets()` performs `Path.iterdir()` per candidate file; on `500` tiny `.pkl` files, the final license warning pass consumed about `1.384s`.
+
+Plan:
+
+1. Add targeted benchmarks for large binary files, large text files, and long one-line files.
+2. Bound non-license-file header reads by bytes as well as lines.
+3. Keep the existing richer behavior for actual license files.
+4. Cache nearby-license discovery by directory during a scan.
+5. Precompute per-directory sibling filename sets before `detect_unlicensed_datasets()` loops over files.
+
+Expected upside:
+
+- Large win for arbitrary text-like files and broad directories containing many sibling assets.
+
+Correctness constraints:
+
+- Preserve detection for real license headers and explicit license files.
+
+### 4. Many-file directory overhead
+
+- Directory scans currently:
+  - optionally count files with `rglob`
+  - walk the tree
+  - hash every candidate path
+  - scan each path independently
+- Synthetic results:
+  - `2000` empty `.dat` files: `3.748604s` median
+  - `500` tiny `.pkl` files: `1.264593s` median
+- The `2000`-file profile also exposed repeated per-file scanner-selection normalization and HuggingFace cache path checks:
+  - `scanner_selection.policy_from_config()` / alias rebuilding: about `3.568s`
+  - `_is_huggingface_cache_file()` family: about `1.540s`
+
+Plan:
+
+1. Break directory timing into discovery, filtering, hashing, and scanning phases.
+2. Skip file counting unless progress reporting needs it.
+3. Normalize scanner selection once per top-level scan and pass the resolved policy down instead of rebuilding aliases per file.
+4. Avoid repeated nearby-license directory walks.
+5. Short-circuit HuggingFace bookkeeping checks when the scan root is not under a known HuggingFace cache layout.
+6. Consider scanner-aware dedupe only where a scanner is provably content-only.
+7. Measure HuggingFace-cache and duplicate-heavy directory cases separately.
+
+Expected upside:
+
+- Better scaling on repositories, checkpoints, and model folders with many support files.
+
+Correctness constraints:
+
+- Preserve path-specific results for scanners that depend on neighboring files or parent directories.
+
+### 5. Pickle wrapper passes
+
+- Root pickle scans do extra wrapper work after the Rust engine:
+  - raw root window detectors
+  - binary-tail checks
+  - legacy metadata detectors
+  - unconditional JAX checkpoint pass
+- Some of that is necessary security depth, but the JAX pass imports scanner code and reads the file even for ordinary pickles.
+- A cold-process `safe_large_model.pkl` profile spent about `0.063s` inside `_scan_jax_checkpoint_patterns_if_needed()`, mostly importing `jax_checkpoint_scanner` and `numpy`; subsequent warm scans are much faster.
+
+Plan:
+
+1. Benchmark ordinary safe pickles, JAX-like pickles, nested-pickle-heavy files, and malicious call-graph fixtures separately.
+2. Add cheap evidence gates before optional wrapper passes where semantics allow.
+3. Keep every bypass-sensitive detector covered by malicious and benign fixtures.
+
+Expected upside:
+
+- Moderate improvement for common clean pickle scans.
+
+Correctness constraints:
+
+- Do not weaken nested-pickle, encoded-payload, or JAX checkpoint coverage.
+
+### 6. Scanner selection rebuilds
+
+- Every file normalizes scanner selection repeatedly even when no scanner filters were requested.
+- On `2000` empty `.dat` files`, scanner-selection work consumed about `3.568s` in aggregate.
+- `_scanner_aliases()` rebuilds a registry-derived alias map for every resolution.
+
+Plan:
+
+1. Cache scanner aliases from static registry metadata.
+2. Preserve one resolved `ScannerSelectionPolicy` in normalized config for the duration of a scan.
+3. Avoid re-normalizing config in nested calls when the normalized payload is already present and unchanged.
+
+Expected upside:
+
+- Large many-file directory improvement with low behavioral risk.
+
+### 7. HuggingFace cache probing on ordinary local paths
+
+- `_is_huggingface_cache_file()` invokes HuggingFace path-resolution helpers for every file.
+- On `2000` ordinary local `.dat` files, this family consumed about `1.540s`.
+
+Plan:
+
+1. Carry top-level `is_hf_cache` state from directory discovery into lower layers.
+2. Skip expensive HuggingFace bookkeeping resolution for files under roots already known not to be HF caches.
+3. Keep the existing symlink protections for true HF cache layouts.
+
+Expected upside:
+
+- Noticeable improvement for large ordinary local folders.
+
+## File-by-File Audit Queue
+
+Priority 0:
+
+- `packages/modelaudit-picklescan/src/modelaudit_picklescan/call_graph.py`
+- `modelaudit/core.py`
+- `modelaudit/scanners/base.py`
+- `modelaudit/integrations/license_checker.py`
+- `modelaudit/scanner_selection.py`
+- `modelaudit/scanners/pickle_scanner.py`
+- `modelaudit/cache/adaptive_cache_keys.py`
+- `modelaudit/cache/scan_results_cache.py`
+
+Priority 1:
+
+- `modelaudit/utils/file/detection.py`
+- `modelaudit/scanners/pytorch_zip_scanner.py`
+- `modelaudit/scanners/zip_scanner.py`
+- `modelaudit/scanners/tar_scanner.py`
+- `modelaudit/scanners/sevenzip_scanner.py`
+- `modelaudit/scanners/compressed_scanner.py`
+- `modelaudit/scanners/safetensors_scanner.py`
+- `modelaudit/scanners/tf_savedmodel_scanner.py`
+- `modelaudit/scanners/keras_h5_scanner.py`
+- `modelaudit/scanners/keras_zip_scanner.py`
+- `modelaudit/scanners/manifest_scanner.py`
+- `modelaudit/detectors/secrets.py`
+- `modelaudit/detectors/network_comm.py`
+- `modelaudit/detectors/jit_script.py`
+
+## File-by-File Notes
+
+| File | Current read | Audit note |
+| --- | --- | --- |
+| `packages/modelaudit-picklescan/src/modelaudit_picklescan/call_graph.py` | profiled | Highest measured hotspot; repeated cache clearing and repeated AST analysis dominate pickle-heavy workloads. |
+| `modelaudit/core.py` | profiled | Directory orchestration performs discovery, prehash, repeated config normalization, per-file HF cache checks, and path-specific scans. Needs phase timings. |
+| `modelaudit/scanner_selection.py` | profiled | Alias maps and policies are rebuilt per file even when config is unchanged. Strong many-file optimization candidate. |
+| `modelaudit/integrations/license_checker.py` | profiled | Repeated directory walks and sibling directory scans create large many-file costs; header reading is also expensive for long one-line text-like files. |
+| `modelaudit/scanners/base.py` | profiled | Multi-hash integrity pass is a meaningful large-file cost and duplicates other hashing work. |
+| `modelaudit/scanners/pickle_scanner.py` | profiled | Clean duplicate pickle workloads spend heavily in raw detectors and the JAX wrapper pass after the Rust engine. |
+| `modelaudit/cache/adaptive_cache_keys.py` | inspected | Large-file cache keys can trigger content hashing; must be considered together with scanner and aggregate hashes. |
+| `modelaudit/cache/scan_results_cache.py` | inspected | Cache storage computes a secure file hash after scan completion, adding another full-file pass on misses. |
+| `modelaudit/utils/file/detection.py` | inspected | Mostly bounded probes; this is a good local pattern to preserve. |
+| `modelaudit/scanners/pytorch_zip_scanner.py` | lightly profiled | Tiny fixture is fast, but archive-member passes are numerous; needs larger archive benchmark before changing. |
+| `modelaudit/scanners/zip_scanner.py` | lightly profiled | Generic archive flow is currently fast on tiny fixtures; nested archive fan-out needs larger corpus benchmarks. |
+| `modelaudit/scanners/tar_scanner.py` | inspected | Mostly streaming/bounded extraction; needs benchmark coverage rather than speculative edits. |
+| `modelaudit/scanners/compressed_scanner.py` | inspected | Chunked and budgeted; likely lower priority unless decompression-heavy inputs show otherwise. |
+| `modelaudit/scanners/onnx_scanner.py` | inspected | Reads whole file for raw detectors after protobuf load; candidate for shared-buffer or bounded-detector review. |
+| `modelaudit/scanners/tflite_scanner.py` | inspected | Metadata extraction reads whole file up to a `2 GiB` cap. Needs large-file benchmark and maybe parser-driven reuse. |
+| `modelaudit/scanners/flax_msgpack_scanner.py` | inspected | Whole-file read to detect trailing objects; may be necessary but should get a large-file benchmark. |
+| `modelaudit/scanners/jinja2_template_scanner.py` | inspected | Whole-file read is bounded by `max_template_size`; lower priority. |
+| `modelaudit/scanners/manifest_scanner.py` | inspected | Multiple whole-file text reads across parse and blacklist paths; candidate for one-read reuse on larger manifests. |
+| `modelaudit/scanners/metadata_scanner.py` | inspected | Whole-file read for text metadata; likely acceptable for small docs but should be bounded by type/size. |
+| `modelaudit/scanners/tf_savedmodel_scanner.py` | lightly profiled | Tiny fixture cost was mostly lazy imports; file itself is read whole. Large SavedModel benchmarks are still needed. |
+| `modelaudit/detectors/secrets.py` | inspected | Convenience file API reads whole files; core pickle path already gates detector execution with seeds. |
+| `modelaudit/detectors/network_comm.py` | inspected | Convenience file API reads whole files and regex work can be expensive on large buffers. |
+| `modelaudit/detectors/jit_script.py` | inspected | Convenience file API reads whole files and AST walks parsed code; keep behind bounded callers. |
+| `modelaudit/scanners/catboost_scanner.py` | inspected | Uses bounded head/core/trailer reads; low priority until a CatBoost-specific benchmark says otherwise. |
+| `modelaudit/scanners/cntk_scanner.py` | inspected | Uses explicit read limits; low priority. |
+| `modelaudit/scanners/executorch_scanner.py` | inspected | Length-delimited reads; low priority. |
+| `modelaudit/scanners/gguf_scanner.py` | inspected | Structured parser advances by bounded field reads; benchmark malformed/huge-metadata cases before changing. |
+| `modelaudit/scanners/nemo_scanner.py` | inspected | Config extraction is explicitly capped; low priority. |
+| `modelaudit/scanners/paddle_scanner.py` | inspected | Chunked raw scanning; low priority. |
+| `modelaudit/scanners/pytorch_binary_scanner.py` | inspected | Chunked raw scanning and bounded header reads; low priority. |
+| `modelaudit/scanners/tf_metagraph_scanner.py` | inspected | Uses an explicit read cap; low priority. |
+| `modelaudit/scanners/xgboost_scanner.py` | inspected | Most routing probes are bounded, but UBJSON parsing still materializes the file; add large `.bst` benchmark if this format matters. |
+| `modelaudit/scanners/oci_layer_scanner.py` | inspected | Manifest probing is chunked, but full text read remains in one path; add an OCI-layer benchmark before changing. |
+| `modelaudit/scanners/pmml_scanner.py` | inspected | Whole-file XML read; likely acceptable for normal PMML sizes, but worth one large-text benchmark. |
+
+## Open Questions
+
+- Which integrity hashes are product requirements versus legacy convenience?
+- Should cache keys use full content hashes for files above `10 MiB` when scan results themselves already include strong hashes?
+- How much source freshness does call-graph analysis truly need within one process, and can module mtimes provide a sufficient invalidation boundary?
+- Which scanners are content-only enough for duplicate-result reuse without changing semantics?
+
+## Performance Backlog
+
+### Measurement Infrastructure
+
+- [ ] Make the existing benchmark suites runnable in the intended benchmark lane.
+- [ ] Decide whether benchmark files belong in the reduced-Python allowlist or should run only in a dedicated full lane.
+- [ ] Add a checked-in benchmark command matrix for:
+  - [ ] single-file scans
+  - [ ] directory scans
+  - [ ] cache miss scans
+  - [ ] cache hit scans
+  - [ ] duplicate-heavy scans
+  - [ ] many-small-file scans
+- [ ] Add stable JSON output generation for benchmark runs.
+- [ ] Add a small script that compares current benchmark JSON against a prior baseline.
+- [ ] Add explicit benchmark tags for:
+  - [ ] pickle-heavy
+  - [ ] large-file
+  - [ ] many-file
+  - [ ] archive-heavy
+  - [ ] metadata-heavy
+- [ ] Record host, Python, dependency set, cache state, and git revision with every benchmark artifact.
+- [ ] Add a benchmark corpus inventory file so future runs use the same representative inputs.
+- [ ] Add a benchmark for cold-process startup cost versus warm-process repeated scan cost.
+- [ ] Add a benchmark for first import cost of optional scanner families.
+- [ ] Add a benchmark for scan result serialization overhead.
+- [ ] Add a benchmark for progress-enabled versus progress-disabled directory scans.
+- [ ] Add a benchmark for aggregate result construction on very large directory scans.
+- [ ] Add a benchmark for SBOM generation when scan results are large.
+- [ ] Add a benchmark for telemetry-disabled and telemetry-enabled paths, only if telemetry behavior is intentionally in scope.
+
+### Core Pipeline Instrumentation
+
+- [ ] Add phase timings around top-level scan orchestration.
+- [ ] Measure:
+  - [ ] path expansion
+  - [ ] directory discovery
+  - [ ] file counting
+  - [ ] file filtering
+  - [ ] scanner selection
+  - [ ] top-level hashing
+  - [ ] per-file scan dispatch
+  - [ ] license metadata collection
+  - [ ] result merge
+  - [ ] commercial-use warning aggregation
+  - [ ] cache lookup
+  - [ ] cache store
+- [ ] Emit optional timing metadata in debug/perf mode without changing normal user output.
+- [ ] Add a helper to aggregate timing metadata across directory scans.
+- [ ] Add a way to compare scanner self-time versus orchestration time.
+- [ ] Add profiling docs for `scripts/profile_scan.py`.
+- [ ] Add one canonical command for profiling a directory scan and one for profiling a single file.
+- [ ] Add a way to suppress finding logs during perf runs so output does not drown the profile.
+- [ ] Add a benchmark/profiling smoke test to keep the profiling script working.
+
+### Pickle / PickleScan Hotspots
+
+- [ ] Replace unconditional call-graph cache clearing with source-aware invalidation.
+- [ ] Make dangerous-call, startup-hook, and related enrichment passes share one cache lifetime.
+- [ ] Add tests proving changed source files invalidate cached analysis.
+- [ ] Add tests proving monkeypatched/temp-module scenarios still invalidate correctly.
+- [ ] Add a benchmark that scans many small call-graph-heavy pickles in one process.
+- [ ] Add a benchmark that scans many call-graph-light pickles in one process.
+- [ ] Add a benchmark that scans the same pickle repeatedly in one process.
+- [ ] Separate call-graph parsing time from actual pickle opcode scanning time in measurements.
+- [ ] Inspect whether `_safe_call_graph_entrypoints()` repeats equivalent reference expansion work.
+- [ ] Inspect whether `_split_function_name()` and `_resolve_function_target()` can share more intermediate work.
+- [ ] Inspect repeated `ast.walk()` usage for opportunities to precompute indexes during module analysis.
+- [ ] Audit repeated source reads in `call_graph.py`.
+- [ ] Audit repeated `ast.parse()` calls in `call_graph.py`.
+- [ ] Evaluate whether module-level function metadata can be materialized once per source fingerprint.
+- [ ] Add a microbenchmark around `_analyze_module()`.
+- [ ] Add a microbenchmark around `_collect_function_calls()`.
+- [ ] Add a microbenchmark around nested reference resolution.
+- [ ] Review whether startup-hook detection needs the same source surface as dangerous-call detection.
+- [ ] Review whether all wrapper passes must run for all ordinary root pickles.
+- [ ] Add cheap evidence gating before optional JAX wrapper work if detection coverage permits.
+- [ ] Avoid cold-importing heavy JAX dependencies for obviously non-JAX pickles if a safe prefilter exists.
+- [ ] Benchmark root raw detector passes separately:
+  - [ ] encoded text indicators
+  - [ ] raw root window detectors
+  - [ ] binary tail checks
+  - [ ] JAX checkpoint heuristics
+- [ ] Add explicit correctness fixtures before changing any bypass-sensitive detector gating.
+
+### Hashing and Cache Passes
+
+- [ ] Inventory every full-file hash consumer and the algorithms each one needs.
+- [ ] Map where SHA256, SHA512, MD5, BLAKE2, and secure aggregate hashes are produced.
+- [ ] Decide which integrity hashes are product requirements versus legacy conveniences.
+- [ ] Reuse scanner-emitted hashes for top-level aggregate hashes when semantics match.
+- [ ] Reuse one digest pass for cache metadata and scanner metadata where possible.
+- [ ] Avoid rehashing the same top-level file separately in core and scanner layers when bytes are identical.
+- [ ] Preserve nested archive-member hash semantics while optimizing top-level files.
+- [ ] Evaluate whether cache content hashing can reuse already-computed digests on cache miss.
+- [ ] Evaluate whether cache keys need full-content hashes for very large files in all cases.
+- [ ] Add benchmarks for:
+  - [ ] `10 MiB`
+  - [ ] `64 MiB`
+  - [ ] `256 MiB`
+  - [ ] `1 GiB`, if practical locally
+- [ ] Add benchmark coverage for cache miss versus cache hit across multiple file sizes.
+- [ ] Add a regression benchmark for duplicate-heavy directories with cache disabled.
+- [ ] Add a regression benchmark for duplicate-heavy directories with cache enabled.
+- [ ] Inspect whether cache store can avoid secure rehashing when a strong digest is already available and trusted.
+- [ ] Record RSS impact of any digest reuse strategy.
+
+### License Metadata and Commercial-Use Checks
+
+- [ ] Bound non-license-file header reads by bytes as well as lines.
+- [ ] Keep richer reads for actual license files where full text matters.
+- [ ] Cache nearby-license discovery by directory during a scan.
+- [ ] Precompute sibling filename sets for commercial-use warning aggregation.
+- [ ] Avoid repeated `Path.iterdir()` for each candidate file in the same directory.
+- [ ] Add a benchmark for many sibling files with no license file.
+- [ ] Add a benchmark for many sibling files with one nearby license file.
+- [ ] Add a benchmark for a large binary file with no license metadata.
+- [ ] Add a benchmark for a large text file with normal newlines.
+- [ ] Add a benchmark for a large one-line text file.
+- [ ] Add negative tests proving bounded reads still find nearby explicit license files.
+- [ ] Add positive tests proving real license headers are still detected after byte limits.
+- [ ] Consider separating directory-level license discovery from per-file metadata extraction.
+- [ ] Inspect whether license warning aggregation can operate on grouped directories instead of individual paths.
+- [ ] Record how much of `collect_license_metadata()` time is header reading versus nearby-file discovery.
+
+### Directory Scan Scaling
+
+- [ ] Normalize scanner-selection config once per top-level scan.
+- [ ] Cache scanner aliases derived from static registry metadata.
+- [ ] Reuse one resolved `ScannerSelectionPolicy` during child scans.
+- [ ] Avoid re-normalizing already-normalized config on nested calls.
+- [ ] Skip expensive file pre-counting unless progress reporting actually requires it.
+- [ ] Measure `rglob()` pre-count cost separately from `os.walk()` discovery.
+- [ ] Carry top-level HuggingFace-cache state into lower layers.
+- [ ] Short-circuit HuggingFace cache resolution for roots known not to be HF caches.
+- [ ] Preserve existing symlink and provenance protections for true HF cache layouts.
+- [ ] Measure scan cost for:
+  - [ ] `100`
+  - [ ] `1,000`
+  - [ ] `10,000`
+  - [ ] `50,000` tiny files
+- [ ] Add benchmarks for shallow directories and deep directory trees separately.
+- [ ] Add benchmarks for extension-heavy directories and mixed-content directories separately.
+- [ ] Add benchmarks for true HF-cache roots and ordinary local roots.
+- [ ] Consider grouping work by directory to amortize nearby-file checks.
+- [ ] Consider batching scanner-selection lookups by file type if that can be done without changing semantics.
+- [ ] Investigate content-aware duplicate-result reuse only for scanners proven path-independent.
+- [ ] Define a scanner capability flag for content-only versus path-sensitive behavior before deduplication.
+- [ ] Add correctness tests for duplicate files in different directories when path context changes results.
+
+### Scanner Routing and Detection
+
+- [ ] Audit all scanner routing paths for repeated header reads.
+- [ ] Audit file-type detection for repeated suffix/path checks that can be memoized per file.
+- [ ] Keep the current bounded-read patterns in `modelaudit/utils/file/detection.py`.
+- [ ] Measure whether scanner candidate ordering causes avoidable work on common file types.
+- [ ] Measure whether scanner registry lookup itself is meaningful outside many-file cases.
+- [ ] Add a benchmark for disguised extensions and routed archives so optimizations do not weaken safety.
+- [ ] Add a benchmark for files rejected early by cheap routing versus files that fan out to deeper scanners.
+
+### Large-Input Scanner Follow-Ups
+
+- [ ] Add a large ONNX benchmark before changing `onnx_scanner.py`.
+- [ ] Decide whether ONNX raw detector passes can share an already-loaded buffer or safely use bounded windows.
+- [ ] Add a large TFLite benchmark before changing `tflite_scanner.py`.
+- [ ] Review whether TFLite metadata extraction truly needs to materialize the whole file.
+- [ ] Add a large Flax msgpack benchmark before changing `flax_msgpack_scanner.py`.
+- [ ] Review whether trailing-object detection in Flax can be streamed or partially indexed.
+- [ ] Add a large manifest benchmark with:
+  - [ ] no blacklist patterns
+  - [ ] blacklist patterns
+  - [ ] cloud URL checks
+  - [ ] embedded Jinja templates
+- [ ] Consider one-read reuse across manifest parse, blacklist, and cloud URL checks.
+- [ ] Add a large SavedModel benchmark before changing `tf_savedmodel_scanner.py`.
+- [ ] Add a large XGBoost UBJSON benchmark before changing `xgboost_scanner.py`.
+- [ ] Add a large PMML benchmark before changing `pmml_scanner.py`.
+- [ ] Add an OCI-layer benchmark before changing `oci_layer_scanner.py`.
+- [ ] Add a large metadata-text benchmark before changing `metadata_scanner.py`.
+- [ ] Add benchmarks for archive scanners with:
+  - [ ] many tiny members
+  - [ ] a few large members
+  - [ ] nested archives
+  - [ ] malicious positive members
+  - [ ] benign near-match members
+- [ ] Add a large PyTorch ZIP benchmark before touching member traversal logic.
+- [ ] Add a large generic ZIP benchmark before touching generic archive traversal logic.
+- [ ] Add a large TAR benchmark before touching TAR traversal logic.
+- [ ] Add a decompression-heavy benchmark before touching compressed wrapper scanners.
+
+### Memory and Allocation Work
+
+- [ ] Record peak RSS for the main benchmark scenarios.
+- [ ] Add allocation profiling for:
+  - [ ] call-graph-heavy pickle scans
+  - [ ] large ONNX scans
+  - [ ] large TFLite scans
+  - [ ] large manifest scans
+- [ ] Identify scanners that duplicate large byte buffers.
+- [ ] Identify scanners that parse once and then reread the same file into memory.
+- [ ] Inspect regex-heavy detectors for large temporary strings or repeated lowercasing.
+- [ ] Inspect whole-file `.lower()` calls on large text inputs.
+- [ ] Prefer streaming or bounded windows where detection semantics allow.
+- [ ] Record the memory cost of any digest sharing or buffer reuse proposal.
+
+### Logging and UX Overhead
+
+- [ ] Measure effect of finding-log volume on perf runs.
+- [ ] Add a quiet profiling mode if logs materially distort timings.
+- [ ] Measure progress callback overhead on very large directory scans.
+- [ ] Measure debug metadata overhead when many findings are emitted.
+- [ ] Measure cost of result explanation generation if enabled on large result sets.
+
+### Correctness Guardrails for Optimizations
+
+- [ ] For every optimization, record:
+  - [ ] expected win
+  - [ ] changed code paths
+  - [ ] failure mode if wrong
+  - [ ] benchmark proving the win
+  - [ ] malicious fixture proving detection is preserved
+  - [ ] benign near-match proving false positives do not regress
+- [ ] Treat path-sensitive scanners as non-deduplicable until proven otherwise.
+- [ ] Keep fail-closed behavior explicit when bounded reads truncate analysis.
+- [ ] Preserve archive-member semantics when reusing hashes or buffers.
+- [ ] Preserve source freshness semantics in call-graph caching.
+- [ ] Preserve true HF-cache behavior while optimizing ordinary local roots.
+- [ ] Preserve reduced-Python-lane test coverage for every benchmark-adjacent change that needs it.
+
+### Documentation and Process
+
+- [ ] Keep this audit file updated after every benchmark tranche.
+- [ ] Record benchmark commands next to every measurement.
+- [ ] Record profile artifacts for every new hotspot claim.
+- [ ] Keep a “measured” versus “suspected” label on every backlog item.
+- [ ] Add a small changelog section to this doc for completed perf wins.
+- [ ] Track before/after numbers for every landed optimization.
+- [ ] Add a release-note rubric for user-visible scan-time improvements.
+- [ ] Decide whether perf work should land as:
+  - [ ] many small PRs
+  - [ ] a small stack of thematic PRs
+  - [ ] one instrumentation PR followed by focused optimization PRs
+
+## Completed Wins
+
+### 2026-05-01 - Scanner selection reuse
+
+- PR:
+  - `#1153`
+- Change:
+  - cached static scanner metadata and alias resolution
+  - rehydrated already-normalized selection payloads without re-running alias resolution
+- Targeted regression:
+  - `tests/test_scanner_selection.py::test_normalized_selection_rehydrates_without_alias_resolution`
+- Benchmarks:
+  - `2000` empty `.dat` files: `3.740284s` -> `3.066438s`
+  - `500` tiny `.pkl` files: `1.543400s` -> `1.326489s`
+- Notes:
+  - this is the first low-risk directory-scale win from the backlog
+  - larger remaining costs in the same path are still license directory work and non-HF bookkeeping
+
+### 2026-05-01 - HuggingFace bookkeeping short-circuit
+
+- PR:
+  - `#1154`
+- Change:
+  - ordinary filenames now return before HuggingFace bookkeeping path resolution starts
+  - bookkeeping-shaped names retain the existing trust checks
+- Targeted regression:
+  - `tests/test_directory_file_filtering.py::TestDirectoryFileFiltering::test_non_bookkeeping_filenames_skip_hf_path_resolution`
+- Benchmarks:
+  - ordinary `weights.dat` helper calls, `20,000` iterations: `2.504382s` -> `0.004380s`
+  - `2000`-file directory profile: HF helper family reduced to `0.009s` aggregate
+- Notes:
+  - full-directory wall time is still dominated by scanner-selection and license work on branches without those fixes
+
+### 2026-05-01 - Nearby-license discovery reuse
+
+- PR:
+  - `#1155`
+- Change:
+  - nearby-license discovery is cached per scan and reused across sibling files
+  - reduced-lane coverage now includes the license checker and license integration tests
+- Targeted regressions:
+  - `tests/integrations/test_license_checker.py::TestLicenseMetadataCollection::test_collect_license_metadata_reuses_nearby_license_cache`
+  - `tests/integrations/test_license_integration.py::TestLicenseIntegration::test_directory_scan_reuses_nearby_license_discovery`
+- Benchmarks:
+  - synthetic `2000`-file profile:
+    - `find_license_files()`: about `5.479s` / `2000` calls -> `0.003s` / `1` call
+    - `collect_license_metadata()`: about `5.694s` -> `0.153s`
+- Notes:
+  - sibling-name reuse in `detect_unlicensed_datasets()` landed separately in `#1157`
+
+### 2026-05-01 - Report-scoped call-graph cache sharing
+
+- PR:
+  - `#1156`
+- Change:
+  - call-graph enrichment passes now share one fresh source-sensitive cache generation per report
+  - direct public helper calls still clear caches independently outside that report scope
+- Targeted regressions:
+  - `packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py::test_shared_source_sensitive_caches_clears_once_per_scope`
+  - `packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py::test_scan_bytes_refreshes_call_graph_after_source_rewrite`
+- Benchmarks:
+  - same-process `dill_func.pkl` A/B:
+    - old three-clear behavior: `0.538389s` median
+    - report-scoped sharing: `0.196939s` median
+- Notes:
+  - this fixes repeated clearing inside one report only; broader source-fingerprint invalidation remains open work
+
+### 2026-05-01 - Sibling license-directory reuse
+
+- PR:
+  - `#1157`
+- Change:
+  - `detect_unlicensed_datasets()` now lists each sibling directory once per pass instead of once per candidate file
+  - reduced-Python coverage now includes the focused license checker regression
+- Targeted regression:
+  - `tests/integrations/test_license_checker.py::TestUnlicensedDatasetDetection::test_reuses_sibling_directory_listing`
+- Benchmarks:
+  - isolated `500` sibling dataset files:
+    - repeated directory listings: `0.736675s` median
+    - one cached listing per directory: `0.005581s` median
+- Notes:
+  - this addresses the remaining measured directory-scale license hotspot after nearby-license discovery reuse
+
+### 2026-05-01 - Ordinary-pickle JAX delegation gate
+
+- PR:
+  - `#1158`
+- Change:
+  - complete non-JAX root pickle windows now skip the extra JAX checkpoint delegation pass
+  - truncated windows and JAX-bearing payloads keep the existing conservative path
+- Targeted regressions:
+  - `tests/scanners/test_pickle_scanner.py::test_pickle_scanner_skips_jax_delegation_for_complete_non_jax_payloads`
+  - `tests/scanners/test_pickle_scanner.py::test_pickle_scanner_uses_jax_window_beyond_root_raw_scan_limit`
+- Benchmarks:
+  - synthetic `4 MiB` ordinary pickle:
+    - unconditional delegation: `0.191007s` median
+    - complete-window non-JAX skip: `0.065762s` median
+- Notes:
+  - broader pickle-wrapper cleanup remains open, but this removes a safe common-case pass
+
+## Measured Non-Wins
+
+### 2026-05-01 - Skip directory pre-count without progress
+
+- Hypothesis:
+  - avoid the lazy `rglob()` pre-count when no progress callback is present
+- Result:
+  - direct `5000`-file pre-count cost was only `0.023548s` median
+  - matched `5000`-file full scans were effectively unchanged:
+    - no progress: `18.869611s` -> `18.883523s`
+    - with progress: `18.997390s` -> `19.097184s`
+- Decision:
+  - do not spend a PR on this yet; the larger directory costs remain elsewhere
+
+## Remaining Recommended Implementation Order
+
+1. Add phase-level timings in the core scan pipeline.
+   - Gives us durable instrumentation before larger changes.
+2. Unify or reuse hashing passes.
+   - Strong large-file win, but product requirements around hash outputs need to be settled first.
+3. Replace report-scoped call-graph sharing with source-aware invalidation where safe.
+   - Higher upside remains, but freshness semantics still need careful proof.
+4. Tighten license header reads for non-license large text-like files only if detection semantics stay explicit.
+   - Binary probes are already bounded; the remaining long-text case is a deliberate behavior tradeoff.
+5. Revisit duplicate-aware reuse and the remaining pickle wrapper passes.
+   - Worth doing, but both need stronger path-sensitivity analysis first.
+
+## Next Measurement Pass
+
+- Add benchmark files to the reduced-Python allowlist or run them in a full lane so their JSON outputs are actually produced.
+- Add custom one-shot scripts for:
+  - cache miss vs hit
+  - many tiny files
+  - duplicate-heavy directories
+  - large text-like vs binary files
+  - call-graph-heavy pickle fixtures
+- Add phase-level instrumentation experiments around the core scan loop.
+- Add dedicated benchmarks for:
+  - scanner-selection normalization on thousands of files
+  - nearby-license discovery on many siblings
+  - HuggingFace cache probing under non-HF roots
+  - large archive members and large SavedModel / ONNX / TFLite inputs
