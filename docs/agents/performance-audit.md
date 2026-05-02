@@ -1357,6 +1357,22 @@ Priority 1:
 - Notes:
   - focused XGBoost tests passed; the repo-wide non-slow lane still hits the existing timing-sensitive directory-scan sentinel in this environment
 
+### 2026-05-02 - Shared metadata-filename lowercase view
+
+- PR:
+  - `#1205`
+- Change:
+  - `should_skip_file()` now lowers metadata candidate basenames once per routing decision
+  - README-like `.txt` handling and metadata allowlisting reuse the same normalized filename
+- Targeted regression:
+  - `tests/utils/file/test_file_filter.py::TestFileFilter::test_metadata_routing_reuses_lowered_filename`
+- Benchmarks:
+  - representative `50,000`-filename metadata-classification batch, `100` passes:
+    - before: `0.926733s` median
+    - after: `0.799956s` median
+- Notes:
+  - this trims repeated work on the per-file routing path; the repo-wide non-slow lane still hits the existing timing-sensitive validation and directory-scan sentinels in this environment
+
 ### 2026-05-01 - Shared Keras metadata lowercase view
 
 - PR:
