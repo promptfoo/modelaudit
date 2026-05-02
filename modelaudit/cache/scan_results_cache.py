@@ -223,7 +223,7 @@ class ScanResultsCache:
                 return False
 
             # Pass file_stat to avoid redundant calls
-            cache_key = self._generate_cache_key(
+            cache_key, content_hash = self._generate_cache_key_material(
                 file_path,
                 file_stat=file_stat,
                 version_context=version_context,
@@ -232,8 +232,8 @@ class ScanResultsCache:
             if not cache_key:
                 return False
 
-            # Use optimized hash method with stat reuse
-            file_hash = self.hasher.hash_file_with_stat(file_path, file_stat)
+            # Large-file cache keys already require this exact secure content hash.
+            file_hash = content_hash or self.hasher.hash_file_with_stat(file_path, file_stat)
             mtime_ns = getattr(file_stat, "st_mtime_ns", int(file_stat.st_mtime * 1_000_000_000))
 
             cache_entry = CacheEntry(
@@ -302,17 +302,34 @@ class ScanResultsCache:
         Returns:
             Cache key string or None if generation failed
         """
+        cache_key, _content_hash = self._generate_cache_key_material(
+            file_path,
+            file_stat=file_stat,
+            version_context=version_context,
+            version_info=version_info,
+        )
+        return cache_key
+
+    def _generate_cache_key_material(
+        self,
+        file_path: str,
+        file_stat: os.stat_result | None = None,
+        version_context: dict[str, Any] | None = None,
+        version_info: dict[str, Any] | None = None,
+    ) -> tuple[str | None, str | None]:
+        """Generate a cache key and surface any secure content hash already computed for it."""
         try:
             if file_stat is not None:
-                file_key = self.key_generator.generate_key_with_stat_reuse(file_path, file_stat)
+                file_key, content_hash = self.key_generator.generate_key_material_with_stat_reuse(file_path, file_stat)
             else:
                 file_key = self.key_generator.generate_key(file_path)
+                content_hash = None
 
             resolved_version_info = (
                 version_info if version_info is not None else self._get_version_info(version_context)
             )
             if resolved_version_info is None:
-                return None
+                return None, None
 
             # Create version fingerprint
             version_str = json.dumps(resolved_version_info, sort_keys=True)
@@ -323,11 +340,11 @@ class ScanResultsCache:
             clean_file_key = file_key.split(":")[-1]
             cache_key = f"{clean_file_key}_{version_hash}"
 
-            return cache_key
+            return cache_key, content_hash
 
         except Exception as e:
             logger.debug(f"Failed to generate cache key for {file_path}: {e}")
-            return None
+            return None, None
 
     def _get_cache_file_path(self, cache_key: str) -> Path:
         """

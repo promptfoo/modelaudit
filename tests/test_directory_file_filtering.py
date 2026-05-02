@@ -489,6 +489,22 @@ class TestDirectoryFileFiltering:
         assert _is_huggingface_cache_file(str(hf_cache_metadata)) is True
         assert _is_huggingface_cache_file(str(hf_download_metadata)) is True
 
+    def test_non_bookkeeping_filenames_skip_hf_path_resolution(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Ordinary filenames should not pay HuggingFace bookkeeping path resolution costs."""
+        ordinary_model = tmp_path / "weights.dat"
+
+        def fail_if_called(*_args: object, **_kwargs: object) -> bool:
+            raise AssertionError("ordinary filenames should short-circuit before HF path resolution")
+
+        monkeypatch.setattr("modelaudit.core._is_hf_hub_bookkeeping_path", fail_if_called)
+        monkeypatch.setattr("modelaudit.core._is_hf_download_bookkeeping_path", fail_if_called)
+
+        assert _is_huggingface_cache_file(str(ordinary_model)) is False
+
     def test_bookkeeping_filenames_only_skip_inside_huggingface_cache(
         self,
         tmp_path: Path,
