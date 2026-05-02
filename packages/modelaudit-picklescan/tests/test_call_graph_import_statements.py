@@ -85,6 +85,27 @@ def _clear_call_graph_caches() -> None:
             cache_clear()
 
 
+def test_shared_source_sensitive_caches_clears_once_per_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    clear_count = 0
+
+    def fake_clear() -> None:
+        nonlocal clear_count
+        clear_count += 1
+
+    monkeypatch.setattr(call_graph, "_clear_source_sensitive_caches_now", fake_clear)
+
+    with call_graph.shared_source_sensitive_caches():
+        call_graph._clear_source_sensitive_caches()
+        call_graph._clear_source_sensitive_caches()
+        call_graph._clear_source_sensitive_caches()
+
+    assert clear_count == 1
+
+    call_graph._clear_source_sensitive_caches()
+
+    assert clear_count == 2
+
+
 def _env_without_pythonpath() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
 
