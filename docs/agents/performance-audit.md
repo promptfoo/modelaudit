@@ -1325,6 +1325,22 @@ Priority 1:
 - Notes:
   - this narrows one of the remaining raw-detector costs on unusually large encoded tokens
 
+### 2026-05-02 - Shared architecture layer-type lowercase view
+
+- PR:
+  - `#1203`
+- Change:
+  - unified architecture analysis now normalizes layer-type names once per pass
+  - transformer and CNN indicator scans reuse that lowered view instead of re-normalizing every nested comparison
+- Targeted regression:
+  - `tests/analysis/test_unified_context.py::TestUnifiedMLContext::test_analyze_architecture_reuses_lowered_layer_types`
+- Benchmarks:
+  - `1,000` synthetic layer names, `500` architecture analyses:
+    - before: `1.268737s` median
+    - after: `0.728951s` median
+- Notes:
+  - this removes repeated nested-loop normalization in a small shared analysis helper
+
 ### 2026-05-01 - Shared Keras metadata lowercase view
 
 - PR:
