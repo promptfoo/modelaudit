@@ -674,6 +674,22 @@ Priority 1:
 - Notes:
   - this is a small routing win, but it removes avoidable duplicate I/O on every pickle-shaped JAX candidate
 
+### 2026-05-01 - Shared license-header lowercase view
+
+- PR:
+  - `#1162`
+- Change:
+  - `collect_license_metadata()` now lowers the shared header text once
+  - license and copyright prefilters reuse that lowercase view instead of recomputing it independently
+- Targeted regression:
+  - `tests/integrations/test_license_checker.py::TestLicenseMetadataCollection::test_collect_license_metadata_reuses_lowered_header`
+- Benchmarks:
+  - synthetic `8 MiB` one-line header, same-process controlled A/B:
+    - forced duplicate lowercasing: `0.687008s` median
+    - shared lowercase view: `0.616486s` median
+- Notes:
+  - this is a narrow CPU cleanup on the long-text license path; the larger header-read semantics tradeoff remains open
+
 ## Measured Non-Wins
 
 ### 2026-05-01 - Skip directory pre-count without progress
