@@ -276,7 +276,9 @@ Priority 1:
 | `modelaudit/scanners/jinja2_template_scanner.py`                         | inspected        | Whole-file read is bounded by `max_template_size`; lower priority.                                                                                          |
 | `modelaudit/scanners/manifest_scanner.py`                                | inspected        | Multiple whole-file text reads across parse and blacklist paths; candidate for one-read reuse on larger manifests.                                          |
 | `modelaudit/scanners/metadata_scanner.py`                                | inspected        | Whole-file read for text metadata; likely acceptable for small docs but should be bounded by type/size.                                                     |
-| `modelaudit/scanners/tf_savedmodel_scanner.py`                           | lightly profiled | Tiny fixture cost was mostly lazy imports; file itself is read whole. Large SavedModel benchmarks are still needed.                                         |
+| `modelaudit/scanners/tf_savedmodel_scanner.py`                           | lightly profiled | Tiny fixture cost was mostly lazy imports; Keras metadata text had repeated lowercase passes, now fixed in `#1168`. Large SavedModel benchmarks remain.     |
+| `modelaudit/scanners/keras_zip_scanner.py`                               | inspected        | Lambda-code scanning reused repeated whole-string lowercase passes, now fixed in `#1168`; larger archive benchmarks are still needed.                       |
+| `modelaudit/scanners/keras_utils.py`                                     | inspected        | Shared Lambda helpers had the same repeated lowercase pattern, now consolidated behind one reusable matcher in `#1168`.                                     |
 | `modelaudit/detectors/secrets.py`                                        | inspected        | Convenience file API reads whole files; core pickle path already gates detector execution with seeds.                                                       |
 | `modelaudit/detectors/network_comm.py`                                   | inspected        | Convenience file API reads whole files and regex work can be expensive on large buffers.                                                                    |
 | `modelaudit/detectors/jit_script.py`                                     | inspected        | Convenience file API reads whole files and AST walks parsed code; keep behind bounded callers.                                                              |
@@ -769,6 +771,25 @@ Priority 1:
     - shared source-context path: `0.095118s` median
 - Notes:
   - this narrows one remaining piece of the broader call-graph invalidation backlog without changing freshness semantics
+
+### 2026-05-01 - Shared Keras metadata lowercase view
+
+- PR:
+  - `#1168`
+- Change:
+  - Keras metadata helpers now lowercase decoded text once before testing configured substrings
+  - the shared matcher is reused by Keras dict-format Lambda scans, Keras ZIP Lambda scans, and TensorFlow SavedModel Keras metadata checks
+- Targeted regression:
+  - `tests/scanners/test_keras_utils.py::test_find_case_insensitive_substrings_reuses_lowered_text`
+- Benchmarks:
+  - synthetic `8 MiB` no-match decoded Lambda text, same-process controlled A/B:
+    - repeated lowercasing path: `0.966723s` median
+    - shared lowercase text: `0.211598s` median
+  - synthetic `8 MiB` no-match direct Keras metadata text, same-process controlled A/B:
+    - repeated lowercasing path: `0.580823s` median
+    - shared lowercase text: `0.233578s` median
+- Notes:
+  - this closes one more long-text scanner pass without broadening the existing Keras detection surface
 
 ## Measured Non-Wins
 
