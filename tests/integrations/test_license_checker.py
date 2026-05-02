@@ -204,6 +204,23 @@ def some_function():
         assert "SPDX-License-Identifier: MIT" not in content
         assert licenses == []
 
+    def test_large_non_license_text_header_still_respects_max_lines(self, tmp_path: Path) -> None:
+        """Ordinary files should stay line-bounded even when the byte probe truncates."""
+        test_file = tmp_path / "payload.dat"
+        test_file.write_text(
+            "".join(f"line {index}\n" for index in range(10))
+            + "SPDX-License-Identifier: MIT\n"
+            + "A" * _LICENSE_HEADER_MAX_BYTES,
+            encoding="utf-8",
+        )
+
+        content = _read_header_text(str(test_file), max_lines=10)
+        licenses = scan_for_license_headers(str(test_file), max_lines=10)
+
+        assert content is not None
+        assert "SPDX-License-Identifier: MIT" not in content
+        assert licenses == []
+
 
 class TestCopyrightExtraction:
     """Test copyright notice extraction."""

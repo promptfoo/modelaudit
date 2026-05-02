@@ -182,7 +182,7 @@ def _read_header_text(file_path: str, max_lines: int) -> str | None:
     if not has_more_bytes:
         return "".join(decoded_header.splitlines(keepends=True)[:max_lines])
     if not _is_explicit_license_file(file_path):
-        return decoded_header
+        return "".join(decoded_header.splitlines(keepends=True)[:max_lines])
 
     # Explicit license files keep the richer line-oriented behavior so long
     # one-line license notices are not silently truncated by the byte cap.
