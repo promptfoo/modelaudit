@@ -1405,6 +1405,22 @@ Priority 1:
 - Notes:
   - this removes repeated normalization in a large-archive scanner path; the repo-wide non-slow lane still hits the existing timing-sensitive validation and directory-scan sentinels in this environment
 
+### 2026-05-02 - Shared metadata secret-description lowercase view
+
+- PR:
+  - `#1208`
+- Change:
+  - metadata secret-format probing now lowers each pattern description once
+  - known-format matching reuses the normalized description across GitHub/OpenAI/AWS/Slack checks
+- Targeted regression:
+  - `tests/scanners/test_metadata_scanner.py::TestMetadataScanner::test_known_secret_format_reuses_lowered_description`
+- Benchmarks:
+  - `100,000` secret descriptions, `50` probe passes:
+    - before: `3.509000s` median
+    - after: `2.000413s` median
+- Notes:
+  - this removes repeated normalization in metadata secret scanning; the repo-wide non-slow lane still hits the existing timing-sensitive validation and directory-scan sentinels in this environment
+
 ### 2026-05-01 - Shared Keras metadata lowercase view
 
 - PR:
