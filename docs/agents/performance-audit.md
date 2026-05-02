@@ -658,6 +658,22 @@ Priority 1:
 - Notes:
   - this removes the first confirmed repeated-read hotspot outside the larger hash redesign
 
+### 2026-05-01 - JAX probe handle reuse
+
+- PR:
+  - `#1161`
+- Change:
+  - pickle-shaped JAX routing probes now reuse the initial open handle
+  - the helper extends the already-read header window instead of reopening the file
+- Targeted regression:
+  - `tests/scanners/test_jax_checkpoint_scanner.py::test_pickle_candidate_probe_reuses_open_file`
+- Benchmarks:
+  - repeated pickle-candidate probe, `200` calls:
+    - previous two-open path: `0.045949s` median
+    - single-handle path: `0.026661s` median
+- Notes:
+  - this is a small routing win, but it removes avoidable duplicate I/O on every pickle-shaped JAX candidate
+
 ## Measured Non-Wins
 
 ### 2026-05-01 - Skip directory pre-count without progress
