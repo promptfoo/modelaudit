@@ -7,7 +7,9 @@ import os
 import sys
 import sysconfig
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib.machinery import EXTENSION_SUFFIXES, BuiltinImporter, FrozenImporter, ModuleSpec, PathFinder
@@ -37,6 +39,10 @@ _PICKLE_ENTERED_IMPORT_EXECUTION_METHODS = (
 _INHERITED_CLASS_ENTRYPOINT_METHODS = (
     *_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS,
     *_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS,
+)
+_SHARED_SOURCE_SENSITIVE_CACHE_DEPTH: ContextVar[int] = ContextVar(
+    "_SHARED_SOURCE_SENSITIVE_CACHE_DEPTH",
+    default=0,
 )
 
 _CLASS_ENTRYPOINT_METHODS = (
@@ -240,6 +246,13 @@ class _WildcardExportSummary:
 
 
 @dataclass(frozen=True)
+class _ModuleSourceContext:
+    source_path: Path
+    module_statements: tuple[ast.stmt, ...]
+    is_package: bool
+
+
+@dataclass(frozen=True)
 class _ClassSourceContext:
     module_name: str
     class_node: ast.ClassDef
@@ -434,6 +447,18 @@ def find_unanalyzed_callable_call_graph_references(
         if len(references) >= _MAX_IMPORT_REFERENCES:
             break
     return tuple(references)
+
+
+@contextmanager
+def shared_source_sensitive_caches() -> Iterator[None]:
+    """Share one fresh cache generation across related enrichment passes."""
+    if _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.get() == 0:
+        _clear_source_sensitive_caches_now()
+    token = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.set(_SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.get() + 1)
+    try:
+        yield
+    finally:
+        _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.reset(token)
 
 
 @lru_cache(maxsize=4096)
@@ -708,6 +733,12 @@ def has_unanalyzed_call_graph_import_references(import_references: object) -> bo
 
 
 def _clear_source_sensitive_caches() -> None:
+    if _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.get() > 0:
+        return
+    _clear_source_sensitive_caches_now()
+
+
+def _clear_source_sensitive_caches_now() -> None:
     for function in (
         _safe_call_graph_entrypoints,
         _has_static_torch_extension_global_target,
@@ -720,6 +751,7 @@ def _clear_source_sensitive_caches() -> None:
         _resolve_wildcard_reexport_alias,
         _wildcard_export_summary,
         _resolve_class_target,
+        _module_source_context,
         _analyze_module,
         _source_function_context,
         _source_class_context,
@@ -1114,19 +1146,10 @@ def _resolve_wildcard_reexport_alias_inner(
 
 @lru_cache(maxsize=4096)
 def _wildcard_export_summary(module_name: str) -> _WildcardExportSummary | None:
-    source_path = _resolve_module_source(module_name)
-    if source_path is None:
+    context = _module_source_context(module_name)
+    if context is None:
         return None
-    try:
-        if source_path.stat().st_size > _MAX_SOURCE_BYTES:
-            return None
-        source = source_path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(source_path))
-    except Exception:
-        return None
-
-    is_package = source_path.name == "__init__.py"
-    return _collect_module_export_summary(_module_level_statements(tree), module_name, is_package)
+    return _collect_module_export_summary(context.module_statements, module_name, context.is_package)
 
 
 @lru_cache(maxsize=4096)
@@ -1177,6 +1200,60 @@ def _split_function_name(function_name: str) -> tuple[str | None, str]:
 
 @lru_cache(maxsize=1024)
 def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
+    context = _module_source_context(module_name)
+    if context is None:
+        return None
+
+    export_summary = _collect_module_export_summary(context.module_statements, module_name, context.is_package)
+    import_aliases = _collect_aliases(context.module_statements, module_name, context.is_package)
+    local_defs = _collect_local_defs(context.module_statements)
+    local_class_entrypoints = _collect_local_class_entrypoints(
+        context.module_statements,
+        module_name,
+        import_aliases,
+        local_defs,
+    )
+    local_class_targets = set(local_class_entrypoints)
+    aliases = {
+        **import_aliases,
+        **_collect_assignment_aliases(
+            context.module_statements,
+            module_name,
+            import_aliases,
+            local_defs,
+            local_class_targets,
+        ),
+    }
+    aliases.update(
+        _collect_class_instance_default_aliases(
+            context.module_statements,
+            module_name,
+            aliases,
+            local_defs,
+            local_class_targets,
+        )
+    )
+    calls_by_function, class_entrypoints = _collect_function_calls(
+        context.module_statements,
+        module_name,
+        context.is_package,
+        aliases,
+        local_defs,
+        local_class_targets,
+        local_class_entrypoints,
+    )
+    return _ModuleAnalysis(
+        module=module_name,
+        source_path=str(context.source_path),
+        aliases=aliases,
+        direct_names=export_summary.direct_names,
+        calls_by_function=calls_by_function,
+        class_entrypoints=class_entrypoints,
+    )
+
+
+@lru_cache(maxsize=4096)
+def _module_source_context(module_name: str) -> _ModuleSourceContext | None:
     source_path = _resolve_module_source(module_name)
     if source_path is None:
         return None
@@ -1190,49 +1267,7 @@ def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
 
     is_package = source_path.name == "__init__.py"
     module_statements = _module_level_statements(tree)
-    export_summary = _collect_module_export_summary(module_statements, module_name, is_package)
-    import_aliases = _collect_aliases(module_statements, module_name, is_package)
-    local_defs = _collect_local_defs(module_statements)
-    local_class_entrypoints = _collect_local_class_entrypoints(
-        module_statements, module_name, import_aliases, local_defs
-    )
-    local_class_targets = set(local_class_entrypoints)
-    aliases = {
-        **import_aliases,
-        **_collect_assignment_aliases(
-            module_statements,
-            module_name,
-            import_aliases,
-            local_defs,
-            local_class_targets,
-        ),
-    }
-    aliases.update(
-        _collect_class_instance_default_aliases(
-            module_statements,
-            module_name,
-            aliases,
-            local_defs,
-            local_class_targets,
-        )
-    )
-    calls_by_function, class_entrypoints = _collect_function_calls(
-        module_statements,
-        module_name,
-        is_package,
-        aliases,
-        local_defs,
-        local_class_targets,
-        local_class_entrypoints,
-    )
-    return _ModuleAnalysis(
-        module=module_name,
-        source_path=str(source_path),
-        aliases=aliases,
-        direct_names=export_summary.direct_names,
-        calls_by_function=calls_by_function,
-        class_entrypoints=class_entrypoints,
-    )
+    return _ModuleSourceContext(source_path=source_path, module_statements=module_statements, is_package=is_package)
 
 
 def _module_level_statements(tree: ast.Module) -> tuple[ast.stmt, ...]:

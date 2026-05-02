@@ -38,6 +38,7 @@ from .keras_utils import (
     check_custom_metric_config,
     check_lambda_dict_function,
     check_subclassed_model,
+    find_case_insensitive_substrings,
     is_known_safe_keras_layer_class,
 )
 
@@ -1790,10 +1791,7 @@ class KerasZipScanner(BaseScanner):
                         "webbrowser",
                     ]
 
-                    found_patterns = []
-                    for pattern in dangerous_patterns:
-                        if pattern in decoded_str.lower():
-                            found_patterns.append(pattern)
+                    found_patterns = find_case_insensitive_substrings(decoded_str, dangerous_patterns)
 
                     if found_patterns:
                         result.add_check(
