@@ -1593,9 +1593,7 @@ Priority 1:
    - First cache-local slice landed in `#1171`; broader product-level hash reuse still needs hash-output requirements settled.
 2. Replace report-scoped call-graph sharing with source-aware invalidation where safe.
    - Higher upside remains, but freshness semantics still need careful proof.
-3. Tighten license header reads for non-license large text-like files only if detection semantics stay explicit.
-   - Binary probes are already bounded; the remaining long-text case is a deliberate behavior tradeoff.
-4. Revisit duplicate-aware reuse and the remaining pickle wrapper passes.
+3. Revisit duplicate-aware reuse and the remaining pickle wrapper passes.
    - Worth doing, but both need stronger path-sensitivity analysis first.
 
 ## Next Measurement Pass
