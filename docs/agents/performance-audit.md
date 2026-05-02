@@ -1309,6 +1309,22 @@ Priority 1:
 - Notes:
   - this keeps a small analysis helper from repeating work on the slower fallback path
 
+### 2026-05-02 - Shared oversized hex-token lowercase view
+
+- PR:
+  - `#1202`
+- Change:
+  - oversized hex-token seed gating now lowers each candidate once before checking configured execution seeds
+  - the bounded raw-pickle window no longer copies the whole token once per seed
+- Targeted regression:
+  - `tests/scanners/test_pickle_scanner.py::test_hex_token_seed_gate_reuses_lowered_token`
+- Benchmarks:
+  - seedless `256 KiB` hex token, `200` seed-gate checks:
+    - before: `0.089854s` median
+    - after: `0.021239s` median
+- Notes:
+  - this narrows one of the remaining raw-detector costs on unusually large encoded tokens
+
 ### 2026-05-01 - Shared Keras metadata lowercase view
 
 - PR:
