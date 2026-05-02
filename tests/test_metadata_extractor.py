@@ -34,6 +34,20 @@ def test_has_tensorflow_protobuf_stubs_fails_closed_on_probe_error(monkeypatch: 
 class TestModelMetadataExtractor:
     """Test the ModelMetadataExtractor class."""
 
+    def test_filter_security_metadata_reuses_lowered_keys(self) -> None:
+        class CountingKey(str):
+            lower_calls = 0
+
+            def lower(self) -> str:
+                self.lower_calls += 1
+                return super().lower()
+
+        extractor = metadata_extractor_module.ModelMetadataExtractor()
+        key = CountingKey("risk_profile")
+
+        assert extractor._filter_security_metadata({key: True}) == {"risk_profile": True}
+        assert key.lower_calls == 1
+
     def test_extract_metadata_uses_scanner_helper_with_deserialization_config(
         self,
         tmp_path: Path,
