@@ -737,12 +737,17 @@ def check_commercial_use_warnings(scan_results: dict[str, Any] | Any, *, strict:
     return warnings
 
 
-def collect_license_metadata(file_path: str) -> dict[str, Any]:
+def collect_license_metadata(
+    file_path: str,
+    *,
+    nearby_license_files_by_directory: dict[str, list[str]] | None = None,
+) -> dict[str, Any]:
     """
     Collect comprehensive license metadata for a file.
 
     Args:
         file_path: Path to the file to analyze
+        nearby_license_files_by_directory: Optional per-scan cache keyed by directory path
 
     Returns:
         Dictionary containing license metadata
@@ -789,7 +794,12 @@ def collect_license_metadata(file_path: str) -> dict[str, Any]:
     # Find nearby license files
     if os.path.isfile(file_path):
         dir_path = str(Path(file_path).parent)
-        nearby_licenses = find_license_files(dir_path)
-        metadata["license_files_nearby"] = nearby_licenses
+        if nearby_license_files_by_directory is None:
+            nearby_licenses = find_license_files(dir_path)
+        else:
+            if dir_path not in nearby_license_files_by_directory:
+                nearby_license_files_by_directory[dir_path] = find_license_files(dir_path)
+            nearby_licenses = nearby_license_files_by_directory[dir_path]
+        metadata["license_files_nearby"] = list(nearby_licenses)
 
     return metadata

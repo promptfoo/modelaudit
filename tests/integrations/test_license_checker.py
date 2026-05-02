@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 
+import pytest
 from pydantic import HttpUrl
 
 from modelaudit.integrations.license_checker import (
@@ -544,6 +545,39 @@ Bob,30
 
         assert metadata["is_dataset"] is True  # .pkl is both dataset and model extension
         assert metadata["is_model"] is True
+
+    def test_collect_license_metadata_reuses_nearby_license_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Sibling files should share one nearby-license directory walk."""
+        first_file = tmp_path / "first.dat"
+        second_file = tmp_path / "second.dat"
+        first_file.write_text("")
+        second_file.write_text("")
+
+        find_calls = 0
+
+        def fake_find_license_files(directory: str) -> list[str]:
+            nonlocal find_calls
+            find_calls += 1
+            return [str(Path(directory) / "LICENSE")]
+
+        monkeypatch.setattr("modelaudit.integrations.license_checker.find_license_files", fake_find_license_files)
+
+        cache: dict[str, list[str]] = {}
+        first_metadata = collect_license_metadata(
+            str(first_file),
+            nearby_license_files_by_directory=cache,
+        )
+        second_metadata = collect_license_metadata(
+            str(second_file),
+            nearby_license_files_by_directory=cache,
+        )
+
+        assert find_calls == 1
+        assert first_metadata["license_files_nearby"] == second_metadata["license_files_nearby"]
 
 
 class TestIntegration:

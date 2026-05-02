@@ -358,6 +358,7 @@ def scan_model_directory_or_file(
     }
     # Track file hashes for aggregate hash computation
     file_hashes: list[str] = []
+    nearby_license_files_by_directory: dict[str, list[str]] = {}
 
     # Configure scan options
     config = {
@@ -495,7 +496,10 @@ def scan_model_directory_or_file(
                         filename_lower = Path(file_path).name.lower()
                         if filename_lower in LICENSE_FILES:
                             try:
-                                license_metadata = collect_license_metadata(str(resolved_file))
+                                license_metadata = collect_license_metadata(
+                                    str(resolved_file),
+                                    nearby_license_files_by_directory=nearby_license_files_by_directory,
+                                )
                                 from .models import FileMetadataModel
 
                                 results.file_metadata[str(resolved_file)] = FileMetadataModel(**license_metadata)
@@ -649,7 +653,10 @@ def scan_model_directory_or_file(
                         _add_asset_to_results(results, representative_file, file_result)
 
                         # Add metadata for this path using Pydantic models
-                        license_metadata = collect_license_metadata(representative_file)
+                        license_metadata = collect_license_metadata(
+                            representative_file,
+                            nearby_license_files_by_directory=nearby_license_files_by_directory,
+                        )
                         combined_metadata = {**file_result.metadata, **license_metadata}
                         combined_metadata["content_hash"] = content_hash
                         duplicate_files = duplicate_paths_by_hash.get(content_hash, [])
@@ -741,7 +748,10 @@ def scan_model_directory_or_file(
                 _add_asset_to_results(results, target, file_result)
 
                 # Collect and apply license metadata for all files
-                license_metadata = collect_license_metadata(target)
+                license_metadata = collect_license_metadata(
+                    target,
+                    nearby_license_files_by_directory=nearby_license_files_by_directory,
+                )
                 if license_metadata:
                     from .models import FileMetadataModel
 
@@ -1309,6 +1319,7 @@ def scan_model_streaming(
     start_time = time.time()
     results = create_initial_audit_result()
     file_hashes: list[str] = []
+    nearby_license_files_by_directory: dict[str, list[str]] = {}
     files_processed = 0
     skip_file_types: bool = bool(kwargs.get("skip_file_types", False))
     scan_kwargs = normalize_scanner_selection_config(kwargs)
@@ -1364,7 +1375,10 @@ def scan_model_streaming(
                     filename_lower = source_path.name.lower()
                     if filename_lower in LICENSE_FILES:
                         try:
-                            license_metadata = collect_license_metadata(str(scan_path))
+                            license_metadata = collect_license_metadata(
+                                str(scan_path),
+                                nearby_license_files_by_directory=nearby_license_files_by_directory,
+                            )
                             from .models import FileMetadataModel
 
                             results.file_metadata[report_path] = FileMetadataModel(**license_metadata)
