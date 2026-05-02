@@ -983,6 +983,28 @@ Priority 1:
 - Notes:
   - this is a common-path detector win because `BaseScanner.check_for_embedded_secrets()` constructs the detector during scans
 
+### 2026-05-02 - Manifest trusted-URL allowlist cache
+
+- PR:
+  - `#1186`
+- Change:
+  - manifest URL trust checks now normalize the allowlist once at import time
+  - exact-host lookups use a precomputed set before falling back to suffix checks for trusted parent domains
+- Targeted regression:
+  - `tests/scanners/test_manifest_scanner.py::TestIsTrustedUrlDomain::test_exact_trusted_domain_skips_suffix_scan`
+- Benchmarks:
+  - `20,000` exact trusted URL checks:
+    - before: `0.342448s` median
+    - after: `0.059979s` median
+  - `20,000` untrusted URL checks:
+    - before: `0.359739s` median
+    - after: `0.247666s` median
+  - `20,000` trusted subdomain checks:
+    - before: `0.090956s` median
+    - after: `0.082338s` median
+- Notes:
+  - this is a manifest-scanner CPU cleanup for URL-heavy configs that preserves the exact-only hosting-domain boundary
+
 ### 2026-05-01 - Shared C2 payload lowercase view
 
 - PR:
