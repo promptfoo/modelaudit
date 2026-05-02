@@ -311,6 +311,10 @@ class NetworkCommDetector:
         b"psycopg2",
         b"mysql.connector",
     ]
+    NETWORK_LIBRARY_PATTERNS: ClassVar[dict[bytes, tuple[bytes, ...]]] = {
+        lib: (b"import " + lib, b"from " + lib, lib + b".connect", lib + b".request", lib + b".__init__")
+        for lib in NETWORK_LIBRARIES
+    }
 
     # Network functions
     NETWORK_FUNCTIONS: ClassVar[list[bytes]] = [
@@ -783,10 +787,7 @@ class NetworkCommDetector:
     def _scan_network_libraries(self, data: bytes, context: str) -> None:
         """Scan for network library imports."""
         for lib in self.NETWORK_LIBRARIES:
-            # Look for import statements
-            patterns = [b"import " + lib, b"from " + lib, lib + b".connect", lib + b".request", lib + b".__init__"]
-
-            for pattern in patterns:
+            for pattern in self.NETWORK_LIBRARY_PATTERNS[lib]:
                 for match_index in _iter_pattern_matches(data, pattern):
                     if _is_doc_only_network_reference(
                         data,
