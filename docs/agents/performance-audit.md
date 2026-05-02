@@ -1373,6 +1373,22 @@ Priority 1:
 - Notes:
   - this trims repeated work on the per-file routing path; the repo-wide non-slow lane still hits the existing timing-sensitive validation and directory-scan sentinels in this environment
 
+### 2026-05-02 - Shared metadata-key lowercase view
+
+- PR:
+  - `#1206`
+- Change:
+  - security-metadata filtering now lowers each metadata key once per pass
+  - multi-term security-key matching reuses the normalized key string
+- Targeted regression:
+  - `tests/test_metadata_extractor.py::TestModelMetadataExtractor::test_filter_security_metadata_reuses_lowered_keys`
+- Benchmarks:
+  - `50,000`-key metadata map, `100` filter passes:
+    - before: `1.357000s` median
+    - after: `1.101180s` median
+- Notes:
+  - this removes repeated normalization on broad metadata maps; the repo-wide non-slow lane still hits the existing timing-sensitive validation and directory-scan sentinels in this environment
+
 ### 2026-05-01 - Shared Keras metadata lowercase view
 
 - PR:
