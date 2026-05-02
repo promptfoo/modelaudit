@@ -180,6 +180,7 @@ class MetadataScanner(BaseScanner):
             self._check_timeout()
             if url in seen:
                 continue
+            seen.add(url)
             parsed = urlparse(url)
             matched_domain = None
             matched_component = None
@@ -200,7 +201,6 @@ class MetadataScanner(BaseScanner):
             if matched_domain is None:
                 continue
 
-            seen.add(url)
             safe_url = _redact_url_for_display(url)
             self._add_issue_check(
                 result,

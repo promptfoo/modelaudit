@@ -223,6 +223,35 @@ def test_scan_directory_preserves_parseable_prefixed_zip_with_central_directory_
     )
 
 
+def test_scan_model_omits_phase_timings_by_default(tmp_path: Path) -> None:
+    payload = tmp_path / "payload.pkl"
+    payload.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+
+    result = scan_model_directory_or_file(str(payload), cache_scan_results=False)
+
+    assert not hasattr(result, "phase_timings")
+
+
+def test_scan_model_emits_opt_in_phase_timings(tmp_path: Path) -> None:
+    payload = tmp_path / "payload.pkl"
+    payload.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+
+    result = scan_model_directory_or_file(str(payload), cache_scan_results=False, profile_timings=True)
+    phase_timings = result.phase_timings  # type: ignore[attr-defined]
+
+    assert phase_timings.keys() >= {
+        "scanner_selection",
+        "top_level_hashing",
+        "file_scan_dispatch",
+        "result_merge",
+        "license_metadata",
+        "result_consolidation",
+        "commercial_use_warnings",
+        "aggregate_hash",
+    }
+    assert all(duration >= 0 for duration in phase_timings.values())
+
+
 def test_scan_file_detects_misnamed_gzip_wrapped_pickle_by_header(tmp_path: Path) -> None:
     disguised_gzip = tmp_path / "payload.jpg"
     disguised_gzip.write_bytes(gzip.compress(_build_malicious_pickle()))
@@ -1377,6 +1406,26 @@ def test_directory_file_probe_stops_after_limit(monkeypatch: pytest.MonkeyPatch,
         )
         is None
     )
+
+
+def test_scan_directory_without_progress_skips_file_counting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "model.pkl"
+    model_path.write_bytes(b"\x80\x04N.")
+
+    def fail_rglob(self: Path, pattern: str) -> Iterator[Path]:
+        raise AssertionError(f"unexpected rglob({pattern!r}) for {self}")
+
+    monkeypatch.setattr(Path, "rglob", fail_rglob)
+
+    result = scan_model_directory_or_file(
+        str(tmp_path),
+        cache_scan_results=False,
+    )
+
+    assert result.files_scanned == 1
 
 
 def test_scan_file_routes_manifest_owned_chat_templates_through_jinja_analysis(tmp_path: Path) -> None:
