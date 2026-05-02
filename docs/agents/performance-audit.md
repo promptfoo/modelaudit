@@ -871,6 +871,22 @@ Priority 1:
 - Notes:
   - this is a narrow scanner-local CPU cleanup; the PR intentionally avoids changing detection coverage while removing repeated long-text lowercasing
 
+### 2026-05-02 - HuggingFace bookkeeping filename short-circuit
+
+- PR:
+  - `#1179`
+- Change:
+  - `_is_huggingface_cache_file()` now returns immediately for filenames that can never be HuggingFace bookkeeping artifacts
+  - ordinary local assets no longer pay the hub/download layout-resolution cost before being scanned
+- Targeted regression:
+  - `tests/test_directory_file_filtering.py::TestDirectoryFileFiltering::test_non_bookkeeping_filenames_skip_hf_layout_probes`
+- Benchmarks:
+  - `20,000` ordinary local filenames:
+    - before: `2.326372s` median
+    - after: `0.027346s` median
+- Notes:
+  - this closes the clearest ordinary-path slice of the HuggingFace probing backlog while keeping the existing true-cache layout checks intact
+
 ### 2026-05-01 - Shared C2 payload lowercase view
 
 - PR:
