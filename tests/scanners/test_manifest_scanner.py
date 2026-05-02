@@ -1,6 +1,8 @@
+import builtins
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -48,6 +50,38 @@ def test_manifest_scanner_blacklist(tmp_path):
         issue.details.get("blacklisted_term", "") for issue in blacklist_issues if hasattr(issue, "details")
     ]
     assert "unsafe" in blacklisted_terms
+
+
+def test_manifest_scanner_reuses_manifest_text_during_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_file = tmp_path / "manifest.json"
+    test_file.write_text(
+        json.dumps(
+            {
+                "model_name": "safe-model",
+                "description": "ordinary manifest",
+                "source": _https_url("huggingface.co"),
+            }
+        )
+    )
+
+    original_open = builtins.open
+    open_count = 0
+
+    def counting_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal open_count
+        if file == str(test_file) and kwargs.get("encoding") == "utf-8":
+            open_count += 1
+        return original_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+
+    result = ManifestScanner(config={"blacklist_patterns": ["blocked"]}).scan(str(test_file))
+
+    assert result.success is True
+    assert open_count == 1
 
 
 def test_manifest_scanner_case_insensitive_blacklist(tmp_path):
