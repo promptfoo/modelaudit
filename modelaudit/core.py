@@ -293,6 +293,7 @@ def _hash_files_by_path(file_paths: list[str]) -> dict[str, str]:
                         content_hashes[file_path] = cached_hash
                         continue
             except OSError:
+                # Fall back to direct hashing when stat is unavailable or the file changes mid-scan.
                 pass
 
             content_hashes[file_path] = _calculate_file_hash(file_path)
