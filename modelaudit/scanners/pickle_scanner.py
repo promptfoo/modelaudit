@@ -1063,6 +1063,11 @@ def _is_legitimate_serialization_file(path: str) -> bool:
     return not report.has_security_findings and report.status.value != "error"
 
 
+def _contains_any_jax_indicator(text: str, indicators: tuple[str, ...]) -> bool:
+    lowered_text = text.lower()
+    return any(indicator in lowered_text for indicator in indicators)
+
+
 def _path_prefix_looks_like_pickle(path: str) -> bool:
     try:
         with open(path, "rb") as handle:
@@ -2449,7 +2454,7 @@ class PickleScanner(BaseScanner):
             path,
             decoded_text,
         )
-        has_jax_context = any(indicator in decoded_text.lower() for indicator in jax_scanner._JAX_INDICATORS)
+        has_jax_context = _contains_any_jax_indicator(decoded_text, jax_scanner._JAX_INDICATORS)
         has_jax_findings = any(
             check.name == "JAX Pattern Security Check" and check.status == CheckStatus.FAILED
             for check in jax_result.checks
