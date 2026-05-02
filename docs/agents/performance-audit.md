@@ -754,6 +754,22 @@ Priority 1:
 - Notes:
   - this is a metadata-doc hot-path cleanup that preserves the suspicious URL finding surface
 
+### 2026-05-01 - Shared call-graph module parse context
+
+- PR:
+  - `#1167`
+- Change:
+  - wildcard export summaries and full module analysis now reuse one cached source parse
+  - the shared parse context is cleared with the existing source-sensitive call-graph caches
+- Targeted regression:
+  - `packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py::test_wildcard_summary_and_analysis_share_module_parse`
+- Benchmarks:
+  - synthetic module with `200` local functions, `20` cache-cleared wildcard-summary plus full-analysis pairs:
+    - duplicate parse path: `0.115265s` median
+    - shared source-context path: `0.095118s` median
+- Notes:
+  - this narrows one remaining piece of the broader call-graph invalidation backlog without changing freshness semantics
+
 ## Measured Non-Wins
 
 ### 2026-05-01 - Skip directory pre-count without progress
@@ -801,6 +817,28 @@ Priority 1:
     - shared lowercase values: `0.009800s` median
 - Decision:
   - the exact changed work is too small to justify a PR; keep focus on larger scanner paths
+
+### 2026-05-01 - Explicit ML network regex precompilation
+
+- Hypothesis:
+  - precompile the four explicit-network regexes used for ML-model false-positive filtering
+- Result:
+  - `20,000` tiny-payload calls:
+    - current path: `0.095730s` median
+    - precompiled probe: `0.082867s` median
+- Decision:
+  - measurable but still too small for a dedicated PR compared with larger detector and call-graph work
+
+### 2026-05-01 - Jinja malformed-JSON fallback text reuse
+
+- Hypothesis:
+  - reuse the decoded JSON text after parse failure instead of falling back to a second file scan
+- Result:
+  - synthetic `64 MiB` malformed tokenizer config:
+    - current bounded file-window fallback: `0.122820s` median
+    - reused decoded-text fallback: `0.130862s` median
+- Decision:
+  - keep the existing file-window path; it is faster than scanning the whole decoded string
 
 ## Remaining Recommended Implementation Order
 
