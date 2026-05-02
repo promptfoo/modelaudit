@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import pytest
+
+import modelaudit.scanners.pmml_scanner as pmml_scanner_module
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pmml_scanner import PmmlScanner
 
@@ -91,6 +94,31 @@ def test_pmml_scanner_system_call_is_flagged(tmp_path: Path) -> None:
 </PMML>"""
     path = tmp_path / "system_call.pmml"
     path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is True
+    assert any(issue.details.get("pattern") == r"\bsystem\s*\(" for issue in result.issues)
+
+
+def test_pmml_scanner_reuses_compiled_extension_patterns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pmml = """<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header>
+    <Extension>system('id')</Extension>
+  </Header>
+  <DataDictionary numberOfFields='0'/>
+</PMML>"""
+    path = tmp_path / "compiled_patterns.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    def fail_re_search(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("PMML extension matching should reuse compiled suspicious patterns")
+
+    monkeypatch.setattr(pmml_scanner_module.re, "search", fail_re_search)
 
     result = PmmlScanner().scan(str(path))
 

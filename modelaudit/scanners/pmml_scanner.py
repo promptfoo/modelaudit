@@ -33,6 +33,7 @@ SUSPICIOUS_PATTERNS = [
     r"__import__",
     r"\bsystem\s*\(",
 ]
+_COMPILED_SUSPICIOUS_PATTERNS = tuple((pattern, re.compile(pattern, re.IGNORECASE)) for pattern in SUSPICIOUS_PATTERNS)
 URL_PATTERNS = ["http://", "https://", "file://", "ftp://"]
 BENIGN_DOCUMENTATION_URL_PATTERNS = frozenset({"http://", "https://"})
 DANGEROUS_ENTITIES = ["<!DOCTYPE", "<!ENTITY", "<!ELEMENT", "<!ATTLIST"]
@@ -366,8 +367,8 @@ class PmmlScanner(BaseScanner):
 
             # Special attention to Extension elements which can contain arbitrary content
             if tag_name == "extension":
-                for pattern in SUSPICIOUS_PATTERNS:
-                    if re.search(pattern, combined, re.IGNORECASE):
+                for pattern, compiled_pattern in _COMPILED_SUSPICIOUS_PATTERNS:
+                    if compiled_pattern.search(combined):
                         result.add_check(
                             name="Extension Element Security Check",
                             passed=False,
