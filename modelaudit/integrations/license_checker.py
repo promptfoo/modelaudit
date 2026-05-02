@@ -181,9 +181,11 @@ def _read_header_text(file_path: str, max_lines: int) -> str | None:
     decoded_header = header_sample.decode("utf-8", errors="ignore")
     if not has_more_bytes:
         return "".join(decoded_header.splitlines(keepends=True)[:max_lines])
+    if not _is_explicit_license_file(file_path):
+        return "".join(decoded_header.splitlines(keepends=True)[:max_lines])
 
-    # Likely text files should keep the original line-oriented behavior so
-    # long one-line headers are not silently truncated by the binary cap.
+    # Explicit license files keep the richer line-oriented behavior so long
+    # one-line license notices are not silently truncated by the byte cap.
     try:
         with open(file_path, encoding="utf-8", errors="ignore") as f:
             return "".join(itertools.islice(f, max_lines))
@@ -244,6 +246,11 @@ LICENSE_FILES = {
     "terms",
     "terms.txt",
 }
+
+
+def _is_explicit_license_file(file_path: str) -> bool:
+    return Path(file_path).name.lower() in LICENSE_FILES
+
 
 # Dataset file patterns that often lack proper licensing
 DATASET_EXTENSIONS = {
