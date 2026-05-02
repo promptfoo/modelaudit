@@ -656,6 +656,18 @@ Priority 1:
 - Decision:
   - do not spend a PR on this yet; the larger directory costs remain elsewhere
 
+### 2026-05-01 - Streaming SHA256 reuse from scanner metadata
+
+- Hypothesis:
+  - reuse scanner-emitted SHA256 values in streaming mode to skip the extra pre-aggregation SHA256 pass
+- Result:
+  - direct SHA256 cost on a synthetic `16 MiB` pickle was only `0.018932s` median
+  - controlled same-process A/B on the full streaming scan was within noise:
+    - forced fallback hash pass: `1.189368s` median
+    - scanner-metadata reuse: `1.224190s` median
+- Decision:
+  - do not land the extra branch yet; the regular large-file hashing work needs a broader design rather than this tiny streaming-only slice
+
 ## Remaining Recommended Implementation Order
 
 1. Add phase-level timings in the core scan pipeline.
