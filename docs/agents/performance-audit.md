@@ -887,6 +887,22 @@ Priority 1:
 - Notes:
   - this closes the clearest ordinary-path slice of the HuggingFace probing backlog while keeping the existing true-cache layout checks intact
 
+### 2026-05-02 - Per-scan nearby-license file cache
+
+- PR:
+  - `#1180`
+- Change:
+  - scan orchestration now passes a short-lived per-scan nearby-license cache into `collect_license_metadata()`
+  - sibling assets reuse the same `find_license_files()` result without introducing a process-global cache
+- Targeted regression:
+  - `tests/integrations/test_license_checker.py::TestLicenseMetadataCollection::test_collect_license_metadata_reuses_nearby_license_cache`
+- Benchmarks:
+  - `800` sibling files with no nearby license files:
+    - before: `0.316707s` median
+    - after: `0.024294s` median
+- Notes:
+  - this closes the metadata-collection side of repeated nearby-license discovery; the separate commercial-warning sibling cache landed in `#1176`
+
 ### 2026-05-01 - Shared C2 payload lowercase view
 
 - PR:
