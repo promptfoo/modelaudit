@@ -303,7 +303,7 @@ Priority 1:
 | `modelaudit/scanner_selection.py`                                        | profiled         | Alias maps and policies are rebuilt per file even when config is unchanged. Strong many-file optimization candidate.                                                  |
 | `modelaudit/integrations/license_checker.py`                             | profiled         | Repeated directory walks and sibling directory scans create large many-file costs; header reading is also expensive for long one-line text-like files.                |
 | `modelaudit/scanners/base.py`                                            | profiled         | Multi-hash integrity pass is a meaningful large-file cost and duplicates other hashing work.                                                                          |
-| `modelaudit/scanners/pickle_scanner.py`                                  | profiled         | Clean duplicate pickle workloads spend heavily in raw detectors and the JAX wrapper pass after the Rust engine.                                                       |
+| `modelaudit/scanners/pickle_scanner.py`                                  | measured         | Clean duplicate pickle workloads spend heavily in raw detectors; ordinary JAX delegation is reduced in `#1158`, and Rust-only validation now avoids call-graph enrichment in `#1196`. |
 | `modelaudit/cache/adaptive_cache_keys.py`                                | inspected        | Large-file cache keys can trigger content hashing; must be considered together with scanner and aggregate hashes.                                                     |
 | `modelaudit/cache/scan_results_cache.py`                                 | inspected        | Cache storage computes a secure file hash after scan completion, adding another full-file pass on misses.                                                             |
 | `modelaudit/utils/file/detection.py`                                     | inspected        | Mostly bounded probes; this is a good local pattern to preserve.                                                                                                      |
@@ -586,6 +586,24 @@ Priority 1:
   - [ ] one instrumentation PR followed by focused optimization PRs
 
 ## Completed Wins
+
+### 2026-05-02 - Native-only pickle validation
+
+- PR:
+  - `#1196`
+- Change:
+  - `_is_legitimate_serialization_file()` now matches its documented Rust-only contract instead of invoking Python call-graph enrichment
+  - the standalone native scan helper gained a private `enrich_call_graph` switch so normal scanner behavior stays unchanged
+- Targeted regressions:
+  - `tests/scanners/test_pickle_scanner.py::test_legitimate_serialization_file_skips_call_graph_enrichment`
+  - `tests/test_real_world_dill_joblib.py::TestPerformanceBenchmarks::test_validation_performance_impact`
+- Benchmarks:
+  - exact validation fixture used by the perf sentinel:
+    - enriched path: `0.039207s` median per call
+    - native-only path: `0.000067s` median per call
+- Notes:
+  - this removed the validation-perf failure from the local broad lane; the remaining local perf failure is the separate directory-scan threshold
+  - public standalone pickle scans still keep call-graph enrichment by default
 
 ### 2026-05-02 - ONNX raw-buffer reuse
 
