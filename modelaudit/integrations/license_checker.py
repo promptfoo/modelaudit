@@ -2,7 +2,7 @@ import itertools
 import json
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -741,7 +741,11 @@ def check_commercial_use_warnings(scan_results: dict[str, Any] | Any, *, strict:
     return warnings
 
 
-def collect_license_metadata(file_path: str) -> dict[str, Any]:
+def collect_license_metadata(
+    file_path: str,
+    *,
+    nearby_license_cache: MutableMapping[str, list[str]] | None = None,
+) -> dict[str, Any]:
     """
     Collect comprehensive license metadata for a file.
 
@@ -793,7 +797,14 @@ def collect_license_metadata(file_path: str) -> dict[str, Any]:
     # Find nearby license files
     if os.path.isfile(file_path):
         dir_path = str(Path(file_path).parent)
-        nearby_licenses = find_license_files(dir_path)
+        if nearby_license_cache is None:
+            nearby_licenses = find_license_files(dir_path)
+        else:
+            cached_nearby_licenses = nearby_license_cache.get(dir_path)
+            if cached_nearby_licenses is None:
+                cached_nearby_licenses = find_license_files(dir_path)
+                nearby_license_cache[dir_path] = cached_nearby_licenses
+            nearby_licenses = cached_nearby_licenses
         metadata["license_files_nearby"] = nearby_licenses
 
     return metadata
