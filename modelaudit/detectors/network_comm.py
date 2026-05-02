@@ -387,6 +387,27 @@ class NetworkCommDetector:
         ]
         for port in SUSPICIOUS_PORTS
     }
+    PORT_NAMES: ClassVar[dict[int, str]] = {
+        22: "SSH",
+        23: "Telnet",
+        135: "RPC",
+        139: "NetBIOS",
+        445: "SMB",
+        1337: "Common Backdoor",
+        1433: "MSSQL",
+        3128: "Proxy",
+        3306: "MySQL",
+        3389: "RDP",
+        4444: "Metasploit",
+        5432: "PostgreSQL",
+        5900: "VNC",
+        6379: "Redis",
+        8080: "HTTP Proxy",
+        8443: "HTTPS Alt",
+        9200: "Elasticsearch",
+        27017: "MongoDB",
+        31337: "Back Orifice",
+    }
 
     EXPLICIT_PORT_PATTERNS: ClassVar[dict[int, list[re.Pattern]]] = {
         port: [
@@ -1009,28 +1030,7 @@ class NetworkCommDetector:
 
     def _get_port_name(self, port: int) -> str:
         """Get common service name for a port."""
-        port_names = {
-            22: "SSH",
-            23: "Telnet",
-            135: "RPC",
-            139: "NetBIOS",
-            445: "SMB",
-            1337: "Common Backdoor",
-            1433: "MSSQL",
-            3128: "Proxy",
-            3306: "MySQL",
-            3389: "RDP",
-            4444: "Metasploit",
-            5432: "PostgreSQL",
-            5900: "VNC",
-            6379: "Redis",
-            8080: "HTTP Proxy",
-            8443: "HTTPS Alt",
-            9200: "Elasticsearch",
-            27017: "MongoDB",
-            31337: "Back Orifice",
-        }
-        return port_names.get(port, "Unknown")
+        return self.PORT_NAMES.get(port, "Unknown")
 
 
 def detect_network_communication(file_path: str, config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
