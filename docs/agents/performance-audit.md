@@ -1201,6 +1201,17 @@ Priority 1:
 
 ## Measured Non-Wins
 
+### 2026-05-02 - Explicit ML network-pattern precompile
+
+- Hypothesis:
+  - precompile the four explicit ML-model network regexes instead of compiling them inside each model-file scan
+- Result:
+  - controlled no-match ML-model helper benchmark using the real helper shape:
+    - literal regex path: `3.441316s` median
+    - shared compiled regex path: `3.957430s` median
+- Decision:
+  - do not land the change; Python's regex cache plus the actual helper shape made the precompiled version slower in the measured path
+
 ### 2026-05-02 - Metadata URL regex precompile
 
 - Hypothesis:
