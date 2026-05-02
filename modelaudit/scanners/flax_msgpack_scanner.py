@@ -95,6 +95,9 @@ class FlaxMsgpackScanner(BaseScanner):
                 r"from\s+os\s+import\s+system",
             ],
         )
+        self._compiled_suspicious_patterns = tuple(
+            (pattern, re.compile(pattern, re.IGNORECASE), pattern.lower()) for pattern in self.suspicious_patterns
+        )
 
         self.suspicious_keys = self.config.get(
             "suspicious_keys",
@@ -421,14 +424,14 @@ class FlaxMsgpackScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         """Check string values for suspicious patterns that might indicate code injection."""
-        for pattern in self.suspicious_patterns:
-            if re.search(pattern, value, re.IGNORECASE):
+        for pattern, compiled_pattern, lowered_pattern in self._compiled_suspicious_patterns:
+            if compiled_pattern.search(value):
                 # Determine appropriate rule code based on pattern
-                if "eval" in pattern.lower():
+                if "eval" in lowered_pattern:
                     rule_code = "S104"  # eval/exec usage
-                elif "compile" in pattern.lower():
+                elif "compile" in lowered_pattern:
                     rule_code = "S105"  # compile usage
-                elif "import\\s+os" in pattern.lower() or "os\\.system" in pattern.lower():
+                elif "import\\s+os" in lowered_pattern or "os\\.system" in lowered_pattern:
                     rule_code = "S101"  # os module usage
                 else:
                     rule_code = "S999"  # Unknown/generic suspicious pattern

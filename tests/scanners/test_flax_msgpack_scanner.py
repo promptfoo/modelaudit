@@ -695,3 +695,12 @@ def test_flax_msgpack_custom_config(tmp_path):
 
     # Should still detect some issues but with different thresholds
     assert len(result.issues) > 0
+
+
+def test_flax_msgpack_custom_suspicious_patterns_still_match(tmp_path: Path) -> None:
+    path = tmp_path / "custom_pattern.msgpack"
+    create_msgpack_file(path, {"payload": "custom_threat"})
+
+    result = FlaxMsgpackScanner(config={"suspicious_patterns": [r"custom_threat"]}).scan(str(path))
+
+    assert any(issue.details.get("pattern") == r"custom_threat" for issue in result.issues)
