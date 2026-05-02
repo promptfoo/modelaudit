@@ -791,6 +791,17 @@ Priority 1:
 - Decision:
   - the measured gain is too small and too localized to justify a dedicated PR right now
 
+### 2026-05-01 - Metadata secret-match lowercase reuse
+
+- Hypothesis:
+  - lowercase each matched secret string and description once before placeholder / known-format checks
+- Result:
+  - exact inner-loop benchmark across `20,000` synthetic matches:
+    - repeated lowercasing: `0.010581s` median
+    - shared lowercase values: `0.009800s` median
+- Decision:
+  - the exact changed work is too small to justify a PR; keep focus on larger scanner paths
+
 ## Remaining Recommended Implementation Order
 
 1. Add phase-level timings in the core scan pipeline.
