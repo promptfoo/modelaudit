@@ -12,7 +12,7 @@ from click.testing import CliRunner
 
 from modelaudit import __version__
 from modelaudit.cache.trusted_config_store import TrustedConfigStore
-from modelaudit.cli import cli, expand_paths, format_text_output
+from modelaudit.cli import _summarize_progress_tree, cli, expand_paths, format_text_output
 from modelaudit.core import scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel, create_initial_audit_result
 from tests.cli_output import parse_click_json_output
@@ -107,6 +107,27 @@ def test_cli_version():
     result = runner.invoke(cli, ["--version"])
     assert result.exit_code == 0
     assert __version__ in result.output
+
+
+def test_summarize_progress_tree_walks_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Directory progress totals should come from one recursive traversal."""
+    nested_dir = tmp_path / "nested"
+    nested_dir.mkdir()
+    (tmp_path / "root.bin").write_bytes(b"abc")
+    (nested_dir / "child.bin").write_bytes(b"de")
+
+    original_rglob = Path.rglob
+    rglob_calls = 0
+
+    def counting_rglob(path: Path, pattern: str) -> Any:
+        nonlocal rglob_calls
+        rglob_calls += 1
+        return original_rglob(path, pattern)
+
+    monkeypatch.setattr(Path, "rglob", counting_rglob)
+
+    assert _summarize_progress_tree(str(tmp_path)) == (5, 3)
+    assert rglob_calls == 1
 
 
 def test_scan_command_help():

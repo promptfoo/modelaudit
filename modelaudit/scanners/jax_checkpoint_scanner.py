@@ -491,18 +491,15 @@ class JaxCheckpointScanner(BaseScanner):
         try:
             with open(path, "rb") as f:
                 header = f.read(512)
-
-            # Check for pickle formats with JAX indicators. Protocol 0 pickles
-            # are textual and can begin directly with a string opcode such as
-            # `Vjax`, so they do not have the binary protocol marker.
-            if header.startswith(b"\x80") or header[:1] in b"(cdgINRSUV":
-                # Read more to check for JAX-specific content
-                with suppress(Exception):
-                    with open(path, "rb") as f:
-                        data = f.read(8192)  # Read first 8KB
+                # Check for pickle formats with JAX indicators. Protocol 0
+                # pickles are textual and can begin directly with a string
+                # opcode such as `Vjax`, so they do not have the binary
+                # protocol marker.
+                if header.startswith(b"\x80") or header[:1] in b"(cdgINRSUV":
+                    with suppress(Exception):
+                        data = header + f.read(max(0, 8192 - len(header)))
                         data_str = data.decode("utf-8", errors="ignore").lower()
-
-                    return cls._contains_jax_indicator(data_str)
+                        return cls._contains_jax_indicator(data_str)
 
             decoded_header = header.decode("utf-8", errors="ignore").lower()
 
