@@ -2,7 +2,7 @@
 
 import base64
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 from modelaudit.detectors.suspicious_symbols import (
@@ -35,6 +35,16 @@ _LAMBDA_DANGEROUS_PATTERNS: list[str] = [
     "shutil",
     "ctypes",
 ]
+
+
+def find_lambda_dangerous_patterns(
+    decoded_text: str,
+    patterns: Iterable[str] = _LAMBDA_DANGEROUS_PATTERNS,
+) -> list[str]:
+    """Return dangerous Lambda patterns present in decoded text."""
+    lowered_text = decoded_text.lower()
+    return [pattern for pattern in patterns if pattern in lowered_text]
+
 
 _EXTRA_SAFE_KERAS_LOSS_IDENTIFIERS: frozenset[str] = frozenset(
     {
@@ -301,7 +311,7 @@ def check_lambda_dict_function(
         )
         return True
 
-    found_patterns = [p for p in _LAMBDA_DANGEROUS_PATTERNS if p in decoded_str.lower()]
+    found_patterns = find_lambda_dangerous_patterns(decoded_str)
 
     if found_patterns:
         result.add_check(
