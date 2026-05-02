@@ -377,6 +377,7 @@ def scan_model_directory_or_file(
     }
     # Track file hashes for aggregate hash computation
     file_hashes: list[str] = []
+    nearby_license_cache: dict[str, list[str]] = {}
 
     phase_timings: dict[str, float] | None = {} if bool(kwargs.get("profile_timings")) else None
 
@@ -526,8 +527,13 @@ def scan_model_directory_or_file(
                         if filename_lower in LICENSE_FILES:
                             try:
                                 license_metadata_started_at = _start_phase_timing(phase_timings)
-                                license_metadata = collect_license_metadata(str(resolved_file))
-                                _finish_phase_timing(phase_timings, "license_metadata", license_metadata_started_at)
+                                try:
+                                    license_metadata = collect_license_metadata(
+                                        str(resolved_file),
+                                        nearby_license_cache=nearby_license_cache,
+                                    )
+                                finally:
+                                    _finish_phase_timing(phase_timings, "license_metadata", license_metadata_started_at)
                                 from .models import FileMetadataModel
 
                                 results.file_metadata[str(resolved_file)] = FileMetadataModel(**license_metadata)
@@ -692,8 +698,13 @@ def scan_model_directory_or_file(
 
                         # Add metadata for this path using Pydantic models
                         license_metadata_started_at = _start_phase_timing(phase_timings)
-                        license_metadata = collect_license_metadata(representative_file)
-                        _finish_phase_timing(phase_timings, "license_metadata", license_metadata_started_at)
+                        try:
+                            license_metadata = collect_license_metadata(
+                                representative_file,
+                                nearby_license_cache=nearby_license_cache,
+                            )
+                        finally:
+                            _finish_phase_timing(phase_timings, "license_metadata", license_metadata_started_at)
                         combined_metadata = {**file_result.metadata, **license_metadata}
                         combined_metadata["content_hash"] = content_hash
                         duplicate_files = duplicate_paths_by_hash.get(content_hash, [])
@@ -795,8 +806,13 @@ def scan_model_directory_or_file(
 
                 # Collect and apply license metadata for all files
                 license_metadata_started_at = _start_phase_timing(phase_timings)
-                license_metadata = collect_license_metadata(target)
-                _finish_phase_timing(phase_timings, "license_metadata", license_metadata_started_at)
+                try:
+                    license_metadata = collect_license_metadata(
+                        target,
+                        nearby_license_cache=nearby_license_cache,
+                    )
+                finally:
+                    _finish_phase_timing(phase_timings, "license_metadata", license_metadata_started_at)
                 if license_metadata:
                     from .models import FileMetadataModel
 
@@ -968,25 +984,12 @@ def _is_huggingface_cache_file(path: str) -> bool:
     import os
 
     filename = os.path.basename(path)
-    path_obj = Path(path)
-
-    is_hf_bookkeeping_path = _is_hf_hub_bookkeeping_path(path_obj) or _is_hf_download_bookkeeping_path(path_obj)
+    if not (filename.endswith((".lock", ".metadata")) or filename in {".gitignore", ".gitattributes", "main", "HEAD"}):
+        return False
 
     # Only trust bookkeeping-shaped filenames when they actually live in a
     # recognized HuggingFace cache layout.
-    if filename.endswith(".lock"):
-        return is_hf_bookkeeping_path
-
-    # Only skip HuggingFace .metadata files in known cache/download layouts.
-    if filename.endswith(".metadata"):
-        return is_hf_bookkeeping_path
-
-    # Check for specific HuggingFace cache metadata files
-    # We no longer skip all HuggingFace cache files since we handle symlinks properly now
-
-    # Check for Git-related files that are commonly cached
-    if filename in [".gitignore", ".gitattributes"]:
-        return is_hf_bookkeeping_path
+    path_obj = Path(path)
 
     if filename in ["main", "HEAD"]:
         hf_cache_root = _find_hf_cache_root(path_obj)
@@ -999,6 +1002,17 @@ def _is_huggingface_cache_file(path: str) -> bool:
             return False
 
         return bool(relative_parts and relative_parts[0] == "refs")
+
+    is_hf_bookkeeping_path = _is_hf_hub_bookkeeping_path(path_obj) or _is_hf_download_bookkeeping_path(path_obj)
+    if filename.endswith((".lock", ".metadata")):
+        return is_hf_bookkeeping_path
+
+    # Check for specific HuggingFace cache metadata files
+    # We no longer skip all HuggingFace cache files since we handle symlinks properly now
+
+    # Check for Git-related files that are commonly cached
+    if filename in [".gitignore", ".gitattributes"]:
+        return is_hf_bookkeeping_path
 
     return False
 
@@ -1381,6 +1395,7 @@ def scan_model_streaming(
     metadata_scanner_available: bool = scanner_selection.allows("metadata") and _registry.has_scanner_class(
         "MetadataScanner"
     )
+    nearby_license_cache: dict[str, list[str]] = {}
 
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
@@ -1426,7 +1441,10 @@ def scan_model_streaming(
                     filename_lower = source_path.name.lower()
                     if filename_lower in LICENSE_FILES:
                         try:
-                            license_metadata = collect_license_metadata(str(scan_path))
+                            license_metadata = collect_license_metadata(
+                                str(scan_path),
+                                nearby_license_cache=nearby_license_cache,
+                            )
                             from .models import FileMetadataModel
 
                             results.file_metadata[report_path] = FileMetadataModel(**license_metadata)
