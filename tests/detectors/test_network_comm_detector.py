@@ -458,6 +458,14 @@ class TestNetworkCommDetector:
 
         assert duration < 1.0
 
+    def test_port_name_lookup_uses_shared_mapping(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Port-name lookup should reuse the shared class mapping."""
+        detector = NetworkCommDetector()
+        monkeypatch.setattr(NetworkCommDetector, "PORT_NAMES", {9999: "Custom Service"})
+
+        assert detector._get_port_name(9999) == "Custom Service"
+        assert detector._get_port_name(22) == "Unknown"
+
     def test_blacklist_detection(self) -> None:
         """Test detection of blacklisted domains when configured."""
         # Configure with specific blacklisted domains
