@@ -90,6 +90,19 @@ def test_selection_policy_uses_allowlist_minus_exclusions() -> None:
     assert not policy.allows("zip")
 
 
+def test_selection_policy_reuses_normalized_cached_results() -> None:
+    list_policy = resolve_scanner_selection_policy(
+        scanners=["pickle", "zip"],
+        exclude_scanners=["zip"],
+    )
+    comma_policy = resolve_scanner_selection_policy(
+        scanners="pickle,zip",
+        exclude_scanners="zip",
+    )
+
+    assert list_policy is comma_policy
+
+
 def test_normalized_selection_rehydrates_without_alias_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     config = normalize_scanner_selection_config({"scanners": ["PickleScanner"], "exclude_scanners": ["zip"]})
 

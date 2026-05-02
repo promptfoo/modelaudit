@@ -174,6 +174,17 @@ def resolve_scanner_selection_policy(
     exclude_scanners: Iterable[str] | str | None = None,
 ) -> ScannerSelectionPolicy:
     """Resolve raw scanner selection inputs into a policy."""
+    return _resolve_scanner_selection_policy_cached(
+        tuple(split_scanner_tokens(scanners)),
+        tuple(split_scanner_tokens(exclude_scanners)),
+    )
+
+
+@lru_cache(maxsize=256)
+def _resolve_scanner_selection_policy_cached(
+    scanners: tuple[str, ...],
+    exclude_scanners: tuple[str, ...],
+) -> ScannerSelectionPolicy:
     metadata = _scanner_metadata()
     all_scanner_ids = frozenset(metadata.keys())
 
