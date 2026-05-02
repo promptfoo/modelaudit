@@ -783,21 +783,26 @@ Priority 1:
   - an earlier `5000`-file end-to-end probe treated this as too small to prioritize, but the direct-path measurement made it a clean low-risk orchestration cleanup
   - this is still a modest many-file win; the larger directory-scaling costs remain in scan dispatch and per-file work
 
-### 2026-05-02 - Bounded directory child probe
+### 2026-05-02 - Bounded directory progress pre-counts
 
 - PR:
   - `#1174`
 - Change:
   - progress-enabled directory scans now stop probing immediate children once they reach the existing `1000`-entry threshold
-  - wide roots no longer materialize every top-level entry just to decide whether recursive pre-counting is worthwhile
-- Targeted regression:
+  - recursive progress pre-counting also stops once a tree is already known to exceed that threshold
+  - wide roots no longer materialize every top-level entry, and deep roots no longer count every nested file just to decide whether percentages are worthwhile
+- Targeted regressions:
   - `tests/test_core.py::test_directory_child_probe_stops_at_limit`
+  - `tests/test_core.py::test_directory_file_probe_stops_after_limit`
 - Benchmarks:
   - synthetic wide directory with `20,000` immediate children, same-process A/B:
     - eager child-list materialization: `0.017017s` median
     - bounded child probe helper: `0.008936s` median
+  - synthetic deep directory with `20,000` nested files, same-process A/B:
+    - full recursive count: `0.138195s` median
+    - bounded recursive probe: `0.014900s` median
 - Notes:
-  - this is intentionally a small companion cleanup to the directory pre-count work, preserving the exact existing threshold behavior while bounding the probe itself
+  - this preserves exact totals for small trees while falling back to open-ended progress once a tree is already large enough that the recursive count is the costlier choice
 
 ### 2026-05-01 - Shared C2 payload lowercase view
 
