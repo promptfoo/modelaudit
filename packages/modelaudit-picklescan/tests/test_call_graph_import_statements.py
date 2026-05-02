@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 import io
 import os
@@ -79,10 +80,36 @@ def _clear_call_graph_caches() -> None:
         "_resolve_module_source",
         "_safe_call_graph_entrypoints",
         "_wildcard_export_summary",
+        "_module_source_context",
     ):
         cache_clear = getattr(getattr(call_graph_module, function_name), "cache_clear", None)
         if cache_clear is not None:
             cache_clear()
+
+
+def test_wildcard_summary_and_analysis_share_module_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_path = tmp_path / "module.py"
+    module_path.write_text("from dependency import *\n\ndef run():\n    return 1\n", encoding="utf-8")
+    parse_calls = 0
+    real_parse = call_graph.ast.parse
+
+    def tracking_parse(source: str, filename: str = "<unknown>") -> ast.Module:
+        nonlocal parse_calls
+        parse_calls += 1
+        return real_parse(source, filename=filename)
+
+    monkeypatch.setattr(
+        call_graph, "_resolve_module_source", lambda module_name: module_path if module_name == "module" else None
+    )
+    monkeypatch.setattr(call_graph.ast, "parse", tracking_parse)
+    _clear_call_graph_caches()
+
+    assert call_graph._wildcard_export_summary("module") is not None
+    assert call_graph._analyze_module("module") is not None
+    assert parse_calls == 1
 
 
 def test_shared_source_sensitive_caches_clears_once_per_scope(monkeypatch: pytest.MonkeyPatch) -> None:
