@@ -1068,7 +1068,7 @@ def _is_legitimate_serialization_file(path: str) -> bool:
         with path_obj.open("rb") as handle:
             if not _looks_like_pickle(handle.read(_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES)):
                 return False
-        report = StandalonePickleScanner().scan_file(path_obj)
+        report = StandalonePickleScanner().scan_file(path_obj, enrich_call_graph=False)
     except Exception:
         return False
     return not report.has_security_findings and report.status.value != "error"

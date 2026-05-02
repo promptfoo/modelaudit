@@ -1620,6 +1620,36 @@ def test_legitimate_serialization_file_uses_rust_scan(tmp_path: Path) -> None:
     assert _is_legitimate_serialization_file(str(text_path)) is False
 
 
+def test_legitimate_serialization_file_skips_call_graph_enrichment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe_path = tmp_path / "safe.joblib"
+    safe_path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00.")
+
+    def fail_call_graph_enrichment(_report: object) -> object:
+        raise AssertionError("validation helper should use native Rust findings only")
+
+    monkeypatch.setattr("modelaudit_picklescan.api._with_call_graph_findings", fail_call_graph_enrichment)
+
+    assert _is_legitimate_serialization_file(str(safe_path)) is True
+
+
+def test_legitimate_serialization_file_keeps_bounded_file_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe_path = tmp_path / "safe.joblib"
+    safe_path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00.")
+
+    def fail_read_bytes(_path: Path) -> bytes:
+        raise AssertionError("validation helper should preserve bounded scanner reads")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+
+    assert _is_legitimate_serialization_file(str(safe_path)) is True
+
+
 def test_scan_missing_path_fails_closed(tmp_path: Path) -> None:
     path = tmp_path / "missing.pkl"
 
