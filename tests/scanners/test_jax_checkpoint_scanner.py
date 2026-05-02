@@ -1,7 +1,9 @@
+import builtins
 import json
 import os
 import pickle
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -231,6 +233,25 @@ def test_benign_jax_pickle_does_not_false_positive_on_opcode_letters(tmp_path: P
     assert result.success
     assert all(check.name != "Pickle Opcode Security Check" for check in result.checks)
     assert all(issue.severity != IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_pickle_candidate_probe_reuses_open_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checkpoint_path = tmp_path / "candidate.pickle"
+    checkpoint_path.write_bytes(pickle.dumps({"framework": "jax"}))
+
+    original_open = builtins.open
+    open_count = 0
+
+    def counting_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal open_count
+        if file == str(checkpoint_path):
+            open_count += 1
+        return original_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+
+    assert JaxCheckpointScanner._is_likely_jax_file(str(checkpoint_path)) is True
+    assert open_count == 1
 
 
 def test_malicious_pickle_global_opcode_is_detected(tmp_path: Path) -> None:

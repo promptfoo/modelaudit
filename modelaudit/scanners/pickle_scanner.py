@@ -23,6 +23,17 @@ from .picklescan_adapter import pickle_report_to_scan_result, scan_options_from_
 
 _NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES = 64 * 1024
 _ROOT_RAW_SCAN_LIMIT_BYTES = 8 * 1024 * 1024
+_JAX_PICKLE_CONTEXT_INDICATORS = (
+    b"jax",
+    b"flax",
+    b"haiku",
+    b"orbax",
+    b"arrayimpl",
+    b"jaxlib",
+    b"device_array",
+)
+_DEFAULT_JAX_PICKLE_SCAN_LIMIT_BYTES = 16 * 1024 * 1024
+_MIN_JAX_PICKLE_SCAN_LIMIT_BYTES = 1024
 _ROOT_EXPENSIVE_RAW_SCAN_LIMIT_BYTES = 1 * 1024 * 1024
 _MAX_METADATA_PICKLE_READ_BYTES = 10 * 1024 * 1024
 _KNOWN_PICKLE_EXTENSIONS = frozenset({".pkl", ".pickle", ".dill", ".joblib"})
@@ -2437,11 +2448,22 @@ class PickleScanner(BaseScanner):
             return result
 
         self._add_root_legacy_metadata_detectors(result, path)
-        self._scan_jax_checkpoint_patterns_if_needed(path, file_size, result)
+        self._scan_jax_checkpoint_patterns_if_needed(path, file_size, raw_data, result)
         self._finish_after_wrapper_analysis(result, base_success=scan_result.success)
         return result
 
-    def _scan_jax_checkpoint_patterns_if_needed(self, path: str, file_size: int, result: ScanResult) -> None:
+    def _scan_jax_checkpoint_patterns_if_needed(
+        self,
+        path: str,
+        file_size: int,
+        raw_data: bytes,
+        result: ScanResult,
+    ) -> None:
+        if file_size <= len(raw_data) and file_size <= self._jax_pickle_scan_limit():
+            lowered_raw_data = raw_data.lower()
+            if not any(indicator in lowered_raw_data for indicator in _JAX_PICKLE_CONTEXT_INDICATORS):
+                return
+
         from .jax_checkpoint_scanner import JaxCheckpointScanner
 
         jax_scanner = JaxCheckpointScanner(config=self.config)
@@ -2478,3 +2500,11 @@ class PickleScanner(BaseScanner):
                 rule_code="S902",
             )
         result.merge(jax_result)
+
+    def _jax_pickle_scan_limit(self) -> int:
+        raw_value = self.config.get("jax_pickle_max_scan_bytes", _DEFAULT_JAX_PICKLE_SCAN_LIMIT_BYTES)
+        try:
+            parsed_value = int(raw_value)
+        except (TypeError, ValueError):
+            parsed_value = _DEFAULT_JAX_PICKLE_SCAN_LIMIT_BYTES
+        return max(parsed_value, _MIN_JAX_PICKLE_SCAN_LIMIT_BYTES)
