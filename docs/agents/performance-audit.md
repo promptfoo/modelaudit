@@ -820,6 +820,22 @@ Priority 1:
 - Notes:
   - this is a narrow I/O win inside the repeated-hashing backlog; broader top-level and scanner-layer hash reuse still needs the product-level digest policy work called out above
 
+### 2026-05-02 - Nearby-license directory cache
+
+- PR:
+  - `#1176`
+- Change:
+  - dataset-license detection now caches whether a directory contains a nearby license file during one pass
+  - sibling datasets in the same directory no longer rebuild the same lowercase sibling-name set independently
+- Targeted regression:
+  - `tests/integrations/test_license_checker.py::TestUnlicensedDatasetDetection::test_detect_unlicensed_datasets_reuses_nearby_license_lookup_per_directory`
+- Benchmarks:
+  - synthetic directory with `800` sibling `.csv` datasets and no nearby license:
+    - before: `1.924856s` median
+    - after: `0.008298s` median
+- Notes:
+  - this closes the clearest repeated directory-walk hotspot in `detect_unlicensed_datasets()`; broader license-header read semantics remain separate work
+
 ### 2026-05-01 - Shared C2 payload lowercase view
 
 - PR:
