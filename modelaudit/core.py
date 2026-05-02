@@ -90,6 +90,25 @@ _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unava
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 
 
+def _start_phase_timing(phase_timings: dict[str, float] | None) -> float | None:
+    return time.perf_counter() if phase_timings is not None else None
+
+
+def _finish_phase_timing(
+    phase_timings: dict[str, float] | None,
+    phase_name: str,
+    started_at: float | None,
+) -> None:
+    if phase_timings is None or started_at is None:
+        return
+    phase_timings[phase_name] = phase_timings.get(phase_name, 0.0) + (time.perf_counter() - started_at)
+
+
+def _attach_phase_timings(results: ModelAuditResultModel, phase_timings: dict[str, float] | None) -> None:
+    if phase_timings is not None:
+        results.phase_timings = phase_timings  # type: ignore[attr-defined]
+
+
 def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
     """Select a scanner by trusted file structure, not just suffix."""
     if header_format == "zip":
@@ -358,8 +377,12 @@ def scan_model_directory_or_file(
     }
     # Track file hashes for aggregate hash computation
     file_hashes: list[str] = []
+    nearby_license_cache: dict[str, list[str]] = {}
+
+    phase_timings: dict[str, float] | None = {} if bool(kwargs.get("profile_timings")) else None
 
     # Configure scan options
+    scanner_selection_started_at = _start_phase_timing(phase_timings)
     config = {
         "blacklist_patterns": blacklist_patterns,
         "max_file_size": max_file_size,
@@ -376,6 +399,7 @@ def scan_model_directory_or_file(
         results.scanner_selection = scanner_selection.to_metadata()
 
     validate_scan_config(config)
+    _finish_phase_timing(phase_timings, "scanner_selection", scanner_selection_started_at)
 
     # Check if metadata scanner is available once (optimization - avoids loading scanner)
     metadata_scanner_available = scanner_selection.allows("metadata") and _registry.has_scanner_class("MetadataScanner")
@@ -420,12 +444,15 @@ def scan_model_directory_or_file(
 
             # Return early for streaming - finalize the model
             try:
+                streaming_scan_started_at = _start_phase_timing(phase_timings)
                 _consolidate_checks(results)
+                _finish_phase_timing(phase_timings, "result_consolidation", streaming_scan_started_at)
             except Exception as e:
                 logger.warning(f"Error consolidating checks ({type(e).__name__}): {e!s}", exc_info=e)
             results.has_errors = bool(scan_metadata.get("has_operational_errors", False))
             results.success = not _results_should_be_unsuccessful(results)
             results.finalize_statistics()
+            _attach_phase_timings(results, phase_timings)
             return results
 
         # Check if path exists (for non-streaming paths)
@@ -452,6 +479,7 @@ def scan_model_directory_or_file(
                 # Quick check: count files only if directory seems reasonable in size.
                 # This avoids the expensive rglob() on large directories.
                 try:
+                    directory_file_count_started_at = _start_phase_timing(phase_timings)
                     # Do a quick count of immediate children first.
                     immediate_children = len(list(Path(path).iterdir()))
                     if immediate_children < 1000:  # Only count if not too many immediate children.
@@ -459,6 +487,8 @@ def scan_model_directory_or_file(
                 except (OSError, PermissionError):
                     # If we can't count, just proceed without progress percentage.
                     total_files = None
+                finally:
+                    _finish_phase_timing(phase_timings, "directory_file_count", directory_file_count_started_at)
 
             base_dir = Path(path).resolve()
             hf_cache_root = _find_hf_cache_root(base_dir)
@@ -467,6 +497,7 @@ def scan_model_directory_or_file(
 
             # First pass: collect all file paths that need scanning
             files_to_scan: list[str] = []
+            directory_discovery_started_at = _start_phase_timing(phase_timings)
             for root, _, files in os.walk(path, followlinks=False):
                 for file in files:
                     file_path = os.path.join(root, file)
@@ -497,7 +528,14 @@ def scan_model_directory_or_file(
                         filename_lower = Path(file_path).name.lower()
                         if filename_lower in LICENSE_FILES:
                             try:
-                                license_metadata = collect_license_metadata(str(resolved_file))
+                                license_metadata_started_at = _start_phase_timing(phase_timings)
+                                try:
+                                    license_metadata = collect_license_metadata(
+                                        str(resolved_file),
+                                        nearby_license_cache=nearby_license_cache,
+                                    )
+                                finally:
+                                    _finish_phase_timing(phase_timings, "license_metadata", license_metadata_started_at)
                                 from .models import FileMetadataModel
 
                                 results.file_metadata[str(resolved_file)] = FileMetadataModel(**license_metadata)
@@ -533,12 +571,15 @@ def scan_model_directory_or_file(
 
                         # Add to files to scan list instead of scanning immediately
                         files_to_scan.append(target_str)
+            _finish_phase_timing(phase_timings, "directory_discovery", directory_discovery_started_at)
 
             # Second pass: scan every path independently. Some scanners depend on
             # parent paths or sibling files, so content equality alone is not a
             # safe proxy for scan-result equality.
             if files_to_scan:
+                top_level_hashing_started_at = _start_phase_timing(phase_timings)
                 content_hashes = _hash_files_by_path(files_to_scan)
+                _finish_phase_timing(phase_timings, "top_level_hashing", top_level_hashing_started_at)
                 duplicate_paths_by_hash: dict[str, list[str]] = {}
                 for file_path, content_hash in content_hashes.items():
                     if not content_hash.startswith("unhashable_"):
@@ -576,7 +617,13 @@ def scan_model_directory_or_file(
                         # Check for interrupts before scanning each file
                         check_interrupted()
 
-                        file_result = scan_file(representative_file, config)
+                        file_scan_started_at = _start_phase_timing(phase_timings)
+                        try:
+                            file_result = scan_file(representative_file, config)
+                        finally:
+                            _finish_phase_timing(phase_timings, "file_scan_dispatch", file_scan_started_at)
+
+                        result_merge_started_at = _start_phase_timing(phase_timings)
                         _normalize_unclassified_scan_failure(file_result)
                         if _scan_result_has_operational_error(file_result):
                             scan_metadata["has_operational_errors"] = True
@@ -649,9 +696,17 @@ def scan_model_directory_or_file(
                                     results.checks.append(Check(**check_dict))
 
                         _add_asset_to_results(results, representative_file, file_result)
+                        _finish_phase_timing(phase_timings, "result_merge", result_merge_started_at)
 
                         # Add metadata for this path using Pydantic models
-                        license_metadata = collect_license_metadata(representative_file)
+                        license_metadata_started_at = _start_phase_timing(phase_timings)
+                        try:
+                            license_metadata = collect_license_metadata(
+                                representative_file,
+                                nearby_license_cache=nearby_license_cache,
+                            )
+                        finally:
+                            _finish_phase_timing(phase_timings, "license_metadata", license_metadata_started_at)
                         combined_metadata = {**file_result.metadata, **license_metadata}
                         combined_metadata["content_hash"] = content_hash
                         duplicate_files = duplicate_paths_by_hash.get(content_hash, [])
@@ -730,20 +785,36 @@ def scan_model_directory_or_file(
                 # nested member results into their metadata, so scanner-emitted
                 # hashes are not always the bytes of this target.
                 try:
+                    top_level_hashing_started_at = _start_phase_timing(phase_timings)
                     file_hash = _calculate_file_hash(target)
                     file_hashes.append(file_hash)
                 except Exception as e:
                     logger.debug(f"Failed to hash file {target}: {e}")
+                finally:
+                    _finish_phase_timing(phase_timings, "top_level_hashing", top_level_hashing_started_at)
 
-                file_result = scan_file(target, config)
+                file_scan_started_at = _start_phase_timing(phase_timings)
+                try:
+                    file_result = scan_file(target, config)
+                finally:
+                    _finish_phase_timing(phase_timings, "file_scan_dispatch", file_scan_started_at)
 
                 # Use helper function to add scan result to Pydantic model
+                result_merge_started_at = _start_phase_timing(phase_timings)
                 _add_scan_result_to_model(results, scan_metadata, file_result, target)
 
                 _add_asset_to_results(results, target, file_result)
+                _finish_phase_timing(phase_timings, "result_merge", result_merge_started_at)
 
                 # Collect and apply license metadata for all files
-                license_metadata = collect_license_metadata(target)
+                license_metadata_started_at = _start_phase_timing(phase_timings)
+                try:
+                    license_metadata = collect_license_metadata(
+                        target,
+                        nearby_license_cache=nearby_license_cache,
+                    )
+                finally:
+                    _finish_phase_timing(phase_timings, "license_metadata", license_metadata_started_at)
                 if license_metadata:
                     from .models import FileMetadataModel
 
@@ -789,13 +860,17 @@ def scan_model_directory_or_file(
 
     # Consolidate checks for cleaner reporting
     try:
+        result_consolidation_started_at = _start_phase_timing(phase_timings)
         _consolidate_checks(results)
+        _finish_phase_timing(phase_timings, "result_consolidation", result_consolidation_started_at)
     except Exception as e:
         logger.warning(f"Error consolidating checks ({type(e).__name__}): {e!s}", exc_info=e)
 
     # Add license warnings if any
     try:
+        commercial_use_started_at = _start_phase_timing(phase_timings)
         license_warnings = check_commercial_use_warnings(results, strict=config.get("strict_license", False))
+        _finish_phase_timing(phase_timings, "commercial_use_warnings", commercial_use_started_at)
         for warning in license_warnings:
             _add_issue_to_model(
                 results,
@@ -818,12 +893,15 @@ def scan_model_directory_or_file(
     if file_hashes:
         from .utils.helpers.secure_hasher import compute_aggregate_hash
 
+        aggregate_hash_started_at = _start_phase_timing(phase_timings)
         results.content_hash = compute_aggregate_hash(file_hashes)
+        _finish_phase_timing(phase_timings, "aggregate_hash", aggregate_hash_started_at)
         logger.info(f"Computed aggregate content hash from {len(file_hashes)} file(s): {results.content_hash}")
 
     # Finalize statistics and return Pydantic model
     results.finalize_statistics()
     results.deduplicate_issues()
+    _attach_phase_timings(results, phase_timings)
     return results
 
 
@@ -908,25 +986,12 @@ def _is_huggingface_cache_file(path: str) -> bool:
     import os
 
     filename = os.path.basename(path)
-    path_obj = Path(path)
-
-    is_hf_bookkeeping_path = _is_hf_hub_bookkeeping_path(path_obj) or _is_hf_download_bookkeeping_path(path_obj)
+    if not (filename.endswith((".lock", ".metadata")) or filename in {".gitignore", ".gitattributes", "main", "HEAD"}):
+        return False
 
     # Only trust bookkeeping-shaped filenames when they actually live in a
     # recognized HuggingFace cache layout.
-    if filename.endswith(".lock"):
-        return is_hf_bookkeeping_path
-
-    # Only skip HuggingFace .metadata files in known cache/download layouts.
-    if filename.endswith(".metadata"):
-        return is_hf_bookkeeping_path
-
-    # Check for specific HuggingFace cache metadata files
-    # We no longer skip all HuggingFace cache files since we handle symlinks properly now
-
-    # Check for Git-related files that are commonly cached
-    if filename in [".gitignore", ".gitattributes"]:
-        return is_hf_bookkeeping_path
+    path_obj = Path(path)
 
     if filename in ["main", "HEAD"]:
         hf_cache_root = _find_hf_cache_root(path_obj)
@@ -939,6 +1004,17 @@ def _is_huggingface_cache_file(path: str) -> bool:
             return False
 
         return bool(relative_parts and relative_parts[0] == "refs")
+
+    is_hf_bookkeeping_path = _is_hf_hub_bookkeeping_path(path_obj) or _is_hf_download_bookkeeping_path(path_obj)
+    if filename.endswith((".lock", ".metadata")):
+        return is_hf_bookkeeping_path
+
+    # Check for specific HuggingFace cache metadata files
+    # We no longer skip all HuggingFace cache files since we handle symlinks properly now
+
+    # Check for Git-related files that are commonly cached
+    if filename in [".gitignore", ".gitattributes"]:
+        return is_hf_bookkeeping_path
 
     return False
 
@@ -1321,6 +1397,7 @@ def scan_model_streaming(
     metadata_scanner_available: bool = scanner_selection.allows("metadata") and _registry.has_scanner_class(
         "MetadataScanner"
     )
+    nearby_license_cache: dict[str, list[str]] = {}
 
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
@@ -1366,7 +1443,10 @@ def scan_model_streaming(
                     filename_lower = source_path.name.lower()
                     if filename_lower in LICENSE_FILES:
                         try:
-                            license_metadata = collect_license_metadata(str(scan_path))
+                            license_metadata = collect_license_metadata(
+                                str(scan_path),
+                                nearby_license_cache=nearby_license_cache,
+                            )
                             from .models import FileMetadataModel
 
                             results.file_metadata[report_path] = FileMetadataModel(**license_metadata)
