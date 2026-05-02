@@ -208,6 +208,16 @@ class TestNetworkCommDetector:
         critical = [f for f in lib_findings if f["severity"] == "CRITICAL"]
         assert len(critical) >= 2  # socket and paramiko are critical
 
+    def test_network_library_scan_uses_shared_patterns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Derived library patterns should come from the shared class table."""
+        detector = NetworkCommDetector()
+        monkeypatch.setattr(NetworkCommDetector, "NETWORK_LIBRARIES", [b"socket"])
+        monkeypatch.setattr(NetworkCommDetector, "NETWORK_LIBRARY_PATTERNS", {b"socket": (b"CUSTOM_SOCKET_PATTERN",)})
+
+        detector._scan_network_libraries(b"CUSTOM_SOCKET_PATTERN", "payload.bin")
+
+        assert any(finding["library"] == "socket" for finding in detector.findings)
+
     def test_detect_network_functions(self) -> None:
         """Test detection of network function calls."""
         detector = NetworkCommDetector()
@@ -358,6 +368,24 @@ class TestNetworkCommDetector:
         assert "backdoor" in patterns
         assert "botnet" in patterns
 
+    def test_cc_pattern_scan_reuses_lowered_payload(self) -> None:
+        """Reuse one lowercase payload view across all C&C pattern checks."""
+
+        class TrackingBytes(bytes):
+            lower_calls = 0
+
+            def lower(self) -> bytes:
+                self.lower_calls += 1
+                return super().lower()
+
+        detector = NetworkCommDetector()
+        data = TrackingBytes(b'payload = {"malware": True, "backdoor": True}')
+
+        detector._scan_cc_patterns(data, "payload.bin")
+
+        assert data.lower_calls == 1
+        assert {finding["pattern"] for finding in detector.findings} >= {"malware", "backdoor"}
+
     def test_benign_metadata_reference_keys_are_not_cc_patterns(self) -> None:
         """Common model metadata URL keys are not C&C indicators by themselves."""
         detector = NetworkCommDetector()
@@ -458,6 +486,42 @@ class TestNetworkCommDetector:
         # Blacklisted domains should have max confidence
         assert all(f["confidence"] == 1.0 for f in blacklist_findings)
         assert all(f["severity"] == "CRITICAL" for f in blacklist_findings)
+
+    def test_blacklist_scan_reuses_lowered_payload(self) -> None:
+        """Reuse one lowercase payload view across configured blacklist checks."""
+
+        class TrackingBytes(bytes):
+            lower_calls = 0
+
+            def lower(self) -> bytes:
+                self.lower_calls += 1
+                return super().lower()
+
+        detector = NetworkCommDetector({"custom_blacklist": [b"blocked.example", b"evil.example"]})
+        data = TrackingBytes(b"https://blocked.example/payload")
+
+        detector._check_blacklist(data, "payload.bin")
+
+        assert data.lower_calls == 1
+        assert [finding["domain"] for finding in detector.findings] == ["blocked.example"]
+
+    def test_blacklist_scan_skips_lowering_without_configured_domains(self) -> None:
+        """Avoid touching payload bytes when no blacklist entries are configured."""
+
+        class TrackingBytes(bytes):
+            lower_calls = 0
+
+            def lower(self) -> bytes:
+                self.lower_calls += 1
+                return super().lower()
+
+        detector = NetworkCommDetector()
+        data = TrackingBytes(b"https://blocked.example/payload")
+
+        detector._check_blacklist(data, "payload.bin")
+
+        assert data.lower_calls == 0
+        assert detector.findings == []
 
     def test_custom_config(self) -> None:
         """Test custom configuration options."""

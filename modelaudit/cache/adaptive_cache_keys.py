@@ -63,17 +63,24 @@ class AdaptiveCacheKeyGenerator:
         self.fingerprint_cache = {}  # Brief cache for repeated operations
         self.cache_expiry = 5.0  # Cache fingerprints for 5 seconds
 
-    def generate_key_with_stat_reuse(self, file_path: str, stat_result: os.stat_result) -> str:
-        """Generate cache key reusing existing stat result for optimal performance."""
+    def generate_key_material_with_stat_reuse(
+        self, file_path: str, stat_result: os.stat_result
+    ) -> tuple[str, str | None]:
+        """Generate a cache key plus any content hash already needed for that key."""
         fingerprint = FileFingerprint.from_stat(file_path, stat_result)
 
         # Use content hash strategy based on file size
         if self._should_use_content_hash(stat_result.st_size):
             secure_key = fingerprint.secure_key(file_path, self.hasher)
-            return str(secure_key)
-        else:
-            quick_key = fingerprint.quick_key()
-            return str(quick_key)
+            return str(secure_key), fingerprint.content_hash
+
+        quick_key = fingerprint.quick_key()
+        return str(quick_key), None
+
+    def generate_key_with_stat_reuse(self, file_path: str, stat_result: os.stat_result) -> str:
+        """Generate cache key reusing existing stat result for optimal performance."""
+        cache_key, _content_hash = self.generate_key_material_with_stat_reuse(file_path, stat_result)
+        return cache_key
 
     def generate_key(self, file_path: str) -> str:
         """Generate cache key using an adaptive strategy."""
