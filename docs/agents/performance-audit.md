@@ -903,6 +903,22 @@ Priority 1:
 - Notes:
   - this closes the metadata-collection side of repeated nearby-license discovery; the separate commercial-warning sibling cache landed in `#1176`
 
+### 2026-05-02 - Scanner-selection renormalization fast path
+
+- PR:
+  - `#1181`
+- Change:
+  - already-normalized scanner-selection payloads now bypass a second policy-resolution pass
+  - repeated scan-file calls can reuse the canonical config shape emitted by the first normalization
+- Targeted regression:
+  - `tests/test_scanner_selection.py::test_normalize_scanner_selection_config_reuses_normalized_payload`
+- Benchmarks:
+  - `50,000` repeated `normalize_scanner_selection_config()` calls on an already-normalized payload:
+    - before: `5.097017s` median
+    - after: `0.014622s` median
+- Notes:
+  - this is a follow-up to the scanner-selection cache work and removes the remaining duplicate normalization work on already-canonical configs
+
 ### 2026-05-01 - Shared C2 payload lowercase view
 
 - PR:
