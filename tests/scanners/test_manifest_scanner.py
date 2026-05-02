@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners import manifest_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.manifest_scanner import _PARSE_FAILED, ManifestScanner, _is_trusted_url_domain
 
@@ -1069,6 +1070,10 @@ class TestIsTrustedUrlDomain:
     def test_exact_trusted_domain(self) -> None:
         assert _is_trusted_url_domain("https://github.com/repo") is True
         assert _is_trusted_url_domain("https://huggingface.co/model") is True
+
+    def test_exact_trusted_domain_skips_suffix_scan(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(manifest_scanner, "_TRUSTED_URL_SUBDOMAIN_SUFFIXES", ())
+        assert _is_trusted_url_domain("https://github.com/repo") is True
 
     def test_s3_endpoint_host_patterns_trusted(self) -> None:
         assert _is_trusted_url_domain("https://bucket.s3.amazonaws.com/model.bin") is True
