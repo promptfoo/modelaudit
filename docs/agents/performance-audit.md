@@ -1315,6 +1315,25 @@ Priority 1:
 - Notes:
   - this is another small but materially useful call-graph cache; the repo-wide non-slow lane still hits the existing timing-sensitive validation and directory-scan sentinels in this environment
 
+### 2026-05-02 - Cached call-graph function-import aliases
+
+- PR:
+  - `#1214`
+- Change:
+  - `_collect_function_import_aliases()` now reuses import-alias traversal results for repeated lookups of the same AST function node
+  - the cache joins the existing source-sensitive invalidation sweep
+- Targeted regression:
+  - `packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py::test_collect_function_import_aliases_reuses_cached_walk`
+- Benchmarks:
+  - repeated same-function alias collection, `5,000` lookups x `5` passes:
+    - before: `0.341559s` median
+    - after: `0.001487s` median
+  - matched cProfile run on `tests/assets/exploits/exploit_ultimate_50pct.pkl` from `origin/main`:
+    - before: `82.470s`
+    - after: `49.019s`
+- Notes:
+  - this is the strongest isolated call-graph cache result so far; the repo-wide non-slow lane still hits the existing timing-sensitive validation and directory-scan sentinels in this environment
+
 ### 2026-05-02 - Shared MetaGraph attr lowercase values
 
 - PR:
