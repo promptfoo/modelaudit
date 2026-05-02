@@ -855,6 +855,22 @@ Priority 1:
 - Notes:
   - this trims repeated setup from many-file scans while leaving the actual scanner-selection semantics unchanged
 
+### 2026-05-02 - Shared Lambda pattern lowercase view
+
+- PR:
+  - `#1178`
+- Change:
+  - shared Lambda dangerous-pattern matching now lowers decoded text once per payload
+  - Keras utility, Keras ZIP, and TensorFlow SavedModel Lambda checks reuse the same helper while preserving their current pattern sets
+- Targeted regression:
+  - `tests/scanners/test_keras_utils.py::test_find_lambda_dangerous_patterns_lowers_once`
+- Benchmarks:
+  - synthetic `8 MiB` decoded Lambda text across `18` patterns:
+    - before: `0.049654s` median
+    - after: `0.017521s` median
+- Notes:
+  - this is a narrow scanner-local CPU cleanup; the PR intentionally avoids changing detection coverage while removing repeated long-text lowercasing
+
 ### 2026-05-01 - Shared C2 payload lowercase view
 
 - PR:
