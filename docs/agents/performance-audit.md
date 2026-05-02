@@ -642,6 +642,22 @@ Priority 1:
 - Notes:
   - broader pickle-wrapper cleanup remains open, but this removes a safe common-case pass
 
+### 2026-05-01 - Manifest text reuse
+
+- PR:
+  - `#1160`
+- Change:
+  - manifest scans now cache decoded text for the lifetime of one scan
+  - blacklist, cloud URL, and parse passes reuse the same text instead of reopening the file
+- Targeted regression:
+  - `tests/scanners/test_manifest_scanner.py::test_manifest_scanner_reuses_manifest_text_during_scan`
+- Benchmarks:
+  - same-process synthetic `8 MiB` manifest:
+    - forced uncached reads: `0.673513s` median
+    - per-scan text cache: `0.423788s` median
+- Notes:
+  - this removes the first confirmed repeated-read hotspot outside the larger hash redesign
+
 ## Measured Non-Wins
 
 ### 2026-05-01 - Skip directory pre-count without progress
