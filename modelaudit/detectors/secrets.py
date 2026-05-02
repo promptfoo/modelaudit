@@ -79,6 +79,21 @@ SECRET_PATTERNS: list[tuple[str, str]] = [
     (r"rg_[a-zA-Z0-9]{32}", "Rollbar Token"),
     (r"sq0atp-[0-9A-Za-z\-_]{22}", "Square OAuth Token"),
 ]
+ML_FALSE_POSITIVE_PATTERNS = (
+    r"^[a-f0-9]{32}$",  # MD5 hashes (common in model checksums)
+    r"^[a-f0-9]{40}$",  # SHA1 hashes
+    r"^[a-f0-9]{64}$",  # SHA256 hashes
+    r"^model_[a-z0-9_]+$",  # Model layer names
+    r"^layer_[0-9]+$",  # Layer identifiers
+    r"^weight_[a-z0-9_]+$",  # Weight names
+    r"^bias_[a-z0-9_]+$",  # Bias names
+    r"^embedding_[0-9]+$",  # Embedding identifiers
+    r"^checkpoint_[0-9]+$",  # Checkpoint names
+    r"^[0-9]+\.[0-9]+\.[0-9]+$",  # Version numbers
+    r"^v[0-9]+\.[0-9]+\.[0-9]+$",  # Version tags
+)
+_COMPILED_DEFAULT_PATTERNS = tuple((re.compile(pattern, re.IGNORECASE), desc) for pattern, desc in SECRET_PATTERNS)
+_COMPILED_ML_FALSE_POSITIVES = tuple(re.compile(pattern, re.IGNORECASE) for pattern in ML_FALSE_POSITIVE_PATTERNS)
 
 
 class SecretsDetector:
@@ -111,24 +126,16 @@ class SecretsDetector:
         self.whitelist = self.config.get("whitelist", [])
 
         # Common false positive patterns in ML models
-        self.ml_false_positives = [
-            r"^[a-f0-9]{32}$",  # MD5 hashes (common in model checksums)
-            r"^[a-f0-9]{40}$",  # SHA1 hashes
-            r"^[a-f0-9]{64}$",  # SHA256 hashes
-            r"^model_[a-z0-9_]+$",  # Model layer names
-            r"^layer_[0-9]+$",  # Layer identifiers
-            r"^weight_[a-z0-9_]+$",  # Weight names
-            r"^bias_[a-z0-9_]+$",  # Bias names
-            r"^embedding_[0-9]+$",  # Embedding identifiers
-            r"^checkpoint_[0-9]+$",  # Checkpoint names
-            r"^[0-9]+\.[0-9]+\.[0-9]+$",  # Version numbers
-            r"^v[0-9]+\.[0-9]+\.[0-9]+$",  # Version tags
-        ]
+        self.ml_false_positives = list(ML_FALSE_POSITIVE_PATTERNS)
 
         # Compiled regex patterns for efficiency
-        self._compiled_patterns = [(re.compile(pattern, re.IGNORECASE), desc) for pattern, desc in self.patterns]
+        self._compiled_patterns = (
+            [(re.compile(pattern, re.IGNORECASE), desc) for pattern, desc in self.patterns]
+            if "patterns" in self.config
+            else _COMPILED_DEFAULT_PATTERNS
+        )
         self._compiled_whitelist = [re.compile(pattern, re.IGNORECASE) for pattern in self.whitelist]
-        self._compiled_ml_fps = [re.compile(pattern, re.IGNORECASE) for pattern in self.ml_false_positives]
+        self._compiled_ml_fps = _COMPILED_ML_FALSE_POSITIVES
 
     @staticmethod
     def calculate_shannon_entropy(data: bytes, window_size: int = 64) -> float:
