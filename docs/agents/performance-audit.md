@@ -1340,6 +1340,17 @@ Priority 1:
 - Decision:
   - do not land the change; the real helper-level win was too small once the rest of the domain-finding work stayed identical
 
+### 2026-05-02 - Keras `get_file` lowercase reuse
+
+- Hypothesis:
+  - reuse one stripped lowercase string while checking the `get_file` callable variants
+- Result:
+  - `200,000` direct callable-string checks:
+    - current path: `0.134620s` median
+    - shared lowercase path: `0.141144s` median
+- Decision:
+  - do not land the change; the supposedly cleaner form was slightly slower in the measured loop
+
 ## Remaining Recommended Implementation Order
 
 1. Unify or reuse hashing passes.
