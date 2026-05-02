@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 import io
 import os
@@ -8386,3 +8387,40 @@ if marker.read_text() != marker_content:
     )
     assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
+
+
+def test_calls_in_function_reuses_getattr_assignment_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = ast.parse(
+        """
+def bridge(target, command, fallback):
+    callback = getattr(target, command, fallback)
+    callback(command)
+"""
+    )
+    bridge = module.body[0]
+    assert isinstance(bridge, ast.FunctionDef)
+
+    calls = 0
+    original_assignment_call_candidates = call_graph._function_assignment_call_candidates
+
+    def counting_assignment_call_candidates(
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> tuple[tuple[set[str], ast.Call], ...]:
+        nonlocal calls
+        calls += 1
+        return original_assignment_call_candidates(function_node)
+
+    monkeypatch.setattr(call_graph, "_function_assignment_call_candidates", counting_assignment_call_candidates)
+
+    resolved_calls = call_graph._calls_in_function(
+        bridge,
+        "benchmod",
+        False,
+        {},
+        {"bridge"},
+        set(),
+        {},
+    )
+
+    assert "builtins.getattr.__call__" in resolved_calls
+    assert calls == 1
