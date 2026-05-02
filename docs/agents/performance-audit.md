@@ -313,7 +313,7 @@ Priority 1:
 | `modelaudit/scanners/compressed_scanner.py`                              | inspected        | Chunked and budgeted; likely lower priority unless decompression-heavy inputs show otherwise.                                                                         |
 | `modelaudit/scanners/onnx_scanner.py`                                    | measured         | Successful scans now reuse one raw-byte buffer for protobuf parsing and raw detectors in `#1193`; keep larger memory/RSS follow-up open for very large models.        |
 | `modelaudit/scanners/tflite_scanner.py`                                  | inspected        | Metadata extraction reads whole file up to a `2 GiB` cap. Needs large-file benchmark and maybe parser-driven reuse.                                                   |
-| `modelaudit/scanners/flax_msgpack_scanner.py`                            | inspected        | Whole-file read to detect trailing objects; repeated JAX-transform lowercase passes are fixed in `#1169`, but a large-file benchmark is still needed.                 |
+| `modelaudit/scanners/flax_msgpack_scanner.py`                            | measured         | Repeated JAX-transform, structure, and suspicious-pattern setup costs are reduced in `#1169`, `#1187`, `#1188`, and `#1194`; large-file behavior remains open.         |
 | `modelaudit/scanners/jinja2_template_scanner.py`                         | inspected        | Whole-file read is bounded by `max_template_size`; lower priority.                                                                                                    |
 | `modelaudit/scanners/manifest_scanner.py`                                | inspected        | Multiple whole-file text reads across parse and blacklist paths; candidate for one-read reuse on larger manifests.                                                    |
 | `modelaudit/scanners/metadata_scanner.py`                                | inspected        | Whole-file read for text metadata; likely acceptable for small docs but should be bounded by type/size.                                                               |
@@ -1053,6 +1053,22 @@ Priority 1:
     - after: `0.182844s` median
 - Notes:
   - this trims duplicate structural traversal in the nonstandard-checkpoint path without changing detection semantics
+
+### 2026-05-02 - Shared Flax suspicious patterns
+
+- PR:
+  - `#1194`
+- Change:
+  - configured suspicious-string regexes are compiled once per scanner instance
+  - lowered pattern text is reused when assigning the rule code for a match
+- Targeted regression:
+  - `tests/scanners/test_flax_msgpack_scanner.py::test_flax_msgpack_custom_suspicious_patterns_still_match`
+- Benchmarks:
+  - benign-string-heavy helper workload, `5,000` strings:
+    - repeated regex setup path: `0.272353s` median
+    - shared compiled-pattern path: `0.177386s` median
+- Notes:
+  - this is a scanner-local CPU cleanup for large benign object traversals and keeps custom pattern configuration intact
 
 ### 2026-05-02 - Shared secrets detector heuristics
 
