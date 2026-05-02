@@ -612,6 +612,7 @@ class ManifestScanner(BaseScanner):
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
+        self._manifest_text_cache: dict[str, str] = {}
 
         try:
             # Store the file path for use in issue locations
@@ -730,6 +731,8 @@ class ManifestScanner(BaseScanner):
             )
             result.finish(success=False)
             return result
+        finally:
+            self._manifest_text_cache.clear()
 
         self._finish_manifest_result(result)
         return result
@@ -762,8 +765,7 @@ class ManifestScanner(BaseScanner):
             return
 
         try:
-            with open(path, encoding="utf-8") as f:
-                content = f.read().lower()
+            content = self._read_manifest_text(path).lower()
 
             found_blacklisted = False
             for pattern in self.blacklist_patterns:
@@ -815,8 +817,7 @@ class ManifestScanner(BaseScanner):
     ) -> Any:
         """Parse the file based on its extension"""
         try:
-            with open(path, encoding="utf-8") as f:
-                content = f.read()
+            content = self._read_manifest_text(path)
 
             stripped_content = content.strip()
 
@@ -1018,8 +1019,7 @@ class ManifestScanner(BaseScanner):
         - Supply chain risks from external resources
         """
         try:
-            with open(path, encoding="utf-8") as f:
-                content = f.read()
+            content = self._read_manifest_text(path)
 
             self._check_timeout()
             seen_urls: set[str] = set()
@@ -1068,6 +1068,18 @@ class ManifestScanner(BaseScanner):
             raise
         except Exception as e:
             logger.debug(f"Error checking cloud storage URLs in {path}: {e}")
+
+    def _read_manifest_text(self, path: str) -> str:
+        cached_content = getattr(self, "_manifest_text_cache", {}).get(path)
+        if cached_content is not None:
+            return cached_content
+
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+
+        if hasattr(self, "_manifest_text_cache"):
+            self._manifest_text_cache[path] = content
+        return content
 
     def _check_suspicious_urls(self, content: Any, result: ScanResult) -> None:
         """Check for untrusted URLs in config values using allowlist approach.
