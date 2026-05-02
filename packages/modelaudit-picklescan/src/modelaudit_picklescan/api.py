@@ -18,6 +18,7 @@ from .call_graph import (
     find_startup_hook_write_call_graphs,
     find_unanalyzed_callable_call_graph_references,
     has_unanalyzed_call_graph_import_references,
+    shared_source_sensitive_caches,
 )
 from .options import ScanOptions
 from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdict, ScanError, ScanStatus, Severity
@@ -963,24 +964,25 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     callable_invocations = report.metadata.get("callable_invocations", ())
     call_graph_limit_exceeded = has_unanalyzed_call_graph_import_references(import_references)
     enrichment_errors: list[tuple[str, Exception]] = []
-    try:
-        call_graph_findings = find_dangerous_call_graphs(import_references, callable_invocations)
-    except Exception as error:
-        call_graph_findings = ()
-        enrichment_errors.append(("python_call_graph", error))
-    try:
-        startup_hook_write_findings = find_startup_hook_write_call_graphs(
-            import_references,
-            callable_invocations,
-        )
-    except Exception as error:
-        startup_hook_write_findings = ()
-        enrichment_errors.append(("python_call_graph_startup_hook_write", error))
-    try:
-        unanalyzed_references = find_unanalyzed_callable_call_graph_references(callable_invocations)
-    except Exception as error:
-        unanalyzed_references = ()
-        enrichment_errors.append(("python_call_graph_source_unavailable", error))
+    with shared_source_sensitive_caches():
+        try:
+            call_graph_findings = find_dangerous_call_graphs(import_references, callable_invocations)
+        except Exception as error:
+            call_graph_findings = ()
+            enrichment_errors.append(("python_call_graph", error))
+        try:
+            startup_hook_write_findings = find_startup_hook_write_call_graphs(
+                import_references,
+                callable_invocations,
+            )
+        except Exception as error:
+            startup_hook_write_findings = ()
+            enrichment_errors.append(("python_call_graph_startup_hook_write", error))
+        try:
+            unanalyzed_references = find_unanalyzed_callable_call_graph_references(callable_invocations)
+        except Exception as error:
+            unanalyzed_references = ()
+            enrichment_errors.append(("python_call_graph_source_unavailable", error))
 
     updated_report = (
         _with_unanalyzed_call_graph_notices(report, unanalyzed_references) if unanalyzed_references else report
