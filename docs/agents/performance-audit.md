@@ -272,7 +272,7 @@ Priority 1:
 | `modelaudit/scanners/compressed_scanner.py`                              | inspected        | Chunked and budgeted; likely lower priority unless decompression-heavy inputs show otherwise.                                                               |
 | `modelaudit/scanners/onnx_scanner.py`                                    | inspected        | Reads whole file for raw detectors after protobuf load; candidate for shared-buffer or bounded-detector review.                                             |
 | `modelaudit/scanners/tflite_scanner.py`                                  | inspected        | Metadata extraction reads whole file up to a `2 GiB` cap. Needs large-file benchmark and maybe parser-driven reuse.                                         |
-| `modelaudit/scanners/flax_msgpack_scanner.py`                            | inspected        | Whole-file read to detect trailing objects; may be necessary but should get a large-file benchmark.                                                         |
+| `modelaudit/scanners/flax_msgpack_scanner.py`                            | inspected        | Whole-file read to detect trailing objects; repeated JAX-transform lowercase passes are fixed in `#1169`, but a large-file benchmark is still needed.       |
 | `modelaudit/scanners/jinja2_template_scanner.py`                         | inspected        | Whole-file read is bounded by `max_template_size`; lower priority.                                                                                          |
 | `modelaudit/scanners/manifest_scanner.py`                                | inspected        | Multiple whole-file text reads across parse and blacklist paths; candidate for one-read reuse on larger manifests.                                          |
 | `modelaudit/scanners/metadata_scanner.py`                                | inspected        | Whole-file read for text metadata; likely acceptable for small docs but should be bounded by type/size.                                                     |
@@ -790,6 +790,22 @@ Priority 1:
     - shared lowercase text: `0.233578s` median
 - Notes:
   - this closes one more long-text scanner pass without broadening the existing Keras detection surface
+
+### 2026-05-01 - Shared Flax transform lowercase view
+
+- PR:
+  - `#1169`
+- Change:
+  - JAX transform matching now lowercases decoded value text once before checking all transform indicators
+  - the transform list moved behind one helper so the one-pass behavior has focused coverage
+- Targeted regression:
+  - `tests/scanners/test_flax_msgpack_scanner.py::test_matching_jax_transforms_reuses_lowered_value_text`
+- Benchmarks:
+  - synthetic `8 MiB` no-match value text, same-process controlled A/B:
+    - repeated lowercasing path: `0.386153s` median
+    - shared lowercase text: `0.210867s` median
+- Notes:
+  - this is a smaller text-path cleanup than the Keras wins, but still removes repeated large-string scans in a scanner-specific hot loop
 
 ## Measured Non-Wins
 
