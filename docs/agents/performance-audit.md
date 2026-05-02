@@ -738,6 +738,22 @@ Priority 1:
 - Notes:
   - this is a configured-path counterpart to the default C2 detector cleanup from `#1163`
 
+### 2026-05-01 - Early metadata URL dedupe
+
+- PR:
+  - `#1166`
+- Change:
+  - metadata URL scans now mark URLs as seen before parsing
+  - repeated benign links are skipped just like repeated suspicious links already were
+- Targeted regression:
+  - `tests/scanners/test_metadata_scanner.py::TestMetadataScanner::test_repeated_benign_urls_are_parsed_once`
+- Benchmarks:
+  - synthetic README text with `20,000` copies of one benign URL, same-process controlled A/B:
+    - late dedupe path: `0.034692s` median
+    - early dedupe path: `0.005104s` median
+- Notes:
+  - this is a metadata-doc hot-path cleanup that preserves the suspicious URL finding surface
+
 ## Measured Non-Wins
 
 ### 2026-05-01 - Skip directory pre-count without progress
