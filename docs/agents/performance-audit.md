@@ -1293,6 +1293,22 @@ Priority 1:
 - Notes:
   - this is a modest but deterministic large-attr cleanup; regex evaluation still dominates the path
 
+### 2026-05-02 - Shared ML-operation lowercase view
+
+- PR:
+  - `#1201`
+- Change:
+  - broad ML-operation fallback matching now lowercases each function call once
+  - model-loading and tensor-op fallback checks reuse that one normalized value
+- Targeted regression:
+  - `tests/analysis/test_ml_context_analyzer.py::TestMLOperationPatterns::test_identify_operation_reuses_lowered_function_call`
+- Benchmarks:
+  - long synthetic function name matching the tensor-op fallback path, `100,000` calls:
+    - before: `0.769627s` median
+    - after: `0.682634s` median
+- Notes:
+  - this keeps a small analysis helper from repeating work on the slower fallback path
+
 ### 2026-05-01 - Shared Keras metadata lowercase view
 
 - PR:
