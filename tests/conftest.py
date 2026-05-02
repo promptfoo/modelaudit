@@ -114,6 +114,7 @@ def pytest_runtest_setup(item):
             "test_metadata_scanner.py",  # Metadata scanner tests
             "test_metadata_extractor.py",  # Metadata extractor helper routing and CLI tests
             "test_weak_hash_detection.py",  # Weak hash detection tests
+            "test_license_checker.py",  # License warning performance and behavior regressions
             "test_cloud_url_detection.py",  # Cloud storage URL detection tests
             "tests/utils/sources/test_cloud_storage.py",  # Cloud storage source tests
             "test_skops_scanner.py",  # Skops scanner CVE detection tests
