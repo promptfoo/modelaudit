@@ -766,6 +766,23 @@ Priority 1:
 - Notes:
   - this is a scanner-local large-text CPU cleanup that keeps mixed-case malicious input detection intact
 
+### 2026-05-02 - Skip directory pre-count without progress
+
+- PR:
+  - `#1173`
+- Change:
+  - directory scans now skip the lazy `rglob()` file pre-count when callers did not request progress callbacks
+  - progress-enabled scans keep the existing percentage denominator behavior
+- Targeted regression:
+  - `tests/test_core.py::test_scan_directory_without_progress_skips_file_counting`
+- Benchmarks:
+  - synthetic `10,000`-file tree (`100` directories x `100` skipped files), removed pre-count pass:
+    - current pre-count work: `0.094856s` median
+    - after the guard: no `Path.rglob()` pass on no-progress scans
+- Notes:
+  - an earlier `5000`-file end-to-end probe treated this as too small to prioritize, but the direct-path measurement made it a clean low-risk orchestration cleanup
+  - this is still a modest many-file win; the larger directory-scaling costs remain in scan dispatch and per-file work
+
 ### 2026-05-01 - Shared C2 payload lowercase view
 
 - PR:
@@ -900,17 +917,19 @@ Priority 1:
 
 ## Measured Non-Wins
 
-### 2026-05-01 - Skip directory pre-count without progress
+### 2026-05-02 - Integrity hash chunk-size increase
 
 - Hypothesis:
-  - avoid the lazy `rglob()` pre-count when no progress callback is present
+  - replace the `8 KiB` reads in `BaseScanner.calculate_file_hashes()` with larger chunks to reduce syscall overhead
 - Result:
-  - direct `5000`-file pre-count cost was only `0.023548s` median
-  - matched `5000`-file full scans were effectively unchanged:
-    - no progress: `18.869611s` -> `18.883523s`
-    - with progress: `18.997390s` -> `19.097184s`
+  - synthetic `128 MiB` triple-hash loop:
+    - `8 KiB`: `0.400828s` median
+    - `2 MiB`: `0.390379s` median
+  - steadier synthetic `256 MiB` rerun:
+    - `8 KiB`: `0.835377s` median
+    - `2 MiB`: `0.926068s` median
 - Decision:
-  - do not spend a PR on this yet; the larger directory costs remain elsewhere
+  - do not land the change; the apparent win did not hold up under the steadier rerun, and hash computation itself dominates this path more than read-buffer overhead
 
 ### 2026-05-01 - Streaming SHA256 reuse from scanner metadata
 
