@@ -1005,6 +1005,22 @@ Priority 1:
 - Notes:
   - this is a manifest-scanner CPU cleanup for URL-heavy configs that preserves the exact-only hosting-domain boundary
 
+### 2026-05-02 - Shared Flax layer keyword text
+
+- PR:
+  - `#1187`
+- Change:
+  - Flax ML-structure analysis now stringifies and lowercases the checkpoint object once before layer-keyword checks
+  - the hierarchical-structure pass reuses that one lowercase view across all indicators
+- Targeted regression:
+  - `tests/scanners/test_flax_msgpack_scanner.py::test_flax_ml_structure_reuses_lowered_object_text`
+- Benchmarks:
+  - synthetic `8 MiB` object in `_analyze_ml_structure()`:
+    - before: `0.076024s` median
+    - after: `0.015901s` median
+- Notes:
+  - this is a scanner-local large-object cleanup distinct from the earlier JAX transform lowercase reuse in `#1169`
+
 ### 2026-05-01 - Shared C2 payload lowercase view
 
 - PR:
@@ -1274,6 +1290,28 @@ Priority 1:
     - one-pass rewrite: `0.256282s` median
 - Decision:
   - keep the current passes; the short-circuiting `any()` checks are faster than the one-pass bookkeeping rewrite
+
+### 2026-05-02 - Manifest `can_handle()` constant hoist
+
+- Hypothesis:
+  - move `ManifestScanner.can_handle()`'s local filename lists to module constants
+- Result:
+  - mixed `50,000`-path loop over existing config-like files:
+    - current path: `0.112712s` median
+    - hoisted-constant probe: `0.111887s` median
+- Decision:
+  - do not land the change; the exact path was effectively flat after keeping `os.path.isfile()` in the benchmark
+
+### 2026-05-02 - Network-library byte-pattern prebuild
+
+- Hypothesis:
+  - prebuild the five import/connect/request byte patterns for each network library
+- Result:
+  - `2,000` no-match `_scan_network_libraries()` calls:
+    - current path: `0.072140s` median
+    - prebuilt-pattern probe: `0.075990s` median
+- Decision:
+  - do not land the change; the proposed setup cleanup was slightly slower in the measured path
 
 ## Remaining Recommended Implementation Order
 
