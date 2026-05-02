@@ -322,7 +322,7 @@ Priority 1:
 | `modelaudit/scanners/keras_utils.py`                                     | inspected        | Shared Lambda helpers had the same repeated lowercase pattern, now consolidated behind one reusable matcher in `#1168`.                                               |
 | `modelaudit/detectors/secrets.py`                                        | inspected        | Fixed detector heuristics now reuse module-level state in `#1189`; convenience file API still reads whole files, while the core pickle path already gates execution.   |
 | `modelaudit/detectors/network_comm.py`                                   | inspected        | Convenience file API reads whole files and regex work can be expensive on large buffers.                                                                              |
-| `modelaudit/detectors/jit_script.py`                                     | inspected        | Convenience file API reads whole files and AST walks parsed code; keep behind bounded callers.                                                                        |
+| `modelaudit/detectors/jit_script.py`                                     | inspected        | Fixed dangerous-import regexes now reuse compiled pairs in `#1190`; convenience file API still reads whole files and AST-walks parsed code.                           |
 | `modelaudit/scanners/catboost_scanner.py`                                | inspected        | Uses bounded head/core/trailer reads; low priority until a CatBoost-specific benchmark says otherwise.                                                                |
 | `modelaudit/scanners/cntk_scanner.py`                                    | inspected        | Uses explicit read limits; low priority.                                                                                                                              |
 | `modelaudit/scanners/executorch_scanner.py`                              | inspected        | Length-delimited reads; low priority.                                                                                                                                 |
@@ -1050,6 +1050,22 @@ Priority 1:
     - after: `1.970997s` median
 - Notes:
   - this is a detector-local CPU cleanup for hit-heavy inputs; it leaves the rule surface unchanged
+
+### 2026-05-02 - Reused JIT dangerous-import regexes
+
+- PR:
+  - `#1190`
+- Change:
+  - fixed dangerous-import checks now reuse one compiled import/from-import regex pair per known module
+  - unexpected caller-supplied module names still take the previous dynamic fallback path
+- Targeted regression:
+  - `tests/detectors/test_jit_script_detector.py::TestJITScriptDetector::test_known_dangerous_import_reuses_compiled_patterns`
+- Benchmarks:
+  - safe embedded-source import checks across the fixed dangerous-import vocabulary:
+    - before: `1.229623s` median
+    - after: `1.087224s` median
+- Notes:
+  - this trims repeated static regex setup from the embedded-code import loop without changing the detection vocabulary
 
 ### 2026-05-01 - Shared C2 payload lowercase view
 
