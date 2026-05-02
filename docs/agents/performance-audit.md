@@ -1421,6 +1421,22 @@ Priority 1:
 - Notes:
   - this removes repeated normalization in metadata secret scanning; the repo-wide non-slow lane still hits the existing timing-sensitive validation and directory-scan sentinels in this environment
 
+### 2026-05-02 - Shared SARIF message lowercase view
+
+- PR:
+  - `#1209`
+- Change:
+  - SARIF short-description formatting now lowers each issue message once
+  - the rule-description branch ladder reuses that normalized message across all checks
+- Targeted regression:
+  - `tests/integrations/test_sarif_formatter.py::TestHelperFunctions::test_get_rule_short_description_reuses_lowered_message`
+- Benchmarks:
+  - `100,000` issue messages, `50` classification passes:
+    - before: `1.469239s` median
+    - after: `0.523130s` median
+- Notes:
+  - this trims output-generation cost for noisy scans; the repo-wide non-slow lane still hits the existing timing-sensitive validation and directory-scan sentinels in this environment
+
 ### 2026-05-01 - Shared Keras metadata lowercase view
 
 - PR:
