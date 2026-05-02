@@ -16,6 +16,7 @@ from modelaudit.scanners.pickle_scanner import (
     ALWAYS_DANGEROUS_FUNCTIONS,
     ALWAYS_DANGEROUS_MODULES,
     PickleScanner,
+    _contains_any_jax_indicator,
     _is_dangerous_module,
     _is_legitimate_serialization_file,
     _looks_like_pickle,
@@ -1481,6 +1482,20 @@ def test_pickle_scanner_delegates_jax_specific_patterns_for_jax_pickles(tmp_path
         and check.details["pattern"] == r"jax\.experimental\.io_callback"
         for check in result.checks
     )
+
+
+def test_contains_any_jax_indicator_reuses_lowered_text() -> None:
+    class TrackingStr(str):
+        lower_calls = 0
+
+        def lower(self) -> str:
+            self.lower_calls += 1
+            return super().lower()
+
+    text = TrackingStr("jax")
+
+    assert _contains_any_jax_indicator(text, ("jax", "flax", "haiku")) is True
+    assert text.lower_calls == 1
 
 
 def test_pickle_scanner_delegates_jax_patterns_for_pkl_suffixes(tmp_path: Path) -> None:
