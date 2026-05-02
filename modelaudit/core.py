@@ -441,22 +441,24 @@ def scan_model_directory_or_file(
             if progress_callback:
                 progress_callback(f"Scanning directory: {path}", 0.0)
 
-            # Scan all files in the directory
-            # Use lazy file counting for better performance on large directories
+            # Scan all files in the directory. File counts are only needed for
+            # progress percentages, so avoid the extra tree walk when callers do
+            # not request progress updates.
             total_files = None  # Will be set to actual count if directory is small
             processed_files = 0
             limit_reached = False
 
-            # Quick check: count files only if directory seems reasonable in size
-            # This avoids the expensive rglob() on large directories
-            try:
-                # Do a quick count of immediate children first
-                immediate_children = len(list(Path(path).iterdir()))
-                if immediate_children < 1000:  # Only count if not too many immediate children
-                    total_files = sum(1 for _ in Path(path).rglob("*") if _.is_file())
-            except (OSError, PermissionError):
-                # If we can't count, just proceed without progress percentage
-                total_files = None
+            if progress_callback:
+                # Quick check: count files only if directory seems reasonable in size.
+                # This avoids the expensive rglob() on large directories.
+                try:
+                    # Do a quick count of immediate children first.
+                    immediate_children = len(list(Path(path).iterdir()))
+                    if immediate_children < 1000:  # Only count if not too many immediate children.
+                        total_files = sum(1 for _ in Path(path).rglob("*") if _.is_file())
+                except (OSError, PermissionError):
+                    # If we can't count, just proceed without progress percentage.
+                    total_files = None
 
             base_dir = Path(path).resolve()
             hf_cache_root = _find_hf_cache_root(base_dir)
