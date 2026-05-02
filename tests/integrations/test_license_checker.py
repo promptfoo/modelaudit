@@ -1,6 +1,7 @@
 """Tests for the license checking functionality in ModelAudit."""
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -324,6 +325,30 @@ class TestUnlicensedDatasetDetection:
         unlicensed = detect_unlicensed_datasets([str(csv_file)])
 
         assert len(unlicensed) == 0  # Should not be flagged due to nearby license
+
+    def test_reuses_sibling_directory_listing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Reuse same-directory license discovery across sibling datasets."""
+        files = []
+        for index in range(3):
+            csv_file = tmp_path / f"data_{index}.csv"
+            csv_file.write_text("name,age\nAlice,25\n")
+            files.append(str(csv_file))
+
+        original_iterdir = Path.iterdir
+        listing_count = 0
+
+        def counting_iterdir(path: Path) -> Iterator[Path]:
+            nonlocal listing_count
+            if path == tmp_path:
+                listing_count += 1
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", counting_iterdir)
+
+        unlicensed = detect_unlicensed_datasets(files, license_info_by_path={file_path: [] for file_path in files})
+
+        assert unlicensed == files
+        assert listing_count == 1
 
     def test_ml_model_directory_skip(self, tmp_path):
         """Test that ML model files in model directories are skipped."""

@@ -385,6 +385,7 @@ def detect_unlicensed_datasets(
 
     # Check if this looks like an ML model directory
     is_ml_model_dir = _is_ml_model_directory(file_paths)
+    sibling_filenames_by_directory: dict[Path, frozenset[str]] = {}
 
     for file_path in file_paths:
         ext = Path(file_path).suffix.lower()
@@ -401,11 +402,14 @@ def detect_unlicensed_datasets(
 
             # Check if there's a nearby license file
             dir_path = Path(file_path).parent
-            try:
-                existing_files = {f.name.lower() for f in dir_path.iterdir() if f.is_file()}
-                has_license = bool(LICENSE_FILES & existing_files)
-            except OSError:
-                has_license = False
+            existing_files = sibling_filenames_by_directory.get(dir_path)
+            if existing_files is None:
+                try:
+                    existing_files = frozenset(f.name.lower() for f in dir_path.iterdir() if f.is_file())
+                except OSError:
+                    existing_files = frozenset()
+                sibling_filenames_by_directory[dir_path] = existing_files
+            has_license = bool(LICENSE_FILES & existing_files)
 
             if not has_license:
                 # Reuse metadata gathered during the scan when available.
