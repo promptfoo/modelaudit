@@ -1245,6 +1245,22 @@ Priority 1:
 - Notes:
   - this narrows one remaining piece of the broader call-graph invalidation backlog without changing freshness semantics
 
+### 2026-05-02 - Reused call-graph controlled-name analysis
+
+- PR:
+  - `#1198`
+- Change:
+  - function-local instance-alias analysis now returns the parameter-controlled name set it already computed
+  - `_calls_in_function()` reuses that result for later dynamic-dispatch checks instead of walking the same function again
+- Targeted regression:
+  - `packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py::test_calls_in_function_reuses_instance_alias_parameter_analysis`
+- Benchmarks:
+  - helper-shaped `_calls_in_function()` workload over `2,000` invocations:
+    - before: `0.257836s` median with `2.0` controlled-name analyses per invocation
+    - after: `0.213943s` median with `1.0` controlled-name analyses per invocation
+- Notes:
+  - this is another narrow call-graph cleanup that leaves the larger source-freshness and cache-lifetime work open
+
 ### 2026-05-01 - Shared Keras metadata lowercase view
 
 - PR:
