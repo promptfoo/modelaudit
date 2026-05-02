@@ -368,6 +368,24 @@ class TestNetworkCommDetector:
         assert "backdoor" in patterns
         assert "botnet" in patterns
 
+    def test_cc_pattern_scan_reuses_lowered_payload(self) -> None:
+        """Reuse one lowercase payload view across all C&C pattern checks."""
+
+        class TrackingBytes(bytes):
+            lower_calls = 0
+
+            def lower(self) -> bytes:
+                self.lower_calls += 1
+                return super().lower()
+
+        detector = NetworkCommDetector()
+        data = TrackingBytes(b'payload = {"malware": True, "backdoor": True}')
+
+        detector._scan_cc_patterns(data, "payload.bin")
+
+        assert data.lower_calls == 1
+        assert {finding["pattern"] for finding in detector.findings} >= {"malware", "backdoor"}
+
     def test_benign_metadata_reference_keys_are_not_cc_patterns(self) -> None:
         """Common model metadata URL keys are not C&C indicators by themselves."""
         detector = NetworkCommDetector()
@@ -460,6 +478,42 @@ class TestNetworkCommDetector:
         # Blacklisted domains should have max confidence
         assert all(f["confidence"] == 1.0 for f in blacklist_findings)
         assert all(f["severity"] == "CRITICAL" for f in blacklist_findings)
+
+    def test_blacklist_scan_reuses_lowered_payload(self) -> None:
+        """Reuse one lowercase payload view across configured blacklist checks."""
+
+        class TrackingBytes(bytes):
+            lower_calls = 0
+
+            def lower(self) -> bytes:
+                self.lower_calls += 1
+                return super().lower()
+
+        detector = NetworkCommDetector({"custom_blacklist": [b"blocked.example", b"evil.example"]})
+        data = TrackingBytes(b"https://blocked.example/payload")
+
+        detector._check_blacklist(data, "payload.bin")
+
+        assert data.lower_calls == 1
+        assert [finding["domain"] for finding in detector.findings] == ["blocked.example"]
+
+    def test_blacklist_scan_skips_lowering_without_configured_domains(self) -> None:
+        """Avoid touching payload bytes when no blacklist entries are configured."""
+
+        class TrackingBytes(bytes):
+            lower_calls = 0
+
+            def lower(self) -> bytes:
+                self.lower_calls += 1
+                return super().lower()
+
+        detector = NetworkCommDetector()
+        data = TrackingBytes(b"https://blocked.example/payload")
+
+        detector._check_blacklist(data, "payload.bin")
+
+        assert data.lower_calls == 0
+        assert detector.findings == []
 
     def test_custom_config(self) -> None:
         """Test custom configuration options."""
