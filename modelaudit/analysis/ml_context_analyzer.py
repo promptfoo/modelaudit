@@ -274,15 +274,16 @@ class MLContextAnalyzer:
                 return operation
 
         # Pattern-based matching for broader operations
+        function_call_lower = function_call.lower()
         for operation in self.ml_operations:
             if operation.framework == framework and (
                 (
                     operation.operation_type == "model_loading"
-                    and any(keyword in function_call.lower() for keyword in ["load", "restore", "checkpoint"])
+                    and any(keyword in function_call_lower for keyword in ["load", "restore", "checkpoint"])
                 )
                 or (
                     operation.operation_type == "tensor_ops"
-                    and any(keyword in function_call.lower() for keyword in ["tensor", "array", "constant"])
+                    and any(keyword in function_call_lower for keyword in ["tensor", "array", "constant"])
                 )
             ):
                 return operation
