@@ -356,6 +356,24 @@ class TestNetworkCommDetector:
         assert "backdoor" in patterns
         assert "botnet" in patterns
 
+    def test_cc_pattern_scan_reuses_lowered_payload(self) -> None:
+        """Reuse one lowercase payload view across all C&C pattern checks."""
+
+        class TrackingBytes(bytes):
+            lower_calls = 0
+
+            def lower(self) -> bytes:
+                self.lower_calls += 1
+                return super().lower()
+
+        detector = NetworkCommDetector()
+        data = TrackingBytes(b'payload = {"malware": True, "backdoor": True}')
+
+        detector._scan_cc_patterns(data, "payload.bin")
+
+        assert data.lower_calls == 1
+        assert {finding["pattern"] for finding in detector.findings} >= {"malware", "backdoor"}
+
     def test_benign_metadata_reference_keys_are_not_cc_patterns(self) -> None:
         """Common model metadata URL keys are not C&C indicators by themselves."""
         detector = NetworkCommDetector()
