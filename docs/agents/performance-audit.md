@@ -706,6 +706,22 @@ Priority 1:
 - Notes:
   - this is a detector-local CPU win and does not change the C2 pattern surface
 
+### 2026-05-01 - Shared JAX context lowercase view
+
+- PR:
+  - `#1164`
+- Change:
+  - delegated JAX wrapper checks now lowercase decoded text once before testing all framework indicators
+  - the helper preserves the existing indicator set while avoiding repeated long-text scans
+- Targeted regression:
+  - `tests/scanners/test_pickle_scanner.py::test_contains_any_jax_indicator_reuses_lowered_text`
+- Benchmarks:
+  - synthetic `8 MiB` non-JAX text, same-process controlled A/B:
+    - repeated lowercasing path: `0.212387s` median
+    - shared lowercase text: `0.103317s` median
+- Notes:
+  - this is a narrow wrapper cleanup that composes with the larger ordinary-pickle JAX delegation gate from `#1158`
+
 ## Measured Non-Wins
 
 ### 2026-05-01 - Skip directory pre-count without progress
@@ -731,6 +747,17 @@ Priority 1:
     - scanner-metadata reuse: `1.224190s` median
 - Decision:
   - do not land the extra branch yet; the regular large-file hashing work needs a broader design rather than this tiny streaming-only slice
+
+### 2026-05-01 - PyTorch ZIP metadata lowercase reuse
+
+- Hypothesis:
+  - lowercase each archive member name once while estimating parameter-like entries
+- Result:
+  - synthetic `50,000`-entry file list:
+    - repeated per-term lowercasing: `0.011629s` median
+    - one lowercase per name: `0.010124s` median
+- Decision:
+  - the measured gain is too small and too localized to justify a dedicated PR right now
 
 ## Remaining Recommended Implementation Order
 
