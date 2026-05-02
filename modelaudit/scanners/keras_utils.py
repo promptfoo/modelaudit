@@ -36,16 +36,6 @@ _LAMBDA_DANGEROUS_PATTERNS: list[str] = [
     "ctypes",
 ]
 
-
-def find_lambda_dangerous_patterns(
-    decoded_text: str,
-    patterns: Iterable[str] = _LAMBDA_DANGEROUS_PATTERNS,
-) -> list[str]:
-    """Return dangerous Lambda patterns present in decoded text."""
-    lowered_text = decoded_text.lower()
-    return [pattern for pattern in patterns if pattern in lowered_text]
-
-
 _EXTRA_SAFE_KERAS_LOSS_IDENTIFIERS: frozenset[str] = frozenset(
     {
         "bce",
@@ -137,6 +127,12 @@ def is_known_safe_keras_loss(identifier: Any) -> bool:
 def is_known_safe_keras_metric(identifier: Any) -> bool:
     """Return True when a serialized Keras metric identifier is known-safe."""
     return isinstance(identifier, str) and _normalize_keras_identifier(identifier) in _SAFE_KERAS_METRIC_IDENTIFIERS
+
+
+def find_case_insensitive_substrings(text: str, patterns: Iterable[str]) -> list[str]:
+    """Return configured substrings present in `text` using one lowercase pass."""
+    lowered = text.lower()
+    return [pattern for pattern in patterns if pattern in lowered]
 
 
 def iter_keras_serialized_identifiers(value: Any) -> Iterator[tuple[str, Any]]:
@@ -311,7 +307,7 @@ def check_lambda_dict_function(
         )
         return True
 
-    found_patterns = find_lambda_dangerous_patterns(decoded_str)
+    found_patterns = find_case_insensitive_substrings(decoded_str, _LAMBDA_DANGEROUS_PATTERNS)
 
     if found_patterns:
         result.add_check(
