@@ -690,6 +690,22 @@ Priority 1:
 - Notes:
   - this is a narrow CPU cleanup on the long-text license path; the larger header-read semantics tradeoff remains open
 
+### 2026-05-01 - Shared C2 payload lowercase view
+
+- PR:
+  - `#1163`
+- Change:
+  - C2 scanning now lowers each payload once before checking all patterns
+  - repeated membership plus offset lookups were folded into one `find()` pass on the lowered bytes
+- Targeted regression:
+  - `tests/detectors/test_network_comm_detector.py::TestNetworkCommDetector::test_cc_pattern_scan_reuses_lowered_payload`
+- Benchmarks:
+  - synthetic `8 MiB` no-match payload, same-process controlled A/B:
+    - repeated lowercasing path: `0.246317s` median
+    - shared lowercase payload: `0.068608s` median
+- Notes:
+  - this is a detector-local CPU win and does not change the C2 pattern surface
+
 ## Measured Non-Wins
 
 ### 2026-05-01 - Skip directory pre-count without progress
