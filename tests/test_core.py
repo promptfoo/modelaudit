@@ -7,6 +7,7 @@ import gzip
 import json
 import pickle
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -1368,6 +1369,26 @@ def test_scan_file_routes_model_config_json_to_manifest_scanner(tmp_path: Path) 
 
     assert result.scanner_name == "manifest"
     assert result.success is True
+
+
+def test_scan_directory_without_progress_skips_file_counting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "model.pkl"
+    model_path.write_bytes(b"\x80\x04N.")
+
+    def fail_rglob(self: Path, pattern: str) -> Iterator[Path]:
+        raise AssertionError(f"unexpected rglob({pattern!r}) for {self}")
+
+    monkeypatch.setattr(Path, "rglob", fail_rglob)
+
+    result = scan_model_directory_or_file(
+        str(tmp_path),
+        cache_scan_results=False,
+    )
+
+    assert result.files_scanned == 1
 
 
 def test_scan_file_routes_manifest_owned_chat_templates_through_jinja_analysis(tmp_path: Path) -> None:
