@@ -58,11 +58,11 @@ def _create_run(
     issues = _primary_sarif_issues(issues)
 
     # Create rules from unique issue types
-    rules = _create_rules(issues)
+    rules = _create_rules(issues, prefiltered=True)
     rule_indices = {rule["id"]: idx for idx, rule in enumerate(rules)}
 
     # Create results from issues
-    results = _create_results(issues, rule_indices)
+    results = _create_results(issues, rule_indices, prefiltered=True)
 
     # Create artifacts from scanned files
     artifacts = _create_artifacts(audit_result)
@@ -148,9 +148,10 @@ def _exit_code_description(audit_result: ModelAuditResultModel, exit_code: int) 
     return "Errors occurred during scanning"
 
 
-def _create_rules(issues: list) -> list[dict[str, Any]]:
+def _create_rules(issues: list, *, prefiltered: bool = False) -> list[dict[str, Any]]:
     """Create SARIF rules from unique issue types."""
-    issues = _primary_sarif_issues(issues)
+    if not prefiltered:
+        issues = _primary_sarif_issues(issues)
     rules = []
     seen_rules = set()
 
@@ -191,12 +192,18 @@ def _create_rules(issues: list) -> list[dict[str, Any]]:
     return rules
 
 
-def _create_results(issues: list, rule_indices: dict[str, int] | None = None) -> list[dict[str, Any]]:
+def _create_results(
+    issues: list,
+    rule_indices: dict[str, int] | None = None,
+    *,
+    prefiltered: bool = False,
+) -> list[dict[str, Any]]:
     """Create SARIF results from issues."""
-    issues = _primary_sarif_issues(issues)
+    if not prefiltered:
+        issues = _primary_sarif_issues(issues)
     results = []
     if rule_indices is None:
-        rule_indices = {rule["id"]: idx for idx, rule in enumerate(_create_rules(issues))}
+        rule_indices = {rule["id"]: idx for idx, rule in enumerate(_create_rules(issues, prefiltered=prefiltered))}
 
     for issue in issues:
         rule_id = _get_rule_id(issue)
