@@ -238,7 +238,13 @@ class FlaxMsgpackScanner(BaseScanner):
 
         return False
 
-    def _extract_jax_metadata(self, obj: Any, result: ScanResult) -> dict[str, Any]:
+    def _extract_jax_metadata(
+        self,
+        obj: Any,
+        result: ScanResult,
+        *,
+        ml_analysis: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Extract JAX/Flax specific metadata from the checkpoint."""
         metadata: dict[str, Any] = {
             "model_type": "unknown",
@@ -311,7 +317,8 @@ class FlaxMsgpackScanner(BaseScanner):
         metadata["parameter_count"] = count_parameters(obj)
 
         # Perform ML structure analysis to get confidence score
-        ml_analysis = self._analyze_ml_structure(obj, result)
+        if ml_analysis is None:
+            ml_analysis = self._analyze_ml_structure(obj, result)
 
         # Add confidence and ML analysis results to metadata
         metadata["confidence"] = ml_analysis["confidence"]
@@ -740,7 +747,13 @@ class FlaxMsgpackScanner(BaseScanner):
 
         return analysis
 
-    def _validate_flax_structure(self, obj: Any, result: ScanResult) -> None:
+    def _validate_flax_structure(
+        self,
+        obj: Any,
+        result: ScanResult,
+        *,
+        ml_analysis: dict[str, Any] | None = None,
+    ) -> None:
         """Validate that the msgpack structure looks like a legitimate Flax checkpoint using structural analysis."""
         if not isinstance(obj, dict):
             result.add_check(
@@ -847,7 +860,8 @@ class FlaxMsgpackScanner(BaseScanner):
             return
 
         # If no standard keys, perform deep structural analysis
-        ml_analysis = self._analyze_ml_structure(obj, result)
+        if ml_analysis is None:
+            ml_analysis = self._analyze_ml_structure(obj, result)
 
         if ml_analysis["is_ml_model"]:
             # High confidence legitimate ML model based on structural analysis
@@ -1072,10 +1086,11 @@ class FlaxMsgpackScanner(BaseScanner):
                 result.metadata["msgpack_object_count"] = len(objects)
 
             # Extract JAX/Flax specific metadata and architecture information
-            self._extract_jax_metadata(obj, result)
+            ml_analysis = self._analyze_ml_structure(obj, result)
+            self._extract_jax_metadata(obj, result, ml_analysis=ml_analysis)
 
             # Validate Flax structure with enhanced analysis
-            self._validate_flax_structure(obj, result)
+            self._validate_flax_structure(obj, result, ml_analysis=ml_analysis)
 
             # Check for JAX/Flax specific security threats
             self._check_jax_specific_threats(obj, result)

@@ -9,7 +9,7 @@ pytest.importorskip("msgpack")
 
 import msgpack
 
-from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner, _matching_jax_transforms
 
 
@@ -76,6 +76,30 @@ def test_flax_msgpack_valid_checkpoint(tmp_path):
         )
         == 0
     )
+
+
+def test_flax_scan_reuses_ml_structure_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One scan should reuse the same deep ML-structure analysis result."""
+    path = tmp_path / "converted.msgpack"
+    create_msgpack_file(path, {"tensor": b"0" * 4096, "payload": "x" * 4096})
+
+    scanner = FlaxMsgpackScanner()
+    analyze_calls = 0
+    original_analyze = scanner._analyze_ml_structure
+
+    def count_analyze(obj: Any, result: ScanResult) -> dict[str, Any]:
+        nonlocal analyze_calls
+        analyze_calls += 1
+        return original_analyze(obj, result)
+
+    monkeypatch.setattr(scanner, "_analyze_ml_structure", count_analyze)
+
+    scanner.scan(str(path))
+
+    assert analyze_calls == 1
 
 
 def test_flax_ml_structure_reuses_lowered_object_text() -> None:
