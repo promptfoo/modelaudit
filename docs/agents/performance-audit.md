@@ -321,7 +321,7 @@ Priority 1:
 | `modelaudit/scanners/keras_zip_scanner.py`                               | inspected        | Lambda-code scanning reused repeated whole-string lowercase passes, now fixed in `#1168`; larger archive benchmarks are still needed.                                 |
 | `modelaudit/scanners/keras_utils.py`                                     | inspected        | Shared Lambda helpers had the same repeated lowercase pattern, now consolidated behind one reusable matcher in `#1168`.                                               |
 | `modelaudit/detectors/secrets.py`                                        | inspected        | Fixed detector heuristics now reuse module-level state in `#1189`; convenience file API still reads whole files, while the core pickle path already gates execution.   |
-| `modelaudit/detectors/network_comm.py`                                   | inspected        | Convenience file API reads whole files and regex work can be expensive on large buffers.                                                                              |
+| `modelaudit/detectors/network_comm.py`                                   | inspected        | Fixed network-library pattern tuples now reuse shared state in `#1191`; convenience file API still reads whole files and regex work can be expensive on large buffers. |
 | `modelaudit/detectors/jit_script.py`                                     | inspected        | Fixed dangerous-import regexes now reuse compiled pairs in `#1190`; convenience file API still reads whole files and AST-walks parsed code.                           |
 | `modelaudit/scanners/catboost_scanner.py`                                | inspected        | Uses bounded head/core/trailer reads; low priority until a CatBoost-specific benchmark says otherwise.                                                                |
 | `modelaudit/scanners/cntk_scanner.py`                                    | inspected        | Uses explicit read limits; low priority.                                                                                                                              |
@@ -1067,6 +1067,22 @@ Priority 1:
 - Notes:
   - this trims repeated static regex setup from the embedded-code import loop without changing the detection vocabulary
 
+### 2026-05-02 - Shared network-library byte patterns
+
+- PR:
+  - `#1191`
+- Change:
+  - derived network-library byte-pattern tuples are now materialized once on the detector class
+  - each library scan reuses the shared tuple instead of rebuilding five bytes patterns per library per file
+- Targeted regression:
+  - `tests/detectors/test_network_comm_detector.py::TestNetworkCommDetector::test_network_library_scan_uses_shared_patterns`
+- Benchmarks:
+  - benign no-match network-library scan:
+    - before: `0.561651s` median
+    - after: `0.389619s` median
+- Notes:
+  - this is a scan-wide detector cleanup because the network-library pass runs even when no findings are emitted
+
 ### 2026-05-01 - Shared C2 payload lowercase view
 
 - PR:
@@ -1200,6 +1216,20 @@ Priority 1:
   - the benchmark is intentionally an overhead smoke test; the value of this PR is better observability for the larger hashing and orchestration backlog
 
 ## Measured Non-Wins
+
+### 2026-05-02 - JIT code-execution regex precompile
+
+- Hypothesis:
+  - precompile the fixed binary code-execution regexes instead of calling `re.search()` with literals in the helper loop
+- Result:
+  - isolated raw pattern loop improved:
+    - literal regex path: `0.625741s` median
+    - precompiled regex path: `0.524009s` median
+  - real `_extract_and_check_python_code()` no-match helper path was effectively flat:
+    - current helper: `0.148358s` median
+    - precompiled helper variant: `0.150832s` median
+- Decision:
+  - do not land the change; the isolated loop win disappeared once measured inside the actual helper path
 
 ### 2026-05-02 - Explicit ML network-pattern precompile
 
