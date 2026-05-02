@@ -78,6 +78,7 @@ def _clear_call_graph_caches() -> None:
         "_resolve_function_target",
         "_resolve_module_source",
         "_safe_call_graph_entrypoints",
+        "_split_function_name",
         "_wildcard_export_summary",
     ):
         cache_clear = getattr(getattr(call_graph_module, function_name), "cache_clear", None)
@@ -87,6 +88,21 @@ def _clear_call_graph_caches() -> None:
 
 def _env_without_pythonpath() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+
+
+def test_split_function_name_reuses_cached_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    analyze_calls: list[str] = []
+
+    def fake_analyze_module(module_name: str) -> object | None:
+        analyze_calls.append(module_name)
+        return object() if module_name == "pkg.mod" else None
+
+    monkeypatch.setattr(call_graph, "_analyze_module", fake_analyze_module)
+    call_graph._split_function_name.cache_clear()
+
+    assert call_graph._split_function_name("pkg.mod.func") == ("pkg.mod", "func")
+    assert call_graph._split_function_name("pkg.mod.func") == ("pkg.mod", "func")
+    assert analyze_calls == ["pkg.mod"]
 
 
 def _sitebuiltins_helper_instance_call_payload() -> bytes:
