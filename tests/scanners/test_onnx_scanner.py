@@ -121,6 +121,31 @@ def test_onnx_scanner_basic_model(tmp_path):
     assert not any(i.severity in (IssueSeverity.INFO, IssueSeverity.WARNING) for i in result.issues)
 
 
+def test_onnx_scanner_reuses_raw_bytes_for_model_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Successful scans should parse from the raw detector buffer."""
+    model_path = create_onnx_model(tmp_path)
+    parsed_payloads: list[bytes] = []
+    real_load_model_from_string = onnx.load_model_from_string
+
+    def fail_path_loader(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("path-based ONNX parsing should not run after the raw read succeeds")
+
+    def tracking_load_model_from_string(payload: bytes) -> Any:
+        parsed_payloads.append(payload)
+        return real_load_model_from_string(payload)
+
+    monkeypatch.setattr(onnx, "load", fail_path_loader)
+    monkeypatch.setattr(onnx, "load_model_from_string", tracking_load_model_from_string)
+
+    result = OnnxScanner({"check_jit_script": False, "check_network_comm": False}).scan(str(model_path))
+
+    assert result.success
+    assert parsed_payloads == [model_path.read_bytes()]
+
+
 def test_onnx_scanner_custom_op(tmp_path: Path) -> None:
     model_path = create_onnx_model(tmp_path, custom=True)
     result = OnnxScanner().scan(str(model_path))
