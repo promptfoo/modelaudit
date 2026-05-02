@@ -223,6 +223,47 @@ Expected upside:
 
 - Noticeable improvement for large ordinary local folders.
 
+## Rust Rewrite Candidates
+
+### 1. Pickle call-graph enrichment
+
+- Highest-value Rust candidate from current measurements.
+- `packages/modelaudit-picklescan/src/modelaudit_picklescan/call_graph.py` is the largest confirmed CPU hotspot so far:
+  - repeated parsing and AST walks dominate pickle-heavy workloads
+  - the controlled cache experiment reduced warm-corpus time from about `2.0s` to `0.8s`
+- Why Rust fits:
+  - syntax-heavy deterministic analysis
+  - repeated tree traversal over Python source
+- Caveat:
+  - finish the cheaper Python cache and invalidation work first
+  - preserve source freshness and Python-resolution semantics exactly before moving this across the FFI boundary
+
+### 2. Raw byte-oriented pickle wrapper detectors
+
+- Good second-tier Rust candidate once remaining Python-side duplicate passes are trimmed.
+- The best targets are bounded byte scans in `modelaudit/scanners/pickle_scanner.py`, not orchestration logic.
+- Why Rust fits:
+  - tight loops over bytes
+  - stable inputs and a simpler correctness envelope than AST resolution
+
+### 3. Other CPU-dense byte parsers after duplicate reads are removed
+
+- Potential future candidates:
+  - archive-member triage
+  - manifest or metadata parsing passes that remain CPU-hot after I/O cleanup
+  - large-buffer detector kernels
+- Rule:
+  - only port paths that stay hot after duplicate I/O and repeated setup work are removed
+
+### Not Yet Good Rust Candidates
+
+- Repeated hashing:
+  - current issue is duplicate full-file passes, not slow digest implementations
+- License metadata:
+  - current issue is read strategy and repeated directory walks
+- Directory orchestration, scanner selection, and HuggingFace path checks:
+  - current wins come from caching and short-circuiting, not from a faster language boundary
+
 ## File-by-File Audit Queue
 
 Priority 0:
@@ -692,6 +733,23 @@ Priority 1:
 - Notes:
   - this is a narrow CPU cleanup on the long-text license path; the larger header-read semantics tradeoff remains open
 
+### 2026-05-01 - Large-file cache hash reuse
+
+- PR:
+  - `#1171`
+- Change:
+  - large-file cache stores now reuse the secure digest already computed while building the cache key
+  - avoids an immediate second full-file secure hash inside `store_result()`
+- Targeted regression:
+  - `tests/cache/test_cache_correctness.py::test_large_file_store_reuses_cache_key_content_hash`
+- Benchmarks:
+  - synthetic `64 MiB` cache store:
+    - before: `0.126905s` median, `5` key-hash calls, `5` store-hash calls
+    - after: `0.110148s` median, `5` key-hash calls, `0` store-hash calls
+- Notes:
+  - this is the first landed slice of the repeated-hashing backlog
+  - broader SHA256 and integrity-hash reuse still needs product-level hash-output constraints settled
+
 ### 2026-05-01 - Shared C2 payload lowercase view
 
 - PR:
@@ -908,7 +966,7 @@ Priority 1:
 ## Remaining Recommended Implementation Order
 
 1. Unify or reuse hashing passes.
-   - Strong large-file win, but product requirements around hash outputs need to be settled first.
+   - First cache-local slice landed in `#1171`; broader product-level hash reuse still needs hash-output requirements settled.
 2. Replace report-scoped call-graph sharing with source-aware invalidation where safe.
    - Higher upside remains, but freshness semantics still need careful proof.
 3. Tighten license header reads for non-license large text-like files only if detection semantics stay explicit.
