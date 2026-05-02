@@ -804,6 +804,22 @@ Priority 1:
 - Notes:
   - this preserves exact totals for small trees while falling back to open-ended progress once a tree is already large enough that the recursive count is the costlier choice
 
+### 2026-05-02 - Hardlink hash reuse
+
+- PR:
+  - `#1175`
+- Change:
+  - directory hash prepasses now reuse a digest when multiple paths resolve to the same hardlinked inode fingerprint
+  - scan results stay path-specific while repeated reads of identical hardlinked bytes are avoided
+- Targeted regression:
+  - `tests/test_regular_scan_hash.py::TestHashGenerationEdgeCases::test_hash_files_by_path_reuses_hash_for_hardlinks`
+- Benchmarks:
+  - synthetic `32 MiB` file exposed through `16` hardlinked paths:
+    - before: `0.248237s` median
+    - after: `0.020348s` median
+- Notes:
+  - this is a narrow I/O win inside the repeated-hashing backlog; broader top-level and scanner-layer hash reuse still needs the product-level digest policy work called out above
+
 ### 2026-05-01 - Shared C2 payload lowercase view
 
 - PR:
