@@ -1277,6 +1277,25 @@ Priority 1:
 - Notes:
   - focused call-graph tests passed; the repo-wide non-slow lane still hits existing timing-sensitive perf assertions in this environment
 
+### 2026-05-02 - Cached call-graph split-name resolution
+
+- PR:
+  - `#1212`
+- Change:
+  - `_split_function_name()` now reuses dotted-name resolution results across repeated call-graph lookups
+  - the new cache joins the existing source-sensitive invalidation sweep
+- Targeted regression:
+  - `packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py::test_split_function_name_reuses_cached_resolution`
+- Benchmarks:
+  - repeated PyTorch-reference split loop over `5` names x `200`, `100` passes:
+    - before: `0.030549s` median
+    - after: `0.003123s` median
+  - matched cProfile run on `tests/assets/exploits/exploit_ultimate_50pct.pkl`:
+    - before: `82.470s`
+    - after: `58.022s`
+- Notes:
+  - this is one of the first small call-graph changes to move a profiled end-to-end malicious-pickle path materially; the repo-wide non-slow lane still hits the directory-scan timing sentinel in this environment
+
 ### 2026-05-02 - Shared MetaGraph attr lowercase values
 
 - PR:
