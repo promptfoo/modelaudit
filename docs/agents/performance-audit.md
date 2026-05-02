@@ -321,7 +321,7 @@ Priority 1:
 | `modelaudit/scanners/keras_zip_scanner.py`                               | inspected        | Lambda-code scanning reused repeated whole-string lowercase passes, now fixed in `#1168`; larger archive benchmarks are still needed.                                 |
 | `modelaudit/scanners/keras_utils.py`                                     | inspected        | Shared Lambda helpers had the same repeated lowercase pattern, now consolidated behind one reusable matcher in `#1168`.                                               |
 | `modelaudit/detectors/secrets.py`                                        | inspected        | Fixed detector heuristics now reuse module-level state in `#1189`; convenience file API still reads whole files, while the core pickle path already gates execution.   |
-| `modelaudit/detectors/network_comm.py`                                   | inspected        | Fixed network-library pattern tuples now reuse shared state in `#1191`; convenience file API still reads whole files and regex work can be expensive on large buffers. |
+| `modelaudit/detectors/network_comm.py`                                   | inspected        | Network-library patterns and suspicious-port names now reuse shared state in `#1191` and `#1192`; convenience file API still reads whole files.                       |
 | `modelaudit/detectors/jit_script.py`                                     | inspected        | Fixed dangerous-import regexes now reuse compiled pairs in `#1190`; convenience file API still reads whole files and AST-walks parsed code.                           |
 | `modelaudit/scanners/catboost_scanner.py`                                | inspected        | Uses bounded head/core/trailer reads; low priority until a CatBoost-specific benchmark says otherwise.                                                                |
 | `modelaudit/scanners/cntk_scanner.py`                                    | inspected        | Uses explicit read limits; low priority.                                                                                                                              |
@@ -1082,6 +1082,21 @@ Priority 1:
     - after: `0.389619s` median
 - Notes:
   - this is a scan-wide detector cleanup because the network-library pass runs even when no findings are emitted
+
+### 2026-05-02 - Shared suspicious-port name table
+
+- PR:
+  - `#1192`
+- Change:
+  - suspicious-port service names now live in shared detector state instead of being rebuilt for each emitted finding
+- Targeted regression:
+  - `tests/detectors/test_network_comm_detector.py::TestNetworkCommDetector::test_port_name_lookup_uses_shared_mapping`
+- Benchmarks:
+  - hit-heavy suspicious-port scan over every configured port:
+    - before: `0.392935s` median
+    - after: `0.231162s` median
+- Notes:
+  - this is a finding-path cleanup rather than a no-match-path win, but the change is isolated and behavior-preserving
 
 ### 2026-05-01 - Shared C2 payload lowercase view
 
