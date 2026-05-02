@@ -907,23 +907,19 @@ def _is_huggingface_cache_file(path: str) -> bool:
 
     filename = os.path.basename(path)
     path_obj = Path(path)
-
-    is_hf_bookkeeping_path = _is_hf_hub_bookkeeping_path(path_obj) or _is_hf_download_bookkeeping_path(path_obj)
+    maybe_bookkeeping_filename = filename.endswith((".lock", ".metadata")) or filename in {
+        ".gitignore",
+        ".gitattributes",
+        "main",
+        "HEAD",
+    }
+    if not maybe_bookkeeping_filename:
+        return False
 
     # Only trust bookkeeping-shaped filenames when they actually live in a
     # recognized HuggingFace cache layout.
-    if filename.endswith(".lock"):
-        return is_hf_bookkeeping_path
-
-    # Only skip HuggingFace .metadata files in known cache/download layouts.
-    if filename.endswith(".metadata"):
-        return is_hf_bookkeeping_path
-
-    # Check for specific HuggingFace cache metadata files
-    # We no longer skip all HuggingFace cache files since we handle symlinks properly now
-
-    # Check for Git-related files that are commonly cached
-    if filename in [".gitignore", ".gitattributes"]:
+    if filename.endswith((".lock", ".metadata")) or filename in {".gitignore", ".gitattributes"}:
+        is_hf_bookkeeping_path = _is_hf_hub_bookkeeping_path(path_obj) or _is_hf_download_bookkeeping_path(path_obj)
         return is_hf_bookkeeping_path
 
     if filename in ["main", "HEAD"]:

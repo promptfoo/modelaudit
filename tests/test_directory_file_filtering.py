@@ -512,6 +512,29 @@ class TestDirectoryFileFiltering:
         assert _is_huggingface_cache_file(str(hf_download_gitignore)) is True
         assert _is_huggingface_cache_file(str(hf_download_gitattributes)) is True
 
+    def test_non_bookkeeping_filenames_skip_hf_layout_probes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Ordinary filenames should avoid HuggingFace layout checks entirely."""
+        ordinary_file = tmp_path / "weights.safetensors"
+        calls = {"hub": 0, "download": 0}
+
+        def spy_hub(path: Path) -> bool:
+            calls["hub"] += 1
+            return False
+
+        def spy_download(path: Path) -> bool:
+            calls["download"] += 1
+            return False
+
+        monkeypatch.setattr("modelaudit.core._is_hf_hub_bookkeeping_path", spy_hub)
+        monkeypatch.setattr("modelaudit.core._is_hf_download_bookkeeping_path", spy_download)
+
+        assert _is_huggingface_cache_file(str(ordinary_file)) is False
+        assert calls == {"hub": 0, "download": 0}
+
     def test_custom_hf_hub_cache_root_skips_hub_bookkeeping(
         self,
         tmp_path: Path,
