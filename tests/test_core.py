@@ -222,6 +222,35 @@ def test_scan_directory_preserves_parseable_prefixed_zip_with_central_directory_
     )
 
 
+def test_scan_model_omits_phase_timings_by_default(tmp_path: Path) -> None:
+    payload = tmp_path / "payload.pkl"
+    payload.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+
+    result = scan_model_directory_or_file(str(payload), cache_scan_results=False)
+
+    assert not hasattr(result, "phase_timings")
+
+
+def test_scan_model_emits_opt_in_phase_timings(tmp_path: Path) -> None:
+    payload = tmp_path / "payload.pkl"
+    payload.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+
+    result = scan_model_directory_or_file(str(payload), cache_scan_results=False, profile_timings=True)
+    phase_timings = result.phase_timings  # type: ignore[attr-defined]
+
+    assert phase_timings.keys() >= {
+        "scanner_selection",
+        "top_level_hashing",
+        "file_scan_dispatch",
+        "result_merge",
+        "license_metadata",
+        "result_consolidation",
+        "commercial_use_warnings",
+        "aggregate_hash",
+    }
+    assert all(duration >= 0 for duration in phase_timings.values())
+
+
 def test_scan_file_detects_misnamed_gzip_wrapped_pickle_by_header(tmp_path: Path) -> None:
     disguised_gzip = tmp_path / "payload.jpg"
     disguised_gzip.write_bytes(gzip.compress(_build_malicious_pickle()))
