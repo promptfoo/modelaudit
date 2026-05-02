@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 import io
 import os
@@ -78,6 +79,7 @@ def _clear_call_graph_caches() -> None:
         "_resolve_function_target",
         "_resolve_module_source",
         "_safe_call_graph_entrypoints",
+        "_collect_function_import_aliases",
         "_wildcard_export_summary",
     ):
         cache_clear = getattr(getattr(call_graph_module, function_name), "cache_clear", None)
@@ -87,6 +89,39 @@ def _clear_call_graph_caches() -> None:
 
 def _env_without_pythonpath() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+
+
+def test_collect_function_import_aliases_reuses_cached_walk(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = ast.parse(
+        """
+def bridge():
+    import os
+    from subprocess import run
+    return run
+"""
+    )
+    bridge = module.body[0]
+    assert isinstance(bridge, ast.FunctionDef)
+
+    calls = 0
+    original_collect_import_aliases = call_graph._collect_import_aliases
+
+    def counting_collect_import_aliases(
+        statements: tuple[ast.stmt, ...],
+        module_name: str,
+        is_package: bool,
+    ) -> dict[str, str]:
+        nonlocal calls
+        calls += 1
+        return original_collect_import_aliases(statements, module_name, is_package)
+
+    monkeypatch.setattr(call_graph, "_collect_import_aliases", counting_collect_import_aliases)
+    call_graph._collect_function_import_aliases.cache_clear()
+
+    expected = {"os": "os", "run": "subprocess.run"}
+    assert call_graph._collect_function_import_aliases(bridge, "benchmod", False) == expected
+    assert call_graph._collect_function_import_aliases(bridge, "benchmod", False) == expected
+    assert calls == 2
 
 
 def _sitebuiltins_helper_instance_call_payload() -> bytes:
