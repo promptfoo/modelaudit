@@ -14,8 +14,6 @@ from pathlib import Path
 from typing import Any, BinaryIO, ClassVar
 
 from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
-from modelaudit_picklescan.api import _scan_pickle_payload_native
-from modelaudit_picklescan.options import ScanOptions
 
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS
 from modelaudit.utils.helpers.code_validation import validate_python_syntax
@@ -1067,16 +1065,10 @@ def _is_legitimate_serialization_file(path: str) -> bool:
     if not path_obj.is_file():
         return False
     try:
-        payload = path_obj.read_bytes()
-        if not _looks_like_pickle(payload[:_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES]):
-            return False
-        report = _scan_pickle_payload_native(
-            payload,
-            source=str(path_obj),
-            options=ScanOptions(),
-            bytes_total=len(payload),
-            enrich_call_graph=False,
-        )
+        with path_obj.open("rb") as handle:
+            if not _looks_like_pickle(handle.read(_NESTED_PICKLE_HEADER_SEARCH_LIMIT_BYTES)):
+                return False
+        report = StandalonePickleScanner().scan_file(path_obj, enrich_call_graph=False)
     except Exception:
         return False
     return not report.has_security_findings and report.status.value != "error"
