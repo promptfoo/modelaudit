@@ -1,6 +1,7 @@
 """Core scanning engine for orchestrating model file security analysis."""
 
 import hashlib
+import itertools
 import logging
 import os
 import time
@@ -68,6 +69,20 @@ logger = logging.getLogger("modelaudit.core")
 
 _add_asset_to_results = core_results.add_asset_to_results
 _add_error_asset_to_results = core_results.add_error_asset_to_results
+_DIRECTORY_PRECOUNT_CHILD_LIMIT = 1000
+
+
+def _count_immediate_children_up_to(path: Path, limit: int) -> int:
+    """Count at most `limit` immediate children for directory-size heuristics."""
+    return sum(1 for _child in itertools.islice(path.iterdir(), limit))
+
+
+def _count_files_up_to(path: Path, limit: int) -> int | None:
+    """Return an exact recursive file count only while it stays within `limit`."""
+    count = sum(1 for candidate in itertools.islice((item for item in path.rglob("*") if item.is_file()), limit + 1))
+    return None if count > limit else count
+
+
 _add_issue_to_model = core_results.add_issue_to_model
 _add_scan_result_to_model = core_results.add_scan_result_to_model
 _consolidate_checks = core_results.consolidate_checks
@@ -481,9 +496,13 @@ def scan_model_directory_or_file(
                 try:
                     directory_file_count_started_at = _start_phase_timing(phase_timings)
                     # Do a quick count of immediate children first.
-                    immediate_children = len(list(Path(path).iterdir()))
-                    if immediate_children < 1000:  # Only count if not too many immediate children.
-                        total_files = sum(1 for _ in Path(path).rglob("*") if _.is_file())
+                    immediate_children = _count_immediate_children_up_to(
+                        Path(path),
+                        _DIRECTORY_PRECOUNT_CHILD_LIMIT,
+                    )
+                    # Only run the recursive count for narrower roots.
+                    if immediate_children < _DIRECTORY_PRECOUNT_CHILD_LIMIT:
+                        total_files = _count_files_up_to(Path(path), _DIRECTORY_PRECOUNT_CHILD_LIMIT)
                 except (OSError, PermissionError):
                     # If we can't count, just proceed without progress percentage.
                     total_files = None
