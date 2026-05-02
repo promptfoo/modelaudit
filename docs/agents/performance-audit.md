@@ -967,6 +967,22 @@ Priority 1:
 - Notes:
   - this is a many-file routing win because `get_scanner_for_file()` creates a fresh scanner instance for each matched path
 
+### 2026-05-02 - Default secret-pattern reuse
+
+- PR:
+  - `#1185`
+- Change:
+  - default embedded-secret regex banks are now compiled once at module load
+  - custom secret-pattern configs keep the existing dynamic compile path
+- Targeted regression:
+  - `tests/detectors/test_secrets_detector.py::TestSecretsDetector::test_default_detector_reuses_precompiled_patterns`
+- Benchmarks:
+  - `2,000` default `SecretsDetector()` constructions:
+    - before: `0.065173s` median
+    - after: `0.001091s` median
+- Notes:
+  - this is a common-path detector win because `BaseScanner.check_for_embedded_secrets()` constructs the detector during scans
+
 ### 2026-05-01 - Shared C2 payload lowercase view
 
 - PR:
@@ -1203,6 +1219,39 @@ Priority 1:
     - helper split over already-lowered text: `0.148195s` median
 - Decision:
   - do not land the change; the realistic streamed path did not improve despite the apparent duplicate work in the helper boundary
+
+### 2026-05-02 - Explicit ML network regex precompilation
+
+- Hypothesis:
+  - precompile the four explicit-network regexes used by `NetworkCommDetector` for ML-model payloads
+- Result:
+  - `20,000` tiny no-match payload calls:
+    - current path: `0.091411s` median
+    - shared compiled regexes: `0.087378s` median
+- Decision:
+  - do not land the change; the measured win is too small for a dedicated PR
+
+### 2026-05-02 - JIT ONNX Python-op regex precompilation
+
+- Hypothesis:
+  - hoist the static ONNX Python-operator regex out of `scan_onnx()`
+- Result:
+  - `20,000` tiny no-match payload calls:
+    - current path: `0.046086s` median
+    - shared compiled regex path: `0.042912s` median
+- Decision:
+  - do not land the change; the exact helper win is measurable but too small to prioritize
+
+### 2026-05-02 - ZIP metadata one-pass rewrite
+
+- Hypothesis:
+  - replace repeated model/config archive-member scans with one combined member-summary loop
+- Result:
+  - synthetic `200,000`-member archive name list:
+    - current short-circuiting passes: `0.184341s` median
+    - one-pass rewrite: `0.256282s` median
+- Decision:
+  - keep the current passes; the short-circuiting `any()` checks are faster than the one-pass bookkeeping rewrite
 
 ## Remaining Recommended Implementation Order
 
