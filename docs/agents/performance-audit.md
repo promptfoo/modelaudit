@@ -1261,6 +1261,22 @@ Priority 1:
 - Notes:
   - this is another narrow call-graph cleanup that leaves the larger source-freshness and cache-lifetime work open
 
+### 2026-05-02 - Shared call-graph `getattr` assignment candidates
+
+- PR:
+  - `#1199`
+- Change:
+  - controlled and fallback `getattr` dispatch analysis now reuse one assignment-call candidate pass
+  - `_calls_in_function()` avoids walking the same function body twice when both branches are needed
+- Targeted regression:
+  - `packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py::test_calls_in_function_reuses_getattr_assignment_candidates`
+- Benchmarks:
+  - helper-shaped `_calls_in_function()` workload over `5,000` invocations, same checkout before/after:
+    - before: `0.439966s` median with `8.0` `ast.walk()` calls per invocation
+    - after: `0.392207s` median with `7.0` `ast.walk()` calls per invocation
+- Notes:
+  - focused call-graph tests passed; the repo-wide non-slow lane still hits existing timing-sensitive perf assertions in this environment
+
 ### 2026-05-01 - Shared Keras metadata lowercase view
 
 - PR:
