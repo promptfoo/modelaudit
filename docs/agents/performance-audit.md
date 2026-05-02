@@ -301,7 +301,7 @@ Priority 1:
 | `packages/modelaudit-picklescan/src/modelaudit_picklescan/call_graph.py` | profiled         | Highest measured hotspot; repeated cache clearing and repeated AST analysis dominate pickle-heavy workloads.                                                          |
 | `modelaudit/core.py`                                                     | profiled         | Directory orchestration performs discovery, prehash, repeated config normalization, per-file HF cache checks, and path-specific scans. Phase timings land in `#1170`. |
 | `modelaudit/scanner_selection.py`                                        | profiled         | Alias maps and policies are rebuilt per file even when config is unchanged. Strong many-file optimization candidate.                                                  |
-| `modelaudit/integrations/license_checker.py`                             | profiled         | Repeated directory walks and sibling directory scans create large many-file costs; header reading is also expensive for long one-line text-like files.                |
+| `modelaudit/integrations/license_checker.py`                             | profiled         | Repeated directory walks and sibling directory scans create large many-file costs; ordinary long one-line header reads are bounded in `#1197`.                        |
 | `modelaudit/scanners/base.py`                                            | profiled         | Multi-hash integrity pass is a meaningful large-file cost and duplicates other hashing work.                                                                          |
 | `modelaudit/scanners/pickle_scanner.py`                                  | measured         | Clean duplicate pickle workloads spend heavily in raw detectors; ordinary JAX delegation is reduced in `#1158`, and Rust-only validation now avoids call-graph enrichment in `#1196`. |
 | `modelaudit/cache/adaptive_cache_keys.py`                                | inspected        | Large-file cache keys can trigger content hashing; must be considered together with scanner and aggregate hashes.                                                     |
@@ -451,8 +451,8 @@ Priority 1:
 
 ### License Metadata and Commercial-Use Checks
 
-- [ ] Bound non-license-file header reads by bytes as well as lines.
-- [ ] Keep richer reads for actual license files where full text matters.
+- [x] Bound non-license-file header reads by bytes as well as lines. `#1197`
+- [x] Keep richer reads for actual license files where full text matters. `#1197`
 - [ ] Cache nearby-license discovery by directory during a scan.
 - [ ] Precompute sibling filename sets for commercial-use warning aggregation.
 - [ ] Avoid repeated `Path.iterdir()` for each candidate file in the same directory.
@@ -767,6 +767,22 @@ Priority 1:
     - shared lowercase view: `0.616486s` median
 - Notes:
   - this is a narrow CPU cleanup on the long-text license path; the larger header-read semantics tradeoff remains open
+
+### 2026-05-02 - Bounded ordinary license-header reads
+
+- PR:
+  - `#1197`
+- Change:
+  - ordinary non-license files now stop after the existing `64 KiB` header probe even when the first line continues past the byte cap
+  - explicit license files such as `notice.txt` preserve the richer line-oriented read so long license notices are still detected
+- Targeted regression:
+  - `tests/integrations/test_license_checker.py::TestLicenseHeaderScanning::test_long_one_line_non_license_text_header_is_bounded`
+- Benchmarks:
+  - synthetic `64 MiB` one-line `payload.dat` through `scan_for_license_headers()`:
+    - before: `0.166002s` median
+    - after: `0.000738s` median
+- Notes:
+  - this closes the long-text header-read item without weakening explicit license-file coverage
 
 ### 2026-05-01 - Large-file cache hash reuse
 
