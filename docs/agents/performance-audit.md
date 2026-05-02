@@ -255,44 +255,44 @@ Priority 1:
 
 ## File-by-File Notes
 
-| File                                                                     | Current read     | Audit note                                                                                                                                                  |
-| ------------------------------------------------------------------------ | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `packages/modelaudit-picklescan/src/modelaudit_picklescan/call_graph.py` | profiled         | Highest measured hotspot; repeated cache clearing and repeated AST analysis dominate pickle-heavy workloads.                                                |
-| `modelaudit/core.py`                                                     | profiled         | Directory orchestration performs discovery, prehash, repeated config normalization, per-file HF cache checks, and path-specific scans. Needs phase timings. |
-| `modelaudit/scanner_selection.py`                                        | profiled         | Alias maps and policies are rebuilt per file even when config is unchanged. Strong many-file optimization candidate.                                        |
-| `modelaudit/integrations/license_checker.py`                             | profiled         | Repeated directory walks and sibling directory scans create large many-file costs; header reading is also expensive for long one-line text-like files.      |
-| `modelaudit/scanners/base.py`                                            | profiled         | Multi-hash integrity pass is a meaningful large-file cost and duplicates other hashing work.                                                                |
-| `modelaudit/scanners/pickle_scanner.py`                                  | profiled         | Clean duplicate pickle workloads spend heavily in raw detectors and the JAX wrapper pass after the Rust engine.                                             |
-| `modelaudit/cache/adaptive_cache_keys.py`                                | inspected        | Large-file cache keys can trigger content hashing; must be considered together with scanner and aggregate hashes.                                           |
-| `modelaudit/cache/scan_results_cache.py`                                 | inspected        | Cache storage computes a secure file hash after scan completion, adding another full-file pass on misses.                                                   |
-| `modelaudit/utils/file/detection.py`                                     | inspected        | Mostly bounded probes; this is a good local pattern to preserve.                                                                                            |
-| `modelaudit/scanners/pytorch_zip_scanner.py`                             | lightly profiled | Tiny fixture is fast, but archive-member passes are numerous; needs larger archive benchmark before changing.                                               |
-| `modelaudit/scanners/zip_scanner.py`                                     | lightly profiled | Generic archive flow is currently fast on tiny fixtures; nested archive fan-out needs larger corpus benchmarks.                                             |
-| `modelaudit/scanners/tar_scanner.py`                                     | inspected        | Mostly streaming/bounded extraction; needs benchmark coverage rather than speculative edits.                                                                |
-| `modelaudit/scanners/compressed_scanner.py`                              | inspected        | Chunked and budgeted; likely lower priority unless decompression-heavy inputs show otherwise.                                                               |
-| `modelaudit/scanners/onnx_scanner.py`                                    | inspected        | Reads whole file for raw detectors after protobuf load; candidate for shared-buffer or bounded-detector review.                                             |
-| `modelaudit/scanners/tflite_scanner.py`                                  | inspected        | Metadata extraction reads whole file up to a `2 GiB` cap. Needs large-file benchmark and maybe parser-driven reuse.                                         |
-| `modelaudit/scanners/flax_msgpack_scanner.py`                            | inspected        | Whole-file read to detect trailing objects; repeated JAX-transform lowercase passes are fixed in `#1169`, but a large-file benchmark is still needed.       |
-| `modelaudit/scanners/jinja2_template_scanner.py`                         | inspected        | Whole-file read is bounded by `max_template_size`; lower priority.                                                                                          |
-| `modelaudit/scanners/manifest_scanner.py`                                | inspected        | Multiple whole-file text reads across parse and blacklist paths; candidate for one-read reuse on larger manifests.                                          |
-| `modelaudit/scanners/metadata_scanner.py`                                | inspected        | Whole-file read for text metadata; likely acceptable for small docs but should be bounded by type/size.                                                     |
-| `modelaudit/scanners/tf_savedmodel_scanner.py`                           | lightly profiled | Tiny fixture cost was mostly lazy imports; Keras metadata text had repeated lowercase passes, now fixed in `#1168`. Large SavedModel benchmarks remain.     |
-| `modelaudit/scanners/keras_zip_scanner.py`                               | inspected        | Lambda-code scanning reused repeated whole-string lowercase passes, now fixed in `#1168`; larger archive benchmarks are still needed.                       |
-| `modelaudit/scanners/keras_utils.py`                                     | inspected        | Shared Lambda helpers had the same repeated lowercase pattern, now consolidated behind one reusable matcher in `#1168`.                                     |
-| `modelaudit/detectors/secrets.py`                                        | inspected        | Convenience file API reads whole files; core pickle path already gates detector execution with seeds.                                                       |
-| `modelaudit/detectors/network_comm.py`                                   | inspected        | Convenience file API reads whole files and regex work can be expensive on large buffers.                                                                    |
-| `modelaudit/detectors/jit_script.py`                                     | inspected        | Convenience file API reads whole files and AST walks parsed code; keep behind bounded callers.                                                              |
-| `modelaudit/scanners/catboost_scanner.py`                                | inspected        | Uses bounded head/core/trailer reads; low priority until a CatBoost-specific benchmark says otherwise.                                                      |
-| `modelaudit/scanners/cntk_scanner.py`                                    | inspected        | Uses explicit read limits; low priority.                                                                                                                    |
-| `modelaudit/scanners/executorch_scanner.py`                              | inspected        | Length-delimited reads; low priority.                                                                                                                       |
-| `modelaudit/scanners/gguf_scanner.py`                                    | inspected        | Structured parser advances by bounded field reads; benchmark malformed/huge-metadata cases before changing.                                                 |
-| `modelaudit/scanners/nemo_scanner.py`                                    | inspected        | Config extraction is explicitly capped; low priority.                                                                                                       |
-| `modelaudit/scanners/paddle_scanner.py`                                  | inspected        | Chunked raw scanning; low priority.                                                                                                                         |
-| `modelaudit/scanners/pytorch_binary_scanner.py`                          | inspected        | Chunked raw scanning and bounded header reads; low priority.                                                                                                |
-| `modelaudit/scanners/tf_metagraph_scanner.py`                            | inspected        | Uses an explicit read cap; low priority.                                                                                                                    |
-| `modelaudit/scanners/xgboost_scanner.py`                                 | inspected        | Most routing probes are bounded, but UBJSON parsing still materializes the file; add large `.bst` benchmark if this format matters.                         |
-| `modelaudit/scanners/oci_layer_scanner.py`                               | inspected        | Manifest probing is chunked, but full text read remains in one path; add an OCI-layer benchmark before changing.                                            |
-| `modelaudit/scanners/pmml_scanner.py`                                    | inspected        | Whole-file XML read; likely acceptable for normal PMML sizes, but worth one large-text benchmark.                                                           |
+| File                                                                     | Current read     | Audit note                                                                                                                                                            |
+| ------------------------------------------------------------------------ | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `packages/modelaudit-picklescan/src/modelaudit_picklescan/call_graph.py` | profiled         | Highest measured hotspot; repeated cache clearing and repeated AST analysis dominate pickle-heavy workloads.                                                          |
+| `modelaudit/core.py`                                                     | profiled         | Directory orchestration performs discovery, prehash, repeated config normalization, per-file HF cache checks, and path-specific scans. Phase timings land in `#1170`. |
+| `modelaudit/scanner_selection.py`                                        | profiled         | Alias maps and policies are rebuilt per file even when config is unchanged. Strong many-file optimization candidate.                                                  |
+| `modelaudit/integrations/license_checker.py`                             | profiled         | Repeated directory walks and sibling directory scans create large many-file costs; header reading is also expensive for long one-line text-like files.                |
+| `modelaudit/scanners/base.py`                                            | profiled         | Multi-hash integrity pass is a meaningful large-file cost and duplicates other hashing work.                                                                          |
+| `modelaudit/scanners/pickle_scanner.py`                                  | profiled         | Clean duplicate pickle workloads spend heavily in raw detectors and the JAX wrapper pass after the Rust engine.                                                       |
+| `modelaudit/cache/adaptive_cache_keys.py`                                | inspected        | Large-file cache keys can trigger content hashing; must be considered together with scanner and aggregate hashes.                                                     |
+| `modelaudit/cache/scan_results_cache.py`                                 | inspected        | Cache storage computes a secure file hash after scan completion, adding another full-file pass on misses.                                                             |
+| `modelaudit/utils/file/detection.py`                                     | inspected        | Mostly bounded probes; this is a good local pattern to preserve.                                                                                                      |
+| `modelaudit/scanners/pytorch_zip_scanner.py`                             | lightly profiled | Tiny fixture is fast, but archive-member passes are numerous; needs larger archive benchmark before changing.                                                         |
+| `modelaudit/scanners/zip_scanner.py`                                     | lightly profiled | Generic archive flow is currently fast on tiny fixtures; nested archive fan-out needs larger corpus benchmarks.                                                       |
+| `modelaudit/scanners/tar_scanner.py`                                     | inspected        | Mostly streaming/bounded extraction; needs benchmark coverage rather than speculative edits.                                                                          |
+| `modelaudit/scanners/compressed_scanner.py`                              | inspected        | Chunked and budgeted; likely lower priority unless decompression-heavy inputs show otherwise.                                                                         |
+| `modelaudit/scanners/onnx_scanner.py`                                    | inspected        | Reads whole file for raw detectors after protobuf load; candidate for shared-buffer or bounded-detector review.                                                       |
+| `modelaudit/scanners/tflite_scanner.py`                                  | inspected        | Metadata extraction reads whole file up to a `2 GiB` cap. Needs large-file benchmark and maybe parser-driven reuse.                                                   |
+| `modelaudit/scanners/flax_msgpack_scanner.py`                            | inspected        | Whole-file read to detect trailing objects; repeated JAX-transform lowercase passes are fixed in `#1169`, but a large-file benchmark is still needed.                 |
+| `modelaudit/scanners/jinja2_template_scanner.py`                         | inspected        | Whole-file read is bounded by `max_template_size`; lower priority.                                                                                                    |
+| `modelaudit/scanners/manifest_scanner.py`                                | inspected        | Multiple whole-file text reads across parse and blacklist paths; candidate for one-read reuse on larger manifests.                                                    |
+| `modelaudit/scanners/metadata_scanner.py`                                | inspected        | Whole-file read for text metadata; likely acceptable for small docs but should be bounded by type/size.                                                               |
+| `modelaudit/scanners/tf_savedmodel_scanner.py`                           | lightly profiled | Tiny fixture cost was mostly lazy imports; Keras metadata text had repeated lowercase passes, now fixed in `#1168`. Large SavedModel benchmarks remain.               |
+| `modelaudit/scanners/keras_zip_scanner.py`                               | inspected        | Lambda-code scanning reused repeated whole-string lowercase passes, now fixed in `#1168`; larger archive benchmarks are still needed.                                 |
+| `modelaudit/scanners/keras_utils.py`                                     | inspected        | Shared Lambda helpers had the same repeated lowercase pattern, now consolidated behind one reusable matcher in `#1168`.                                               |
+| `modelaudit/detectors/secrets.py`                                        | inspected        | Convenience file API reads whole files; core pickle path already gates detector execution with seeds.                                                                 |
+| `modelaudit/detectors/network_comm.py`                                   | inspected        | Convenience file API reads whole files and regex work can be expensive on large buffers.                                                                              |
+| `modelaudit/detectors/jit_script.py`                                     | inspected        | Convenience file API reads whole files and AST walks parsed code; keep behind bounded callers.                                                                        |
+| `modelaudit/scanners/catboost_scanner.py`                                | inspected        | Uses bounded head/core/trailer reads; low priority until a CatBoost-specific benchmark says otherwise.                                                                |
+| `modelaudit/scanners/cntk_scanner.py`                                    | inspected        | Uses explicit read limits; low priority.                                                                                                                              |
+| `modelaudit/scanners/executorch_scanner.py`                              | inspected        | Length-delimited reads; low priority.                                                                                                                                 |
+| `modelaudit/scanners/gguf_scanner.py`                                    | inspected        | Structured parser advances by bounded field reads; benchmark malformed/huge-metadata cases before changing.                                                           |
+| `modelaudit/scanners/nemo_scanner.py`                                    | inspected        | Config extraction is explicitly capped; low priority.                                                                                                                 |
+| `modelaudit/scanners/paddle_scanner.py`                                  | inspected        | Chunked raw scanning; low priority.                                                                                                                                   |
+| `modelaudit/scanners/pytorch_binary_scanner.py`                          | inspected        | Chunked raw scanning and bounded header reads; low priority.                                                                                                          |
+| `modelaudit/scanners/tf_metagraph_scanner.py`                            | inspected        | Uses an explicit read cap; low priority.                                                                                                                              |
+| `modelaudit/scanners/xgboost_scanner.py`                                 | inspected        | Most routing probes are bounded, but UBJSON parsing still materializes the file; add large `.bst` benchmark if this format matters.                                   |
+| `modelaudit/scanners/oci_layer_scanner.py`                               | inspected        | Manifest probing is chunked, but full text read remains in one path; add an OCI-layer benchmark before changing.                                                      |
+| `modelaudit/scanners/pmml_scanner.py`                                    | inspected        | Whole-file XML read; likely acceptable for normal PMML sizes, but worth one large-text benchmark.                                                                     |
 
 ## Open Questions
 
@@ -807,6 +807,23 @@ Priority 1:
 - Notes:
   - this is a smaller text-path cleanup than the Keras wins, but still removes repeated large-string scans in a scanner-specific hot loop
 
+### 2026-05-01 - Opt-in core phase timings
+
+- PR:
+  - `#1170`
+- Change:
+  - `scan_model_directory_or_file(..., profile_timings=True)` now emits coarse per-phase timings without changing the default result shape
+  - the first pass covers scanner selection, directory counting/discovery, top-level hashing, scan dispatch, result merge, license metadata, consolidation, commercial-use warnings, and aggregate hashing
+- Targeted regressions:
+  - `tests/test_core.py::test_scan_model_omits_phase_timings_by_default`
+  - `tests/test_core.py::test_scan_model_emits_opt_in_phase_timings`
+- Benchmarks:
+  - synthetic directory with `25` tiny pickles, same-process controlled A/B:
+    - default result path: `0.201428s` median
+    - `profile_timings=True`: `0.189312s` median
+- Notes:
+  - the benchmark is intentionally an overhead smoke test; the value of this PR is better observability for the larger hashing and orchestration backlog
+
 ## Measured Non-Wins
 
 ### 2026-05-01 - Skip directory pre-count without progress
@@ -877,17 +894,26 @@ Priority 1:
 - Decision:
   - keep the existing file-window path; it is faster than scanning the whole decoded string
 
+### 2026-05-01 - Weight-key lowercase reuse
+
+- Hypothesis:
+  - reuse each state-dict key's lowercase view across multiple weight-name predicates
+- Result:
+  - synthetic `100,000`-key loop:
+    - repeated inline lowercase checks: `0.097083s` median
+    - shared lowercase variable: `0.124303s` median
+- Decision:
+  - do not optimize this path; the extra local bookkeeping outweighed the saved lowercase calls in the measured loop
+
 ## Remaining Recommended Implementation Order
 
-1. Add phase-level timings in the core scan pipeline.
-   - Gives us durable instrumentation before larger changes.
-2. Unify or reuse hashing passes.
+1. Unify or reuse hashing passes.
    - Strong large-file win, but product requirements around hash outputs need to be settled first.
-3. Replace report-scoped call-graph sharing with source-aware invalidation where safe.
+2. Replace report-scoped call-graph sharing with source-aware invalidation where safe.
    - Higher upside remains, but freshness semantics still need careful proof.
-4. Tighten license header reads for non-license large text-like files only if detection semantics stay explicit.
+3. Tighten license header reads for non-license large text-like files only if detection semantics stay explicit.
    - Binary probes are already bounded; the remaining long-text case is a deliberate behavior tradeoff.
-5. Revisit duplicate-aware reuse and the remaining pickle wrapper passes.
+4. Revisit duplicate-aware reuse and the remaining pickle wrapper passes.
    - Worth doing, but both need stronger path-sensitivity analysis first.
 
 ## Next Measurement Pass
