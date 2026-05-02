@@ -338,19 +338,20 @@ def _get_rule_name(issue: Any) -> str:
 
 def _get_rule_short_description(issue: Any) -> str:
     """Get a short description for a rule."""
-    if "pickle" in issue.message.lower():
+    lowered_message = issue.message.lower()
+    if "pickle" in lowered_message:
         return "Potentially unsafe pickle operation detected"
-    elif "import" in issue.message.lower():
+    elif "import" in lowered_message:
         return "Dangerous import statement found"
-    elif "exec" in issue.message.lower() or "eval" in issue.message.lower():
+    elif "exec" in lowered_message or "eval" in lowered_message:
         return "Code execution vulnerability"
-    elif "network" in issue.message.lower():
+    elif "network" in lowered_message:
         return "Network communication detected"
-    elif "secret" in issue.message.lower() or "key" in issue.message.lower():
+    elif "secret" in lowered_message or "key" in lowered_message:
         return "Potential secrets or keys exposed"
-    elif "license" in issue.message.lower():
+    elif "license" in lowered_message:
         return "License compliance issue"
-    elif "blacklist" in issue.message.lower():
+    elif "blacklist" in lowered_message:
         return "Blacklisted model name detected"
     else:
         return str(issue.message[:100])
