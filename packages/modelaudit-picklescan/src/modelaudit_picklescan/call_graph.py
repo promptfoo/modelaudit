@@ -7,7 +7,9 @@ import os
 import sys
 import sysconfig
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib.machinery import EXTENSION_SUFFIXES, BuiltinImporter, FrozenImporter, ModuleSpec, PathFinder
@@ -37,6 +39,10 @@ _PICKLE_ENTERED_IMPORT_EXECUTION_METHODS = (
 _INHERITED_CLASS_ENTRYPOINT_METHODS = (
     *_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS,
     *_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS,
+)
+_SHARED_SOURCE_SENSITIVE_CACHE_DEPTH: ContextVar[int] = ContextVar(
+    "_SHARED_SOURCE_SENSITIVE_CACHE_DEPTH",
+    default=0,
 )
 
 _CLASS_ENTRYPOINT_METHODS = (
@@ -443,6 +449,18 @@ def find_unanalyzed_callable_call_graph_references(
     return tuple(references)
 
 
+@contextmanager
+def shared_source_sensitive_caches() -> Iterator[None]:
+    """Share one fresh cache generation across related enrichment passes."""
+    if _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.get() == 0:
+        _clear_source_sensitive_caches_now()
+    token = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.set(_SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.get() + 1)
+    try:
+        yield
+    finally:
+        _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.reset(token)
+
+
 @lru_cache(maxsize=4096)
 def _safe_call_graph_entrypoints(function_name: str) -> tuple[str, ...]:
     try:
@@ -715,6 +733,12 @@ def has_unanalyzed_call_graph_import_references(import_references: object) -> bo
 
 
 def _clear_source_sensitive_caches() -> None:
+    if _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.get() > 0:
+        return
+    _clear_source_sensitive_caches_now()
+
+
+def _clear_source_sensitive_caches_now() -> None:
     for function in (
         _safe_call_graph_entrypoints,
         _has_static_torch_extension_global_target,
