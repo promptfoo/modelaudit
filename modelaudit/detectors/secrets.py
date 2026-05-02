@@ -80,6 +80,82 @@ SECRET_PATTERNS: list[tuple[str, str]] = [
     (r"sq0atp-[0-9A-Za-z\-_]{22}", "Square OAuth Token"),
 ]
 
+ML_CONTEXT_HINTS = (
+    "weight",
+    "bias",
+    "layer",
+    "embedding",
+    "attention",
+    "conv",
+    "batch_norm",
+    "dropout",
+    "activation",
+    "pooling",
+    "dense",
+    "lstm",
+    "gru",
+    "transformer",
+    "encoder",
+    "decoder",
+)
+COMMON_ML_WORDS = frozenset(
+    {
+        "training",
+        "validation",
+        "testing",
+        "model",
+        "checkpoint",
+        "optimizer",
+        "learning_rate",
+        "batch_size",
+        "epochs",
+        "steps",
+        "accuracy",
+        "loss",
+        "metric",
+        "score",
+        "performance",
+    }
+)
+FALSE_POSITIVE_SECRET_CONTEXTS = ("key", "token", "secret", "password", "auth")
+UUID_LIKE_PATTERN = re.compile(r"^[a-f0-9]{8}-?[a-f0-9]{4}-?[a-f0-9]{4}-?[a-f0-9]{4}-?[a-f0-9]{12}$")
+ML_PARAMETER_VALUE_PATTERN = re.compile(r"^[\d\.\-e]+$")
+
+HIGH_CONFIDENCE_PATTERN_HINTS = (
+    "AWS Access Key",
+    "OpenAI API Key",
+    "GitHub Personal Token",
+    "Private Key",
+    "JWT Token",
+    "Connection String",
+    "Password",
+    "Secret",
+)
+SECRET_CONTEXT_HINTS = ("key", "token", "secret", "password", "auth", "credential", "api")
+TEST_INDICATORS = frozenset({"test", "example", "sample", "demo", "fake", "dummy", "placeholder"})
+EXAMPLE_SECRETS = (
+    "AKIAIOSFODNN7EXAMPLE",  # AWS example access key
+    "bPxRfiCYEXAMPLEKEY",  # AWS example secret key
+    # JWT.io example token (without signature part)
+    ("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ"),
+    "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",  # JWT.io example signature
+)
+
+BINARY_FALSE_POSITIVE_TYPES = frozenset(
+    {
+        "Hardcoded Password",
+        "Bitcoin Address",
+        "Ethereum Address",
+        "Litecoin Address",
+        "Azure Client Secret",
+        "AWS Access Key",  # AKIA + 16 uppercase alphanums matches random bytes
+        "Basic Auth Credentials",  # "Basic " + base64 matches binary data
+        "Bearer Token",  # "Bearer " + alphanums matches binary data
+        "UUID (potential secret)",  # Random bytes form valid UUID patterns
+    }
+)
+FLOAT_LIKE_PATTERN = re.compile(r"[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?")
+
 
 class SecretsDetector:
     """Detects embedded secrets, API keys, and credentials in model data."""
@@ -176,56 +252,20 @@ class SecretsDetector:
             if fp_pattern.match(text):
                 return True
 
-        # Check if it's in a known ML context (layer names, weights, etc.)
-        ml_contexts = [
-            "weight",
-            "bias",
-            "layer",
-            "embedding",
-            "attention",
-            "conv",
-            "batch_norm",
-            "dropout",
-            "activation",
-            "pooling",
-            "dense",
-            "lstm",
-            "gru",
-            "transformer",
-            "encoder",
-            "decoder",
-        ]
         context_lower = context.lower()
-        if any(ml_ctx in context_lower for ml_ctx in ml_contexts):
+        if any(ml_ctx in context_lower for ml_ctx in ML_CONTEXT_HINTS):
             # In ML context, be more strict about what we consider a secret
             # Must have high entropy or match very specific patterns
             if len(text) < 20:  # Short strings in ML context are likely parameters
                 return True
 
             # Check if it looks like a parameter value (all numbers, decimals, scientific notation)
-            if re.match(r"^[\d\.\-e]+$", text):
+            if ML_PARAMETER_VALUE_PATTERN.match(text):
                 return True
 
         # Check if it's a common word or phrase (not a secret)
-        common_words = [
-            "training",
-            "validation",
-            "testing",
-            "model",
-            "checkpoint",
-            "optimizer",
-            "learning_rate",
-            "batch_size",
-            "epochs",
-            "steps",
-            "accuracy",
-            "loss",
-            "metric",
-            "score",
-            "performance",
-        ]
         text_lower = text.lower()
-        if text_lower in common_words:
+        if text_lower in COMMON_ML_WORDS:
             return True
 
         # If it's all lowercase or all uppercase letters (likely a constant/config)
@@ -235,10 +275,8 @@ class SecretsDetector:
         # Check for sequences that look like UUIDs but aren't secrets
         # (common in model versioning)
         # This is a UUID - only flag if it's not in a secret-like context
-        uuid_pattern = r"^[a-f0-9]{8}-?[a-f0-9]{4}-?[a-f0-9]{4}-?[a-f0-9]{4}-?[a-f0-9]{12}$"
-        secret_contexts = ["key", "token", "secret", "password", "auth"]
-        match = re.match(uuid_pattern, text.lower())
-        return bool(match and not any(word in context_lower for word in secret_contexts))
+        match = UUID_LIKE_PATTERN.match(text_lower)
+        return bool(match and not any(word in context_lower for word in FALSE_POSITIVE_SECRET_CONTEXTS))
 
     def _calculate_confidence(self, text: str, pattern_desc: str, context: str = "") -> float:
         """Calculate confidence score for a detected secret (0.0 to 1.0).
@@ -248,49 +286,28 @@ class SecretsDetector:
         confidence = 0.5  # Base confidence
 
         # Increase confidence for specific high-value patterns
-        high_confidence_patterns = [
-            "AWS Access Key",
-            "OpenAI API Key",
-            "GitHub Personal Token",
-            "Private Key",
-            "JWT Token",
-            "Connection String",
-            "Password",
-            "Secret",
-        ]
-        if any(pattern in pattern_desc for pattern in high_confidence_patterns):
+        if any(pattern in pattern_desc for pattern in HIGH_CONFIDENCE_PATTERN_HINTS):
             confidence += 0.3
 
         # Increase confidence if in a secret-like context
-        secret_contexts = ["key", "token", "secret", "password", "auth", "credential", "api"]
-        if any(ctx in context.lower() for ctx in secret_contexts):
+        context_lower = context.lower()
+        if any(ctx in context_lower for ctx in SECRET_CONTEXT_HINTS):
             confidence += 0.2
 
         # Heuristic handling of test/example indicators
-        test_indicators = ["test", "example", "sample", "demo", "fake", "dummy", "placeholder"]
         text_lower = text.lower()
 
         # Special case: Well-known example/test secrets
         # These are commonly used in documentation and testing
-        example_secrets = [
-            "AKIAIOSFODNN7EXAMPLE",  # AWS example access key
-            "bPxRfiCYEXAMPLEKEY",  # AWS example secret key
-            # JWT.io example token (without signature part)
-            (
-                "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
-                "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ"
-            ),
-            "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",  # JWT.io example signature
-        ]
-        if any(example in text for example in example_secrets):
+        if any(example in text for example in EXAMPLE_SECRETS):
             # The JWT.io sample appears in benign fixtures and documentation, so
             # suppress that one by default. Keep other canned examples at the
             # minimum warning threshold because they are useful test signals.
             confidence = 0.4 if pattern_desc == "JWT Token" else 0.6
-        elif any(indicator in text_lower for indicator in test_indicators):
+        elif any(indicator in text_lower for indicator in TEST_INDICATORS):
             # Check if it's JUST a test indicator or part of real data
             # If the entire string is "test" or "example", it's definitely fake
-            if text_lower in test_indicators:
+            if text_lower in TEST_INDICATORS:
                 confidence = 0.0  # Definitely not a secret
             else:
                 # Partial match - might be real key with unfortunate naming
@@ -435,8 +452,7 @@ class SecretsDetector:
         # weight data (lots of numbers, scientific notation), it's likely a false positive
         if "pwd" in text[position : position + 10].lower() or "password" in text[position : position + 20].lower():
             # Check if surrounded by float-like patterns (common in weights)
-            float_pattern = r"[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?"
-            float_matches = len(re.findall(float_pattern, context))
+            float_matches = len(FLOAT_LIKE_PATTERN.findall(context))
             if float_matches > 5:  # Many float-like values nearby
                 return True
 
@@ -487,18 +503,7 @@ class SecretsDetector:
                 # regex patterns designed for structured text.
                 # NOTE: Use exact matching to avoid "AWS Access Key" also suppressing
                 # "AWS Access Key ID" (which is a structured key=value pattern).
-                binary_false_positive_types = {
-                    "Hardcoded Password",
-                    "Bitcoin Address",
-                    "Ethereum Address",
-                    "Litecoin Address",
-                    "Azure Client Secret",
-                    "AWS Access Key",  # AKIA + 16 uppercase alphanums matches random bytes
-                    "Basic Auth Credentials",  # "Basic " + base64 matches binary data
-                    "Bearer Token",  # "Bearer " + alphanums matches binary data
-                    "UUID (potential secret)",  # Random bytes form valid UUID patterns
-                }
-                if (description in binary_false_positive_types) and self._is_likely_binary_context(text, position):
+                if (description in BINARY_FALSE_POSITIVE_TYPES) and self._is_likely_binary_context(text, position):
                     continue
 
                 confidence = self._calculate_confidence(secret_text, description, context)
