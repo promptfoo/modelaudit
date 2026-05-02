@@ -485,6 +485,24 @@ class TestNetworkCommDetector:
         assert data.lower_calls == 1
         assert [finding["domain"] for finding in detector.findings] == ["blocked.example"]
 
+    def test_blacklist_scan_skips_lowering_without_configured_domains(self) -> None:
+        """Avoid touching payload bytes when no blacklist entries are configured."""
+
+        class TrackingBytes(bytes):
+            lower_calls = 0
+
+            def lower(self) -> bytes:
+                self.lower_calls += 1
+                return super().lower()
+
+        detector = NetworkCommDetector()
+        data = TrackingBytes(b"https://blocked.example/payload")
+
+        detector._check_blacklist(data, "payload.bin")
+
+        assert data.lower_calls == 0
+        assert detector.findings == []
+
     def test_custom_config(self) -> None:
         """Test custom configuration options."""
         config = {

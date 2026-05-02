@@ -997,6 +997,9 @@ class NetworkCommDetector:
 
     def _check_blacklist(self, data: bytes, context: str) -> None:
         """Check against blacklisted domains/IPs."""
+        if not self.blacklisted_domains:
+            return
+
         lowered_data = data.lower()
         for blacklisted in self.blacklisted_domains:
             if blacklisted in lowered_data:
