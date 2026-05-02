@@ -9,6 +9,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+import pytest
 from click.testing import CliRunner
 
 from modelaudit.cache import reset_cache_manager
@@ -17,6 +18,8 @@ from modelaudit.core import scan_file, scan_model_directory_or_file
 from modelaudit.scanner_registry_metadata import get_scanner_registry_metadata
 from modelaudit.scanner_selection import (
     collect_suppressed_preferred_scanners,
+    normalize_scanner_selection_config,
+    policy_from_config,
     resolve_scanner_ids,
     resolve_scanner_selection_policy,
     scanner_catalog,
@@ -85,6 +88,37 @@ def test_selection_policy_uses_allowlist_minus_exclusions() -> None:
     assert policy.enabled_scanner_ids == frozenset({"pickle"})
     assert policy.allows("pickle")
     assert not policy.allows("zip")
+
+
+def test_normalized_selection_rehydrates_without_alias_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = normalize_scanner_selection_config({"scanners": ["PickleScanner"], "exclude_scanners": ["zip"]})
+
+    def fail_resolve(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("normalized selection should not re-resolve aliases")
+
+    monkeypatch.setattr("modelaudit.scanner_selection.resolve_scanner_selection_policy", fail_resolve)
+
+    policy = policy_from_config(config)
+
+    assert policy.active
+    assert policy.enabled_scanner_ids == frozenset({"pickle"})
+    assert policy.exact_scanner_ids == frozenset({"pickle"})
+    assert policy.exclude_scanner_ids == frozenset({"zip"})
+
+
+def test_normalized_selection_rejects_payloads_that_disable_every_scanner() -> None:
+    all_scanner_ids = sorted(get_scanner_registry_metadata())
+    config = {
+        "scanner_selection": {
+            "active": True,
+            "scanners": None,
+            "exclude_scanners": all_scanner_ids,
+            "enabled_scanner_ids": [],
+        }
+    }
+
+    with pytest.raises(ValueError, match="Scanner selection does not enable any scanners"):
+        policy_from_config(config)
 
 
 def test_scan_file_exact_scanner_allows_pickle_detection(tmp_path: Path) -> None:
