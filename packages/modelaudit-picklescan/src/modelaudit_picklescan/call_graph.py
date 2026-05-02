@@ -724,6 +724,7 @@ def _clear_source_sensitive_caches() -> None:
         _source_function_context,
         _source_class_context,
         _constructor_parameter_self_attribute_targets,
+        _iter_call_nodes,
         _can_invoke_function_with_positional_args,
         _can_follow_import_execution_fallback,
         _resolve_module_source,
@@ -2564,6 +2565,7 @@ def _function_instance_alias_value(
     return _resolve_class_target(call_target)
 
 
+@lru_cache(maxsize=4096)
 def _iter_call_nodes(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[ast.Call, ...]:
     calls: list[ast.Call] = []
 

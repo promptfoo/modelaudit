@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import importlib
 import io
 import os
@@ -13,6 +14,7 @@ import zipfile
 from importlib.machinery import ModuleSpec
 from importlib.util import find_spec
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -78,6 +80,7 @@ def _clear_call_graph_caches() -> None:
         "_resolve_function_target",
         "_resolve_module_source",
         "_safe_call_graph_entrypoints",
+        "_iter_call_nodes",
         "_wildcard_export_summary",
     ):
         cache_clear = getattr(getattr(call_graph_module, function_name), "cache_clear", None)
@@ -87,6 +90,37 @@ def _clear_call_graph_caches() -> None:
 
 def _env_without_pythonpath() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+
+
+def test_iter_call_nodes_reuses_cached_walk(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = ast.parse(
+        """
+def bridge(target, command):
+    callback = getattr(target, command)
+    callback(command)
+"""
+    )
+    bridge = module.body[0]
+    assert isinstance(bridge, ast.FunctionDef)
+
+    visits = 0
+    original_visit = ast.NodeVisitor.visit
+
+    def counting_visit(self: ast.NodeVisitor, node: ast.AST) -> Any:
+        nonlocal visits
+        visits += 1
+        return original_visit(self, node)
+
+    monkeypatch.setattr(ast.NodeVisitor, "visit", counting_visit)
+    call_graph._iter_call_nodes.cache_clear()
+
+    first = call_graph._iter_call_nodes(bridge)
+    first_visit_count = visits
+    second = call_graph._iter_call_nodes(bridge)
+
+    assert first == second
+    assert first_visit_count > 0
+    assert visits == first_visit_count
 
 
 def _sitebuiltins_helper_instance_call_payload() -> bytes:
