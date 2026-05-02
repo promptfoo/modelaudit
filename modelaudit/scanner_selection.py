@@ -101,6 +101,7 @@ def _scanner_aliases() -> dict[str, str]:
     aliases.setdefault(_alias_key("TensorFlowMetaGraphScanner"), "tf_metagraph")
     return aliases
 
+
 def resolve_scanner_ids(tokens: Iterable[str] | str | None) -> tuple[str, ...]:
     """Resolve scanner IDs, class names, and friendly aliases to canonical IDs."""
     metadata = _scanner_metadata()
