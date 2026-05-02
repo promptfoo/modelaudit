@@ -723,6 +723,8 @@ class ManifestScanner(BaseScanner):
             )
             result.finish(success=False)
             return result
+        finally:
+            self._manifest_text_cache.clear()
 
         self._finish_manifest_result(result)
         return result

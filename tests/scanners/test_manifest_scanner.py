@@ -84,6 +84,17 @@ def test_manifest_scanner_reuses_manifest_text_during_scan(
     assert open_count == 1
 
 
+def test_manifest_scanner_clears_manifest_text_after_scan(tmp_path: Path) -> None:
+    test_file = tmp_path / "manifest.json"
+    test_file.write_text(json.dumps({"model_name": "safe-model"}))
+    scanner = ManifestScanner(config={"blacklist_patterns": ["blocked"]})
+
+    result = scanner.scan(str(test_file))
+
+    assert result.scanner is scanner
+    assert scanner._manifest_text_cache == {}
+
+
 def test_manifest_scanner_case_insensitive_blacklist(tmp_path):
     """Test that blacklist matching is case-insensitive."""
     test_file = tmp_path / "inference_config.json"
