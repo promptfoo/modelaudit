@@ -311,7 +311,7 @@ Priority 1:
 | `modelaudit/scanners/zip_scanner.py`                                     | lightly profiled | Generic archive flow is currently fast on tiny fixtures; nested archive fan-out needs larger corpus benchmarks.                                                       |
 | `modelaudit/scanners/tar_scanner.py`                                     | inspected        | Mostly streaming/bounded extraction; needs benchmark coverage rather than speculative edits.                                                                          |
 | `modelaudit/scanners/compressed_scanner.py`                              | inspected        | Chunked and budgeted; likely lower priority unless decompression-heavy inputs show otherwise.                                                                         |
-| `modelaudit/scanners/onnx_scanner.py`                                    | inspected        | Reads whole file for raw detectors after protobuf load; candidate for shared-buffer or bounded-detector review.                                                       |
+| `modelaudit/scanners/onnx_scanner.py`                                    | measured         | Successful scans now reuse one raw-byte buffer for protobuf parsing and raw detectors in `#1193`; keep larger memory/RSS follow-up open for very large models.        |
 | `modelaudit/scanners/tflite_scanner.py`                                  | inspected        | Metadata extraction reads whole file up to a `2 GiB` cap. Needs large-file benchmark and maybe parser-driven reuse.                                                   |
 | `modelaudit/scanners/flax_msgpack_scanner.py`                            | inspected        | Whole-file read to detect trailing objects; repeated JAX-transform lowercase passes are fixed in `#1169`, but a large-file benchmark is still needed.                 |
 | `modelaudit/scanners/jinja2_template_scanner.py`                         | inspected        | Whole-file read is bounded by `max_template_size`; lower priority.                                                                                                    |
@@ -504,8 +504,8 @@ Priority 1:
 
 ### Large-Input Scanner Follow-Ups
 
-- [ ] Add a large ONNX benchmark before changing `onnx_scanner.py`.
-- [ ] Decide whether ONNX raw detector passes can share an already-loaded buffer or safely use bounded windows.
+- [x] Add a large ONNX benchmark before changing `onnx_scanner.py`.
+- [x] Decide whether ONNX raw detector passes can share an already-loaded buffer or safely use bounded windows.
 - [ ] Add a large TFLite benchmark before changing `tflite_scanner.py`.
 - [ ] Review whether TFLite metadata extraction truly needs to materialize the whole file.
 - [ ] Add a large Flax msgpack benchmark before changing `flax_msgpack_scanner.py`.
@@ -586,6 +586,23 @@ Priority 1:
   - [ ] one instrumentation PR followed by focused optimization PRs
 
 ## Completed Wins
+
+### 2026-05-02 - ONNX raw-buffer reuse
+
+- PR:
+  - `#1193`
+- Change:
+  - successful ONNX scans now read model bytes once, parse from that same buffer, and reuse it for raw JIT/network detectors
+  - path-based protobuf loading remains as the fallback when the initial raw-byte read fails
+- Targeted regression:
+  - `tests/scanners/test_onnx_scanner.py::test_onnx_scanner_reuses_raw_bytes_for_model_parse`
+- Benchmarks:
+  - synthetic `64 MiB` ONNX model:
+    - previous path parse plus second raw read: `0.023632s` median
+    - shared raw buffer path: `0.013408s` median
+- Notes:
+  - this closes the first measured ONNX duplicate-read hotspot
+  - follow-up work should measure peak RSS on much larger models before considering broader parser/buffer changes
 
 ### 2026-05-01 - Scanner selection reuse
 
@@ -1231,6 +1248,42 @@ Priority 1:
   - the benchmark is intentionally an overhead smoke test; the value of this PR is better observability for the larger hashing and orchestration backlog
 
 ## Measured Non-Wins
+
+### 2026-05-02 - URL marker lowercase reuse
+
+- Hypothesis:
+  - lowercase each extracted URL once, then reuse that view across URL marker checks in `_scan_urls()`
+- Result:
+  - isolated marker-check loop improved:
+    - repeated lowercase path: `0.268479s` median
+    - shared lowercase path: `0.214494s` median
+  - real helper-shaped benchmark was effectively flat and slightly worse:
+    - current helper: `0.479305s` median
+    - shared lowercase variant: `0.489420s` median
+- Decision:
+  - do not land the change; the isolated win disappears inside the actual helper path
+
+### 2026-05-02 - PyTorch ZIP fixed-member index
+
+- Hypothesis:
+  - build a filename index once in `_extract_pytorch_version_info()` instead of probing `safe_entries` repeatedly for `version` and `byteorder`
+- Result:
+  - synthetic `100,000`-entry exact-helper workload:
+    - current repeated probes: `0.129799s` median
+    - indexed variant: `0.186830s` median
+- Decision:
+  - keep the current scans; building the index costs more than the two fixed-name probes
+
+### 2026-05-02 - Call-graph notice-path reorder
+
+- Hypothesis:
+  - ask `_call_graph_source_unavailable_reason()` before full entrypoint resolution for missing-module notices
+- Result:
+  - exact helper-shaped synthetic workload:
+    - current path: `0.454261s` median
+    - reordered path: `0.496242s` median
+- Decision:
+  - do not land the change; the notice-path reorder is slower once measured end to end
 
 ### 2026-05-02 - JIT code-execution regex precompile
 
