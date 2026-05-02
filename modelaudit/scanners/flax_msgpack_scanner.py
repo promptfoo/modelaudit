@@ -683,9 +683,10 @@ class FlaxMsgpackScanner(BaseScanner):
         # Check for hierarchical structure (multiple layers)
         layer_evidence = 0
         layer_keywords = ["layer", "block", "attention", "ffn", "mlp", "linear", "conv"]
+        obj_text_lower = str(obj).lower()
 
         for keyword in layer_keywords:
-            if keyword in str(obj).lower():
+            if keyword in obj_text_lower:
                 layer_evidence += 1
 
         if layer_evidence >= 2:

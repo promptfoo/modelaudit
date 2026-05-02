@@ -78,6 +78,24 @@ def test_flax_msgpack_valid_checkpoint(tmp_path):
     )
 
 
+def test_flax_ml_structure_reuses_lowered_object_text() -> None:
+    """Layer-keyword analysis should stringify the checkpoint object once."""
+
+    class StringCountingDict(dict[str, Any]):
+        stringify_calls = 0
+
+        def __str__(self) -> str:
+            self.stringify_calls += 1
+            return super().__str__()
+
+    obj = StringCountingDict({"tensor": b"0" * 4096, "payload": "x" * 4096})
+    scanner = FlaxMsgpackScanner()
+
+    scanner._analyze_ml_structure(obj, scanner._create_result())
+
+    assert obj.stringify_calls == 1
+
+
 def test_flax_msgpack_suspicious_content(tmp_path):
     """Test detection of suspicious patterns in msgpack content."""
     path = tmp_path / "suspicious.msgpack"
