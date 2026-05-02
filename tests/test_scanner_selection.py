@@ -9,6 +9,7 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
+import pytest
 from click.testing import CliRunner
 
 from modelaudit.cache import reset_cache_manager
@@ -17,6 +18,7 @@ from modelaudit.core import scan_file, scan_model_directory_or_file
 from modelaudit.scanner_registry_metadata import get_scanner_registry_metadata
 from modelaudit.scanner_selection import (
     collect_suppressed_preferred_scanners,
+    normalize_scanner_selection_config,
     resolve_scanner_ids,
     resolve_scanner_selection_policy,
     scanner_catalog,
@@ -85,6 +87,25 @@ def test_selection_policy_uses_allowlist_minus_exclusions() -> None:
     assert policy.enabled_scanner_ids == frozenset({"pickle"})
     assert policy.allows("pickle")
     assert not policy.allows("zip")
+
+
+def test_normalize_scanner_selection_config_reuses_normalized_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = normalize_scanner_selection_config(
+        {
+            "scanners": ["pickle"],
+            "exclude_scanners": ["zip"],
+            "cache_enabled": False,
+        }
+    )
+
+    def fail_policy_resolution(_: object) -> None:
+        raise AssertionError("already normalized config should not resolve policy again")
+
+    monkeypatch.setattr("modelaudit.scanner_selection.policy_from_config", fail_policy_resolution)
+
+    assert normalize_scanner_selection_config(config) == config
 
 
 def test_scan_file_exact_scanner_allows_pickle_detection(tmp_path: Path) -> None:

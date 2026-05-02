@@ -215,9 +215,33 @@ def policy_from_config(config: Mapping[str, Any] | None) -> ScannerSelectionPoli
     )
 
 
+def _is_normalized_scanner_selection_payload(selection: Any) -> bool:
+    """Return True for payloads already emitted by `ScannerSelectionPolicy.to_config()`."""
+    if not isinstance(selection, Mapping):
+        return False
+
+    scanners = selection.get("scanners")
+    exclude_scanners = selection.get("exclude_scanners")
+    enabled_scanner_ids = selection.get("enabled_scanner_ids")
+    return (
+        isinstance(selection.get("active"), bool)
+        and (scanners is None or isinstance(scanners, list))
+        and isinstance(exclude_scanners, list)
+        and isinstance(enabled_scanner_ids, list)
+    )
+
+
 def normalize_scanner_selection_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
     """Return a mutable config with a normalized scanner selection payload."""
     normalized = dict(config or {})
+    raw_selection = normalized.get(SCANNER_SELECTION_CONFIG_KEY)
+    if (
+        "scanners" not in normalized
+        and "exclude_scanners" not in normalized
+        and _is_normalized_scanner_selection_payload(raw_selection)
+    ):
+        return normalized
+
     has_raw_selection = any(key in normalized for key in (SCANNER_SELECTION_CONFIG_KEY, "scanners", "exclude_scanners"))
     policy = policy_from_config(normalized)
     if policy.active or has_raw_selection:
