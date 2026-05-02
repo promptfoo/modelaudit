@@ -6,6 +6,7 @@ from typing import Any, Protocol, TypedDict
 
 import pytest
 
+import modelaudit.scanners.tf_savedmodel_scanner as tf_savedmodel_scanner
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.tf_savedmodel_scanner import _ASSET_PROBE_BYTES, TensorFlowSavedModelScanner
@@ -64,6 +65,18 @@ def test_tf_savedmodel_scanner_can_handle(tmp_path: Path) -> None:
         assert TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is False
         assert TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
         assert TensorFlowSavedModelScanner.can_handle(str(test_file)) is False
+
+
+def test_suspicious_function_name_reuses_precompiled_patterns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Function-name matching should not rebuild static regexes per call."""
+
+    def fail_compile(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("unexpected regex compilation")
+
+    monkeypatch.setattr(tf_savedmodel_scanner.re, "compile", fail_compile)
+
+    assert TensorFlowSavedModelScanner._match_suspicious_function_name("safe_function_name") is None
+    assert TensorFlowSavedModelScanner._match_suspicious_function_name("module.eval") == "eval"
 
 
 def create_tf_savedmodel(tmp_path: Path, *, malicious: bool = False) -> Path:
