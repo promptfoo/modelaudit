@@ -146,6 +146,42 @@ def test_onnx_scanner_reuses_raw_bytes_for_model_parse(
     assert parsed_payloads == [model_path.read_bytes()]
 
 
+def test_onnx_scanner_raw_read_failure_falls_back_to_path_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Raw-detector read failures should keep structural parsing but fail closed."""
+    model_path = create_onnx_model(tmp_path)
+    real_load = onnx.load
+    raw_read_attempts = 0
+    path_loads: list[str] = []
+
+    def fail_first_raw_read(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        nonlocal raw_read_attempts
+        if mode == "rb" and raw_read_attempts == 0:
+            raw_read_attempts += 1
+            raise OSError("simulated raw read failure")
+        return open(file, mode, *args, **kwargs)
+
+    def tracking_path_loader(path: str, *, load_external_data: bool) -> Any:
+        path_loads.append(path)
+        return real_load(path, load_external_data=load_external_data)
+
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner.open", fail_first_raw_read, raising=False)
+    monkeypatch.setattr(onnx, "load", tracking_path_loader)
+
+    result = OnnxScanner({"check_jit_script": False, "check_network_comm": False}).scan(str(model_path))
+    coverage_checks = [check for check in result.checks if check.name == "Raw Detector Analysis Coverage"]
+
+    assert path_loads == [str(model_path)]
+    assert result.success is False
+    assert result.bytes_scanned > 0
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["detector"] == "raw_file_read"
+    assert coverage_checks[0].details["coverage_gap"] == "file_read_failed"
+
+
 def test_onnx_scanner_custom_op(tmp_path: Path) -> None:
     model_path = create_onnx_model(tmp_path, custom=True)
     result = OnnxScanner().scan(str(model_path))
