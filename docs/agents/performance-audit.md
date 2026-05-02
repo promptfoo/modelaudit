@@ -1453,6 +1453,22 @@ Priority 1:
 - Notes:
   - this removes duplicate product-path list scans during SARIF generation; the repo-wide non-slow lane still hits the existing timing-sensitive validation and directory-scan sentinels in this environment
 
+### 2026-05-02 - Shared Keras `get_file` lowercase view
+
+- PR:
+  - `#1211`
+- Change:
+  - the Keras `get_file` CVE checks now share one callable matcher
+  - non-exact callable candidates strip once and lowercase once before suffix / substring checks
+- Targeted regression:
+  - `tests/scanners/test_keras_zip_scanner.py::TestCVE20258747GetFileGadget::test_get_file_reference_reuses_lowered_value_text`
+- Benchmarks:
+  - synthetic `200,001`-value config list, `10` matcher passes:
+    - repeated predicate ladder: `0.500627s` median
+    - shared lowered-value path: `0.320392s` median
+- Notes:
+  - this removes duplicated string normalization from two security checks while preserving the broader CVE regression suite; the repo-wide non-slow lane still hits the existing timing-sensitive validation and directory-scan sentinels in this environment
+
 ### 2026-05-01 - Shared Keras metadata lowercase view
 
 - PR:
