@@ -1296,6 +1296,25 @@ Priority 1:
 - Notes:
   - this is one of the first small call-graph changes to move a profiled end-to-end malicious-pickle path materially; the repo-wide non-slow lane still hits the directory-scan timing sentinel in this environment
 
+### 2026-05-02 - Cached call-graph parameter-control analysis
+
+- PR:
+  - `#1213`
+- Change:
+  - `_parameter_controlled_names()` now reuses the fixed-point control-flow result for repeated lookups of the same AST function node
+  - the cache joins the existing source-sensitive invalidation sweep
+- Targeted regression:
+  - `packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py::test_parameter_controlled_names_reuses_cached_analysis`
+- Benchmarks:
+  - repeated same-function analysis, `5,000` lookups x `5` passes:
+    - before: `0.900395s` median
+    - after: `0.000790s` median
+  - matched cProfile run on `tests/assets/exploits/exploit_ultimate_50pct.pkl` from `origin/main`:
+    - before: `82.470s`
+    - after: `59.106s`
+- Notes:
+  - this is another small but materially useful call-graph cache; the repo-wide non-slow lane still hits the existing timing-sensitive validation and directory-scan sentinels in this environment
+
 ### 2026-05-02 - Shared MetaGraph attr lowercase values
 
 - PR:
