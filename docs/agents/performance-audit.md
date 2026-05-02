@@ -979,6 +979,17 @@ Priority 1:
 - Decision:
   - do not optimize this path; the extra local bookkeeping outweighed the saved lowercase calls in the measured loop
 
+### 2026-05-01 - Metadata secret-pattern precompilation
+
+- Hypothesis:
+  - precompile the static metadata secret regex set once instead of passing string patterns to `re.finditer()` on each scan
+- Result:
+  - synthetic `8 MiB` no-match documentation payload after the regex cache was warm:
+    - current path: `0.585789s` median
+    - explicit precompiled path: `0.802890s` median
+- Decision:
+  - do not land this change; Python's regex cache already covers the steady-state case and the explicit precompiled path was not a repeatable win
+
 ## Remaining Recommended Implementation Order
 
 1. Unify or reuse hashing passes.
