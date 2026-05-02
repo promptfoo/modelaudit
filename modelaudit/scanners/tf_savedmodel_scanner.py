@@ -86,6 +86,17 @@ _PYFUNC_DANGEROUS_REFERENCE_TOKENS = frozenset(
         "webbrowser",
     }
 )
+_SUSPICIOUS_FUNCTION_NAME_PATTERNS = (
+    ("eval", re.compile(r"(?:^|[^a-z0-9])eval(?:[^a-z0-9]|$)")),
+    ("exec", re.compile(r"(?:^|[^a-z0-9])exec(?:[^a-z0-9]|$)")),
+    ("compile", re.compile(r"(?:^|[^a-z0-9])compile(?:[^a-z0-9]|$)")),
+    ("__import__", re.compile(r"(?:^|[^a-z0-9])__import__(?:[^a-z0-9]|$)")),
+    ("system", re.compile(r"(?:^|[^a-z0-9])system(?:[^a-z0-9]|$)")),
+    ("popen", re.compile(r"(?:^|[^a-z0-9])popen(?:[^a-z0-9]|$)")),
+    ("subprocess", re.compile(r"(?:^|[^a-z0-9])subprocess(?:[^a-z0-9]|$)")),
+    ("pickle", re.compile(r"(?:^|[^a-z0-9])pickle(?:[^a-z0-9]|$)")),
+    ("marshal", re.compile(r"(?:^|[^a-z0-9])marshal(?:[^a-z0-9]|$)")),
+)
 
 
 def _looks_like_pe_executable(content_head: bytes) -> bool:
@@ -981,20 +992,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
     @staticmethod
     def _match_suspicious_function_name(func_name: str) -> str | None:
         """Return the suspicious token matched in a function name, if any."""
-        suspicious_patterns = (
-            ("eval", re.compile(r"(?:^|[^a-z0-9])eval(?:[^a-z0-9]|$)")),
-            ("exec", re.compile(r"(?:^|[^a-z0-9])exec(?:[^a-z0-9]|$)")),
-            ("compile", re.compile(r"(?:^|[^a-z0-9])compile(?:[^a-z0-9]|$)")),
-            ("__import__", re.compile(r"(?:^|[^a-z0-9])__import__(?:[^a-z0-9]|$)")),
-            ("system", re.compile(r"(?:^|[^a-z0-9])system(?:[^a-z0-9]|$)")),
-            ("popen", re.compile(r"(?:^|[^a-z0-9])popen(?:[^a-z0-9]|$)")),
-            ("subprocess", re.compile(r"(?:^|[^a-z0-9])subprocess(?:[^a-z0-9]|$)")),
-            ("pickle", re.compile(r"(?:^|[^a-z0-9])pickle(?:[^a-z0-9]|$)")),
-            ("marshal", re.compile(r"(?:^|[^a-z0-9])marshal(?:[^a-z0-9]|$)")),
-        )
-
         lowered_func_name = func_name.lower()
-        for pattern_name, pattern in suspicious_patterns:
+        for pattern_name, pattern in _SUSPICIOUS_FUNCTION_NAME_PATTERNS:
             if pattern.search(lowered_func_name):
                 return pattern_name
         return None
