@@ -24,7 +24,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import keras_zip_scanner as keras_zip_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.keras_zip_scanner import KerasZipScanner
+from modelaudit.scanners.keras_zip_scanner import KerasZipScanner, _has_get_file_reference
 
 try:
     import h5py
@@ -2207,6 +2207,22 @@ class TestCVE20251550ModuleReferences:
 
 class TestCVE20258747GetFileGadget:
     """Test CVE-2025-8747: keras.utils.get_file gadget bypass detection."""
+
+    def test_get_file_reference_reuses_lowered_value_text(self) -> None:
+        """Non-exact callable checks should lowercase each string once."""
+
+        class CountingValue(str):
+            lower_calls = 0
+
+            def strip(self) -> "CountingValue":
+                return self
+
+            def lower(self) -> str:
+                type(self).lower_calls += 1
+                return super().lower()
+
+        assert _has_get_file_reference([CountingValue("pkg.keras.utils.get_file")])
+        assert CountingValue.lower_calls == 1
 
     def _make_keras_zip(self, config_str: str, tmp_path: Path) -> str:
         """Helper to create a .keras ZIP with raw config string."""
