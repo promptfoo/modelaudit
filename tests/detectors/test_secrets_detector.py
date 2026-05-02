@@ -4,7 +4,6 @@ import pickle
 
 import pytest
 
-import modelaudit.detectors.secrets as secrets_detector
 from modelaudit.detectors.secrets import SecretsDetector, detect_secrets_in_file
 from modelaudit.scanners.pickle_scanner import PickleScanner
 
@@ -18,7 +17,7 @@ class TestSecretsDetector:
         def fail_compile(*_args: object, **_kwargs: object) -> None:
             raise AssertionError("unexpected regex compilation")
 
-        monkeypatch.setattr(secrets_detector.re, "compile", fail_compile)
+        monkeypatch.setattr("modelaudit.detectors.secrets.re.compile", fail_compile)
 
         detector = SecretsDetector()
 
