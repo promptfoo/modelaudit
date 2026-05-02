@@ -191,8 +191,13 @@ def _read_header_text(file_path: str, max_lines: int) -> str | None:
         return None
 
 
-def _content_has_prefilter_term(content: str, terms: tuple[str, ...]) -> bool:
-    lowered = content.lower()
+def _content_has_prefilter_term(
+    content: str,
+    terms: tuple[str, ...],
+    *,
+    lowered_content: str | None = None,
+) -> bool:
+    lowered = lowered_content if lowered_content is not None else content.lower()
     return any(term in lowered for term in terms)
 
 
@@ -256,9 +261,13 @@ DATASET_EXTENSIONS = {
 MODEL_EXTENSIONS = COMMON_MODEL_EXTENSIONS
 
 
-def _scan_license_headers_from_content(content: str) -> list[LicenseInfo]:
+def _scan_license_headers_from_content(
+    content: str,
+    *,
+    lowered_content: str | None = None,
+) -> list[LicenseInfo]:
     licenses: list[LicenseInfo] = []
-    if not _content_has_prefilter_term(content, _LICENSE_PREFILTER_TERMS):
+    if not _content_has_prefilter_term(content, _LICENSE_PREFILTER_TERMS, lowered_content=lowered_content):
         return licenses
 
     # Search for license patterns
@@ -296,9 +305,13 @@ def scan_for_license_headers(file_path: str, max_lines: int = 50) -> list[Licens
     return _scan_license_headers_from_content(content)
 
 
-def _extract_copyright_notices_from_content(content: str) -> list[CopyrightInfo]:
+def _extract_copyright_notices_from_content(
+    content: str,
+    *,
+    lowered_content: str | None = None,
+) -> list[CopyrightInfo]:
     copyrights: list[CopyrightInfo] = []
-    if not _content_has_prefilter_term(content, _COPYRIGHT_PREFILTER_TERMS):
+    if not _content_has_prefilter_term(content, _COPYRIGHT_PREFILTER_TERMS, lowered_content=lowered_content):
         return copyrights
 
     # Search for copyright patterns
@@ -770,8 +783,12 @@ def collect_license_metadata(
 
     content = _read_header_text(file_path, max_lines=50)
 
+    lowered_content = content.lower() if content is not None else None
+
     # Scan for license headers
-    licenses = _scan_license_headers_from_content(content) if content is not None else []
+    licenses = (
+        _scan_license_headers_from_content(content, lowered_content=lowered_content) if content is not None else []
+    )
     metadata["license_info"] = [
         {
             "spdx_id": lic.spdx_id,
@@ -784,7 +801,9 @@ def collect_license_metadata(
     ]
 
     # Extract copyright notices
-    copyrights = _extract_copyright_notices_from_content(content) if content is not None else []
+    copyrights = (
+        _extract_copyright_notices_from_content(content, lowered_content=lowered_content) if content is not None else []
+    )
     metadata["copyright_notices"] = [
         {
             "holder": cr.holder,
