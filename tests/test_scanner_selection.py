@@ -90,6 +90,25 @@ def test_selection_policy_uses_allowlist_minus_exclusions() -> None:
     assert not policy.allows("zip")
 
 
+def test_normalize_scanner_selection_config_reuses_normalized_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = normalize_scanner_selection_config(
+        {
+            "scanners": ["pickle"],
+            "exclude_scanners": ["zip"],
+            "cache_enabled": False,
+        }
+    )
+
+    def fail_policy_resolution(_: object) -> None:
+        raise AssertionError("already normalized config should not resolve policy again")
+
+    monkeypatch.setattr("modelaudit.scanner_selection.policy_from_config", fail_policy_resolution)
+
+    assert normalize_scanner_selection_config(config) == config
+
+
 def test_selection_policy_reuses_normalized_cached_results() -> None:
     list_policy = resolve_scanner_selection_policy(
         scanners=["pickle", "zip"],
@@ -132,6 +151,21 @@ def test_normalized_selection_rejects_payloads_that_disable_every_scanner() -> N
 
     with pytest.raises(ValueError, match="Scanner selection does not enable any scanners"):
         policy_from_config(config)
+
+
+def test_normalize_scanner_selection_config_rejects_invalid_normalized_payload() -> None:
+    all_scanner_ids = sorted(get_scanner_registry_metadata())
+    config = {
+        "scanner_selection": {
+            "active": True,
+            "scanners": None,
+            "exclude_scanners": all_scanner_ids,
+            "enabled_scanner_ids": [],
+        }
+    }
+
+    with pytest.raises(ValueError, match="Scanner selection does not enable any scanners"):
+        normalize_scanner_selection_config(config)
 
 
 def test_scan_file_exact_scanner_allows_pickle_detection(tmp_path: Path) -> None:

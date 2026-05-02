@@ -279,6 +279,15 @@ def _policy_from_normalized_selection(selection: Mapping[str, Any]) -> ScannerSe
 def normalize_scanner_selection_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
     """Return a mutable config with a normalized scanner selection payload."""
     normalized = dict(config or {})
+    raw_selection = normalized.get(SCANNER_SELECTION_CONFIG_KEY)
+    if (
+        "scanners" not in normalized
+        and "exclude_scanners" not in normalized
+        and isinstance(raw_selection, Mapping)
+        and _policy_from_normalized_selection(raw_selection) is not None
+    ):
+        return normalized
+
     has_raw_selection = any(key in normalized for key in (SCANNER_SELECTION_CONFIG_KEY, "scanners", "exclude_scanners"))
     policy = policy_from_config(normalized)
     if policy.active or has_raw_selection:
