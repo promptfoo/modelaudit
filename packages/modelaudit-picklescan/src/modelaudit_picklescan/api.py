@@ -900,6 +900,7 @@ def _scan_pickle_payload_native(
     options: ScanOptions,
     bytes_total: int | None = None,
     position_offset: int = 0,
+    enrich_call_graph: bool = True,
 ) -> PickleReport:
     native_bytes_total = _normalize_stream_size(bytes_total)
     native_position_offset = max(position_offset, 0)
@@ -915,7 +916,8 @@ def _scan_pickle_payload_native(
         )
         if not isinstance(raw_report, Mapping):
             raise TypeError(f"Rust scanner returned {type(raw_report).__name__}, expected mapping")
-        return _with_call_graph_findings(_report_from_native_dict(raw_report))
+        report = _report_from_native_dict(raw_report)
+        return _with_call_graph_findings(report) if enrich_call_graph else report
     except Exception as error:
         return _engine_error_report(
             source=source,
