@@ -27,6 +27,13 @@ except Exception:  # pragma: no cover - optional dependency missing
 
 from .base import BaseScanner, IssueSeverity, ScanResult
 
+_DANGEROUS_JAX_TRANSFORMS = ("jit_compile", "eval_jit", "exec_transform", "dynamic_eval", "runtime_eval")
+
+
+def _matching_jax_transforms(key_str: str, value_str: str) -> list[str]:
+    value_lower = value_str.lower()
+    return [transform for transform in _DANGEROUS_JAX_TRANSFORMS if transform in key_str or transform in value_lower]
+
 
 class FlaxMsgpackScanner(BaseScanner):
     """Scanner for Flax/JAX msgpack checkpoint files with enhanced security threat detection."""
@@ -334,23 +341,19 @@ class FlaxMsgpackScanner(BaseScanner):
                     key_str = str(key).lower()
                     value_str = str(value)
 
-                    # Check for suspicious JAX transform patterns
-                    dangerous_transforms = ["jit_compile", "eval_jit", "exec_transform", "dynamic_eval", "runtime_eval"]
-
-                    for transform in dangerous_transforms:
-                        if transform in key_str or transform in value_str.lower():
-                            result.add_check(
-                                name="JAX Transform Security Check",
-                                passed=False,
-                                message=f"Suspicious JAX transform detected: {transform}",
-                                severity=IssueSeverity.CRITICAL,
-                                location=f"{path}/{key}",
-                                details={
-                                    "transform": transform,
-                                    "context": value_str[:200] if len(value_str) > 200 else value_str,
-                                },
-                                rule_code="S1105",  # JAX compilation risks
-                            )
+                    for transform in _matching_jax_transforms(key_str, value_str):
+                        result.add_check(
+                            name="JAX Transform Security Check",
+                            passed=False,
+                            message=f"Suspicious JAX transform detected: {transform}",
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{path}/{key}",
+                            details={
+                                "transform": transform,
+                                "context": value_str[:200] if len(value_str) > 200 else value_str,
+                            },
+                            rule_code="S1105",  # JAX compilation risks
+                        )
 
                     check_jax_transforms(value, f"{path}/{key}" if path else key)
             elif isinstance(data, list | tuple):
