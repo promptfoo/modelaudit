@@ -106,6 +106,21 @@ def test_normalized_selection_rehydrates_without_alias_resolution(monkeypatch: p
     assert policy.exclude_scanner_ids == frozenset({"zip"})
 
 
+def test_normalized_selection_rejects_payloads_that_disable_every_scanner() -> None:
+    all_scanner_ids = sorted(get_scanner_registry_metadata())
+    config = {
+        "scanner_selection": {
+            "active": True,
+            "scanners": None,
+            "exclude_scanners": all_scanner_ids,
+            "enabled_scanner_ids": [],
+        }
+    }
+
+    with pytest.raises(ValueError, match="Scanner selection does not enable any scanners"):
+        policy_from_config(config)
+
+
 def test_scan_file_exact_scanner_allows_pickle_detection(tmp_path: Path) -> None:
     path = tmp_path / "payload.pkl"
     path.write_bytes(_build_malicious_pickle())

@@ -253,6 +253,8 @@ def _policy_from_normalized_selection(selection: Mapping[str, Any]) -> ScannerSe
     expected_enabled = frozenset((exact_ids or all_scanner_ids) - exclude_ids)
     if enabled_ids != expected_enabled or active != bool(exact_ids or exclude_ids):
         return None
+    if active and not enabled_ids:
+        return None
 
     return ScannerSelectionPolicy(
         enabled_scanner_ids=enabled_ids,
