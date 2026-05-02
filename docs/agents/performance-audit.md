@@ -1193,6 +1193,17 @@ Priority 1:
 - Decision:
   - do not land this change; Python's regex cache already covers the steady-state case and the explicit precompiled path was not a repeatable win
 
+### 2026-05-02 - JAX indicator lowercasing split
+
+- Hypothesis:
+  - avoid a second lowercase pass inside `_contains_jax_indicator()` when routing helpers already pass lowered text
+- Result:
+  - synthetic `64 MiB` no-match streamed checkpoint search:
+    - current path: `0.147748s` median
+    - helper split over already-lowered text: `0.148195s` median
+- Decision:
+  - do not land the change; the realistic streamed path did not improve despite the apparent duplicate work in the helper boundary
+
 ## Remaining Recommended Implementation Order
 
 1. Unify or reuse hashing passes.
