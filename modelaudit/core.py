@@ -906,25 +906,12 @@ def _is_huggingface_cache_file(path: str) -> bool:
     import os
 
     filename = os.path.basename(path)
-    path_obj = Path(path)
-
-    is_hf_bookkeeping_path = _is_hf_hub_bookkeeping_path(path_obj) or _is_hf_download_bookkeeping_path(path_obj)
+    if not (filename.endswith((".lock", ".metadata")) or filename in {".gitignore", ".gitattributes", "main", "HEAD"}):
+        return False
 
     # Only trust bookkeeping-shaped filenames when they actually live in a
     # recognized HuggingFace cache layout.
-    if filename.endswith(".lock"):
-        return is_hf_bookkeeping_path
-
-    # Only skip HuggingFace .metadata files in known cache/download layouts.
-    if filename.endswith(".metadata"):
-        return is_hf_bookkeeping_path
-
-    # Check for specific HuggingFace cache metadata files
-    # We no longer skip all HuggingFace cache files since we handle symlinks properly now
-
-    # Check for Git-related files that are commonly cached
-    if filename in [".gitignore", ".gitattributes"]:
-        return is_hf_bookkeeping_path
+    path_obj = Path(path)
 
     if filename in ["main", "HEAD"]:
         hf_cache_root = _find_hf_cache_root(path_obj)
@@ -937,6 +924,17 @@ def _is_huggingface_cache_file(path: str) -> bool:
             return False
 
         return bool(relative_parts and relative_parts[0] == "refs")
+
+    is_hf_bookkeeping_path = _is_hf_hub_bookkeeping_path(path_obj) or _is_hf_download_bookkeeping_path(path_obj)
+    if filename.endswith((".lock", ".metadata")):
+        return is_hf_bookkeeping_path
+
+    # Check for specific HuggingFace cache metadata files
+    # We no longer skip all HuggingFace cache files since we handle symlinks properly now
+
+    # Check for Git-related files that are commonly cached
+    if filename in [".gitignore", ".gitattributes"]:
+        return is_hf_bookkeeping_path
 
     return False
 
