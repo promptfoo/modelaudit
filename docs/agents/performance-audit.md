@@ -1389,6 +1389,22 @@ Priority 1:
 - Notes:
   - this removes repeated normalization on broad metadata maps; the repo-wide non-slow lane still hits the existing timing-sensitive validation and directory-scan sentinels in this environment
 
+### 2026-05-02 - Shared Skops member-name lowercase view
+
+- PR:
+  - `#1207`
+- Change:
+  - Skops protocol probing now lowers each archive member name once per pass
+  - schema/version/protocol checks reuse that normalized member name instead of re-normalizing per term
+- Targeted regression:
+  - `tests/scanners/test_skops_scanner.py::test_protocol_probe_reuses_lowered_member_names`
+- Benchmarks:
+  - `100,000` archive-member names, `50` probe passes:
+    - before: `1.223372s` median
+    - after: `0.542726s` median
+- Notes:
+  - this removes repeated normalization in a large-archive scanner path; the repo-wide non-slow lane still hits the existing timing-sensitive validation and directory-scan sentinels in this environment
+
 ### 2026-05-01 - Shared Keras metadata lowercase view
 
 - PR:
