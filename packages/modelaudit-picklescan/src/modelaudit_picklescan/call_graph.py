@@ -724,6 +724,7 @@ def _clear_source_sensitive_caches() -> None:
         _source_function_context,
         _source_class_context,
         _constructor_parameter_self_attribute_targets,
+        _parameter_controlled_names,
         _can_invoke_function_with_positional_args,
         _can_follow_import_execution_fallback,
         _resolve_module_source,
@@ -2602,6 +2603,7 @@ def _iter_call_nodes(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> t
     return tuple(calls)
 
 
+@lru_cache(maxsize=4096)
 def _parameter_controlled_names(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     controlled = _initial_parameter_controlled_names(function_node)
 
