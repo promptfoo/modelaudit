@@ -241,10 +241,29 @@ def _hash_files_by_path(file_paths: list[str]) -> dict[str, str]:
         hash get unique placeholder values so they still scan independently.
     """
     content_hashes: dict[str, str] = {}
+    hashes_by_inode: dict[tuple[int, int, int, int], str] = {}
 
     for file_path in file_paths:
         try:
+            inode_key: tuple[int, int, int, int] | None = None
+            try:
+                file_stat = os.stat(file_path)
+                if file_stat.st_nlink > 1:
+                    inode_key = (
+                        file_stat.st_dev,
+                        file_stat.st_ino,
+                        file_stat.st_size,
+                        file_stat.st_mtime_ns,
+                    )
+                    if cached_hash := hashes_by_inode.get(inode_key):
+                        content_hashes[file_path] = cached_hash
+                        continue
+            except OSError:
+                pass
+
             content_hashes[file_path] = _calculate_file_hash(file_path)
+            if inode_key is not None:
+                hashes_by_inode[inode_key] = content_hashes[file_path]
         except Exception as e:
             # Log error but continue with other files to prevent single I/O failure from aborting entire scan
             logger.warning(f"Failed to hash file {file_path}: {e}. Skipping deduplication for this file.")
