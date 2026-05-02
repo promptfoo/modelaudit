@@ -1,10 +1,13 @@
+import builtins
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners import manifest_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.manifest_scanner import _PARSE_FAILED, ManifestScanner, _is_trusted_url_domain
 
@@ -48,6 +51,49 @@ def test_manifest_scanner_blacklist(tmp_path):
         issue.details.get("blacklisted_term", "") for issue in blacklist_issues if hasattr(issue, "details")
     ]
     assert "unsafe" in blacklisted_terms
+
+
+def test_manifest_scanner_reuses_manifest_text_during_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_file = tmp_path / "manifest.json"
+    test_file.write_text(
+        json.dumps(
+            {
+                "model_name": "safe-model",
+                "description": "ordinary manifest",
+                "source": _https_url("huggingface.co"),
+            }
+        )
+    )
+
+    original_open = builtins.open
+    open_count = 0
+
+    def counting_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal open_count
+        if file == str(test_file) and kwargs.get("encoding") == "utf-8":
+            open_count += 1
+        return original_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+
+    result = ManifestScanner(config={"blacklist_patterns": ["blocked"]}).scan(str(test_file))
+
+    assert result.success is True
+    assert open_count == 1
+
+
+def test_manifest_scanner_clears_manifest_text_after_scan(tmp_path: Path) -> None:
+    test_file = tmp_path / "manifest.json"
+    test_file.write_text(json.dumps({"model_name": "safe-model"}))
+    scanner = ManifestScanner(config={"blacklist_patterns": ["blocked"]})
+
+    result = scanner.scan(str(test_file))
+
+    assert result.scanner is scanner
+    assert scanner._manifest_text_cache == {}
 
 
 def test_manifest_scanner_case_insensitive_blacklist(tmp_path):
@@ -1024,6 +1070,10 @@ class TestIsTrustedUrlDomain:
     def test_exact_trusted_domain(self) -> None:
         assert _is_trusted_url_domain("https://github.com/repo") is True
         assert _is_trusted_url_domain("https://huggingface.co/model") is True
+
+    def test_exact_trusted_domain_skips_suffix_scan(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(manifest_scanner, "_TRUSTED_URL_SUBDOMAIN_SUFFIXES", ())
+        assert _is_trusted_url_domain("https://github.com/repo") is True
 
     def test_s3_endpoint_host_patterns_trusted(self) -> None:
         assert _is_trusted_url_domain("https://bucket.s3.amazonaws.com/model.bin") is True
