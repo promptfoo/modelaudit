@@ -935,6 +935,22 @@ Priority 1:
 - Notes:
   - this is a modest progress-enabled CLI win, separate from the larger core directory pre-count work in `#1173` and `#1174`
 
+### 2026-05-02 - SavedModel function-pattern reuse
+
+- PR:
+  - `#1183`
+- Change:
+  - TensorFlow SavedModel suspicious-function regexes are now compiled once at module load instead of once per checked function name
+  - the helper keeps the same token-boundary matching while removing repeated static setup
+- Targeted regression:
+  - `tests/scanners/test_tf_savedmodel_scanner.py::test_suspicious_function_name_reuses_precompiled_patterns`
+- Benchmarks:
+  - `100,000` safe function-name checks:
+    - before: `1.497486s` median
+    - after: `0.563691s` median
+- Notes:
+  - this is a scanner-local cleanup for models with many function references; the broad non-slow suite still has a separate noisy picklescan timing guard on this machine
+
 ### 2026-05-01 - Shared C2 payload lowercase view
 
 - PR:
