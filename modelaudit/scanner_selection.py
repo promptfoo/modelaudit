@@ -12,6 +12,7 @@ import difflib
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Literal
 
 from .scanner_registry_metadata import get_scanner_registry_metadata
@@ -67,7 +68,15 @@ def _alias_key(value: str) -> str:
     return value.strip().lower().replace("_", "").replace("-", "")
 
 
-def _scanner_aliases(metadata: Mapping[str, Mapping[str, Any]]) -> dict[str, str]:
+@lru_cache(maxsize=1)
+def _scanner_metadata() -> dict[str, dict[str, Any]]:
+    """Return the static registry metadata used by hot selection paths."""
+    return get_scanner_registry_metadata()
+
+
+@lru_cache(maxsize=1)
+def _scanner_aliases() -> dict[str, str]:
+    """Return canonical aliases derived from the static registry metadata."""
     aliases: dict[str, str] = {}
 
     def add(alias: str, scanner_id: str) -> None:
@@ -75,7 +84,7 @@ def _scanner_aliases(metadata: Mapping[str, Mapping[str, Any]]) -> dict[str, str
         if key:
             aliases.setdefault(key, scanner_id)
 
-    for scanner_id, scanner_info in metadata.items():
+    for scanner_id, scanner_info in _scanner_metadata().items():
         add(scanner_id, scanner_id)
         add(scanner_id.replace("_", "-"), scanner_id)
 
@@ -95,8 +104,8 @@ def _scanner_aliases(metadata: Mapping[str, Mapping[str, Any]]) -> dict[str, str
 
 def resolve_scanner_ids(tokens: Iterable[str] | str | None) -> tuple[str, ...]:
     """Resolve scanner IDs, class names, and friendly aliases to canonical IDs."""
-    metadata = get_scanner_registry_metadata()
-    aliases = _scanner_aliases(metadata)
+    metadata = _scanner_metadata()
+    aliases = _scanner_aliases()
     resolved: list[str] = []
     unknown: list[str] = []
 
@@ -165,7 +174,18 @@ def resolve_scanner_selection_policy(
     exclude_scanners: Iterable[str] | str | None = None,
 ) -> ScannerSelectionPolicy:
     """Resolve raw scanner selection inputs into a policy."""
-    metadata = get_scanner_registry_metadata()
+    return _resolve_scanner_selection_policy_cached(
+        tuple(split_scanner_tokens(scanners)),
+        tuple(split_scanner_tokens(exclude_scanners)),
+    )
+
+
+@lru_cache(maxsize=256)
+def _resolve_scanner_selection_policy_cached(
+    scanners: tuple[str, ...],
+    exclude_scanners: tuple[str, ...],
+) -> ScannerSelectionPolicy:
+    metadata = _scanner_metadata()
     all_scanner_ids = frozenset(metadata.keys())
 
     exact_ids = frozenset(resolve_scanner_ids(scanners))
@@ -204,6 +224,9 @@ def policy_from_config(config: Mapping[str, Any] | None) -> ScannerSelectionPoli
     raw_selection = raw_config.get(SCANNER_SELECTION_CONFIG_KEY)
 
     if isinstance(raw_selection, Mapping):
+        normalized_policy = _policy_from_normalized_selection(raw_selection)
+        if normalized_policy is not None:
+            return normalized_policy
         return resolve_scanner_selection_policy(
             scanners=raw_selection.get("scanners"),
             exclude_scanners=raw_selection.get("exclude_scanners"),
@@ -215,19 +238,41 @@ def policy_from_config(config: Mapping[str, Any] | None) -> ScannerSelectionPoli
     )
 
 
-def _is_normalized_scanner_selection_payload(selection: Any) -> bool:
-    """Return True for payloads already emitted by `ScannerSelectionPolicy.to_config()`."""
-    if not isinstance(selection, Mapping):
-        return False
+def _policy_from_normalized_selection(selection: Mapping[str, Any]) -> ScannerSelectionPolicy | None:
+    """Rehydrate a policy from ``to_config()`` output without re-resolving aliases."""
+    active = selection.get("active")
+    enabled_values = selection.get("enabled_scanner_ids")
+    if not isinstance(active, bool) or not isinstance(enabled_values, list):
+        return None
 
-    scanners = selection.get("scanners")
-    exclude_scanners = selection.get("exclude_scanners")
-    enabled_scanner_ids = selection.get("enabled_scanner_ids")
-    return (
-        isinstance(selection.get("active"), bool)
-        and (scanners is None or isinstance(scanners, list))
-        and isinstance(exclude_scanners, list)
-        and isinstance(enabled_scanner_ids, list)
+    all_scanner_ids = frozenset(_scanner_metadata().keys())
+
+    def parse_ids(value: Any, *, allow_none: bool = False) -> frozenset[str] | None:
+        if value is None and allow_none:
+            return frozenset()
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            return None
+        ids = frozenset(value)
+        return ids if ids <= all_scanner_ids else None
+
+    enabled_ids = parse_ids(enabled_values)
+    exact_ids = parse_ids(selection.get("scanners"), allow_none=True)
+    exclude_ids = parse_ids(selection.get("exclude_scanners"))
+    if enabled_ids is None or exact_ids is None or exclude_ids is None:
+        return None
+
+    expected_enabled = frozenset((exact_ids or all_scanner_ids) - exclude_ids)
+    if enabled_ids != expected_enabled or active != bool(exact_ids or exclude_ids):
+        return None
+    if active and not enabled_ids:
+        return None
+
+    return ScannerSelectionPolicy(
+        enabled_scanner_ids=enabled_ids,
+        all_scanner_ids=all_scanner_ids,
+        exact_scanner_ids=exact_ids,
+        exclude_scanner_ids=exclude_ids,
+        active=active,
     )
 
 
@@ -238,7 +283,8 @@ def normalize_scanner_selection_config(config: Mapping[str, Any] | None) -> dict
     if (
         "scanners" not in normalized
         and "exclude_scanners" not in normalized
-        and _is_normalized_scanner_selection_payload(raw_selection)
+        and isinstance(raw_selection, Mapping)
+        and _policy_from_normalized_selection(raw_selection) is not None
     ):
         return normalized
 
@@ -263,7 +309,7 @@ def selected_scanner_extensions(
     headers. Remote sources only have filenames before download, so they need
     this fail-open behavior to avoid selection-created coverage gaps.
     """
-    metadata = get_scanner_registry_metadata()
+    metadata = _scanner_metadata()
     extensions: set[str] = set()
     for scanner_id in policy.enabled_scanner_ids:
         scanner_info = metadata.get(scanner_id, {})
