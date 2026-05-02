@@ -1341,6 +1341,22 @@ Priority 1:
 - Notes:
   - this removes repeated nested-loop normalization in a small shared analysis helper
 
+### 2026-05-02 - Shared XGBoost legacy-header lowercase view
+
+- PR:
+  - `#1204`
+- Change:
+  - legacy XGBoost marker probing now lowers the decoded header once per validation pass
+  - the binary-structure check reuses that normalized header across all expected-marker checks
+- Targeted regression:
+  - `tests/scanners/test_xgboost_scanner.py::TestXGBoostBinaryScanning::test_legacy_header_pattern_search_reuses_lowered_header`
+- Benchmarks:
+  - representative `136`-byte legacy header, `200,000` searches:
+    - before: `0.123105s` median
+    - after: `0.098412s` median
+- Notes:
+  - focused XGBoost tests passed; the repo-wide non-slow lane still hits the existing timing-sensitive directory-scan sentinel in this environment
+
 ### 2026-05-01 - Shared Keras metadata lowercase view
 
 - PR:
