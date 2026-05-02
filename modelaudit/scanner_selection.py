@@ -12,6 +12,7 @@ import difflib
 import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Literal
 
 from .scanner_registry_metadata import get_scanner_registry_metadata
@@ -93,10 +94,15 @@ def _scanner_aliases(metadata: Mapping[str, Mapping[str, Any]]) -> dict[str, str
     return aliases
 
 
+@lru_cache(maxsize=1)
+def _cached_scanner_aliases() -> dict[str, str]:
+    return _scanner_aliases(get_scanner_registry_metadata())
+
+
 def resolve_scanner_ids(tokens: Iterable[str] | str | None) -> tuple[str, ...]:
     """Resolve scanner IDs, class names, and friendly aliases to canonical IDs."""
     metadata = get_scanner_registry_metadata()
-    aliases = _scanner_aliases(metadata)
+    aliases = _cached_scanner_aliases()
     resolved: list[str] = []
     unknown: list[str] = []
 
@@ -165,6 +171,17 @@ def resolve_scanner_selection_policy(
     exclude_scanners: Iterable[str] | str | None = None,
 ) -> ScannerSelectionPolicy:
     """Resolve raw scanner selection inputs into a policy."""
+    return _resolve_scanner_selection_policy_cached(
+        tuple(split_scanner_tokens(scanners)),
+        tuple(split_scanner_tokens(exclude_scanners)),
+    )
+
+
+@lru_cache(maxsize=256)
+def _resolve_scanner_selection_policy_cached(
+    scanners: tuple[str, ...],
+    exclude_scanners: tuple[str, ...],
+) -> ScannerSelectionPolicy:
     metadata = get_scanner_registry_metadata()
     all_scanner_ids = frozenset(metadata.keys())
 

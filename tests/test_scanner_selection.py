@@ -87,6 +87,19 @@ def test_selection_policy_uses_allowlist_minus_exclusions() -> None:
     assert not policy.allows("zip")
 
 
+def test_selection_policy_reuses_normalized_cached_results() -> None:
+    list_policy = resolve_scanner_selection_policy(
+        scanners=["pickle", "zip"],
+        exclude_scanners=["zip"],
+    )
+    comma_policy = resolve_scanner_selection_policy(
+        scanners="pickle,zip",
+        exclude_scanners="zip",
+    )
+
+    assert list_policy is comma_policy
+
+
 def test_scan_file_exact_scanner_allows_pickle_detection(tmp_path: Path) -> None:
     path = tmp_path / "payload.pkl"
     path.write_bytes(_build_malicious_pickle())
