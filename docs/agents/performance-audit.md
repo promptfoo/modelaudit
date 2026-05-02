@@ -836,6 +836,25 @@ Priority 1:
 - Notes:
   - this closes the clearest repeated directory-walk hotspot in `detect_unlicensed_datasets()`; broader license-header read semantics remain separate work
 
+### 2026-05-02 - Scanner-selection policy cache
+
+- PR:
+  - `#1177`
+- Change:
+  - scanner aliases are now built once from the static registry metadata
+  - equivalent normalized scanner-selection inputs reuse one bounded cached frozen policy object
+- Targeted regression:
+  - `tests/test_scanner_selection.py::test_selection_policy_reuses_normalized_cached_results`
+- Benchmarks:
+  - `20,000` repeated `resolve_scanner_ids()` calls:
+    - before: `0.857873s` median
+    - after: `0.288100s` median
+  - `20,000` repeated equivalent policy resolutions:
+    - before: `2.038787s` median
+    - after: `0.007434s` median
+- Notes:
+  - this trims repeated setup from many-file scans while leaving the actual scanner-selection semantics unchanged
+
 ### 2026-05-01 - Shared C2 payload lowercase view
 
 - PR:
