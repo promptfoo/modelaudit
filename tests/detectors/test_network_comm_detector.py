@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 from urllib.parse import urlparse
 
+import pytest
+
 from modelaudit.detectors.network_comm import NetworkCommDetector, detect_network_communication
 
 
@@ -205,6 +207,16 @@ class TestNetworkCommDetector:
         # Check severity levels
         critical = [f for f in lib_findings if f["severity"] == "CRITICAL"]
         assert len(critical) >= 2  # socket and paramiko are critical
+
+    def test_network_library_scan_uses_shared_patterns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Derived library patterns should come from the shared class table."""
+        detector = NetworkCommDetector()
+        monkeypatch.setattr(NetworkCommDetector, "NETWORK_LIBRARIES", [b"socket"])
+        monkeypatch.setattr(NetworkCommDetector, "NETWORK_LIBRARY_PATTERNS", {b"socket": (b"CUSTOM_SOCKET_PATTERN",)})
+
+        detector._scan_network_libraries(b"CUSTOM_SOCKET_PATTERN", "payload.bin")
+
+        assert any(finding["library"] == "socket" for finding in detector.findings)
 
     def test_detect_network_functions(self) -> None:
         """Test detection of network function calls."""
