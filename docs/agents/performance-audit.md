@@ -919,6 +919,22 @@ Priority 1:
 - Notes:
   - this is a follow-up to the scanner-selection cache work and removes the remaining duplicate normalization work on already-canonical configs
 
+### 2026-05-02 - One-pass CLI progress tree summary
+
+- PR:
+  - `#1182`
+- Change:
+  - enhanced CLI progress initialization now summarizes directory bytes and descendant items in one recursive traversal
+  - preserves the existing totals while removing a duplicate `Path.rglob("*")` walk
+- Targeted regression:
+  - `tests/test_cli.py::test_summarize_progress_tree_walks_once`
+- Benchmarks:
+  - synthetic `20,000`-file tree (`100` directories x `200` files):
+    - before: `0.553156s` median
+    - after: `0.413021s` median
+- Notes:
+  - this is a modest progress-enabled CLI win, separate from the larger core directory pre-count work in `#1173` and `#1174`
+
 ### 2026-05-01 - Shared C2 payload lowercase view
 
 - PR:
