@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import HttpUrl
 
+from modelaudit.integrations import license_checker
 from modelaudit.integrations.license_checker import (
     _LICENSE_HEADER_MAX_BYTES,
     CopyrightInfo,
@@ -596,6 +597,31 @@ Bob,30
 
         assert metadata["is_dataset"] is True  # .pkl is both dataset and model extension
         assert metadata["is_model"] is True
+
+    def test_collect_license_metadata_reuses_lowered_header(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Reuse one lowercase view across the shared metadata collectors."""
+
+        class TrackingStr(str):
+            lower_calls = 0
+
+            def lower(self) -> str:
+                self.lower_calls += 1
+                return super().lower()
+
+        test_file = tmp_path / "header.py"
+        test_file.write_text("placeholder")
+        content = TrackingStr("# SPDX-License-Identifier: MIT\n# Copyright 2024 Test Corp\n")
+        monkeypatch.setattr(license_checker, "_read_header_text", lambda *_args, **_kwargs: content)
+
+        metadata = collect_license_metadata(str(test_file))
+
+        assert content.lower_calls == 1
+        assert metadata["license_info"][0]["spdx_id"] == "MIT"
+        assert metadata["copyright_notices"][0]["holder"] == "Test Corp"
 
     def test_collect_license_metadata_reuses_nearby_license_cache(
         self,
