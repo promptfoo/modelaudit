@@ -419,6 +419,19 @@ TRUSTED_URL_EXACT_DOMAINS = {
     "sourceforge.net",
     "streamlit.io",
 }
+_NORMALIZED_TRUSTED_URL_DOMAINS: Final[frozenset[str]] = frozenset(
+    domain.lower().rstrip(".") for domain in TRUSTED_URL_DOMAINS
+)
+_NORMALIZED_TRUSTED_URL_EXACT_DOMAINS: Final[frozenset[str]] = frozenset(
+    domain.lower().rstrip(".") for domain in TRUSTED_URL_EXACT_DOMAINS
+)
+_TRUSTED_URL_SUBDOMAIN_SUFFIXES: Final[tuple[str, ...]] = tuple(
+    dict.fromkeys(
+        normalized_domain
+        for domain in TRUSTED_URL_DOMAINS
+        if (normalized_domain := domain.lower().rstrip(".")) not in _NORMALIZED_TRUSTED_URL_EXACT_DOMAINS
+    )
+)
 
 # Regex to find URLs in text
 URL_PATTERN = re.compile(r'https?://[^\s<>"\']+[^\s<>"\',.]')
@@ -485,15 +498,10 @@ def _is_trusted_url_domain(url: str) -> bool:
     if _is_trusted_s3_endpoint_host(host):
         return True
 
-    for domain in TRUSTED_URL_DOMAINS:
-        trusted = domain.lower().rstrip(".")
-        if host == trusted:
-            return True
-        if trusted in TRUSTED_URL_EXACT_DOMAINS:
-            continue
-        if host.endswith(f".{trusted}"):
-            return True
-    return False
+    if host in _NORMALIZED_TRUSTED_URL_DOMAINS:
+        return True
+
+    return any(host.endswith(f".{trusted}") for trusted in _TRUSTED_URL_SUBDOMAIN_SUFFIXES)
 
 
 class ManifestScanner(BaseScanner):
