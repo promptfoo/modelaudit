@@ -1334,6 +1334,25 @@ Priority 1:
 - Notes:
   - this is the strongest isolated call-graph cache result so far; the repo-wide non-slow lane still hits the existing timing-sensitive validation and directory-scan sentinels in this environment
 
+### 2026-05-02 - Cached call-graph call nodes
+
+- PR:
+  - `#1215`
+- Change:
+  - `_iter_call_nodes()` now reuses the AST walk result for repeated lookups of the same function node
+  - the cache joins the existing source-sensitive invalidation sweep
+- Targeted regression:
+  - `packages/modelaudit-picklescan/tests/test_call_graph_import_statements.py::test_iter_call_nodes_reuses_cached_walk`
+- Benchmarks:
+  - repeated same-function call-node walk, `5,000` lookups x `5` passes:
+    - before: `1.000113s` median
+    - after: `0.000891s` median
+  - matched cProfile run on `tests/assets/exploits/exploit_ultimate_50pct.pkl` from `origin/main`:
+    - before: `82.470s`
+    - after: `66.972s`
+- Notes:
+  - this is a smaller whole-scan win than the alias caches, but still a useful reduction on the same malicious-pickle profile; the repo-wide non-slow lane still hits the existing timing-sensitive validation and directory-scan sentinels in this environment
+
 ### 2026-05-02 - Shared MetaGraph attr lowercase values
 
 - PR:
