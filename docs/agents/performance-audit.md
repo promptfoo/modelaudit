@@ -320,7 +320,7 @@ Priority 1:
 | `modelaudit/scanners/tf_savedmodel_scanner.py`                           | lightly profiled | Tiny fixture cost was mostly lazy imports; Keras metadata text had repeated lowercase passes, now fixed in `#1168`. Large SavedModel benchmarks remain.               |
 | `modelaudit/scanners/keras_zip_scanner.py`                               | inspected        | Lambda-code scanning reused repeated whole-string lowercase passes, now fixed in `#1168`; larger archive benchmarks are still needed.                                 |
 | `modelaudit/scanners/keras_utils.py`                                     | inspected        | Shared Lambda helpers had the same repeated lowercase pattern, now consolidated behind one reusable matcher in `#1168`.                                               |
-| `modelaudit/detectors/secrets.py`                                        | inspected        | Convenience file API reads whole files; core pickle path already gates detector execution with seeds.                                                                 |
+| `modelaudit/detectors/secrets.py`                                        | inspected        | Fixed detector heuristics now reuse module-level state in `#1189`; convenience file API still reads whole files, while the core pickle path already gates execution.   |
 | `modelaudit/detectors/network_comm.py`                                   | inspected        | Convenience file API reads whole files and regex work can be expensive on large buffers.                                                                              |
 | `modelaudit/detectors/jit_script.py`                                     | inspected        | Convenience file API reads whole files and AST walks parsed code; keep behind bounded callers.                                                                        |
 | `modelaudit/scanners/catboost_scanner.py`                                | inspected        | Uses bounded head/core/trailer reads; low priority until a CatBoost-specific benchmark says otherwise.                                                                |
@@ -1037,6 +1037,20 @@ Priority 1:
 - Notes:
   - this trims duplicate structural traversal in the nonstandard-checkpoint path without changing detection semantics
 
+### 2026-05-02 - Shared secrets detector heuristics
+
+- PR:
+  - `#1189`
+- Change:
+  - fixed ML-context, confidence, example-secret, and binary-filter heuristics now live at module scope instead of being rebuilt for each candidate finding
+  - lowercased text/context values and compiled helper regexes are reused within each scoring pass
+- Benchmarks:
+  - synthetic secret-heavy workload with `200` candidate findings scanned `200` times per run, same-process controlled A/B:
+    - before: `2.707902s` median
+    - after: `1.970997s` median
+- Notes:
+  - this is a detector-local CPU cleanup for hit-heavy inputs; it leaves the rule surface unchanged
+
 ### 2026-05-01 - Shared C2 payload lowercase view
 
 - PR:
@@ -1170,6 +1184,31 @@ Priority 1:
   - the benchmark is intentionally an overhead smoke test; the value of this PR is better observability for the larger hashing and orchestration backlog
 
 ## Measured Non-Wins
+
+### 2026-05-02 - Metadata URL regex precompile
+
+- Hypothesis:
+  - precompile the metadata URL extractor instead of relying on `re.findall()` with a literal regex at each call site
+- Result:
+  - synthetic README text with no URLs:
+    - literal regex: `0.065490s`
+    - precompiled regex: `0.040135s`
+  - synthetic README text with many URLs:
+    - literal regex: `0.666813s`
+    - precompiled regex: `0.704760s`
+- Decision:
+  - do not land the change; the benefit only appeared on the no-match path and reversed on the URL-heavy case that matters more for this scanner
+
+### 2026-05-02 - Generic ZIP config-name lowercase reuse
+
+- Hypothesis:
+  - lowercase archive entry names once while extracting generic ZIP metadata instead of repeating `.lower()` inside each config-name probe
+- Result:
+  - synthetic `200,000`-entry archive-name list:
+    - current path: `0.135729s`
+    - shared lowercase probe: `0.133178s`
+- Decision:
+  - do not land the change; the improvement was too small to justify another dedicated optimization branch
 
 ### 2026-05-02 - Integrity hash chunk-size increase
 
