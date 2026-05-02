@@ -1277,6 +1277,22 @@ Priority 1:
 - Notes:
   - focused call-graph tests passed; the repo-wide non-slow lane still hits existing timing-sensitive perf assertions in this environment
 
+### 2026-05-02 - Shared MetaGraph attr lowercase values
+
+- PR:
+  - `#1200`
+- Change:
+  - executable TensorFlow MetaGraph attr values now share one lowered copy per node scan
+  - decode-hint probing and the main signal loop no longer lowercase the same bounded payload separately
+- Targeted regression:
+  - `tests/scanners/test_tf_metagraph_scanner.py::test_tf_metagraph_attr_lowering_reuses_shared_values`
+- Benchmarks:
+  - bounded worst-case executable-node payload, `64` attrs at the scanner `32 KiB` attr cap, `200` iterations:
+    - before: `9.785893s` median
+    - after: `9.487525s` median
+- Notes:
+  - this is a modest but deterministic large-attr cleanup; regex evaluation still dominates the path
+
 ### 2026-05-01 - Shared Keras metadata lowercase view
 
 - PR:
