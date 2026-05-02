@@ -534,7 +534,7 @@ def test_batch_store_counts_only_persisted_results(tmp_path: Path, monkeypatch: 
     batch_ops = BatchCacheOperations(cache_manager)
 
     assert cache_manager.cache is not None
-    monkeypatch.setattr(cache_manager.cache, "_generate_cache_key", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cache_manager.cache, "_generate_cache_key_material", lambda *args, **kwargs: (None, None))
 
     stored_count = batch_ops.batch_store(
         [
@@ -613,6 +613,31 @@ def test_cache_key_generation_avoids_full_hash_for_medium_files(
     cache_key = cache.generate_cache_key(str(file_path), version_context=build_cache_version_context({"timeout": 30}))
 
     assert cache_key is not None
+
+
+def test_large_file_store_reuses_cache_key_content_hash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="large.bin")
+    file_path.write_bytes(b"x" * (11 * 1024 * 1024))
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    version_context = build_cache_version_context({"timeout": 30})
+    expected_hash = "secure:" + ("a" * 64)
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+
+    monkeypatch.setattr(cache.key_generator.hasher, "hash_file", lambda _path: expected_hash)
+
+    def fail_hash(_path: str, _stat: os.stat_result) -> str:
+        raise AssertionError("large-file cache store should reuse the cache-key content hash")
+
+    monkeypatch.setattr(cache.hasher, "hash_file_with_stat", fail_hash)
+
+    assert cache.store_result(str(file_path), expected, 10, version_context=version_context) is True
+
+    cache_key = cache.generate_cache_key(str(file_path), version_context=version_context)
+    assert cache_key is not None
+    cache_file_path = cache._get_cache_file_path(cache_key)
+    cache_entry = json.loads(cache_file_path.read_text(encoding="utf-8"))
+
+    assert cache_entry["file_info"]["hash"] == expected_hash
 
 
 def test_same_size_rewrite_with_high_resolution_mtime_invalidates_cache(tmp_path: Path) -> None:
