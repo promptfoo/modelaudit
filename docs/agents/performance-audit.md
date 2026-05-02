@@ -1437,6 +1437,22 @@ Priority 1:
 - Notes:
   - this trims output-generation cost for noisy scans; the repo-wide non-slow lane still hits the existing timing-sensitive validation and directory-scan sentinels in this environment
 
+### 2026-05-02 - Reused prefiltered SARIF issues
+
+- PR:
+  - `#1210`
+- Change:
+  - `_create_run()` now marks its already-primary issue list as prefiltered for SARIF rule/result generation
+  - standalone helper calls preserve their existing compatibility filtering behavior
+- Targeted regression:
+  - `tests/integrations/test_sarif_formatter.py::TestCreateRun::test_primary_issue_filter_runs_once`
+- Benchmarks:
+  - synthetic `100,000`-issue list with `25%` compatibility-only supporting rows, `20` passes:
+    - three-pass filter path: `0.636097s` median
+    - one-pass prefiltered path: `0.222424s` median
+- Notes:
+  - this removes duplicate product-path list scans during SARIF generation; the repo-wide non-slow lane still hits the existing timing-sensitive validation and directory-scan sentinels in this environment
+
 ### 2026-05-01 - Shared Keras metadata lowercase view
 
 - PR:
