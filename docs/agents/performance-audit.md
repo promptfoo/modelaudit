@@ -333,7 +333,7 @@ Priority 1:
 | `modelaudit/scanners/tf_metagraph_scanner.py`                            | inspected        | Uses an explicit read cap; low priority.                                                                                                                              |
 | `modelaudit/scanners/xgboost_scanner.py`                                 | inspected        | Most routing probes are bounded, but UBJSON parsing still materializes the file; add large `.bst` benchmark if this format matters.                                   |
 | `modelaudit/scanners/oci_layer_scanner.py`                               | inspected        | Manifest probing is chunked, but full text read remains in one path; add an OCI-layer benchmark before changing.                                                      |
-| `modelaudit/scanners/pmml_scanner.py`                                    | inspected        | Whole-file XML read; likely acceptable for normal PMML sizes, but worth one large-text benchmark.                                                                     |
+| `modelaudit/scanners/pmml_scanner.py`                                    | inspected        | Whole-file XML read remains, but repeated case-insensitive extension-pattern searches are fixed in `#1172`.                                                           |
 
 ## Open Questions
 
@@ -749,6 +749,22 @@ Priority 1:
 - Notes:
   - this is the first landed slice of the repeated-hashing backlog
   - broader SHA256 and integrity-hash reuse still needs product-level hash-output constraints settled
+
+### 2026-05-01 - PMML extension-pattern reuse
+
+- PR:
+  - `#1172`
+- Change:
+  - PMML suspicious extension patterns are compiled once at import time
+  - extension content is already lowercased, so the scan now uses case-sensitive compiled regexes instead of repeated ignore-case regex searches
+- Targeted regression:
+  - `tests/scanners/test_pmml_scanner.py::test_pmml_scanner_mixed_case_system_call_is_flagged`
+- Benchmarks:
+  - synthetic `8 MiB` no-match extension text:
+    - repeated ignore-case search loop: `0.770225s` median
+    - compiled case-sensitive search loop over lowered text: `0.460403s` median
+- Notes:
+  - this is a scanner-local large-text CPU cleanup that keeps mixed-case malicious input detection intact
 
 ### 2026-05-01 - Shared C2 payload lowercase view
 
