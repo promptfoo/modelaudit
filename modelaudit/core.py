@@ -1,6 +1,7 @@
 """Core scanning engine for orchestrating model file security analysis."""
 
 import hashlib
+import itertools
 import logging
 import os
 import time
@@ -68,6 +69,14 @@ logger = logging.getLogger("modelaudit.core")
 
 _add_asset_to_results = core_results.add_asset_to_results
 _add_error_asset_to_results = core_results.add_error_asset_to_results
+_DIRECTORY_PRECOUNT_CHILD_LIMIT = 1000
+
+
+def _count_immediate_children_up_to(path: Path, limit: int) -> int:
+    """Count at most `limit` immediate children for directory-size heuristics."""
+    return sum(1 for _child in itertools.islice(path.iterdir(), limit))
+
+
 _add_issue_to_model = core_results.add_issue_to_model
 _add_scan_result_to_model = core_results.add_scan_result_to_model
 _consolidate_checks = core_results.consolidate_checks
@@ -451,8 +460,12 @@ def scan_model_directory_or_file(
             # This avoids the expensive rglob() on large directories
             try:
                 # Do a quick count of immediate children first
-                immediate_children = len(list(Path(path).iterdir()))
-                if immediate_children < 1000:  # Only count if not too many immediate children
+                immediate_children = _count_immediate_children_up_to(
+                    Path(path),
+                    _DIRECTORY_PRECOUNT_CHILD_LIMIT,
+                )
+                # Only run the recursive count for narrower roots.
+                if immediate_children < _DIRECTORY_PRECOUNT_CHILD_LIMIT:
                     total_files = sum(1 for _ in Path(path).rglob("*") if _.is_file())
             except (OSError, PermissionError):
                 # If we can't count, just proceed without progress percentage

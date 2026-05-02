@@ -7,6 +7,7 @@ import gzip
 import json
 import pickle
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -1339,6 +1340,23 @@ def test_scan_file_routes_model_config_json_to_manifest_scanner(tmp_path: Path) 
 
     assert result.scanner_name == "manifest"
     assert result.success is True
+
+
+def test_directory_child_probe_stops_at_limit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def bounded_iterdir(self: Path) -> Iterator[Path]:
+        for index in range(core_module._DIRECTORY_PRECOUNT_CHILD_LIMIT):
+            yield self / f"child_{index}"
+        raise AssertionError("directory child probe consumed past its limit")
+
+    monkeypatch.setattr(Path, "iterdir", bounded_iterdir)
+
+    assert (
+        core_module._count_immediate_children_up_to(
+            tmp_path,
+            core_module._DIRECTORY_PRECOUNT_CHILD_LIMIT,
+        )
+        == core_module._DIRECTORY_PRECOUNT_CHILD_LIMIT
+    )
 
 
 def test_scan_file_routes_manifest_owned_chat_templates_through_jinja_analysis(tmp_path: Path) -> None:
