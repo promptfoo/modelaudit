@@ -1,6 +1,7 @@
 """Tests for the license checking functionality in ModelAudit."""
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -326,6 +327,30 @@ class TestUnlicensedDatasetDetection:
 
         assert len(unlicensed) == 0  # Should not be flagged due to nearby license
 
+    def test_reuses_sibling_directory_listing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Reuse same-directory license discovery across sibling datasets."""
+        files = []
+        for index in range(3):
+            csv_file = tmp_path / f"data_{index}.csv"
+            csv_file.write_text("name,age\nAlice,25\n")
+            files.append(str(csv_file))
+
+        original_iterdir = Path.iterdir
+        listing_count = 0
+
+        def counting_iterdir(path: Path) -> Iterator[Path]:
+            nonlocal listing_count
+            if path == tmp_path:
+                listing_count += 1
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", counting_iterdir)
+
+        unlicensed = detect_unlicensed_datasets(files, license_info_by_path={file_path: [] for file_path in files})
+
+        assert unlicensed == files
+        assert listing_count == 1
+
     def test_ml_model_directory_skip(self, tmp_path):
         """Test that ML model files in model directories are skipped."""
         # Create ML model directory
@@ -571,6 +596,32 @@ Bob,30
         assert content.lower_calls == 1
         assert metadata["license_info"][0]["spdx_id"] == "MIT"
         assert metadata["copyright_notices"][0]["holder"] == "Test Corp"
+
+    def test_collect_license_metadata_reuses_nearby_license_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Repeated same-directory metadata scans should reuse nearby-license discovery."""
+        first_file = tmp_path / "first.pkl"
+        second_file = tmp_path / "second.pkl"
+        first_file.write_bytes(b"first")
+        second_file.write_bytes(b"second")
+        calls = 0
+
+        def fake_find_license_files(directory: str) -> list[str]:
+            nonlocal calls
+            calls += 1
+            return [str(Path(directory) / "LICENSE")]
+
+        monkeypatch.setattr("modelaudit.integrations.license_checker.find_license_files", fake_find_license_files)
+        nearby_license_cache: dict[str, list[str]] = {}
+
+        first_metadata = collect_license_metadata(str(first_file), nearby_license_cache=nearby_license_cache)
+        second_metadata = collect_license_metadata(str(second_file), nearby_license_cache=nearby_license_cache)
+
+        assert calls == 1
+        assert first_metadata["license_files_nearby"] == second_metadata["license_files_nearby"]
 
 
 class TestIntegration:
