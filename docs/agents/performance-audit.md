@@ -1021,6 +1021,22 @@ Priority 1:
 - Notes:
   - this is a scanner-local large-object cleanup distinct from the earlier JAX transform lowercase reuse in `#1169`
 
+### 2026-05-02 - Reused Flax structure analysis
+
+- PR:
+  - `#1188`
+- Change:
+  - Flax scans now reuse one deep ML-structure analysis result across metadata extraction and format validation
+  - direct helper calls keep their previous behavior by computing the analysis locally when no precomputed result is supplied
+- Targeted regression:
+  - `tests/scanners/test_flax_msgpack_scanner.py::test_flax_scan_reuses_ml_structure_analysis`
+- Benchmarks:
+  - synthetic `8 MiB` object across metadata extraction plus format validation:
+    - before: `0.351241s` median
+    - after: `0.182844s` median
+- Notes:
+  - this trims duplicate structural traversal in the nonstandard-checkpoint path without changing detection semantics
+
 ### 2026-05-01 - Shared C2 payload lowercase view
 
 - PR:
@@ -1312,6 +1328,17 @@ Priority 1:
     - prebuilt-pattern probe: `0.075990s` median
 - Decision:
   - do not land the change; the proposed setup cleanup was slightly slower in the measured path
+
+### 2026-05-02 - Generic-domain TLD set hoist
+
+- Hypothesis:
+  - move the generic-domain valid-TLD and suspicious-TLD lists out of the per-match loop
+- Result:
+  - controlled same-process `20,000`-domain helper loop:
+    - current path: `0.086000s` median
+    - shared-set probe: `0.082068s` median
+- Decision:
+  - do not land the change; the real helper-level win was too small once the rest of the domain-finding work stayed identical
 
 ## Remaining Recommended Implementation Order
 
