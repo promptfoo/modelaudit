@@ -4,6 +4,9 @@ import json
 import time
 from types import SimpleNamespace
 
+import pytest
+
+import modelaudit.integrations.sarif_formatter as sarif_formatter
 from modelaudit.integrations.sarif_formatter import (
     _create_artifacts,
     _create_results,
@@ -135,6 +138,35 @@ class TestCreateRun:
         assert driver["name"] == "ModelAudit"
         assert "version" in driver
         assert "rules" in driver
+
+    def test_primary_issue_filter_runs_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Prefiltered issues should not be filtered again while building one run."""
+        result = create_initial_audit_result()
+        result.issues = [
+            Issue(
+                message="Primary dangerous call",
+                severity=IssueSeverity.CRITICAL,
+                location="/test/file.pkl",
+                details={"pickle_rule_code": "DANGEROUS_CALL"},
+                rule_code="S104",
+                timestamp=time.time(),
+            )
+        ]
+        result.finalize_statistics()
+
+        call_count = 0
+        original_primary_sarif_issues = sarif_formatter._primary_sarif_issues
+
+        def counting_primary_sarif_issues(issues: list[Issue]) -> list[Issue]:
+            nonlocal call_count
+            call_count += 1
+            return original_primary_sarif_issues(issues)
+
+        monkeypatch.setattr(sarif_formatter, "_primary_sarif_issues", counting_primary_sarif_issues)
+
+        _create_run(result, ["/test"], verbose=False)
+
+        assert call_count == 1
 
     def test_invocation_properties(self):
         """Test invocation includes scan properties."""
