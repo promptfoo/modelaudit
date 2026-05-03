@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
+
+
+### Bug Fixes
+
+* remove checked-in benchmark files ([#1220](https://github.com/promptfoo/modelaudit/issues/1220)) ([1e258e4](https://github.com/promptfoo/modelaudit/commit/1e258e48f43522853ba167463a5fae8d5533612a))
+
 ## [0.2.44](https://github.com/promptfoo/modelaudit/compare/v0.2.43...v0.2.44) (2026-05-03)
 
 ### Bug Fixes
