@@ -2,7 +2,7 @@
 
 import base64
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 from modelaudit.detectors.suspicious_symbols import (
@@ -127,6 +127,12 @@ def is_known_safe_keras_loss(identifier: Any) -> bool:
 def is_known_safe_keras_metric(identifier: Any) -> bool:
     """Return True when a serialized Keras metric identifier is known-safe."""
     return isinstance(identifier, str) and _normalize_keras_identifier(identifier) in _SAFE_KERAS_METRIC_IDENTIFIERS
+
+
+def find_case_insensitive_substrings(text: str, patterns: Iterable[str]) -> list[str]:
+    """Return configured substrings present in `text` using one lowercase pass."""
+    lowered = text.lower()
+    return [pattern for pattern in patterns if pattern in lowered]
 
 
 def iter_keras_serialized_identifiers(value: Any) -> Iterator[tuple[str, Any]]:
@@ -301,7 +307,7 @@ def check_lambda_dict_function(
         )
         return True
 
-    found_patterns = [p for p in _LAMBDA_DANGEROUS_PATTERNS if p in decoded_str.lower()]
+    found_patterns = find_case_insensitive_substrings(decoded_str, _LAMBDA_DANGEROUS_PATTERNS)
 
     if found_patterns:
         result.add_check(
