@@ -1832,6 +1832,37 @@ def test_scan_bytes_refreshes_call_graph_after_source_rewrite(
     assert _has_critical_call_graph_finding(dangerous_report, module_name, "invoke", "os.system")
 
 
+def test_scan_bytes_refreshes_invoked_import_fallback_after_source_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_rewritten_invoked_import_source"
+    module_path = module_dir / f"{module_name}.py"
+    module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+    payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo rewritten"))
+
+    try:
+        safe_report = scan_bytes(payload, source="rewritten-invoked-import-safe.pkl")
+
+        module_path.write_text(
+            "def invoke(command):\n    import modelaudit_tp_invoked_import_dependency\n    return command\n",
+            encoding="utf-8",
+        )
+        importlib.invalidate_caches()
+        dangerous_report = scan_bytes(payload, source="rewritten-invoked-import-dangerous.pkl")
+    finally:
+        _clear_call_graph_caches()
+
+    assert safe_report.verdict == SafetyVerdict.CLEAN
+    assert dangerous_report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(dangerous_report, module_name, "invoke", "builtins.__import__")
+
+
 def test_call_graph_propagates_wrapper_import_execution_fallbacks() -> None:
     calls = call_graph._calls_for_function("platform.mac_ver") or ()
 
