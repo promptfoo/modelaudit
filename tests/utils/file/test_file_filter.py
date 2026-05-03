@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from modelaudit.utils.file import filtering
 from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
 from modelaudit.utils.file.filtering import (
     _ZIP_MEMBER_SNIFF_LIMIT,
@@ -63,6 +64,20 @@ def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
 
 class TestFileFilter:
     """Test file filtering functionality."""
+
+    def test_metadata_routing_reuses_lowered_filename(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class CountingFilename(str):
+            lower_calls = 0
+
+            def lower(self) -> str:
+                self.lower_calls += 1
+                return super().lower()
+
+        filename = CountingFilename("README.notes.txt")
+        monkeypatch.setattr(filtering.os.path, "basename", lambda _path: filename)
+
+        assert should_skip_file("/ignored/path.txt", metadata_scanner_available=True) is False
+        assert filename.lower_calls == 1
 
     def test_skip_common_extensions(self):
         """Test that common non-model extensions are skipped."""
