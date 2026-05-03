@@ -19,7 +19,6 @@ class BenchmarkRecord:
 @dataclass(frozen=True)
 class ComparisonRow:
     name: str
-    persona: str
     workload: str
     target: str
     size: str
@@ -89,34 +88,30 @@ def _string_value(record: BenchmarkRecord, key: str) -> str:
     return value if isinstance(value, str) and value else "-"
 
 
-def _record_context(record: BenchmarkRecord | None) -> tuple[str, str, str, str, str]:
+def _record_context(record: BenchmarkRecord | None) -> tuple[str, str, str, str]:
     if record is None:
-        return "-", "-", "-", "-", "-"
+        return "-", "-", "-", "-"
 
-    persona = _string_value(record, "persona")
     workload = _string_value(record, "workload")
     target = _string_value(record, "path")
     size_bytes = _coerce_int(record.extra_info.get("bytes"))
     file_count = _coerce_int(record.extra_info.get("files"))
     file_count_label = str(file_count) if file_count is not None else "-"
 
-    return persona, workload, target, _format_bytes(size_bytes), file_count_label
+    return workload, target, _format_bytes(size_bytes), file_count_label
 
 
 def _merged_record_context(
     current_record: BenchmarkRecord,
     baseline_record: BenchmarkRecord,
-) -> tuple[str, str, str, str, str]:
-    current_persona, current_workload, current_target, current_size, current_files = _record_context(current_record)
-    baseline_persona, baseline_workload, baseline_target, baseline_size, baseline_files = _record_context(
-        baseline_record
-    )
-    persona = current_persona if current_persona != "-" else baseline_persona
+) -> tuple[str, str, str, str]:
+    current_workload, current_target, current_size, current_files = _record_context(current_record)
+    baseline_workload, baseline_target, baseline_size, baseline_files = _record_context(baseline_record)
     workload = current_workload if current_workload != "-" else baseline_workload
     target = current_target if current_target != "-" else baseline_target
     size = current_size if current_size != "-" else baseline_size
     files = current_files if current_files != "-" else baseline_files
-    return persona, workload, target, size, files
+    return workload, target, size, files
 
 
 def _format_change(delta_ratio: float) -> str:
@@ -149,19 +144,19 @@ def _build_summary(
             lines.append("")
             lines.append("Slowest benchmarks:")
             for record in sorted_current[:3]:
-                persona, workload, target, size, files = _record_context(record)
+                workload, target, size, files = _record_context(record)
                 lines.append(
                     f"- `{record.name}` at {_format_duration(record.median)} "
-                    f"({persona}/{workload}, {target}, size={size}, files={files})"
+                    f"({workload}, {target}, size={size}, files={files})"
                 )
         lines.append("")
-        lines.append("| Persona | Workload | Benchmark | Target | Size | Files | Median | Mean | Rounds |")
-        lines.append("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: |")
+        lines.append("| Workload | Benchmark | Target | Size | Files | Median | Mean | Rounds |")
+        lines.append("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |")
 
         for record in sorted_current:
-            persona, workload, target, size, files = _record_context(record)
+            workload, target, size, files = _record_context(record)
             lines.append(
-                f"| `{persona}` | `{workload}` | `{record.name}` | `{target}` | {size} | {files} | "
+                f"| `{workload}` | `{record.name}` | `{target}` | {size} | {files} | "
                 f"{_format_duration(record.median)} | {_format_duration(record.mean)} | {record.rounds} |"
             )
 
@@ -194,11 +189,10 @@ def _build_summary(
             status = "stable"
             stable_count += 1
 
-        persona, workload, target, size, files = _merged_record_context(current_record, baseline_record)
+        workload, target, size, files = _merged_record_context(current_record, baseline_record)
         comparison_rows.append(
             ComparisonRow(
                 name=name,
-                persona=persona,
                 workload=workload,
                 target=target,
                 size=size,
@@ -233,7 +227,7 @@ def _build_summary(
             lines.append(
                 f"- `{row.name}` {_format_change(row.delta_ratio)} "
                 f"({_format_duration(row.baseline_median)} -> {_format_duration(row.current_median)}, "
-                f"{row.persona}/{row.workload}, {row.target}, size={row.size}, files={row.files})"
+                f"{row.workload}, {row.target}, size={row.size}, files={row.files})"
             )
 
     lines.append("")
@@ -244,16 +238,16 @@ def _build_summary(
             lines.append(
                 f"- `{row.name}` {_format_change(row.delta_ratio)} "
                 f"({_format_duration(row.baseline_median)} -> {_format_duration(row.current_median)}, "
-                f"{row.persona}/{row.workload}, {row.target}, size={row.size}, files={row.files})"
+                f"{row.workload}, {row.target}, size={row.size}, files={row.files})"
             )
         lines.append("")
 
-    lines.append("| Persona | Workload | Benchmark | Target | Size | Files | Baseline | Current | Change | Status |")
-    lines.append("| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |")
+    lines.append("| Workload | Benchmark | Target | Size | Files | Baseline | Current | Change | Status |")
+    lines.append("| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |")
 
     for row in sorted_rows:
         lines.append(
-            f"| `{row.persona}` | `{row.workload}` | `{row.name}` | `{row.target}` | {row.size} | {row.files} | "
+            f"| `{row.workload}` | `{row.name}` | `{row.target}` | {row.size} | {row.files} | "
             f"{_format_duration(row.baseline_median)} | {_format_duration(row.current_median)} | "
             f"{_format_change(row.delta_ratio)} | {row.status} |"
         )

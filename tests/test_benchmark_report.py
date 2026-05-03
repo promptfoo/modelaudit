@@ -24,11 +24,7 @@ def _benchmark_entry(
     *,
     extra_info: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    metadata: dict[str, object] = {
-        "persona": "ml_engineer",
-        "workload": "single-checkpoint-preflight",
-        "path": name.split("::")[-1],
-    }
+    metadata: dict[str, object] = {"workload": "single-checkpoint-preflight", "path": name.split("::")[-1]}
     if extra_info is not None:
         metadata.update(extra_info)
 
@@ -80,7 +76,6 @@ def test_benchmark_report_summary_only(tmp_path: Path) -> None:
                 0.045,
                 0.046,
                 extra_info={
-                    "persona": "release_engineer",
                     "workload": "mixed-model-repository",
                     "path": "release-candidate",
                     "bytes": 2048,
@@ -110,18 +105,17 @@ def test_benchmark_report_summary_only(tmp_path: Path) -> None:
     assert "across `2` workloads" in completed.stdout
     assert "Aggregate median across all benchmarks" in completed.stdout
     summary_text = summary_file.read_text(encoding="utf-8")
-    assert "| Persona | Workload | Benchmark | Target | Size | Files | Median | Mean | Rounds |" in summary_text
-    assert "release_engineer" in summary_text
+    assert "| Workload | Benchmark | Target | Size | Files | Median | Mean | Rounds |" in summary_text
     assert "2.0 KiB" in summary_text
     table_rows = [line for line in summary_text.splitlines() if line.startswith("| `") and "test_scan_" in line]
     assert table_rows == [
         (
-            "| `release_engineer` | `mixed-model-repository` | "
+            "| `mixed-model-repository` | "
             "`tests/benchmarks/test_scan_benchmarks.py::test_scan_release_candidate_repository` | "
             "`release-candidate` | 2.0 KiB | 7 | 45.00ms | 46.00ms | 5 |"
         ),
         (
-            "| `ml_engineer` | `single-checkpoint-preflight` | "
+            "| `single-checkpoint-preflight` | "
             "`tests/benchmarks/test_scan_benchmarks.py::test_scan_single_checkpoint_before_load` | "
             "`single_checkpoint.pkl` | 1.0 KiB | 1 | 20.00ms | 21.00ms | 5 |"
         ),
@@ -275,7 +269,6 @@ def test_benchmark_report_uses_baseline_size_when_current_metadata_partial(tmp_p
                 0.100,
                 0.101,
                 extra_info={
-                    "persona": "platform_engineer",
                     "workload": "duplicate-heavy-registry",
                     "path": "baseline_dir",
                     "bytes": 2048,
@@ -307,9 +300,7 @@ def test_benchmark_report_uses_baseline_size_when_current_metadata_partial(tmp_p
     )
 
     assert completed.returncode == 0
-    expected_row_prefix = (
-        f"| `ml_engineer` | `single-checkpoint-preflight` | `{benchmark_name}` | `current_dir` | 2.0 KiB | 4 |"
-    )
+    expected_row_prefix = f"| `single-checkpoint-preflight` | `{benchmark_name}` | `current_dir` | 2.0 KiB | 4 |"
     assert expected_row_prefix in completed.stdout
 
 
@@ -328,7 +319,6 @@ def test_benchmark_report_top_improvements_and_mixed_metadata_fallback(tmp_path:
                 0.100,
                 0.101,
                 extra_info={
-                    "persona": "platform_engineer",
                     "workload": "duplicate-heavy-registry",
                     "path": "baseline_dir",
                     "bytes": 4096,
@@ -374,7 +364,5 @@ def test_benchmark_report_top_improvements_and_mixed_metadata_fallback(tmp_path:
     assert "Status: `0` regressions, `1` improved, `0` stable, `1` new, `1` missing." in completed.stdout
     assert "Top improvements:" in completed.stdout
     assert f"- `{improved_name}` -20.0%" in completed.stdout
-    expected_row_prefix = (
-        f"| `ml_engineer` | `single-checkpoint-preflight` | `{improved_name}` | `current_dir` | 4.0 KiB | 2 |"
-    )
+    expected_row_prefix = f"| `single-checkpoint-preflight` | `{improved_name}` | `current_dir` | 4.0 KiB | 2 |"
     assert expected_row_prefix in completed.stdout

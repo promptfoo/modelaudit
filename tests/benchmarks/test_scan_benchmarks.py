@@ -129,12 +129,10 @@ def _path_total_bytes(path: Path) -> int:
 def _benchmark_context(
     path: Path,
     *,
-    persona: str,
     workload: str,
     cache_state: str,
 ) -> dict[str, int | str]:
     return {
-        "persona": persona,
         "workload": workload,
         "path": path.name,
         "bytes": _path_total_bytes(path),
@@ -167,7 +165,6 @@ def _benchmark_scan(
     benchmark: Any,
     path: Path,
     *,
-    persona: str,
     workload: str,
     cache_enabled: bool = False,
     cache_dir: Path | None = None,
@@ -176,7 +173,6 @@ def _benchmark_scan(
     benchmark.extra_info.update(
         _benchmark_context(
             path,
-            persona=persona,
             workload=workload,
             cache_state=cache_state,
         )
@@ -198,7 +194,6 @@ def test_scan_single_checkpoint_before_load(benchmark: Any, benchmark_inputs: di
     result = _benchmark_scan(
         benchmark,
         benchmark_inputs["single_checkpoint"],
-        persona="ml_engineer",
         workload="single-checkpoint-preflight",
     )
 
@@ -210,7 +205,6 @@ def test_scan_release_candidate_repository(benchmark: Any, benchmark_inputs: dic
     result = _benchmark_scan(
         benchmark,
         benchmark_inputs["release_candidate"],
-        persona="release_engineer",
         workload="mixed-model-repository",
     )
 
@@ -222,7 +216,6 @@ def test_scan_duplicate_registry_snapshot(benchmark: Any, benchmark_inputs: dict
     result = _benchmark_scan(
         benchmark,
         benchmark_inputs["registry_snapshot"],
-        persona="platform_engineer",
         workload="duplicate-heavy-registry",
     )
 
@@ -234,7 +227,6 @@ def test_scan_suspicious_pickle_intake(benchmark: Any, benchmark_inputs: dict[st
     result = _benchmark_scan(
         benchmark,
         benchmark_inputs["suspicious_intake"],
-        persona="security_analyst",
         workload="suspicious-pickle-intake",
     )
 
@@ -264,7 +256,6 @@ def test_scan_warm_cached_repository_rescan(
         result = _benchmark_scan(
             benchmark,
             path,
-            persona="ci_operator",
             workload="warm-cache-rescan",
             cache_enabled=True,
             cache_dir=cache_dir,

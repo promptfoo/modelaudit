@@ -84,14 +84,12 @@ def standalone_pickle_payloads() -> dict[str, bytes]:
 def _benchmark_scan_bytes(
     benchmark: Any,
     *,
-    persona: str,
     workload: str,
     name: str,
     payload: bytes,
 ) -> Any:
     benchmark.extra_info.update(
         {
-            "persona": persona,
             "workload": workload,
             "path": name,
             "bytes": len(payload),
@@ -113,7 +111,6 @@ def test_picklescan_clean_training_checkpoint(
 ) -> None:
     report = _benchmark_scan_bytes(
         benchmark,
-        persona="ml_engineer",
         workload="clean-training-checkpoint",
         name="safe_large",
         payload=standalone_pickle_payloads["safe_large"],
@@ -130,7 +127,6 @@ def test_picklescan_direct_malicious_upload(
 ) -> None:
     report = _benchmark_scan_bytes(
         benchmark,
-        persona="security_analyst",
         workload="direct-malicious-upload",
         name="malicious_reduce",
         payload=standalone_pickle_payloads["malicious_reduce"],
@@ -149,7 +145,6 @@ def test_picklescan_nested_payload_review(
 ) -> None:
     report = _benchmark_scan_bytes(
         benchmark,
-        persona="security_analyst",
         workload="nested-payload-review",
         name=payload_name,
         payload=standalone_pickle_payloads[payload_name],
@@ -166,7 +161,6 @@ def test_picklescan_padded_multi_stream_upload(
 ) -> None:
     report = _benchmark_scan_bytes(
         benchmark,
-        persona="security_analyst",
         workload="padded-multi-stream-upload",
         name="multi_stream_padded",
         payload=standalone_pickle_payloads["multi_stream_padded"],
@@ -186,7 +180,6 @@ def test_picklescan_chunked_upload_stream(
     scanner = PickleScanner()
     benchmark.extra_info.update(
         {
-            "persona": "service_operator",
             "workload": "chunked-upload-stream",
             "path": "chunked_stream",
             "bytes": len(payload),

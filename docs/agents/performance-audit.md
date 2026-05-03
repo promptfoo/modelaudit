@@ -8,17 +8,8 @@ artifacts, and profiler output rather than in a growing diary here.
 
 ## What We Optimize For
 
-ModelAudit is used in a few meaningfully different ways. Benchmarks should map
-to those people and their real waits, not just to convenient helper functions.
-
-| Persona           | Real question                                          | Canonical workload                |
-| ----------------- | ------------------------------------------------------ | --------------------------------- |
-| ML engineer       | "Can I safely load this checkpoint?"                   | single checkpoint preflight       |
-| Release engineer  | "Is this model repo safe to ship?"                     | mixed model repository            |
-| Platform engineer | "How expensive is scanning stored artifacts at scale?" | duplicate-heavy registry snapshot |
-| Security analyst  | "How quickly can I triage suspicious uploads?"         | suspicious pickle intake          |
-| CI operator       | "How fast is a repeat scan after cache warm-up?"       | warm-cache repository re-scan     |
-| Service operator  | "What happens on streamed uploads?"                    | chunked upload stream             |
+Benchmarks should map to common scan shapes and real waits, not just to
+convenient helper functions.
 
 ## Benchmark Design Rules
 
@@ -26,8 +17,8 @@ to those people and their real waits, not just to convenient helper functions.
   release claims.
 - Keep benchmark corpora deterministic, generated under `tmp_path`, and small
   enough for CI while still resembling actual user inputs.
-- Tag every benchmark with `persona`, `workload`, `path`, `bytes`, and `files`
-  so the report explains what changed, not just which test name moved.
+- Tag every benchmark with `workload`, `path`, `bytes`, and `files` so the
+  report explains what changed, not just which test name moved.
 - Keep cache-disabled workloads and warm-cache workloads separate. Do not mix
   first-run and repeat-run timings into one number.
 - Preserve security meaning in the assertions. A benchmark for malicious input
@@ -46,23 +37,23 @@ The PR benchmark lane lives in:
 
 ### End-To-End Scanner Workloads
 
-| Workload                      | Persona             | Corpus shape                                                                      | Why it matters                   |
-| ----------------------------- | ------------------- | --------------------------------------------------------------------------------- | -------------------------------- |
-| `single-checkpoint-preflight` | `ml_engineer`       | one realistic pickle checkpoint                                                   | common local pre-load scan       |
-| `mixed-model-repository`      | `release_engineer`  | pickle, PyTorch ZIP, manifest, license, tokenizer, nested adapter, metadata files | repo-level release scan          |
-| `duplicate-heavy-registry`    | `platform_engineer` | repeated model versions plus manifests and docs                                   | duplicate-heavy stored artifacts |
-| `suspicious-pickle-intake`    | `security_analyst`  | known-good plus direct and encoded malicious pickles                              | security triage throughput       |
-| `warm-cache-rescan`           | `ci_operator`       | warmed repeat scan of the mixed repo                                              | repeated CI / local verification |
+| Workload                      | Corpus shape                                                                      | Why it matters                   |
+| ----------------------------- | --------------------------------------------------------------------------------- | -------------------------------- |
+| `single-checkpoint-preflight` | one realistic pickle checkpoint                                                   | common local pre-load scan       |
+| `mixed-model-repository`      | pickle, PyTorch ZIP, manifest, license, tokenizer, nested adapter, metadata files | repo-level release scan          |
+| `duplicate-heavy-registry`    | repeated model versions plus manifests and docs                                   | duplicate-heavy stored artifacts |
+| `suspicious-pickle-intake`    | known-good plus direct and encoded malicious pickles                              | suspicious-upload triage         |
+| `warm-cache-rescan`           | warmed repeat scan of the mixed repo                                              | repeated CI / local verification |
 
 ### Pickle Engine Workloads
 
-| Workload                     | Persona            | Why it stays                                       |
-| ---------------------------- | ------------------ | -------------------------------------------------- |
-| `clean-training-checkpoint`  | `ml_engineer`      | common benign pickle path                          |
-| `direct-malicious-upload`    | `security_analyst` | fast-path dangerous global detection               |
-| `nested-payload-review`      | `security_analyst` | encoded nested payloads remain a core bypass class |
-| `padded-multi-stream-upload` | `security_analyst` | concatenated stream handling is security-sensitive |
-| `chunked-upload-stream`      | `service_operator` | streamed scans exercise a different ingestion path |
+| Workload                     | Why it stays                                       |
+| ---------------------------- | -------------------------------------------------- |
+| `clean-training-checkpoint`  | common benign pickle path                          |
+| `direct-malicious-upload`    | fast-path dangerous global detection               |
+| `nested-payload-review`      | encoded nested payloads remain a core bypass class |
+| `padded-multi-stream-upload` | concatenated stream handling is security-sensitive |
+| `chunked-upload-stream`      | streamed scans exercise a different ingestion path |
 
 These are intentionally fewer and more meaningful than a long list of
 micro-probes. Add a new checked-in benchmark only when it represents a stable,
@@ -143,7 +134,7 @@ These are the main measured areas that still deserve attention:
 
 Before landing a performance change, record:
 
-1. Which persona and workload become faster.
+1. Which workload becomes faster.
 2. The baseline and new benchmark result.
 3. The code path that changed.
 4. The failure mode if the optimization is wrong.
