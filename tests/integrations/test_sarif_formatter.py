@@ -149,7 +149,15 @@ class TestCreateRun:
                 details={"pickle_rule_code": "DANGEROUS_CALL"},
                 rule_code="S104",
                 timestamp=time.time(),
-            )
+            ),
+            Issue(
+                message="Supporting import module",
+                severity=IssueSeverity.WARNING,
+                location="/test/file.pkl",
+                details={"supporting_rule_code": True, "primary_rule_code": "S104"},
+                rule_code="S100",
+                timestamp=time.time(),
+            ),
         ]
         result.finalize_statistics()
 
@@ -163,9 +171,11 @@ class TestCreateRun:
 
         monkeypatch.setattr(sarif_formatter, "_primary_sarif_issues", counting_primary_sarif_issues)
 
-        _create_run(result, ["/test"], verbose=False)
+        run = _create_run(result, ["/test"], verbose=False)
 
         assert call_count == 1
+        assert len(run["results"]) == 1
+        assert run["results"][0]["message"]["text"] == "Primary dangerous call"
 
     def test_invocation_properties(self):
         """Test invocation includes scan properties."""
@@ -551,9 +561,9 @@ class TestHelperFunctions:
         assert "pickle" in tags
         assert "deserialization" in tags
 
-    def test_get_tags_for_issue_code_execution(self):
+    def test_get_tags_for_issue_code_execution(self) -> None:
         """Test tags for code execution issues."""
-        issue = Issue(message="eval() import detected", severity=IssueSeverity.WARNING, timestamp=time.time())
+        issue = Issue(message="eval() call detected", severity=IssueSeverity.WARNING, timestamp=time.time())
 
         tags = _get_tags_for_issue(issue)
         assert "code-execution" in tags

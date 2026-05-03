@@ -1,6 +1,7 @@
 """Tests for SkopsScanner covering CVE-2025-54412, CVE-2025-54413, CVE-2025-54886."""
 
 import os
+import textwrap
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,10 @@ def _make_numeric_npy(element_count: int = 64) -> bytes:
     padding_len = (16 - ((10 + header_len) % 16)) % 16
     padded_header = header_bytes + (b" " * padding_len) + b"\n"
     return (
-        b"\x93NUMPY\x01\x00" + len(padded_header).to_bytes(2, "little") + padded_header + (b"\x00" * element_count * 8)
+        b"\x93NUMPY\x01\x00"
+        + len(padded_header).to_bytes(2, "little")
+        + padded_header
+        + (b"\x00" * (element_count * 8))
     )
 
 
@@ -58,6 +62,8 @@ def _assert_inconclusive_reason(metadata: Any, reason: str) -> None:
 
 
 def test_protocol_probe_reuses_lowered_member_names() -> None:
+    """Keep ZIP member normalization linear while probing large archives."""
+
     class CountingMemberName(str):
         lower_calls = 0
 
@@ -249,11 +255,13 @@ class TestSkopsScannerCVE2025_54886:
         """Test detection of Card.get_model with joblib references."""
         skops_file = tmp_path / "malicious.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
-            card_content = """
-            # Model Card
-            This model uses get_model() to load the model.
-            Fallback to joblib for compatibility.
-            """
+            card_content = textwrap.dedent(
+                """
+                # Model Card
+                This model uses get_model() to load the model.
+                Fallback to joblib for compatibility.
+                """
+            ).strip()
             zf.writestr("model_card.md", card_content)
             zf.writestr("schema.json", '{"version": "1.0"}')
 
@@ -270,10 +278,12 @@ class TestSkopsScannerCVE2025_54886:
         """Test detection of README with joblib fallback pattern."""
         skops_file = tmp_path / "malicious.skops"
         with zipfile.ZipFile(skops_file, "w") as zf:
-            readme_content = """
-            # Model README
-            Load the model using joblib.load() if skops fails.
-            """
+            readme_content = textwrap.dedent(
+                """
+                # Model README
+                Load the model using joblib.load() if skops fails.
+                """
+            ).strip()
             zf.writestr("README.md", readme_content)
             zf.writestr("schema.json", '{"version": "1.0"}')
 
