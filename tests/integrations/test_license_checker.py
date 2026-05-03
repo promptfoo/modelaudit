@@ -188,6 +188,39 @@ def some_function():
 
         assert [license_info.spdx_id for license_info in licenses] == ["MIT"]
 
+    def test_long_one_line_non_license_text_header_is_bounded(self, tmp_path: Path) -> None:
+        """Ordinary text-like payloads should not force a full-file line read."""
+        test_file = tmp_path / "payload.dat"
+        test_file.write_text(
+            "A" * (_LICENSE_HEADER_MAX_BYTES + 256) + " SPDX-License-Identifier: MIT\n",
+            encoding="utf-8",
+        )
+
+        content = _read_header_text(str(test_file), max_lines=1)
+        licenses = scan_for_license_headers(str(test_file), max_lines=1)
+
+        assert content is not None
+        assert len(content) <= _LICENSE_HEADER_MAX_BYTES
+        assert "SPDX-License-Identifier: MIT" not in content
+        assert licenses == []
+
+    def test_large_non_license_text_header_still_respects_max_lines(self, tmp_path: Path) -> None:
+        """Ordinary files should stay line-bounded even when the byte probe truncates."""
+        test_file = tmp_path / "payload.dat"
+        test_file.write_text(
+            "".join(f"line {index}\n" for index in range(10))
+            + "SPDX-License-Identifier: MIT\n"
+            + "A" * _LICENSE_HEADER_MAX_BYTES,
+            encoding="utf-8",
+        )
+
+        content = _read_header_text(str(test_file), max_lines=10)
+        licenses = scan_for_license_headers(str(test_file), max_lines=10)
+
+        assert content is not None
+        assert "SPDX-License-Identifier: MIT" not in content
+        assert licenses == []
+
 
 class TestCopyrightExtraction:
     """Test copyright notice extraction."""
