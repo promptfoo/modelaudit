@@ -10,7 +10,7 @@ import pytest
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.skops_scanner import SkopsScanner
 
 SAMPLES_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "assets", "samples")
@@ -55,6 +55,32 @@ def _scan_twice_with_cache(
 def _assert_inconclusive_reason(metadata: Any, reason: str) -> None:
     assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
     assert reason in metadata.get("scan_outcome_reasons", [])
+
+
+def test_protocol_probe_reuses_lowered_member_names() -> None:
+    class CountingMemberName(str):
+        lower_calls = 0
+
+        def lower(self) -> str:
+            self.lower_calls += 1
+            return super().lower()
+
+    class FakeZipFile:
+        def __init__(self, member_name: str) -> None:
+            self.member_name = member_name
+
+        def namelist(self) -> list[str]:
+            return [self.member_name]
+
+    member_name = CountingMemberName("archive/member.txt")
+
+    SkopsScanner()._check_protocol_version(
+        FakeZipFile(member_name),  # type: ignore[arg-type]
+        ScanResult(scanner_name="skops"),
+        "model.skops",
+    )
+
+    assert member_name.lower_calls == 1
 
 
 class TestSkopsScannerCanHandle:

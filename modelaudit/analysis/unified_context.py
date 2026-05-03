@@ -143,21 +143,20 @@ class UnifiedMLContext:
         layer_type_counts: dict[str, int] = {}
         for pattern in self.layer_patterns:
             layer_type_counts[pattern.layer_type] = layer_type_counts.get(pattern.layer_type, 0) + 1
+        lowered_layer_types = tuple(str(layer.layer_type).lower() for layer in self.layer_patterns)
 
         # Transformer detection
         transformer_indicators = ["attention", "multi_head", "position", "embedding"]
         transformer_score = sum(
             1
             for indicator in transformer_indicators
-            if any(indicator in str(layer.layer_type).lower() for layer in self.layer_patterns)
+            if any(indicator in layer_type for layer_type in lowered_layer_types)
         )
 
         # CNN detection
         cnn_indicators = ["conv", "pool", "batch_norm"]
         cnn_score = sum(
-            1
-            for indicator in cnn_indicators
-            if any(indicator in str(layer.layer_type).lower() for layer in self.layer_patterns)
+            1 for indicator in cnn_indicators if any(indicator in layer_type for layer_type in lowered_layer_types)
         )
 
         # Determine architecture

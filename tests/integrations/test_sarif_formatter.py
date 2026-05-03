@@ -2,6 +2,7 @@
 
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -448,6 +449,22 @@ class TestHelperFunctions:
 
         desc = _get_rule_short_description(issue)
         assert "pickle" in desc.lower()
+
+    def test_get_rule_short_description_reuses_lowered_message(self):
+        """Short-description matching should normalize the issue message once."""
+
+        class CountingMessage(str):
+            lower_calls = 0
+
+            def lower(self) -> str:
+                self.lower_calls += 1
+                return super().lower()
+
+        message = CountingMessage("Potential exposed secret")
+        issue = SimpleNamespace(message=message)
+
+        assert _get_rule_short_description(issue) == "Potential secrets or keys exposed"
+        assert message.lower_calls == 1
 
     def test_get_rule_short_description_import(self):
         """Test short description for import issues."""
