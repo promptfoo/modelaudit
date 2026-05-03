@@ -241,7 +241,8 @@ class SkopsScanner(BaseScanner):
         with suppress(Exception):
             # Check for schema or version files
             for file_name in zip_file.namelist():
-                if "schema" in file_name.lower() or "version" in file_name.lower() or "protocol" in file_name.lower():
+                lowered_file_name = file_name.lower()
+                if "schema" in lowered_file_name or "version" in lowered_file_name or "protocol" in lowered_file_name:
                     file_info = zip_file.getinfo(file_name)
                     raw_content = self._read_zip_entry_safely(zip_file, file_info, result=result, zip_path=zip_path)
                     if raw_content is None:
