@@ -8523,3 +8523,45 @@ if marker.read_text() != marker_content:
     )
     assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
+
+
+def test_calls_in_function_reuses_instance_alias_parameter_analysis(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = ast.parse(
+        """
+class Runner:
+    def execute(self, command):
+        pass
+
+def bridge(target, command):
+    runner = Runner(command)
+    runner.execute(command)
+    getattr(target, command)(command)
+"""
+    )
+    bridge = module.body[1]
+    assert isinstance(bridge, ast.FunctionDef)
+
+    calls = 0
+    original_parameter_controlled_names = call_graph._parameter_controlled_names
+
+    def counting_parameter_controlled_names(
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> set[str]:
+        nonlocal calls
+        calls += 1
+        return original_parameter_controlled_names(function_node)
+
+    monkeypatch.setattr(call_graph, "_parameter_controlled_names", counting_parameter_controlled_names)
+
+    resolved_calls = call_graph._calls_in_function(
+        bridge,
+        "benchmod",
+        False,
+        {},
+        {"Runner", "bridge"},
+        {"benchmod.Runner"},
+        {"benchmod.Runner": ("benchmod.Runner.execute",)},
+    )
+
+    assert "benchmod.Runner.execute" in resolved_calls
+    assert calls == 1
