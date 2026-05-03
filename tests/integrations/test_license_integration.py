@@ -45,11 +45,11 @@ class TestLicenseIntegration:
 
         # Should have no license warnings
         license_warnings = check_commercial_use_warnings(results)
-        [w for w in license_warnings if w.get("severity") != "debug"]
+        non_debug_warnings = [w for w in license_warnings if w.get("severity") != "debug"]
 
         # MIT is permissive, should not trigger warnings
-        agpl_warnings = [w for w in license_warnings if "AGPL" in w.get("message", "")]
-        nc_warnings = [w for w in license_warnings if "NonCommercial" in w.get("message", "")]
+        agpl_warnings = [w for w in non_debug_warnings if "AGPL" in w.get("message", "")]
+        nc_warnings = [w for w in non_debug_warnings if "NonCommercial" in w.get("message", "")]
 
         assert len(agpl_warnings) == 0, "MIT model should not trigger AGPL warnings"
         assert len(nc_warnings) == 0, "MIT model should not trigger non-commercial warnings"

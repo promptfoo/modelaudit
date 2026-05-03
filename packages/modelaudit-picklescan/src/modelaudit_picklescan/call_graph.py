@@ -32,6 +32,7 @@ _IMPORT_EXECUTION_SINK = "builtins.__import__"
 _IMPORT_EXECUTION_SAFE_MODULES = frozenset(sys.builtin_module_names)
 _PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS = ("__new__", "__init__")
 _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS = ("__setstate__",)
+_PICKLE_LIFECYCLE_ENTRYPOINT_METHOD_SET = frozenset(_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS)
 _PICKLE_ENTERED_IMPORT_EXECUTION_METHODS = (
     *_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS,
     *_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS,
@@ -57,6 +58,7 @@ _CLASS_ENTRYPOINT_METHODS = (
     *_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS,
     "__init__",
 )
+_CLASS_ENTRYPOINT_METHOD_SET = frozenset(_CLASS_ENTRYPOINT_METHODS)
 _RCE_SINK_EXACT = frozenset(
     {
         "asyncio.create_subprocess_exec",
@@ -2239,7 +2241,10 @@ def _import_execution_calls(
     module_name: str,
     is_package: bool,
 ) -> tuple[str, ...]:
-    if _has_required_user_arguments(function_node) and function_node.name not in _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS:
+    if (
+        _has_required_user_arguments(function_node)
+        and function_node.name not in _PICKLE_LIFECYCLE_ENTRYPOINT_METHOD_SET
+    ):
         return ()
     return _direct_import_execution_calls(function_node, module_name, is_package)
 
@@ -2315,7 +2320,7 @@ def _can_follow_import_execution_fallback(function_name: str, positional_arg_cou
 def _is_pickle_entered_import_execution_entrypoint(function_name: str) -> bool:
     _module_name, qualified_name = _split_source_qualified_name(function_name)
     class_name, _separator, method_name = qualified_name.rpartition(".")
-    if not class_name or method_name not in _CLASS_ENTRYPOINT_METHODS:
+    if not class_name or method_name not in _CLASS_ENTRYPOINT_METHOD_SET:
         return True
     return method_name in _PICKLE_ENTERED_IMPORT_EXECUTION_METHODS
 
@@ -2323,7 +2328,7 @@ def _is_pickle_entered_import_execution_entrypoint(function_name: str) -> bool:
 def _is_pickle_lifecycle_entrypoint(function_name: str) -> bool:
     _module_name, qualified_name = _split_source_qualified_name(function_name)
     class_name, _separator, method_name = qualified_name.rpartition(".")
-    return bool(class_name and method_name in _PICKLE_LIFECYCLE_ENTRYPOINT_METHODS)
+    return bool(class_name and method_name in _PICKLE_LIFECYCLE_ENTRYPOINT_METHOD_SET)
 
 
 def _can_enter_function_with_positional_args(

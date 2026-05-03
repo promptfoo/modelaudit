@@ -1102,6 +1102,7 @@ class TestIsTrustedUrlDomain:
         assert _is_trusted_url_domain("https://evil.gradio.app/p") is False
         assert _is_trusted_url_domain("https://evil.fastly.net/p") is False
         assert _is_trusted_url_domain("https://evil.azureedge.net/p") is False
+        # sourceforge.net is exact-match only; attacker-controlled subdomains stay untrusted.
         assert _is_trusted_url_domain("https://evil.sourceforge.net/p") is False
         assert _is_trusted_url_domain("https://evil.quay.io/p") is False
 
@@ -1114,6 +1115,7 @@ class TestIsTrustedUrlDomain:
         assert _is_trusted_url_domain("https://github.io/page") is True
         assert _is_trusted_url_domain("https://cloudfront.net/res") is True
         assert _is_trusted_url_domain("https://readthedocs.io/docs") is True
+        assert _is_trusted_url_domain("https://sourceforge.net/project") is True
 
     def test_userinfo_bypass_blocked(self) -> None:
         """URLs with userinfo (user@host) must NOT be trusted."""

@@ -22,12 +22,13 @@ from modelaudit.scanners.pickle_scanner import (
     _is_legitimate_serialization_file,
     _looks_like_pickle,
     _pickle_opcode_summary,
+    _rebuild_tensor_indicators_are_documentation_literals,
     is_suspicious_global,
 )
 from tests.helpers import create_mock_pytorch_zip
 
 EXPECTED_SYSTEM_GLOBAL = "nt.system" if os.name == "nt" else "posix.system"
-BYPASS_V4_REFERENCES: tuple[tuple[str, str, IssueSeverity], ...] = (
+BYPASS_V4_REFERENCES_TEST_CASES: tuple[tuple[str, str, IssueSeverity], ...] = (
     ("ctypes", "CDLL", IssueSeverity.CRITICAL),
     ("ctypes", "cast", IssueSeverity.CRITICAL),
     ("cProfile", "run", IssueSeverity.CRITICAL),
@@ -66,7 +67,8 @@ def _short_binunicode(data: bytes) -> bytes:
 
 
 def _binary_opcode_os_system_reduce_payload() -> bytes:
-    return _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93" + _short_binunicode(b"true") + b"\x85R."
+    # The command text is inert here; the scanner only needs a realistic GLOBAL/REDUCE payload shape.
+    return _short_binunicode(b"os") + _short_binunicode(b"system") + b"\x93" + _short_binunicode(b"echo") + b"\x85R."
 
 
 def _binary_opcode_stack_global_probe_decoy() -> bytes:
@@ -736,8 +738,8 @@ def test_comment_token_does_not_bypass_main_stack_global_detection(tmp_path: Pat
     )
 
 
-@pytest.mark.parametrize(("module", "func", "expected_severity"), BYPASS_V4_REFERENCES)
-def test_deleted_bypass_v4_generator_references_remain_covered(
+@pytest.mark.parametrize(("module", "func", "expected_severity"), BYPASS_V4_REFERENCES_TEST_CASES)
+def test_bypass_v4_references_still_detected(
     module: str,
     func: str,
     expected_severity: IssueSeverity,
@@ -1369,6 +1371,18 @@ def test_raw_cve_attributions_are_deduplicated_by_rule(
     assert len(result.metadata["cve_attributions"]) == 1
 
 
+def test_analyze_cve_patterns_deduplicates_attributions() -> None:
+    from modelaudit.detectors import cve_patterns
+
+    attributions = cve_patterns.analyze_cve_patterns(
+        "_rebuild_tensor SETITEM _rebuild_tensor SETITEM",
+    )
+    cve_ids = [attribution.cve_id for attribution in attributions]
+
+    assert cve_ids.count("CVE-2026-24747") == 1
+    assert len(cve_ids) == len(set(cve_ids))
+
+
 def test_raw_cve_comment_only_text_does_not_trigger_setitem(tmp_path: Path) -> None:
     path = tmp_path / "comment-only.pkl"
     path.write_bytes(
@@ -1390,6 +1404,16 @@ def test_raw_cve_rebuild_tensor_global_is_not_suppressed_by_documentation_litera
 
     assert any(issue.details.get("cve_id") == "CVE-2026-24747" for issue in result.issues)
     assert result.metadata["primary_cve"] == "CVE-2026-24747"
+
+
+def test_rebuild_tensor_documentation_literal_detector_behavior() -> None:
+    doc_only_payload = pickle.dumps({"doc": "# _rebuild_tensor\n# documentation only"}, protocol=4)
+    real_global_payload = (
+        b"(dS'doc'\nS'# _rebuild_tensor\\n# documentation only'\nsctorch\n_rebuild_tensor_v2\nS'value'\ns."
+    )
+
+    assert _rebuild_tensor_indicators_are_documentation_literals(doc_only_payload) is True
+    assert _rebuild_tensor_indicators_are_documentation_literals(real_global_payload) is False
 
 
 def test_raw_cve_rebuild_tensor_doc_filter_uses_rust_import_metadata(
