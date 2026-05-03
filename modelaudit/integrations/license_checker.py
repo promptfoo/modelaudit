@@ -2,7 +2,7 @@ import itertools
 import json
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, MutableMapping
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -181,9 +181,11 @@ def _read_header_text(file_path: str, max_lines: int) -> str | None:
     decoded_header = header_sample.decode("utf-8", errors="ignore")
     if not has_more_bytes:
         return "".join(decoded_header.splitlines(keepends=True)[:max_lines])
+    if not _is_explicit_license_file(file_path):
+        return "".join(decoded_header.splitlines(keepends=True)[:max_lines])
 
-    # Likely text files should keep the original line-oriented behavior so
-    # long one-line headers are not silently truncated by the binary cap.
+    # Explicit license files keep the richer line-oriented behavior so long
+    # one-line license notices are not silently truncated by the byte cap.
     try:
         with open(file_path, encoding="utf-8", errors="ignore") as f:
             return "".join(itertools.islice(f, max_lines))
@@ -191,8 +193,13 @@ def _read_header_text(file_path: str, max_lines: int) -> str | None:
         return None
 
 
-def _content_has_prefilter_term(content: str, terms: tuple[str, ...]) -> bool:
-    lowered = content.lower()
+def _content_has_prefilter_term(
+    content: str,
+    terms: tuple[str, ...],
+    *,
+    lowered_content: str | None = None,
+) -> bool:
+    lowered = lowered_content if lowered_content is not None else content.lower()
     return any(term in lowered for term in terms)
 
 
@@ -240,6 +247,11 @@ LICENSE_FILES = {
     "terms.txt",
 }
 
+
+def _is_explicit_license_file(file_path: str) -> bool:
+    return Path(file_path).name.lower() in LICENSE_FILES
+
+
 # Dataset file patterns that often lack proper licensing
 DATASET_EXTENSIONS = {
     ".csv",
@@ -256,9 +268,13 @@ DATASET_EXTENSIONS = {
 MODEL_EXTENSIONS = COMMON_MODEL_EXTENSIONS
 
 
-def _scan_license_headers_from_content(content: str) -> list[LicenseInfo]:
+def _scan_license_headers_from_content(
+    content: str,
+    *,
+    lowered_content: str | None = None,
+) -> list[LicenseInfo]:
     licenses: list[LicenseInfo] = []
-    if not _content_has_prefilter_term(content, _LICENSE_PREFILTER_TERMS):
+    if not _content_has_prefilter_term(content, _LICENSE_PREFILTER_TERMS, lowered_content=lowered_content):
         return licenses
 
     # Search for license patterns
@@ -296,9 +312,13 @@ def scan_for_license_headers(file_path: str, max_lines: int = 50) -> list[Licens
     return _scan_license_headers_from_content(content)
 
 
-def _extract_copyright_notices_from_content(content: str) -> list[CopyrightInfo]:
+def _extract_copyright_notices_from_content(
+    content: str,
+    *,
+    lowered_content: str | None = None,
+) -> list[CopyrightInfo]:
     copyrights: list[CopyrightInfo] = []
-    if not _content_has_prefilter_term(content, _COPYRIGHT_PREFILTER_TERMS):
+    if not _content_has_prefilter_term(content, _COPYRIGHT_PREFILTER_TERMS, lowered_content=lowered_content):
         return copyrights
 
     # Search for copyright patterns
@@ -385,6 +405,7 @@ def detect_unlicensed_datasets(
 
     # Check if this looks like an ML model directory
     is_ml_model_dir = _is_ml_model_directory(file_paths)
+    sibling_filenames_by_directory: dict[Path, frozenset[str]] = {}
 
     for file_path in file_paths:
         ext = Path(file_path).suffix.lower()
@@ -401,11 +422,14 @@ def detect_unlicensed_datasets(
 
             # Check if there's a nearby license file
             dir_path = Path(file_path).parent
-            try:
-                existing_files = {f.name.lower() for f in dir_path.iterdir() if f.is_file()}
-                has_license = bool(LICENSE_FILES & existing_files)
-            except OSError:
-                has_license = False
+            existing_files = sibling_filenames_by_directory.get(dir_path)
+            if existing_files is None:
+                try:
+                    existing_files = frozenset(f.name.lower() for f in dir_path.iterdir() if f.is_file())
+                except OSError:
+                    existing_files = frozenset()
+                sibling_filenames_by_directory[dir_path] = existing_files
+            has_license = bool(LICENSE_FILES & existing_files)
 
             if not has_license:
                 # Reuse metadata gathered during the scan when available.
@@ -737,7 +761,11 @@ def check_commercial_use_warnings(scan_results: dict[str, Any] | Any, *, strict:
     return warnings
 
 
-def collect_license_metadata(file_path: str) -> dict[str, Any]:
+def collect_license_metadata(
+    file_path: str,
+    *,
+    nearby_license_cache: MutableMapping[str, list[str]] | None = None,
+) -> dict[str, Any]:
     """
     Collect comprehensive license metadata for a file.
 
@@ -762,8 +790,12 @@ def collect_license_metadata(file_path: str) -> dict[str, Any]:
 
     content = _read_header_text(file_path, max_lines=50)
 
+    lowered_content = content.lower() if content is not None else None
+
     # Scan for license headers
-    licenses = _scan_license_headers_from_content(content) if content is not None else []
+    licenses = (
+        _scan_license_headers_from_content(content, lowered_content=lowered_content) if content is not None else []
+    )
     metadata["license_info"] = [
         {
             "spdx_id": lic.spdx_id,
@@ -776,7 +808,9 @@ def collect_license_metadata(file_path: str) -> dict[str, Any]:
     ]
 
     # Extract copyright notices
-    copyrights = _extract_copyright_notices_from_content(content) if content is not None else []
+    copyrights = (
+        _extract_copyright_notices_from_content(content, lowered_content=lowered_content) if content is not None else []
+    )
     metadata["copyright_notices"] = [
         {
             "holder": cr.holder,
@@ -789,7 +823,14 @@ def collect_license_metadata(file_path: str) -> dict[str, Any]:
     # Find nearby license files
     if os.path.isfile(file_path):
         dir_path = str(Path(file_path).parent)
-        nearby_licenses = find_license_files(dir_path)
+        if nearby_license_cache is None:
+            nearby_licenses = find_license_files(dir_path)
+        else:
+            cached_nearby_licenses = nearby_license_cache.get(dir_path)
+            if cached_nearby_licenses is None:
+                cached_nearby_licenses = find_license_files(dir_path)
+                nearby_license_cache[dir_path] = cached_nearby_licenses
+            nearby_licenses = cached_nearby_licenses
         metadata["license_files_nearby"] = nearby_licenses
 
     return metadata

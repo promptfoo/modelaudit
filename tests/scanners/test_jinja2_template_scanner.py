@@ -60,6 +60,19 @@ def test_directory_scan_preserves_path_sensitive_yaml_routing(tmp_path: Path) ->
     assert not any(issue.location and str(misc_file) in issue.location for issue in result.issues)
 
 
+def test_jinja_scanner_reuses_precompiled_patterns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scanner construction should reuse the shared static regex set."""
+
+    def fail_compile(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("unexpected regex compilation")
+
+    monkeypatch.setattr(jinja2_template_scanner.re, "compile", fail_compile)
+
+    scanner = Jinja2TemplateScanner()
+
+    assert scanner._compiled_patterns
+
+
 class TestJinja2TemplateScannerCanHandle:
     """Test the can_handle method."""
 
