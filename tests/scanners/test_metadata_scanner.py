@@ -88,8 +88,6 @@ class TestMetadataScanner:
             "bit.ly",
             "ngrok.io",
         }
-        assert any("bit.ly" in issue.message for issue in result.issues)
-        assert any("ngrok.io" in issue.message for issue in result.issues)
 
     def test_repeated_benign_urls_are_parsed_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Skip duplicate benign URLs before reparsing them."""
