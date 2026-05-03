@@ -2120,21 +2120,20 @@ def _calls_in_function(
         **aliases,
         **_collect_function_import_aliases(function_node, module_name, is_package),
     }
-    function_aliases.update(
-        _collect_function_instance_aliases(
-            function_node,
-            call_nodes,
-            module_name,
-            function_aliases,
-            local_defs,
-            local_class_targets,
-            class_name=class_name,
-        )
+    instance_aliases, parameter_controlled_names = _collect_function_instance_aliases(
+        function_node,
+        call_nodes,
+        module_name,
+        function_aliases,
+        local_defs,
+        local_class_targets,
+        class_name=class_name,
     )
-    parameter_controlled_names: set[str] | None = None
+    function_aliases.update(instance_aliases)
     tcl_command_controlled_names: set[str] | None = None
     dynamic_getattr_callable_names: set[str] | None = None
     getattr_default_callable_names: dict[str, str] | None = None
+    assignment_call_candidates: tuple[tuple[set[str], ast.Call], ...] | None = None
     may_use_getattr_dispatch = _may_use_getattr_dispatch(call_nodes, function_aliases)
     for node in call_nodes:
         if may_use_getattr_dispatch:
@@ -2152,8 +2151,10 @@ def _calls_in_function(
                 continue
             if isinstance(node.func, ast.Name):
                 if dynamic_getattr_callable_names is None:
+                    if assignment_call_candidates is None:
+                        assignment_call_candidates = _function_assignment_call_candidates(function_node)
                     dynamic_getattr_callable_names = _controlled_getattr_callable_names(
-                        function_node,
+                        assignment_call_candidates,
                         module_name,
                         function_aliases,
                         local_defs,
@@ -2166,8 +2167,10 @@ def _calls_in_function(
                     calls.append(_CONTROLLED_GETATTR_DISPATCH_SINK)
                     continue
                 if getattr_default_callable_names is None:
+                    if assignment_call_candidates is None:
+                        assignment_call_candidates = _function_assignment_call_candidates(function_node)
                     getattr_default_callable_names = _getattr_default_callable_names(
-                        function_node,
+                        assignment_call_candidates,
                         call_nodes,
                         module_name,
                         function_aliases,
@@ -2385,7 +2388,7 @@ def _is_controlled_direct_getattr_dispatch(
 
 
 def _controlled_getattr_callable_names(
-    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    assignment_call_candidates: tuple[tuple[set[str], ast.Call], ...],
     module_name: str,
     aliases: dict[str, str],
     local_defs: set[str],
@@ -2394,20 +2397,7 @@ def _controlled_getattr_callable_names(
     class_name: str | None,
 ) -> set[str]:
     callable_names: set[str] = set()
-    for node in ast.walk(function_node):
-        value: ast.AST | None
-        if isinstance(node, ast.Assign):
-            value = node.value
-            targets = set()
-            for target in node.targets:
-                targets.update(_assignment_target_names(target))
-        elif isinstance(node, ast.AnnAssign):
-            value = node.value
-            targets = _assignment_target_names(node.target)
-        else:
-            continue
-        if not isinstance(value, ast.Call):
-            continue
+    for targets, value in assignment_call_candidates:
         if _controlled_getattr_call(
             value,
             module_name,
@@ -2438,7 +2428,7 @@ def _controlled_getattr_call(
 
 
 def _getattr_default_callable_names(
-    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    assignment_call_candidates: tuple[tuple[set[str], ast.Call], ...],
     call_nodes: tuple[ast.Call, ...],
     module_name: str,
     aliases: dict[str, str],
@@ -2451,20 +2441,7 @@ def _getattr_default_callable_names(
         return {}
 
     callable_names: dict[str, str] = {}
-    for node in ast.walk(function_node):
-        value: ast.AST | None
-        if isinstance(node, ast.Assign):
-            value = node.value
-            targets = set()
-            for target in node.targets:
-                targets.update(_assignment_target_names(target))
-        elif isinstance(node, ast.AnnAssign):
-            value = node.value
-            targets = _assignment_target_names(node.target)
-        else:
-            continue
-        if not isinstance(value, ast.Call):
-            continue
+    for targets, value in assignment_call_candidates:
         target_names = targets & called_names
         if not target_names:
             continue
@@ -2480,6 +2457,27 @@ def _getattr_default_callable_names(
         for target_name in sorted(target_names):
             callable_names[target_name] = fallback_target
     return callable_names
+
+
+def _function_assignment_call_candidates(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> tuple[tuple[set[str], ast.Call], ...]:
+    candidates: list[tuple[set[str], ast.Call]] = []
+    for node in ast.walk(function_node):
+        value: ast.AST | None
+        if isinstance(node, ast.Assign):
+            value = node.value
+            targets = set()
+            for target in node.targets:
+                targets.update(_assignment_target_names(target))
+        elif isinstance(node, ast.AnnAssign):
+            value = node.value
+            targets = _assignment_target_names(node.target)
+        else:
+            continue
+        if isinstance(value, ast.Call):
+            candidates.append((targets, value))
+    return tuple(candidates)
 
 
 def _getattr_default_callable_target(
@@ -2505,10 +2503,10 @@ def _collect_function_instance_aliases(
     local_class_targets: set[str],
     *,
     class_name: str | None,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], set[str] | None]:
     receiver_names = _method_call_receiver_names(call_nodes)
     if not receiver_names:
-        return {}
+        return {}, None
 
     assignment_candidates = tuple(
         (node, target_names)
@@ -2517,7 +2515,7 @@ def _collect_function_instance_aliases(
         and (target_names := _assignment_alias_target_names(node) & receiver_names)
     )
     if not assignment_candidates:
-        return {}
+        return {}, None
 
     instance_aliases: dict[str, str] = {}
     controlled_names = _parameter_controlled_names(function_node)
@@ -2539,8 +2537,8 @@ def _collect_function_instance_aliases(
                 continue
             instance_aliases[target_name] = resolved
             if len(instance_aliases) >= _MAX_FUNCTION_INSTANCE_ALIASES:
-                return instance_aliases
-    return instance_aliases
+                return instance_aliases, controlled_names
+    return instance_aliases, controlled_names
 
 
 def _method_call_receiver_names(call_nodes: tuple[ast.Call, ...]) -> set[str]:

@@ -244,6 +244,7 @@ class XGBoostScanner(BaseScanner):
     )
     _BINARY_MIN_STRUCTURE_BYTES: ClassVar[int] = 32
     _LEGACY_HEADER_BYTES: ClassVar[int] = 136
+    _LEGACY_HEADER_PATTERNS: ClassVar[tuple[str, ...]] = ("gbtree", "gblinear", "dart", "reg:", "binary:", "multi:")
     _BINARY_SIGNATURE: ClassVar[bytes] = b"binf"
     _MAX_LEGACY_HEADER_MAJOR_VERSION: ClassVar[int] = 3
     _MAX_LEGACY_HEADER_MINOR_VERSION: ClassVar[int] = 100
@@ -286,6 +287,11 @@ class XGBoostScanner(BaseScanner):
         result.finish(
             success=not result.has_errors and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
         )
+
+    @classmethod
+    def _find_legacy_header_patterns(cls, header_text: str) -> list[str]:
+        lowered_header = header_text.lower()
+        return [pattern for pattern in cls._LEGACY_HEADER_PATTERNS if pattern in lowered_header]
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -1026,8 +1032,7 @@ class XGBoostScanner(BaseScanner):
                 # The legacy binary format starts with `binf`; marker strings
                 # alone can be planted in arbitrary text payloads.
                 header_str = header.decode("utf-8", errors="ignore")
-                expected_patterns = ["gbtree", "gblinear", "dart", "reg:", "binary:", "multi:"]
-                patterns_found = [pattern for pattern in expected_patterns if pattern in header_str.lower()]
+                patterns_found = self._find_legacy_header_patterns(header_str)
                 has_binary_signature = header.startswith(self._BINARY_SIGNATURE)
                 has_headerless_legacy_structure = self._looks_like_headerless_legacy_binary(header)
 

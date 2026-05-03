@@ -14,6 +14,19 @@ from modelaudit.scanners.metadata_scanner import MetadataScanner
 class TestMetadataScanner:
     """Test metadata scanner functionality."""
 
+    def test_known_secret_format_reuses_lowered_description(self) -> None:
+        class CountingDescription(str):
+            lower_calls = 0
+
+            def lower(self) -> str:
+                self.lower_calls += 1
+                return super().lower()
+
+        description = CountingDescription("OpenAI API Key")
+
+        assert MetadataScanner._is_known_secret_format(description) is True
+        assert description.lower_calls == 1
+
     def test_can_handle_text_metadata(self):
         """Test that scanner handles text metadata files only."""
         scanner = MetadataScanner()
