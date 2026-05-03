@@ -2,6 +2,9 @@
 
 from pathlib import Path
 
+import pytest
+
+from modelaudit.detectors import jit_script as jit_script_module
 from modelaudit.detectors.jit_script import JITScriptDetector, detect_jit_script_risks
 
 
@@ -118,6 +121,16 @@ class TestJITScriptDetector:
         assert any("os" in getattr(f, "import_", "") for f in findings)
         assert any("subprocess" in getattr(f, "import_", "") for f in findings)
         assert any(f.severity == "CRITICAL" for f in findings)
+
+    def test_known_dangerous_import_reuses_compiled_patterns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Known import checks should not rebuild regex source at call time."""
+
+        def fail_escape(_value: str) -> str:
+            raise AssertionError("known import checks should reuse compiled patterns")
+
+        monkeypatch.setattr(jit_script_module.re, "escape", fail_escape)
+
+        assert JITScriptDetector._contains_dangerous_import("import os\n", "os") is True
 
     def test_scan_torchscript_checks_unmarked_python_blobs(self) -> None:
         """Raw Python payloads should be analyzed even without TorchScript markers."""
