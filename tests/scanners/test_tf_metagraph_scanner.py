@@ -13,6 +13,8 @@ from modelaudit.scanners.tf_metagraph_scanner import (
     _MAX_PARSE_BYTES,
     DISCOVERY_ASSUMPTIONS,
     TensorFlowMetaGraphScanner,
+    _attr_strings_with_lowered_values,
+    _AttrString,
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 
@@ -73,6 +75,22 @@ def _build_metagraph(
                 collection.bytes_list.value.append(value)
 
     return cast(bytes, metagraph.SerializeToString())
+
+
+def test_tf_metagraph_attr_lowering_reuses_shared_values() -> None:
+    class CountingStr(str):
+        lower_calls = 0
+
+        def lower(self) -> str:
+            type(self).lower_calls += 1
+            return super().lower()
+
+    attr_value = CountingStr("BASE64 payload")
+
+    lowered_values = _attr_strings_with_lowered_values((_AttrString("payload", attr_value, len(attr_value)),))
+
+    assert lowered_values == ((_AttrString("payload", attr_value, len(attr_value)), "base64 payload"),)
+    assert CountingStr.lower_calls == 1
 
 
 def test_tf_metagraph_scanner_can_handle_strict(tmp_path: Path) -> None:

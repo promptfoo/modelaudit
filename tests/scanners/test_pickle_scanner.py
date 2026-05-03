@@ -17,6 +17,7 @@ from modelaudit.scanners.pickle_scanner import (
     ALWAYS_DANGEROUS_MODULES,
     PickleScanner,
     _contains_any_jax_indicator,
+    _hex_token_has_execution_seed,
     _is_dangerous_module,
     _is_legitimate_serialization_file,
     _looks_like_pickle,
@@ -529,6 +530,18 @@ def test_scan_stream_detects_base64_encoded_execution_text(encoded: str, pattern
     assert encoded_issues[0].details["pattern"] == pattern
     assert encoded_issues[0].details["legacy_rule_aliases"] == ["S104"]
     assert not any(issue.message.startswith("Legacy encoded dangerous pattern detected") for issue in result.issues)
+
+
+def test_hex_token_seed_gate_reuses_lowered_token() -> None:
+    class CountingBytes(bytes):
+        lower_calls = 0
+
+        def lower(self) -> bytes:
+            type(self).lower_calls += 1
+            return super().lower()
+
+    assert _hex_token_has_execution_seed(CountingBytes(b"AA" * 4096)) is False
+    assert CountingBytes.lower_calls == 1
 
 
 def test_scan_stream_detects_pem_private_key_after_seed_tightening() -> None:
