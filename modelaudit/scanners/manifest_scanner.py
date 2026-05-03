@@ -419,6 +419,19 @@ TRUSTED_URL_EXACT_DOMAINS = {
     "sourceforge.net",
     "streamlit.io",
 }
+_NORMALIZED_TRUSTED_URL_DOMAINS: Final[frozenset[str]] = frozenset(
+    domain.lower().rstrip(".") for domain in TRUSTED_URL_DOMAINS
+)
+_NORMALIZED_TRUSTED_URL_EXACT_DOMAINS: Final[frozenset[str]] = frozenset(
+    domain.lower().rstrip(".") for domain in TRUSTED_URL_EXACT_DOMAINS
+)
+_TRUSTED_URL_SUBDOMAIN_SUFFIXES: Final[tuple[str, ...]] = tuple(
+    dict.fromkeys(
+        normalized_domain
+        for domain in TRUSTED_URL_DOMAINS
+        if (normalized_domain := domain.lower().rstrip(".")) not in _NORMALIZED_TRUSTED_URL_EXACT_DOMAINS
+    )
+)
 
 # Regex to find URLs in text
 URL_PATTERN = re.compile(r'https?://[^\s<>"\']+[^\s<>"\',.]')
@@ -485,15 +498,10 @@ def _is_trusted_url_domain(url: str) -> bool:
     if _is_trusted_s3_endpoint_host(host):
         return True
 
-    for domain in TRUSTED_URL_DOMAINS:
-        trusted = domain.lower().rstrip(".")
-        if host == trusted:
-            return True
-        if trusted in TRUSTED_URL_EXACT_DOMAINS:
-            continue
-        if host.endswith(f".{trusted}"):
-            return True
-    return False
+    if host in _NORMALIZED_TRUSTED_URL_DOMAINS:
+        return True
+
+    return any(host.endswith(f".{trusted}") for trusted in _TRUSTED_URL_SUBDOMAIN_SUFFIXES)
 
 
 class ManifestScanner(BaseScanner):
@@ -604,6 +612,7 @@ class ManifestScanner(BaseScanner):
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
+        self._manifest_text_cache: dict[str, str] = {}
 
         try:
             # Store the file path for use in issue locations
@@ -722,6 +731,8 @@ class ManifestScanner(BaseScanner):
             )
             result.finish(success=False)
             return result
+        finally:
+            self._manifest_text_cache.clear()
 
         self._finish_manifest_result(result)
         return result
@@ -754,8 +765,7 @@ class ManifestScanner(BaseScanner):
             return
 
         try:
-            with open(path, encoding="utf-8") as f:
-                content = f.read().lower()
+            content = self._read_manifest_text(path).lower()
 
             found_blacklisted = False
             for pattern in self.blacklist_patterns:
@@ -807,8 +817,7 @@ class ManifestScanner(BaseScanner):
     ) -> Any:
         """Parse the file based on its extension"""
         try:
-            with open(path, encoding="utf-8") as f:
-                content = f.read()
+            content = self._read_manifest_text(path)
 
             stripped_content = content.strip()
 
@@ -1010,8 +1019,7 @@ class ManifestScanner(BaseScanner):
         - Supply chain risks from external resources
         """
         try:
-            with open(path, encoding="utf-8") as f:
-                content = f.read()
+            content = self._read_manifest_text(path)
 
             self._check_timeout()
             seen_urls: set[str] = set()
@@ -1060,6 +1068,18 @@ class ManifestScanner(BaseScanner):
             raise
         except Exception as e:
             logger.debug(f"Error checking cloud storage URLs in {path}: {e}")
+
+    def _read_manifest_text(self, path: str) -> str:
+        cached_content = getattr(self, "_manifest_text_cache", {}).get(path)
+        if cached_content is not None:
+            return cached_content
+
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+
+        if hasattr(self, "_manifest_text_cache"):
+            self._manifest_text_cache[path] = content
+        return content
 
     def _check_suspicious_urls(self, content: Any, result: ScanResult) -> None:
         """Check for untrusted URLs in config values using allowlist approach.
