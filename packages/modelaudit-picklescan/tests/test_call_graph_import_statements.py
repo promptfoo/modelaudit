@@ -79,6 +79,7 @@ def _clear_call_graph_caches() -> None:
         "_resolve_function_target",
         "_resolve_module_source",
         "_safe_call_graph_entrypoints",
+        "_parameter_controlled_names",
         "_split_function_name",
         "_wildcard_export_summary",
         "_module_source_context",
@@ -136,6 +137,39 @@ def test_shared_source_sensitive_caches_clears_once_per_scope(monkeypatch: pytes
 
 def _env_without_pythonpath() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+
+
+def test_parameter_controlled_names_reuses_cached_analysis(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = ast.parse(
+        """
+def bridge(command):
+    alias = command
+    return alias
+"""
+    )
+    bridge = module.body[0]
+    assert isinstance(bridge, ast.FunctionDef)
+
+    calls = 0
+    original_initial_parameter_controlled_names = call_graph._initial_parameter_controlled_names
+
+    def counting_initial_parameter_controlled_names(
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> set[str]:
+        nonlocal calls
+        calls += 1
+        return original_initial_parameter_controlled_names(function_node)
+
+    monkeypatch.setattr(
+        call_graph,
+        "_initial_parameter_controlled_names",
+        counting_initial_parameter_controlled_names,
+    )
+    call_graph._parameter_controlled_names.cache_clear()
+
+    assert call_graph._parameter_controlled_names(bridge) == {"command", "alias"}
+    assert call_graph._parameter_controlled_names(bridge) == {"command", "alias"}
+    assert calls == 1
 
 
 def test_split_function_name_reuses_cached_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
