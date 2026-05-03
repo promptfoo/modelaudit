@@ -70,26 +70,8 @@ def _global_call_payload(module: str, name: str, *arg_operands: bytes) -> bytes:
 
 
 def _clear_call_graph_caches() -> None:
-    call_graph_module = sys.modules["modelaudit_picklescan.call_graph"]
-    for function_name in (
-        "_analyze_module",
-        "_call_graph_entrypoints",
-        "_find_sink_path",
-        "_has_static_torch_extension_global_target",
-        "_resolve_class_target",
-        "_resolve_function_target",
-        "_resolve_module_source",
-        "_safe_call_graph_entrypoints",
-        "_iter_call_nodes",
-        "_collect_function_import_aliases",
-        "_parameter_controlled_names",
-        "_split_function_name",
-        "_wildcard_export_summary",
-        "_module_source_context",
-    ):
-        cache_clear = getattr(getattr(call_graph_module, function_name), "cache_clear", None)
-        if cache_clear is not None:
-            cache_clear()
+    for function in call_graph._SOURCE_SENSITIVE_CACHED_FUNCTIONS:
+        function.cache_clear()
 
 
 def test_wildcard_summary_and_analysis_share_module_parse(

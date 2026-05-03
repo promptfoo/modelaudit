@@ -7,24 +7,23 @@ from types import SimpleNamespace
 import pytest
 
 import modelaudit.integrations.sarif_formatter as sarif_formatter
-from modelaudit.integrations.sarif_formatter import (
-    _create_artifacts,
-    _create_results,
-    _create_rules,
-    _create_run,
-    _get_mime_type,
-    _get_rule_full_description,
-    _get_rule_id,
-    _get_rule_name,
-    _get_rule_short_description,
-    _get_tags_for_issue,
-    _normalize_path_to_uri,
-    _severity_to_rank,
-    _severity_to_sarif_level,
-    format_sarif_output,
-)
 from modelaudit.models import AssetModel, FileHashesModel, FileMetadataModel, create_initial_audit_result
 from modelaudit.scanners.base import Issue, IssueSeverity
+
+_create_artifacts = sarif_formatter._create_artifacts
+_create_results = sarif_formatter._create_results
+_create_rules = sarif_formatter._create_rules
+_create_run = sarif_formatter._create_run
+_get_mime_type = sarif_formatter._get_mime_type
+_get_rule_full_description = sarif_formatter._get_rule_full_description
+_get_rule_id = sarif_formatter._get_rule_id
+_get_rule_name = sarif_formatter._get_rule_name
+_get_rule_short_description = sarif_formatter._get_rule_short_description
+_get_tags_for_issue = sarif_formatter._get_tags_for_issue
+_normalize_path_to_uri = sarif_formatter._normalize_path_to_uri
+_severity_to_rank = sarif_formatter._severity_to_rank
+_severity_to_sarif_level = sarif_formatter._severity_to_sarif_level
+format_sarif_output = sarif_formatter.format_sarif_output
 
 
 class TestFormatSarifOutput:
@@ -150,7 +149,15 @@ class TestCreateRun:
                 details={"pickle_rule_code": "DANGEROUS_CALL"},
                 rule_code="S104",
                 timestamp=time.time(),
-            )
+            ),
+            Issue(
+                message="Supporting import module",
+                severity=IssueSeverity.WARNING,
+                location="/test/file.pkl",
+                details={"supporting_rule_code": True, "primary_rule_code": "S104"},
+                rule_code="S100",
+                timestamp=time.time(),
+            ),
         ]
         result.finalize_statistics()
 
@@ -164,9 +171,11 @@ class TestCreateRun:
 
         monkeypatch.setattr(sarif_formatter, "_primary_sarif_issues", counting_primary_sarif_issues)
 
-        _create_run(result, ["/test"], verbose=False)
+        run = _create_run(result, ["/test"], verbose=False)
 
         assert call_count == 1
+        assert len(run["results"]) == 1
+        assert run["results"][0]["message"]["text"] == "Primary dangerous call"
 
     def test_invocation_properties(self):
         """Test invocation includes scan properties."""
@@ -552,9 +561,9 @@ class TestHelperFunctions:
         assert "pickle" in tags
         assert "deserialization" in tags
 
-    def test_get_tags_for_issue_code_execution(self):
+    def test_get_tags_for_issue_code_execution(self) -> None:
         """Test tags for code execution issues."""
-        issue = Issue(message="eval() import detected", severity=IssueSeverity.WARNING, timestamp=time.time())
+        issue = Issue(message="eval() call detected", severity=IssueSeverity.WARNING, timestamp=time.time())
 
         tags = _get_tags_for_issue(issue)
         assert "code-execution" in tags
