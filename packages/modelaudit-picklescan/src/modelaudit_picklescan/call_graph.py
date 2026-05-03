@@ -757,6 +757,7 @@ def _clear_source_sensitive_caches_now() -> None:
         _source_function_context,
         _source_class_context,
         _constructor_parameter_self_attribute_targets,
+        _collect_function_import_aliases,
         _parameter_controlled_names,
         _can_invoke_function_with_positional_args,
         _can_follow_import_execution_fallback,
@@ -1363,6 +1364,7 @@ def _collect_import_aliases(nodes: Iterable[ast.AST], module_name: str, is_packa
     return aliases
 
 
+@lru_cache(maxsize=4096)
 def _collect_function_import_aliases(
     function_node: ast.FunctionDef | ast.AsyncFunctionDef,
     module_name: str,
