@@ -5,6 +5,25 @@ All notable changes to `modelaudit-picklescan` will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this package adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.4...modelaudit-picklescan-v0.1.5) (2026-05-03)
+
+### Bug Fixes
+
+- address ai quality findings ([#1218](https://github.com/promptfoo/modelaudit/issues/1218)) ([30f4ef2](https://github.com/promptfoo/modelaudit/commit/30f4ef246f7e26a4c6f85e684bfb35ceaea7c43d))
+- clear remaining security-quality findings ([#1219](https://github.com/promptfoo/modelaudit/issues/1219)) ([259f931](https://github.com/promptfoo/modelaudit/commit/259f931fa573e234734b7d72850e0ca09d775f45))
+
+### Performance Improvements
+
+- cache call graph call nodes ([#1215](https://github.com/promptfoo/modelaudit/issues/1215)) ([aa52759](https://github.com/promptfoo/modelaudit/commit/aa52759aabaac335b87e30e2cbf042d141dc4e9f))
+- cache function import aliases ([#1214](https://github.com/promptfoo/modelaudit/issues/1214)) ([d56eef2](https://github.com/promptfoo/modelaudit/commit/d56eef2de18652fee1a759642165e404b8202be9))
+- cache parameter controlled names ([#1213](https://github.com/promptfoo/modelaudit/issues/1213)) ([41b8f45](https://github.com/promptfoo/modelaudit/commit/41b8f4541c9b62204c74c04199931ef0484ba1a5))
+- cache split call graph names ([#1212](https://github.com/promptfoo/modelaudit/issues/1212)) ([77ab177](https://github.com/promptfoo/modelaudit/commit/77ab17782f23de46c57f6e2a7302a539fb0bfb98))
+- reuse call graph controlled names ([#1198](https://github.com/promptfoo/modelaudit/issues/1198)) ([84e6a9b](https://github.com/promptfoo/modelaudit/commit/84e6a9bd841095917e2199e9004759bcbe9c0eb3))
+- reuse call graph module parses ([#1167](https://github.com/promptfoo/modelaudit/issues/1167)) ([0822b40](https://github.com/promptfoo/modelaudit/commit/0822b4043db270882b8fd14ff04de1cf3d3fb134))
+- share call graph caches within reports ([#1156](https://github.com/promptfoo/modelaudit/issues/1156)) ([b16d37c](https://github.com/promptfoo/modelaudit/commit/b16d37c3b4439b4e6d966b8b9624642307c2a322))
+- share getattr assignment candidates ([#1199](https://github.com/promptfoo/modelaudit/issues/1199)) ([5d12903](https://github.com/promptfoo/modelaudit/commit/5d1290330328ad4fb6e6f88bddc34e7bfba9d310))
+- skip call graph enrichment in pickle validation ([#1196](https://github.com/promptfoo/modelaudit/issues/1196)) ([2347d80](https://github.com/promptfoo/modelaudit/commit/2347d80a2d110f582c188679b4a0c04489779745))
+
 ## [0.1.4](https://github.com/promptfoo/modelaudit/compare/modelaudit-picklescan-v0.1.3...modelaudit-picklescan-v0.1.4) (2026-05-01)
 
 ### Bug Fixes

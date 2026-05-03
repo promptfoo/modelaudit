@@ -5,6 +5,77 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.44](https://github.com/promptfoo/modelaudit/compare/v0.2.43...v0.2.44) (2026-05-03)
+
+### Bug Fixes
+
+- address ai quality findings ([#1218](https://github.com/promptfoo/modelaudit/issues/1218)) ([30f4ef2](https://github.com/promptfoo/modelaudit/commit/30f4ef246f7e26a4c6f85e684bfb35ceaea7c43d))
+- clear remaining security-quality findings ([#1219](https://github.com/promptfoo/modelaudit/issues/1219)) ([259f931](https://github.com/promptfoo/modelaudit/commit/259f931fa573e234734b7d72850e0ca09d775f45))
+
+### Performance Improvements
+
+- add opt-in core phase timings ([#1170](https://github.com/promptfoo/modelaudit/issues/1170)) ([75a7f0b](https://github.com/promptfoo/modelaudit/commit/75a7f0b4480f6e4305617a729fa9635b15432fe3))
+- bound directory progress pre-counts ([#1174](https://github.com/promptfoo/modelaudit/issues/1174)) ([23dc5d0](https://github.com/promptfoo/modelaudit/commit/23dc5d009a9cf14060ee046fe74ef1af02de2e7d))
+- bound ordinary license header reads ([#1197](https://github.com/promptfoo/modelaudit/issues/1197)) ([113ad34](https://github.com/promptfoo/modelaudit/commit/113ad3402d82aa1815239a4e3cbe93a862619cdc))
+- cache call graph call nodes ([#1215](https://github.com/promptfoo/modelaudit/issues/1215)) ([aa52759](https://github.com/promptfoo/modelaudit/commit/aa52759aabaac335b87e30e2cbf042d141dc4e9f))
+- cache function import aliases ([#1214](https://github.com/promptfoo/modelaudit/issues/1214)) ([d56eef2](https://github.com/promptfoo/modelaudit/commit/d56eef2de18652fee1a759642165e404b8202be9))
+- cache manifest trusted-url lookups ([#1186](https://github.com/promptfoo/modelaudit/issues/1186)) ([09e76cf](https://github.com/promptfoo/modelaudit/commit/09e76cf9a793572e961aefbbc827aeaeab351e64))
+- cache parameter controlled names ([#1213](https://github.com/promptfoo/modelaudit/issues/1213)) ([41b8f45](https://github.com/promptfoo/modelaudit/commit/41b8f4541c9b62204c74c04199931ef0484ba1a5))
+- cache scanner selection policies ([#1177](https://github.com/promptfoo/modelaudit/issues/1177)) ([371f480](https://github.com/promptfoo/modelaudit/commit/371f48024153dcd93f5df327781348b4076ddfd4))
+- cache split call graph names ([#1212](https://github.com/promptfoo/modelaudit/issues/1212)) ([77ab177](https://github.com/promptfoo/modelaudit/commit/77ab17782f23de46c57f6e2a7302a539fb0bfb98))
+- dedupe repeated metadata urls ([#1166](https://github.com/promptfoo/modelaudit/issues/1166)) ([b3f1009](https://github.com/promptfoo/modelaudit/commit/b3f1009d8e75912117df1279da6230b80e6e61cc))
+- reuse cache key content hash on store ([#1171](https://github.com/promptfoo/modelaudit/issues/1171)) ([e3981bd](https://github.com/promptfoo/modelaudit/commit/e3981bd21ddd912d893e306f354d49eb6b4e06e1))
+- reuse call graph controlled names ([#1198](https://github.com/promptfoo/modelaudit/issues/1198)) ([84e6a9b](https://github.com/promptfoo/modelaudit/commit/84e6a9bd841095917e2199e9004759bcbe9c0eb3))
+- reuse call graph module parses ([#1167](https://github.com/promptfoo/modelaudit/issues/1167)) ([0822b40](https://github.com/promptfoo/modelaudit/commit/0822b4043db270882b8fd14ff04de1cf3d3fb134))
+- reuse compiled pmml extension patterns ([#1172](https://github.com/promptfoo/modelaudit/issues/1172)) ([51ddc85](https://github.com/promptfoo/modelaudit/commit/51ddc8510bf1fa696bf38f2f54b29885c267ca2a))
+- reuse default secret regexes ([#1185](https://github.com/promptfoo/modelaudit/issues/1185)) ([b5ba149](https://github.com/promptfoo/modelaudit/commit/b5ba149f0667be7f7d86fe11f3647dac5ea3a620))
+- reuse flax layer keyword text ([#1187](https://github.com/promptfoo/modelaudit/issues/1187)) ([b50947f](https://github.com/promptfoo/modelaudit/commit/b50947fefde1140693856011b221ff540d83b100))
+- reuse flax structure analysis ([#1188](https://github.com/promptfoo/modelaudit/issues/1188)) ([c33c566](https://github.com/promptfoo/modelaudit/commit/c33c566cdb37ca480d593bbd474cb6f3dbd727b2))
+- reuse flax suspicious patterns ([#1194](https://github.com/promptfoo/modelaudit/issues/1194)) ([0351de1](https://github.com/promptfoo/modelaudit/commit/0351de1b3419353a60bdc6510772ddb6b8b55d47))
+- reuse hashes for hardlinked files ([#1175](https://github.com/promptfoo/modelaudit/issues/1175)) ([aac4367](https://github.com/promptfoo/modelaudit/commit/aac4367ef610e77c33bed9181821d83d4ccf1e4b))
+- reuse jax probe file handle ([#1161](https://github.com/promptfoo/modelaudit/issues/1161)) ([3e95649](https://github.com/promptfoo/modelaudit/commit/3e956493a476156b71fd06142190d49eb95b8bac))
+- reuse jinja scanner patterns ([#1184](https://github.com/promptfoo/modelaudit/issues/1184)) ([bb5a729](https://github.com/promptfoo/modelaudit/commit/bb5a729364aff328996d2868799b3ce394193df5))
+- reuse jit import regexes ([#1190](https://github.com/promptfoo/modelaudit/issues/1190)) ([9f37f5d](https://github.com/promptfoo/modelaudit/commit/9f37f5d35317d9273388e24e72af4a6a2fd4c001))
+- reuse lowered blacklist payload ([#1165](https://github.com/promptfoo/modelaudit/issues/1165)) ([624a17b](https://github.com/promptfoo/modelaudit/commit/624a17b2ede0e84062120987ed2b8919bedd822d))
+- reuse lowered c2 payload scan ([#1163](https://github.com/promptfoo/modelaudit/issues/1163)) ([a63efaa](https://github.com/promptfoo/modelaudit/commit/a63efaaa44c257c6428ec64ac337657f8d948d9a))
+- reuse lowered flax transform values ([#1169](https://github.com/promptfoo/modelaudit/issues/1169)) ([3d73ad7](https://github.com/promptfoo/modelaudit/commit/3d73ad719e540697d64636354f1ff23d4b2a8837))
+- reuse lowered get_file values ([#1211](https://github.com/promptfoo/modelaudit/issues/1211)) ([3bc7890](https://github.com/promptfoo/modelaudit/commit/3bc7890339f9373e73e2979e48ef010c190c6028))
+- reuse lowered hex token seed checks ([#1202](https://github.com/promptfoo/modelaudit/issues/1202)) ([8a34db9](https://github.com/promptfoo/modelaudit/commit/8a34db967e25d5b0a78479f71e53f85486f4c557))
+- reuse lowered jax context text ([#1164](https://github.com/promptfoo/modelaudit/issues/1164)) ([d012c09](https://github.com/promptfoo/modelaudit/commit/d012c09ebb8a73b75360e8132d8a1434b37342ce))
+- reuse lowered keras metadata text ([#1168](https://github.com/promptfoo/modelaudit/issues/1168)) ([abfe87b](https://github.com/promptfoo/modelaudit/commit/abfe87b3e4ac15aaf3d0721c9a9751a16fa10e6f))
+- reuse lowered layer type names ([#1203](https://github.com/promptfoo/modelaudit/issues/1203)) ([4b94a67](https://github.com/promptfoo/modelaudit/commit/4b94a67f2b5142332b49da29fdb1e8ad2106cf03))
+- reuse lowered license header text ([#1162](https://github.com/promptfoo/modelaudit/issues/1162)) ([447ea66](https://github.com/promptfoo/modelaudit/commit/447ea664889624da254d7de4c9c4219fe286e9e7))
+- reuse lowered metadata filenames ([#1205](https://github.com/promptfoo/modelaudit/issues/1205)) ([4251df5](https://github.com/promptfoo/modelaudit/commit/4251df584cb5c3491492c643f211e07f3234fd68))
+- reuse lowered metadata keys ([#1206](https://github.com/promptfoo/modelaudit/issues/1206)) ([3ea11f0](https://github.com/promptfoo/modelaudit/commit/3ea11f0d671902a95458cd143f3061b63db4f588))
+- reuse lowered ml operation names ([#1201](https://github.com/promptfoo/modelaudit/issues/1201)) ([c5de398](https://github.com/promptfoo/modelaudit/commit/c5de398c1c1cb4809edd6bcab25740dc23eda1b8))
+- reuse lowered sarif messages ([#1209](https://github.com/promptfoo/modelaudit/issues/1209)) ([fde43a4](https://github.com/promptfoo/modelaudit/commit/fde43a4a267de63530bd7716fcf6b851c6b74e78))
+- reuse lowered secret descriptions ([#1208](https://github.com/promptfoo/modelaudit/issues/1208)) ([cb0324b](https://github.com/promptfoo/modelaudit/commit/cb0324b6ffd4444a974895a0dee7d209b0e4b571))
+- reuse lowered skops member names ([#1207](https://github.com/promptfoo/modelaudit/issues/1207)) ([879c531](https://github.com/promptfoo/modelaudit/commit/879c5310f3f7f39b96bb280e9cc772647e1ea749))
+- reuse lowered xgboost legacy headers ([#1204](https://github.com/promptfoo/modelaudit/issues/1204)) ([8bc1e7d](https://github.com/promptfoo/modelaudit/commit/8bc1e7d45ee89d62d51503c8e549114fa3df197e))
+- reuse manifest text within scans ([#1160](https://github.com/promptfoo/modelaudit/issues/1160)) ([848bc1e](https://github.com/promptfoo/modelaudit/commit/848bc1ec65b428d0fe47adf117d848519e05f2be))
+- reuse metagraph attr lowercase values ([#1200](https://github.com/promptfoo/modelaudit/issues/1200)) ([349751e](https://github.com/promptfoo/modelaudit/commit/349751e228f601c30bfbe61d386621db14aefb31))
+- reuse nearby license discovery ([#1155](https://github.com/promptfoo/modelaudit/issues/1155)) ([301618d](https://github.com/promptfoo/modelaudit/commit/301618da66a41514e6e210d4ba8298cf816da81d))
+- reuse network library patterns ([#1191](https://github.com/promptfoo/modelaudit/issues/1191)) ([630bd3d](https://github.com/promptfoo/modelaudit/commit/630bd3d35eff43c980a3bb9d0f75ad6cb548b42c))
+- reuse normalized scanner selection policy ([#1153](https://github.com/promptfoo/modelaudit/issues/1153)) ([b8430a0](https://github.com/promptfoo/modelaudit/commit/b8430a04b141972febab6b03e744e1382c14aacb))
+- reuse onnx model bytes for parsing ([#1193](https://github.com/promptfoo/modelaudit/issues/1193)) ([a5356a5](https://github.com/promptfoo/modelaudit/commit/a5356a5109a09f04db6efa764cb47088b7a5b1aa))
+- reuse prefiltered sarif issues ([#1210](https://github.com/promptfoo/modelaudit/issues/1210)) ([d996043](https://github.com/promptfoo/modelaudit/commit/d9960432a37982595109d2c20ca34cbb7e2807cf))
+- reuse savedmodel function patterns ([#1183](https://github.com/promptfoo/modelaudit/issues/1183)) ([c043bcd](https://github.com/promptfoo/modelaudit/commit/c043bcd0c9509f0704406e3cbf67a374f898d73e))
+- reuse secrets detector heuristics ([#1189](https://github.com/promptfoo/modelaudit/issues/1189)) ([799e8bf](https://github.com/promptfoo/modelaudit/commit/799e8bf6c62c336cd64083309d2f615426041863))
+- reuse sibling license directory listings ([#1157](https://github.com/promptfoo/modelaudit/issues/1157)) ([5ec7f21](https://github.com/promptfoo/modelaudit/commit/5ec7f21ab0b16eaf23c654688eab4219c091fc86))
+- reuse suspicious port names ([#1192](https://github.com/promptfoo/modelaudit/issues/1192)) ([8ed7665](https://github.com/promptfoo/modelaudit/commit/8ed76651cc386ef4ad1ffbdd9f1b280ee951f1cc))
+- share call graph caches within reports ([#1156](https://github.com/promptfoo/modelaudit/issues/1156)) ([b16d37c](https://github.com/promptfoo/modelaudit/commit/b16d37c3b4439b4e6d966b8b9624642307c2a322))
+- share getattr assignment candidates ([#1199](https://github.com/promptfoo/modelaudit/issues/1199)) ([5d12903](https://github.com/promptfoo/modelaudit/commit/5d1290330328ad4fb6e6f88bddc34e7bfba9d310))
+- short-circuit hf bookkeeping checks ([#1154](https://github.com/promptfoo/modelaudit/issues/1154)) ([ed0122d](https://github.com/promptfoo/modelaudit/commit/ed0122d57bb875beab88a92dbb670c7d06ec881b))
+- skip call graph enrichment in pickle validation ([#1196](https://github.com/promptfoo/modelaudit/issues/1196)) ([2347d80](https://github.com/promptfoo/modelaudit/commit/2347d80a2d110f582c188679b4a0c04489779745))
+- skip directory pre-count without progress ([#1173](https://github.com/promptfoo/modelaudit/issues/1173)) ([83c8bb4](https://github.com/promptfoo/modelaudit/commit/83c8bb42a53180d09d707bad6cd90d06d3ab55ee))
+- skip redundant jax scans for plain pickles ([#1158](https://github.com/promptfoo/modelaudit/issues/1158)) ([04c6974](https://github.com/promptfoo/modelaudit/commit/04c6974283a02ddb5233a498ccfd0306261ab6ab))
+- skip renormalizing scanner selection ([#1181](https://github.com/promptfoo/modelaudit/issues/1181)) ([74ac7a7](https://github.com/promptfoo/modelaudit/commit/74ac7a7fef31028582c201690610076214c2d544))
+- summarize CLI progress tree once ([#1182](https://github.com/promptfoo/modelaudit/issues/1182)) ([0bc373f](https://github.com/promptfoo/modelaudit/commit/0bc373fc8a3d1694fa35a18f7789d195f2cacd79))
+
+### Documentation
+
+- add performance audit backlog ([#1159](https://github.com/promptfoo/modelaudit/issues/1159)) ([be6cc4a](https://github.com/promptfoo/modelaudit/commit/be6cc4a43facb6212c6f591779c5faddc111a280))
+
 ## [0.2.43](https://github.com/promptfoo/modelaudit/compare/v0.2.42...v0.2.43) (2026-05-01)
 
 ### Bug Fixes
