@@ -15,9 +15,7 @@ Status: active audit started 2026-05-01
 - Telemetry disabled for benchmarks with `PROMPTFOO_DISABLE_TELEMETRY=1`
 - Cache disabled unless a benchmark explicitly measures cache behavior
 - Profiles collected with `cProfile`
-- Existing benchmark surfaces:
-  - `tests/benchmarks/test_scan_benchmarks.py`
-  - `tests/benchmarks/test_picklescan_benchmarks.py`
+- Existing performance surface:
   - `tests/test_performance_benchmarks.py`
 
 ## Initial Baseline
@@ -46,7 +44,6 @@ Benchmark artifacts:
   - `/tmp/modelaudit-profile-assets.{json,pstats}`
   - `/tmp/modelaudit-profile-dill.{json,pstats}`
   - `/tmp/modelaudit-profile-safe-large.{json,pstats}`
-- Existing `pytest-benchmark` suites currently skip on Python `3.12` because the global test allowlist in `tests/conftest.py` excludes the benchmark files on reduced-version lanes. Running with `uv run --with pytest-benchmark ...` installs the plugin, but the tests still skip under the repo's current lane policy.
 
 Slowest fixture files in the current corpus:
 
@@ -346,32 +343,30 @@ Priority 1:
 
 ### Measurement Infrastructure
 
-- [ ] Make the existing benchmark suites runnable in the intended benchmark lane.
-- [ ] Decide whether benchmark files belong in the reduced-Python allowlist or should run only in a dedicated full lane.
-- [ ] Add a checked-in benchmark command matrix for:
+- [ ] Decide what repeatable performance measurements should stay checked in versus live only in maintainer workflows.
+- [ ] Add a documented performance command matrix for:
   - [ ] single-file scans
   - [ ] directory scans
   - [ ] cache miss scans
   - [ ] cache hit scans
   - [ ] duplicate-heavy scans
   - [ ] many-small-file scans
-- [ ] Add stable JSON output generation for benchmark runs.
-- [ ] Add a small script that compares current benchmark JSON against a prior baseline.
-- [ ] Add explicit benchmark tags for:
+- [ ] Decide whether performance runs need stable JSON artifacts and a comparison script.
+- [ ] Add explicit performance tags for:
   - [ ] pickle-heavy
   - [ ] large-file
   - [ ] many-file
   - [ ] archive-heavy
   - [ ] metadata-heavy
 - [ ] Record host, Python, dependency set, cache state, and git revision with every benchmark artifact.
-- [ ] Add a benchmark corpus inventory file so future runs use the same representative inputs.
-- [ ] Add a benchmark for cold-process startup cost versus warm-process repeated scan cost.
-- [ ] Add a benchmark for first import cost of optional scanner families.
-- [ ] Add a benchmark for scan result serialization overhead.
-- [ ] Add a benchmark for progress-enabled versus progress-disabled directory scans.
-- [ ] Add a benchmark for aggregate result construction on very large directory scans.
-- [ ] Add a benchmark for SBOM generation when scan results are large.
-- [ ] Add a benchmark for telemetry-disabled and telemetry-enabled paths, only if telemetry behavior is intentionally in scope.
+- [ ] Add a corpus inventory for repeatable performance runs.
+- [ ] Add coverage for cold-process startup cost versus warm-process repeated scan cost.
+- [ ] Add coverage for first import cost of optional scanner families.
+- [ ] Add coverage for scan result serialization overhead.
+- [ ] Add coverage for progress-enabled versus progress-disabled directory scans.
+- [ ] Add coverage for aggregate result construction on very large directory scans.
+- [ ] Add coverage for SBOM generation when scan results are large.
+- [ ] Add coverage for telemetry-disabled and telemetry-enabled paths, only if telemetry behavior is intentionally in scope.
 
 ### Core Pipeline Instrumentation
 
