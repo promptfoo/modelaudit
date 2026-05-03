@@ -751,6 +751,7 @@ def _clear_source_sensitive_caches_now() -> None:
         _resolve_wildcard_reexport_alias,
         _wildcard_export_summary,
         _resolve_class_target,
+        _split_function_name,
         _module_source_context,
         _analyze_module,
         _source_function_context,
@@ -1187,6 +1188,7 @@ def _class_entrypoints(class_name: str) -> tuple[str, ...]:
     return analysis.class_entrypoints.get(f"{module_name}.{qualified_name}", ())
 
 
+@lru_cache(maxsize=4096)
 def _split_function_name(function_name: str) -> tuple[str | None, str]:
     parts = function_name.split(".")
     for index in range(len(parts) - 1, 0, -1):
