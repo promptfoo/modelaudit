@@ -18,6 +18,7 @@ from .call_graph import (
     find_startup_hook_write_call_graphs,
     find_unanalyzed_callable_call_graph_references,
     has_unanalyzed_call_graph_import_references,
+    shared_source_sensitive_caches,
 )
 from .options import ScanOptions
 from .report import CoverageSummary, Finding, Notice, PickleReport, SafetyVerdict, ScanError, ScanStatus, Severity
@@ -96,10 +97,22 @@ class PickleScanner:
     def __init__(self, options: ScanOptions | None = None) -> None:
         self.options = ScanOptions() if options is None else options
 
-    def scan_bytes(self, data: bytes | bytearray | memoryview, *, source: str = "<bytes>") -> PickleReport:
+    def scan_bytes(
+        self,
+        data: bytes | bytearray | memoryview,
+        *,
+        source: str = "<bytes>",
+        enrich_call_graph: bool = True,
+    ) -> PickleReport:
         """Scan a raw pickle byte payload."""
         payload = bytes(data)
-        return _scan_pickle_payload_native(payload, source=source, options=self.options, bytes_total=len(payload))
+        return _scan_pickle_payload_native(
+            payload,
+            source=source,
+            options=self.options,
+            bytes_total=len(payload),
+            enrich_call_graph=enrich_call_graph,
+        )
 
     def scan_stream(
         self,
@@ -107,6 +120,7 @@ class PickleScanner:
         *,
         source: str = "<stream>",
         size: int | None = None,
+        enrich_call_graph: bool = True,
     ) -> PickleReport:
         """Scan pickle bytes from the current position of a binary stream."""
         normalized_size = _normalize_stream_size(size)
@@ -130,6 +144,7 @@ class PickleScanner:
                     options=self.options,
                     bytes_total=error.bytes_read,
                     position_offset=position_offset,
+                    enrich_call_graph=enrich_call_graph,
                 )
                 return _with_short_read_error(
                     partial_report,
@@ -160,6 +175,7 @@ class PickleScanner:
             options=self.options,
             bytes_total=native_bytes_total,
             position_offset=position_offset,
+            enrich_call_graph=enrich_call_graph,
         )
         if stream_truncated:
             if normalized_size is None:
@@ -178,7 +194,7 @@ class PickleScanner:
             )
         return report
 
-    def scan_file(self, path: str | Path) -> PickleReport:
+    def scan_file(self, path: str | Path, *, enrich_call_graph: bool = True) -> PickleReport:
         """Scan a pickle file path, including pickle members in PyTorch ZIP containers."""
         source = str(path)
         path_obj = Path(path)
@@ -186,13 +202,23 @@ class PickleScanner:
         try:
             size = path_obj.stat().st_size
             if zipfile.is_zipfile(path_obj):
-                container_report = self._scan_pytorch_zip_file(path_obj, source=source, size=size)
+                container_report = self._scan_pytorch_zip_file(
+                    path_obj,
+                    source=source,
+                    size=size,
+                    enrich_call_graph=enrich_call_graph,
+                )
                 if container_report is not None:
                     return container_report
                 if _has_pytorch_checkpoint_suffix(path_obj):
                     return _unsupported_zip_report(source=source, size=size)
             with path_obj.open("rb") as handle:
-                return self.scan_stream(handle, source=source, size=size)
+                return self.scan_stream(
+                    handle,
+                    source=source,
+                    size=size,
+                    enrich_call_graph=enrich_call_graph,
+                )
         except OSError as error:
             return _io_error_report(
                 source=source,
@@ -212,7 +238,14 @@ class PickleScanner:
                 bytes_total=size,
             )
 
-    def _scan_pytorch_zip_file(self, path: Path, *, source: str, size: int) -> PickleReport | None:
+    def _scan_pytorch_zip_file(
+        self,
+        path: Path,
+        *,
+        source: str,
+        size: int,
+        enrich_call_graph: bool = True,
+    ) -> PickleReport | None:
         preflight_entry_count = _read_zip_entry_count(path, size)
         if preflight_entry_count is not None and preflight_entry_count > _MAX_PYTORCH_ZIP_ENTRIES:
             return _pytorch_zip_entry_limit_report(
@@ -270,6 +303,7 @@ class PickleScanner:
                                 cast(BinaryIO, member_stream),
                                 source=member_source,
                                 size=entry.file_size,
+                                enrich_call_graph=enrich_call_graph,
                             )
                         )
                 except Exception as error:
@@ -299,9 +333,10 @@ def scan_bytes(
     *,
     source: str = "<bytes>",
     options: ScanOptions | None = None,
+    enrich_call_graph: bool = True,
 ) -> PickleReport:
     """Convenience wrapper around :meth:`PickleScanner.scan_bytes`."""
-    return PickleScanner(options=options).scan_bytes(data, source=source)
+    return PickleScanner(options=options).scan_bytes(data, source=source, enrich_call_graph=enrich_call_graph)
 
 
 def scan_stream(
@@ -310,14 +345,25 @@ def scan_stream(
     source: str = "<stream>",
     size: int | None = None,
     options: ScanOptions | None = None,
+    enrich_call_graph: bool = True,
 ) -> PickleReport:
     """Convenience wrapper around :meth:`PickleScanner.scan_stream`."""
-    return PickleScanner(options=options).scan_stream(stream, source=source, size=size)
+    return PickleScanner(options=options).scan_stream(
+        stream,
+        source=source,
+        size=size,
+        enrich_call_graph=enrich_call_graph,
+    )
 
 
-def scan_file(path: str | Path, *, options: ScanOptions | None = None) -> PickleReport:
+def scan_file(
+    path: str | Path,
+    *,
+    options: ScanOptions | None = None,
+    enrich_call_graph: bool = True,
+) -> PickleReport:
     """Convenience wrapper around :meth:`PickleScanner.scan_file`."""
-    return PickleScanner(options=options).scan_file(path)
+    return PickleScanner(options=options).scan_file(path, enrich_call_graph=enrich_call_graph)
 
 
 def _read_zip_entry_count(path: Path, file_size: int) -> int | None:
@@ -900,6 +946,7 @@ def _scan_pickle_payload_native(
     options: ScanOptions,
     bytes_total: int | None = None,
     position_offset: int = 0,
+    enrich_call_graph: bool = True,
 ) -> PickleReport:
     native_bytes_total = _normalize_stream_size(bytes_total)
     native_position_offset = max(position_offset, 0)
@@ -915,7 +962,8 @@ def _scan_pickle_payload_native(
         )
         if not isinstance(raw_report, Mapping):
             raise TypeError(f"Rust scanner returned {type(raw_report).__name__}, expected mapping")
-        return _with_call_graph_findings(_report_from_native_dict(raw_report))
+        report = _report_from_native_dict(raw_report)
+        return _with_call_graph_findings(report) if enrich_call_graph else report
     except Exception as error:
         return _engine_error_report(
             source=source,
@@ -961,24 +1009,25 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     callable_invocations = report.metadata.get("callable_invocations", ())
     call_graph_limit_exceeded = has_unanalyzed_call_graph_import_references(import_references)
     enrichment_errors: list[tuple[str, Exception]] = []
-    try:
-        call_graph_findings = find_dangerous_call_graphs(import_references, callable_invocations)
-    except Exception as error:
-        call_graph_findings = ()
-        enrichment_errors.append(("python_call_graph", error))
-    try:
-        startup_hook_write_findings = find_startup_hook_write_call_graphs(
-            import_references,
-            callable_invocations,
-        )
-    except Exception as error:
-        startup_hook_write_findings = ()
-        enrichment_errors.append(("python_call_graph_startup_hook_write", error))
-    try:
-        unanalyzed_references = find_unanalyzed_callable_call_graph_references(callable_invocations)
-    except Exception as error:
-        unanalyzed_references = ()
-        enrichment_errors.append(("python_call_graph_source_unavailable", error))
+    with shared_source_sensitive_caches():
+        try:
+            call_graph_findings = find_dangerous_call_graphs(import_references, callable_invocations)
+        except Exception as error:
+            call_graph_findings = ()
+            enrichment_errors.append(("python_call_graph", error))
+        try:
+            startup_hook_write_findings = find_startup_hook_write_call_graphs(
+                import_references,
+                callable_invocations,
+            )
+        except Exception as error:
+            startup_hook_write_findings = ()
+            enrichment_errors.append(("python_call_graph_startup_hook_write", error))
+        try:
+            unanalyzed_references = find_unanalyzed_callable_call_graph_references(callable_invocations)
+        except Exception as error:
+            unanalyzed_references = ()
+            enrichment_errors.append(("python_call_graph_source_unavailable", error))
 
     updated_report = (
         _with_unanalyzed_call_graph_notices(report, unanalyzed_references) if unanalyzed_references else report
