@@ -924,10 +924,7 @@ def _create_path_progress_callback(
             total_bytes = os.path.getsize(actual_path)
             total_items = 1
         elif os.path.isdir(actual_path):
-            total_bytes = sum(
-                file_path.stat().st_size for file_path in Path(actual_path).rglob("*") if file_path.is_file()
-            )
-            total_items = len(list(Path(actual_path).rglob("*")))
+            total_bytes, total_items = _summarize_progress_tree(actual_path)
         else:
             total_bytes = 0
             total_items = 1
@@ -955,6 +952,17 @@ def _create_path_progress_callback(
             spinner.text = f"{message} ({percentage:.1f}%)"
 
     return enhanced_progress_callback
+
+
+def _summarize_progress_tree(path: str) -> tuple[int, int]:
+    """Return total file bytes and total descendant items with one tree walk."""
+    total_bytes = 0
+    total_items = 0
+    for item in Path(path).rglob("*"):
+        total_items += 1
+        if item.is_file():
+            total_bytes += item.stat().st_size
+    return total_bytes, total_items
 
 
 def _scan_local_or_downloaded_path(
