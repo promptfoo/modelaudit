@@ -192,6 +192,23 @@ class TestMLOperationPatterns:
         result = analyzer.analyze_context("model.fit(X, y)", ["sklearn", "RandomForestClassifier"])
         assert result.framework == MLFramework.SKLEARN
 
+    def test_identify_operation_reuses_lowered_function_call(self) -> None:
+        """Broad operation matching should lowercase a function call once."""
+        analyzer = MLContextAnalyzer()
+
+        class CountingStr(str):
+            lower_calls = 0
+
+            def lower(self) -> str:
+                type(self).lower_calls += 1
+                return super().lower()
+
+        operation = analyzer._identify_operation(CountingStr("torch.create_tensor_value"), MLFramework.PYTORCH)
+
+        assert operation is not None
+        assert operation.operation_type == "tensor_ops"
+        assert CountingStr.lower_calls == 1
+
 
 class TestFalsePositiveReduction:
     """Test false positive reduction scenarios."""
