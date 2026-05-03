@@ -95,6 +95,22 @@ _URL_SCHEME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 _WINDOWS_ABSOLUTE_PATH_PATTERN = re.compile(r"^(?:[a-zA-Z]:[\\/]|\\\\)")
 _KERAS_CONFIG_ENTRY = "config.json"
 _KERAS_CONFIG_MAX_BYTES = 10 * 1024 * 1024
+
+
+def _has_get_file_reference(values: list[str]) -> bool:
+    """Return whether config string values reference a get_file callable."""
+    for value in values:
+        stripped_value = value.strip()
+        if _GET_FILE_PATTERN.fullmatch(stripped_value) is not None:
+            return True
+
+        stripped_value_lower = stripped_value.lower()
+        if stripped_value_lower.endswith(".get_file") or "keras.utils.get_file" in stripped_value_lower:
+            return True
+
+    return False
+
+
 _KERAS_METADATA_ENTRY = "metadata.json"
 _KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
@@ -1098,12 +1114,7 @@ class KerasZipScanner(BaseScanner):
                 key_lower = str(key).lower()
                 if key_lower in {"url", "origin", "args", "kwargs"}:
                     url_candidate_values.extend(self._extract_string_literals(value, include_dict_values=True))
-            has_get_file = any(
-                _GET_FILE_PATTERN.fullmatch(value.strip()) is not None
-                or value.strip().lower().endswith(".get_file")
-                or "keras.utils.get_file" in value.strip().lower()
-                for value in direct_string_values
-            )
+            has_get_file = _has_get_file_reference(direct_string_values)
             has_url = any(_URL_PATTERN.search(value) is not None for value in url_candidate_values)
             if not (has_get_file and has_url):
                 continue
@@ -1146,12 +1157,7 @@ class KerasZipScanner(BaseScanner):
                 if key_lower in {"url", "origin", "args", "kwargs"}:
                     url_candidate_values.extend(self._extract_string_literals(value, include_dict_values=True))
 
-            has_get_file = any(
-                _GET_FILE_PATTERN.fullmatch(value.strip()) is not None
-                or value.strip().lower().endswith(".get_file")
-                or "keras.utils.get_file" in value.strip().lower()
-                for value in direct_string_values
-            )
+            has_get_file = _has_get_file_reference(direct_string_values)
             if not has_get_file or not self._node_has_get_file_extract_true(node):
                 continue
 
