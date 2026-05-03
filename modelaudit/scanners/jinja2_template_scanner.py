@@ -65,6 +65,25 @@ _RAW_PARSE_FALLBACK_MAX_WINDOWS = 8
 _RAW_PARSE_FALLBACK_READ_BYTES = 256 * 1024
 
 
+def _compile_all_patterns() -> dict[str, list[tuple[re.Pattern[str], str]]]:
+    """Compile the static SSTI regex set once for all scanner instances."""
+    compiled: dict[str, list[tuple[re.Pattern[str], str]]] = {}
+
+    for category, patterns in JINJA2_SSTI_PATTERNS.items():
+        compiled[category] = []
+        for pattern in patterns:
+            try:
+                compiled_pattern = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+                compiled[category].append((compiled_pattern, pattern))
+            except re.error as e:
+                logger.warning(f"Failed to compile regex pattern '{pattern}': {e}")
+
+    return compiled
+
+
+_COMPILED_JINJA2_SSTI_PATTERNS = _compile_all_patterns()
+
+
 class MLContext:
     """Context information about the ML model/file being scanned"""
 
@@ -117,23 +136,7 @@ class Jinja2TemplateScanner(BaseScanner):
         self.enable_sandbox_test = self.config.get("enable_sandbox_test", True) and HAS_JINJA2_SANDBOX
         self.skip_common_patterns = self.config.get("skip_common_patterns", True)  # Ignore common ML patterns
 
-        # Compile regex patterns for efficiency
-        self._compiled_patterns = self._compile_all_patterns()
-
-    def _compile_all_patterns(self) -> dict[str, list[tuple[re.Pattern, str]]]:
-        """Compile all regex patterns for efficient matching"""
-        compiled: dict[str, list[tuple[re.Pattern, str]]] = {}
-
-        for category, patterns in JINJA2_SSTI_PATTERNS.items():
-            compiled[category] = []
-            for pattern in patterns:
-                try:
-                    compiled_pattern = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
-                    compiled[category].append((compiled_pattern, pattern))
-                except re.error as e:
-                    logger.warning(f"Failed to compile regex pattern '{pattern}': {e}")
-
-        return compiled
+        self._compiled_patterns = _COMPILED_JINJA2_SSTI_PATTERNS
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
