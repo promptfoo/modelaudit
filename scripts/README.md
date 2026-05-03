@@ -16,9 +16,9 @@ Script to regenerate vendored TensorFlow protobuf stubs from `.proto` files.
 
 Utilities for fetching model metadata from HuggingFace for testing and validation.
 
-### `profile_scan.py`
+### `benchmark_report.py` / `profile_scan.py`
 
-Utility for profiling scanner performance.
+Utilities for summarizing benchmark output and profiling scanner performance.
 
 ### `large_pickle_corpus_qa.py`
 
