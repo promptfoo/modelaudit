@@ -138,7 +138,8 @@ class ModelMetadataExtractor:
 
         # Add any keys containing 'security', 'suspicious', 'dangerous', etc.
         for key, value in metadata.items():
-            if any(term in key.lower() for term in ["security", "suspicious", "dangerous", "malicious", "risk"]):
+            key_lower = key.lower()
+            if any(term in key_lower for term in ["security", "suspicious", "dangerous", "malicious", "risk"]):
                 filtered[key] = value
 
         return filtered

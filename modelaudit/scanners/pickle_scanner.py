@@ -60,6 +60,13 @@ _HEX_CODE_EXECUTION_SEEDS: tuple[bytes, ...] = (
     b"73756270726f63657373",  # subprocess
     b"5f5f696d706f72745f5f",  # __import__
 )
+
+
+def _hex_token_has_execution_seed(token: bytes) -> bool:
+    token_lower = token.lower()
+    return any(seed in token_lower for seed in _HEX_CODE_EXECUTION_SEEDS)
+
+
 _ENCODED_CODE_EXECUTION_PATTERNS: tuple[tuple[bytes, str], ...] = (
     (b"eval(", "eval"),
     (b"exec(", "exec"),
@@ -2069,9 +2076,7 @@ class PickleScanner(BaseScanner):
                 continue
             seen_tokens.add(token)
             token_count += 1
-            if len(token) > _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES and not any(
-                seed in token.lower() for seed in _HEX_CODE_EXECUTION_SEEDS
-            ):
+            if len(token) > _MAX_RAW_ENCODED_TOKEN_WITHOUT_SEED_BYTES and not _hex_token_has_execution_seed(token):
                 continue
 
             if len(token) % 2 != 0:
