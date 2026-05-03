@@ -2214,7 +2214,7 @@ class TestCVE20258747GetFileGadget:
         class CountingValue(str):
             lower_calls = 0
 
-            def strip(self) -> "CountingValue":
+            def strip(self, chars: str | None = None, /) -> "CountingValue":
                 return self
 
             def lower(self) -> str:
