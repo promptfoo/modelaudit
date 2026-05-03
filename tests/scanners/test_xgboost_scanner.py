@@ -727,6 +727,19 @@ class TestXGBoostUBJScanning:
 class TestXGBoostBinaryScanning:
     """Test XGBoost binary model scanning."""
 
+    def test_legacy_header_pattern_search_reuses_lowered_header(self, xgboost_scanner: XGBoostScanner) -> None:
+        class CountingHeader(str):
+            lower_calls = 0
+
+            def lower(self) -> str:
+                self.lower_calls += 1
+                return super().lower()
+
+        header = CountingHeader("BINF GBTree REG:squarederror")
+
+        assert xgboost_scanner._find_legacy_header_patterns(header) == ["gbtree", "reg:"]
+        assert header.lower_calls == 1
+
     def test_empty_binary_file_detected(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
         """Test detection of empty binary files."""
         binary_file = temp_dir / "empty.bst"

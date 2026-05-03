@@ -1,6 +1,7 @@
 """Tests for content hash generation in regular scan mode."""
 
 import hashlib
+import os
 import pickle
 import zipfile
 from pathlib import Path
@@ -241,6 +242,31 @@ class TestHashGenerationEdgeCases:
 
         assert result.content_hash is not None
         assert result.files_scanned == 1
+
+    def test_hash_files_by_path_reuses_hash_for_hardlinks(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Hardlinked paths should reuse the same read during the hash prepass."""
+        from modelaudit import core
+
+        source = tmp_path / "source.pkl"
+        source.write_bytes(pickle.dumps({"hardlink": True}))
+        linked_path = tmp_path / "linked.pkl"
+        os.link(source, linked_path)
+
+        hashed_paths: list[str] = []
+        original_hash = core._calculate_file_hash
+
+        def spy_hash(path: str) -> str:
+            hashed_paths.append(path)
+            return original_hash(path)
+
+        monkeypatch.setattr(core, "_calculate_file_hash", spy_hash)
+
+        content_hashes = core._hash_files_by_path([str(source), str(linked_path)])
+
+        assert content_hashes[str(source)] == content_hashes[str(linked_path)]
+        assert hashed_paths == [str(source)]
 
     def test_unhashable_files_excluded_from_hash(self, tmp_path, monkeypatch):
         """Test that files failing to hash are excluded from aggregate hash."""

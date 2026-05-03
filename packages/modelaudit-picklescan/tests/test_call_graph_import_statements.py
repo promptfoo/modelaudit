@@ -80,11 +80,60 @@ def _clear_call_graph_caches() -> None:
         "_resolve_module_source",
         "_safe_call_graph_entrypoints",
         "_collect_function_import_aliases",
+        "_parameter_controlled_names",
+        "_split_function_name",
         "_wildcard_export_summary",
+        "_module_source_context",
     ):
         cache_clear = getattr(getattr(call_graph_module, function_name), "cache_clear", None)
         if cache_clear is not None:
             cache_clear()
+
+
+def test_wildcard_summary_and_analysis_share_module_parse(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_path = tmp_path / "module.py"
+    module_path.write_text("from dependency import *\n\ndef run():\n    return 1\n", encoding="utf-8")
+    parse_calls = 0
+    real_parse = call_graph.ast.parse
+
+    def tracking_parse(source: str, filename: str = "<unknown>") -> ast.Module:
+        nonlocal parse_calls
+        parse_calls += 1
+        return real_parse(source, filename=filename)
+
+    monkeypatch.setattr(
+        call_graph, "_resolve_module_source", lambda module_name: module_path if module_name == "module" else None
+    )
+    monkeypatch.setattr(call_graph.ast, "parse", tracking_parse)
+    _clear_call_graph_caches()
+
+    assert call_graph._wildcard_export_summary("module") is not None
+    assert call_graph._analyze_module("module") is not None
+    assert parse_calls == 1
+
+
+def test_shared_source_sensitive_caches_clears_once_per_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    clear_count = 0
+
+    def fake_clear() -> None:
+        nonlocal clear_count
+        clear_count += 1
+
+    monkeypatch.setattr(call_graph, "_clear_source_sensitive_caches_now", fake_clear)
+
+    with call_graph.shared_source_sensitive_caches():
+        call_graph._clear_source_sensitive_caches()
+        call_graph._clear_source_sensitive_caches()
+        call_graph._clear_source_sensitive_caches()
+
+    assert clear_count == 1
+
+    call_graph._clear_source_sensitive_caches()
+
+    assert clear_count == 2
 
 
 def _env_without_pythonpath() -> dict[str, str]:
@@ -122,6 +171,54 @@ def bridge():
     assert call_graph._collect_function_import_aliases(bridge, "benchmod", False) == expected
     assert call_graph._collect_function_import_aliases(bridge, "benchmod", False) == expected
     assert calls == 2
+
+
+def test_parameter_controlled_names_reuses_cached_analysis(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = ast.parse(
+        """
+def bridge(command):
+    alias = command
+    return alias
+"""
+    )
+    bridge = module.body[0]
+    assert isinstance(bridge, ast.FunctionDef)
+
+    calls = 0
+    original_initial_parameter_controlled_names = call_graph._initial_parameter_controlled_names
+
+    def counting_initial_parameter_controlled_names(
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> set[str]:
+        nonlocal calls
+        calls += 1
+        return original_initial_parameter_controlled_names(function_node)
+
+    monkeypatch.setattr(
+        call_graph,
+        "_initial_parameter_controlled_names",
+        counting_initial_parameter_controlled_names,
+    )
+    call_graph._parameter_controlled_names.cache_clear()
+
+    assert call_graph._parameter_controlled_names(bridge) == {"command", "alias"}
+    assert call_graph._parameter_controlled_names(bridge) == {"command", "alias"}
+    assert calls == 1
+
+
+def test_split_function_name_reuses_cached_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
+    analyze_calls: list[str] = []
+
+    def fake_analyze_module(module_name: str) -> object | None:
+        analyze_calls.append(module_name)
+        return object() if module_name == "pkg.mod" else None
+
+    monkeypatch.setattr(call_graph, "_analyze_module", fake_analyze_module)
+    call_graph._split_function_name.cache_clear()
+
+    assert call_graph._split_function_name("pkg.mod.func") == ("pkg.mod", "func")
+    assert call_graph._split_function_name("pkg.mod.func") == ("pkg.mod", "func")
+    assert analyze_calls == ["pkg.mod"]
 
 
 def _sitebuiltins_helper_instance_call_payload() -> bytes:
@@ -975,6 +1072,29 @@ def _nested_defaultdict_str_format_payload() -> bytes:
             _unicode_operand("present"),
             b"h\x00",
             b"s",
+            b"0",
+            _global_operand("builtins", "str.format"),
+            _args_tuple(_unicode_operand("{0[present][missing]}"), b"h\x01"),
+            b"R.",
+        ]
+    )
+
+
+def _nested_setitems_defaultdict_str_format_payload() -> bytes:
+    return b"".join(
+        [
+            b"\x80\x04",
+            _global_operand("collections", "defaultdict"),
+            _global_operand("builtins", "help"),
+            b"\x85R",
+            b"\x94",
+            b"0",
+            b"}",
+            b"\x94",
+            b"(",
+            _unicode_operand("present"),
+            b"h\x00",
+            b"u",
             b"0",
             _global_operand("builtins", "str.format"),
             _args_tuple(_unicode_operand("{0[present][missing]}"), b"h\x01"),
@@ -6975,6 +7095,72 @@ if marker.read_text() != marker_content:
     assert marker.read_text() == marker_content
 
 
+def test_scan_bytes_blocks_nested_setitems_str_format_defaultdict_lookup_rce(tmp_path: Path) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    marker = tmp_path / "nested_setitems_str_format_defaultdict_marker"
+    marker_content = "pydoc-owned"
+    (module_dir / "pydoc.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text({marker_content!r})\n"
+        "def help(*args, **kwargs):\n"
+        "    return 'factory-value'\n",
+        encoding="utf-8",
+    )
+    payload = _nested_setitems_defaultdict_str_format_payload()
+
+    report = scan_bytes(payload, source="nested-setitems-str-format-defaultdict-rce.pkl")
+
+    assert report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(
+        report,
+        "_sitebuiltins",
+        "_Helper.__call__",
+        "builtins.__import__",
+    )
+    assert any(
+        invocation.get("module") == "builtins"
+        and invocation.get("name") == "help"
+        and invocation.get("positional_arg_count") == 0
+        for invocation in report.metadata.get("callable_invocations", [])
+    )
+
+    assert not marker.exists()
+    child_code = """
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+marker_content = sys.argv[4]
+
+if marker.exists():
+    raise SystemExit("marker already exists before pickle execution")
+sys.path.insert(0, str(module_dir))
+sys.modules.pop("pydoc", None)
+result = pickle.loads(payload)
+if result != "factory-value":
+    raise SystemExit(f"expected factory value result, got {result!r}")
+if not marker.exists():
+    raise SystemExit("marker was not written")
+if marker.read_text() != marker_content:
+    raise SystemExit("marker content mismatch")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex(), marker_content],
+        cwd=str(tmp_path.parent),
+        env={key: value for key, value in os.environ.items() if key != "PYTHONPATH"},
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert marker.read_text() == marker_content
+
+
 def test_scan_bytes_blocks_nested_format_map_defaultdict_lookup_rce(tmp_path: Path) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
@@ -8421,3 +8607,82 @@ if marker.read_text() != marker_content:
     )
     assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
+
+
+def test_calls_in_function_reuses_getattr_assignment_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = ast.parse(
+        """
+def bridge(target, command, fallback):
+    callback = getattr(target, command, fallback)
+    callback(command)
+"""
+    )
+    bridge = module.body[0]
+    assert isinstance(bridge, ast.FunctionDef)
+
+    calls = 0
+    original_assignment_call_candidates = call_graph._function_assignment_call_candidates
+
+    def counting_assignment_call_candidates(
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> tuple[tuple[set[str], ast.Call], ...]:
+        nonlocal calls
+        calls += 1
+        return original_assignment_call_candidates(function_node)
+
+    monkeypatch.setattr(call_graph, "_function_assignment_call_candidates", counting_assignment_call_candidates)
+
+    resolved_calls = call_graph._calls_in_function(
+        bridge,
+        "benchmod",
+        False,
+        {},
+        {"bridge"},
+        set(),
+        {},
+    )
+
+    assert "builtins.getattr.__call__" in resolved_calls
+    assert calls == 1
+
+
+def test_calls_in_function_reuses_instance_alias_parameter_analysis(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = ast.parse(
+        """
+class Runner:
+    def execute(self, command):
+        pass
+
+def bridge(target, command):
+    runner = Runner(command)
+    runner.execute(command)
+    getattr(target, command)(command)
+"""
+    )
+    bridge = module.body[1]
+    assert isinstance(bridge, ast.FunctionDef)
+
+    calls = 0
+    original_parameter_controlled_names = call_graph._parameter_controlled_names
+
+    def counting_parameter_controlled_names(
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> set[str]:
+        nonlocal calls
+        calls += 1
+        return original_parameter_controlled_names(function_node)
+
+    monkeypatch.setattr(call_graph, "_parameter_controlled_names", counting_parameter_controlled_names)
+
+    resolved_calls = call_graph._calls_in_function(
+        bridge,
+        "benchmod",
+        False,
+        {},
+        {"Runner", "bridge"},
+        {"benchmod.Runner"},
+        {"benchmod.Runner": ("benchmod.Runner.execute",)},
+    )
+
+    assert "benchmod.Runner.execute" in resolved_calls
+    assert calls == 1

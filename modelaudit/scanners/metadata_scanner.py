@@ -180,6 +180,7 @@ class MetadataScanner(BaseScanner):
             self._check_timeout()
             if url in seen:
                 continue
+            seen.add(url)
             parsed = urlparse(url)
             matched_domain = None
             matched_component = None
@@ -200,7 +201,6 @@ class MetadataScanner(BaseScanner):
             if matched_domain is None:
                 continue
 
-            seen.add(url)
             safe_url = _redact_url_for_display(url)
             self._add_issue_check(
                 result,
@@ -312,7 +312,7 @@ class MetadataScanner(BaseScanner):
 
                 # For well-known token formats (GitHub, OpenAI, AWS), we trust the pattern
                 # and don't need entropy checks - these have specific prefixes/formats
-                is_known_format = any(prefix in description.lower() for prefix in ["github", "openai", "aws", "slack"])
+                is_known_format = self._is_known_secret_format(description)
 
                 if is_known_format:
                     # Known format - report if not a placeholder
@@ -334,6 +334,7 @@ class MetadataScanner(BaseScanner):
                                 type="exposed_secret",
                             ),
                         )
+
                 else:
                     # Generic pattern - use entropy check to reduce false positives
                     entropy = self._calculate_entropy(secret_part)
@@ -358,3 +359,8 @@ class MetadataScanner(BaseScanner):
                                 type="exposed_secret",
                             ),
                         )
+
+    @staticmethod
+    def _is_known_secret_format(description: str) -> bool:
+        lowered_description = description.lower()
+        return any(prefix in lowered_description for prefix in ["github", "openai", "aws", "slack"])
