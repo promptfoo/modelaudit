@@ -22,6 +22,7 @@ from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult
+from .keras_utils import find_case_insensitive_substrings
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,17 @@ _PYFUNC_DANGEROUS_REFERENCE_TOKENS = frozenset(
         "system",
         "webbrowser",
     }
+)
+_SUSPICIOUS_FUNCTION_NAME_PATTERNS = (
+    ("eval", re.compile(r"(?:^|[^a-z0-9])eval(?:[^a-z0-9]|$)")),
+    ("exec", re.compile(r"(?:^|[^a-z0-9])exec(?:[^a-z0-9]|$)")),
+    ("compile", re.compile(r"(?:^|[^a-z0-9])compile(?:[^a-z0-9]|$)")),
+    ("__import__", re.compile(r"(?:^|[^a-z0-9])__import__(?:[^a-z0-9]|$)")),
+    ("system", re.compile(r"(?:^|[^a-z0-9])system(?:[^a-z0-9]|$)")),
+    ("popen", re.compile(r"(?:^|[^a-z0-9])popen(?:[^a-z0-9]|$)")),
+    ("subprocess", re.compile(r"(?:^|[^a-z0-9])subprocess(?:[^a-z0-9]|$)")),
+    ("pickle", re.compile(r"(?:^|[^a-z0-9])pickle(?:[^a-z0-9]|$)")),
+    ("marshal", re.compile(r"(?:^|[^a-z0-9])marshal(?:[^a-z0-9]|$)")),
 )
 
 
@@ -980,20 +992,8 @@ class TensorFlowSavedModelScanner(BaseScanner):
     @staticmethod
     def _match_suspicious_function_name(func_name: str) -> str | None:
         """Return the suspicious token matched in a function name, if any."""
-        suspicious_patterns = (
-            ("eval", re.compile(r"(?:^|[^a-z0-9])eval(?:[^a-z0-9]|$)")),
-            ("exec", re.compile(r"(?:^|[^a-z0-9])exec(?:[^a-z0-9]|$)")),
-            ("compile", re.compile(r"(?:^|[^a-z0-9])compile(?:[^a-z0-9]|$)")),
-            ("__import__", re.compile(r"(?:^|[^a-z0-9])__import__(?:[^a-z0-9]|$)")),
-            ("system", re.compile(r"(?:^|[^a-z0-9])system(?:[^a-z0-9]|$)")),
-            ("popen", re.compile(r"(?:^|[^a-z0-9])popen(?:[^a-z0-9]|$)")),
-            ("subprocess", re.compile(r"(?:^|[^a-z0-9])subprocess(?:[^a-z0-9]|$)")),
-            ("pickle", re.compile(r"(?:^|[^a-z0-9])pickle(?:[^a-z0-9]|$)")),
-            ("marshal", re.compile(r"(?:^|[^a-z0-9])marshal(?:[^a-z0-9]|$)")),
-        )
-
         lowered_func_name = func_name.lower()
-        for pattern_name, pattern in suspicious_patterns:
+        for pattern_name, pattern in _SUSPICIOUS_FUNCTION_NAME_PATTERNS:
             if pattern.search(lowered_func_name):
                 return pattern_name
         return None
@@ -1187,10 +1187,7 @@ class TensorFlowSavedModelScanner(BaseScanner):
                                 "webbrowser",
                             ]
 
-                            found_patterns = []
-                            for pattern in dangerous_patterns:
-                                if pattern in decoded_str.lower():
-                                    found_patterns.append(pattern)
+                            found_patterns = find_case_insensitive_substrings(decoded_str, dangerous_patterns)
 
                             if found_patterns:
                                 result.add_check(
@@ -1275,8 +1272,9 @@ class TensorFlowSavedModelScanner(BaseScanner):
                     "marshal": "Unsafe deserialization",
                 }
 
+                present_patterns = set(find_case_insensitive_substrings(content_str, suspicious_patterns))
                 for pattern, description in suspicious_patterns.items():
-                    if pattern in content_str.lower():
+                    if pattern in present_patterns:
                         result.add_check(
                             name="Keras Metadata Pattern Check",
                             passed=False,

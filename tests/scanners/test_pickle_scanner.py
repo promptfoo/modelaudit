@@ -16,6 +16,8 @@ from modelaudit.scanners.pickle_scanner import (
     ALWAYS_DANGEROUS_FUNCTIONS,
     ALWAYS_DANGEROUS_MODULES,
     PickleScanner,
+    _contains_any_jax_indicator,
+    _hex_token_has_execution_seed,
     _is_dangerous_module,
     _is_legitimate_serialization_file,
     _looks_like_pickle,
@@ -528,6 +530,18 @@ def test_scan_stream_detects_base64_encoded_execution_text(encoded: str, pattern
     assert encoded_issues[0].details["pattern"] == pattern
     assert encoded_issues[0].details["legacy_rule_aliases"] == ["S104"]
     assert not any(issue.message.startswith("Legacy encoded dangerous pattern detected") for issue in result.issues)
+
+
+def test_hex_token_seed_gate_reuses_lowered_token() -> None:
+    class CountingBytes(bytes):
+        lower_calls = 0
+
+        def lower(self) -> bytes:
+            type(self).lower_calls += 1
+            return super().lower()
+
+    assert _hex_token_has_execution_seed(CountingBytes(b"AA" * 4096)) is False
+    assert CountingBytes.lower_calls == 1
 
 
 def test_scan_stream_detects_pem_private_key_after_seed_tightening() -> None:
@@ -1483,6 +1497,20 @@ def test_pickle_scanner_delegates_jax_specific_patterns_for_jax_pickles(tmp_path
     )
 
 
+def test_contains_any_jax_indicator_reuses_lowered_text() -> None:
+    class TrackingStr(str):
+        lower_calls = 0
+
+        def lower(self) -> str:
+            self.lower_calls += 1
+            return super().lower()
+
+    text = TrackingStr("jax")
+
+    assert _contains_any_jax_indicator(text, ("jax", "flax", "haiku")) is True
+    assert text.lower_calls == 1
+
+
 def test_pickle_scanner_delegates_jax_patterns_for_pkl_suffixes(tmp_path: Path) -> None:
     path = tmp_path / "jax_state.pkl"
     path.write_bytes(pickle.dumps({"payload": "jax.experimental.io_callback"}))
@@ -1495,6 +1523,28 @@ def test_pickle_scanner_delegates_jax_patterns_for_pkl_suffixes(tmp_path: Path) 
         and check.details["pattern"] == r"jax\.experimental\.io_callback"
         for check in result.checks
     )
+
+
+def test_pickle_scanner_skips_jax_delegation_for_complete_non_jax_payloads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "plain_state.pkl"
+    payload = pickle.dumps({"payload": "ordinary pickle state"})
+    path.write_bytes(payload)
+
+    scanner = PickleScanner()
+    result = scanner._create_result()
+
+    def fail_if_called(path: str, text: str) -> ScanResult:
+        raise AssertionError("JAX checkpoint delegation should be skipped")
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.jax_checkpoint_scanner.JaxCheckpointScanner.scan_pickle_pattern_text",
+        fail_if_called,
+    )
+
+    scanner._scan_jax_checkpoint_patterns_if_needed(str(path), len(payload), payload, result)
 
 
 def test_pickle_scanner_uses_jax_window_beyond_root_raw_scan_limit(tmp_path: Path) -> None:
@@ -1581,6 +1631,36 @@ def test_legitimate_serialization_file_uses_rust_scan(tmp_path: Path) -> None:
     assert _is_legitimate_serialization_file(str(safe_path)) is True
     assert _is_legitimate_serialization_file(str(malicious_path)) is False
     assert _is_legitimate_serialization_file(str(text_path)) is False
+
+
+def test_legitimate_serialization_file_skips_call_graph_enrichment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe_path = tmp_path / "safe.joblib"
+    safe_path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00.")
+
+    def fail_call_graph_enrichment(_report: object) -> object:
+        raise AssertionError("validation helper should use native Rust findings only")
+
+    monkeypatch.setattr("modelaudit_picklescan.api._with_call_graph_findings", fail_call_graph_enrichment)
+
+    assert _is_legitimate_serialization_file(str(safe_path)) is True
+
+
+def test_legitimate_serialization_file_keeps_bounded_file_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    safe_path = tmp_path / "safe.joblib"
+    safe_path.write_bytes(b"\x80\x04cjoblib.numpy_pickle\nNumpyArrayWrapper\nq\x00.")
+
+    def fail_read_bytes(_path: Path) -> bytes:
+        raise AssertionError("validation helper should preserve bounded scanner reads")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+
+    assert _is_legitimate_serialization_file(str(safe_path)) is True
 
 
 def test_scan_missing_path_fails_closed(tmp_path: Path) -> None:
