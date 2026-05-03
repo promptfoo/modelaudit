@@ -2,9 +2,11 @@
 
 import tempfile
 from pathlib import Path
+from urllib.parse import ParseResult
 
 import pytest
 
+from modelaudit.scanners import metadata_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.metadata_scanner import MetadataScanner
 
@@ -75,6 +77,29 @@ class TestMetadataScanner:
         }
         assert any("bit.ly" in issue.message for issue in result.issues)
         assert any("ngrok.io" in issue.message for issue in result.issues)
+
+    def test_repeated_benign_urls_are_parsed_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Skip duplicate benign URLs before reparsing them."""
+        scanner = MetadataScanner()
+        result = scanner._create_result()
+        parse_calls = 0
+        real_urlparse = metadata_scanner.urlparse
+
+        def tracking_urlparse(url: str) -> ParseResult:
+            nonlocal parse_calls
+            parse_calls += 1
+            return real_urlparse(url)
+
+        monkeypatch.setattr(metadata_scanner, "urlparse", tracking_urlparse)
+
+        scanner._check_suspicious_urls_in_text(
+            "\n".join(["https://huggingface.co/example/model"] * 3),
+            "README.md",
+            result,
+        )
+
+        assert parse_calls == 1
+        assert result.issues == []
 
     def test_scan_detects_suspicious_subdomain_hosts(self):
         """Test suspicious domains are detected through subdomain matching."""
