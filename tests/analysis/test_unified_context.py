@@ -1,6 +1,7 @@
 """Tests for unified context module."""
 
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -226,6 +227,28 @@ class TestUnifiedMLContext:
         ]
         basic_context.analyze_architecture_patterns()
         assert basic_context.architecture == ModelArchitecture.CNN
+
+    def test_analyze_architecture_reuses_lowered_layer_types(self, basic_context: UnifiedMLContext) -> None:
+        """Architecture detection should normalize each layer type once."""
+
+        class CountingLayerType:
+            str_calls = 0
+
+            def __str__(self) -> str:
+                type(self).str_calls += 1
+                return "custom_layer"
+
+        basic_context.layer_patterns = [
+            LayerPattern(
+                layer_type=cast(str, CountingLayerType()),
+                parameter_names=[],
+                activation_functions=[],
+            )
+        ]
+
+        basic_context.analyze_architecture_patterns()
+
+        assert CountingLayerType.str_calls == 1
 
     def test_analyze_architecture_bert(self, basic_context):
         """Test BERT architecture detection."""

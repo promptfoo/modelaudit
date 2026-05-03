@@ -2,12 +2,26 @@
 
 import pickle
 
+import pytest
+
 from modelaudit.detectors.secrets import SecretsDetector, detect_secrets_in_file
 from modelaudit.scanners.pickle_scanner import PickleScanner
 
 
 class TestSecretsDetector:
     """Test the SecretsDetector class."""
+
+    def test_default_detector_reuses_precompiled_patterns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Default detector construction should not rebuild static regex banks."""
+
+        def fail_compile(*_args: object, **_kwargs: object) -> None:
+            raise AssertionError("unexpected regex compilation")
+
+        monkeypatch.setattr("modelaudit.detectors.secrets.re.compile", fail_compile)
+
+        detector = SecretsDetector()
+
+        assert detector.scan_text("normal model metadata") == []
 
     def test_detect_aws_keys(self):
         """Test detection of AWS access keys."""

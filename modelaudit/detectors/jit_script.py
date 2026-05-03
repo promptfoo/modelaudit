@@ -115,6 +115,20 @@ DANGEROUS_IMPORTS = [
     "__builtins__",
 ]
 
+
+def _compile_dangerous_import_patterns(dangerous_import: str) -> tuple[re.Pattern[str], re.Pattern[str]]:
+    """Compile exact import/from-import regexes for one dangerous module name."""
+    escaped = re.escape(dangerous_import)
+    return (
+        re.compile(rf"(?m)^\s*import\s+{escaped}(?:[.\s,]|$)"),
+        re.compile(rf"(?m)^\s*from\s+{escaped}(?:[.\s]|$)"),
+    )
+
+
+_DANGEROUS_IMPORT_PATTERNS = {
+    dangerous_import: _compile_dangerous_import_patterns(dangerous_import) for dangerous_import in DANGEROUS_IMPORTS
+}
+
 # Patterns that indicate code execution attempts
 CODE_EXECUTION_PATTERNS = [
     # Direct execution patterns
@@ -231,10 +245,9 @@ class JITScriptDetector:
     @staticmethod
     def _contains_dangerous_import(source: str, dangerous_import: str) -> bool:
         """Return whether source imports the exact dangerous module or one of its submodules."""
-        escaped = re.escape(dangerous_import)
-        import_pattern = rf"(?m)^\s*import\s+{escaped}(?:[.\s,]|$)"
-        from_pattern = rf"(?m)^\s*from\s+{escaped}(?:[.\s]|$)"
-        return re.search(import_pattern, source) is not None or re.search(from_pattern, source) is not None
+        patterns = _DANGEROUS_IMPORT_PATTERNS.get(dangerous_import)
+        import_pattern, from_pattern = patterns or _compile_dangerous_import_patterns(dangerous_import)
+        return import_pattern.search(source) is not None or from_pattern.search(source) is not None
 
     def scan_torchscript(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
         """Scan TorchScript model data for dangerous operations.
