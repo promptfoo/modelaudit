@@ -8523,3 +8523,82 @@ if marker.read_text() != marker_content:
     )
     assert result.returncode == 0, result.stderr
     assert marker.read_text() == marker_content
+
+
+def test_calls_in_function_reuses_getattr_assignment_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = ast.parse(
+        """
+def bridge(target, command, fallback):
+    callback = getattr(target, command, fallback)
+    callback(command)
+"""
+    )
+    bridge = module.body[0]
+    assert isinstance(bridge, ast.FunctionDef)
+
+    calls = 0
+    original_assignment_call_candidates = call_graph._function_assignment_call_candidates
+
+    def counting_assignment_call_candidates(
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> tuple[tuple[set[str], ast.Call], ...]:
+        nonlocal calls
+        calls += 1
+        return original_assignment_call_candidates(function_node)
+
+    monkeypatch.setattr(call_graph, "_function_assignment_call_candidates", counting_assignment_call_candidates)
+
+    resolved_calls = call_graph._calls_in_function(
+        bridge,
+        "benchmod",
+        False,
+        {},
+        {"bridge"},
+        set(),
+        {},
+    )
+
+    assert "builtins.getattr.__call__" in resolved_calls
+    assert calls == 1
+
+
+def test_calls_in_function_reuses_instance_alias_parameter_analysis(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = ast.parse(
+        """
+class Runner:
+    def execute(self, command):
+        pass
+
+def bridge(target, command):
+    runner = Runner(command)
+    runner.execute(command)
+    getattr(target, command)(command)
+"""
+    )
+    bridge = module.body[1]
+    assert isinstance(bridge, ast.FunctionDef)
+
+    calls = 0
+    original_parameter_controlled_names = call_graph._parameter_controlled_names
+
+    def counting_parameter_controlled_names(
+        function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    ) -> set[str]:
+        nonlocal calls
+        calls += 1
+        return original_parameter_controlled_names(function_node)
+
+    monkeypatch.setattr(call_graph, "_parameter_controlled_names", counting_parameter_controlled_names)
+
+    resolved_calls = call_graph._calls_in_function(
+        bridge,
+        "benchmod",
+        False,
+        {},
+        {"Runner", "bridge"},
+        {"benchmod.Runner"},
+        {"benchmod.Runner": ("benchmod.Runner.execute",)},
+    )
+
+    assert "benchmod.Runner.execute" in resolved_calls
+    assert calls == 1

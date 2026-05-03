@@ -232,6 +232,10 @@ def _extract_attr_strings(attrs: Any) -> list[_AttrString]:
     return strings
 
 
+def _attr_strings_with_lowered_values(attr_strings: Iterable[_AttrString]) -> tuple[tuple[_AttrString, str], ...]:
+    return tuple((attr_string, attr_string.attr_value.lower()) for attr_string in attr_strings)
+
+
 class TensorFlowMetaGraphScanner(BaseScanner):
     """Scanner for TensorFlow MetaGraph protobuf files (.meta)."""
 
@@ -397,12 +401,14 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                 continue
 
             attr_strings = _extract_attr_strings(ctx.attrs)
-            has_decode_hint = any(_DECODE_HINT_RE.search(attr.attr_value.lower()) for attr in attr_strings)
+            attr_strings_with_lowered_values = _attr_strings_with_lowered_values(attr_strings)
+            has_decode_hint = any(
+                _DECODE_HINT_RE.search(attr_lower) for _attr_string, attr_lower in attr_strings_with_lowered_values
+            )
 
-            for attr_string in attr_strings:
+            for attr_string, attr_lower in attr_strings_with_lowered_values:
                 attr_name = attr_string.attr_name
                 attr_val = attr_string.attr_value
-                attr_lower = attr_val.lower()
 
                 if _LIBRARY_OR_PATH_RE.search(attr_val):
                     suspicious_signal_categories.add("dynamic_library_or_path")
