@@ -59,7 +59,8 @@ _CachedFunctionT = TypeVar("_CachedFunctionT", bound=Callable[..., object])
 
 
 class _CacheClearable(Protocol):
-    def cache_clear(self) -> None: ...
+    def cache_clear(self) -> None:
+        pass
 
 
 _SOURCE_SENSITIVE_CACHED_FUNCTIONS: set[_CacheClearable] = set()
