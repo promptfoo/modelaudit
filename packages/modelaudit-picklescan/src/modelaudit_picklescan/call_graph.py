@@ -7,7 +7,9 @@ import os
 import sys
 import sysconfig
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib.machinery import EXTENSION_SUFFIXES, BuiltinImporter, FrozenImporter, ModuleSpec, PathFinder
@@ -37,6 +39,10 @@ _PICKLE_ENTERED_IMPORT_EXECUTION_METHODS = (
 _INHERITED_CLASS_ENTRYPOINT_METHODS = (
     *_PICKLE_CONSTRUCTOR_ENTRYPOINT_METHODS,
     *_PICKLE_LIFECYCLE_ENTRYPOINT_METHODS,
+)
+_SHARED_SOURCE_SENSITIVE_CACHE_DEPTH: ContextVar[int] = ContextVar(
+    "_SHARED_SOURCE_SENSITIVE_CACHE_DEPTH",
+    default=0,
 )
 
 _CLASS_ENTRYPOINT_METHODS = (
@@ -240,6 +246,13 @@ class _WildcardExportSummary:
 
 
 @dataclass(frozen=True)
+class _ModuleSourceContext:
+    source_path: Path
+    module_statements: tuple[ast.stmt, ...]
+    is_package: bool
+
+
+@dataclass(frozen=True)
 class _ClassSourceContext:
     module_name: str
     class_node: ast.ClassDef
@@ -434,6 +447,18 @@ def find_unanalyzed_callable_call_graph_references(
         if len(references) >= _MAX_IMPORT_REFERENCES:
             break
     return tuple(references)
+
+
+@contextmanager
+def shared_source_sensitive_caches() -> Iterator[None]:
+    """Share one fresh cache generation across related enrichment passes."""
+    if _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.get() == 0:
+        _clear_source_sensitive_caches_now()
+    token = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.set(_SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.get() + 1)
+    try:
+        yield
+    finally:
+        _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.reset(token)
 
 
 @lru_cache(maxsize=4096)
@@ -708,6 +733,12 @@ def has_unanalyzed_call_graph_import_references(import_references: object) -> bo
 
 
 def _clear_source_sensitive_caches() -> None:
+    if _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.get() > 0:
+        return
+    _clear_source_sensitive_caches_now()
+
+
+def _clear_source_sensitive_caches_now() -> None:
     for function in (
         _safe_call_graph_entrypoints,
         _has_static_torch_extension_global_target,
@@ -720,11 +751,15 @@ def _clear_source_sensitive_caches() -> None:
         _resolve_wildcard_reexport_alias,
         _wildcard_export_summary,
         _resolve_class_target,
+        _split_function_name,
+        _module_source_context,
         _analyze_module,
         _source_function_context,
         _source_class_context,
         _constructor_parameter_self_attribute_targets,
         _iter_call_nodes,
+        _collect_function_import_aliases,
+        _parameter_controlled_names,
         _can_invoke_function_with_positional_args,
         _can_follow_import_execution_fallback,
         _resolve_module_source,
@@ -1115,19 +1150,10 @@ def _resolve_wildcard_reexport_alias_inner(
 
 @lru_cache(maxsize=4096)
 def _wildcard_export_summary(module_name: str) -> _WildcardExportSummary | None:
-    source_path = _resolve_module_source(module_name)
-    if source_path is None:
+    context = _module_source_context(module_name)
+    if context is None:
         return None
-    try:
-        if source_path.stat().st_size > _MAX_SOURCE_BYTES:
-            return None
-        source = source_path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(source_path))
-    except Exception:
-        return None
-
-    is_package = source_path.name == "__init__.py"
-    return _collect_module_export_summary(_module_level_statements(tree), module_name, is_package)
+    return _collect_module_export_summary(context.module_statements, module_name, context.is_package)
 
 
 @lru_cache(maxsize=4096)
@@ -1165,6 +1191,7 @@ def _class_entrypoints(class_name: str) -> tuple[str, ...]:
     return analysis.class_entrypoints.get(f"{module_name}.{qualified_name}", ())
 
 
+@lru_cache(maxsize=4096)
 def _split_function_name(function_name: str) -> tuple[str | None, str]:
     parts = function_name.split(".")
     for index in range(len(parts) - 1, 0, -1):
@@ -1178,6 +1205,60 @@ def _split_function_name(function_name: str) -> tuple[str | None, str]:
 
 @lru_cache(maxsize=1024)
 def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
+    context = _module_source_context(module_name)
+    if context is None:
+        return None
+
+    export_summary = _collect_module_export_summary(context.module_statements, module_name, context.is_package)
+    import_aliases = _collect_aliases(context.module_statements, module_name, context.is_package)
+    local_defs = _collect_local_defs(context.module_statements)
+    local_class_entrypoints = _collect_local_class_entrypoints(
+        context.module_statements,
+        module_name,
+        import_aliases,
+        local_defs,
+    )
+    local_class_targets = set(local_class_entrypoints)
+    aliases = {
+        **import_aliases,
+        **_collect_assignment_aliases(
+            context.module_statements,
+            module_name,
+            import_aliases,
+            local_defs,
+            local_class_targets,
+        ),
+    }
+    aliases.update(
+        _collect_class_instance_default_aliases(
+            context.module_statements,
+            module_name,
+            aliases,
+            local_defs,
+            local_class_targets,
+        )
+    )
+    calls_by_function, class_entrypoints = _collect_function_calls(
+        context.module_statements,
+        module_name,
+        context.is_package,
+        aliases,
+        local_defs,
+        local_class_targets,
+        local_class_entrypoints,
+    )
+    return _ModuleAnalysis(
+        module=module_name,
+        source_path=str(context.source_path),
+        aliases=aliases,
+        direct_names=export_summary.direct_names,
+        calls_by_function=calls_by_function,
+        class_entrypoints=class_entrypoints,
+    )
+
+
+@lru_cache(maxsize=4096)
+def _module_source_context(module_name: str) -> _ModuleSourceContext | None:
     source_path = _resolve_module_source(module_name)
     if source_path is None:
         return None
@@ -1191,49 +1272,7 @@ def _analyze_module(module_name: str) -> _ModuleAnalysis | None:
 
     is_package = source_path.name == "__init__.py"
     module_statements = _module_level_statements(tree)
-    export_summary = _collect_module_export_summary(module_statements, module_name, is_package)
-    import_aliases = _collect_aliases(module_statements, module_name, is_package)
-    local_defs = _collect_local_defs(module_statements)
-    local_class_entrypoints = _collect_local_class_entrypoints(
-        module_statements, module_name, import_aliases, local_defs
-    )
-    local_class_targets = set(local_class_entrypoints)
-    aliases = {
-        **import_aliases,
-        **_collect_assignment_aliases(
-            module_statements,
-            module_name,
-            import_aliases,
-            local_defs,
-            local_class_targets,
-        ),
-    }
-    aliases.update(
-        _collect_class_instance_default_aliases(
-            module_statements,
-            module_name,
-            aliases,
-            local_defs,
-            local_class_targets,
-        )
-    )
-    calls_by_function, class_entrypoints = _collect_function_calls(
-        module_statements,
-        module_name,
-        is_package,
-        aliases,
-        local_defs,
-        local_class_targets,
-        local_class_entrypoints,
-    )
-    return _ModuleAnalysis(
-        module=module_name,
-        source_path=str(source_path),
-        aliases=aliases,
-        direct_names=export_summary.direct_names,
-        calls_by_function=calls_by_function,
-        class_entrypoints=class_entrypoints,
-    )
+    return _ModuleSourceContext(source_path=source_path, module_statements=module_statements, is_package=is_package)
 
 
 def _module_level_statements(tree: ast.Module) -> tuple[ast.stmt, ...]:
@@ -1326,6 +1365,7 @@ def _collect_import_aliases(nodes: Iterable[ast.AST], module_name: str, is_packa
     return aliases
 
 
+@lru_cache(maxsize=4096)
 def _collect_function_import_aliases(
     function_node: ast.FunctionDef | ast.AsyncFunctionDef,
     module_name: str,
@@ -2086,21 +2126,20 @@ def _calls_in_function(
         **aliases,
         **_collect_function_import_aliases(function_node, module_name, is_package),
     }
-    function_aliases.update(
-        _collect_function_instance_aliases(
-            function_node,
-            call_nodes,
-            module_name,
-            function_aliases,
-            local_defs,
-            local_class_targets,
-            class_name=class_name,
-        )
+    instance_aliases, parameter_controlled_names = _collect_function_instance_aliases(
+        function_node,
+        call_nodes,
+        module_name,
+        function_aliases,
+        local_defs,
+        local_class_targets,
+        class_name=class_name,
     )
-    parameter_controlled_names: set[str] | None = None
+    function_aliases.update(instance_aliases)
     tcl_command_controlled_names: set[str] | None = None
     dynamic_getattr_callable_names: set[str] | None = None
     getattr_default_callable_names: dict[str, str] | None = None
+    assignment_call_candidates: tuple[tuple[set[str], ast.Call], ...] | None = None
     may_use_getattr_dispatch = _may_use_getattr_dispatch(call_nodes, function_aliases)
     for node in call_nodes:
         if may_use_getattr_dispatch:
@@ -2118,8 +2157,10 @@ def _calls_in_function(
                 continue
             if isinstance(node.func, ast.Name):
                 if dynamic_getattr_callable_names is None:
+                    if assignment_call_candidates is None:
+                        assignment_call_candidates = _function_assignment_call_candidates(function_node)
                     dynamic_getattr_callable_names = _controlled_getattr_callable_names(
-                        function_node,
+                        assignment_call_candidates,
                         module_name,
                         function_aliases,
                         local_defs,
@@ -2132,8 +2173,10 @@ def _calls_in_function(
                     calls.append(_CONTROLLED_GETATTR_DISPATCH_SINK)
                     continue
                 if getattr_default_callable_names is None:
+                    if assignment_call_candidates is None:
+                        assignment_call_candidates = _function_assignment_call_candidates(function_node)
                     getattr_default_callable_names = _getattr_default_callable_names(
-                        function_node,
+                        assignment_call_candidates,
                         call_nodes,
                         module_name,
                         function_aliases,
@@ -2351,7 +2394,7 @@ def _is_controlled_direct_getattr_dispatch(
 
 
 def _controlled_getattr_callable_names(
-    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    assignment_call_candidates: tuple[tuple[set[str], ast.Call], ...],
     module_name: str,
     aliases: dict[str, str],
     local_defs: set[str],
@@ -2360,20 +2403,7 @@ def _controlled_getattr_callable_names(
     class_name: str | None,
 ) -> set[str]:
     callable_names: set[str] = set()
-    for node in ast.walk(function_node):
-        value: ast.AST | None
-        if isinstance(node, ast.Assign):
-            value = node.value
-            targets = set()
-            for target in node.targets:
-                targets.update(_assignment_target_names(target))
-        elif isinstance(node, ast.AnnAssign):
-            value = node.value
-            targets = _assignment_target_names(node.target)
-        else:
-            continue
-        if not isinstance(value, ast.Call):
-            continue
+    for targets, value in assignment_call_candidates:
         if _controlled_getattr_call(
             value,
             module_name,
@@ -2404,7 +2434,7 @@ def _controlled_getattr_call(
 
 
 def _getattr_default_callable_names(
-    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    assignment_call_candidates: tuple[tuple[set[str], ast.Call], ...],
     call_nodes: tuple[ast.Call, ...],
     module_name: str,
     aliases: dict[str, str],
@@ -2417,20 +2447,7 @@ def _getattr_default_callable_names(
         return {}
 
     callable_names: dict[str, str] = {}
-    for node in ast.walk(function_node):
-        value: ast.AST | None
-        if isinstance(node, ast.Assign):
-            value = node.value
-            targets = set()
-            for target in node.targets:
-                targets.update(_assignment_target_names(target))
-        elif isinstance(node, ast.AnnAssign):
-            value = node.value
-            targets = _assignment_target_names(node.target)
-        else:
-            continue
-        if not isinstance(value, ast.Call):
-            continue
+    for targets, value in assignment_call_candidates:
         target_names = targets & called_names
         if not target_names:
             continue
@@ -2446,6 +2463,27 @@ def _getattr_default_callable_names(
         for target_name in sorted(target_names):
             callable_names[target_name] = fallback_target
     return callable_names
+
+
+def _function_assignment_call_candidates(
+    function_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> tuple[tuple[set[str], ast.Call], ...]:
+    candidates: list[tuple[set[str], ast.Call]] = []
+    for node in ast.walk(function_node):
+        value: ast.AST | None
+        if isinstance(node, ast.Assign):
+            value = node.value
+            targets = set()
+            for target in node.targets:
+                targets.update(_assignment_target_names(target))
+        elif isinstance(node, ast.AnnAssign):
+            value = node.value
+            targets = _assignment_target_names(node.target)
+        else:
+            continue
+        if isinstance(value, ast.Call):
+            candidates.append((targets, value))
+    return tuple(candidates)
 
 
 def _getattr_default_callable_target(
@@ -2471,10 +2509,10 @@ def _collect_function_instance_aliases(
     local_class_targets: set[str],
     *,
     class_name: str | None,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], set[str] | None]:
     receiver_names = _method_call_receiver_names(call_nodes)
     if not receiver_names:
-        return {}
+        return {}, None
 
     assignment_candidates = tuple(
         (node, target_names)
@@ -2483,7 +2521,7 @@ def _collect_function_instance_aliases(
         and (target_names := _assignment_alias_target_names(node) & receiver_names)
     )
     if not assignment_candidates:
-        return {}
+        return {}, None
 
     instance_aliases: dict[str, str] = {}
     controlled_names = _parameter_controlled_names(function_node)
@@ -2505,8 +2543,8 @@ def _collect_function_instance_aliases(
                 continue
             instance_aliases[target_name] = resolved
             if len(instance_aliases) >= _MAX_FUNCTION_INSTANCE_ALIASES:
-                return instance_aliases
-    return instance_aliases
+                return instance_aliases, controlled_names
+    return instance_aliases, controlled_names
 
 
 def _method_call_receiver_names(call_nodes: tuple[ast.Call, ...]) -> set[str]:
@@ -2604,6 +2642,7 @@ def _iter_call_nodes(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> t
     return tuple(calls)
 
 
+@lru_cache(maxsize=4096)
 def _parameter_controlled_names(function_node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     controlled = _initial_parameter_controlled_names(function_node)
 

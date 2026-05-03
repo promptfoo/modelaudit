@@ -240,13 +240,38 @@ class OnnxScanner(BaseScanner):
             result.finish(success=False)
             return result
 
+        # Read raw bytes first so successful scans can parse and run raw
+        # detectors from the same buffer. If this read fails, fall back to
+        # ONNX's path-based loader so structural analysis still has a chance
+        # to complete while raw detector coverage stays explicitly incomplete.
+        model_data: bytes | None = None
+        try:
+            self.check_interrupted()
+            with open(path, "rb") as f:
+                model_data = f.read()
+            self.check_interrupted()
+        except Exception as e:
+            logger.warning("Raw ONNX detector input read failed: %s", e)
+            self._mark_raw_detection_incomplete(
+                result,
+                path,
+                detector="raw_file_read",
+                reason="file_read_failed",
+                message=f"Raw ONNX detector input read failed: {e!s}",
+                details={"exception": str(e), "exception_type": type(e).__name__},
+            )
+
         try:
             import onnx
 
-            # Check for interrupts before starting the potentially long-running load
+            # Check for interrupts before starting the potentially long-running load.
             self.check_interrupted()
-            model = onnx.load(path, load_external_data=False)
-            # Check for interrupts after loading completes
+            model = (
+                onnx.load(path, load_external_data=False)
+                if model_data is None
+                else onnx.load_model_from_string(model_data)
+            )
+            # Check for interrupts after loading completes.
             self.check_interrupted()
             result.bytes_scanned = file_size
         except KeyboardInterrupt:
@@ -272,24 +297,7 @@ class OnnxScanner(BaseScanner):
             },
         )
 
-        # Read the raw bytes once, then keep detector coverage separate so a
-        # failure in one detector does not masquerade as a clean pass.
-        try:
-            self.check_interrupted()
-            with open(path, "rb") as f:
-                model_data = f.read()
-            self.check_interrupted()
-        except Exception as e:
-            logger.warning("Raw ONNX detector input read failed: %s", e)
-            self._mark_raw_detection_incomplete(
-                result,
-                path,
-                detector="raw_file_read",
-                reason="file_read_failed",
-                message=f"Raw ONNX detector input read failed: {e!s}",
-                details={"exception": str(e), "exception_type": type(e).__name__},
-            )
-        else:
+        if model_data is not None:
             check_jit = self._get_bool_config("check_jit_script", True)
             if check_jit:
                 try:
