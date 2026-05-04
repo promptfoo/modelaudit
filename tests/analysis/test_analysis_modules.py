@@ -8,7 +8,7 @@ import pytest
 class TestAnalysisModules:
     """Test that analysis modules can be imported and instantiated."""
 
-    def test_import_modules(self):
+    def test_import_modules(self) -> None:
         """Test importing all analysis modules."""
         # These imports should not raise exceptions
         from modelaudit.analysis import (
@@ -20,35 +20,7 @@ class TestAnalysisModules:
         assert AnalysisConfidence.HIGH.value == 0.8
         assert CodeRiskLevel.SAFE.value == "safe"  # It's a string enum
 
-    def test_instantiate_analyzers(self):
-        """Test instantiating analyzer objects."""
-        from modelaudit.analysis import (
-            AnomalyDetector,
-            EntropyAnalyzer,
-            IntegratedAnalyzer,
-            SemanticAnalyzer,
-        )
-        from modelaudit.analysis.framework_patterns import FrameworkKnowledgeBase
-        from modelaudit.analysis.unified_context import UnifiedMLContext
-
-        # These should instantiate without errors
-        entropy = EntropyAnalyzer()
-        semantic = SemanticAnalyzer()
-        anomaly = AnomalyDetector()
-        integrated = IntegratedAnalyzer()
-        # UnifiedMLContext requires file info
-        context = UnifiedMLContext(Path("test.pkl"), 1024, "pickle")
-        kb = FrameworkKnowledgeBase()
-
-        # Basic sanity checks
-        assert entropy is not None
-        assert semantic is not None
-        assert anomaly is not None
-        assert integrated is not None
-        assert context is not None
-        assert kb is not None
-
-    def test_entropy_analyzer_basic(self):
+    def test_entropy_analyzer_basic(self) -> None:
         """Test basic entropy analyzer functionality."""
         from modelaudit.analysis import EntropyAnalyzer
 
@@ -64,7 +36,7 @@ class TestAnalysisModules:
         # Code should have higher entropy than repetitive data
         assert code_entropy > weight_entropy
 
-    def test_semantic_analyzer_basic(self):
+    def test_semantic_analyzer_basic(self) -> None:
         """Test basic semantic analyzer functionality."""
         from modelaudit.analysis import CodeRiskLevel, SemanticAnalyzer
 
@@ -159,28 +131,24 @@ class TestAnalysisModules:
         assert risk_level == CodeRiskLevel.SAFE
         assert details["mitigating_factors"] == ["Safe usage of eval"]
 
-    def test_integrated_analyzer_basic(self):
-        """Test basic integrated analyzer functionality."""
+    def test_integrated_analyzer_includes_code_specific_analysis(self) -> None:
+        """Code patterns should include semantic and syntax validation details."""
         from modelaudit.analysis import IntegratedAnalyzer
         from modelaudit.analysis.unified_context import UnifiedMLContext
 
         analyzer = IntegratedAnalyzer()
-
-        # Create a context for the analysis
         context = UnifiedMLContext(Path("test.pkl"), 1024, "pickle")
 
-        # Test with simple analysis
         result = analyzer.analyze_suspicious_pattern(
-            pattern="eval",
-            pattern_type="code_execution",
+            pattern="os.system",
+            pattern_type="code",
             context=context,
-            code_snippet="eval('2+2')",
+            code_snippet="import os\nos.system('id')",
         )
 
-        assert result is not None
-        assert isinstance(result.is_suspicious, bool)
-        assert isinstance(result.confidence, float)
-        assert isinstance(result.risk_level, str)
+        assert result.detailed_analysis["semantic"]["risk_level"] == "medium"
+        assert result.detailed_analysis["validation"]["is_valid_python"] is True
+        assert "Dangerous operation: os.system" in result.reasoning
 
     def test_integrated_analyzer_treats_high_safety_confidence_as_not_suspicious(
         self,

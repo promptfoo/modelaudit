@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.joblib_scanner import JoblibScanner
 from modelaudit.scanners.numpy_scanner import NumPyScanner
 
@@ -435,7 +435,7 @@ class TestNumPyScannerSecurity:
         dtype_issues = [issue for issue in result.issues if "dangerous dtype" in issue.message.lower()]
         assert len(dtype_issues) == 0
 
-    def test_unsupported_numpy_version(self, tmp_path):
+    def test_unsupported_numpy_version(self, tmp_path: Path) -> None:
         """Test handling of unsupported NumPy file versions."""
         scanner = NumPyScanner()
 
@@ -454,9 +454,20 @@ class TestNumPyScannerSecurity:
 
         result = scanner.scan(str(npy_file))
 
-        # Should either succeed (if NumPy handles it) or fail gracefully
-        # The important thing is it doesn't crash
-        assert result is not None
+        magic_checks = [check for check in result.checks if check.name == "NumPy Magic String Validation"]
+        assert len(magic_checks) == 1
+        assert magic_checks[0].status == CheckStatus.PASSED
+
+        if result.success:
+            assert any(
+                check.name == "Array Dimension Validation" and check.status == CheckStatus.PASSED
+                for check in result.checks
+            )
+        else:
+            header_checks = [check for check in result.checks if check.name == "NumPy Header Read"]
+            assert len(header_checks) == 1
+            assert header_checks[0].status == CheckStatus.FAILED
+            assert "Failed to read NumPy array header" in header_checks[0].message
 
 
 class TestConfigurableLimits:
