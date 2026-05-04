@@ -30,7 +30,7 @@ ModelAudit is a static security scanner for model artifacts. It analyzes files a
 ## Local scan policy files
 
 - Local `.modelaudit.toml` or `pyproject.toml` policy files are not applied implicitly during scans.
-- Interactive text scans may offer to trust a detected local policy file for future runs on that same config directory.
+- Interactive text scans may offer to trust a detected local policy file for later scans on that same config directory.
 - Remembered trust is stored in the local ModelAudit cache and is invalidated automatically if the config file changes.
 - CI and other non-interactive scans should use explicit configuration rather than relying on remembered local trust.
 
@@ -39,6 +39,14 @@ ModelAudit is a static security scanner for model artifacts. It analyzes files a
 - `CRITICAL`: High-confidence risk indicator. Block release/use by default.
 - `WARNING`: Potential risk. Require manual review.
 - `INFO`: Context signal. Useful for triage and audit trails.
+
+For dashboards and aggregate corpus scans, filter security-alert views to
+`WARNING` and `CRITICAL` findings by default. INFO rows may include benign
+explainability notices, budget notes, or structural context; group them by code
+or keep them in an audit/detail view rather than counting each row as a blocker.
+Some compatibility findings intentionally include a secondary rule-code row for
+dashboards that rely on older rule identifiers; these rows carry `supporting_rule_code=true` in details and
+should be excluded from primary issue counts when de-duplicating.
 
 Exit codes:
 
@@ -50,7 +58,7 @@ Exit codes:
 
 1. Scan artifacts before loading or serving them.
 2. Treat `CRITICAL` findings as release blockers.
-3. Keep scanner dependencies current (`modelaudit[all]` for broadest coverage).
+3. Keep scanner dependencies current (`modelaudit[all]` for broad portable coverage; ONNX is included on Python 3.10-3.12; add `modelaudit[tensorflow]` on Python 3.11-3.12 only for TensorFlow runtime-dependent paths).
 4. Pair scanning with provenance and runtime controls.
 
 ## Reporting gaps or misses

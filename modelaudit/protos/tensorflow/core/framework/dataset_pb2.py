@@ -7,7 +7,6 @@
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import runtime_version as _runtime_version
-from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
 _runtime_version.ValidateProtobufRuntimeVersion(
     _runtime_version.Domain.PUBLIC,
@@ -19,14 +18,21 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 )
 # @@protoc_insertion_point(imports)
 
-_sym_db = _symbol_database.Default()
+
 
 
 from tensorflow.core.framework import tensor_pb2 as tensorflow_dot_core_dot_framework_dot_tensor__pb2
 from tensorflow.core.framework import tensor_shape_pb2 as tensorflow_dot_core_dot_framework_dot_tensor__shape__pb2
 from tensorflow.core.framework import types_pb2 as tensorflow_dot_core_dot_framework_dot_types__pb2
 
-
+# Keep generated dependency imports for descriptor registration side effects.
+# Reference aliases so static analysis preserves these side-effect imports.
+id(tensorflow_dot_core_dot_framework_dot_tensor__pb2)
+id(tensorflow_dot_core_dot_framework_dot_tensor__shape__pb2)
+id(tensorflow_dot_core_dot_framework_dot_types__pb2)
+del tensorflow_dot_core_dot_framework_dot_tensor__pb2
+del tensorflow_dot_core_dot_framework_dot_tensor__shape__pb2
+del tensorflow_dot_core_dot_framework_dot_types__pb2
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\'tensorflow/core/framework/dataset.proto\x12\x0ftensorflow.data\x1a&tensorflow/core/framework/tensor.proto\x1a,tensorflow/core/framework/tensor_shape.proto\x1a%tensorflow/core/framework/types.proto\"\x98\x01\n\x1b\x43ompressedComponentMetadata\x12#\n\x05\x64type\x18\x01 \x01(\x0e\x32\x14.tensorflow.DataType\x12\x32\n\x0ctensor_shape\x18\x02 \x01(\x0b\x32\x1c.tensorflow.TensorShapeProto\x12\x1a\n\x12uncompressed_bytes\x18\x04 \x03(\x04J\x04\x08\x03\x10\x04\"|\n\x11\x43ompressedElement\x12\x0c\n\x04\x64\x61ta\x18\x01 \x01(\x0c\x12H\n\x12\x63omponent_metadata\x18\x02 \x03(\x0b\x32,.tensorflow.data.CompressedComponentMetadata\x12\x0f\n\x07version\x18\x03 \x01(\x05\"B\n\x13UncompressedElement\x12+\n\ncomponents\x18\x01 \x03(\x0b\x32\x17.tensorflow.TensorProtoB\x03\xf8\x01\x01\x62\x06proto3')
 
 _globals = globals()

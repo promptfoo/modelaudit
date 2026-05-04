@@ -1,7 +1,9 @@
+import builtins
 import json
 import os
 import pickle
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -231,6 +233,25 @@ def test_benign_jax_pickle_does_not_false_positive_on_opcode_letters(tmp_path: P
     assert result.success
     assert all(check.name != "Pickle Opcode Security Check" for check in result.checks)
     assert all(issue.severity != IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_pickle_candidate_probe_reuses_open_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checkpoint_path = tmp_path / "candidate.pickle"
+    checkpoint_path.write_bytes(pickle.dumps({"framework": "jax"}))
+
+    original_open = builtins.open
+    open_count = 0
+
+    def counting_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal open_count
+        if file == str(checkpoint_path):
+            open_count += 1
+        return original_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+
+    assert JaxCheckpointScanner._is_likely_jax_file(str(checkpoint_path)) is True
+    assert open_count == 1
 
 
 def test_malicious_pickle_global_opcode_is_detected(tmp_path: Path) -> None:
@@ -755,6 +776,50 @@ def test_can_handle_json_checkpoint_rejects_non_jax_near_match(tmp_path: Path) -
     assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
 
 
+def test_can_handle_json_checkpoint_rejects_ajax_near_match(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "ajax_model.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps({"framework": "ajax", "format": "checkpoint"}),
+        encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
+
+
+def test_can_handle_json_checkpoint_rejects_late_ajax_near_match(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "late_ajax_model.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps({"padding": "x" * 1024, "framework": "ajax", "format": "checkpoint"}),
+        encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
+
+
+def test_can_handle_pickle_checkpoint_rejects_ajax_near_match(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "ajax_state.pickle"
+    checkpoint_path.write_bytes(pickle.dumps({"framework": "ajax"}))
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
+
+
+def test_can_handle_pickle_checkpoint_accepts_protocol_zero_jax_indicator(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "state.pickle"
+    checkpoint_path.write_bytes(b"Vjax\np0\n.")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+
+
+def test_can_handle_json_checkpoint_accepts_letter_prefixed_jax_indicator(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "prefixed_model.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps({"framework": "myflax", "format": "checkpoint"}),
+        encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+
+
 def test_can_handle_bom_json_checkpoint_rejects_non_jax_near_match(tmp_path: Path) -> None:
     checkpoint_path = tmp_path / "bom_generic_model.checkpoint"
     checkpoint_path.write_bytes(
@@ -762,6 +827,59 @@ def test_can_handle_bom_json_checkpoint_rejects_non_jax_near_match(tmp_path: Pat
     )
 
     assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
+
+
+def test_can_handle_numpy_checkpoint_rejects_ajax_filename_near_match(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "ajax_weights.checkpoint"
+    checkpoint_path.write_bytes(b"\x93NUMPY" + (b"\x00" * 64))
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is False
+
+
+def test_can_handle_numpy_checkpoint_accepts_underscored_jax_filename(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "model_jax_weights.checkpoint"
+    checkpoint_path.write_bytes(b"\x93NUMPY")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+
+
+def test_can_handle_numpy_checkpoint_accepts_digit_prefixed_jax_filename(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "model1jax_weights.checkpoint"
+    checkpoint_path.write_bytes(b"\x93NUMPY")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+
+
+def test_can_handle_numpy_checkpoint_accepts_letter_prefixed_jax_filename(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "myjax_weights.checkpoint"
+    checkpoint_path.write_bytes(b"\x93NUMPY")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+
+
+def test_can_handle_letter_prefixed_jax_payload_still_routes_malicious_json(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "prefixed_payload.checkpoint"
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "framework": "myjax",
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success
+    assert any(
+        check.name == "JSON Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
 
 
 def test_metadata_traversal_stops_at_depth_limit_without_recursing_unbounded() -> None:

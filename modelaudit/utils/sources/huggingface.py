@@ -1,6 +1,7 @@
 """Utilities for handling HuggingFace model downloads."""
 
 import logging
+import os
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,32 @@ def _get_hf_cache_root() -> Path:
         return Path(HF_HUB_CACHE)
     except Exception:
         return Path.home() / ".cache" / "huggingface" / "hub"
+
+
+def _is_within_directory(base_dir: Path, target: Path) -> bool:
+    """Return True when target resolves inside base_dir."""
+    base_path = base_dir.resolve()
+    target_path = target.resolve()
+    if os.name == "nt":
+        base_norm = os.path.normcase(os.path.normpath(str(base_path)))
+        target_norm = os.path.normcase(os.path.normpath(str(target_path)))
+        try:
+            return os.path.commonpath([target_norm, base_norm]) == base_norm
+        except ValueError:
+            return False
+    return target_path.is_relative_to(base_path)
+
+
+def _build_huggingface_download_path(cache_dir: Path, namespace: str, repo_name: str) -> Path:
+    """Build and containment-check the local HuggingFace download path."""
+    cache_root = (cache_dir / "huggingface").resolve()
+    download_path = cache_root / namespace
+    if repo_name:
+        download_path = download_path / repo_name
+    resolved_download_path = download_path.resolve()
+    if not _is_within_directory(cache_root, resolved_download_path):
+        raise ValueError(f"HuggingFace cache path escaped cache directory: {resolved_download_path}")
+    return resolved_download_path
 
 
 def _list_repo_files_with_timeout(repo_id: str, timeout_seconds: float = 30) -> tuple[list[str] | None, str | None]:
@@ -131,9 +158,6 @@ def get_model_info(url: str) -> dict:
                     files.append({"name": item.path, "size": file_size})
         except Exception as e:
             # If list_repo_tree fails, return 0 (will show as "Unknown size" in CLI)
-            import logging
-
-            logger = logging.getLogger(__name__)
             logger.debug(f"list_repo_tree failed for {repo_id}, falling back to unknown size: {e}")
             total_size = 0
             # Still try to get file count from siblings
@@ -213,27 +237,14 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
     model_size = get_model_size(repo_id)
     download_path = None  # Will be set only if cache_dir is provided
     disk_check_path = None
+    download_path_preexisting = False
 
     if cache_dir is not None:
-        # Create a structured cache directory
-        download_path = cache_dir / "huggingface" / namespace
-        if repo_name:
-            download_path = download_path / repo_name
+        # Create a structured, containment-checked cache directory.
+        download_path = _build_huggingface_download_path(cache_dir, namespace, repo_name)
+        download_path_preexisting = download_path.exists()
         download_path.mkdir(parents=True, exist_ok=True)
         disk_check_path = download_path
-
-        # Check if model already exists in cache
-        if download_path.exists() and any(download_path.iterdir()):
-            # Verify it's a valid model directory
-            expected_files = [
-                "config.json",
-                "pytorch_model.bin",
-                "model.safetensors",
-                "flax_model.msgpack",
-                "tf_model.h5",
-            ]
-            if any((download_path / f).exists() for f in expected_files):
-                return download_path
 
     else:
         disk_check_path = _get_hf_cache_root()
@@ -325,7 +336,13 @@ def download_model(url: str, cache_dir: Path | None = None, show_progress: bool 
     except Exception as e:
         # Clean up directory on failure only if we created a custom cache directory
         # When cache_dir is None, we use HF's default cache and shouldn't clean it up
-        if cache_dir is not None and download_path is not None and download_path.exists():
+        if (
+            cache_dir is not None
+            and download_path is not None
+            and not download_path_preexisting
+            and download_path.exists()
+            and _is_within_directory(cache_dir / "huggingface", download_path)
+        ):
             import shutil
 
             shutil.rmtree(download_path)
@@ -398,9 +415,7 @@ def download_model_streaming(
         # Setup cache directory
         download_path = None
         if cache_dir is not None:
-            download_path = cache_dir / "huggingface" / namespace
-            if repo_name:
-                download_path = download_path / repo_name
+            download_path = _build_huggingface_download_path(cache_dir, namespace, repo_name)
             download_path.mkdir(parents=True, exist_ok=True)
 
         # Download each file one at a time

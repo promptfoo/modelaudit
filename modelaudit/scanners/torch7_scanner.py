@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from typing import Any, ClassVar
 
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from ._string_extraction import extract_bounded_printable_strings
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -15,7 +16,7 @@ MAX_SCAN_BYTES = 12 * 1024 * 1024
 MAX_EXTRACTED_STRINGS = 5000
 MIN_TORCH7_SIZE = 8
 
-PRINTABLE_TEXT_PATTERN = re.compile(rb"[ -~]{6,512}")
+PRINTABLE_TEXT_PATTERN = re.compile(rb"[\t\n\r -~]{6,512}")
 
 EXEC_PRIMITIVE_CALL_PATTERN = re.compile(
     r"(?i)\b(?:os\.execute|io\.popen|loadstring|dofile|loadfile|setfenv|getfenv)\s*\("
@@ -26,7 +27,12 @@ NETWORK_OR_SHELL_PATTERN = re.compile(
     r"/bin/sh|/bin/bash|bash\s+-c|sh\s+-c|netcat|nc\s+"
     r")"
 )
-REQUIRE_PATTERN = re.compile(r"(?i)\brequire\s*\(\s*['\"]([^'\"]+)['\"]\s*\)")
+_LUA_GAP_PATTERN = r"(?:\s|--[^\r\n]*(?:\r?\n|$))*"
+REQUIRE_PATTERN = re.compile(
+    rf"(?is)\brequire{_LUA_GAP_PATTERN}"
+    rf"(?:\({_LUA_GAP_PATTERN}(?:['\"]([^'\"]+)['\"]|\[(=*)\[(.*?)\]\2\]){_LUA_GAP_PATTERN}\)"
+    rf"|['\"]([^'\"]+)['\"]|\[(=*)\[(.*?)\]\5\])"
+)
 DYNAMIC_LOAD_PATTERN = re.compile(r"(?i)\b(?:package\.loadlib|ffi\.load|loadlib)\b")
 
 SAFE_REQUIRE_MODULES = frozenset(
@@ -121,6 +127,7 @@ class Torch7Scanner(BaseScanner):
         result.metadata["scan_truncated"] = truncated
 
         if truncated:
+            mark_inconclusive_scan_result(result, "torch7_bounded_read_incomplete")
             result.add_check(
                 name="Torch7 Bounded Read",
                 passed=False,
@@ -175,7 +182,9 @@ class Torch7Scanner(BaseScanner):
         self._analyze_dynamic_loads(path, extracted_strings, result)
         self._analyze_network_shell_strings(path, extracted_strings, result)
 
-        result.finish(success=not result.has_errors)
+        result.finish(
+            success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
+        )
         return result
 
     def _extract_strings(self, payload: bytes) -> list[str]:
@@ -241,7 +250,12 @@ class Torch7Scanner(BaseScanner):
 
         for text in strings:
             load_hit = bool(DYNAMIC_LOAD_PATTERN.search(text))
-            requires = REQUIRE_PATTERN.findall(text)
+            requires = [
+                module
+                for quoted_paren, _, long_paren, quoted_bare, _, long_bare in REQUIRE_PATTERN.findall(text)
+                for module in (quoted_paren, long_paren, quoted_bare, long_bare)
+                if module
+            ]
             suspicious_requires = [
                 module
                 for module in requires

@@ -64,12 +64,15 @@ def test_joblib_scanner_marks_incomplete_pickle_inconclusive_without_dangerous_f
     assert not any(issue.severity.value in {"warning", "critical"} for issue in result.issues)
 
 
-def test_joblib_scanner_preserves_legacy_pickle_rule_codes_on_embedded_pickle() -> None:
+def test_joblib_scanner_preserves_pickle_rule_codes_on_embedded_pickle() -> None:
     supply_chain_path = _ASSETS_DIR / "exploits" / "exploit4_supply_chain_attack.pkl"
     decode_chain_path = _ASSETS_DIR / "samples" / "pickles" / "decode_exec_chain.pkl"
 
     supply_chain_result = JoblibScanner().scan(str(supply_chain_path))
     decode_chain_result = JoblibScanner().scan(str(decode_chain_path))
 
-    assert any(issue.rule_code == "S310" for issue in supply_chain_result.issues)
-    assert any(issue.rule_code == "S104" for issue in decode_chain_result.issues)
+    assert any(issue.rule_code == "S201" for issue in supply_chain_result.issues)
+    assert any(
+        issue.rule_code == "S604" and issue.details.get("legacy_rule_aliases") == ["S104"]
+        for issue in decode_chain_result.issues
+    )

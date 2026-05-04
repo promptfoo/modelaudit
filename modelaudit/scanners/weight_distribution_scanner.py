@@ -4,6 +4,7 @@ import inspect
 import os
 import re
 import zipfile
+from contextlib import suppress
 from typing import Any, ClassVar
 
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
@@ -433,13 +434,11 @@ class WeightDistributionScanner(BaseScanner):
 
                 nodes: list[Any] = []
                 saved_model = saved_model_pb2.SavedModel()
-                try:
+                with suppress(Exception):
                     saved_model.ParseFromString(data)
                     if saved_model.meta_graphs:
                         for meta_graph in saved_model.meta_graphs:
                             nodes.extend(meta_graph.graph_def.node)
-                except Exception:
-                    pass
 
                 if not nodes:
                     graph_def = graph_pb2.GraphDef()
@@ -504,15 +503,13 @@ class WeightDistributionScanner(BaseScanner):
                 if len(initializer.dims) >= 2:
                     # Pre-check estimated byte size before materializing the
                     # full array — avoids memory exhaustion on huge tensors.
-                    try:
+                    with suppress(Exception):
                         _onnx_mapping = getattr(onnx, "mapping", None)
                         if _onnx_mapping is not None and hasattr(_onnx_mapping, "TENSOR_TYPE_TO_NP_TYPE"):
                             tensor_dtype = _onnx_mapping.TENSOR_TYPE_TO_NP_TYPE[initializer.data_type]
                             estimated_size = int(np.prod(initializer.dims)) * np.dtype(tensor_dtype).itemsize
                             if self.max_array_size and self.max_array_size > 0 and estimated_size > self.max_array_size:
                                 continue
-                    except Exception:
-                        pass  # Fall through and let to_array handle it
 
                     arr = onnx.numpy_helper.to_array(initializer)  # type: ignore[possibly-unresolved-reference]
                     if self.max_array_size and self.max_array_size > 0 and arr.nbytes > self.max_array_size:

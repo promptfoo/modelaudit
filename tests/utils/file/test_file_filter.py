@@ -1,19 +1,83 @@
 """Tests for file filtering functionality."""
 
+import json
 import pickle
 import zipfile
 from pathlib import Path
 
 import pytest
 
+from modelaudit.utils.file import filtering
+from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
 from modelaudit.utils.file.filtering import (
     _ZIP_MEMBER_SNIFF_LIMIT,
     should_skip_file,
 )
+from tests.helpers.file_creators import create_v7_tar_archive
+
+
+def _build_lightgbm_text() -> str:
+    return "\n".join(
+        [
+            "tree=0",
+            "version=v4",
+            "num_class=1",
+            "num_tree_per_iteration=1",
+            "max_feature_idx=2",
+            "feature_names=f0 f1 f2",
+            "tree_sizes=12",
+            "num_leaves=2",
+            "split_feature=0",
+            "leaf_value=0.1 0.2",
+        ]
+    )
+
+
+def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
+    """Patch a ZIP member CRC so reading the member raises BadZipFile."""
+    with zipfile.ZipFile(path) as archive:
+        info = archive.getinfo(member_name)
+        bad_crc = ((info.CRC + 1) & 0xFFFFFFFF).to_bytes(4, "little")
+        local_offset = info.header_offset
+
+    data = bytearray(path.read_bytes())
+    assert data[local_offset : local_offset + 4] == b"PK\x03\x04"
+    data[local_offset + 14 : local_offset + 18] = bad_crc
+
+    member_name_bytes = member_name.encode("utf-8")
+    central_offset = 0
+    while True:
+        central_offset = data.find(b"PK\x01\x02", central_offset)
+        assert central_offset >= 0
+        name_length = int.from_bytes(data[central_offset + 28 : central_offset + 30], "little")
+        extra_length = int.from_bytes(data[central_offset + 30 : central_offset + 32], "little")
+        comment_length = int.from_bytes(data[central_offset + 32 : central_offset + 34], "little")
+        name_start = central_offset + 46
+        name_end = name_start + name_length
+        if data[name_start:name_end] == member_name_bytes:
+            data[central_offset + 16 : central_offset + 20] = bad_crc
+            break
+        central_offset = name_end + extra_length + comment_length
+
+    path.write_bytes(data)
 
 
 class TestFileFilter:
     """Test file filtering functionality."""
+
+    def test_metadata_routing_reuses_lowered_filename(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class CountingFilename(str):
+            lower_calls = 0
+
+            def lower(self) -> str:
+                self.lower_calls += 1
+                return super().lower()
+
+        filename = CountingFilename("README.notes.txt")
+        monkeypatch.setattr(filtering.os.path, "basename", lambda _path: filename)
+
+        assert should_skip_file("/ignored/path.txt", metadata_scanner_available=True) is False
+        assert filename.lower_calls == 1
 
     def test_skip_common_extensions(self):
         """Test that common non-model extensions are skipped."""
@@ -145,16 +209,93 @@ class TestFileFilter:
         disguised_pickle = tmp_path / "payload.jpg"
         disguised_pickle.write_bytes(pickle.dumps({"safe": True}))
 
+        disguised_protocol0_pickle = tmp_path / "payload-protocol0.jpg"
+        disguised_protocol0_pickle.write_bytes(pickle.dumps({"safe": True}, protocol=0))
+
         disguised_zip = tmp_path / "archive.jpg"
         with zipfile.ZipFile(disguised_zip, "w") as archive:
             archive.writestr("payload.pkl", pickle.dumps({"safe": True}))
+
+        disguised_legacy_tar = create_v7_tar_archive(tmp_path / "legacy-tar.jpg")
 
         real_image = tmp_path / "cover.jpg"
         real_image.write_bytes(b"\xff\xd8\xff\xe0" + b"jpeg")
 
         assert not should_skip_file(str(disguised_pickle))
+        assert not should_skip_file(str(disguised_protocol0_pickle))
         assert not should_skip_file(str(disguised_zip))
+        assert not should_skip_file(str(disguised_legacy_tar))
         assert should_skip_file(str(real_image))
+
+    def test_pk_prefix_near_match_stays_skipped(self, tmp_path: Path) -> None:
+        near_match = tmp_path / "pknope.jpg"
+        near_match.write_bytes(b"PKNO harmless text")
+
+        assert should_skip_file(str(near_match))
+
+    def test_prefixed_zip_with_central_directory_stub_stays_scannable(self, tmp_path: Path) -> None:
+        disguised_zip = tmp_path / "archive.jpg"
+        with zipfile.ZipFile(disguised_zip, "w") as archive:
+            archive.writestr("payload.pkl", b"payload")
+        disguised_zip.write_bytes(b"PK\x01\x02stub-prefix" + disguised_zip.read_bytes())
+
+        assert not should_skip_file(str(disguised_zip))
+
+    @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
+    def test_content_recognized_payloads_bypass_default_hidden_and_basename_skips(
+        self,
+        tmp_path: Path,
+        filename: str,
+    ) -> None:
+        """Supported payloads should survive default hidden and basename filters."""
+        disguised_pickle = tmp_path / filename
+        disguised_pickle.write_bytes(pickle.dumps({"safe": True}))
+
+        assert not should_skip_file(str(disguised_pickle))
+
+    def test_disguised_lightgbm_text_model_bypasses_default_skip(self, tmp_path: Path) -> None:
+        """Default skip filtering must preserve supported text models under skipped suffixes."""
+        disguised_lightgbm = tmp_path / "model.txt"
+        disguised_lightgbm.write_text(("# preface\n" * 64) + _build_lightgbm_text(), encoding="utf-8")
+
+        assert detect_file_format_for_skip_filter(str(disguised_lightgbm)) == "lightgbm"
+        assert not should_skip_file(str(disguised_lightgbm))
+
+    def test_disguised_xml_models_with_long_prologs_bypass_default_skip(self, tmp_path: Path) -> None:
+        """Skipped suffixes must not hide XML model roots after long benign prologs."""
+        disguised_openvino = tmp_path / "openvino.txt"
+        disguised_openvino.write_text(
+            f"<?xml version='1.0'?><!--{'x' * 1024}--><net name='Model0' version='11'></net>",
+            encoding="utf-8",
+        )
+        disguised_pmml = tmp_path / "pmml.txt"
+        disguised_pmml.write_text(
+            f"<?xml version='1.0'?><!--{'x' * 1024}--><PMML version='4.4'></PMML>",
+            encoding="utf-8",
+        )
+        benign_xml = tmp_path / "notes.txt"
+        benign_xml.write_text(
+            f"<?xml version='1.0'?><!--{'x' * 1024}--><project><model name='safe'/></project>",
+            encoding="utf-8",
+        )
+
+        assert detect_file_format_for_skip_filter(str(disguised_openvino)) == "openvino"
+        assert detect_file_format_for_skip_filter(str(disguised_pmml)) == "pmml"
+        assert detect_file_format_for_skip_filter(str(benign_xml)) == "unknown"
+        assert not should_skip_file(str(disguised_openvino))
+        assert not should_skip_file(str(disguised_pmml))
+        assert should_skip_file(str(benign_xml))
+
+    def test_disguised_pmml_with_oversized_doctype_subset_fails_closed(self, tmp_path: Path) -> None:
+        """Incomplete oversized XML prologs should survive filtering for fail-closed handling."""
+        disguised_pmml = tmp_path / "pmml.txt"
+        disguised_pmml.write_text(
+            "<?xml version='1.0'?><!DOCTYPE PMML [" + ("x" * ((1024 * 1024) + 64)) + "]><PMML version='4.4'></PMML>",
+            encoding="utf-8",
+        )
+
+        assert detect_file_format_for_skip_filter(str(disguised_pmml)) == "xml_model_inconclusive"
+        assert not should_skip_file(str(disguised_pmml))
 
     def test_executorch_payloads_bypass_extension_skip(self, tmp_path: Path) -> None:
         """Disguised ZIPs carrying supported ExecuTorch payloads should survive prefiltering."""
@@ -163,6 +304,13 @@ class TestFileFilter:
             archive.writestr("model.pte", b"executorch payload")
 
         assert not should_skip_file(str(disguised_zip))
+
+    def test_rar_archives_bypass_extension_skip(self, tmp_path: Path) -> None:
+        """RAR archives should be routed to the fail-closed unsupported scanner."""
+        rar_path = tmp_path / "archive.rar"
+        rar_path.write_bytes(b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32)
+
+        assert not should_skip_file(str(rar_path))
 
     def test_docx_like_zip_remains_skipped(self, tmp_path: Path) -> None:
         """Common document ZIP containers should not be promoted into the scan set."""
@@ -183,8 +331,58 @@ class TestFileFilter:
 
         assert should_skip_file(str(docx_path))
 
-    def test_docx_like_zip_remains_skipped_when_office_markers_appear_late(self, tmp_path: Path) -> None:
-        """Office ZIP detection should not depend on member order within the sniff budget."""
+    def test_docx_with_embedded_pk_near_match_bin_remains_skipped(self, tmp_path: Path) -> None:
+        """PK-prefixed non-ZIP OLE binaries must not promote Office documents."""
+        docx_path = tmp_path / "embedded-pk-near-match.docx"
+        with zipfile.ZipFile(docx_path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types></Types>")
+            archive.writestr("word/document.xml", "<w:document></w:document>")
+            archive.writestr("word/embeddings/oleObject1.bin", b"PKNOPE embedded-ole")
+
+        assert should_skip_file(str(docx_path))
+
+    def test_docx_with_unreadable_embedded_pickle_bin_is_preserved(self, tmp_path: Path) -> None:
+        """Unreadable model-like .bin members must preserve Office ZIPs for full scanning."""
+        docx_path = tmp_path / "embedded-corrupt.docx"
+        member_name = "word/embeddings/oleObject1.bin"
+        with zipfile.ZipFile(docx_path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types></Types>")
+            archive.writestr("word/document.xml", "<w:document></w:document>")
+            archive.writestr(member_name, pickle.dumps({"safe": True}, protocol=4))
+        _corrupt_zip_member_crc(docx_path, member_name)
+
+        assert not should_skip_file(str(docx_path))
+
+    def test_docx_with_embedded_pickle_bin_bypasses_extension_skip(self, tmp_path: Path) -> None:
+        """Office ZIPs with model-like .bin payloads should survive prefiltering."""
+        docx_path = tmp_path / "embedded-model.docx"
+        with zipfile.ZipFile(docx_path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types></Types>")
+            archive.writestr("word/document.xml", "<w:document></w:document>")
+            archive.writestr("word/embeddings/oleObject1.bin", pickle.dumps({"safe": True}, protocol=4))
+
+        assert not should_skip_file(str(docx_path))
+
+    def test_config_only_keras_zip_bypasses_extension_skip(self, tmp_path: Path) -> None:
+        """Config-only Keras ZIPs should not depend on a .keras outer suffix."""
+        keras_zip = tmp_path / "model.jpg"
+        config = {"class_name": "Sequential", "config": {"layers": []}}
+        with zipfile.ZipFile(keras_zip, "w") as archive:
+            archive.writestr("config.json", json.dumps(config))
+
+        assert not should_skip_file(str(keras_zip))
+
+    def test_generic_config_zip_with_skipped_extension_remains_skipped(self, tmp_path: Path) -> None:
+        """Generic config.json members must not promote arbitrary skipped-suffix ZIPs."""
+        config_zip = tmp_path / "settings.jpg"
+        config = {"name": "not-a-keras-model", "config": {"theme": "light"}}
+        with zipfile.ZipFile(config_zip, "w") as archive:
+            archive.writestr("config.json", json.dumps(config))
+
+        assert should_skip_file(str(config_zip))
+
+    def test_large_docx_like_zip_is_preserved_when_sniff_budget_is_exhausted(self, tmp_path: Path) -> None:
+        """Large Office ZIPs should be preserved once the prefilter can no longer prove they are benign."""
         docx_path = tmp_path / "late-office.docx"
         with zipfile.ZipFile(docx_path, "w") as archive:
             archive.writestr("[Content_Types].xml", "<Types></Types>")
@@ -192,7 +390,19 @@ class TestFileFilter:
                 archive.writestr(f"docs/{index}.txt", "filler")
             archive.writestr("word/document.xml", "<w:document></w:document>")
 
-        assert should_skip_file(str(docx_path))
+        assert not should_skip_file(str(docx_path))
+
+    def test_large_docx_with_late_pickle_payload_is_preserved(self, tmp_path: Path) -> None:
+        """Late payloads in Office-like ZIPs must survive bounded prefiltering."""
+        docx_path = tmp_path / "late-payload.docx"
+        with zipfile.ZipFile(docx_path, "w") as archive:
+            archive.writestr("[Content_Types].xml", "<Types></Types>")
+            archive.writestr("word/document.xml", "<w:document></w:document>")
+            for index in range(_ZIP_MEMBER_SNIFF_LIMIT):
+                archive.writestr(f"docs/{index}.txt", "filler")
+            archive.writestr("payload.pkl", pickle.dumps({"safe": True}, protocol=4))
+
+        assert not should_skip_file(str(docx_path))
 
     def test_large_ambiguous_zip_is_preserved_for_scanning(self, tmp_path: Path) -> None:
         """Ambiguous ZIPs should survive the prefilter when the sniff budget is exhausted."""
@@ -219,6 +429,6 @@ class TestFileFilter:
         def raise_os_error(_path: str) -> str:
             raise OSError("synthetic sniff failure")
 
-        monkeypatch.setattr("modelaudit.utils.file.detection.detect_file_format", raise_os_error)
+        monkeypatch.setattr("modelaudit.utils.file.detection.detect_file_format_for_skip_filter", raise_os_error)
 
         assert not should_skip_file(str(disguised_payload))

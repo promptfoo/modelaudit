@@ -5,247 +5,449 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
+
+### Bug Fixes
+
+- remove checked-in benchmark files ([#1220](https://github.com/promptfoo/modelaudit/issues/1220)) ([1e258e4](https://github.com/promptfoo/modelaudit/commit/1e258e48f43522853ba167463a5fae8d5533612a))
+
+## [0.2.44](https://github.com/promptfoo/modelaudit/compare/v0.2.43...v0.2.44) (2026-05-03)
+
+### Bug Fixes
+
+- address ai quality findings ([#1218](https://github.com/promptfoo/modelaudit/issues/1218)) ([30f4ef2](https://github.com/promptfoo/modelaudit/commit/30f4ef246f7e26a4c6f85e684bfb35ceaea7c43d))
+- clear remaining security-quality findings ([#1219](https://github.com/promptfoo/modelaudit/issues/1219)) ([259f931](https://github.com/promptfoo/modelaudit/commit/259f931fa573e234734b7d72850e0ca09d775f45))
+
+### Performance Improvements
+
+- add opt-in core phase timings ([#1170](https://github.com/promptfoo/modelaudit/issues/1170)) ([75a7f0b](https://github.com/promptfoo/modelaudit/commit/75a7f0b4480f6e4305617a729fa9635b15432fe3))
+- bound directory progress pre-counts ([#1174](https://github.com/promptfoo/modelaudit/issues/1174)) ([23dc5d0](https://github.com/promptfoo/modelaudit/commit/23dc5d009a9cf14060ee046fe74ef1af02de2e7d))
+- bound ordinary license header reads ([#1197](https://github.com/promptfoo/modelaudit/issues/1197)) ([113ad34](https://github.com/promptfoo/modelaudit/commit/113ad3402d82aa1815239a4e3cbe93a862619cdc))
+- cache call graph call nodes ([#1215](https://github.com/promptfoo/modelaudit/issues/1215)) ([aa52759](https://github.com/promptfoo/modelaudit/commit/aa52759aabaac335b87e30e2cbf042d141dc4e9f))
+- cache function import aliases ([#1214](https://github.com/promptfoo/modelaudit/issues/1214)) ([d56eef2](https://github.com/promptfoo/modelaudit/commit/d56eef2de18652fee1a759642165e404b8202be9))
+- cache manifest trusted-url lookups ([#1186](https://github.com/promptfoo/modelaudit/issues/1186)) ([09e76cf](https://github.com/promptfoo/modelaudit/commit/09e76cf9a793572e961aefbbc827aeaeab351e64))
+- cache parameter controlled names ([#1213](https://github.com/promptfoo/modelaudit/issues/1213)) ([41b8f45](https://github.com/promptfoo/modelaudit/commit/41b8f4541c9b62204c74c04199931ef0484ba1a5))
+- cache scanner selection policies ([#1177](https://github.com/promptfoo/modelaudit/issues/1177)) ([371f480](https://github.com/promptfoo/modelaudit/commit/371f48024153dcd93f5df327781348b4076ddfd4))
+- cache split call graph names ([#1212](https://github.com/promptfoo/modelaudit/issues/1212)) ([77ab177](https://github.com/promptfoo/modelaudit/commit/77ab17782f23de46c57f6e2a7302a539fb0bfb98))
+- dedupe repeated metadata urls ([#1166](https://github.com/promptfoo/modelaudit/issues/1166)) ([b3f1009](https://github.com/promptfoo/modelaudit/commit/b3f1009d8e75912117df1279da6230b80e6e61cc))
+- reuse cache key content hash on store ([#1171](https://github.com/promptfoo/modelaudit/issues/1171)) ([e3981bd](https://github.com/promptfoo/modelaudit/commit/e3981bd21ddd912d893e306f354d49eb6b4e06e1))
+- reuse call graph controlled names ([#1198](https://github.com/promptfoo/modelaudit/issues/1198)) ([84e6a9b](https://github.com/promptfoo/modelaudit/commit/84e6a9bd841095917e2199e9004759bcbe9c0eb3))
+- reuse call graph module parses ([#1167](https://github.com/promptfoo/modelaudit/issues/1167)) ([0822b40](https://github.com/promptfoo/modelaudit/commit/0822b4043db270882b8fd14ff04de1cf3d3fb134))
+- reuse compiled pmml extension patterns ([#1172](https://github.com/promptfoo/modelaudit/issues/1172)) ([51ddc85](https://github.com/promptfoo/modelaudit/commit/51ddc8510bf1fa696bf38f2f54b29885c267ca2a))
+- reuse default secret regexes ([#1185](https://github.com/promptfoo/modelaudit/issues/1185)) ([b5ba149](https://github.com/promptfoo/modelaudit/commit/b5ba149f0667be7f7d86fe11f3647dac5ea3a620))
+- reuse flax layer keyword text ([#1187](https://github.com/promptfoo/modelaudit/issues/1187)) ([b50947f](https://github.com/promptfoo/modelaudit/commit/b50947fefde1140693856011b221ff540d83b100))
+- reuse flax structure analysis ([#1188](https://github.com/promptfoo/modelaudit/issues/1188)) ([c33c566](https://github.com/promptfoo/modelaudit/commit/c33c566cdb37ca480d593bbd474cb6f3dbd727b2))
+- reuse flax suspicious patterns ([#1194](https://github.com/promptfoo/modelaudit/issues/1194)) ([0351de1](https://github.com/promptfoo/modelaudit/commit/0351de1b3419353a60bdc6510772ddb6b8b55d47))
+- reuse hashes for hardlinked files ([#1175](https://github.com/promptfoo/modelaudit/issues/1175)) ([aac4367](https://github.com/promptfoo/modelaudit/commit/aac4367ef610e77c33bed9181821d83d4ccf1e4b))
+- reuse jax probe file handle ([#1161](https://github.com/promptfoo/modelaudit/issues/1161)) ([3e95649](https://github.com/promptfoo/modelaudit/commit/3e956493a476156b71fd06142190d49eb95b8bac))
+- reuse jinja scanner patterns ([#1184](https://github.com/promptfoo/modelaudit/issues/1184)) ([bb5a729](https://github.com/promptfoo/modelaudit/commit/bb5a729364aff328996d2868799b3ce394193df5))
+- reuse jit import regexes ([#1190](https://github.com/promptfoo/modelaudit/issues/1190)) ([9f37f5d](https://github.com/promptfoo/modelaudit/commit/9f37f5d35317d9273388e24e72af4a6a2fd4c001))
+- reuse lowered blacklist payload ([#1165](https://github.com/promptfoo/modelaudit/issues/1165)) ([624a17b](https://github.com/promptfoo/modelaudit/commit/624a17b2ede0e84062120987ed2b8919bedd822d))
+- reuse lowered c2 payload scan ([#1163](https://github.com/promptfoo/modelaudit/issues/1163)) ([a63efaa](https://github.com/promptfoo/modelaudit/commit/a63efaaa44c257c6428ec64ac337657f8d948d9a))
+- reuse lowered flax transform values ([#1169](https://github.com/promptfoo/modelaudit/issues/1169)) ([3d73ad7](https://github.com/promptfoo/modelaudit/commit/3d73ad719e540697d64636354f1ff23d4b2a8837))
+- reuse lowered get_file values ([#1211](https://github.com/promptfoo/modelaudit/issues/1211)) ([3bc7890](https://github.com/promptfoo/modelaudit/commit/3bc7890339f9373e73e2979e48ef010c190c6028))
+- reuse lowered hex token seed checks ([#1202](https://github.com/promptfoo/modelaudit/issues/1202)) ([8a34db9](https://github.com/promptfoo/modelaudit/commit/8a34db967e25d5b0a78479f71e53f85486f4c557))
+- reuse lowered jax context text ([#1164](https://github.com/promptfoo/modelaudit/issues/1164)) ([d012c09](https://github.com/promptfoo/modelaudit/commit/d012c09ebb8a73b75360e8132d8a1434b37342ce))
+- reuse lowered keras metadata text ([#1168](https://github.com/promptfoo/modelaudit/issues/1168)) ([abfe87b](https://github.com/promptfoo/modelaudit/commit/abfe87b3e4ac15aaf3d0721c9a9751a16fa10e6f))
+- reuse lowered layer type names ([#1203](https://github.com/promptfoo/modelaudit/issues/1203)) ([4b94a67](https://github.com/promptfoo/modelaudit/commit/4b94a67f2b5142332b49da29fdb1e8ad2106cf03))
+- reuse lowered license header text ([#1162](https://github.com/promptfoo/modelaudit/issues/1162)) ([447ea66](https://github.com/promptfoo/modelaudit/commit/447ea664889624da254d7de4c9c4219fe286e9e7))
+- reuse lowered metadata filenames ([#1205](https://github.com/promptfoo/modelaudit/issues/1205)) ([4251df5](https://github.com/promptfoo/modelaudit/commit/4251df584cb5c3491492c643f211e07f3234fd68))
+- reuse lowered metadata keys ([#1206](https://github.com/promptfoo/modelaudit/issues/1206)) ([3ea11f0](https://github.com/promptfoo/modelaudit/commit/3ea11f0d671902a95458cd143f3061b63db4f588))
+- reuse lowered ml operation names ([#1201](https://github.com/promptfoo/modelaudit/issues/1201)) ([c5de398](https://github.com/promptfoo/modelaudit/commit/c5de398c1c1cb4809edd6bcab25740dc23eda1b8))
+- reuse lowered sarif messages ([#1209](https://github.com/promptfoo/modelaudit/issues/1209)) ([fde43a4](https://github.com/promptfoo/modelaudit/commit/fde43a4a267de63530bd7716fcf6b851c6b74e78))
+- reuse lowered secret descriptions ([#1208](https://github.com/promptfoo/modelaudit/issues/1208)) ([cb0324b](https://github.com/promptfoo/modelaudit/commit/cb0324b6ffd4444a974895a0dee7d209b0e4b571))
+- reuse lowered skops member names ([#1207](https://github.com/promptfoo/modelaudit/issues/1207)) ([879c531](https://github.com/promptfoo/modelaudit/commit/879c5310f3f7f39b96bb280e9cc772647e1ea749))
+- reuse lowered xgboost legacy headers ([#1204](https://github.com/promptfoo/modelaudit/issues/1204)) ([8bc1e7d](https://github.com/promptfoo/modelaudit/commit/8bc1e7d45ee89d62d51503c8e549114fa3df197e))
+- reuse manifest text within scans ([#1160](https://github.com/promptfoo/modelaudit/issues/1160)) ([848bc1e](https://github.com/promptfoo/modelaudit/commit/848bc1ec65b428d0fe47adf117d848519e05f2be))
+- reuse metagraph attr lowercase values ([#1200](https://github.com/promptfoo/modelaudit/issues/1200)) ([349751e](https://github.com/promptfoo/modelaudit/commit/349751e228f601c30bfbe61d386621db14aefb31))
+- reuse nearby license discovery ([#1155](https://github.com/promptfoo/modelaudit/issues/1155)) ([301618d](https://github.com/promptfoo/modelaudit/commit/301618da66a41514e6e210d4ba8298cf816da81d))
+- reuse network library patterns ([#1191](https://github.com/promptfoo/modelaudit/issues/1191)) ([630bd3d](https://github.com/promptfoo/modelaudit/commit/630bd3d35eff43c980a3bb9d0f75ad6cb548b42c))
+- reuse normalized scanner selection policy ([#1153](https://github.com/promptfoo/modelaudit/issues/1153)) ([b8430a0](https://github.com/promptfoo/modelaudit/commit/b8430a04b141972febab6b03e744e1382c14aacb))
+- reuse onnx model bytes for parsing ([#1193](https://github.com/promptfoo/modelaudit/issues/1193)) ([a5356a5](https://github.com/promptfoo/modelaudit/commit/a5356a5109a09f04db6efa764cb47088b7a5b1aa))
+- reuse prefiltered sarif issues ([#1210](https://github.com/promptfoo/modelaudit/issues/1210)) ([d996043](https://github.com/promptfoo/modelaudit/commit/d9960432a37982595109d2c20ca34cbb7e2807cf))
+- reuse savedmodel function patterns ([#1183](https://github.com/promptfoo/modelaudit/issues/1183)) ([c043bcd](https://github.com/promptfoo/modelaudit/commit/c043bcd0c9509f0704406e3cbf67a374f898d73e))
+- reuse secrets detector heuristics ([#1189](https://github.com/promptfoo/modelaudit/issues/1189)) ([799e8bf](https://github.com/promptfoo/modelaudit/commit/799e8bf6c62c336cd64083309d2f615426041863))
+- reuse sibling license directory listings ([#1157](https://github.com/promptfoo/modelaudit/issues/1157)) ([5ec7f21](https://github.com/promptfoo/modelaudit/commit/5ec7f21ab0b16eaf23c654688eab4219c091fc86))
+- reuse suspicious port names ([#1192](https://github.com/promptfoo/modelaudit/issues/1192)) ([8ed7665](https://github.com/promptfoo/modelaudit/commit/8ed76651cc386ef4ad1ffbdd9f1b280ee951f1cc))
+- share call graph caches within reports ([#1156](https://github.com/promptfoo/modelaudit/issues/1156)) ([b16d37c](https://github.com/promptfoo/modelaudit/commit/b16d37c3b4439b4e6d966b8b9624642307c2a322))
+- share getattr assignment candidates ([#1199](https://github.com/promptfoo/modelaudit/issues/1199)) ([5d12903](https://github.com/promptfoo/modelaudit/commit/5d1290330328ad4fb6e6f88bddc34e7bfba9d310))
+- short-circuit hf bookkeeping checks ([#1154](https://github.com/promptfoo/modelaudit/issues/1154)) ([ed0122d](https://github.com/promptfoo/modelaudit/commit/ed0122d57bb875beab88a92dbb670c7d06ec881b))
+- skip call graph enrichment in pickle validation ([#1196](https://github.com/promptfoo/modelaudit/issues/1196)) ([2347d80](https://github.com/promptfoo/modelaudit/commit/2347d80a2d110f582c188679b4a0c04489779745))
+- skip directory pre-count without progress ([#1173](https://github.com/promptfoo/modelaudit/issues/1173)) ([83c8bb4](https://github.com/promptfoo/modelaudit/commit/83c8bb42a53180d09d707bad6cd90d06d3ab55ee))
+- skip redundant jax scans for plain pickles ([#1158](https://github.com/promptfoo/modelaudit/issues/1158)) ([04c6974](https://github.com/promptfoo/modelaudit/commit/04c6974283a02ddb5233a498ccfd0306261ab6ab))
+- skip renormalizing scanner selection ([#1181](https://github.com/promptfoo/modelaudit/issues/1181)) ([74ac7a7](https://github.com/promptfoo/modelaudit/commit/74ac7a7fef31028582c201690610076214c2d544))
+- summarize CLI progress tree once ([#1182](https://github.com/promptfoo/modelaudit/issues/1182)) ([0bc373f](https://github.com/promptfoo/modelaudit/commit/0bc373fc8a3d1694fa35a18f7789d195f2cacd79))
+
+### Documentation
+
+- add performance audit backlog ([#1159](https://github.com/promptfoo/modelaudit/issues/1159)) ([be6cc4a](https://github.com/promptfoo/modelaudit/commit/be6cc4a43facb6212c6f591779c5faddc111a280))
+
+## [0.2.43](https://github.com/promptfoo/modelaudit/compare/v0.2.42...v0.2.43) (2026-05-01)
+
+### Bug Fixes
+
+- align manifest scanner routing ([#1111](https://github.com/promptfoo/modelaudit/issues/1111)) ([ad7f253](https://github.com/promptfoo/modelaudit/commit/ad7f2534ad3e9f5ec744aadbf2448e02bdaa092f))
+- analyze jax-like pickle checkpoints ([#1114](https://github.com/promptfoo/modelaudit/issues/1114)) ([576ac54](https://github.com/promptfoo/modelaudit/commit/576ac540822e620204ea7d654848bcca9376b44f))
+- avoid inert skops cve false positives ([7538e58](https://github.com/promptfoo/modelaudit/commit/7538e58fc6ba7c3f9f7721a6c686035f6502c1e6))
+- avoid PMML system substring false positives ([#1125](https://github.com/promptfoo/modelaudit/issues/1125)) ([20fdd0c](https://github.com/promptfoo/modelaudit/commit/20fdd0c7ef498099e439306e323093920fd752c7))
+- catch suspicious nemo target leaves ([#1116](https://github.com/promptfoo/modelaudit/issues/1116)) ([b8dccfa](https://github.com/promptfoo/modelaudit/commit/b8dccfa1b2aca25c277c35616ee1b01c87953e6f))
+- close pytorch zip coverage gaps ([#1095](https://github.com/promptfoo/modelaudit/issues/1095)) ([a1ca298](https://github.com/promptfoo/modelaudit/commit/a1ca298b7d217989286b9bc0e3ef6545871f9b53))
+- correct analysis suspiciousness ([#1101](https://github.com/promptfoo/modelaudit/issues/1101)) ([11b1d3e](https://github.com/promptfoo/modelaudit/commit/11b1d3e3ce7ace309f3864c599c7f70b6479c5cb))
+- cover eager statistics consumers in picklescan ([#1148](https://github.com/promptfoo/modelaudit/issues/1148)) ([0d5ea8e](https://github.com/promptfoo/modelaudit/commit/0d5ea8e5a0be4f96d3ca97c55640cdb35b55215c))
+- detect bare torch7 require loads ([#1117](https://github.com/promptfoo/modelaudit/issues/1117)) ([7c77be0](https://github.com/promptfoo/modelaudit/commit/7c77be01de8783e852815e58811f592455b3b6c4))
+- detect extensionless archive executables ([#1110](https://github.com/promptfoo/modelaudit/issues/1110)) ([b64a2da](https://github.com/promptfoo/modelaudit/commit/b64a2da696f9a922e826c39d64c37894ce393582))
+- detect nested brace-format mapping lookups ([#1151](https://github.com/promptfoo/modelaudit/issues/1151)) ([fc296ad](https://github.com/promptfoo/modelaudit/commit/fc296adaa97815b4067f0a764e653cdf777a5724))
+- detect Paddle patterns across chunk boundaries ([#1120](https://github.com/promptfoo/modelaudit/issues/1120)) ([d4fedf9](https://github.com/promptfoo/modelaudit/commit/d4fedf9e9b1492cec291dedb1ff53fe420d13bb7))
+- fail closed on bounded scanner analysis ([#1099](https://github.com/promptfoo/modelaudit/issues/1099)) ([60973e4](https://github.com/promptfoo/modelaudit/commit/60973e4eb48928c120d62ed651b1abb95c210134))
+- fail closed on call graph errors ([#1143](https://github.com/promptfoo/modelaudit/issues/1143)) ([1a08449](https://github.com/promptfoo/modelaudit/commit/1a084493b16b5c62b0cd7022b79e60795e88b07b))
+- fail closed on directory size limits ([#1093](https://github.com/promptfoo/modelaudit/issues/1093)) ([47054d7](https://github.com/promptfoo/modelaudit/commit/47054d7fe808cfb3ee676d1da533c244170946bf))
+- fail closed on header-only streaming scans ([#1103](https://github.com/promptfoo/modelaudit/issues/1103)) ([7b934c0](https://github.com/promptfoo/modelaudit/commit/7b934c02004850b5ca2428fe2871acb3e413062a))
+- fail closed on incomplete mar scans ([#1096](https://github.com/promptfoo/modelaudit/issues/1096)) ([af31235](https://github.com/promptfoo/modelaudit/commit/af312351a7b2069214d4938cb9c8e051e25ae8f3))
+- fail closed on limited llamafile payload scans ([ceb3f22](https://github.com/promptfoo/modelaudit/commit/ceb3f22870f5555e809dbf19d7ce37e4d2488b5a))
+- fail closed on malformed XGBoost JSON ([#1123](https://github.com/promptfoo/modelaudit/issues/1123)) ([4d4ba28](https://github.com/promptfoo/modelaudit/commit/4d4ba285e60a3abfb64f0259c792c52dcb66794d))
+- fail closed on nemo archives without config ([#1115](https://github.com/promptfoo/modelaudit/issues/1115)) ([a09f763](https://github.com/promptfoo/modelaudit/commit/a09f76308e1e5e3db7d20298e1ed508806d9cbbd))
+- fail closed on ONNX raw detector failures ([#1119](https://github.com/promptfoo/modelaudit/issues/1119)) ([2963764](https://github.com/promptfoo/modelaudit/commit/2963764e28c4fb94cdfdef6a975e630c4ab4dd2f))
+- fail closed on truncated tensor metadata ([b267328](https://github.com/promptfoo/modelaudit/commit/b267328ca6952ade157a82de00ddc3ca541619f0))
+- fail closed on unanalyzable call graphs ([#1108](https://github.com/promptfoo/modelaudit/issues/1108)) ([dcb8bbe](https://github.com/promptfoo/modelaudit/commit/dcb8bbe4683c284a1ea6c84231dee6808a93fc52))
+- fail closed when recognized scanners are unavailable ([#1104](https://github.com/promptfoo/modelaudit/issues/1104)) ([f4866d4](https://github.com/promptfoo/modelaudit/commit/f4866d424c5fe2112c681f7984a2c59d9fe5b794))
+- fail closed without yaml parser ([99ef15a](https://github.com/promptfoo/modelaudit/commit/99ef15a35cea50257ca31629da3e51f50d369f75))
+- harden detector heuristics ([#1100](https://github.com/promptfoo/modelaudit/issues/1100)) ([bf57b3b](https://github.com/promptfoo/modelaudit/commit/bf57b3b20ab43d1fdf764a503a7bd9fe19c7cd11))
+- ignore inert format placeholders ([#1142](https://github.com/promptfoo/modelaudit/issues/1142)) ([8f728e8](https://github.com/promptfoo/modelaudit/commit/8f728e8454578ba34ce5b28389258fa2eba29fe8))
+- ignore inert XGBoost feature labels ([f637e1e](https://github.com/promptfoo/modelaudit/commit/f637e1ebc024913af14f4a3eff01ee4600459b5d))
+- inspect savedmodel root siblings ([#1118](https://github.com/promptfoo/modelaudit/issues/1118)) ([cf6bf8f](https://github.com/promptfoo/modelaudit/commit/cf6bf8f83499910bf179361d1015c161ee8dafff))
+- keep inert dotted global metadata clean ([#1150](https://github.com/promptfoo/modelaudit/issues/1150)) ([9a76915](https://github.com/promptfoo/modelaudit/commit/9a769151c0ffd29a1638f1dacc78d2eb77b0f268))
+- **picklescan:** detect hidden-only pytorch zips ([#1098](https://github.com/promptfoo/modelaudit/issues/1098)) ([3e94f70](https://github.com/promptfoo/modelaudit/commit/3e94f7020d5a28fc150afed1520adcac8d58ce73))
+- **picklescan:** detect statistics quantiles iterator consumption ([#1152](https://github.com/promptfoo/modelaudit/issues/1152)) ([b357fdb](https://github.com/promptfoo/modelaudit/commit/b357fdb7db320d3485cf0458a4cf0f16b86717c1))
+- **picklescan:** fail closed on late encoded payload probes ([#1107](https://github.com/promptfoo/modelaudit/issues/1107)) ([55b43a5](https://github.com/promptfoo/modelaudit/commit/55b43a5229baadf1c3673b4d89838e55c5cf6ae3))
+- **picklescan:** model str.format lookups ([#1097](https://github.com/promptfoo/modelaudit/issues/1097)) ([2c87acb](https://github.com/promptfoo/modelaudit/commit/2c87acbb01285289872203063074baf51d0cd28c))
+- preserve exact entropy literals ([#1138](https://github.com/promptfoo/modelaudit/issues/1138)) ([95ba57c](https://github.com/promptfoo/modelaudit/commit/95ba57cad1d9bb346c2752942b8e054d8dfa66ff))
+- preserve hidden model payloads ([#1091](https://github.com/promptfoo/modelaudit/issues/1091)) ([5b11f91](https://github.com/promptfoo/modelaudit/commit/5b11f91942c1e5943e74affa3fbf86244f63f9cc))
+- preserve incomplete office zip scans ([#1094](https://github.com/promptfoo/modelaudit/issues/1094)) ([9ed81db](https://github.com/promptfoo/modelaudit/commit/9ed81db90ce60e4128f8e95a0ae50f5f5a75d214))
+- preserve merged scan failures ([#1092](https://github.com/promptfoo/modelaudit/issues/1092)) ([e7fecc5](https://github.com/promptfoo/modelaudit/commit/e7fecc5e674a404164e352f07d5bca381e1862f0))
+- preserve path-sensitive directory scans ([#1102](https://github.com/promptfoo/modelaudit/issues/1102)) ([ddebc52](https://github.com/promptfoo/modelaudit/commit/ddebc52095773f651b64944412180e2ee5e76762))
+- preserve str.format lookup keys in picklescan ([#1149](https://github.com/promptfoo/modelaudit/issues/1149)) ([feb3e1c](https://github.com/promptfoo/modelaudit/commit/feb3e1ccb629344180e3a27e093e24b707c671e6))
+- reject ajax as a JAX checkpoint hint ([#1124](https://github.com/promptfoo/modelaudit/issues/1124)) ([9f51b2c](https://github.com/promptfoo/modelaudit/commit/9f51b2c8e154d94b3361dfb0b07ba6bdd37aedd1))
+- reject marker-only XGBoost binaries ([#1122](https://github.com/promptfoo/modelaudit/issues/1122)) ([30ec930](https://github.com/promptfoo/modelaudit/commit/30ec9308a50f445ddd2f55624fe0b294dc2e92cd))
+- remove filename-based framework skips ([#1137](https://github.com/promptfoo/modelaudit/issues/1137)) ([7a18b49](https://github.com/promptfoo/modelaudit/commit/7a18b49f434ddc091cb26672323dad6dab42dab7))
+- require startup hook invocations ([#1140](https://github.com/promptfoo/modelaudit/issues/1140)) ([7e0777d](https://github.com/promptfoo/modelaudit/commit/7e0777dcc71bfdbd8212358aa548ee45d3808642))
+- require strict zip signatures ([93f60af](https://github.com/promptfoo/modelaudit/commit/93f60afe5765047752f2c97fc10f160939a66c62))
+- resolve concatenated archive getattr names ([#1105](https://github.com/promptfoo/modelaudit/issues/1105)) ([59a7df6](https://github.com/promptfoo/modelaudit/commit/59a7df6464fda09f79bbd5fa44754402764e89b7))
+- resync post-budget pickle replay ([#1141](https://github.com/promptfoo/modelaudit/issues/1141)) ([e275676](https://github.com/promptfoo/modelaudit/commit/e27567661295a96d94cd1ea29abd4f42c6c249e3))
+- route extensionless scanners ([18accbd](https://github.com/promptfoo/modelaudit/commit/18accbdaf6808bd6316d742c84a1f92dce63984a))
+- route flax suffixes without msgpack ([dca6056](https://github.com/promptfoo/modelaudit/commit/dca605662e2dbf3209b4d69e61fb9f1306599b7d))
+- route middle-marker llamafiles ([f11792c](https://github.com/promptfoo/modelaudit/commit/f11792ca6c4e3237d731d54c47ce44b00a3c7d4b))
+- route renamed XML models after long prologs ([#1109](https://github.com/promptfoo/modelaudit/issues/1109)) ([e2f9962](https://github.com/promptfoo/modelaudit/commit/e2f9962a887762ad49854ec1ee750c7df20b6a7c))
+- scan concatenated compressed members ([#1135](https://github.com/promptfoo/modelaudit/issues/1135)) ([3f9a51a](https://github.com/promptfoo/modelaudit/commit/3f9a51a37b92bc6e48dedb5aa97e3aeb32d64a0d))
+- scan embedded manifest chat templates ([#1112](https://github.com/promptfoo/modelaudit/issues/1112)) ([18433a8](https://github.com/promptfoo/modelaudit/commit/18433a83966229642555fa8886e3e55a8b3e15bb))
+- scan gguf chat templates with jinja analysis ([#1113](https://github.com/promptfoo/modelaudit/issues/1113)) ([35b420a](https://github.com/promptfoo/modelaudit/commit/35b420ac908bd29cecc6e82b85e1af88056b9551))
+- scan unmarked python jit blobs ([#1136](https://github.com/promptfoo/modelaudit/issues/1136)) ([681ce62](https://github.com/promptfoo/modelaudit/commit/681ce62487f0f41a9c2af7e8f7b50be65b16f901))
+- scope huggingface bookkeeping skips ([#1090](https://github.com/promptfoo/modelaudit/issues/1090)) ([87f7204](https://github.com/promptfoo/modelaudit/commit/87f7204bedc8a6ff94472b5831abd52a25836dcd))
+- stabilize non-pytorch zip status ([7449aae](https://github.com/promptfoo/modelaudit/commit/7449aae0e36a38de7681acfd0f5f77033afea059))
+- validate all XGBoost trees ([#1121](https://github.com/promptfoo/modelaudit/issues/1121)) ([a38eab2](https://github.com/promptfoo/modelaudit/commit/a38eab225b3671e8df20621455fca775ff5ee96a))
+
+### Documentation
+
+- narrow scan coverage claims ([#1139](https://github.com/promptfoo/modelaudit/issues/1139)) ([47ec8cf](https://github.com/promptfoo/modelaudit/commit/47ec8cf3bc5a5ac3166757bbaae0c5a3c6adb73d))
+
 ## [Unreleased]
 
 ### Bug Fixes
 
-- honor trusted header/content routing for misnamed ONNX, GGUF, and NumPy artifacts.
-- route extensionless compressed archive members through registry-backed nested dispatch.
+- detect nested brace-format lookups that reach tracked `defaultdict` factories
+- avoid `str.format` picklescan false positives when a `ChainMap` shadows a `defaultdict`
+- block `statistics.quantiles` call-iterator consumption in picklescan call-graph analysis
+- block additional eager `statistics` consumers in picklescan call-graph analysis
+- avoid picklescan false positives for inert metadata under dangerous dotted globals
+- preserve path-sensitive scan results while hashing duplicate directory contents
+- correct analysis suspiciousness scoring and alias-aware semantic risk handling
+- harden detector heuristics against comment padding, byte-backed credentials, unmarked Python blobs, and spoofed network context
+- fail closed when bounded scanner windows leave relevant model content uninspected
+- fail closed when TorchServe MAR limits leave manifest-referenced payloads unscanned
+- recurse into nested ZIP members inside PyTorch archives and fail closed when compression-ratio guards leave members unscanned
+- preserve large Office-like ZIPs when prefilter inspection is incomplete
+- fail closed when directory scans stop at the total-size budget
+- restrict Hugging Face bookkeeping filename skips to recognized cache layouts
+- preserve unsuccessful child results after scan-result merges
+- preserve supported payloads hidden behind default directory-skip names
+- use bounded raw Jinja fallback windows and fail closed when PyYAML is
+  unavailable for YAML template configs
+- let extensionless file scanners participate in local file selection so
+  supported extensionless Llamafiles do not fall through to clean unknown
+  results
+- fail closed when PyTorch ZIP tensor-metadata validation can only inspect a
+  bounded pickle prefix or cannot complete member analysis
+- preserve and scan concatenated compressed-wrapper member boundaries so a
+  benign first member cannot hide later malicious payloads
 
-## [0.2.36](https://github.com/promptfoo/modelaudit/compare/v0.2.35...v0.2.36) (2026-04-11)
-
-### Documentation
-
-- disable telemetry during agent validation ([#928](https://github.com/promptfoo/modelaudit/issues/928)) ([69a1986](https://github.com/promptfoo/modelaudit/commit/69a1986aa2a63ab07e63871507e96bf857c1c882))
-
-## [0.2.35](https://github.com/promptfoo/modelaudit/compare/v0.2.34...v0.2.35) (2026-04-11)
-
-### Bug Fixes
-
-- clean up oversized zip entry temps ([#911](https://github.com/promptfoo/modelaudit/issues/911)) ([66b4871](https://github.com/promptfoo/modelaudit/commit/66b4871f49e367dea545f36af85c9cc75303d615))
-- flag Paddle code patterns as warnings ([#925](https://github.com/promptfoo/modelaudit/issues/925)) ([32fa0b7](https://github.com/promptfoo/modelaudit/commit/32fa0b7551c13059515c464b0118851fa1fbe671))
-- harden manifest parse boundaries ([#922](https://github.com/promptfoo/modelaudit/issues/922)) ([6f5b516](https://github.com/promptfoo/modelaudit/commit/6f5b516bec8492b2f062ba5ea10498c705d972ca))
-- harden standalone pickle scanner ([#901](https://github.com/promptfoo/modelaudit/issues/901)) ([31f7dd3](https://github.com/promptfoo/modelaudit/commit/31f7dd38c6bd77631ccdca90438312c4db2ac857))
-- mark corrupt NumPy object payloads inconclusive ([#912](https://github.com/promptfoo/modelaudit/issues/912)) ([ecba19d](https://github.com/promptfoo/modelaudit/commit/ecba19dc585d5bfbfbfbd687e81cd734a7b0103b))
-- mark incomplete MXNet scans inconclusive ([#923](https://github.com/promptfoo/modelaudit/issues/923)) ([a928ed7](https://github.com/promptfoo/modelaudit/commit/a928ed723a220185c3c0ea4b046b8885c74e8f62))
-- mark incomplete sharded scans inconclusive ([#909](https://github.com/promptfoo/modelaudit/issues/909)) ([510d0fb](https://github.com/promptfoo/modelaudit/commit/510d0fbe45ae9f1b7e213227ebb1210b15a35991))
-- mark malformed GGUF scans inconclusive ([#914](https://github.com/promptfoo/modelaudit/issues/914)) ([9b3e216](https://github.com/promptfoo/modelaudit/commit/9b3e21607309b846b15f809af6fd1bef31268b6a))
-- mark malformed Keras H5 configs inconclusive ([#917](https://github.com/promptfoo/modelaudit/issues/917)) ([23671c3](https://github.com/promptfoo/modelaudit/commit/23671c38796293978b0538eb4c7ce30c8cfa5160))
-- mark malformed Keras ZIP configs inconclusive ([#918](https://github.com/promptfoo/modelaudit/issues/918)) ([d4ad8d8](https://github.com/promptfoo/modelaudit/commit/d4ad8d8717c4f1ca647b292035f68bbf570d9904))
-- mark malformed SafeTensors scans inconclusive ([#913](https://github.com/promptfoo/modelaudit/issues/913)) ([43913d6](https://github.com/promptfoo/modelaudit/commit/43913d65c5eb89014d1bb137768f89e93b8d0d41))
-- mark malformed tflite scans inconclusive ([#916](https://github.com/promptfoo/modelaudit/issues/916)) ([07c871a](https://github.com/promptfoo/modelaudit/commit/07c871a8d19e9181bdcd568fffa9a165883585de))
-- mark partial archive scans inconclusive ([#907](https://github.com/promptfoo/modelaudit/issues/907)) ([c8eb918](https://github.com/promptfoo/modelaudit/commit/c8eb918b8d0a717460be93097cfc1cf0a47e6689))
-- mark partial streaming scans inconclusive ([#908](https://github.com/promptfoo/modelaudit/issues/908)) ([3d47a10](https://github.com/promptfoo/modelaudit/commit/3d47a1055d09c20995c21ebe75a50a2c3d1105f0))
-- mark unknown ONNX tensor dtypes inconclusive ([#915](https://github.com/promptfoo/modelaudit/issues/915)) ([35661b6](https://github.com/promptfoo/modelaudit/commit/35661b6ac166f38f7642ac9a3ea89b6cea538928))
-- preserve picklescan stack state ([#910](https://github.com/promptfoo/modelaudit/issues/910)) ([fabac5c](https://github.com/promptfoo/modelaudit/commit/fabac5c9ead49c2ed5f8357dfa53ccdcce946527))
-- recover malformed Jinja template configs ([#920](https://github.com/promptfoo/modelaudit/issues/920)) ([d619c8f](https://github.com/promptfoo/modelaudit/commit/d619c8f185040c7b3c772a4b94631edddde9d8a8))
-- route corrupt catboost scans fail closed ([#924](https://github.com/promptfoo/modelaudit/issues/924)) ([052bb5f](https://github.com/promptfoo/modelaudit/commit/052bb5f4e6dbc5e48a3fe5d134e0ec8d9605e292))
-- traverse nemo yaml list configs ([#919](https://github.com/promptfoo/modelaudit/issues/919)) ([0d8d4fd](https://github.com/promptfoo/modelaudit/commit/0d8d4fd4dc2ef774db093fb9e7daf27c32b5a0a8))
-- **zip:** fail closed on MAR handler parse errors ([#896](https://github.com/promptfoo/modelaudit/issues/896)) ([a06a620](https://github.com/promptfoo/modelaudit/commit/a06a620f011d120072b1e8619e543a7306d5a4fc))
-
-### Documentation
-
-- add repo correctness audit ledger ([#921](https://github.com/promptfoo/modelaudit/issues/921)) ([06be0b6](https://github.com/promptfoo/modelaudit/commit/06be0b6eaeb53f5f238612a386665c45f3c27dc2))
-
-## [0.2.34](https://github.com/promptfoo/modelaudit/compare/v0.2.33...v0.2.34) (2026-04-10)
+## [0.2.42](https://github.com/promptfoo/modelaudit/compare/v0.2.41...v0.2.42) (2026-04-27)
 
 ### Bug Fixes
 
-- flag Paddle code patterns as warnings instead of failing benign scans
-- route corrupt CatBoost scans to fail closed outcomes
-- mark incomplete MXNet scans inconclusive instead of clean
-- harden manifest parse boundaries around malformed metadata
-- recover malformed Jinja template configs as inconclusive scan outcomes
-- traverse NeMo YAML list configs when checking suspicious targets
-- mark malformed Keras ZIP configs inconclusive instead of clean
-- mark malformed Keras H5 scans inconclusive instead of clean
-- mark malformed TFLite scans inconclusive instead of clean
-- mark malformed GGUF scans inconclusive instead of clean
-- mark malformed SafeTensors scans inconclusive instead of clean
-- preserve picklescan stack state across reused scanner runs
-- mark partial streaming scans inconclusive when large-file streaming coverage is incomplete
-- harden native code detection in model scanners ([#897](https://github.com/promptfoo/modelaudit/issues/897)) ([f4f661a](https://github.com/promptfoo/modelaudit/commit/f4f661a09be0032e15aa8895864413e3878233f8))
+- require latest picklescan release ([a0237a7](https://github.com/promptfoo/modelaudit/commit/a0237a7658c0885848eea8d51b792ccfad45cc1c))
 
-## [0.2.33](https://github.com/promptfoo/modelaudit/compare/v0.2.32...v0.2.33) (2026-04-09)
+## [0.2.41](https://github.com/promptfoo/modelaudit/compare/v0.2.40...v0.2.41) (2026-04-27)
+
+### Bug Fixes
+
+- **ci:** skip POSIX proof cases on Windows ([#1072](https://github.com/promptfoo/modelaudit/issues/1072)) ([bfa17a3](https://github.com/promptfoo/modelaudit/commit/bfa17a3e152cd178c5d1fdbfec55dd3f124778ef))
+- **docker:** add apt-get clean and pinned pip constraints to Dockerfile.tensorflow ([#1079](https://github.com/promptfoo/modelaudit/issues/1079)) ([8d9f9b7](https://github.com/promptfoo/modelaudit/commit/8d9f9b7c628ae05cdccf5d8eb480eea89f551e8d))
+- harden picklescan call graph RCE detection ([#1061](https://github.com/promptfoo/modelaudit/issues/1061)) ([19c4fc4](https://github.com/promptfoo/modelaudit/commit/19c4fc487b4758462ac2107a3f3e59463e5d888b))
+- harden picklescan stdlib callable detection ([f0f57b4](https://github.com/promptfoo/modelaudit/commit/f0f57b47f3355bea008a48779dbd856e6f550ec7))
+- improve test isolation, reduce duplication, and fix command injection risk in test suite ([#1078](https://github.com/promptfoo/modelaudit/issues/1078)) ([3867c83](https://github.com/promptfoo/modelaudit/commit/3867c83b2dd0d5ab6a83b650c28d64122a675dea))
+- **picklescan:** avoid call-graph false positives for PyTorch storage IDs ([#1069](https://github.com/promptfoo/modelaudit/issues/1069)) ([e75ed24](https://github.com/promptfoo/modelaudit/commit/e75ed249948558864d8f56882a02f1327323205d))
+- silence stale CodeQL generated import alerts ([#1080](https://github.com/promptfoo/modelaudit/issues/1080)) ([9530740](https://github.com/promptfoo/modelaudit/commit/9530740312725d051a41f7f2a405280ee2be4c62))
+- **telemetry:** stabilize modelaudit identity ([#1071](https://github.com/promptfoo/modelaudit/issues/1071)) ([592a656](https://github.com/promptfoo/modelaudit/commit/592a65672ac58e0b89eb50a54614e736b60c6741))
+
+### Documentation
+
+- improve PyPI READMEs ([#1057](https://github.com/promptfoo/modelaudit/issues/1057)) ([1cfb27d](https://github.com/promptfoo/modelaudit/commit/1cfb27de814125470d1e1a38eec03a83d79ff3d9))
+
+## [0.2.40](https://github.com/promptfoo/modelaudit/compare/v0.2.39...v0.2.40) (2026-04-17)
+
+### Bug Fixes
+
+- add manual release recovery path ([aeea2da](https://github.com/promptfoo/modelaudit/commit/aeea2da68099f42a2fae68a50fff9e64e5e2f86f))
+- avoid duplicate manylinux compatibility tag ([412677f](https://github.com/promptfoo/modelaudit/commit/412677f00e6a24b3471d9f14a36ef2b9405e5067))
+- persist manylinux picklescan artifacts ([346bb3f](https://github.com/promptfoo/modelaudit/commit/346bb3f048b646c69573812a08ffd23342843658))
+
+## [0.2.39](https://github.com/promptfoo/modelaudit/compare/v0.2.38...v0.2.39) (2026-04-17)
+
+### Bug Fixes
+
+- repair picklescan release wheel jobs ([#1051](https://github.com/promptfoo/modelaudit/issues/1051)) ([6c23190](https://github.com/promptfoo/modelaudit/commit/6c23190f9b23686d33d5da0a8b5522a59490084e))
+
+## [0.2.38](https://github.com/promptfoo/modelaudit/compare/v0.2.37...v0.2.38) (2026-04-17)
 
 ### Features
 
-- extract standalone pickle scanner package with parity harness ([#832](https://github.com/promptfoo/modelaudit/issues/832)) ([e2986cd](https://github.com/promptfoo/modelaudit/commit/e2986cddaa592306cc10541865f011b3dc99a0ba))
+- add scanner selection controls ([83334ca](https://github.com/promptfoo/modelaudit/commit/83334cacc53e5ab194bf46ced64cc775a7b9d18c)), closes [#7520](https://github.com/promptfoo/modelaudit/issues/7520)
 
 ### Bug Fixes
 
-- harden helper routing for zip-backed pickle checkpoints ([#870](https://github.com/promptfoo/modelaudit/issues/870)) ([3ebe0c0](https://github.com/promptfoo/modelaudit/commit/3ebe0c04f02f51274b9c9588200212ad2cffe70b))
-- make return paths explicit ([#884](https://github.com/promptfoo/modelaudit/issues/884)) ([e31c254](https://github.com/promptfoo/modelaudit/commit/e31c254b820c78278289cf06acdf17f3f81d49b2))
-- skip extraction for suspicious ZIP entries ([358aa44](https://github.com/promptfoo/modelaudit/commit/358aa4498ce9d6a091340c6f23289523f98f3a55))
+- address code quality findings ([#1038](https://github.com/promptfoo/modelaudit/issues/1038)) ([7af03cf](https://github.com/promptfoo/modelaudit/commit/7af03cf42f33f1b255eb9f9cbcaac6caccd48bc1))
+- avoid per-call rule mapper closures ([fa0dc70](https://github.com/promptfoo/modelaudit/commit/fa0dc70ef2e1ca133a2eca9409c8b5ce86977caa))
+- bound pytorch zip jit reads ([#1048](https://github.com/promptfoo/modelaudit/issues/1048)) ([f920d76](https://github.com/promptfoo/modelaudit/commit/f920d76563745d484895872b1724eb4b98856168))
+- define analysis lazy exports ([8aeeadd](https://github.com/promptfoo/modelaudit/commit/8aeeadd8ffd4943b8c6007c58d9bef3f44eeba09))
+- **deps:** update rust crate pyo3 to 0.28.0 ([#1006](https://github.com/promptfoo/modelaudit/issues/1006)) ([fe93b47](https://github.com/promptfoo/modelaudit/commit/fe93b47c839588b3f33cfd21f4380306ec418f2a))
+- detect hidden pytorch zip pickles ([#1043](https://github.com/promptfoo/modelaudit/issues/1043)) ([19b6ebe](https://github.com/promptfoo/modelaudit/commit/19b6ebe505d2ba90f81d6284d07e111f77cbf0b5))
+- detect proto0 pickles in 7z probes ([c1fb7d6](https://github.com/promptfoo/modelaudit/commit/c1fb7d6a8ba9e675780e78752e81bbc0f318a7b0))
+- enforce ZIP aggregate size budget ([#1022](https://github.com/promptfoo/modelaudit/issues/1022)) ([94d576f](https://github.com/promptfoo/modelaudit/commit/94d576fc9c86ee1102677ccbf280284bdb2276ea))
+- fail closed on incomplete ONNX weight analysis ([#1025](https://github.com/promptfoo/modelaudit/issues/1025)) ([03413c5](https://github.com/promptfoo/modelaudit/commit/03413c5f39b53aa9637bf914650812afb8eff9af))
+- fail closed on incomplete XGBoost analysis ([#1019](https://github.com/promptfoo/modelaudit/issues/1019)) ([b8f334e](https://github.com/promptfoo/modelaudit/commit/b8f334ebad0b678c2e8ad1e14102323b30ce1096))
+- fail closed on oversized Skops entries ([#1018](https://github.com/promptfoo/modelaudit/issues/1018)) ([3d74ab0](https://github.com/promptfoo/modelaudit/commit/3d74ab01d2eebfa5696afbab92cfaff62fc363a4))
+- fail closed on pytorch zip timeouts ([bf72f62](https://github.com/promptfoo/modelaudit/commit/bf72f624aa5b1f6a306e9c545e36ec64160b876f))
+- fail closed on RAR archives ([#1030](https://github.com/promptfoo/modelaudit/issues/1030)) ([14b6e8f](https://github.com/promptfoo/modelaudit/commit/14b6e8f3ae619081d656a8831dc78e0bbb328ea5))
+- fail closed on template truncation ([#1026](https://github.com/promptfoo/modelaudit/issues/1026)) ([3d7967d](https://github.com/promptfoo/modelaudit/commit/3d7967dad5d34c49fe8e14c0690caddb5be33dd7))
+- fail closed on unclassified scan failures ([#1014](https://github.com/promptfoo/modelaudit/issues/1014)) ([dfe0455](https://github.com/promptfoo/modelaudit/commit/dfe045561dacbc475395bc8f7b379c0b4a1b84b9))
+- harden incomplete Keras scanner paths ([#1020](https://github.com/promptfoo/modelaudit/issues/1020)) ([86e017a](https://github.com/promptfoo/modelaudit/commit/86e017a7f12ba23bd995f69bf7a6a3b8179265cb))
+- harden NeMo Hydra deserialization targets ([#1021](https://github.com/promptfoo/modelaudit/issues/1021)) ([0f899a6](https://github.com/promptfoo/modelaudit/commit/0f899a64afd84cc5f1651ff5b22b427f685bc314))
+- harden pickle nested bypass detection ([#1027](https://github.com/promptfoo/modelaudit/issues/1027)) ([c3a3b9d](https://github.com/promptfoo/modelaudit/commit/c3a3b9d1e4ffbd854e6003afbf6ebef1e708a619))
+- harden PyTorch pickle import classification ([#1015](https://github.com/promptfoo/modelaudit/issues/1015)) ([7b00e55](https://github.com/promptfoo/modelaudit/commit/7b00e55ce8c4377fc8e3d9c589e1a310f4b469e9))
+- harden remote cache and scanner bounds ([#1031](https://github.com/promptfoo/modelaudit/issues/1031)) ([74c2b6d](https://github.com/promptfoo/modelaudit/commit/74c2b6d65867babde10a4fc3fc3d6ee3e73fd23a))
+- preserve active payload severities ([#1046](https://github.com/promptfoo/modelaudit/issues/1046)) ([13752e9](https://github.com/promptfoo/modelaudit/commit/13752e9fc5764cdb45caa177f34a102be72990af))
+- preserve scannable skipped ZIP containers ([#1028](https://github.com/promptfoo/modelaudit/issues/1028)) ([29747d5](https://github.com/promptfoo/modelaudit/commit/29747d508b28947216e1926e52cba1093dd63ced))
+- redact telemetry issue fields ([#1023](https://github.com/promptfoo/modelaudit/issues/1023)) ([cd80d22](https://github.com/promptfoo/modelaudit/commit/cd80d22ac4c2fee113179d81d15685885713ac6b))
+- restore nested pickle CI coverage ([b7a4846](https://github.com/promptfoo/modelaudit/commit/b7a4846a85d6d46685cd4d002f1ebcd605b6d917))
+- route disguised nested archives in sevenzip scans ([#1017](https://github.com/promptfoo/modelaudit/issues/1017)) ([cb2572e](https://github.com/promptfoo/modelaudit/commit/cb2572ed65ffb2e8ba403d4a772b75c1998f6a40))
+- route ONNX pb files by content ([#1029](https://github.com/promptfoo/modelaudit/issues/1029)) ([6e9aa45](https://github.com/promptfoo/modelaudit/commit/6e9aa459f36e8ab282dc7dbda6f6c027c6b34a11))
+- route PyTorch ZIP archives without metadata ([#1016](https://github.com/promptfoo/modelaudit/issues/1016)) ([1f56bb8](https://github.com/promptfoo/modelaudit/commit/1f56bb82989c61004c2716f966ace3823e6fae5f))
+- route UBJSON-format .bst files to UBJ scanner ([#1037](https://github.com/promptfoo/modelaudit/issues/1037)) ([52f869a](https://github.com/promptfoo/modelaudit/commit/52f869a7d7e95fc5168a55d9c21389f0e3860aca))
+- **rule-mapper:** preserve unknown opcode fallback ([5153d68](https://github.com/promptfoo/modelaudit/commit/5153d68101e6e5c67d64419c6d391ec405b4daa1))
+- run full Docker image as non-root ([#1024](https://github.com/promptfoo/modelaudit/issues/1024)) ([c1d2be6](https://github.com/promptfoo/modelaudit/commit/c1d2be64382718516432325a3ac8f005be64444c))
+- scan generic archive python handlers ([#1047](https://github.com/promptfoo/modelaudit/issues/1047)) ([5b90a84](https://github.com/promptfoo/modelaudit/commit/5b90a84161cee233b0f6c8b69c36d21b182261f9))
+
+### Performance Improvements
+
+- optimize model scan hot paths ([#1012](https://github.com/promptfoo/modelaudit/issues/1012)) ([6a0c53a](https://github.com/promptfoo/modelaudit/commit/6a0c53a3172db274ba2ea4e192ce7dc244d92374))
 
 ### Documentation
 
-- clarify detection bypass severity policy ([d8117a1](https://github.com/promptfoo/modelaudit/commit/d8117a14b4f8ef3e1a93cb1d48eeba8d8af92677))
-
-## [0.2.32](https://github.com/promptfoo/modelaudit/compare/v0.2.31...v0.2.32) (2026-04-05)
-
-### Bug Fixes
-
-- detect punctuated TensorRT tmp paths ([#867](https://github.com/promptfoo/modelaudit/issues/867)) ([9607530](https://github.com/promptfoo/modelaudit/commit/96075302de2d71b228be97e49698d6a1ad6b35bf))
-- fail closed on OpenVINO DOCTYPE parse errors ([#864](https://github.com/promptfoo/modelaudit/issues/864)) ([f5b19c4](https://github.com/promptfoo/modelaudit/commit/f5b19c48c7eab876e29f1f474c555b902fa9b6ce))
-- ignore OCI metadata URLs during layer discovery ([#866](https://github.com/promptfoo/modelaudit/issues/866)) ([0b24e3f](https://github.com/promptfoo/modelaudit/commit/0b24e3f7a0e013541bce100b64f1d69558bd807d))
-- reduce PMML subprocess extension false positives ([#869](https://github.com/promptfoo/modelaudit/issues/869)) ([5e6f79d](https://github.com/promptfoo/modelaudit/commit/5e6f79dc134267202b5a4b841a8946af865ebd15))
-- tolerate bounded CoreML custom block truncation ([#868](https://github.com/promptfoo/modelaudit/issues/868)) ([34df06d](https://github.com/promptfoo/modelaudit/commit/34df06dd2c12b69815a2a15f1273085856bebf64))
-
-## [Unreleased]
-
-### Bug Fixes
-
-- add CVE-specific coverage for ONNX symlink traversal, Keras `get_file(extract=True)` archives, MXNet ReDoS operator names, NeMo archive/checkpoint exploits, and TorchServe MAR ZipSlip attribution
-- mark trailing bytes after NumPy object-array pickle payloads inconclusive without escalating to security findings
-- avoid CoreML nested parse failures on bounded-read truncation
-- mark incomplete sharded-model scans as inconclusive, ignore shard-name prefix matches, and skip caching explicit incomplete outcomes
-- flag TensorFlow `LoadLibrary` and `LoadLibraryV2` graph ops as dangerous native-library loading
-- detect split CNTK native-user-function and native-library references
-- detect Linux/macOS native-library members in Keras archives and uppercase native-library members in PyTorch ZIPs
-- detect embedded Windows DLL/PE, Linux ELF shared-object, and TensorRT plugin entry-point markers in TensorRT engines
-- detect punctuation-delimited TensorRT `/tmp` plugin paths
-- clean up temporary ZIP entry files when extraction fails on entry size limits
-- preserve HuggingFace cache provenance for symlinked custom cache roots
-- mark ONNX tensor dtype validation failures inconclusive instead of allowing clean scans
-- ignore remote OCI `layers[].urls` entries during local layer discovery
-- fail closed on unterminated OpenVINO DOCTYPE declarations
-- avoid PMML `<Extension>` false positives for benign `subprocess` prose while preserving `subprocess.getoutput()`, `subprocess.getstatusoutput()`, and `importlib.import_module("subprocess")` detections
-- mark incomplete ZIP, TAR, and 7z archive traversals as inconclusive in scan metadata
-- route helper-level ZIP-backed `.ckpt`/`.pkl` checkpoints through archive scanners
-- harden standalone pickle scanner dangerous global coverage, nested payload bounds, incomplete-scan reporting, and standalone-primary migration behavior
-- cap standalone pickle stream line reads when callers do not provide a stream size
-
-## [0.2.31](https://github.com/promptfoo/modelaudit/compare/v0.2.30...v0.2.31) (2026-04-04)
-
-### Bug Fixes
-
-- clean up CodeQL quality findings ([#862](https://github.com/promptfoo/modelaudit/issues/862)) ([5fbcb10](https://github.com/promptfoo/modelaudit/commit/5fbcb101322791831fbf6159bab454231a7f01f0))
-- detect long-gap protocol-0 pickle tails ([#844](https://github.com/promptfoo/modelaudit/issues/844)) ([cbc24b2](https://github.com/promptfoo/modelaudit/commit/cbc24b2af187055622b3776b3e49cca0c43ce9b7))
-- detect protocol 0/1 pickles with trailing junk ([#827](https://github.com/promptfoo/modelaudit/issues/827)) ([d07869d](https://github.com/promptfoo/modelaudit/commit/d07869dadc80de567db894dd8ceda9de53038a71))
-- fail closed on conflicting Keras ZIP config aliases ([#847](https://github.com/promptfoo/modelaudit/issues/847)) ([ab426b8](https://github.com/promptfoo/modelaudit/commit/ab426b8230b1766b4a7678803c90c45256bcdf54))
-- harden content-routed .keras ZIP recursive scans ([#828](https://github.com/promptfoo/modelaudit/issues/828)) ([a607df7](https://github.com/promptfoo/modelaudit/commit/a607df7e8f94623c7802ef3af90896e1b4c564cc))
-- harden CoreML scanner ([#859](https://github.com/promptfoo/modelaudit/issues/859)) ([50da953](https://github.com/promptfoo/modelaudit/commit/50da95393c6b0be318cb33535e12d16a361663ac))
-- harden Flax msgpack stream scanning ([#842](https://github.com/promptfoo/modelaudit/issues/842)) ([34e4595](https://github.com/promptfoo/modelaudit/commit/34e4595b2017f272c951a45c6f89a0fa8997f8d5))
-- harden JAX checkpoint scanner heuristics ([#837](https://github.com/promptfoo/modelaudit/issues/837)) ([1042c20](https://github.com/promptfoo/modelaudit/commit/1042c20c48ce09613125967623c715babc7b9da8))
-- harden Joblib raw/compressed pickle analysis ([#841](https://github.com/promptfoo/modelaudit/issues/841)) ([9d16470](https://github.com/promptfoo/modelaudit/commit/9d164701345aebef8ad03421ac66cbcca6c61aed))
-- harden Keras H5 scanner ([#848](https://github.com/promptfoo/modelaudit/issues/848)) ([aa0ef28](https://github.com/promptfoo/modelaudit/commit/aa0ef2878593e639a5b868a4be2d5de7a6c9c23b))
-- harden MAR duplicate-member analysis ([#830](https://github.com/promptfoo/modelaudit/issues/830)) ([8d4e056](https://github.com/promptfoo/modelaudit/commit/8d4e0567f1df15405f429cefe3cd894aada3b712))
-- harden NeMo target checks and YAML bounds ([#839](https://github.com/promptfoo/modelaudit/issues/839)) ([63ff67d](https://github.com/promptfoo/modelaudit/commit/63ff67d45aa7d454e63781c71039839c35e74892))
-- harden OCI layer scanner ([#856](https://github.com/promptfoo/modelaudit/issues/856)) ([637a4da](https://github.com/promptfoo/modelaudit/commit/637a4daa72047c15598660320f2f12de6a43e627))
-- harden ONNX scanner ([#857](https://github.com/promptfoo/modelaudit/issues/857)) ([de304a7](https://github.com/promptfoo/modelaudit/commit/de304a77513abf551e96a1828f57fdfdd11150c2))
-- harden OpenVINO scanner ([#852](https://github.com/promptfoo/modelaudit/issues/852)) ([a97b76e](https://github.com/promptfoo/modelaudit/commit/a97b76efc44940d70b6cc0f485485d5c5ff7b550))
-- harden PMML scanner ([#860](https://github.com/promptfoo/modelaudit/issues/860)) ([cbcd88a](https://github.com/promptfoo/modelaudit/commit/cbcd88a91cc8b3f9986554b255be366fcae672a8))
-- harden post-budget pickle tail scan bounds ([16d6db3](https://github.com/promptfoo/modelaudit/commit/16d6db39a6263bc923415d34f7501765550e3564))
-- harden PyTorch binary chunk scanning ([#846](https://github.com/promptfoo/modelaudit/issues/846)) ([930c0bf](https://github.com/promptfoo/modelaudit/commit/930c0bf32b53fbc32252c1b2d98aa1f30716eece))
-- harden SevenZip scanner ([#855](https://github.com/promptfoo/modelaudit/issues/855)) ([8d0c362](https://github.com/promptfoo/modelaudit/commit/8d0c362770f4261eefd7461309e7de09b923587d))
-- harden skops archive routing, recursion, and scanner reporting ([#829](https://github.com/promptfoo/modelaudit/issues/829)) ([fb13f68](https://github.com/promptfoo/modelaudit/commit/fb13f6880fdf80e2e78f5f3f30d9b31c2cff17a3))
-- harden Skops CVE status and card fallback detection ([#843](https://github.com/promptfoo/modelaudit/issues/843)) ([9dd964f](https://github.com/promptfoo/modelaudit/commit/9dd964f0aff86092178578f5b952418a6ec52200))
-- harden TAR scanner ([#854](https://github.com/promptfoo/modelaudit/issues/854)) ([219ce54](https://github.com/promptfoo/modelaudit/commit/219ce54446385e87739beacb2b9a8629cde31abb))
-- harden TensorFlow MetaGraph scanner ([#850](https://github.com/promptfoo/modelaudit/issues/850)) ([2dacc9d](https://github.com/promptfoo/modelaudit/commit/2dacc9dcf844ff8ecd335ad1604519b07fc95432))
-- harden TensorFlow SavedModel scanner ([#849](https://github.com/promptfoo/modelaudit/issues/849)) ([f42b7f2](https://github.com/promptfoo/modelaudit/commit/f42b7f2aa560ff72f495a330870478f9028d4fc3))
-- harden TensorRT scanner ([#858](https://github.com/promptfoo/modelaudit/issues/858)) ([c923b55](https://github.com/promptfoo/modelaudit/commit/c923b55df6e8101f40728cbad254d708eea515c5))
-- harden TFLite scanner ([#851](https://github.com/promptfoo/modelaudit/issues/851)) ([b1b1060](https://github.com/promptfoo/modelaudit/commit/b1b1060ae746047becec36356c6a3d3c8227c723))
-- harden TorchServe MAR handler and manifest analysis ([#840](https://github.com/promptfoo/modelaudit/issues/840)) ([6fc0437](https://github.com/promptfoo/modelaudit/commit/6fc04375fd4709869766418e1873231623458e59))
-- harden ZIP scanner ([#853](https://github.com/promptfoo/modelaudit/issues/853)) ([4ccec1a](https://github.com/promptfoo/modelaudit/commit/4ccec1afcd66b2bac3c75f6bd635f34b446090ea))
-- reject raw trailers in zlib wrappers ([#838](https://github.com/promptfoo/modelaudit/issues/838)) ([3b15e2e](https://github.com/promptfoo/modelaudit/commit/3b15e2e1d148d1c700c6d5300655b5e4bb388d70))
-- scan duplicate PyTorch ZIP members ([#845](https://github.com/promptfoo/modelaudit/issues/845)) ([4f63b22](https://github.com/promptfoo/modelaudit/commit/4f63b2277b8d843411d833d00bcf33615b8fb17b))
-
-### Documentation
-
-- remove Claude-specific commit trailer ([#834](https://github.com/promptfoo/modelaudit/issues/834)) ([d891025](https://github.com/promptfoo/modelaudit/commit/d891025791128245f293057f4849b481806292c7))
-- simplify CLAUDE shim ([#835](https://github.com/promptfoo/modelaudit/issues/835)) ([616ee31](https://github.com/promptfoo/modelaudit/commit/616ee318019e188f90ee1d41b2a2aaaee9c9444e))
-
-## [0.2.30](https://github.com/promptfoo/modelaudit/compare/v0.2.29...v0.2.30) (2026-03-30)
-
-### Bug Fixes
-
-- always run binary fallback for parse-failed .bin files ([#814](https://github.com/promptfoo/modelaudit/issues/814)) ([f5f3c90](https://github.com/promptfoo/modelaudit/commit/f5f3c904855bbd0c305690196826453d54502983))
-- harden nested pickle detection against padded payloads ([#812](https://github.com/promptfoo/modelaudit/issues/812)) ([c15f53e](https://github.com/promptfoo/modelaudit/commit/c15f53eb8960e2328440b5c300c435d5a53d42d1))
-- mark incomplete pickle scans as inconclusive ([#810](https://github.com/promptfoo/modelaudit/issues/810)) ([ade9296](https://github.com/promptfoo/modelaudit/commit/ade9296b6f1c41e8bae1ac6bdbd2fd83d6234c9a))
-- normalize archive locations and route .skops ZIPs ([#805](https://github.com/promptfoo/modelaudit/issues/805)) ([f7c8277](https://github.com/promptfoo/modelaudit/commit/f7c8277adaf505655b5414aa1cda4d79a906c955))
-- preserve fail-closed pickle fallback semantics ([#817](https://github.com/promptfoo/modelaudit/issues/817)) ([e8a6db7](https://github.com/promptfoo/modelaudit/commit/e8a6db7275aba944666bd668f6ae8e782618bb0f))
-- restore post-budget pickle opcode parity ([#811](https://github.com/promptfoo/modelaudit/issues/811)) ([d321309](https://github.com/promptfoo/modelaudit/commit/d32130943ba931eef7b8f85804bde4762410bf39))
-- use symbolic STACK_GLOBAL refs for pickle ML context ([#813](https://github.com/promptfoo/modelaudit/issues/813)) ([eb48c52](https://github.com/promptfoo/modelaudit/commit/eb48c52ee7522bccaf1da0d1f274ce3f33f1cb23))
-- **utils:** recurse into cloud directories with size metadata ([#819](https://github.com/promptfoo/modelaudit/issues/819)) ([2d9852d](https://github.com/promptfoo/modelaudit/commit/2d9852deaaab4f6002404c197fd22231a9c9e69d))
-
-## [0.2.29](https://github.com/promptfoo/modelaudit/compare/v0.2.28...v0.2.29) (2026-03-29)
-
-### Features
-
-- **cli:** add --no-whitelist and --strict flags for CI pipelines ([636b813](https://github.com/promptfoo/modelaudit/commit/636b813b607cec13af5bdb8fecc1ba2461828938))
-- detect pickle expansion attack heuristics ([8e074fd](https://github.com/promptfoo/modelaudit/commit/8e074fda38280716bd6c09aba718b63486d357e2))
-- **whitelist:** warn when HuggingFace whitelist snapshot is stale ([5a60871](https://github.com/promptfoo/modelaudit/commit/5a60871c21c9df18d26674c2c46222fbb98d318f))
-
-### Bug Fixes
-
-- add guarded CRC fallback for PyTorch ZIP scanning ([5db1e71](https://github.com/promptfoo/modelaudit/commit/5db1e71927d97c8c6c3b3ed41ec5d404fc41e2a3))
-- **cache:** harden invalidation and skip operational failures ([6492598](https://github.com/promptfoo/modelaudit/commit/649259821adcbd30c9c1cf40722d0ac591223a2d))
-- **cli:** propagate cache settings to registry downloads ([d6cf508](https://github.com/promptfoo/modelaudit/commit/d6cf508d7f5046757beb590273996dee70ea1365))
-- **core:** count stream scans in files_scanned ([#749](https://github.com/promptfoo/modelaudit/issues/749)) ([50326bb](https://github.com/promptfoo/modelaudit/commit/50326bbada68a6dacbc82e0f0e8929156fcebfa1))
-- **core:** route misnamed archives by trusted file structure ([cad90c3](https://github.com/promptfoo/modelaudit/commit/cad90c3fb2ebbfacee5c1113eefb71c89f8c04a6))
-- **deps:** include py7zr in all extras ([#759](https://github.com/promptfoo/modelaudit/issues/759)) ([16cfae1](https://github.com/promptfoo/modelaudit/commit/16cfae1d805e7eaae082f743f5f69bfb2d32775b))
-- **detection:** tighten safetensors magic detection to prevent misrouting ([109bca2](https://github.com/promptfoo/modelaudit/commit/109bca24440898bb954ae66eac5c054eca705afc))
-- fail closed on pickle unknown opcode parse errors ([#747](https://github.com/promptfoo/modelaudit/issues/747)) ([a63979a](https://github.com/promptfoo/modelaudit/commit/a63979a70c63b22d8cd6993fd4e6f155d139a03c))
-- **filtering:** preserve disguised model files during directory scans ([27058f5](https://github.com/promptfoo/modelaudit/commit/27058f5fd35ca2d1ec665385236ed27b06cc6b54))
-- generate release sbom from uv lock ([#733](https://github.com/promptfoo/modelaudit/issues/733)) ([a1019a8](https://github.com/promptfoo/modelaudit/commit/a1019a8ac79652f9395e29c15e06d39cd9b18e07))
-- harden pickle setitem target detection ([#756](https://github.com/promptfoo/modelaudit/issues/756)) ([877669c](https://github.com/promptfoo/modelaudit/commit/877669cf5a3c036abfc5f730200324ec3d0d9fdd))
-- **huggingface:** fail closed on listing errors and timeouts ([f22ebbe](https://github.com/promptfoo/modelaudit/commit/f22ebbe894b80fb6f6d680d86a908b6509f48fad))
-- **jfrog:** fail closed on partial folder downloads ([14e2ddd](https://github.com/promptfoo/modelaudit/commit/14e2ddd02fe19f74efc0ca5c3269da26c514e7d1))
-- keep json stdout clean for skipped files ([#768](https://github.com/promptfoo/modelaudit/issues/768)) ([0857b98](https://github.com/promptfoo/modelaudit/commit/0857b98da7c331d45579777e2e0d1f45a7a9bec2))
-- **keras-zip:** harden documentation padding bypass for CVE-2025-9906 ([6e73043](https://github.com/promptfoo/modelaudit/commit/6e73043cb5b0c5b346c14be92049010ca345f4dc))
-- **keras:** anchor safe Lambda pattern regexes to prevent code injection bypass ([73fa571](https://github.com/promptfoo/modelaudit/commit/73fa571a172129602bf8637ef1ba601eb3de22d8))
-- **keras:** prevent spoofed built-in registered_name from hiding non-allowlisted modules ([#736](https://github.com/promptfoo/modelaudit/issues/736)) ([6d8350e](https://github.com/promptfoo/modelaudit/commit/6d8350e1a9583c0d53931a6a465e6f8b9dea1d44))
-- **large-files:** fail closed without bounded scanner coverage ([a2317eb](https://github.com/promptfoo/modelaudit/commit/a2317eb1ab98c16a29eb689282c32c61fbcafed0))
-- make pickle operational errors explicit ([2d75778](https://github.com/promptfoo/modelaudit/commit/2d75778ba0f39601bae8adf18d7a8e3f5f79b345))
-- **manifest:** trust regional S3 manifest URLs ([#763](https://github.com/promptfoo/modelaudit/issues/763)) ([f43af54](https://github.com/promptfoo/modelaudit/commit/f43af548a88c953a4c753b74bdad08d199a7fc5f))
-- **mar:** analyze all Python files in TorchServe MAR archives ([dd2cf32](https://github.com/promptfoo/modelaudit/commit/dd2cf3220c42ecc1ea487c3e38c627d43633006a))
-- **mar:** analyze requirements.txt for supply chain attacks ([5365583](https://github.com/promptfoo/modelaudit/commit/536558314b090fc9d7d58db027e6ef9361743ab7))
-- **metadata:** harden metadata scanner userinfo URLs ([#767](https://github.com/promptfoo/modelaudit/issues/767)) ([07bf5a5](https://github.com/promptfoo/modelaudit/commit/07bf5a5d9906edd9d7bef9901e38a9812e2385e3))
-- normalize streamed source path reporting ([#765](https://github.com/promptfoo/modelaudit/issues/765)) ([09431e0](https://github.com/promptfoo/modelaudit/commit/09431e0fb6aace491587b0fd221ee7e456b2f095))
-- **onnx:** add ai.onnx.ml to standard domain allowlist ([c94f804](https://github.com/promptfoo/modelaudit/commit/c94f804c3d889fde1f20224d1e178dd580228f96))
-- **pickle:** add budget-independent global/import byte scanner for large files ([512dd18](https://github.com/promptfoo/modelaudit/commit/512dd18ae43d0306c0f59b115af477ced262a74a))
-- **pickle:** add catch-all for unhandled opcodes in stack simulator ([445b204](https://github.com/promptfoo/modelaudit/commit/445b204e98564267312ced85ea5f620d7f78dfd4))
-- **pickle:** allow uppercase module segments in import checks ([#757](https://github.com/promptfoo/modelaudit/issues/757)) ([c1aeb55](https://github.com/promptfoo/modelaudit/commit/c1aeb55eec9adc67e29ac66973f78ab9b6eddc38))
-- **pickle:** detect nested pickle BINBYTES8 and BYTEARRAY8 payloads ([#754](https://github.com/promptfoo/modelaudit/issues/754)) ([814c7f2](https://github.com/promptfoo/modelaudit/commit/814c7f2216556e687f256dbbddcd7ac77c11d011))
-- **pickle:** harden blocklist — copyreg, \_pickle.Unpickler, functools.reduce ([fe04d9a](https://github.com/promptfoo/modelaudit/commit/fe04d9a077beb3b2659944e30e464103cb831701))
-- **pickle:** surface large-file raw pattern coverage limits ([#769](https://github.com/promptfoo/modelaudit/issues/769)) ([d9904f2](https://github.com/promptfoo/modelaudit/commit/d9904f2551158b88ec80251d98553e64d82b627c))
-- **pickle:** track BUILD opcode **setstate** exploitation ([7e8c370](https://github.com/promptfoo/modelaudit/commit/7e8c370df527c4b204f7357c375b2b1704fafa4a))
-- **pickle:** treat scan timeouts as unsuccessful without regressing tail scans ([075adcd](https://github.com/promptfoo/modelaudit/commit/075adcd0d13058b66d784b3f6a55ebc8424bb014))
-- preserve exit code 1 for zero-file findings ([#764](https://github.com/promptfoo/modelaudit/issues/764)) ([34d25e7](https://github.com/promptfoo/modelaudit/commit/34d25e7952c893b5aa688583511bcb8dd87a9f5a))
-- preserve scanner execution for chunked large files ([#745](https://github.com/promptfoo/modelaudit/issues/745)) ([8d93f1d](https://github.com/promptfoo/modelaudit/commit/8d93f1d85c2c13fffc93a71629a5fc718468c1cc))
-- preserve validated PE detections in pickle scans ([#746](https://github.com/promptfoo/modelaudit/issues/746)) ([017202c](https://github.com/promptfoo/modelaudit/commit/017202cc74839fc9007e7a11576a71fc63a06d98))
-- prevent ExecuTorch polyglot ZIP bypass ([#743](https://github.com/promptfoo/modelaudit/issues/743)) ([e06d0e8](https://github.com/promptfoo/modelaudit/commit/e06d0e84ecd2ae878b2e78043f492ce3b2f40a67))
-- route zip-backed pytorch containers in pickle scanner ([0390a00](https://github.com/promptfoo/modelaudit/commit/0390a00534867849d4b842a0c457c756a23e1289))
-- **routing:** complete format_to_scanner primary routing map ([de69f71](https://github.com/promptfoo/modelaudit/commit/de69f71d891f9bddcc322e4c02e9b663559879cf))
-- **safetensors:** add missing BF16/BOOL/FP8 dtypes for size validation ([f2f2574](https://github.com/promptfoo/modelaudit/commit/f2f257489cce06ad87277e3344200e1dd3f41150))
-- **safetensors:** apply MAX_HEADER_BYTES limit in scan() to prevent DoS ([7a847a7](https://github.com/promptfoo/modelaudit/commit/7a847a7a309f41f1bf49feb7b6ce6fdb8ac2468c))
-- **savedmodel:** scan assets/ directory for executable content ([04d2a0c](https://github.com/promptfoo/modelaudit/commit/04d2a0c358d297316664ce290fa612be0535d9ab))
-- scan padded follow-on pickle streams ([#755](https://github.com/promptfoo/modelaudit/issues/755)) ([8727d03](https://github.com/promptfoo/modelaudit/commit/8727d03204bf903158164d2fa430c8c36e36015c))
-- **security:** block streamed symlink traversal outside scan roots ([#751](https://github.com/promptfoo/modelaudit/issues/751)) ([aee6656](https://github.com/promptfoo/modelaudit/commit/aee66568021ca205372de27ef2ecfcae4929d070))
-- **security:** bound embedded .keras weight extraction to prevent zip-bomb DoS ([#737](https://github.com/promptfoo/modelaudit/issues/737)) ([1cc0e46](https://github.com/promptfoo/modelaudit/commit/1cc0e4624b80766ec127c55f960405ab58a59cb6))
-- **security:** bound MAR fallback python handler reads ([#735](https://github.com/promptfoo/modelaudit/issues/735)) ([88e42b9](https://github.com/promptfoo/modelaudit/commit/88e42b97b4ab30b07c87f3ac04978b5445aead9a))
-- **security:** harden manifest URL trust checks and timeout handling ([#760](https://github.com/promptfoo/modelaudit/issues/760)) ([9ccc5f3](https://github.com/promptfoo/modelaudit/commit/9ccc5f36793b756b4a314c69adb33d939123232e))
-- **security:** preserve scannable artifacts in directory filtering ([#758](https://github.com/promptfoo/modelaudit/issues/758)) ([7666930](https://github.com/promptfoo/modelaudit/commit/7666930fcdf357fcd9d8c905becd7985a1b4655f))
-- **security:** preserve shared depth across nested archive types ([#753](https://github.com/promptfoo/modelaudit/issues/753)) ([607b506](https://github.com/promptfoo/modelaudit/commit/607b5060422a9848ebdea11c6e239a932c532a23))
-- **security:** recurse into extensionless nested ZIP members ([#752](https://github.com/promptfoo/modelaudit/issues/752)) ([a2dfea9](https://github.com/promptfoo/modelaudit/commit/a2dfea9b5dd24994c8624c9db865db219f1587f4))
-- **security:** recurse into nested sevenzip archives by content ([#761](https://github.com/promptfoo/modelaudit/issues/761)) ([3b0e3dc](https://github.com/promptfoo/modelaudit/commit/3b0e3dc0b6915ef2cd7ffaa4d41a6eb54ef475b3))
-- **security:** require explicit HuggingFace provenance for whitelist downgrades ([#750](https://github.com/promptfoo/modelaudit/issues/750)) ([582e361](https://github.com/promptfoo/modelaudit/commit/582e36198bd30699bce2ebd1bbab73ad6e3504d9))
-- **security:** route nested sevenzip members through core scanning ([#762](https://github.com/promptfoo/modelaudit/issues/762)) ([92ffdf7](https://github.com/promptfoo/modelaudit/commit/92ffdf7ca6bc30972e3b136470e92c2e8c8fbc63))
-- **sevenzip:** recurse into misnamed nested archives ([2cc5423](https://github.com/promptfoo/modelaudit/commit/2cc5423764749344e6ce6108d6ac2943bc002dcd))
-- **streaming:** avoid materializing file iterators ([7a9ae37](https://github.com/promptfoo/modelaudit/commit/7a9ae3741f3c8ab90fdd47c9101e8bf17179a086))
-- **tflite:** stop after excessive subgraph counts ([64b08fa](https://github.com/promptfoo/modelaudit/commit/64b08fa3501ed7321c08887a6bee5c4914246e69))
-- **whitelist:** preserve explicit HF download provenance ([#766](https://github.com/promptfoo/modelaudit/issues/766)) ([7e187cb](https://github.com/promptfoo/modelaudit/commit/7e187cb0bd96350c34b2e430a20be6a48ca7fd27))
-
-### Documentation
-
-- **agents:** tighten validation and routing guidance ([335b656](https://github.com/promptfoo/modelaudit/commit/335b65679de6c98d4040d3ea9e6a4fd025ac3f45))
-- normalize unreleased changelog section ([#741](https://github.com/promptfoo/modelaudit/issues/741)) ([5e66490](https://github.com/promptfoo/modelaudit/commit/5e664901d4448871715685833a91cfb339d632d7))
+- align markdown with current repo state ([#1035](https://github.com/promptfoo/modelaudit/issues/1035)) ([690bc52](https://github.com/promptfoo/modelaudit/commit/690bc5274198eb3428db9779ada0bdc2d40702ee))
+- align README support and dependency guidance ([#1008](https://github.com/promptfoo/modelaudit/issues/1008)) ([5dcd62b](https://github.com/promptfoo/modelaudit/commit/5dcd62bad05ed9e661c2cafacc7ec1b4a4bad515))
+- clarify security report closure policy ([#1049](https://github.com/promptfoo/modelaudit/issues/1049)) ([d53e445](https://github.com/promptfoo/modelaudit/commit/d53e445609708909eee6822a5215289ed64d6c48))
+- prune stale planning artifacts ([#1010](https://github.com/promptfoo/modelaudit/issues/1010)) ([851cc10](https://github.com/promptfoo/modelaudit/commit/851cc102a8c1d40fce7433a1d221d6ff9acece5f))
 
 ## [Unreleased]
 
 ### Added
 
+- **security:** inspect non-canonical SavedModel root siblings for suspicious
+  executable-like content
+- **security:** detect bare-string Lua `require "module"` loads in Torch7
+  artifacts
+- **security:** keep trusted NeMo namespaces from suppressing suspicious Hydra
+  `_target_` leaf names
+- **security:** fail closed when NeMo archives contain no analyzable config files
+- **security:** analyze GGUF-embedded chat templates through the Jinja scanner
+  while preserving GGUF scanner ownership
+- **security:** run JAX checkpoint analysis for JAX-like pickle payloads that
+  stay on the primary pickle scanner path
+- **security:** detect `mailcap.findmatch` pickle call targets that can execute
+  attacker-controlled mailcap `test` commands on Python versions that still
+  provide `mailcap`
+- **security:** detect `setuptools._distutils.spawn.spawn` pickle call targets
+  that can execute attacker-controlled subprocess command lists when
+  `setuptools` is installed
+- **security:** detect `pipes.Template` pickle call targets that can execute
+  attacker-controlled shell pipelines on Python versions that still provide
+  `pipes`
+- **security:** resolve module-level bound-method aliases and same-module
+  constructor call paths in pickle call-graph analysis so process-dispatch
+  wrappers are blocked
+- **security:** resolve dangerous `six.moves` compatibility aliases, including
+  vendored `six` copies, in pickle call-graph analysis so subprocess, pickle
+  deserializer, and builtin execution wrappers are blocked
+- **security:** resolve constructor-default sink aliases assigned to instance
+  attributes in pickle call-graph analysis so wrappers like Botocore credential
+  process providers are blocked
+- **security:** resolve sink defaults forwarded through `super().__init__` in
+  pickle call-graph analysis so async credential process wrappers are blocked
+- **security:** resolve parameter-fed function-local class instance aliases in
+  pickle call-graph analysis so wrapper functions like `click.edit` are blocked
+- **security:** resolve function-local import aliases in pickle call-graph
+  analysis so wrappers that import RCE sinks inside function bodies are blocked
+- **security:** preserve callable invocation aliases when import-reference
+  metadata is crowded, while ignoring uninvoked nested function and lambda
+  bodies during pickle call-graph analysis
+- **security:** detect `typing._eval_type` pickle call targets that can
+  evaluate attacker-controlled `ForwardRef` expressions
+- **security:** detect `dataclasses._create_fn` pickle call targets that can
+  execute attacker-controlled generated Python source
+- **security:** detect `typing.get_type_hints` pickle call targets that can
+  evaluate attacker-controlled annotation strings
+- **security:** detect public `operator.call` pickle call targets that can
+  invoke attacker-controlled callables
+- **security:** detect `builtins.map` pickle call targets that can lazily
+  invoke attacker-controlled callables when iterated
+- **security:** detect `itertools.starmap` pickle call targets that can lazily
+  invoke attacker-controlled callables when iterated
+- **security:** detect `builtins.filter` pickle call targets that can lazily
+  invoke attacker-controlled callables when iterated
+- **security:** detect `types.MethodType` pickle call targets that can
+  synthesize attacker-controlled bound methods for later invocation
+- **security:** detect `types.DynamicClassAttribute.__get__` pickle call
+  targets that can invoke attacker-controlled descriptor getters
+- **security:** detect `functools.cached_property.__get__` pickle call targets
+  that can invoke attacker-controlled cached-property getters
+- **security:** detect `functools.cmp_to_key` pickle call targets that can
+  invoke attacker-controlled comparators during rich comparison
+- **security:** detect `logging.Filterer.filter` pickle call targets that can
+  invoke attacker-controlled logging filter callbacks
+- **security:** detect `inspect.getmembers` pickle call targets that can
+  invoke attacker-controlled descriptors during introspection
+- **security:** detect `builtins.hasattr` pickle call targets that can invoke
+  attacker-controlled descriptors during attribute-existence checks
+- **security:** detect `__del__` finalizer string seeds that can execute
+  attacker-controlled methods when pickle-built objects are dropped
+- **security:** detect `__eq__` rich-comparison string seeds that can execute
+  attacker-controlled methods during equality checks
+- **security:** detect `__lt__`, `__le__`, `__gt__`, `__ge__`, and `__ne__`
+  rich-comparison string seeds that can execute attacker-controlled methods
+  during ordering checks
+- **security:** detect `__contains__` membership string seeds that can execute
+  attacker-controlled methods during containment checks
+- **security:** detect `__setitem__` item-assignment string seeds that can
+  execute attacker-controlled methods during item mutation
+- **security:** detect `__getitem__` and `__delitem__` item-protocol string
+  seeds that can execute attacker-controlled methods during item access
+- **security:** detect binary arithmetic and bitwise dunder string seeds that
+  can execute attacker-controlled methods during operator dispatch
+- **security:** detect reflected and in-place binary operator dunder string
+  seeds that can execute attacker-controlled methods during operator dispatch
+- **security:** detect unary operator dunder string seeds that can execute
+  attacker-controlled methods during operator dispatch
+- **security:** detect context-manager entry dunder string seeds and
+  `contextlib.ExitStack.enter_context` pickle call targets that can invoke
+  attacker-controlled `__enter__` methods
+- **security:** detect iteration protocol dunder string seeds that can execute
+  attacker-controlled methods during builtin iteration dispatch
+- **security:** detect numeric rounding protocol dunder string seeds that can
+  execute attacker-controlled methods during rounding helper dispatch
+- **security:** detect descriptor setup and numeric coercion dunder string
+  seeds that can execute attacker-controlled methods during class creation
+- **security:** detect presentation and size protocol dunder string seeds that
+  can execute attacker-controlled methods during common builtin dispatch
+- **security:** detect PathLike `__fspath__` dunder string seeds that can
+  route attacker-controlled paths into file APIs during pickle loading
+- **security:** detect direct pickle calls to stdlib file-write sinks such as
+  `pathlib.Path.write_text`, `io.open`, and `_io.FileIO`
+- **security:** detect pickle calls to logging file handlers and emit/handle
+  dispatch methods that can write attacker-controlled startup hooks
+- **security:** detect pickle calls to `argparse.FileType` and high-level
+  logging stream dispatch methods that can write attacker-controlled startup
+  hooks
+- **security:** detect pickle calls to NumPy text writers that can write
+  attacker-controlled startup hooks
+- **security:** detect pickle calls to `python-dotenv` key writers that can
+  write attacker-controlled startup hooks
+- **security:** detect pickle globals whose Python call graph reaches known
+  RCE-capable source primitives such as `os.execvpe`
+- **security:** detect pickle globals whose Python call graph pairs file-open
+  and file-write wrappers that can create executable startup hooks
+- **security:** resolve pickle-imported Python class globals through bounded
+  constructor and object-method call graph entrypoints
+- **security:** detect public `io.FileIO` and `io.TextIOWrapper.write` aliases
+  for blocked `_io` file-writing primitives
+- **security:** detect builtin namespace dictionary access that can recover
+  blocked primitives through mapping lookups
+- **security:** detect dotted pickle global aliases that resolve to blocked
+  source primitives such as `os.system`
+- **security:** detect concrete `pathlib` path writer aliases and module
+  namespace dictionary recovery for modules with blocked globals
+- **security:** detect module namespace and `__builtins__` access used for
+  dynamic builtin recovery
+- **security:** detect `string.Formatter.get_field` pickle call targets that
+  can traverse attacker-controlled field expressions into callable objects
+- **security:** detect `unittest.mock._get_target` pickle call targets that
+  can manufacture delayed `pkgutil.resolve_name` resolver partials
+- **security:** detect descriptor getter pickle call targets that can bind
+  recovered function descriptors and expose builtin namespaces
+- **security:** detect wrapper and method descriptor getter pickle call targets
+  that can bind recovered slot wrappers for dynamic attribute access
+- **security:** detect global references to attribute-access and function
+  namespace source methods used for dynamic builtin recovery
+- **security:** detect object subclass enumeration globals that can recover
+  loaded process capabilities without direct imports
+- **security:** detect garbage collector object-graph globals that can recover
+  hidden namespaces and loaded process capabilities
+- **security:** detect frame-introspection globals and frame namespace
+  descriptor getters used for dynamic builtin recovery
+- **security:** detect callable `__call__` aliases of blocked pickle globals
+  used to invoke hidden RCE source primitives
+- **security:** detect wrapper `__get__` and `__self__` aliases of blocked
+  pickle globals used to recover hidden RCE source primitives
+- **security:** detect attribute aliases under blocked pickle global prefixes
+  used to recover hidden RCE source primitives
+- **security:** detect pickle calls to PyYAML unsafe loaders that can execute
+  attacker-controlled Python constructors
+- **security:** detect pickle calls to `codecs.open` and codec stream writes
+  that can write attacker-controlled startup hooks
+- **security:** detect pickle calls to durable tempfile creation and CSV
+  `DictWriter` row dispatch that can write attacker-controlled startup hooks
+- **security:** detect pickle calls to mailbox single-file `add` dispatch
+  methods that can write attacker-controlled startup hooks
+- **security:** detect pickle calls to `_tkinter` Tcl interpreter dispatch
+  methods that can execute local commands
+- **security:** detect high-level `tkinter.Misc` pickle call targets that can
+  forward attacker-controlled commands into Tcl interpreter dispatch
+- **security:** detect pickle calls to `_xxsubinterpreters.run_string` that
+  can execute attacker-controlled Python source
+- **security:** detect `builtins.staticmethod` pickle call targets that can
+  synthesize callable descriptors for later invocation
+- **security:** detect `builtins.property.__get__` pickle call targets that
+  can invoke attacker-controlled property getters during descriptor access
+- **security:** detect `builtins.classmethod.__get__` pickle call targets that
+  can synthesize attacker-controlled bound methods during descriptor access
+- **security:** detect `_functools.partial` pickle call targets that can
+  synthesize private-alias partial callables for later invocation
+- **security:** detect `_functools.reduce` pickle call targets that can invoke
+  attacker-controlled reducer callables through the private CPython alias
+- **security:** detect `functools.cache`, `functools.lru_cache`, and
+  `functools.singledispatch` pickle call targets that can synthesize callable
+  wrappers around attacker-controlled functions for later invocation
+- **cli:** add scanner selection with `--scanners`, `--exclude-scanner`, and `--list-scanners` wired into core routing, nested dispatch, remote prefilters, and scan metadata; selection-suppressed preferred scanners emit a stderr warning and populate `scanner_selection.suppressed_preferred_scanner_ids`, and unknown scanner names suggest the closest match
+- **pickle:** replace the standalone pickle scanner's package-engine selector with the Rust-only runtime and explicit native-extension errors
+- **pickle:** scan PyTorch ZIP checkpoint pickle members directly in the standalone pickle scanner
 - **pickle:** bundle the standalone `modelaudit_picklescan` API in the root `modelaudit` wheel and add source-tree coverage for the package boundary
 - **tests:** enable existing PaddlePaddle scanner tests in CI by adding `test_paddle_scanner.py` to the allowed test files list (Python 3.10/3.12/3.13)
 - **security:** detect CVE-2026-1669 Keras HDF5 external weight references in standalone `.h5` and embedded `.keras` weights
@@ -255,10 +457,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **security:** temporarily bump the optional ONNX dependency to `1.21.0rc3`, which removes the vulnerable `onnx.hub` module flagged by CVE-2026-28500.
+- **telemetry:** persist ModelAudit distinct IDs in Promptfoo's global config
+  format (creating `~/.promptfoo/promptfoo.yaml` if absent and migrating any
+  legacy `~/.modelaudit/user_config.json` ID) and include `isRunningInCi` on
+  analytics payloads, with presence-based detection for marker-style providers
+  (TeamCity, CodeBuild, Bitbucket, Jenkins)
+- **docs:** align public README and compatibility guidance with supported Python 3.10-3.13, TensorFlow extra requirements, supported formats, and telemetry sanitization behavior
+- **security:** credit @mosebit for privately reporting a TensorRT native-code detection gap that helped harden native-code scanner coverage
+- **security-policy:** clarify when low-impact scanner coverage gaps may be closed without publishing a public advisory while still crediting reporters
+- **pickle:** increase Rust stream read chunks to reduce scan overhead on large file and archive-member inputs
+- **pickle:** store Rust byte stack operands as source spans instead of copied previews to reduce large-pickle scan overhead
+- **pickle:** skip no-seed raw-text and CVE fallback passes on clean Rust-complete pickle scans, tightening benign state-dict CLI performance while preserving targeted raw-detector positives
+- **pickle:** document and pin parse-incomplete tail suppression to trusted pickle boundaries without dangerous import references; parse failures with security findings or dangerous imports still fail closed
+- **security:** bump the optional ONNX dependency to `1.21.0rc3`, which removes the vulnerable `onnx.hub` module flagged by CVE-2026-28500.
+
+### Rule Codes
+
+- **pickle:** preserve and document Rust pickle scanner mappings for SETITEM abuse (`S209`), copyreg extensions (`S211`), persistent IDs (`S212`), nested or encoded pickle payloads (`S213`), base64/hex/obfuscated encoded payloads (`S601`/`S602`/`S604`), structural tamper and incomplete analysis (`S902`), and the new pickle expansion denial-of-service rule (`S214`).
+- **pickle:** keep internal Rust finding codes such as `STRUCTURAL_TAMPER` and `PICKLE_EXPANSION` in `pickle_rule_code` details while exposing stable ModelAudit rule codes for dashboards, SARIF, suppression, and severity configuration.
 
 ### Fixed
 
+- **llamafile:** stream marker detection across executable bodies so `.exe`
+  wrappers with middle-only `llamafile` markers still route to the scanner
+- **flax:** keep explicit Flax/JAX checkpoint suffixes routed to the scanner when
+  `msgpack` is unavailable so missing parser coverage fails closed
+- **llamafile:** fail closed when bounded embedded-payload scanning stops before
+  covering the full executable
+- **skops:** require exploit-shaped structured loader nodes for CVE-2025-54412
+  and CVE-2025-54413 checks so inert prose, filenames, and valid loader nodes do
+  not become critical findings
+- **routing:** require recognized ZIP signatures before classifying files or
+  streaming previews as archives, so benign `PK*` near-matches stay unclassified
+- **xgboost:** avoid flagging inert `feature_names` metadata as executable JSON
+  content.
+- **pmml:** avoid flagging benign `ecosystem()` prose as a `system(...)` call.
+- **jax:** avoid routing `ajax` near-matches as JAX checkpoint indicators.
+- **security:** fail closed on malformed nested XGBoost JSON structures that
+  would otherwise skip booster or tree validation.
+- **security:** require the legacy XGBoost binary signature instead of
+  accepting marker-shaped text payloads as valid `.bst` models.
+- **security:** validate late XGBoost trees instead of sampling only the first
+  ten tree structures.
+- **security:** detect PaddlePaddle suspicious tokens that span the scanner's
+  1 MiB read boundaries.
+- **routing:** align manifest scanner routing with the manifest filenames and
+  dedicated manifest-style suffixes declared by the registry.
+- **security:** detect strong executable headers in generic archive members even
+  when the payload has no executable-looking suffix.
+- **routing:** preserve renamed OpenVINO and PMML XML models with long benign
+  prologs during content-based directory filtering.
+- **security:** resolve compile-time string concatenation in archive-member `getattr` calls so high-risk targets like `os.system` cannot hide behind split literals
+- **security:** fail closed when routing recognizes a model format but no scanner is available to analyze it
+- **security:** fail closed when streaming scans only fall back to heuristic header checks, even if the remote file bytes were fully read
+- **docs:** narrow public scan-coverage wording so unsupported or merely discovered formats are not over-promised
+- **analysis:** keep exact dangerous literals visible even when surrounding bytes look like ML weights
+- **analysis:** stop attacker-controlled file and directory names from suppressing dangerous framework-pattern findings
+- **security:** detect dangerous marker-free Python source blobs through the public JIT path so disguised archive members are still analyzed
+- **security:** mark ONNX scans inconclusive when raw JIT/script or network
+  detector analysis cannot complete instead of treating detector failures as
+  clean passes.
+- **security:** run Jinja template analysis for manifest-owned configs that carry
+  embedded chat-template fields.
+- **pickle:** detect stdlib filesystem probe and process-state callables such as `pathlib` metadata methods, `decimal.setcontext`, and `gc.disable` during pickle scans, while keeping local container mutations clean and covering public `operator.setitem` registry poisoning plus target-aware `operator.imul` warning-filter mutation.
+- **pickle:** detect public `operator.setitem` pickle calls, keep callable
+  invocation aliases ahead of import-reference budget exhaustion, dedupe repeated
+  invocation metadata before the reporting cap, preserve literal mapping-key
+  shadowing through `ChainMap`, block deeply wrapped `defaultdict` factories,
+  and avoid outer-function call-graph false positives from nested function and
+  lambda bodies.
+- **security:** prevent HuggingFace whitelist provenance from downgrading active payload, CVE, traversal, executable, operational-error, or incomplete-coverage findings. Exemptions now cover S1xx code-execution primitives (`S101`–`S115`) and HIGH-severity S3xx network primitives (`S301`/`S304`/`S305`/`S310`), and the keyword fallback uses word-boundary matching so substrings like "executable" inside "ExecuTorch" no longer over-suppress legitimate downgrades.
+- **security:** scan generic ZIP/TAR/NPZ Python members and ZIP/TAR/NPZ executable members, including wildcard imports and callable rebindings while failing closed on malformed Python source. Findings carry accurate rule codes per risk category (`S101` for `os.system`/`os.popen`, `S103` for `subprocess.*`, `S104` for `eval`/`exec`, `S106` for `__import__`, `S107` for `importlib.import_module`, `S213` for `pickle.load`/`pickle.loads`) instead of a single catch-all, the ZIP path now honors `max_mar_python_analysis_bytes` for non-MAR Python members, and source bytes are parsed directly so PEP 263 encoding declarations are respected.
+- **security:** bound PyTorch ZIP JIT/network member reads (default 32 MiB per-member cap, configurable via `max_jit_scan_member_bytes`) and mark oversized or unreadable member coverage inconclusive. Oversize and read-failure events are aggregated into a single summary INFO check per kind (with per-member detail in `details["entries"]`) so adversarial archives cannot flood the checks list, duplicate-name entries are de-duplicated by `ZipInfo` identity rather than filename so the second of two same-name members is still analyzed, directory entries are skipped explicitly, and pickle members continue through the bounded JIT/network pass so padded payloads remain covered beyond the pickle scanner raw window.
+- **security:** detect hidden PyTorch ZIP pickle members even when a benign `data.pkl` is already present. The bounded-prefix sniff now always runs across unselected members (including extensionless payloads and files under `data/<n>`), fails closed with one aggregated INFO check if probe reads raise (was one check per failed member), and is mirrored in the standalone `modelaudit-picklescan` package so both code paths discover the same hidden payloads.
+- **security:** mark PyTorch ZIP scan timeouts inconclusive and unsuccessful instead of reporting complete coverage.
+- **security:** detect extensionless protocol-0/1 pickle members during 7-Zip nested archive probes.
+- **pickle:** restore ModelAudit nested-pickle findings from Rust standalone notices and keep network raw-detector coverage after native pickle findings
+- **xgboost:** route UBJSON-backed `.bst` models when `version` or booster markers appear after a large `learner` object, and route extensionless XGBoost UBJSON models via content sniffing (requires both the `learner` marker and a booster/model-param strong marker within the probe window).
+- **telemetry:** strip query strings, fragments, and URL userinfo from cloud model names and file-extension metadata
+- preserve `S999` unknown-opcode mapping in generic rule fallback
+- **docker:** run the full parser image as a non-root `appuser`
+- **onnx:** mark weight-distribution analysis inconclusive when dependencies are missing or eligible tensors are external, oversized, or fail extraction
+- **zip:** enforce an aggregate uncompressed-size budget before extracting ZIP entries so split archive bombs cannot bypass per-entry limits
+- **security:** flag NeMo Hydra `_target_` values that invoke ML deserialization loaders such as `torch.load`, `joblib.load`, Keras load-model APIs, and related pickle-backed helpers.
+- **telemetry:** replace free-form issue messages in telemetry issue fields with stable rule/CVE/type identifiers
 - **security:** route renamed TFLite FlatBuffers by magic bytes, enforce scanner file-size limits before model reads, and fail closed instead of propagating malformed structure traversal exceptions
 - **onnx:** fail closed on CRITICAL findings, detect `PyFunc` operators and Windows absolute external-data paths, validate external tensor slices with the current ONNX dtype API, and avoid Python-op substring false positives
 - **tensorrt:** route `.trt` engines, detect case-variant and UTF-16 suspicious strings, and avoid substring false positives in benign engine metadata
@@ -267,24 +549,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **gguf:** fall back to the GGUF spec default tensor-data alignment after rejecting invalid `general.alignment` metadata values
 - **security:** detect protocol 0/1 pickle streams hidden behind long separator gaps after an initial safe pickle stream
 - **security:** preserve failed status for malicious Skops CVE detections and avoid CVE-2025-54886 false positives on benign README/model-card text such as "download"
+- **security:** validate HuggingFace repo path components before cache path construction, revalidate HuggingFace cache freshness through the provider SDK, bound XGBoost JSON routing sniffing, redact signed cloud URLs from cache metadata, and default full-file scanner reads to bounded fail-closed limits
 - **security:** enforce Flax msgpack scanner file-size limits before full reads, scan trailing msgpack stream objects with a bounded object-count cap, downgrade benign container-like trailing-object findings to INFO, and preserve failed status when CRITICAL findings are reported
 - **security:** route `.joblib` files through the Joblib scanner, scan raw protocol-0/1 payloads directly, support gzip/bzip2/lzma/zlib wrappers with bounded output and trailing-data checks, preserve embedded Pickle finding locations, and fail closed on undecodable/trailing-wrapper errors
+- **security:** route ONNX protobuf payloads saved with a `.pb` suffix by content before TensorFlow protobuf extension fallback
 - **security:** detect direct `getattr(module, "dangerous")` handler calls in TorchServe MAR archives, parse conflicting duplicate manifests without silently downgrading hidden handlers, and suppress collision warnings for byte-identical duplicate manifests
+- **security:** recognize RAR archives and fail closed as unsupported coverage instead of skipping `.rar` files during directory scans
+- **skops:** fail closed when Skops archive limits, malformed archives, or bounded metadata reads leave CVE coverage incomplete, while preserving benign numeric-array payload scans
+- **xgboost:** fail closed on incomplete JSON, UBJ, binary-structure, pickle-spoof, and enabled-loader analyses while preserving core exit-code and cache semantics
+- **security:** route disguised ZIP and TAR members inside 7-Zip archives by bounded header probes while stopping probe reads at the per-member budget
 - **security:** reduce NeMo Hydra `_target_` false positives by matching suspicious identifiers on token boundaries, preserve CVE-2025-23304 details on suspicious-target findings, and reject oversized YAML members before parsing
+- **security:** preserve skipped-suffix ZIP containers when Keras config-only structure or embedded model-like `.bin` members indicate scannable content
+- **security:** fail closed when oversized NeMo YAML prevents Hydra target analysis and scan malformed Jinja2 config fallbacks beyond the initial prefix window
 - **security:** detect protocol 0/1 pickle streams with trivial opcode prefixes even when `STOP` is followed by trailing junk, while preserving plain-text near-match rejection
 - **security:** detect protocol 0/1 pickle streams whose dangerous opcode appears after large trivial padding or after a non-trivial probe-boundary prelude, reject all-trivial no-`STOP` probe prefixes, and preserve rule codes across cached scan-result round trips
 - **pickle:** propagate standalone fallback parse and stream-read failures into merged scan success, preserve truncated `.bin` fail-closed behavior, reuse non-seekable stream spools for the legacy parity pass, clamp negative stream sizes, and reset post-budget scan state between reused scanner runs
+- **pickle:** align Rust pickle suspicious-string matching, protocol-0 text decoding, EOF-before-`STOP` handling, malformed argument diagnostics, parse-incomplete reports, warning dangerous-call adaptation, negative stream sizes, and compatibility finding promotion with Python parity
+- **pickle:** harden Rust opcode parity for protocol 5 buffers, copyreg extensions, follow-on streams, protocol-0 encoded nested payloads, and `__main__` call escalation while bounding Python raw-detector hot paths
+- **pickle:** preserve root raw-detector coverage for Slack tokens, `mongodb+srv://` secrets, bare IPs, domains, and network-library/function indicators behind large-file compatibility prefilters
+- **pickle:** detect modern `STACK_GLOBAL`, `INST`, and copyreg extension references in post-budget pickle tails, avoid a second Rust-boundary copy of Python byte payloads, and skip expensive raw detectors for realistic benign PyTorch state-dict key streams
+- **pickle:** route crafted protocol-1 binary pickle headers and nested protocol-1 payload prefixes through the same scanner paths as newer binary protocols
+- **pickle:** enforce PyTorch ZIP entry limits with a bounded EOCD preflight before opening over-cap archives
+- **pickle:** resolve memoized `GET`/`BINGET`/`LONG_BINGET` operands in post-budget `STACK_GLOBAL` tails so pre-memoized dangerous globals cannot bypass the Rust scanner
+- **pickle:** detect no-`PROTO` binary-opcode nested payloads in raw/base64/hex fields, fail closed when nested probe candidates exceed the bounded budget, and flag process-termination/resource primitives such as `builtins.exit`, `faulthandler._sigsegv`, and `resource.setrlimit`
+- **numpy:** propagate incomplete embedded-pickle scan status from object-dtype `.npy` payloads so partial recursive pickle coverage fails closed
 - **license:** bound binary header scans and reuse compiled patterns to avoid full-file regex passes on large model archives
 - **security:** stop iterating malformed TFLite models after excessive subgraph counts are detected
 - **openvino:** route forbidden-DOCTYPE IR XML into the OpenVINO scanner, fail closed on XML parse errors, and suppress warning-level format-validation noise for benign `.xml` models with no distinctive magic bytes
 - **security:** fail closed on conflicting duplicate or alias Keras root members so benign trailing `config.json` entries cannot hide malicious earlier configs, while accepting byte-identical duplicates without warning noise
 - **security:** detect PyTorch binary code and blacklist patterns that straddle chunk boundaries, avoid duplicate overlap reports, and return `success=False` when CRITICAL findings are present
+- fail closed on bare scanner `success=False` results across object, dict, streaming, and cached scan paths instead of allowing clean aggregate success
+- **security:** harden PyTorch ZIP pickle import classification without downgrading dangerous builtins or known benign rebuild aliases
 - **security:** scan every duplicate PyTorch ZIP member by physical archive entry and report conflicting duplicate names at INFO severity so benign trailing `data.pkl` entries cannot shadow malicious earlier payloads without making benign-but-conflicting duplicates warning-fail by themselves
+- **security:** route metadata-stripped PyTorch ZIP archives by numeric tensor storage members only, preserving generic ZIP routing for data-directory near-matches
 - **security:** route misnamed Skops ZIPs by bounded schema sniffing, treat encrypted Skops-like schema members as non-matches instead of crashing routing, recurse into embedded members while preserving Skops-specific CVE checks, avoid tiny nested `.bin` false positives on clean archive members, preserve nested-member byte accounting, and preserve CLI `scanner_names` in aggregated JSON output
 - **pickle:** bound post-budget global fallback state, retained findings, and deadline checks to prevent crafted pickle tails from exhausting scanner memory or flooding logs
 - **pickle:** mark timeout-, budget-, recursion-, and resource-limited pickle scans as inconclusive so clean-looking partial analysis returns exit code 2 unless real security findings were reported
 - route misnamed ZIP, HDF5, and 7z files through content-aware scanner selection
 - **security:** recursively scan all members of content-routed `.keras` ZIP archives with bounded per-member extraction, prefer canonical root members over normalized aliases, and fail closed on ambiguous duplicate aliases so embedded payloads and `./config.json` entries are not skipped
+- **keras:** fail closed when embedded `.keras` weights exceed inspection limits, constrain fully-qualified H5/ZIP Lambda CVE attribution to Keras/TensorFlow namespaces, and avoid CVE noise for documentation URLs that mention `get_file`.
 - **security:** scan duplicate ZIP entries by physical archive member instead of resolving repeated names to the final entry, preventing shadowed payloads from being skipped during recursive archive analysis
 - bound Keras `config.json` and `metadata.json` member reads before JSON parsing
 - **openvino:** parse XML roots for long-prolog routing, enforce size limits before parsing, scan nested layer attributes for external library references, and avoid importlib substring false positives
@@ -431,6 +734,270 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - update README and user docs for the `modelaudit metadata` command, metadata safety guidance (`--trust-loaders`), and new NeMo format coverage
 - align maintainer/agent docs with current architecture and release workflow (metadata extractor component, dependency extras, and release-please + changelog guidance)
+- align repository documentation around current scanner coverage, rule codes, package boundaries, and supported CI workflows
+
+## [0.2.37](https://github.com/promptfoo/modelaudit/compare/v0.2.36...v0.2.37) (2026-04-12)
+
+### Bug Fixes
+
+- add CVE scanner coverage ([01dec02](https://github.com/promptfoo/modelaudit/commit/01dec0270516738295651ce07e7804de82eaabdb))
+- add size floor for zip compression ratio ([#949](https://github.com/promptfoo/modelaudit/issues/949)) ([5e66eeb](https://github.com/promptfoo/modelaudit/commit/5e66eeb483048644da7c07bba6496a5c6c73a187))
+- align SARIF scan metadata with CLI results ([#934](https://github.com/promptfoo/modelaudit/issues/934)) ([1a90415](https://github.com/promptfoo/modelaudit/commit/1a90415d53d9ddc4dba01ff7ad804125a1d76c20))
+- allow generated TorchScript source files ([#948](https://github.com/promptfoo/modelaudit/issues/948)) ([53d0cdc](https://github.com/promptfoo/modelaudit/commit/53d0cdc48025628de0f56397d832dbac839721fd))
+- **archives:** honor nested header routing ([fccdb91](https://github.com/promptfoo/modelaudit/commit/fccdb914ccd87d0f178729f6becdfdddcfe72024))
+- avoid archive bin pickle routing ([#962](https://github.com/promptfoo/modelaudit/issues/962)) ([446df6b](https://github.com/promptfoo/modelaudit/commit/446df6b06a59cf6cc8e11485d6df8f5dc0d35ec8))
+- avoid safetensors unicode metadata false positive ([#945](https://github.com/promptfoo/modelaudit/issues/945)) ([d595fde](https://github.com/promptfoo/modelaudit/commit/d595fdee57150ea22d9bb38b92ec61cdc865da60))
+- bound standalone pickle stream reads ([4d0cb84](https://github.com/promptfoo/modelaudit/commit/4d0cb84af010b4ed332ebbf17fc8bd0769fa8b6e))
+- **catboost:** redact finding urls ([c65334c](https://github.com/promptfoo/modelaudit/commit/c65334ceb456556835d80bf17010d952c7437985))
+- **cli:** honor streaming file skips ([49291ac](https://github.com/promptfoo/modelaudit/commit/49291acbc9fb8c35f7944ee894fd81ac23fe3045))
+- **cli:** redact cloud urls in output ([#964](https://github.com/promptfoo/modelaudit/issues/964)) ([0ee82ca](https://github.com/promptfoo/modelaudit/commit/0ee82ca1e84f2dc06daa8d05a4ad9c3abdc85987))
+- default unknown severities to info ([#963](https://github.com/promptfoo/modelaudit/issues/963)) ([9b27b9a](https://github.com/promptfoo/modelaudit/commit/9b27b9ac672009a77a413aeea1fea350f6df145c))
+- **deps:** update dependency tensorflow to &gt;=2.21,&lt;2.22 ([#985](https://github.com/promptfoo/modelaudit/issues/985)) ([2e3ac65](https://github.com/promptfoo/modelaudit/commit/2e3ac651e2bb0b83d87d070c00894eeddcf0091d))
+- **detectors:** redact network urls in findings ([7e28a46](https://github.com/promptfoo/modelaudit/commit/7e28a46c6de3f5646d42b14fd76061fdfeaf114e))
+- **dvc:** restrict target paths ([3bd9b68](https://github.com/promptfoo/modelaudit/commit/3bd9b685a3e3bb5de87d3775a9704deb7f4a253b))
+- flag pickle persistent ids ([#938](https://github.com/promptfoo/modelaudit/issues/938)) ([2cfba40](https://github.com/promptfoo/modelaudit/commit/2cfba403e21d53f46ba7089b655cebc564dcddaf))
+- **gguf:** detect tensor bounds overflow ([a4358ff](https://github.com/promptfoo/modelaudit/commit/a4358ffe0e3b8a8d8729b8bcf23a8f00f205a5e1))
+- honor header-routed scanners ([#941](https://github.com/promptfoo/modelaudit/issues/941)) ([6740260](https://github.com/promptfoo/modelaudit/commit/6740260c36331156eb6f7fc491d58f5b570dbee4))
+- **huggingface:** redact source urls ([73b538e](https://github.com/promptfoo/modelaudit/commit/73b538e21ccf23c5ef452b16153c1e6e2b8e6663))
+- ignore pmml documentation urls ([506aa75](https://github.com/promptfoo/modelaudit/commit/506aa7510a820e4c01018231cb52be4f5964334f))
+- **jfrog:** redact url secrets ([4546eee](https://github.com/promptfoo/modelaudit/commit/4546eeeadad7a8fadd31e21cf550a44688f0d076))
+- **keras:** redact archive urls ([e532b0d](https://github.com/promptfoo/modelaudit/commit/e532b0dd67d2f7033c29644356efe8a220060441))
+- **lightgbm:** redact finding urls ([d4f1fe2](https://github.com/promptfoo/modelaudit/commit/d4f1fe2a61e51166bf48c74861ff7cb31f55a69c))
+- **manifest:** redact url secrets ([c831733](https://github.com/promptfoo/modelaudit/commit/c83173316cf98d9f19b0a8481a40b848077d0096))
+- mark missing numpy format as operational ([#958](https://github.com/promptfoo/modelaudit/issues/958)) ([6d271d6](https://github.com/promptfoo/modelaudit/commit/6d271d6eb4e3faf38bf03ae3db76ce9d369ce4af))
+- mark pickle parse failures inconclusive ([8a0e3fd](https://github.com/promptfoo/modelaudit/commit/8a0e3fd125ec6e4d49f72ab68d43d1c6544d3ae0))
+- **metadata:** redact suspicious urls ([7af0d4d](https://github.com/promptfoo/modelaudit/commit/7af0d4d1dbe8a6c6d87870f3a0b5989c91bb35d1))
+- **metadata:** reject symlink escapes ([3869cf0](https://github.com/promptfoo/modelaudit/commit/3869cf0492fa1db7418269c8263b42f65a130a07))
+- narrow flax suspicious key criticals ([#957](https://github.com/promptfoo/modelaudit/issues/957)) ([9276d24](https://github.com/promptfoo/modelaudit/commit/9276d2472c18cda02a559c1f451fa65c91bdbcf1))
+- narrow network c2 metadata patterns ([fd9cc41](https://github.com/promptfoo/modelaudit/commit/fd9cc410440568cbb1ef0c17fea03499c16441e9))
+- narrow openvino external library checks ([#959](https://github.com/promptfoo/modelaudit/issues/959)) ([e895872](https://github.com/promptfoo/modelaudit/commit/e895872612c15bfd016f9a9e1fb58262ff4ee1eb))
+- narrow safetensors path metadata checks ([#955](https://github.com/promptfoo/modelaudit/issues/955)) ([4241780](https://github.com/promptfoo/modelaudit/commit/42417800670c4fb49d8bf2ea9b46aec702550485))
+- narrow suspicious dunder string detection ([#947](https://github.com/promptfoo/modelaudit/issues/947)) ([e866760](https://github.com/promptfoo/modelaudit/commit/e8667609d293d4391205ce4e8884fa3559030604))
+- **nemo:** scan referenced non-checkpoint suffixes ([3ba4ff7](https://github.com/promptfoo/modelaudit/commit/3ba4ff76399987dbcaf7b56c1a23f0d0a3c0a205))
+- **openvino:** flag sidecar symlink escapes ([772e796](https://github.com/promptfoo/modelaudit/commit/772e796c73b1b05172225af27a6dabf6c5254aae))
+- **openvino:** redact library urls ([241a667](https://github.com/promptfoo/modelaudit/commit/241a667dd658f1e0a827a05d3ddef5d13717f357))
+- preserve informational network findings ([b39d312](https://github.com/promptfoo/modelaudit/commit/b39d3124bf0b8578ae79919c726a28d7731261a4))
+- reduce benign Keras Lambda bytecode noise ([8cb5c29](https://github.com/promptfoo/modelaudit/commit/8cb5c29308673f52e9a9f2b7186cdd37c9657214))
+- require nested pickle execution evidence ([d2ad631](https://github.com/promptfoo/modelaudit/commit/d2ad6314f4df70ae03064f78ef37ddd6c8de8f53))
+- route nested compressed archive members ([e217b29](https://github.com/promptfoo/modelaudit/commit/e217b2982609a1888450c3d4ae9bd29726e187d4))
+- route nested compressed members ([#944](https://github.com/promptfoo/modelaudit/issues/944)) ([d839fe7](https://github.com/promptfoo/modelaudit/commit/d839fe734ccdabb62401970f4b652048156707ec))
+- **r:** redact serialized urls ([013bcf0](https://github.com/promptfoo/modelaudit/commit/013bcf0056b63f850ff569062ca3f6c64cfdbd9a))
+- **scanners:** redact evidence secrets ([3ae1383](https://github.com/promptfoo/modelaudit/commit/3ae13834844cd1cffc3975379e3ab8550309dc83))
+- skip prose-only network references ([773eb88](https://github.com/promptfoo/modelaudit/commit/773eb881187ef3b6601c9650e5bd4c8c17ec939c))
+- skip protocol-only streaming pickle warning ([#961](https://github.com/promptfoo/modelaudit/issues/961)) ([dba3ebe](https://github.com/promptfoo/modelaudit/commit/dba3ebec5c19ea86b1e40012ff0ffce8d81af451))
+- tighten pytorch zip pickle discovery ([#953](https://github.com/promptfoo/modelaudit/issues/953)) ([bfd9663](https://github.com/promptfoo/modelaudit/commit/bfd9663f68e30213fa8bb76016815dfbfdbdd968))
+- **torchserve:** redact manifest urls ([4626a02](https://github.com/promptfoo/modelaudit/commit/4626a02450b5436cc994329662b5e1623d2d6b00))
+
+### Documentation
+
+- add scanner CVE coverage notes ([73d6e8e](https://github.com/promptfoo/modelaudit/commit/73d6e8e512f0d86c7307df69a5663e3223724196))
+- allow promptfoo telemetry approval ([1fbe64c](https://github.com/promptfoo/modelaudit/commit/1fbe64cbe071579ebbb8064980cd05cf27133f2c))
+
+## [0.2.36](https://github.com/promptfoo/modelaudit/compare/v0.2.35...v0.2.36) (2026-04-11)
+
+### Documentation
+
+- disable telemetry during agent validation ([#928](https://github.com/promptfoo/modelaudit/issues/928)) ([69a1986](https://github.com/promptfoo/modelaudit/commit/69a1986aa2a63ab07e63871507e96bf857c1c882))
+
+## [0.2.35](https://github.com/promptfoo/modelaudit/compare/v0.2.34...v0.2.35) (2026-04-11)
+
+### Bug Fixes
+
+- clean up oversized zip entry temps ([#911](https://github.com/promptfoo/modelaudit/issues/911)) ([66b4871](https://github.com/promptfoo/modelaudit/commit/66b4871f49e367dea545f36af85c9cc75303d615))
+- flag Paddle code patterns as warnings ([#925](https://github.com/promptfoo/modelaudit/issues/925)) ([32fa0b7](https://github.com/promptfoo/modelaudit/commit/32fa0b7551c13059515c464b0118851fa1fbe671))
+- harden manifest parse boundaries ([#922](https://github.com/promptfoo/modelaudit/issues/922)) ([6f5b516](https://github.com/promptfoo/modelaudit/commit/6f5b516bec8492b2f062ba5ea10498c705d972ca))
+- harden standalone pickle scanner ([#901](https://github.com/promptfoo/modelaudit/issues/901)) ([31f7dd3](https://github.com/promptfoo/modelaudit/commit/31f7dd38c6bd77631ccdca90438312c4db2ac857))
+- mark corrupt NumPy object payloads inconclusive ([#912](https://github.com/promptfoo/modelaudit/issues/912)) ([ecba19d](https://github.com/promptfoo/modelaudit/commit/ecba19dc585d5bfbfbfbd687e81cd734a7b0103b))
+- mark incomplete MXNet scans inconclusive ([#923](https://github.com/promptfoo/modelaudit/issues/923)) ([a928ed7](https://github.com/promptfoo/modelaudit/commit/a928ed723a220185c3c0ea4b046b8885c74e8f62))
+- mark incomplete sharded scans inconclusive ([#909](https://github.com/promptfoo/modelaudit/issues/909)) ([510d0fb](https://github.com/promptfoo/modelaudit/commit/510d0fbe45ae9f1b7e213227ebb1210b15a35991))
+- mark malformed GGUF scans inconclusive ([#914](https://github.com/promptfoo/modelaudit/issues/914)) ([9b3e216](https://github.com/promptfoo/modelaudit/commit/9b3e21607309b846b15f809af6fd1bef31268b6a))
+- mark malformed Keras H5 configs inconclusive ([#917](https://github.com/promptfoo/modelaudit/issues/917)) ([23671c3](https://github.com/promptfoo/modelaudit/commit/23671c38796293978b0538eb4c7ce30c8cfa5160))
+- mark malformed Keras ZIP configs inconclusive ([#918](https://github.com/promptfoo/modelaudit/issues/918)) ([d4ad8d8](https://github.com/promptfoo/modelaudit/commit/d4ad8d8717c4f1ca647b292035f68bbf570d9904))
+- mark malformed SafeTensors scans inconclusive ([#913](https://github.com/promptfoo/modelaudit/issues/913)) ([43913d6](https://github.com/promptfoo/modelaudit/commit/43913d65c5eb89014d1bb137768f89e93b8d0d41))
+- mark malformed tflite scans inconclusive ([#916](https://github.com/promptfoo/modelaudit/issues/916)) ([07c871a](https://github.com/promptfoo/modelaudit/commit/07c871a8d19e9181bdcd568fffa9a165883585de))
+- mark partial archive scans inconclusive ([#907](https://github.com/promptfoo/modelaudit/issues/907)) ([c8eb918](https://github.com/promptfoo/modelaudit/commit/c8eb918b8d0a717460be93097cfc1cf0a47e6689))
+- mark partial streaming scans inconclusive ([#908](https://github.com/promptfoo/modelaudit/issues/908)) ([3d47a10](https://github.com/promptfoo/modelaudit/commit/3d47a1055d09c20995c21ebe75a50a2c3d1105f0))
+- mark unknown ONNX tensor dtypes inconclusive ([#915](https://github.com/promptfoo/modelaudit/issues/915)) ([35661b6](https://github.com/promptfoo/modelaudit/commit/35661b6ac166f38f7642ac9a3ea89b6cea538928))
+- preserve picklescan stack state ([#910](https://github.com/promptfoo/modelaudit/issues/910)) ([fabac5c](https://github.com/promptfoo/modelaudit/commit/fabac5c9ead49c2ed5f8357dfa53ccdcce946527))
+- recover malformed Jinja template configs ([#920](https://github.com/promptfoo/modelaudit/issues/920)) ([d619c8f](https://github.com/promptfoo/modelaudit/commit/d619c8f185040c7b3c772a4b94631edddde9d8a8))
+- route corrupt catboost scans fail closed ([#924](https://github.com/promptfoo/modelaudit/issues/924)) ([052bb5f](https://github.com/promptfoo/modelaudit/commit/052bb5f4e6dbc5e48a3fe5d134e0ec8d9605e292))
+- traverse nemo yaml list configs ([#919](https://github.com/promptfoo/modelaudit/issues/919)) ([0d8d4fd](https://github.com/promptfoo/modelaudit/commit/0d8d4fd4dc2ef774db093fb9e7daf27c32b5a0a8))
+- **zip:** fail closed on MAR handler parse errors ([#896](https://github.com/promptfoo/modelaudit/issues/896)) ([a06a620](https://github.com/promptfoo/modelaudit/commit/a06a620f011d120072b1e8619e543a7306d5a4fc))
+
+### Documentation
+
+- improve scanner correctness documentation ([#921](https://github.com/promptfoo/modelaudit/issues/921)) ([06be0b6](https://github.com/promptfoo/modelaudit/commit/06be0b6eaeb53f5f238612a386665c45f3c27dc2))
+
+## [0.2.34](https://github.com/promptfoo/modelaudit/compare/v0.2.33...v0.2.34) (2026-04-10)
+
+### Bug Fixes
+
+- flag Paddle code patterns as warnings instead of failing benign scans
+- route corrupt CatBoost scans to fail closed outcomes
+- mark incomplete MXNet scans inconclusive instead of clean
+- harden manifest parse boundaries around malformed metadata
+- recover malformed Jinja template configs as inconclusive scan outcomes
+- traverse NeMo YAML list configs when checking suspicious targets
+- mark malformed Keras ZIP configs inconclusive instead of clean
+- mark malformed Keras H5 scans inconclusive instead of clean
+- mark malformed TFLite scans inconclusive instead of clean
+- mark malformed GGUF scans inconclusive instead of clean
+- mark malformed SafeTensors scans inconclusive instead of clean
+- preserve picklescan stack state across reused scanner runs
+- mark partial streaming scans inconclusive when large-file streaming coverage is incomplete
+- harden native code detection in model scanners ([#897](https://github.com/promptfoo/modelaudit/issues/897)) ([f4f661a](https://github.com/promptfoo/modelaudit/commit/f4f661a09be0032e15aa8895864413e3878233f8))
+
+## [0.2.33](https://github.com/promptfoo/modelaudit/compare/v0.2.32...v0.2.33) (2026-04-09)
+
+### Features
+
+- extract standalone pickle scanner package with parity harness ([#832](https://github.com/promptfoo/modelaudit/issues/832)) ([e2986cd](https://github.com/promptfoo/modelaudit/commit/e2986cddaa592306cc10541865f011b3dc99a0ba))
+
+### Bug Fixes
+
+- harden helper routing for zip-backed pickle checkpoints ([#870](https://github.com/promptfoo/modelaudit/issues/870)) ([3ebe0c0](https://github.com/promptfoo/modelaudit/commit/3ebe0c04f02f51274b9c9588200212ad2cffe70b))
+- make return paths explicit ([#884](https://github.com/promptfoo/modelaudit/issues/884)) ([e31c254](https://github.com/promptfoo/modelaudit/commit/e31c254b820c78278289cf06acdf17f3f81d49b2))
+- skip extraction for suspicious ZIP entries ([358aa44](https://github.com/promptfoo/modelaudit/commit/358aa4498ce9d6a091340c6f23289523f98f3a55))
+
+### Documentation
+
+- clarify detection bypass severity policy ([d8117a1](https://github.com/promptfoo/modelaudit/commit/d8117a14b4f8ef3e1a93cb1d48eeba8d8af92677))
+
+## [0.2.32](https://github.com/promptfoo/modelaudit/compare/v0.2.31...v0.2.32) (2026-04-05)
+
+### Bug Fixes
+
+- detect punctuated TensorRT tmp paths ([#867](https://github.com/promptfoo/modelaudit/issues/867)) ([9607530](https://github.com/promptfoo/modelaudit/commit/96075302de2d71b228be97e49698d6a1ad6b35bf))
+- fail closed on OpenVINO DOCTYPE parse errors ([#864](https://github.com/promptfoo/modelaudit/issues/864)) ([f5b19c4](https://github.com/promptfoo/modelaudit/commit/f5b19c48c7eab876e29f1f474c555b902fa9b6ce))
+- ignore OCI metadata URLs during layer discovery ([#866](https://github.com/promptfoo/modelaudit/issues/866)) ([0b24e3f](https://github.com/promptfoo/modelaudit/commit/0b24e3f7a0e013541bce100b64f1d69558bd807d))
+- reduce PMML subprocess extension false positives ([#869](https://github.com/promptfoo/modelaudit/issues/869)) ([5e6f79d](https://github.com/promptfoo/modelaudit/commit/5e6f79dc134267202b5a4b841a8946af865ebd15))
+- tolerate bounded CoreML custom block truncation ([#868](https://github.com/promptfoo/modelaudit/issues/868)) ([34df06d](https://github.com/promptfoo/modelaudit/commit/34df06dd2c12b69815a2a15f1273085856bebf64))
+
+## [0.2.31](https://github.com/promptfoo/modelaudit/compare/v0.2.30...v0.2.31) (2026-04-04)
+
+### Bug Fixes
+
+- clean up CodeQL quality findings ([#862](https://github.com/promptfoo/modelaudit/issues/862)) ([5fbcb10](https://github.com/promptfoo/modelaudit/commit/5fbcb101322791831fbf6159bab454231a7f01f0))
+- detect long-gap protocol-0 pickle tails ([#844](https://github.com/promptfoo/modelaudit/issues/844)) ([cbc24b2](https://github.com/promptfoo/modelaudit/commit/cbc24b2af187055622b3776b3e49cca0c43ce9b7))
+- detect protocol 0/1 pickles with trailing junk ([#827](https://github.com/promptfoo/modelaudit/issues/827)) ([d07869d](https://github.com/promptfoo/modelaudit/commit/d07869dadc80de567db894dd8ceda9de53038a71))
+- fail closed on conflicting Keras ZIP config aliases ([#847](https://github.com/promptfoo/modelaudit/issues/847)) ([ab426b8](https://github.com/promptfoo/modelaudit/commit/ab426b8230b1766b4a7678803c90c45256bcdf54))
+- harden content-routed .keras ZIP recursive scans ([#828](https://github.com/promptfoo/modelaudit/issues/828)) ([a607df7](https://github.com/promptfoo/modelaudit/commit/a607df7e8f94623c7802ef3af90896e1b4c564cc))
+- harden CoreML scanner ([#859](https://github.com/promptfoo/modelaudit/issues/859)) ([50da953](https://github.com/promptfoo/modelaudit/commit/50da95393c6b0be318cb33535e12d16a361663ac))
+- harden Flax msgpack stream scanning ([#842](https://github.com/promptfoo/modelaudit/issues/842)) ([34e4595](https://github.com/promptfoo/modelaudit/commit/34e4595b2017f272c951a45c6f89a0fa8997f8d5))
+- harden JAX checkpoint scanner heuristics ([#837](https://github.com/promptfoo/modelaudit/issues/837)) ([1042c20](https://github.com/promptfoo/modelaudit/commit/1042c20c48ce09613125967623c715babc7b9da8))
+- harden Joblib raw/compressed pickle analysis ([#841](https://github.com/promptfoo/modelaudit/issues/841)) ([9d16470](https://github.com/promptfoo/modelaudit/commit/9d164701345aebef8ad03421ac66cbcca6c61aed))
+- harden Keras H5 scanner ([#848](https://github.com/promptfoo/modelaudit/issues/848)) ([aa0ef28](https://github.com/promptfoo/modelaudit/commit/aa0ef2878593e639a5b868a4be2d5de7a6c9c23b))
+- harden MAR duplicate-member analysis ([#830](https://github.com/promptfoo/modelaudit/issues/830)) ([8d4e056](https://github.com/promptfoo/modelaudit/commit/8d4e0567f1df15405f429cefe3cd894aada3b712))
+- harden NeMo target checks and YAML bounds ([#839](https://github.com/promptfoo/modelaudit/issues/839)) ([63ff67d](https://github.com/promptfoo/modelaudit/commit/63ff67d45aa7d454e63781c71039839c35e74892))
+- harden OCI layer scanner ([#856](https://github.com/promptfoo/modelaudit/issues/856)) ([637a4da](https://github.com/promptfoo/modelaudit/commit/637a4daa72047c15598660320f2f12de6a43e627))
+- harden ONNX scanner ([#857](https://github.com/promptfoo/modelaudit/issues/857)) ([de304a7](https://github.com/promptfoo/modelaudit/commit/de304a77513abf551e96a1828f57fdfdd11150c2))
+- harden OpenVINO scanner ([#852](https://github.com/promptfoo/modelaudit/issues/852)) ([a97b76e](https://github.com/promptfoo/modelaudit/commit/a97b76efc44940d70b6cc0f485485d5c5ff7b550))
+- harden PMML scanner ([#860](https://github.com/promptfoo/modelaudit/issues/860)) ([cbcd88a](https://github.com/promptfoo/modelaudit/commit/cbcd88a91cc8b3f9986554b255be366fcae672a8))
+- harden post-budget pickle tail scan bounds ([16d6db3](https://github.com/promptfoo/modelaudit/commit/16d6db39a6263bc923415d34f7501765550e3564))
+- harden PyTorch binary chunk scanning ([#846](https://github.com/promptfoo/modelaudit/issues/846)) ([930c0bf](https://github.com/promptfoo/modelaudit/commit/930c0bf32b53fbc32252c1b2d98aa1f30716eece))
+- harden SevenZip scanner ([#855](https://github.com/promptfoo/modelaudit/issues/855)) ([8d0c362](https://github.com/promptfoo/modelaudit/commit/8d0c362770f4261eefd7461309e7de09b923587d))
+- harden skops archive routing, recursion, and scanner reporting ([#829](https://github.com/promptfoo/modelaudit/issues/829)) ([fb13f68](https://github.com/promptfoo/modelaudit/commit/fb13f6880fdf80e2e78f5f3f30d9b31c2cff17a3))
+- harden Skops CVE status and card fallback detection ([#843](https://github.com/promptfoo/modelaudit/issues/843)) ([9dd964f](https://github.com/promptfoo/modelaudit/commit/9dd964f0aff86092178578f5b952418a6ec52200))
+- harden TAR scanner ([#854](https://github.com/promptfoo/modelaudit/issues/854)) ([219ce54](https://github.com/promptfoo/modelaudit/commit/219ce54446385e87739beacb2b9a8629cde31abb))
+- harden TensorFlow MetaGraph scanner ([#850](https://github.com/promptfoo/modelaudit/issues/850)) ([2dacc9d](https://github.com/promptfoo/modelaudit/commit/2dacc9dcf844ff8ecd335ad1604519b07fc95432))
+- harden TensorFlow SavedModel scanner ([#849](https://github.com/promptfoo/modelaudit/issues/849)) ([f42b7f2](https://github.com/promptfoo/modelaudit/commit/f42b7f2aa560ff72f495a330870478f9028d4fc3))
+- harden TensorRT scanner ([#858](https://github.com/promptfoo/modelaudit/issues/858)) ([c923b55](https://github.com/promptfoo/modelaudit/commit/c923b55df6e8101f40728cbad254d708eea515c5))
+- harden TFLite scanner ([#851](https://github.com/promptfoo/modelaudit/issues/851)) ([b1b1060](https://github.com/promptfoo/modelaudit/commit/b1b1060ae746047becec36356c6a3d3c8227c723))
+- harden TorchServe MAR handler and manifest analysis ([#840](https://github.com/promptfoo/modelaudit/issues/840)) ([6fc0437](https://github.com/promptfoo/modelaudit/commit/6fc04375fd4709869766418e1873231623458e59))
+- harden ZIP scanner ([#853](https://github.com/promptfoo/modelaudit/issues/853)) ([4ccec1a](https://github.com/promptfoo/modelaudit/commit/4ccec1afcd66b2bac3c75f6bd635f34b446090ea))
+- reject raw trailers in zlib wrappers ([#838](https://github.com/promptfoo/modelaudit/issues/838)) ([3b15e2e](https://github.com/promptfoo/modelaudit/commit/3b15e2e1d148d1c700c6d5300655b5e4bb388d70))
+- scan duplicate PyTorch ZIP members ([#845](https://github.com/promptfoo/modelaudit/issues/845)) ([4f63b22](https://github.com/promptfoo/modelaudit/commit/4f63b2277b8d843411d833d00bcf33615b8fb17b))
+
+### Documentation
+
+- remove Claude-specific commit trailer ([#834](https://github.com/promptfoo/modelaudit/issues/834)) ([d891025](https://github.com/promptfoo/modelaudit/commit/d891025791128245f293057f4849b481806292c7))
+- simplify CLAUDE shim ([#835](https://github.com/promptfoo/modelaudit/issues/835)) ([616ee31](https://github.com/promptfoo/modelaudit/commit/616ee318019e188f90ee1d41b2a2aaaee9c9444e))
+
+## [0.2.30](https://github.com/promptfoo/modelaudit/compare/v0.2.29...v0.2.30) (2026-03-30)
+
+### Bug Fixes
+
+- always run binary fallback for parse-failed .bin files ([#814](https://github.com/promptfoo/modelaudit/issues/814)) ([f5f3c90](https://github.com/promptfoo/modelaudit/commit/f5f3c904855bbd0c305690196826453d54502983))
+- harden nested pickle detection against padded payloads ([#812](https://github.com/promptfoo/modelaudit/issues/812)) ([c15f53e](https://github.com/promptfoo/modelaudit/commit/c15f53eb8960e2328440b5c300c435d5a53d42d1))
+- mark incomplete pickle scans as inconclusive ([#810](https://github.com/promptfoo/modelaudit/issues/810)) ([ade9296](https://github.com/promptfoo/modelaudit/commit/ade9296b6f1c41e8bae1ac6bdbd2fd83d6234c9a))
+- normalize archive locations and route .skops ZIPs ([#805](https://github.com/promptfoo/modelaudit/issues/805)) ([f7c8277](https://github.com/promptfoo/modelaudit/commit/f7c8277adaf505655b5414aa1cda4d79a906c955))
+- preserve fail-closed pickle fallback semantics ([#817](https://github.com/promptfoo/modelaudit/issues/817)) ([e8a6db7](https://github.com/promptfoo/modelaudit/commit/e8a6db7275aba944666bd668f6ae8e782618bb0f))
+- restore post-budget pickle opcode parity ([#811](https://github.com/promptfoo/modelaudit/issues/811)) ([d321309](https://github.com/promptfoo/modelaudit/commit/d32130943ba931eef7b8f85804bde4762410bf39))
+- use symbolic STACK_GLOBAL refs for pickle ML context ([#813](https://github.com/promptfoo/modelaudit/issues/813)) ([eb48c52](https://github.com/promptfoo/modelaudit/commit/eb48c52ee7522bccaf1da0d1f274ce3f33f1cb23))
+- **utils:** recurse into cloud directories with size metadata ([#819](https://github.com/promptfoo/modelaudit/issues/819)) ([2d9852d](https://github.com/promptfoo/modelaudit/commit/2d9852deaaab4f6002404c197fd22231a9c9e69d))
+
+## [0.2.29](https://github.com/promptfoo/modelaudit/compare/v0.2.28...v0.2.29) (2026-03-29)
+
+### Features
+
+- **cli:** add --no-whitelist and --strict flags for CI pipelines ([636b813](https://github.com/promptfoo/modelaudit/commit/636b813b607cec13af5bdb8fecc1ba2461828938))
+- detect pickle expansion attack heuristics ([8e074fd](https://github.com/promptfoo/modelaudit/commit/8e074fda38280716bd6c09aba718b63486d357e2))
+- **whitelist:** warn when HuggingFace whitelist snapshot is stale ([5a60871](https://github.com/promptfoo/modelaudit/commit/5a60871c21c9df18d26674c2c46222fbb98d318f))
+
+### Bug Fixes
+
+- add guarded CRC fallback for PyTorch ZIP scanning ([5db1e71](https://github.com/promptfoo/modelaudit/commit/5db1e71927d97c8c6c3b3ed41ec5d404fc41e2a3))
+- **cache:** harden invalidation and skip operational failures ([6492598](https://github.com/promptfoo/modelaudit/commit/649259821adcbd30c9c1cf40722d0ac591223a2d))
+- **cli:** propagate cache settings to registry downloads ([d6cf508](https://github.com/promptfoo/modelaudit/commit/d6cf508d7f5046757beb590273996dee70ea1365))
+- **core:** count stream scans in files_scanned ([#749](https://github.com/promptfoo/modelaudit/issues/749)) ([50326bb](https://github.com/promptfoo/modelaudit/commit/50326bbada68a6dacbc82e0f0e8929156fcebfa1))
+- **core:** route misnamed archives by trusted file structure ([cad90c3](https://github.com/promptfoo/modelaudit/commit/cad90c3fb2ebbfacee5c1113eefb71c89f8c04a6))
+- **deps:** include py7zr in all extras ([#759](https://github.com/promptfoo/modelaudit/issues/759)) ([16cfae1](https://github.com/promptfoo/modelaudit/commit/16cfae1d805e7eaae082f743f5f69bfb2d32775b))
+- **detection:** tighten safetensors magic detection to prevent misrouting ([109bca2](https://github.com/promptfoo/modelaudit/commit/109bca24440898bb954ae66eac5c054eca705afc))
+- fail closed on pickle unknown opcode parse errors ([#747](https://github.com/promptfoo/modelaudit/issues/747)) ([a63979a](https://github.com/promptfoo/modelaudit/commit/a63979a70c63b22d8cd6993fd4e6f155d139a03c))
+- **filtering:** preserve disguised model files during directory scans ([27058f5](https://github.com/promptfoo/modelaudit/commit/27058f5fd35ca2d1ec665385236ed27b06cc6b54))
+- generate release sbom from uv lock ([#733](https://github.com/promptfoo/modelaudit/issues/733)) ([a1019a8](https://github.com/promptfoo/modelaudit/commit/a1019a8ac79652f9395e29c15e06d39cd9b18e07))
+- harden pickle setitem target detection ([#756](https://github.com/promptfoo/modelaudit/issues/756)) ([877669c](https://github.com/promptfoo/modelaudit/commit/877669cf5a3c036abfc5f730200324ec3d0d9fdd))
+- **huggingface:** fail closed on listing errors and timeouts ([f22ebbe](https://github.com/promptfoo/modelaudit/commit/f22ebbe894b80fb6f6d680d86a908b6509f48fad))
+- **jfrog:** fail closed on partial folder downloads ([14e2ddd](https://github.com/promptfoo/modelaudit/commit/14e2ddd02fe19f74efc0ca5c3269da26c514e7d1))
+- keep json stdout clean for skipped files ([#768](https://github.com/promptfoo/modelaudit/issues/768)) ([0857b98](https://github.com/promptfoo/modelaudit/commit/0857b98da7c331d45579777e2e0d1f45a7a9bec2))
+- **keras-zip:** harden documentation padding bypass for CVE-2025-9906 ([6e73043](https://github.com/promptfoo/modelaudit/commit/6e73043cb5b0c5b346c14be92049010ca345f4dc))
+- **keras:** anchor safe Lambda pattern regexes to prevent code injection bypass ([73fa571](https://github.com/promptfoo/modelaudit/commit/73fa571a172129602bf8637ef1ba601eb3de22d8))
+- **keras:** prevent spoofed built-in registered_name from hiding non-allowlisted modules ([#736](https://github.com/promptfoo/modelaudit/issues/736)) ([6d8350e](https://github.com/promptfoo/modelaudit/commit/6d8350e1a9583c0d53931a6a465e6f8b9dea1d44))
+- **large-files:** fail closed without bounded scanner coverage ([a2317eb](https://github.com/promptfoo/modelaudit/commit/a2317eb1ab98c16a29eb689282c32c61fbcafed0))
+- make pickle operational errors explicit ([2d75778](https://github.com/promptfoo/modelaudit/commit/2d75778ba0f39601bae8adf18d7a8e3f5f79b345))
+- **manifest:** trust regional S3 manifest URLs ([#763](https://github.com/promptfoo/modelaudit/issues/763)) ([f43af54](https://github.com/promptfoo/modelaudit/commit/f43af548a88c953a4c753b74bdad08d199a7fc5f))
+- **mar:** analyze all Python files in TorchServe MAR archives ([dd2cf32](https://github.com/promptfoo/modelaudit/commit/dd2cf3220c42ecc1ea487c3e38c627d43633006a))
+- **mar:** analyze requirements.txt for supply chain attacks ([5365583](https://github.com/promptfoo/modelaudit/commit/536558314b090fc9d7d58db027e6ef9361743ab7))
+- **metadata:** harden metadata scanner userinfo URLs ([#767](https://github.com/promptfoo/modelaudit/issues/767)) ([07bf5a5](https://github.com/promptfoo/modelaudit/commit/07bf5a5d9906edd9d7bef9901e38a9812e2385e3))
+- normalize streamed source path reporting ([#765](https://github.com/promptfoo/modelaudit/issues/765)) ([09431e0](https://github.com/promptfoo/modelaudit/commit/09431e0fb6aace491587b0fd221ee7e456b2f095))
+- **onnx:** add ai.onnx.ml to standard domain allowlist ([c94f804](https://github.com/promptfoo/modelaudit/commit/c94f804c3d889fde1f20224d1e178dd580228f96))
+- **pickle:** add budget-independent global/import byte scanner for large files ([512dd18](https://github.com/promptfoo/modelaudit/commit/512dd18ae43d0306c0f59b115af477ced262a74a))
+- **pickle:** add catch-all for unhandled opcodes in stack simulator ([445b204](https://github.com/promptfoo/modelaudit/commit/445b204e98564267312ced85ea5f620d7f78dfd4))
+- **pickle:** allow uppercase module segments in import checks ([#757](https://github.com/promptfoo/modelaudit/issues/757)) ([c1aeb55](https://github.com/promptfoo/modelaudit/commit/c1aeb55eec9adc67e29ac66973f78ab9b6eddc38))
+- **pickle:** detect nested pickle BINBYTES8 and BYTEARRAY8 payloads ([#754](https://github.com/promptfoo/modelaudit/issues/754)) ([814c7f2](https://github.com/promptfoo/modelaudit/commit/814c7f2216556e687f256dbbddcd7ac77c11d011))
+- **pickle:** harden blocklist — copyreg, \_pickle.Unpickler, functools.reduce ([fe04d9a](https://github.com/promptfoo/modelaudit/commit/fe04d9a077beb3b2659944e30e464103cb831701))
+- **pickle:** surface large-file raw pattern coverage limits ([#769](https://github.com/promptfoo/modelaudit/issues/769)) ([d9904f2](https://github.com/promptfoo/modelaudit/commit/d9904f2551158b88ec80251d98553e64d82b627c))
+- **pickle:** track BUILD opcode **setstate** exploitation ([7e8c370](https://github.com/promptfoo/modelaudit/commit/7e8c370df527c4b204f7357c375b2b1704fafa4a))
+- **pickle:** treat scan timeouts as unsuccessful without regressing tail scans ([075adcd](https://github.com/promptfoo/modelaudit/commit/075adcd0d13058b66d784b3f6a55ebc8424bb014))
+- preserve exit code 1 for zero-file findings ([#764](https://github.com/promptfoo/modelaudit/issues/764)) ([34d25e7](https://github.com/promptfoo/modelaudit/commit/34d25e7952c893b5aa688583511bcb8dd87a9f5a))
+- preserve scanner execution for chunked large files ([#745](https://github.com/promptfoo/modelaudit/issues/745)) ([8d93f1d](https://github.com/promptfoo/modelaudit/commit/8d93f1d85c2c13fffc93a71629a5fc718468c1cc))
+- preserve validated PE detections in pickle scans ([#746](https://github.com/promptfoo/modelaudit/issues/746)) ([017202c](https://github.com/promptfoo/modelaudit/commit/017202cc74839fc9007e7a11576a71fc63a06d98))
+- prevent ExecuTorch polyglot ZIP bypass ([#743](https://github.com/promptfoo/modelaudit/issues/743)) ([e06d0e8](https://github.com/promptfoo/modelaudit/commit/e06d0e84ecd2ae878b2e78043f492ce3b2f40a67))
+- route zip-backed pytorch containers in pickle scanner ([0390a00](https://github.com/promptfoo/modelaudit/commit/0390a00534867849d4b842a0c457c756a23e1289))
+- **routing:** complete format_to_scanner primary routing map ([de69f71](https://github.com/promptfoo/modelaudit/commit/de69f71d891f9bddcc322e4c02e9b663559879cf))
+- **safetensors:** add missing BF16/BOOL/FP8 dtypes for size validation ([f2f2574](https://github.com/promptfoo/modelaudit/commit/f2f257489cce06ad87277e3344200e1dd3f41150))
+- **safetensors:** apply MAX_HEADER_BYTES limit in scan() to prevent DoS ([7a847a7](https://github.com/promptfoo/modelaudit/commit/7a847a7a309f41f1bf49feb7b6ce6fdb8ac2468c))
+- **savedmodel:** scan assets/ directory for executable content ([04d2a0c](https://github.com/promptfoo/modelaudit/commit/04d2a0c358d297316664ce290fa612be0535d9ab))
+- scan padded follow-on pickle streams ([#755](https://github.com/promptfoo/modelaudit/issues/755)) ([8727d03](https://github.com/promptfoo/modelaudit/commit/8727d03204bf903158164d2fa430c8c36e36015c))
+- **security:** block streamed symlink traversal outside scan roots ([#751](https://github.com/promptfoo/modelaudit/issues/751)) ([aee6656](https://github.com/promptfoo/modelaudit/commit/aee66568021ca205372de27ef2ecfcae4929d070))
+- **security:** bound embedded .keras weight extraction to prevent zip-bomb DoS ([#737](https://github.com/promptfoo/modelaudit/issues/737)) ([1cc0e46](https://github.com/promptfoo/modelaudit/commit/1cc0e4624b80766ec127c55f960405ab58a59cb6))
+- **security:** bound MAR fallback python handler reads ([#735](https://github.com/promptfoo/modelaudit/issues/735)) ([88e42b9](https://github.com/promptfoo/modelaudit/commit/88e42b97b4ab30b07c87f3ac04978b5445aead9a))
+- **security:** harden manifest URL trust checks and timeout handling ([#760](https://github.com/promptfoo/modelaudit/issues/760)) ([9ccc5f3](https://github.com/promptfoo/modelaudit/commit/9ccc5f36793b756b4a314c69adb33d939123232e))
+- **security:** preserve scannable artifacts in directory filtering ([#758](https://github.com/promptfoo/modelaudit/issues/758)) ([7666930](https://github.com/promptfoo/modelaudit/commit/7666930fcdf357fcd9d8c905becd7985a1b4655f))
+- **security:** preserve shared depth across nested archive types ([#753](https://github.com/promptfoo/modelaudit/issues/753)) ([607b506](https://github.com/promptfoo/modelaudit/commit/607b5060422a9848ebdea11c6e239a932c532a23))
+- **security:** recurse into extensionless nested ZIP members ([#752](https://github.com/promptfoo/modelaudit/issues/752)) ([a2dfea9](https://github.com/promptfoo/modelaudit/commit/a2dfea9b5dd24994c8624c9db865db219f1587f4))
+- **security:** recurse into nested sevenzip archives by content ([#761](https://github.com/promptfoo/modelaudit/issues/761)) ([3b0e3dc](https://github.com/promptfoo/modelaudit/commit/3b0e3dc0b6915ef2cd7ffaa4d41a6eb54ef475b3))
+- **security:** require explicit HuggingFace provenance for whitelist downgrades ([#750](https://github.com/promptfoo/modelaudit/issues/750)) ([582e361](https://github.com/promptfoo/modelaudit/commit/582e36198bd30699bce2ebd1bbab73ad6e3504d9))
+- **security:** route nested sevenzip members through core scanning ([#762](https://github.com/promptfoo/modelaudit/issues/762)) ([92ffdf7](https://github.com/promptfoo/modelaudit/commit/92ffdf7ca6bc30972e3b136470e92c2e8c8fbc63))
+- **sevenzip:** recurse into misnamed nested archives ([2cc5423](https://github.com/promptfoo/modelaudit/commit/2cc5423764749344e6ce6108d6ac2943bc002dcd))
+- **streaming:** avoid materializing file iterators ([7a9ae37](https://github.com/promptfoo/modelaudit/commit/7a9ae3741f3c8ab90fdd47c9101e8bf17179a086))
+- **tflite:** stop after excessive subgraph counts ([64b08fa](https://github.com/promptfoo/modelaudit/commit/64b08fa3501ed7321c08887a6bee5c4914246e69))
+- **whitelist:** preserve explicit HF download provenance ([#766](https://github.com/promptfoo/modelaudit/issues/766)) ([7e187cb](https://github.com/promptfoo/modelaudit/commit/7e187cb0bd96350c34b2e430a20be6a48ca7fd27))
+
+### Documentation
+
+- **agents:** tighten validation and routing guidance ([335b656](https://github.com/promptfoo/modelaudit/commit/335b65679de6c98d4040d3ea9e6a4fd025ac3f45))
+- normalize unreleased changelog section ([#741](https://github.com/promptfoo/modelaudit/issues/741)) ([5e66490](https://github.com/promptfoo/modelaudit/commit/5e664901d4448871715685833a91cfb339d632d7))
 
 ## [0.2.28](https://github.com/promptfoo/modelaudit/compare/v0.2.27...v0.2.28) (2026-03-20)
 
@@ -690,7 +1257,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **chore**: standardize on `add_check()` API - migrated all internal code from legacy `add_issue()` method to modern `add_check()` method for structured check reporting with explicit pass/fail status
+- **chore**: standardize on `add_check()` API - internal code now uses the modern `add_check()` method for structured check reporting with explicit pass/fail status
 
 ## [0.2.17] - 2025-11-19
 
@@ -1231,7 +1798,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **style**: improve code formatting and documentation standards (#12, #23)
 - **fix**: improve core scanner functionality and comprehensive test coverage (#11)
 
-[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.28...HEAD
+[unreleased]: https://github.com/promptfoo/modelaudit/compare/v0.2.37...HEAD
 [0.2.25]: https://github.com/promptfoo/modelaudit/compare/v0.2.24...v0.2.25
 [0.2.24]: https://github.com/promptfoo/modelaudit/compare/v0.2.23...v0.2.24
 [0.2.23]: https://github.com/promptfoo/modelaudit/compare/v0.2.22...v0.2.23

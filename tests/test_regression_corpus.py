@@ -16,11 +16,15 @@ import pytest
 
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
+from tests.assets.generators.generate_safetensors_assets import generate_safetensors_assets
 
 ASSETS = Path(__file__).parent / "assets"
 EXPLOITS_DIR = ASSETS / "exploits"
 SAFE_PICKLES_DIR = ASSETS / "samples" / "pickles"
-MALICIOUS_PICKLES_DIR = ASSETS / "samples" / "pickles"
+MALICIOUS_PICKLES_CANDIDATE_DIR = ASSETS / "samples" / "malicious_pickles"
+MALICIOUS_PICKLES_DIR = (
+    MALICIOUS_PICKLES_CANDIDATE_DIR if MALICIOUS_PICKLES_CANDIDATE_DIR.exists() else SAFE_PICKLES_DIR
+)
 SAFE_SAFETENSORS_DIR = ASSETS / "samples" / "safetensors"
 SAFE_PYTORCH_DIR = ASSETS / "samples" / "pytorch"
 SAFE_ARCHIVES_DIR = ASSETS / "samples" / "archives"
@@ -75,6 +79,14 @@ ALL_SAFE = SAFE_PICKLE_FILES + SAFE_SAFETENSORS + SAFE_PYTORCH + SAFE_ARCHIVES
 def _file_id(path: Path) -> str:
     """Generate a short test ID from a fixture path."""
     return f"{path.parent.name}/{path.name}"
+
+
+def test_committed_safetensors_assets_match_generator(tmp_path: Path) -> None:
+    """Committed SafeTensors corpus files should be byte-for-byte reproducible."""
+    generate_safetensors_assets(tmp_path)
+
+    for fixture_name in ("malicious_import.safetensors", "safe_model.safetensors"):
+        assert (tmp_path / fixture_name).read_bytes() == (SAFE_SAFETENSORS_DIR / fixture_name).read_bytes()
 
 
 # ---------------------------------------------------------------------------

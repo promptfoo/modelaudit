@@ -10,6 +10,15 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      root_version:
+        description: "Publish an already-versioned root modelaudit release, for example 0.2.39"
+        required: false
+        type: string
+      picklescan_version:
+        description: "Publish an already-versioned modelaudit-picklescan release, for example 0.1.2"
+        required: false
+        type: string
 
 jobs:
   release-please:
@@ -18,30 +27,89 @@ jobs:
       contents: write
       pull-requests: write
     outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-      version: ${{ steps.release.outputs.version }}
+      release_created: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.release_created || steps.release.outputs.release_created }}
+      tag_name: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.tag_name || steps.release.outputs.tag_name }}
+      version: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.version || steps.release.outputs.version }}
+      picklescan_release_created: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.picklescan_release_created || steps.release.outputs['packages/modelaudit-picklescan--release_created'] }}
+      picklescan_tag_name: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.picklescan_tag_name || steps.release.outputs['packages/modelaudit-picklescan--tag_name'] }}
+      picklescan_version: ${{ steps.manual.outputs.manual_release == 'true' && steps.manual.outputs.picklescan_version || steps.release.outputs['packages/modelaudit-picklescan--version'] }}
       pr_number: ${{ steps.release.outputs.pr && fromJSON(steps.release.outputs.pr).number || '' }}
     steps:
-      - uses: googleapis/release-please-action@v4
+      - name: Resolve manual release inputs
+        id: manual
+        env:
+          ROOT_VERSION: ${{ github.event.inputs.root_version || '' }}
+          PICKLESCAN_VERSION: ${{ github.event.inputs.picklescan_version || '' }}
+        run: |
+          {
+            if [[ -n "$ROOT_VERSION" ]]; then
+              echo "release_created=true"
+              echo "version=$ROOT_VERSION"
+              echo "tag_name=v$ROOT_VERSION"
+            else
+              echo "release_created=false"
+            fi
+
+            if [[ -n "$PICKLESCAN_VERSION" ]]; then
+              echo "picklescan_release_created=true"
+              echo "picklescan_version=$PICKLESCAN_VERSION"
+              echo "picklescan_tag_name=modelaudit-picklescan-v$PICKLESCAN_VERSION"
+            else
+              echo "picklescan_release_created=false"
+            fi
+
+            if [[ -n "$ROOT_VERSION" || -n "$PICKLESCAN_VERSION" ]]; then
+              echo "manual_release=true"
+            else
+              echo "manual_release=false"
+            fi
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4
+        if: steps.manual.outputs.manual_release != 'true'
         id: release
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Format CHANGELOG.md immediately after release-please creates/updates a PR
+      - name: Ensure manual GitHub releases exist
+        if: steps.manual.outputs.manual_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ROOT_TAG: ${{ steps.manual.outputs.tag_name }}
+          ROOT_VERSION: ${{ steps.manual.outputs.version }}
+          PICKLESCAN_TAG: ${{ steps.manual.outputs.picklescan_tag_name }}
+          PICKLESCAN_VERSION: ${{ steps.manual.outputs.picklescan_version }}
+        run: |
+          if [[ -n "$ROOT_VERSION" ]] && ! gh release view "$ROOT_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$ROOT_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$ROOT_TAG" \
+              --notes "Manual recovery release for modelaudit $ROOT_VERSION."
+          fi
+
+          if [[ -n "$PICKLESCAN_VERSION" ]] && ! gh release view "$PICKLESCAN_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$PICKLESCAN_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "modelaudit-picklescan: v$PICKLESCAN_VERSION" \
+              --notes "Manual recovery release for modelaudit-picklescan $PICKLESCAN_VERSION."
+          fi
+
+      # Format changelogs immediately after release-please creates/updates a PR
       # This runs for BOTH new PRs (prs_created) and existing PRs (pr output exists)
       - name: Check if PR exists
         id: check-pr
         run: |
           PR_OUTPUT='${{ steps.release.outputs.pr }}'
           if [ -n "$PR_OUTPUT" ] && [ "$PR_OUTPUT" != "null" ]; then
-            echo "has_pr=true" >> $GITHUB_OUTPUT
-            echo "pr_branch=$(echo '${{ steps.release.outputs.pr }}' | jq -r '.headBranchName')" >> $GITHUB_OUTPUT
+            echo "has_pr=true" >> "$GITHUB_OUTPUT"
+            echo "pr_branch=$(echo '${{ steps.release.outputs.pr }}' | jq -r '.headBranchName')" >> "$GITHUB_OUTPUT"
           else
-            echo "has_pr=false" >> $GITHUB_OUTPUT
+            echo "has_pr=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: steps.check-pr.outputs.has_pr == 'true'
         with:
           ref: ${{ steps.check-pr.outputs.pr_branch }}
@@ -50,7 +118,13 @@ jobs:
 
       - name: Install uv
         if: steps.check-pr.outputs.has_pr == 'true'
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+
+      - name: Install Rust toolchain for standalone lock refresh
+        if: steps.check-pr.outputs.has_pr == 'true'
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Sync uv.lock with pyproject.toml
         if: steps.check-pr.outputs.has_pr == 'true'
@@ -87,7 +161,7 @@ jobs:
 
       - name: Setup Node.js
         if: steps.check-pr.outputs.has_pr == 'true'
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
         with:
           node-version: "24"
 
@@ -95,20 +169,20 @@ jobs:
         if: steps.check-pr.outputs.has_pr == 'true'
         run: npm ci --ignore-scripts
 
-      - name: Format CHANGELOG.md with Prettier
+      - name: Format changelogs with Prettier
         if: steps.check-pr.outputs.has_pr == 'true'
         run: |
-          echo "Formatting CHANGELOG.md on branch: ${{ steps.check-pr.outputs.pr_branch }}"
-          npx prettier --write CHANGELOG.md
+          echo "Formatting changelogs on branch: ${{ steps.check-pr.outputs.pr_branch }}"
+          npx prettier --write CHANGELOG.md packages/modelaudit-picklescan/CHANGELOG.md
 
-          if git diff --quiet CHANGELOG.md; then
+          if git diff --quiet CHANGELOG.md packages/modelaudit-picklescan/CHANGELOG.md; then
             echo "✓ No formatting changes needed"
           else
             echo "→ Formatting changes detected, committing..."
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add CHANGELOG.md
-            git commit -m "chore: format CHANGELOG.md with prettier"
+            git add CHANGELOG.md packages/modelaudit-picklescan/CHANGELOG.md
+            git commit -m "chore: format changelogs with prettier"
             git push
             echo "✓ Formatting committed and pushed"
           fi
@@ -122,12 +196,17 @@ jobs:
     outputs:
       artifact-name: ${{ steps.upload.outputs.artifact-id }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: true
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
 
       - name: Sync dependencies
         run: uv sync --extra all-ci
@@ -147,6 +226,9 @@ jobs:
 
       - name: Build package
         run: uv build
+
+      - name: Build standalone pickle package for smoke installs
+        run: uv build packages/modelaudit-picklescan --out-dir /tmp/modelaudit-picklescan-dist
 
       - name: Verify distribution artifacts and version consistency
         run: |
@@ -250,7 +332,10 @@ jobs:
 
           uv venv /tmp/modelaudit-wheel-smoke
 
-          uv pip install --python /tmp/modelaudit-wheel-smoke/bin/python "${WHEEL_ARTIFACT}"
+          uv pip install \
+            --python /tmp/modelaudit-wheel-smoke/bin/python \
+            --find-links /tmp/modelaudit-picklescan-dist \
+            "${WHEEL_ARTIFACT}"
 
           INSTALLED_VERSION="$(
             /tmp/modelaudit-wheel-smoke/bin/python -c "import importlib.metadata as m; print(m.version('modelaudit'))"
@@ -336,7 +421,10 @@ jobs:
 
           uv venv /tmp/modelaudit-sdist-smoke
 
-          uv pip install --python /tmp/modelaudit-sdist-smoke/bin/python "${SDIST_ARTIFACT}"
+          uv pip install \
+            --python /tmp/modelaudit-sdist-smoke/bin/python \
+            --find-links /tmp/modelaudit-picklescan-dist \
+            "${SDIST_ARTIFACT}"
 
           INSTALLED_VERSION="$(
             /tmp/modelaudit-sdist-smoke/bin/python -c "import importlib.metadata as m; print(m.version('modelaudit'))"
@@ -382,25 +470,46 @@ jobs:
 
       - name: Upload build artifacts
         id: upload
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dist
           path: dist/
 
   build-picklescan-package:
-    if: needs.release-please.outputs.release_created == 'true'
-    runs-on: ubuntu-latest
+    if: needs.release-please.outputs.picklescan_release_created == 'true'
+    name: Build standalone pickle package (${{ matrix.artifact-suffix }})
+    runs-on: ${{ matrix.os }}
     needs: release-please
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact-suffix: linux
+            build-sdist: "true"
+          - os: macos-14
+            artifact-suffix: macos-arm64
+            build-sdist: "false"
+          - os: macos-15-intel
+            artifact-suffix: macos-x86_64
+            build-sdist: "false"
+          - os: ubuntu-24.04-arm
+            artifact-suffix: linux-aarch64
+            build-sdist: "false"
+          - os: windows-latest
+            artifact-suffix: windows
+            build-sdist: "false"
     defaults:
       run:
+        shell: bash
         working-directory: packages/modelaudit-picklescan
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: true
 
@@ -408,9 +517,38 @@ jobs:
         run: |
           uv python pin 3.12
 
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/modelaudit-picklescan/target
+          key: ${{ runner.os }}-cargo-picklescan-${{ hashFiles('packages/modelaudit-picklescan/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-picklescan-
+
       - name: Check standalone package lock is in sync
         run: |
           uv lock --check
+
+      - name: Check Rust scanner formatting
+        run: cargo fmt --manifest-path Cargo.toml -- --check
+
+      - name: Check Rust scanner crate
+        run: cargo check --manifest-path Cargo.toml
+
+      - name: Lint Rust scanner crate
+        run: cargo clippy --manifest-path Cargo.toml --all-targets -- -D warnings
+
+      - name: Test Rust scanner crate
+        run: |
+          cargo test --manifest-path Cargo.toml
 
       - name: Lint standalone package with Ruff
         run: uv run --with ruff ruff check src tests
@@ -424,46 +562,134 @@ jobs:
       - name: Run standalone package tests
         run: uv run --with pytest --with pytest-xdist pytest -n auto tests --tb=short
 
-      - name: Build standalone package
-        run: uv build --out-dir /tmp/modelaudit-picklescan-dist
+      - name: Build standalone package sdist
+        if: matrix.build-sdist == 'true'
+        run: |
+          uv build --sdist --out-dir dist
+
+      - name: Build standalone package manylinux wheel
+        if: runner.os == 'Linux'
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1
+        with:
+          command: build
+          args: --release --out dist
+          manylinux: "2_28"
+          working-directory: packages/modelaudit-picklescan
+
+      - name: Build standalone package wheel
+        if: runner.os != 'Linux'
+        run: |
+          uv build --wheel --out-dir dist
 
       - name: Validate standalone package metadata
-        run: uvx twine check /tmp/modelaudit-picklescan-dist/*
+        run: uvx twine check dist/*
+
+      - name: Verify standalone artifact version consistency
+        run: |
+          set -euo pipefail
+          EXPECTED_VERSION="${{ needs.release-please.outputs.picklescan_version }}"
+
+          shopt -s nullglob
+          artifacts=(dist/modelaudit_picklescan-*.whl dist/modelaudit_picklescan-*.tar.gz)
+          if [[ ${#artifacts[@]} -eq 0 ]]; then
+            echo "ERROR: Expected at least one modelaudit_picklescan artifact"
+            ls -la dist/
+            exit 1
+          fi
+
+          for artifact in "${artifacts[@]}"; do
+            ARTIFACT_VERSION="$(
+              python - "${artifact}" <<'PY'
+          import sys
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          artifact_path = Path(sys.argv[1])
+          if artifact_path.suffix == ".whl":
+              with zipfile.ZipFile(artifact_path) as zf:
+                  metadata_files = [name for name in zf.namelist() if name.endswith(".dist-info/METADATA")]
+                  if len(metadata_files) != 1:
+                      raise SystemExit(f"Expected one wheel METADATA file, found {len(metadata_files)}")
+                  metadata_text = zf.read(metadata_files[0]).decode("utf-8", errors="replace")
+          elif artifact_path.name.endswith(".tar.gz"):
+              with tarfile.open(artifact_path, "r:gz") as tf:
+                  pkg_info_files = [member for member in tf.getmembers() if member.name.endswith("/PKG-INFO")]
+                  if len(pkg_info_files) != 1:
+                      raise SystemExit(f"Expected one PKG-INFO file, found {len(pkg_info_files)}")
+                  file_obj = tf.extractfile(pkg_info_files[0])
+                  if file_obj is None:
+                      raise SystemExit("Failed to read PKG-INFO from sdist")
+                  metadata_text = file_obj.read().decode("utf-8", errors="replace")
+          else:
+              raise SystemExit(f"Unsupported artifact type: {artifact_path}")
+
+          for line in metadata_text.splitlines():
+              if line.startswith("Version: "):
+                  print(line.split(":", 1)[1].strip())
+                  break
+          else:
+              raise SystemExit("Could not find Version header")
+          PY
+            )"
+
+            if [[ "$ARTIFACT_VERSION" != "$EXPECTED_VERSION" ]]; then
+              echo "ERROR: Artifact version mismatch for ${artifact}"
+              echo "Expected version: $EXPECTED_VERSION"
+              echo "Artifact version: $ARTIFACT_VERSION"
+              exit 1
+            fi
+          done
+
+          echo "Standalone artifact validation passed for version ${EXPECTED_VERSION}"
 
       - name: Smoke test standalone package wheel install
         run: |
           set -euo pipefail
           uv venv /tmp/modelaudit-picklescan-wheel-smoke
+          if [[ -x /tmp/modelaudit-picklescan-wheel-smoke/bin/python ]]; then
+            SMOKE_PYTHON=/tmp/modelaudit-picklescan-wheel-smoke/bin/python
+          else
+            SMOKE_PYTHON=/tmp/modelaudit-picklescan-wheel-smoke/Scripts/python.exe
+          fi
 
           shopt -s nullglob
-          picklescan_wheels=(/tmp/modelaudit-picklescan-dist/modelaudit_picklescan-*.whl)
+          picklescan_wheels=(dist/modelaudit_picklescan-*.whl)
           if [[ ${#picklescan_wheels[@]} -ne 1 ]]; then
             echo "ERROR: Expected exactly 1 modelaudit_picklescan wheel artifact, found ${#picklescan_wheels[@]}"
-            ls -la /tmp/modelaudit-picklescan-dist/
+            ls -la dist/
             exit 1
           fi
 
-          uv pip install --python /tmp/modelaudit-picklescan-wheel-smoke/bin/python "${picklescan_wheels[0]}"
+          uv pip install --python "$SMOKE_PYTHON" "${picklescan_wheels[0]}"
 
           smoke_dir="$(mktemp -d)"
           (
             cd "$smoke_dir"
-            PYTHONPATH= /tmp/modelaudit-picklescan-wheel-smoke/bin/python -I - <<'PY'
+            PYTHONPATH='' "$SMOKE_PYTHON" -I - <<'PY'
           import importlib.util
 
           import modelaudit_picklescan
 
           assert importlib.util.find_spec("modelaudit") is None
+          assert importlib.util.find_spec("modelaudit_picklescan._rust") is not None
           report = modelaudit_picklescan.scan_bytes(b"\x80\x04}q\x00.")
           assert report.status.value == "complete", report
           assert report.verdict.value == "clean", report
+          assert not any(notice.code == "engine_fallback" for notice in report.notices)
           print("standalone modelaudit_picklescan wheel loaded without modelaudit")
           PY
           )
 
+      - name: Upload standalone package artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: modelaudit-picklescan-dist-${{ matrix.artifact-suffix }}
+          path: packages/modelaudit-picklescan/dist/
+
   publish-pypi:
     if: needs.release-please.outputs.release_created == 'true'
-    needs: [build, build-picklescan-package, release-please]
+    needs: [build, release-please]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -473,45 +699,362 @@ jobs:
       id-token: write
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: dist
           path: dist/
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         with:
           print-hash: true
           attestations: true
 
+  publish-picklescan-pypi:
+    if: needs.release-please.outputs.picklescan_release_created == 'true'
+    needs: [build-picklescan-package, release-please]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/modelaudit-picklescan/
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download standalone pickle package artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: modelaudit-picklescan-dist-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          print-hash: true
+          attestations: true
+
+  verify-picklescan-pypi:
+    if: needs.release-please.outputs.picklescan_release_created == 'true'
+    needs: [publish-picklescan-pypi, release-please]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      EXPECTED_VERSION: ${{ needs.release-please.outputs.picklescan_version }}
+    steps:
+      - name: Wait for modelaudit-picklescan files on PyPI
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.request
+
+          version = os.environ["EXPECTED_VERSION"]
+          expected_files = {
+              f"modelaudit_picklescan-{version}-cp310-abi3-macosx_10_12_x86_64.whl",
+              f"modelaudit_picklescan-{version}-cp310-abi3-macosx_11_0_arm64.whl",
+              f"modelaudit_picklescan-{version}-cp310-abi3-manylinux_2_28_aarch64.whl",
+              f"modelaudit_picklescan-{version}-cp310-abi3-manylinux_2_28_x86_64.whl",
+              f"modelaudit_picklescan-{version}-cp310-abi3-win_amd64.whl",
+              f"modelaudit_picklescan-{version}.tar.gz",
+          }
+          url = f"https://pypi.org/pypi/modelaudit-picklescan/{version}/json"
+          deadline = time.monotonic() + 600
+          last_status = "not checked"
+
+          while time.monotonic() < deadline:
+              try:
+                  with urllib.request.urlopen(url, timeout=20) as response:
+                      payload = json.load(response)
+                  filenames = {entry["filename"] for entry in payload.get("urls", [])}
+                  missing = sorted(expected_files - filenames)
+                  info_version = payload.get("info", {}).get("version")
+                  if info_version == version and not missing:
+                      print(f"PyPI has modelaudit-picklescan {version}: {sorted(filenames)}")
+                      break
+                  last_status = f"version={info_version!r}, missing={missing}"
+              except Exception as exc:
+                  last_status = repr(exc)
+              time.sleep(10)
+          else:
+              raise SystemExit(f"Timed out waiting for modelaudit-picklescan {version} on PyPI: {last_status}")
+          PY
+
+      - name: Install published modelaudit-picklescan and smoke test API
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/modelaudit-picklescan-pypi-smoke
+          /tmp/modelaudit-picklescan-pypi-smoke/bin/python -m pip install --upgrade pip
+          /tmp/modelaudit-picklescan-pypi-smoke/bin/python -m pip install \
+            --no-cache-dir \
+            --retries 10 \
+            --timeout 60 \
+            "modelaudit-picklescan==${EXPECTED_VERSION}"
+
+          /tmp/modelaudit-picklescan-pypi-smoke/bin/python - <<'PY'
+          import importlib.metadata as md
+          import importlib.util
+          import os
+          import pickle
+
+          import modelaudit_picklescan
+
+          expected_version = os.environ["EXPECTED_VERSION"]
+          installed_version = md.version("modelaudit-picklescan")
+          if installed_version != expected_version:
+              raise SystemExit(f"Expected modelaudit-picklescan {expected_version}, got {installed_version}")
+          if importlib.util.find_spec("modelaudit_picklescan._rust") is None:
+              raise SystemExit("modelaudit_picklescan._rust extension was not installed")
+
+          clean_report = modelaudit_picklescan.scan_bytes(pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+          if clean_report.status.value != "complete" or clean_report.verdict.value != "clean":
+              raise SystemExit(f"Expected clean complete report, got {clean_report}")
+
+          class MaliciousPayload:
+              def __reduce__(self):
+                  return (os.system, ("echo modelaudit-picklescan-smoke",))
+
+          malicious_report = modelaudit_picklescan.scan_bytes(
+              pickle.dumps(MaliciousPayload(), protocol=4),
+              source="malicious.pkl",
+          )
+          if malicious_report.status.value != "complete" or malicious_report.verdict.value != "malicious":
+              raise SystemExit(f"Expected malicious complete report, got {malicious_report}")
+          if not any(finding.rule_code == "DANGEROUS_CALL" for finding in malicious_report.findings):
+              raise SystemExit(f"Expected DANGEROUS_CALL finding, got {malicious_report.findings}")
+
+          print("Published modelaudit-picklescan API smoke test passed.")
+          PY
+
+  verify-pypi:
+    if: >-
+      ${{
+        always() &&
+        needs.release-please.outputs.release_created == 'true' &&
+        needs.publish-pypi.result == 'success' &&
+        (
+          needs.release-please.outputs.picklescan_release_created != 'true' ||
+          needs.verify-picklescan-pypi.result == 'success'
+        )
+      }}
+    needs:
+      [
+        publish-pypi,
+        publish-picklescan-pypi,
+        release-please,
+        verify-picklescan-pypi,
+      ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      EXPECTED_VERSION: ${{ needs.release-please.outputs.version }}
+      EXPECTED_PICKLESCAN_VERSION: ${{ needs.release-please.outputs.picklescan_version }}
+      PICKLESCAN_RELEASE_CREATED: ${{ needs.release-please.outputs.picklescan_release_created }}
+      PROMPTFOO_DISABLE_TELEMETRY: "1"
+    steps:
+      - name: Wait for modelaudit files on PyPI
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.request
+
+          version = os.environ["EXPECTED_VERSION"]
+          expected_files = {
+              f"modelaudit-{version}-py3-none-any.whl",
+              f"modelaudit-{version}.tar.gz",
+          }
+          url = f"https://pypi.org/pypi/modelaudit/{version}/json"
+          deadline = time.monotonic() + 600
+          last_status = "not checked"
+
+          while time.monotonic() < deadline:
+              try:
+                  with urllib.request.urlopen(url, timeout=20) as response:
+                      payload = json.load(response)
+                  filenames = {entry["filename"] for entry in payload.get("urls", [])}
+                  missing = sorted(expected_files - filenames)
+                  info_version = payload.get("info", {}).get("version")
+                  if info_version == version and not missing:
+                      print(f"PyPI has modelaudit {version}: {sorted(filenames)}")
+                      break
+                  last_status = f"version={info_version!r}, missing={missing}"
+              except Exception as exc:
+                  last_status = repr(exc)
+              time.sleep(10)
+          else:
+              raise SystemExit(f"Timed out waiting for modelaudit {version} on PyPI: {last_status}")
+          PY
+
+      - name: Install published modelaudit and run end-to-end smoke tests
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/modelaudit-pypi-smoke
+          /tmp/modelaudit-pypi-smoke/bin/python -m pip install --upgrade pip
+          /tmp/modelaudit-pypi-smoke/bin/python -m pip install \
+            --no-cache-dir \
+            --retries 10 \
+            --timeout 60 \
+            "modelaudit[all]==${EXPECTED_VERSION}"
+
+          /tmp/modelaudit-pypi-smoke/bin/python - <<'PY'
+          import importlib.metadata as md
+          import json
+          import os
+          import pickle
+          import subprocess
+          import tempfile
+          import zipfile
+          from pathlib import Path
+
+          expected_version = os.environ["EXPECTED_VERSION"]
+          installed_version = md.version("modelaudit")
+          if installed_version != expected_version:
+              raise SystemExit(f"Expected modelaudit {expected_version}, got {installed_version}")
+
+          picklescan_version = md.version("modelaudit-picklescan")
+          expected_picklescan_version = os.environ.get("EXPECTED_PICKLESCAN_VERSION")
+          if os.environ.get("PICKLESCAN_RELEASE_CREATED") == "true" and expected_picklescan_version:
+              if picklescan_version != expected_picklescan_version:
+                  raise SystemExit(
+                      "Expected coordinated picklescan "
+                      f"{expected_picklescan_version}, got {picklescan_version}"
+                  )
+          print(f"Installed modelaudit {installed_version} with modelaudit-picklescan {picklescan_version}.")
+
+          modelaudit = Path("/tmp/modelaudit-pypi-smoke/bin/modelaudit")
+          env = os.environ.copy()
+          env["PROMPTFOO_DISABLE_TELEMETRY"] = "1"
+
+          def run(args: list[str | Path], expected_returncode: int) -> subprocess.CompletedProcess[str]:
+              command = [str(arg) for arg in args]
+              print("$", " ".join(command))
+              completed = subprocess.run(
+                  command,
+                  capture_output=True,
+                  text=True,
+                  env=env,
+                  check=False,
+              )
+              if completed.stdout:
+                  print(completed.stdout)
+              if completed.stderr:
+                  print(completed.stderr)
+              if completed.returncode != expected_returncode:
+                  raise SystemExit(
+                      f"Expected exit {expected_returncode} from {' '.join(command)}, "
+                      f"got {completed.returncode}"
+                  )
+              return completed
+
+          run([modelaudit, "--version"], 0)
+          run([modelaudit, "doctor", "--show-failed"], 0)
+
+          with tempfile.TemporaryDirectory(prefix="modelaudit-pypi-smoke-") as tmpdir:
+              workdir = Path(tmpdir)
+              marker = workdir / "payload-executed"
+              benign = workdir / "benign.pkl"
+              malicious = workdir / "malicious.pkl"
+              malicious_zip = workdir / "malicious.zip"
+
+              with benign.open("wb") as handle:
+                  pickle.dump({"weights": [1.0, 2.0, 3.0], "metadata": {"name": "release-smoke"}}, handle)
+
+              class MaliciousPayload:
+                  def __reduce__(self):
+                      return (os.system, (f"touch {marker}",))
+
+              with malicious.open("wb") as handle:
+                  pickle.dump(MaliciousPayload(), handle, protocol=4)
+              with zipfile.ZipFile(malicious_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                  archive.write(malicious, arcname="malicious.pkl")
+
+              benign_json = workdir / "benign.json"
+              malicious_json = workdir / "malicious.json"
+              zip_json = workdir / "malicious-zip.json"
+              sarif_json = workdir / "malicious.sarif"
+              sbom_json = workdir / "sbom.json"
+
+              run([modelaudit, "scan", benign, "--format", "json", "--output", benign_json, "--no-cache"], 0)
+              run([modelaudit, "scan", malicious, "--format", "json", "--output", malicious_json, "--no-cache"], 1)
+              run([modelaudit, "scan", malicious_zip, "--format", "json", "--output", zip_json, "--no-cache"], 1)
+              run(
+                  [
+                      modelaudit,
+                      "scan",
+                      malicious,
+                      "--format",
+                      "sarif",
+                      "--output",
+                      sarif_json,
+                      "--sbom",
+                      sbom_json,
+                      "--no-cache",
+                  ],
+                  1,
+              )
+
+              if marker.exists():
+                  raise SystemExit("Malicious pickle payload executed during scan")
+
+              benign_report = json.loads(benign_json.read_text())
+              if benign_report.get("issues") or benign_report.get("failed_checks") != 0:
+                  raise SystemExit(f"Expected benign pickle to be clean, got {benign_report}")
+
+              for report_path in (malicious_json, zip_json):
+                  report = json.loads(report_path.read_text())
+                  if not any(
+                      issue.get("rule_code") == "S201" and issue.get("severity") == "critical"
+                      for issue in report.get("issues", [])
+                  ):
+                      raise SystemExit(f"Expected critical S201 in {report_path}, got {report}")
+
+              sarif_report = json.loads(sarif_json.read_text())
+              sarif_results = sarif_report.get("runs", [{}])[0].get("results", [])
+              if sarif_report.get("version") != "2.1.0" or not any(
+                  result.get("ruleId") == "S201" for result in sarif_results
+              ):
+                  raise SystemExit(f"Expected SARIF S201 result, got {sarif_report}")
+
+              sbom_report = json.loads(sbom_json.read_text())
+              if sbom_report.get("bomFormat") != "CycloneDX" or not sbom_report.get("components"):
+                  raise SystemExit(f"Expected CycloneDX SBOM with components, got {sbom_report}")
+
+          print("Published modelaudit end-to-end smoke test passed.")
+          PY
+
   provenance:
     if: needs.release-please.outputs.release_created == 'true'
-    needs: [build, build-picklescan-package, publish-pypi, release-please]
+    needs: [build, publish-pypi, release-please]
     runs-on: ubuntu-latest
     permissions:
       contents: write
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           sparse-checkout: |
             pyproject.toml
             uv.lock
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: true
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: dist
           path: dist/
 
       - name: Generate artifact attestations
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
         with:
           subject-path: "dist/*"
 
@@ -534,5 +1077,58 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ needs.release-please.outputs.tag_name }}" dist/* \
+            --repo "${{ github.repository }}" \
+            --clobber
+
+  picklescan-provenance:
+    if: needs.release-please.outputs.picklescan_release_created == 'true'
+    needs: [build-picklescan-package, publish-picklescan-pypi, release-please]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          sparse-checkout: |
+            packages/modelaudit-picklescan/pyproject.toml
+            packages/modelaudit-picklescan/uv.lock
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          enable-cache: true
+
+      - name: Download standalone pickle package artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: modelaudit-picklescan-dist-*
+          path: dist/
+          merge-multiple: true
+
+      - name: Generate artifact attestations
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
+        with:
+          subject-path: "dist/*"
+
+      - name: Generate standalone package SBOM
+        working-directory: packages/modelaudit-picklescan
+        run: |
+          uv export \
+            --frozen \
+            --no-dev \
+            --preview-features sbom-export \
+            --format cyclonedx1.5 \
+            --output-file ../../dist/modelaudit-picklescan-${{ needs.release-please.outputs.picklescan_version }}.cdx.json \
+            > /dev/null
+          echo "Standalone package SBOM generated:"
+          ls -la ../../dist/*.cdx.json
+
+      - name: Upload standalone artifacts to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.release-please.outputs.picklescan_tag_name }}" dist/* \
             --repo "${{ github.repository }}" \
             --clobber

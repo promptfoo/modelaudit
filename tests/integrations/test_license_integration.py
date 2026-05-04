@@ -45,11 +45,11 @@ class TestLicenseIntegration:
 
         # Should have no license warnings
         license_warnings = check_commercial_use_warnings(results)
-        [w for w in license_warnings if w.get("severity") != "debug"]
+        non_debug_warnings = [w for w in license_warnings if w.get("severity") != "debug"]
 
         # MIT is permissive, should not trigger warnings
-        agpl_warnings = [w for w in license_warnings if "AGPL" in w.get("message", "")]
-        nc_warnings = [w for w in license_warnings if "NonCommercial" in w.get("message", "")]
+        agpl_warnings = [w for w in non_debug_warnings if "AGPL" in w.get("message", "")]
+        nc_warnings = [w for w in non_debug_warnings if "NonCommercial" in w.get("message", "")]
 
         assert len(agpl_warnings) == 0, "MIT model should not trigger AGPL warnings"
         assert len(nc_warnings) == 0, "MIT model should not trigger non-commercial warnings"
@@ -111,6 +111,27 @@ class TestLicenseIntegration:
         dataset_warning = dataset_warnings[0]
         assert dataset_warning["severity"] == "info"
         assert "Verify data usage rights" in dataset_warning["message"]
+
+    def test_directory_scan_reuses_nearby_license_discovery(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Directory scans should reuse nearby-license discovery across sibling files."""
+        (tmp_path / "first.dat").write_text("first", encoding="utf-8")
+        (tmp_path / "second.dat").write_text("second", encoding="utf-8")
+        calls = 0
+
+        def fake_find_license_files(directory: str) -> list[str]:
+            nonlocal calls
+            calls += 1
+            return [str(Path(directory) / "LICENSE")]
+
+        monkeypatch.setattr("modelaudit.integrations.license_checker.find_license_files", fake_find_license_files)
+
+        scan_model_directory_or_file(str(tmp_path), skip_file_types=False, cache_enabled=False)
+
+        assert calls == 1
 
     def test_mixed_licenses_detection(self, test_data_dir: Any) -> None:
         """Test detection of mixed license scenarios."""

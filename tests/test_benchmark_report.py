@@ -24,7 +24,7 @@ def _benchmark_entry(
     *,
     extra_info: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    metadata: dict[str, object] = {"path": name.split("::")[-1]}
+    metadata: dict[str, object] = {"workload": "single-checkpoint-preflight", "path": name.split("::")[-1]}
     if extra_info is not None:
         metadata.update(extra_info)
 
@@ -66,16 +66,21 @@ def test_benchmark_report_summary_only(tmp_path: Path) -> None:
         current_json,
         [
             _benchmark_entry(
-                "tests/benchmarks/test_scan_benchmarks.py::test_scan_safe_pickle",
+                "tests/benchmarks/test_scan_benchmarks.py::test_scan_single_checkpoint_before_load",
                 0.020,
                 0.021,
-                extra_info={"path": "safe_model.pkl", "bytes": 1024, "files": 1},
+                extra_info={"path": "single_checkpoint.pkl", "bytes": 1024, "files": 1},
             ),
             _benchmark_entry(
-                "tests/benchmarks/test_scan_benchmarks.py::test_scan_pytorch_zip",
+                "tests/benchmarks/test_scan_benchmarks.py::test_scan_release_candidate_repository",
                 0.045,
                 0.046,
-                extra_info={"path": "state_dict.pt", "bytes": 2048, "files": 1},
+                extra_info={
+                    "workload": "mixed-model-repository",
+                    "path": "release-candidate",
+                    "bytes": 2048,
+                    "files": 7,
+                },
             ),
         ],
     )
@@ -97,22 +102,22 @@ def test_benchmark_report_summary_only(tmp_path: Path) -> None:
 
     assert completed.returncode == 0
     assert "Performance Benchmarks" in completed.stdout
+    assert "across `2` workloads" in completed.stdout
     assert "Aggregate median across all benchmarks" in completed.stdout
     summary_text = summary_file.read_text(encoding="utf-8")
-    assert "| Benchmark | Target | Size | Files | Median | Mean | Rounds |" in summary_text
-    assert "safe_model.pkl" in summary_text
+    assert "| Workload | Benchmark | Target | Size | Files | Median | Mean | Rounds |" in summary_text
     assert "2.0 KiB" in summary_text
-    table_rows = [
-        line for line in summary_text.splitlines() if line.startswith("| `tests/benchmarks/test_scan_benchmarks.py::")
-    ]
+    table_rows = [line for line in summary_text.splitlines() if line.startswith("| `") and "test_scan_" in line]
     assert table_rows == [
         (
-            "| `tests/benchmarks/test_scan_benchmarks.py::test_scan_pytorch_zip` | "
-            "`state_dict.pt` | 2.0 KiB | 1 | 45.00ms | 46.00ms | 5 |"
+            "| `mixed-model-repository` | "
+            "`tests/benchmarks/test_scan_benchmarks.py::test_scan_release_candidate_repository` | "
+            "`release-candidate` | 2.0 KiB | 7 | 45.00ms | 46.00ms | 5 |"
         ),
         (
-            "| `tests/benchmarks/test_scan_benchmarks.py::test_scan_safe_pickle` | "
-            "`safe_model.pkl` | 1.0 KiB | 1 | 20.00ms | 21.00ms | 5 |"
+            "| `single-checkpoint-preflight` | "
+            "`tests/benchmarks/test_scan_benchmarks.py::test_scan_single_checkpoint_before_load` | "
+            "`single_checkpoint.pkl` | 1.0 KiB | 1 | 20.00ms | 21.00ms | 5 |"
         ),
     ]
 
@@ -121,7 +126,7 @@ def test_benchmark_report_reports_regression_without_failing(tmp_path: Path) -> 
     baseline_json = tmp_path / "baseline.json"
     current_json = tmp_path / "current.json"
 
-    benchmark_name = "tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_directory"
+    benchmark_name = "tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_registry_snapshot"
     _write_benchmark_json(baseline_json, [_benchmark_entry(benchmark_name, 0.100, 0.101)])
     _write_benchmark_json(current_json, [_benchmark_entry(benchmark_name, 0.135, 0.136)])
 
@@ -153,7 +158,7 @@ def test_benchmark_report_can_fail_on_regression(tmp_path: Path) -> None:
     baseline_json = tmp_path / "baseline.json"
     current_json = tmp_path / "current.json"
 
-    benchmark_name = "tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_directory"
+    benchmark_name = "tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_registry_snapshot"
     _write_benchmark_json(baseline_json, [_benchmark_entry(benchmark_name, 0.100, 0.101)])
     _write_benchmark_json(current_json, [_benchmark_entry(benchmark_name, 0.135, 0.136)])
 
@@ -184,8 +189,8 @@ def test_benchmark_report_reports_missing_benchmark_without_failing(tmp_path: Pa
     baseline_json = tmp_path / "baseline.json"
     current_json = tmp_path / "current.json"
 
-    kept_benchmark = "tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_directory"
-    missing_benchmark = "tests/benchmarks/test_scan_benchmarks.py::test_scan_mixed_directory"
+    kept_benchmark = "tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_registry_snapshot"
+    missing_benchmark = "tests/benchmarks/test_scan_benchmarks.py::test_scan_release_candidate_repository"
     _write_benchmark_json(
         baseline_json,
         [
@@ -219,8 +224,8 @@ def test_benchmark_report_can_fail_on_missing_benchmark(tmp_path: Path) -> None:
     baseline_json = tmp_path / "baseline.json"
     current_json = tmp_path / "current.json"
 
-    kept_benchmark = "tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_directory"
-    missing_benchmark = "tests/benchmarks/test_scan_benchmarks.py::test_scan_mixed_directory"
+    kept_benchmark = "tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_registry_snapshot"
+    missing_benchmark = "tests/benchmarks/test_scan_benchmarks.py::test_scan_release_candidate_repository"
     _write_benchmark_json(
         baseline_json,
         [
@@ -255,7 +260,7 @@ def test_benchmark_report_uses_baseline_size_when_current_metadata_partial(tmp_p
     baseline_json = tmp_path / "baseline.json"
     current_json = tmp_path / "current.json"
 
-    benchmark_name = "tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_directory"
+    benchmark_name = "tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_registry_snapshot"
     _write_benchmark_json(
         baseline_json,
         [
@@ -263,7 +268,12 @@ def test_benchmark_report_uses_baseline_size_when_current_metadata_partial(tmp_p
                 benchmark_name,
                 0.100,
                 0.101,
-                extra_info={"path": "baseline_dir", "bytes": 2048, "files": 4},
+                extra_info={
+                    "workload": "duplicate-heavy-registry",
+                    "path": "baseline_dir",
+                    "bytes": 2048,
+                    "files": 4,
+                },
             )
         ],
     )
@@ -290,9 +300,7 @@ def test_benchmark_report_uses_baseline_size_when_current_metadata_partial(tmp_p
     )
 
     assert completed.returncode == 0
-    expected_row_prefix = (
-        "| `tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_directory` | `current_dir` | 2.0 KiB | 4 |"
-    )
+    expected_row_prefix = f"| `single-checkpoint-preflight` | `{benchmark_name}` | `current_dir` | 2.0 KiB | 4 |"
     assert expected_row_prefix in completed.stdout
 
 
@@ -300,9 +308,9 @@ def test_benchmark_report_top_improvements_and_mixed_metadata_fallback(tmp_path:
     baseline_json = tmp_path / "baseline.json"
     current_json = tmp_path / "current.json"
 
-    improved_name = "tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_directory"
-    missing_name = "tests/benchmarks/test_scan_benchmarks.py::test_scan_mixed_directory"
-    new_name = "tests/benchmarks/test_scan_benchmarks.py::test_scan_safe_pickle"
+    improved_name = "tests/benchmarks/test_scan_benchmarks.py::test_scan_duplicate_registry_snapshot"
+    missing_name = "tests/benchmarks/test_scan_benchmarks.py::test_scan_release_candidate_repository"
+    new_name = "tests/benchmarks/test_scan_benchmarks.py::test_scan_single_checkpoint_before_load"
     _write_benchmark_json(
         baseline_json,
         [
@@ -310,7 +318,12 @@ def test_benchmark_report_top_improvements_and_mixed_metadata_fallback(tmp_path:
                 improved_name,
                 0.100,
                 0.101,
-                extra_info={"path": "baseline_dir", "bytes": 4096, "files": 10},
+                extra_info={
+                    "workload": "duplicate-heavy-registry",
+                    "path": "baseline_dir",
+                    "bytes": 4096,
+                    "files": 10,
+                },
             ),
             _benchmark_entry(missing_name, 0.200, 0.201),
         ],
@@ -351,5 +364,5 @@ def test_benchmark_report_top_improvements_and_mixed_metadata_fallback(tmp_path:
     assert "Status: `0` regressions, `1` improved, `0` stable, `1` new, `1` missing." in completed.stdout
     assert "Top improvements:" in completed.stdout
     assert f"- `{improved_name}` -20.0%" in completed.stdout
-    expected_row_prefix = f"| `{improved_name}` | `current_dir` | 4.0 KiB | 2 |"
+    expected_row_prefix = f"| `single-checkpoint-preflight` | `{improved_name}` | `current_dir` | 4.0 KiB | 2 |"
     assert expected_row_prefix in completed.stdout

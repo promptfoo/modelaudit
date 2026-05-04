@@ -7,7 +7,6 @@
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import runtime_version as _runtime_version
-from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
 _runtime_version.ValidateProtobufRuntimeVersion(
     _runtime_version.Domain.PUBLIC,
@@ -18,12 +17,6 @@ _runtime_version.ValidateProtobufRuntimeVersion(
     'tensorflow/core/protobuf/critical_section.proto'
 )
 # @@protoc_insertion_point(imports)
-
-_sym_db = _symbol_database.Default()
-
-
-
-
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n/tensorflow/core/protobuf/critical_section.proto\x12\ntensorflow\"3\n\x12\x43riticalSectionDef\x12\x1d\n\x15\x63ritical_section_name\x18\x01 \x01(\t\"j\n\x1b\x43riticalSectionExecutionDef\x12(\n execute_in_critical_section_name\x18\x01 \x01(\t\x12!\n\x19\x65xclusive_resource_access\x18\x02 \x01(\x08\x42\x8d\x01\n\x18org.tensorflow.frameworkB\x15\x43riticalSectionProtosP\x01ZUgithub.com/tensorflow/tensorflow/tensorflow/go/core/protobuf/for_core_protos_go_proto\xf8\x01\x01\x62\x06proto3')
 
 _globals = globals()

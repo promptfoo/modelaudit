@@ -9,12 +9,113 @@ import os
 import pickletools
 import zlib
 from collections.abc import Callable
+from contextlib import suppress
 from typing import Any, ClassVar
 
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
+from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils.file.detection import read_magic_bytes
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner, _looks_like_pickle
+
+_JOBLIB_NUMPY_ARRAY_WRAPPER_REF = "joblib.numpy_pickle.NumpyArrayWrapper"
+_JOBLIB_NUMPY_ARRAY_REQUIRED_REFS = {
+    _JOBLIB_NUMPY_ARRAY_WRAPPER_REF,
+    "numpy.ndarray",
+    "numpy.dtype",
+}
+_JOBLIB_NUMPY_ARRAY_MODULE_PREFIXES = ("joblib.numpy_pickle", "numpy")
+_MAX_JOBLIB_ARRAY_ALIGNMENT_PADDING = 64
+_JOBLIB_TAIL_DANGER_SCAN_BYTES = 4096
+_JOBLIB_TAIL_DANGEROUS_SEEDS = (
+    b"\x80\x01",
+    b"\x80\x02",
+    b"\x80\x03",
+    b"\x80\x04",
+    b"\x80\x05",
+    b"cos\n",
+    b"cposix\n",
+    b"cnt\n",
+    b"subprocess",
+    b"os.system",
+    b"builtins",
+    b"eval",
+    b"exec",
+    b"pickle.loads",
+    b"marshal.loads",
+)
+
+
+def _has_trusted_joblib_numpy_array_refs(references: object) -> bool:
+    """Return True for the narrow benign import set used by Joblib numpy arrays."""
+    if not isinstance(references, list):
+        return False
+
+    observed_refs: set[str] = set()
+    for reference in references:
+        if not isinstance(reference, dict) or bool(reference.get("is_dangerous")):
+            return False
+        import_reference = reference.get("import_reference")
+        module = reference.get("module")
+        if not isinstance(import_reference, str) or not isinstance(module, str):
+            return False
+        if module not in _JOBLIB_NUMPY_ARRAY_MODULE_PREFIXES and not any(
+            module.startswith(f"{prefix}.") for prefix in _JOBLIB_NUMPY_ARRAY_MODULE_PREFIXES
+        ):
+            return False
+        observed_refs.add(import_reference)
+
+    return _JOBLIB_NUMPY_ARRAY_REQUIRED_REFS.issubset(observed_refs)
+
+
+def _parse_unknown_opcode_position(result: ScanResult) -> int | None:
+    for issue in result.issues:
+        if issue.rule_code != "S901" or issue.details.get("category") != "parse_error":
+            continue
+        position = _parse_position_from_exception(issue.details.get("parse_error"))
+        if position is not None:
+            return position
+
+    for check in result.checks:
+        if check.rule_code != "S902" or check.details.get("notice_code") != "parse_incomplete":
+            continue
+        position = _parse_position_from_exception(check.details.get("exception"))
+        if position is not None:
+            return position
+
+    return None
+
+
+def _parse_position_from_exception(exception: object) -> int | None:
+    if not isinstance(exception, str) or "at position " not in exception:
+        return None
+    position_text = exception.split("at position ", 1)[1].split(",", 1)[0]
+    try:
+        return int(position_text)
+    except ValueError:
+        return None
+
+
+def _looks_like_joblib_numpy_array_tail(tail: bytes) -> bool:
+    """Return True for Joblib's raw ndarray tail framing after NumpyArrayWrapper metadata."""
+    if not tail:
+        return False
+    padding_length = tail[0]
+    if padding_length > _MAX_JOBLIB_ARRAY_ALIGNMENT_PADDING or padding_length >= len(tail):
+        return False
+
+    padding = tail[1 : 1 + padding_length]
+    if padding != (b"\xff" * padding_length):
+        return False
+
+    raw_array_data = tail[1 + padding_length :]
+    if not raw_array_data:
+        return False
+    if _looks_like_pickle(raw_array_data):
+        return False
+
+    probe = raw_array_data[:_JOBLIB_TAIL_DANGER_SCAN_BYTES].lower()
+    return not any(seed in probe for seed in _JOBLIB_TAIL_DANGEROUS_SEEDS)
 
 
 class JoblibScanner(BaseScanner):
@@ -27,7 +128,7 @@ class JoblibScanner(BaseScanner):
     def __init__(self, config: dict[str, Any] | None = None):
         """Initialize Joblib scanning limits and the embedded Pickle scanner."""
         super().__init__(config)
-        self.pickle_scanner = PickleScanner(config=self.config)
+        self.pickle_scanner, self.scanner_selection = embedded_pickle_scanner(self.config, PickleScanner)
         # Security limits
         self.max_decompression_ratio = self.config.get("max_decompression_ratio", 100.0)
         self.max_decompressed_size = self.config.get(
@@ -135,6 +236,17 @@ class JoblibScanner(BaseScanner):
         self._detect_cve_patterns(payload, result, context)
         self._scan_for_joblib_specific_threats(payload, result, context)
 
+        if self.pickle_scanner is None:
+            add_scanner_selection_skip_check(
+                result,
+                context,
+                "pickle",
+                self.scanner_selection,
+                context="embedded joblib pickle analysis",
+            )
+            result.bytes_scanned = len(payload)
+            return
+
         with io.BytesIO(payload) as file_like:
             sub_result = self.pickle_scanner.scan_stream(
                 file_like,
@@ -142,7 +254,42 @@ class JoblibScanner(BaseScanner):
                 source=context,
             )
         result.merge(sub_result)
+        self._downgrade_embedded_pickle_parse_errors(result)
+        self._mark_trusted_numpy_wrapper_tail(result, payload)
         result.bytes_scanned = len(payload)
+
+    @staticmethod
+    def _downgrade_embedded_pickle_parse_errors(result: ScanResult) -> None:
+        for issue in result.issues:
+            if issue.rule_code == "S901" and issue.details.get("category") == "parse_error":
+                issue.severity = IssueSeverity.INFO
+        for check in result.checks:
+            if check.rule_code == "S901" and check.details.get("category") == "parse_error":
+                check.severity = IssueSeverity.INFO
+
+    @staticmethod
+    def _mark_trusted_numpy_wrapper_tail(result: ScanResult, payload: bytes) -> None:
+        if result.metadata.get("trusted_incomplete_tail") is True:
+            result.trust_merged_child_failures()
+            return
+        if result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME:
+            return
+        if result.metadata.get("failure_reason") != "unknown_opcode_or_format_error":
+            return
+        if any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues):
+            return
+        if not _has_trusted_joblib_numpy_array_refs(result.metadata.get("import_references")):
+            return
+
+        tail_start = _parse_unknown_opcode_position(result)
+        if tail_start is None or tail_start >= len(payload):
+            return
+        if not _looks_like_joblib_numpy_array_tail(payload[tail_start:]):
+            return
+
+        result.metadata["trusted_incomplete_tail"] = True
+        result.metadata["trusted_incomplete_tail_reason"] = "joblib_numpy_array_payload"
+        result.trust_merged_child_failures()
 
     def _looks_like_raw_pickle_payload(self, data: bytes) -> bool:
         """Return True when `.joblib` bytes should be scanned directly as pickle."""
@@ -426,7 +573,7 @@ class JoblibScanner(BaseScanner):
                         }
                     )
                 except Exception:
-                    pass
+                    metadata["model_parameters_unavailable"] = True
 
             # Check for common sklearn model attributes
             if hasattr(obj, "n_features_in_"):
@@ -444,15 +591,13 @@ class JoblibScanner(BaseScanner):
 
             if hasattr(obj, "feature_importances_"):
                 metadata["has_feature_importances"] = True
-                try:
+                with suppress(Exception):
                     importances = obj.feature_importances_
                     metadata["feature_importance_stats"] = {
                         "min": float(min(importances)),
                         "max": float(max(importances)),
                         "mean": float(sum(importances) / len(importances)),
                     }
-                except Exception:
-                    pass
             else:
                 metadata["has_feature_importances"] = False
 

@@ -69,6 +69,26 @@ _DANGEROUS_TARGETS = {
     "importlib.import_module",
     "pickle.loads",
     "pickle.load",
+    "cloudpickle.loads",
+    "cloudpickle.load",
+    "dill.loads",
+    "dill.load",
+    "joblib.load",
+    "sklearn.externals.joblib.load",
+    "keras.models.load_model",
+    "mlflow.pyfunc.load_model",
+    "pandas.read_pickle",
+    "tensorflow.keras.models.load_model",
+    "tensorflow.saved_model.load",
+    "tf.keras.models.load_model",
+    "torch.hub.load",
+    "torch.hub.load_state_dict_from_url",
+    "torch.jit.load",
+    "torch.load",
+    "torch.package.PackageImporter",
+    "torch.package.PackageImporter.load_pickle",
+    "torch.serialization.load",
+    "torch.utils.model_zoo.load_url",
     "shutil.rmtree",
     "pathlib.Path.unlink",
     "webbrowser.open",
@@ -126,8 +146,31 @@ def _find_suspicious_target_pattern(target: str) -> str | None:
     return None
 
 
+def _find_suspicious_safe_prefixed_target_pattern(target: str) -> str | None:
+    """Return a suspicious safe-prefixed callable leaf, if present."""
+    leaf = target.rsplit(".", maxsplit=1)[-1].lower()
+    if leaf in _SUSPICIOUS_TARGET_PATTERNS:
+        return leaf
+    for pattern in _SUSPICIOUS_TARGET_PATTERNS:
+        if leaf.startswith(pattern) and leaf[len(pattern) :].isdigit():
+            return pattern
+    return None
+
+
+def _is_runtime_truthy(value: Any) -> bool:
+    """Return whether a Hydra argument would be truthy when passed to Python."""
+    return bool(value)
+
+
 def _scan_result_has_security_findings(result: ScanResult) -> bool:
     return any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+def _get_nested_scanner_for_file(path: str, *, config: dict[str, Any]) -> BaseScanner | None:
+    """Resolve nested scanners lazily to avoid scanner registry import cycles."""
+    from modelaudit.scanners import get_scanner_for_file
+
+    return get_scanner_for_file(path, config=config)
 
 
 class NemoScanner(BaseScanner):
@@ -199,6 +242,7 @@ class NemoScanner(BaseScanner):
         message: str,
         location: str,
         details: dict[str, Any] | None = None,
+        severity: IssueSeverity = IssueSeverity.INFO,
     ) -> None:
         reasons = result.metadata.get(_INCONCLUSIVE_REASONS_METADATA_KEY)
         if not isinstance(reasons, list):
@@ -212,7 +256,7 @@ class NemoScanner(BaseScanner):
             name=check_name,
             passed=False,
             message=message,
-            severity=IssueSeverity.INFO,
+            severity=severity,
             location=location,
             details={"scan_outcome_reason": reason, **(details or {})},
         )
@@ -231,6 +275,7 @@ class NemoScanner(BaseScanner):
         """Extract and scan YAML configs from a NeMo tar archive."""
         yaml_configs_found = 0
         yaml_config_files_found = 0
+        scanned_member_entries: set[str] = set()
 
         with tarfile.open(path, "r:*") as tar:
             for member in tar:
@@ -290,6 +335,7 @@ class NemoScanner(BaseScanner):
                                         result,
                                         entry_name=member.name,
                                     )
+                                    scanned_member_entries.add(member.name)
                                 else:
                                     self._mark_inconclusive_scan_result(
                                         result,
@@ -319,12 +365,18 @@ class NemoScanner(BaseScanner):
                 if name_lower.endswith((".yaml", ".yml")):
                     yaml_config_files_found += 1
                     if member.size > self.MAX_CONFIG_SIZE:
-                        result.add_check(
-                            name="NeMo Config Size Check",
-                            passed=False,
+                        self._mark_inconclusive_scan_result(
+                            result,
+                            reason="nemo_config_size_limit",
+                            check_name="NeMo Config Size Check",
                             message=(f"Config file too large: {member.name} ({member.size} bytes)"),
-                            severity=IssueSeverity.WARNING,
                             location=f"{path}:{member.name}",
+                            severity=IssueSeverity.WARNING,
+                            details={
+                                "config_file": member.name,
+                                "size_bytes": member.size,
+                                "max_config_size": self.MAX_CONFIG_SIZE,
+                            },
                         )
                         continue
 
@@ -335,18 +387,37 @@ class NemoScanner(BaseScanner):
                         try:
                             raw = f.read(self.MAX_CONFIG_SIZE + 1)
                             if len(raw) > self.MAX_CONFIG_SIZE:
-                                result.add_check(
-                                    name="NeMo Config Size Check",
-                                    passed=False,
+                                self._mark_inconclusive_scan_result(
+                                    result,
+                                    reason="nemo_config_size_limit",
+                                    check_name="NeMo Config Size Check",
                                     message=(f"Config file too large: {member.name} ({len(raw)} bytes)"),
-                                    severity=IssueSeverity.WARNING,
                                     location=f"{path}:{member.name}",
+                                    severity=IssueSeverity.WARNING,
+                                    details={
+                                        "config_file": member.name,
+                                        "size_bytes": len(raw),
+                                        "max_config_size": self.MAX_CONFIG_SIZE,
+                                    },
                                 )
                                 continue
                             config = yaml.safe_load(raw)
                             if isinstance(config, dict | list):
                                 yaml_configs_found += 1
                                 self._check_hydra_targets(config, member.name, path, result)
+                                for config_path, referenced_member_name in self._collect_nemo_member_references(config):
+                                    if referenced_member_name in scanned_member_entries:
+                                        continue
+                                    referenced_member_scanned = self._scan_config_referenced_member(
+                                        tar,
+                                        referenced_member_name,
+                                        path,
+                                        result,
+                                        config_file=member.name,
+                                        config_path=config_path,
+                                    )
+                                    if referenced_member_scanned:
+                                        scanned_member_entries.add(referenced_member_name)
                             else:
                                 self._mark_inconclusive_scan_result(
                                     result,
@@ -375,7 +446,10 @@ class NemoScanner(BaseScanner):
                             )
 
                 if name_lower.endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS)):
+                    if member.name in scanned_member_entries:
+                        continue
                     self._scan_checkpoint_member(tar, member, path, result)
+                    scanned_member_entries.add(member.name)
 
         if yaml_configs_found == 0:
             message = (
@@ -383,13 +457,22 @@ class NemoScanner(BaseScanner):
                 if yaml_config_files_found == 0
                 else "No analyzable YAML configuration found in NeMo archive"
             )
-            result.add_check(
-                name="NeMo Config Presence",
-                passed=False,
-                message=message,
-                severity=IssueSeverity.INFO,
-                location=path,
-            )
+            if yaml_config_files_found == 0:
+                self._mark_inconclusive_scan_result(
+                    result,
+                    reason="nemo_config_missing",
+                    check_name="NeMo Config Presence",
+                    message=message,
+                    location=path,
+                )
+            else:
+                result.add_check(
+                    name="NeMo Config Presence",
+                    passed=False,
+                    message=message,
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                )
         else:
             result.add_check(
                 name="NeMo Config Presence",
@@ -508,9 +591,7 @@ class NemoScanner(BaseScanner):
             return
 
         try:
-            from modelaudit.scanners import get_scanner_for_file
-
-            scanner = get_scanner_for_file(extracted_path, config=dict(self.config))
+            scanner = _get_nested_scanner_for_file(extracted_path, config=dict(self.config))
             if scanner is None:
                 self._mark_inconclusive_scan_result(
                     result,
@@ -558,6 +639,177 @@ class NemoScanner(BaseScanner):
                 os.unlink(extracted_path)
             except OSError:
                 logger.debug("Failed to remove temporary NeMo checkpoint scan file: %s", extracted_path)
+
+    def _scan_config_referenced_member(
+        self,
+        tar: tarfile.TarFile,
+        referenced_member_name: str,
+        archive_path: str,
+        result: ScanResult,
+        *,
+        config_file: str,
+        config_path: str,
+    ) -> bool:
+        """Scan `nemo:`-referenced archive members through content-based nested dispatch."""
+        try:
+            member = tar.getmember(referenced_member_name)
+        except KeyError:
+            return False
+
+        if member.issym() or member.islnk():
+            resolved_name = self._resolve_archive_link_member_name(member)
+            if resolved_name is None:
+                return False
+            try:
+                member = tar.getmember(resolved_name)
+            except KeyError:
+                return False
+
+        if not member.isfile():
+            return False
+
+        max_scan_bytes = self._normalize_positive_int_config(
+            self.config.get("max_nemo_checkpoint_scan_bytes"),
+            NEMO_MAX_CHECKPOINT_SCAN_BYTES,
+        )
+        if member.size > max_scan_bytes:
+            self._mark_inconclusive_scan_result(
+                result,
+                reason="nemo_checkpoint_scan_skipped_size_limit",
+                check_name="NeMo Checkpoint Nested Scan",
+                message=f"Referenced member exceeds nested scan limit: {referenced_member_name}",
+                location=f"{archive_path}:{referenced_member_name}",
+                details={
+                    "entry": referenced_member_name,
+                    "source_entry": member.name,
+                    "config_file": config_file,
+                    "config_path": config_path,
+                    "size_bytes": member.size,
+                    "max_scan_bytes": max_scan_bytes,
+                },
+            )
+            return True
+
+        extracted_path = self._extract_member_to_tempfile(tar, member, suffix_source=referenced_member_name)
+        if extracted_path is None:
+            self._mark_inconclusive_scan_result(
+                result,
+                reason="nemo_checkpoint_extract_failed",
+                check_name="NeMo Checkpoint Nested Scan",
+                message=f"Could not extract referenced member for nested scan: {referenced_member_name}",
+                location=f"{archive_path}:{referenced_member_name}",
+                details={
+                    "entry": referenced_member_name,
+                    "source_entry": member.name,
+                    "config_file": config_file,
+                    "config_path": config_path,
+                },
+            )
+            return True
+
+        try:
+            from .archive_dispatch import scan_nested_file
+
+            try:
+                nested_result = scan_nested_file(extracted_path, config=dict(self.config))
+            except Exception as exc:
+                self._mark_inconclusive_scan_result(
+                    result,
+                    reason="nemo_referenced_nested_scan_failed",
+                    check_name="NeMo Checkpoint Nested Scan",
+                    message=f"Nested scan failed for referenced member {referenced_member_name}: {exc!s}",
+                    location=f"{archive_path}:{referenced_member_name}",
+                    details={
+                        "entry": referenced_member_name,
+                        "source_entry": member.name,
+                        "config_file": config_file,
+                        "config_path": config_path,
+                        "exception_type": type(exc).__name__,
+                        "exception_message": str(exc),
+                    },
+                )
+                return True
+
+            critical_issues = [
+                issue
+                for issue in nested_result.issues
+                if issue.severity == IssueSeverity.CRITICAL and self._is_nested_checkpoint_deserialization_issue(issue)
+            ]
+            if critical_issues:
+                self._add_checkpoint_deserialization_check(
+                    result,
+                    archive_path=archive_path,
+                    entry=referenced_member_name,
+                    nested_scanner=nested_result.scanner_name,
+                    critical_issues=critical_issues,
+                    extra_details={
+                        "config_file": config_file,
+                        "config_path": config_path,
+                        "source_entry": member.name,
+                    },
+                )
+            return True
+        finally:
+            try:
+                os.unlink(extracted_path)
+            except OSError:
+                logger.debug("Failed to remove temporary NeMo referenced scan file: %s", extracted_path)
+
+    @classmethod
+    def _collect_nemo_member_references(
+        cls,
+        config: Any,
+        path_prefix: str = "",
+    ) -> list[tuple[str, str]]:
+        """Collect internal `nemo:` artifact references from a parsed config."""
+        collected: list[tuple[str, str]] = []
+
+        if isinstance(config, list):
+            for index, item in enumerate(config):
+                collected.extend(
+                    cls._collect_nemo_member_references(
+                        item,
+                        f"{path_prefix}[{index}]" if path_prefix else f"[{index}]",
+                    )
+                )
+            return collected
+
+        if isinstance(config, dict):
+            for key, value in config.items():
+                current_path = f"{path_prefix}.{key}" if path_prefix else key
+                collected.extend(cls._collect_nemo_member_references(value, current_path))
+            return collected
+
+        if isinstance(config, str):
+            member_name = cls._extract_nemo_member_reference(config)
+            if member_name is not None:
+                return [(path_prefix or "$", member_name)]
+
+        return []
+
+    @staticmethod
+    def _extract_nemo_member_reference(value: str) -> str | None:
+        normalized = value.strip()
+        if not normalized or ":" not in normalized:
+            return None
+
+        scheme, member_name = normalized.split(":", 1)
+        if scheme.lower() != "nemo":
+            return None
+
+        member_name = member_name.strip().replace("\\", "/")
+        if not member_name:
+            return None
+
+        normalized_member = os.path.normpath(member_name).replace("\\", "/")
+        if (
+            normalized_member in {"", ".", ".."}
+            or normalized_member.startswith("../")
+            or is_absolute_archive_path(normalized_member)
+        ):
+            return None
+
+        return normalized_member.lstrip("./")
 
     @staticmethod
     def _is_nested_checkpoint_deserialization_issue(issue: Any) -> bool:
@@ -619,6 +871,7 @@ class NemoScanner(BaseScanner):
         entry: str,
         nested_scanner: str,
         critical_issues: list[Any],
+        extra_details: dict[str, Any] | None = None,
     ) -> None:
         result.add_check(
             name="CVE-2025-23249: NeMo Checkpoint Unsafe Deserialization",
@@ -646,6 +899,7 @@ class NemoScanner(BaseScanner):
                     "Update NVIDIA NeMo Framework to release 25.02 or later, keep current with subsequent "
                     "checkpoint-loading fixes, and reject untrusted checkpoint payloads."
                 ),
+                **(extra_details or {}),
             },
             why=(
                 "A nested scanner found critical unsafe-deserialization behavior inside a checkpoint bundled "
@@ -681,7 +935,7 @@ class NemoScanner(BaseScanner):
             current_path = f"{path_prefix}.{key}" if path_prefix else key
 
             if key == "_target_" and isinstance(value, str):
-                self._evaluate_target(value, current_path, config_name, archive_path, result)
+                self._evaluate_target(value, current_path, config_name, archive_path, result, config)
             elif isinstance(value, dict | list):
                 self._check_hydra_targets(value, config_name, archive_path, result, current_path)
 
@@ -692,10 +946,11 @@ class NemoScanner(BaseScanner):
         config_name: str,
         archive_path: str,
         result: ScanResult,
+        target_config: dict[str, Any] | None = None,
     ) -> None:
         """Evaluate a single _target_ value for dangerous patterns."""
         # Check against known dangerous targets (always flag, even if safe prefix)
-        if target in _DANGEROUS_TARGETS:
+        if target in _DANGEROUS_TARGETS or (target == "numpy.load" and self._numpy_load_allows_pickle(target_config)):
             result.add_check(
                 name=f"{CVE_2025_23304_ID}: Dangerous Hydra _target_",
                 passed=False,
@@ -722,9 +977,19 @@ class NemoScanner(BaseScanner):
             )
             return
 
-        # Check safe prefixes BEFORE suspicious patterns to avoid
-        # false positives on legitimate targets like nemo.eval_utils
+        # Trusted namespaces can still hide obviously dangerous leaf names.
         if any(target.startswith(prefix) for prefix in _SAFE_TARGET_PREFIXES):
+            pattern = _find_suspicious_safe_prefixed_target_pattern(target)
+            if pattern is not None:
+                self._add_suspicious_target_check(
+                    target,
+                    pattern,
+                    config_path,
+                    config_name,
+                    archive_path,
+                    result,
+                )
+                return
             result.add_check(
                 name="Hydra _target_ Safety Check",
                 passed=True,
@@ -737,28 +1002,7 @@ class NemoScanner(BaseScanner):
         # Check for suspicious patterns in target (only for non-safe targets)
         pattern = _find_suspicious_target_pattern(target)
         if pattern is not None:
-            result.add_check(
-                name=f"{CVE_2025_23304_ID}: Suspicious Hydra _target_",
-                passed=False,
-                message=(
-                    f"{CVE_2025_23304_ID}: Suspicious _target_ "
-                    f"'{target}' (contains '{pattern}') at "
-                    f"{config_path} in {config_name}"
-                ),
-                severity=IssueSeverity.CRITICAL,
-                location=f"{archive_path}:{config_name}",
-                details={
-                    "target": target,
-                    "pattern": pattern,
-                    "config_path": config_path,
-                    "config_file": config_name,
-                    "cve_id": CVE_2025_23304_ID,
-                    "cvss": CVE_2025_23304_CVSS,
-                    "cwe": CVE_2025_23304_CWE,
-                    "description": CVE_2025_23304_DESCRIPTION,
-                    "remediation": CVE_2025_23304_REMEDIATION,
-                },
-            )
+            self._add_suspicious_target_check(target, pattern, config_path, config_name, archive_path, result)
             return
 
         # Unknown target - flag for review
@@ -774,3 +1018,50 @@ class NemoScanner(BaseScanner):
                 "config_file": config_name,
             },
         )
+
+    def _add_suspicious_target_check(
+        self,
+        target: str,
+        pattern: str,
+        config_path: str,
+        config_name: str,
+        archive_path: str,
+        result: ScanResult,
+    ) -> None:
+        result.add_check(
+            name=f"{CVE_2025_23304_ID}: Suspicious Hydra _target_",
+            passed=False,
+            message=(
+                f"{CVE_2025_23304_ID}: Suspicious _target_ "
+                f"'{target}' (contains '{pattern}') at "
+                f"{config_path} in {config_name}"
+            ),
+            severity=IssueSeverity.CRITICAL,
+            location=f"{archive_path}:{config_name}",
+            details={
+                "target": target,
+                "pattern": pattern,
+                "config_path": config_path,
+                "config_file": config_name,
+                "cve_id": CVE_2025_23304_ID,
+                "cvss": CVE_2025_23304_CVSS,
+                "cwe": CVE_2025_23304_CWE,
+                "description": CVE_2025_23304_DESCRIPTION,
+                "remediation": CVE_2025_23304_REMEDIATION,
+            },
+        )
+
+    @staticmethod
+    def _numpy_load_allows_pickle(target_config: dict[str, Any] | None) -> bool:
+        """Return whether a Hydra numpy.load target enables pickle loading."""
+        if not isinstance(target_config, dict):
+            return False
+
+        if "allow_pickle" in target_config:
+            return _is_runtime_truthy(target_config["allow_pickle"])
+
+        positional_args = target_config.get("_args_")
+        if isinstance(positional_args, list) and len(positional_args) >= 3:
+            return _is_runtime_truthy(positional_args[2])
+
+        return False

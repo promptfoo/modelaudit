@@ -19,7 +19,7 @@ from modelaudit.cache.optimized_config import (
 )
 from modelaudit.cache.scan_results_cache import ScanResultsCache
 from modelaudit.config.rule_config import ModelAuditConfig, get_config, reset_config, set_config
-from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, ScanResult
 from modelaudit.utils.helpers.cache_decorator import cached_scan
 
 
@@ -210,6 +210,57 @@ def test_cached_scan_skips_persisting_incomplete_metadata(
 
     assert first["scan_count"] == 1
     assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+def test_cached_scan_skips_persisting_bare_unsuccessful_results(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        calls["count"] += 1
+        return {
+            "checks": [],
+            "issues": [],
+            "success": False,
+            "scan_count": calls["count"],
+        }
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert first["scan_count"] == 1
+    assert second["scan_count"] == 2
+    assert calls["count"] == 2
+    assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+
+
+def test_cached_scan_normalizes_and_skips_persisting_bare_unsuccessful_scan_result(tmp_path: Path) -> None:
+    file_path = _make_cacheable_file(tmp_path)
+    cache_dir = tmp_path / "cache"
+    config = {"cache_enabled": True, "cache_dir": str(cache_dir)}
+    calls = {"count": 0}
+
+    @cached_scan()
+    def scan(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        calls["count"] += 1
+        result = ScanResult(scanner_name="numpy")
+        result.finish(success=False)
+        return result
+
+    first = scan(str(file_path), config)
+    second = scan(str(file_path), config)
+
+    assert isinstance(first, ScanResult)
+    assert isinstance(second, ScanResult)
+    assert first.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert second.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert first.metadata["scan_outcome_reasons"] == ["scanner_reported_unsuccessful_without_outcome"]
+    assert second.metadata["scan_outcome_reasons"] == ["scanner_reported_unsuccessful_without_outcome"]
     assert calls["count"] == 2
     assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
 
@@ -483,7 +534,7 @@ def test_batch_store_counts_only_persisted_results(tmp_path: Path, monkeypatch: 
     batch_ops = BatchCacheOperations(cache_manager)
 
     assert cache_manager.cache is not None
-    monkeypatch.setattr(cache_manager.cache, "_generate_cache_key", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cache_manager.cache, "_generate_cache_key_material", lambda *args, **kwargs: (None, None))
 
     stored_count = batch_ops.batch_store(
         [
@@ -562,6 +613,31 @@ def test_cache_key_generation_avoids_full_hash_for_medium_files(
     cache_key = cache.generate_cache_key(str(file_path), version_context=build_cache_version_context({"timeout": 30}))
 
     assert cache_key is not None
+
+
+def test_large_file_store_reuses_cache_key_content_hash(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    file_path = _make_cacheable_file(tmp_path, name="large.bin")
+    file_path.write_bytes(b"x" * (11 * 1024 * 1024))
+    cache = ScanResultsCache(str(tmp_path / "scan-cache"))
+    version_context = build_cache_version_context({"timeout": 30})
+    expected_hash = "secure:" + ("a" * 64)
+    expected = {"checks": [], "issues": [], "metadata": {}, "scanner": "test", "success": True}
+
+    monkeypatch.setattr(cache.key_generator.hasher, "hash_file", lambda _path: expected_hash)
+
+    def fail_hash(_path: str, _stat: os.stat_result) -> str:
+        raise AssertionError("large-file cache store should reuse the cache-key content hash")
+
+    monkeypatch.setattr(cache.hasher, "hash_file_with_stat", fail_hash)
+
+    assert cache.store_result(str(file_path), expected, 10, version_context=version_context) is True
+
+    cache_key = cache.generate_cache_key(str(file_path), version_context=version_context)
+    assert cache_key is not None
+    cache_file_path = cache._get_cache_file_path(cache_key)
+    cache_entry = json.loads(cache_file_path.read_text(encoding="utf-8"))
+
+    assert cache_entry["file_info"]["hash"] == expected_hash
 
 
 def test_same_size_rewrite_with_high_resolution_mtime_invalidates_cache(tmp_path: Path) -> None:

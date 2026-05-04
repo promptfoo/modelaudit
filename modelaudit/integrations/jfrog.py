@@ -7,11 +7,17 @@ import logging
 import shutil
 import tempfile
 import time
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any
 
 from ..models import ModelAuditResultModel
-from ..utils.sources.jfrog import detect_jfrog_target_type, download_artifact, download_jfrog_folder
+from ..utils.sources.jfrog import (
+    detect_jfrog_target_type,
+    download_artifact,
+    download_jfrog_folder,
+    redact_jfrog_url_for_display,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +45,7 @@ def scan_jfrog_artifact(
     max_file_size: int = 0,
     max_total_size: int = 0,
     selective_download: bool = True,
+    scannable_extensions: Collection[str] | None = None,
     **kwargs: Any,
 ) -> ModelAuditResultModel:
     """Download and scan an artifact or folder from JFrog Artifactory.
@@ -93,10 +100,11 @@ def scan_jfrog_artifact(
     scan_cache_dir = str(Path(raw_cache_dir).expanduser()) if cache_enabled and raw_cache_dir else None
     download_dir, cleanup_download_dir = _prepare_download_dir(url, scan_cache_dir)
     start_time = time.time()
+    display_url = redact_jfrog_url_for_display(url)
 
     try:
         # Detect if URL points to a file or folder
-        logger.debug(f"Analyzing JFrog target {url}")
+        logger.debug(f"Analyzing JFrog target {display_url}")
         target_info = detect_jfrog_target_type(
             url,
             api_token=api_token,
@@ -105,7 +113,7 @@ def scan_jfrog_artifact(
         )
 
         if target_info["type"] == "file":
-            logger.debug(f"Downloading JFrog file {url} to {download_dir}")
+            logger.debug(f"Downloading JFrog file {display_url} to {download_dir}")
             download_path = download_artifact(
                 url,
                 cache_dir=download_dir,
@@ -114,7 +122,10 @@ def scan_jfrog_artifact(
                 timeout=timeout,
             )
         else:
-            logger.debug(f"Downloading JFrog folder {url} to {download_dir}")
+            logger.debug(f"Downloading JFrog folder {display_url} to {download_dir}")
+            folder_download_kwargs: dict[str, Any] = {}
+            if scannable_extensions is not None:
+                folder_download_kwargs["scannable_extensions"] = scannable_extensions
             download_path = download_jfrog_folder(
                 url,
                 cache_dir=download_dir,
@@ -123,6 +134,7 @@ def scan_jfrog_artifact(
                 timeout=timeout,
                 selective=selective_download,
                 show_progress=True,
+                **folder_download_kwargs,
             )
 
         # Calculate remaining timeout for scanning phase
@@ -153,7 +165,7 @@ def scan_jfrog_artifact(
 
         # Add JFrog source information
         result.metadata["jfrog_source"] = {  # type: ignore[attr-defined]
-            "url": url,
+            "url": display_url,
             "type": target_info["type"],
             "repo": target_info.get("repo", ""),
         }

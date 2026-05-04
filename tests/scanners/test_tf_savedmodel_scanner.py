@@ -1,5 +1,6 @@
 import base64
 import pickle
+import shutil
 from pathlib import Path
 from typing import Any, Protocol, TypedDict
 
@@ -7,7 +8,7 @@ import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import IssueSeverity
-from modelaudit.scanners.tf_savedmodel_scanner import TensorFlowSavedModelScanner
+from modelaudit.scanners.tf_savedmodel_scanner import _ASSET_PROBE_BYTES, TensorFlowSavedModelScanner
 from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as has_tf_protos
 
@@ -63,6 +64,18 @@ def test_tf_savedmodel_scanner_can_handle(tmp_path: Path) -> None:
         assert TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is False
         assert TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
         assert TensorFlowSavedModelScanner.can_handle(str(test_file)) is False
+
+
+def test_suspicious_function_name_reuses_precompiled_patterns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Function-name matching should not rebuild static regexes per call."""
+
+    def fail_compile(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("unexpected regex compilation")
+
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner.re.compile", fail_compile)
+
+    assert TensorFlowSavedModelScanner._match_suspicious_function_name("safe_function_name") is None
+    assert TensorFlowSavedModelScanner._match_suspicious_function_name("module.eval") == "eval"
 
 
 def create_tf_savedmodel(tmp_path: Path, *, malicious: bool = False) -> Path:
@@ -596,6 +609,139 @@ def test_savedmodel_assets_benign_text_file_passes(tmp_path: Path) -> None:
     asset_checks = [check for check in result.checks if check.name == "SavedModel Assets Security Check"]
 
     assert asset_checks == []
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_root_sibling_pickle_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    sibling_path = model_dir / "payload.dat"
+    sibling_path.write_bytes(_build_protocol1_pickle_payload())
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    matching_checks = [
+        check
+        for check in result.checks
+        if check.name == "SavedModel Supplemental File Security Check" and check.location == str(sibling_path)
+    ]
+
+    assert matching_checks
+    assert all(check.severity == IssueSeverity.WARNING for check in matching_checks)
+    assert any("pickle_payload" in check.details.get("detected_content_type", "") for check in matching_checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_reserved_root_dir_name_file_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    sibling_path = model_dir / "assets.extra"
+    sibling_path.write_bytes(_build_protocol1_pickle_payload())
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    matching_checks = [
+        check
+        for check in result.checks
+        if check.name == "SavedModel Supplemental File Security Check" and check.location == str(sibling_path)
+    ]
+
+    assert matching_checks
+    assert any("pickle_payload" in check.details.get("detected_content_type", "") for check in matching_checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_root_sibling_benign_text_stays_clean(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    sibling_path = model_dir / "README.txt"
+    sibling_path.write_text("model notes only\n", encoding="utf-8")
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+
+    assert not [
+        check
+        for check in result.checks
+        if check.name == "SavedModel Supplemental File Security Check" and check.location == str(sibling_path)
+    ]
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_root_sibling_directory_pickle_is_flagged(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    sibling_path = model_dir / "supplemental" / "payload.dat"
+    sibling_path.parent.mkdir()
+    sibling_path.write_bytes(_build_protocol1_pickle_payload())
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    matching_checks = [
+        check
+        for check in result.checks
+        if check.name == "SavedModel Supplemental File Security Check" and check.location == str(sibling_path)
+    ]
+
+    assert matching_checks
+    assert any("pickle_payload" in check.details.get("detected_content_type", "") for check in matching_checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_reserved_root_dir_name_symlink_is_reported(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    target_path = model_dir / "payload.dat"
+    target_path.write_bytes(_build_protocol1_pickle_payload())
+    sibling_path = model_dir / "variables"
+    shutil.rmtree(sibling_path)
+    sibling_path.symlink_to(target_path.name)
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    matching_checks = [
+        check
+        for check in result.checks
+        if check.name == "SavedModel Supplemental File Security Check" and check.location == str(sibling_path)
+    ]
+
+    assert matching_checks
+    assert all("symlink supplemental file" in check.message.lower() for check in matching_checks)
+    assert all(check.details.get("detected_content_type") == "unscannable_asset" for check in matching_checks)
+    assert all(check.details.get("asset_kind") == "symlink" for check in matching_checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_root_sibling_directory_symlink_is_reported_without_traversal(
+    tmp_path: Path,
+    requires_symlinks: None,
+) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    external_dir = tmp_path / "outside"
+    external_dir.mkdir()
+    (external_dir / "payload.dat").write_bytes(_build_protocol1_pickle_payload())
+    sibling_path = model_dir / "supplemental"
+    sibling_path.symlink_to(external_dir, target_is_directory=True)
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+    matching_checks = [
+        check
+        for check in result.checks
+        if check.name == "SavedModel Supplemental File Security Check" and check.location == str(sibling_path)
+    ]
+
+    assert matching_checks
+    assert all("symlink supplemental file" in check.message.lower() for check in matching_checks)
+    assert all(check.details.get("detected_content_type") == "unscannable_asset" for check in matching_checks)
+    assert all(check.details.get("asset_kind") == "symlink" for check in matching_checks)
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_savedmodel_large_unclassified_asset_marks_scan_inconclusive(tmp_path: Path) -> None:
+    model_dir = Path(create_tf_savedmodel(tmp_path))
+    asset_path = model_dir / "assets" / "large.dat"
+    asset_path.write_bytes(b"A" * (_ASSET_PROBE_BYTES + 1))
+
+    result = TensorFlowSavedModelScanner().scan(str(model_dir))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    probe_checks = [check for check in result.checks if check.name == "SavedModel Asset Probe Limit"]
+    assert len(probe_checks) == 1
+    assert probe_checks[0].details["analysis_incomplete"] is True
 
 
 @pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")

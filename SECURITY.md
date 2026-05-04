@@ -17,7 +17,7 @@ A security vulnerability is any bug that threatens the safety of ModelAudit user
 **Not considered a vulnerability:**
 
 - Malicious content that ModelAudit **correctly detects** — that is working as designed.
-- False positives and **non-security** false negatives (for example, a new malware variant, signature gap, obfuscation technique not yet covered, or heuristic that needs tuning) — these are detection quality issues. Report them via [GitHub Issues](https://github.com/promptfoo/modelaudit/issues) using the bug report template, or see [CONTRIBUTING.md](CONTRIBUTING.md) for guidance. A false negative becomes a security vulnerability only when it materially defeats a documented security guarantee, common malicious-model attack class, or enforcement boundary that users reasonably rely on. Narrow misses in niche formats or runtime-specific paths may still be accepted privately during triage, but they are not automatically High severity and may be closed as detection-quality improvements if the practical security impact is low.
+- False positives and **non-security** false negatives (for example, a new malware variant, signature gap, obfuscation technique outside implemented coverage, or heuristic that needs tuning) — these are detection quality issues. Report them via [GitHub Issues](https://github.com/promptfoo/modelaudit/issues) using the bug report template, or see [CONTRIBUTING.md](CONTRIBUTING.md) for guidance. A false negative becomes a security vulnerability only when it materially defeats a documented security guarantee, common malicious-model attack class, or enforcement boundary that users reasonably rely on. Narrow misses in niche formats or runtime-specific paths may still be accepted privately during triage, but they are not automatically High severity and may be closed as detection-quality improvements if the practical security impact is low.
 - Bugs in third-party dependencies that are not reachable through ModelAudit's own code paths — report those to the respective upstream maintainers.
 - Issues that require the attacker to already have equivalent privilege on the scanning host **and** do not enable privilege escalation, lateral movement, persistence, or additional data access. (Bugs exploitable in shared CI runners or multi-tenant environments where the attacker starts with limited access are in scope.)
 
@@ -94,7 +94,7 @@ If a fix requires longer than the default window, we will negotiate an extension
 
 ## When we issue CVEs
 
-We request CVE IDs through [GitHub's CVE Numbering Authority (CNA)](https://docs.github.com/en/code-security/security-advisories/working-with-repository-security-advisories/about-github-security-advisories-for-repositories) program. Not every security fix warrants a CVE.
+We request CVE IDs through [GitHub's CVE Numbering Authority (CNA)](https://docs.github.com/code-security/security-advisories/repository-security-advisories/about-repository-security-advisories) program. Not every security fix warrants a CVE.
 
 **CVE issued:**
 
@@ -123,6 +123,7 @@ When in doubt, we err toward issuing a CVE.
 **In scope:**
 
 - The `modelaudit` Python package published on [PyPI](https://pypi.org/project/modelaudit/).
+- The `modelaudit-picklescan` Python package published on [PyPI](https://pypi.org/project/modelaudit-picklescan/), including its bundled Rust pickle engine.
 - The official Docker images.
 - The GitHub Actions CI/CD workflows in the [modelaudit repository](https://github.com/promptfoo/modelaudit).
 
@@ -145,11 +146,13 @@ We recommend always upgrading to the latest version. See the [CHANGELOG](CHANGEL
 
 ## Coordinated disclosure
 
-After a fix is released, we will:
+After a fix is released for a CVE/advisory-eligible vulnerability, we will:
 
 1. **Publish a GitHub Security Advisory** with CVE ID, affected and patched versions, CVSS score, and a description of the vulnerability and its impact.
 2. **Credit the reporter** in the advisory and CHANGELOG, unless you prefer anonymity.
 3. **Include the fix** in the `### Security` section of the [CHANGELOG](CHANGELOG.md).
+
+For reports triaged as detection-quality improvements, heuristic/signature gaps, or narrow low-impact scanner coverage misses, we may close the private report without publishing a GitHub Security Advisory or requesting a CVE. In those cases, we will still thank the reporter and provide appropriate public credit in release notes or acknowledgments unless they prefer anonymity.
 
 ## Safe harbor
 

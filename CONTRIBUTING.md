@@ -6,9 +6,10 @@ Thank you for your interest in contributing to ModelAudit! This guide will help 
 
 ### Prerequisites
 
-- Python 3.10 or higher
+- Python 3.10-3.13
 - uv (recommended) or pip
 - Git
+- Rust 1.83+ toolchain with `cargo`, `rustfmt`, and `clippy`; editable installs build the native pickle scanner extension
 
 ### Setup
 
@@ -23,7 +24,7 @@ uv sync --extra all
 # Windows (lighter optional set)
 uv sync --extra all-ci-windows
 
-# Or with pip
+# Or with pip (also requires the Rust toolchain above)
 pip install -e .[all]
 ```
 
@@ -32,7 +33,7 @@ pip install -e .[all]
 **Install and test your local development version:**
 
 ```bash
-# Option 1: Install in development mode with pip
+# Option 1: Install in development mode with pip (also requires the Rust toolchain above)
 pip install -e .[all]
 
 # Then test the CLI directly (both forms work: "modelaudit <path>" or "modelaudit scan <path>")
@@ -84,7 +85,7 @@ uv run pytest -n auto -x --tb=short
 uv run pytest -n auto --cov=modelaudit
 
 # SPECIFIC - Test individual files or patterns
-uv run pytest tests/test_pickle_scanner.py -n auto -v
+uv run pytest tests/scanners/test_pickle_scanner.py -n auto -v
 uv run pytest -k "test_scanner" -n auto
 
 # PERFORMANCE - Profile slow tests
@@ -95,12 +96,18 @@ uv run pytest --durations=10 --tb=no
 
 ```bash
 # Run linting and formatting with Ruff
-uv run ruff check modelaudit/ tests/           # Check code
-uv run ruff check --fix modelaudit/ tests/     # Automatically fix lint issues
-uv run ruff format modelaudit/ tests/          # Format code
+uv run ruff check modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+uv run ruff check --fix modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+uv run ruff format modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
 
 # Type checking
-uv run mypy modelaudit/
+uv run mypy modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+
+# Standalone Rust pickle scanner
+cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check
+cargo check --manifest-path packages/modelaudit-picklescan/Cargo.toml
+cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
 
 # Build package
 uv build
@@ -183,6 +190,7 @@ We use [Conventional Commits](https://www.conventionalcommits.org/) format:
 
 ```
 modelaudit/
+├── packages/modelaudit-picklescan/ # Standalone Rust-backed pickle scanner package
 ├── modelaudit/           # Main package
 │   ├── scanners/         # Scanner implementations (one per format)
 │   ├── utils/            # Utility modules
@@ -207,8 +215,8 @@ For the security-focused implementation checklist, see `docs/agents/new-scanner-
 
 ### Code Style
 
-- Follow PEP 8 style guidelines
-- Use type hints where appropriate
+- Use Ruff for Python formatting/import organization and Rustfmt for Rust formatting
+- Use type hints for Python code and keep mypy clean
 - Write descriptive docstrings
 - Keep functions focused and small
 - Add comments for complex logic
@@ -229,14 +237,18 @@ For the security-focused implementation checklist, see `docs/agents/new-scanner-
 uv run pytest -n auto --cov=modelaudit --cov-report=html
 
 # Check for type errors
-uv run mypy modelaudit/
+uv run mypy modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
 
 # Format and lint code
-uv run ruff format modelaudit/ tests/
-uv run ruff check --fix modelaudit/ tests/
+uv run ruff format modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+uv run ruff check --fix modelaudit/ packages/modelaudit-picklescan/src packages/modelaudit-picklescan/tests tests/
+
+# Check the standalone Rust pickle scanner
+cargo fmt --manifest-path packages/modelaudit-picklescan/Cargo.toml -- --check
+cargo clippy --manifest-path packages/modelaudit-picklescan/Cargo.toml --all-targets -- -D warnings
 
 # Quick development test cycle
-uv run pytest -n auto -m "not slow and not integration" -x
+PROMPTFOO_DISABLE_TELEMETRY=1 uv run pytest -n auto -m "not slow and not integration" -x
 
 # Create test models for specific formats
 python -c "import torch; torch.save({'model': 'data'}, 'test.pt')"

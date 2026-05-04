@@ -6,9 +6,9 @@ import sys
 import warnings
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
-from .base import BaseScanner, Check, Issue, IssueSeverity, ScanResult
+from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, Issue, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
-from .pickle_support import _finish_with_inconclusive_contract, _mark_inconclusive_scan_result
 
 # Import NumPy with compatibility handling
 try:
@@ -43,6 +43,18 @@ except ImportError:
         fmt = None  # type: ignore[assignment]
 
 
+def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
+    result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    reasons = result.metadata.setdefault("scan_outcome_reasons", [])
+    if isinstance(reasons, list) and reason not in reasons:
+        reasons.append(reason)
+    result.metadata["analysis_incomplete"] = True
+
+
+def _finish_with_inconclusive_contract(result: ScanResult, *, default_success: bool) -> None:
+    result.finish(success=default_success and not result.has_errors)
+
+
 class NumPyScanner(BaseScanner):
     """Scanner for NumPy binary files (.npy) with cross-version compatibility."""
 
@@ -52,6 +64,7 @@ class NumPyScanner(BaseScanner):
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
+        self.scanner_selection = policy_from_config(self.config)
         # Security limits
         self.max_array_bytes = self.config.get(
             "max_array_bytes",
@@ -97,6 +110,19 @@ class NumPyScanner(BaseScanner):
         context_path: str,
     ) -> ScanResult:
         """Reuse PickleScanner analysis for object-dtype NumPy payloads."""
+        if not self.scanner_selection.allows("pickle"):
+            result = ScanResult(scanner_name="scanner_selection")
+            result.bytes_scanned = payload_size
+            add_scanner_selection_skip_check(
+                result,
+                context_path,
+                "pickle",
+                self.scanner_selection,
+                context="embedded NumPy object pickle analysis",
+            )
+            result.finish(success=True)
+            return result
+
         pickle_scanner = PickleScanner(config=self.config)
         return pickle_scanner.scan_stream(
             file_obj,
@@ -381,7 +407,7 @@ class NumPyScanner(BaseScanner):
                                     },
                                 )
                                 _mark_inconclusive_scan_result(result, "numpy_object_pickle_trailing_bytes")
-                                _finish_with_inconclusive_contract(result, default_success=True)
+                                _finish_with_inconclusive_contract(result, default_success=False)
                                 return result
 
                             result.issues.extend(embedded_result.issues)
@@ -390,24 +416,50 @@ class NumPyScanner(BaseScanner):
                             # Object-dtype .npy payloads are stored as a pickle stream rather than
                             # fixed-width element data, so the numeric dtype/size validation path
                             # is not applicable after we recurse into the embedded pickle payload.
+                            pickle_scan_skipped = embedded_result.scanner_name == "scanner_selection"
                             result.add_check(
                                 name="Data Type Safety Check",
                                 passed=True,
-                                message=f"Object dtype '{dtype}' handled via recursive pickle analysis",
+                                message=(
+                                    f"Object dtype '{dtype}' embedded pickle analysis skipped by scanner selection"
+                                    if pickle_scan_skipped
+                                    else f"Object dtype '{dtype}' handled via recursive pickle analysis"
+                                ),
                                 location=path,
                                 rule_code=None,
                                 details={
                                     "dtype": str(dtype),
                                     "dtype_kind": dtype.kind,
-                                    "handled_via": "embedded_pickle_scan",
+                                    "handled_via": (
+                                        "scanner_selection_skip" if pickle_scan_skipped else "embedded_pickle_scan"
+                                    ),
                                     "cve_id": self.CVE_2019_6446_ID,
                                 },
                             )
                             result.bytes_scanned = file_size
                             result.metadata.update(
-                                {"shape": shape, "dtype": str(dtype), "fortran_order": fortran},
+                                embedded_result.metadata,
                             )
-                            result.finish(success=True)
+                            result.metadata.update(
+                                {
+                                    "shape": shape,
+                                    "dtype": str(dtype),
+                                    "fortran_order": fortran,
+                                    "embedded_pickle_scan_success": embedded_result.success,
+                                },
+                            )
+                            if (
+                                result.metadata.get("analysis_incomplete") is True
+                                or result.metadata.get("operational_error") is True
+                                or result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+                            ):
+                                _mark_inconclusive_scan_result(
+                                    result,
+                                    "numpy_object_embedded_pickle_incomplete",
+                                )
+                                _finish_with_inconclusive_contract(result, default_success=False)
+                            else:
+                                result.finish(success=embedded_result.success)
                             return result
 
                         self._validate_dtype(dtype)

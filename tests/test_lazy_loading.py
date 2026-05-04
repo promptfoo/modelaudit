@@ -218,6 +218,18 @@ class TestLazyListInterface:
 class TestBackwardsCompatibility:
     """Test backwards compatibility of the lazy loading system."""
 
+    def test_analysis_all_exports_resolve(self) -> None:
+        """Analysis package __all__ entries should resolve through lazy imports."""
+        import modelaudit.analysis as analysis
+
+        namespace: dict[str, object] = {}
+
+        exec("from modelaudit.analysis import *", {}, namespace)
+
+        for name in analysis.__all__:
+            assert name in namespace
+            assert getattr(analysis, name) is namespace[name]
+
     def test_direct_scanner_import(self):
         """Test that scanners can still be imported directly."""
         from modelaudit.scanners import PickleScanner
@@ -267,7 +279,7 @@ class TestBackwardsCompatibility:
         for scanner_id, scanner_info in _registry._scanners.items():
             class_name = scanner_info["class"]
             assert _registry.has_scanner_class(class_name)
-            assert _registry._get_scanner_id_for_class(class_name) == scanner_id
+            assert _registry.get_scanner_id_for_class(class_name) == scanner_id
 
         for scanner_id, scanner_info in _registry._scanners.items():
             if scanner_info.get("dependencies"):

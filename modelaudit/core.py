@@ -1,10 +1,10 @@
 """Core scanning engine for orchestrating model file security analysis."""
 
 import hashlib
+import itertools
 import logging
 import os
 import time
-from collections import defaultdict
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -17,12 +17,21 @@ from modelaudit.integrations.license_checker import (
 )
 from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
 from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
+from modelaudit.scanner_selection import (
+    SCANNER_SELECTION_PREFERRED_KIND,
+    add_scanner_selection_skip_check,
+    make_scanner_selection_skip_result,
+    normalize_scanner_selection_config,
+    policy_from_config,
+    selected_scanner_extensions,
+)
 from modelaudit.scanners import _registry
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
-from modelaudit.scanners.base import BaseScanner
+from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.file.detection import (
+    XML_MODEL_INCONCLUSIVE_FORMAT,
     detect_file_format,
     detect_file_format_from_magic,
     detect_format_from_extension,
@@ -31,7 +40,7 @@ from modelaudit.utils.file.detection import (
     is_pytorch_zip_archive,
     is_skops_archive,
     is_torchserve_mar_archive,
-    validate_file_type,
+    validate_file_type_with_formats,
 )
 from modelaudit.utils.file.handlers import (
     scan_advanced_large_file,
@@ -49,12 +58,31 @@ from modelaudit.utils.helpers.types import (
     ProgressCallback,
 )
 from modelaudit.utils.lfs import check_lfs_pointer, get_lfs_issue_details, get_lfs_remediation_steps
-from modelaudit.utils.sources._huggingface_cache import _find_hf_cache_root, _path_has_part, _resolve_hf_cache_path
+from modelaudit.utils.sources._huggingface_cache import (
+    _find_hf_cache_root,
+    _get_hf_cache_roots,
+    _path_has_part,
+    _resolve_hf_cache_path,
+)
 
 logger = logging.getLogger("modelaudit.core")
 
 _add_asset_to_results = core_results.add_asset_to_results
 _add_error_asset_to_results = core_results.add_error_asset_to_results
+_DIRECTORY_PRECOUNT_CHILD_LIMIT = 1000
+
+
+def _count_immediate_children_up_to(path: Path, limit: int) -> int:
+    """Count at most `limit` immediate children for directory-size heuristics."""
+    return sum(1 for _child in itertools.islice(path.iterdir(), limit))
+
+
+def _count_files_up_to(path: Path, limit: int) -> int | None:
+    """Return an exact recursive file count only while it stays within `limit`."""
+    count = sum(1 for candidate in itertools.islice((item for item in path.rglob("*") if item.is_file()), limit + 1))
+    return None if count > limit else count
+
+
 _add_issue_to_model = core_results.add_issue_to_model
 _add_scan_result_to_model = core_results.add_scan_result_to_model
 _consolidate_checks = core_results.consolidate_checks
@@ -64,12 +92,36 @@ _results_should_be_unsuccessful = core_results.results_should_be_unsuccessful
 _scan_result_has_operational_error = core_results.scan_result_has_operational_error
 _serialize_streamed_records = core_results.serialize_streamed_records
 _to_telemetry_severity = core_results.to_telemetry_severity
+_normalize_unclassified_scan_failure = core_results.normalize_unclassified_scan_failure
 determine_exit_code = core_results.determine_exit_code
 merge_scan_result = core_results.merge_scan_result
 
 HEADER_FORMAT_TO_SCANNER_ID = _registry.get_header_format_to_scanner_ids()
 _COMPRESSED_HEADER_FORMATS = frozenset({"compressed", "gzip", "bzip2", "xz", "lz4", "zlib"})
 _R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
+_XGBOOST_BINARY_EXTENSIONS = frozenset({".bst"})
+_XGBOOST_PICKLE_SPOOF_REASON = "xgboost_binary_pickle_spoof"
+_RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
+_XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
+
+
+def _start_phase_timing(phase_timings: dict[str, float] | None) -> float | None:
+    return time.perf_counter() if phase_timings is not None else None
+
+
+def _finish_phase_timing(
+    phase_timings: dict[str, float] | None,
+    phase_name: str,
+    started_at: float | None,
+) -> None:
+    if phase_timings is None or started_at is None:
+        return
+    phase_timings[phase_name] = phase_timings.get(phase_name, 0.0) + (time.perf_counter() - started_at)
+
+
+def _attach_phase_timings(results: ModelAuditResultModel, phase_timings: dict[str, float] | None) -> None:
+    if phase_timings is not None:
+        results.phase_timings = phase_timings  # type: ignore[attr-defined]
 
 
 def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
@@ -130,6 +182,74 @@ def _preferred_scanner_can_handle(
     return False
 
 
+def _mark_xgboost_pickle_extension_spoof(result: ScanResult, path: str, ext: str) -> None:
+    """Preserve pickle analysis while flagging XGBoost extension spoofing."""
+    existing_reasons = result.metadata.get("scan_outcome_reasons")
+    if isinstance(existing_reasons, list) and _XGBOOST_PICKLE_SPOOF_REASON in existing_reasons:
+        result.success = False
+        return
+
+    claimed_format = ext.lower().lstrip(".") or "binary"
+    result.add_check(
+        name="File Format Validation",
+        passed=False,
+        message=f"File appears to be a pickle file with .{claimed_format} extension",
+        severity=IssueSeverity.WARNING,
+        location=path,
+        details={"detected_format": "pickle", "claimed_format": claimed_format},
+        why=(
+            "File extension spoofing is a security evasion technique used to bypass security scanners. "
+            "This may indicate malicious intent."
+        ),
+    )
+    _mark_inconclusive_scan_outcome(result, _XGBOOST_PICKLE_SPOOF_REASON)
+    result.success = False
+
+
+def _make_unavailable_recognized_format_result(path: str, format_: str, scanner_id: str | None) -> ScanResult:
+    """Fail closed when routing recognizes a format but no scanner can analyze it."""
+    result = ScanResult(scanner_name="unknown")
+    details: dict[str, Any] = {"format": format_, "path": path}
+    if scanner_id:
+        details["preferred_scanner_id"] = scanner_id
+        scanner_load_error = _registry.get_failed_scanners().get(scanner_id)
+        if scanner_load_error:
+            details["scanner_load_error"] = scanner_load_error
+
+    result.add_check(
+        name="Format Detection",
+        passed=False,
+        message="Recognized format could not be scanned because no scanner was available",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details=details,
+    )
+    _mark_inconclusive_scan_outcome(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
+    _mark_operational_scan_error(result, _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON)
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_xml_model_result(path: str) -> ScanResult:
+    """Fail closed when bounded XML routing cannot reach the structural root."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="XML Model Routing",
+        passed=False,
+        message=(
+            "XML model routing was inconclusive because the bounded probe ended "
+            "before the first structural root element"
+        ),
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": XML_MODEL_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _XML_MODEL_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _XML_MODEL_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
 def _calculate_file_hash(file_path: str) -> str:
     """Calculate SHA256 hash of a file for deduplication purposes.
 
@@ -144,35 +264,47 @@ def _calculate_file_hash(file_path: str) -> str:
     return hash_sha256.hexdigest()
 
 
-def _group_files_by_content(file_paths: list[str]) -> dict[str, list[str]]:
-    """Group files by their content hash to avoid scanning duplicates.
+def _hash_files_by_path(file_paths: list[str]) -> dict[str, str]:
+    """Hash files individually so scan results stay path-specific.
 
     Args:
         file_paths: List of file paths to group
 
     Returns:
-        Dictionary mapping content hash to list of file paths with that content
+        Dictionary mapping each file path to its content hash. Files that fail to
+        hash get unique placeholder values so they still scan independently.
     """
-    content_groups: dict[str, list[str]] = defaultdict(list)
+    content_hashes: dict[str, str] = {}
+    hashes_by_inode: dict[tuple[int, int, int, int], str] = {}
 
     for file_path in file_paths:
         try:
-            content_hash = _calculate_file_hash(file_path)
-            content_groups[content_hash].append(file_path)
+            inode_key: tuple[int, int, int, int] | None = None
+            try:
+                file_stat = os.stat(file_path)
+                if file_stat.st_nlink > 1:
+                    inode_key = (
+                        file_stat.st_dev,
+                        file_stat.st_ino,
+                        file_stat.st_size,
+                        file_stat.st_mtime_ns,
+                    )
+                    if cached_hash := hashes_by_inode.get(inode_key):
+                        content_hashes[file_path] = cached_hash
+                        continue
+            except OSError:
+                # Fall back to direct hashing when stat is unavailable or the file changes mid-scan.
+                pass
+
+            content_hashes[file_path] = _calculate_file_hash(file_path)
+            if inode_key is not None:
+                hashes_by_inode[inode_key] = content_hashes[file_path]
         except Exception as e:
             # Log error but continue with other files to prevent single I/O failure from aborting entire scan
             logger.warning(f"Failed to hash file {file_path}: {e}. Skipping deduplication for this file.")
-            # Add file with unique hash to ensure it gets scanned independently
-            content_groups[f"unhashable_{id(file_path)}"].append(file_path)
+            content_hashes[file_path] = f"unhashable_{id(file_path)}"
 
-    # Log information about duplicate content found
-    for content_hash, paths in content_groups.items():
-        if len(paths) > 1:
-            logger.debug(f"Found {len(paths)} files with identical content (hash: {content_hash[:16]})")
-            for path in paths:
-                logger.debug(f"  - {path}")
-
-    return dict(content_groups)
+    return content_hashes
 
 
 def _resolve_directory_scan_target(
@@ -280,8 +412,12 @@ def scan_model_directory_or_file(
     }
     # Track file hashes for aggregate hash computation
     file_hashes: list[str] = []
+    nearby_license_cache: dict[str, list[str]] = {}
+
+    phase_timings: dict[str, float] | None = {} if bool(kwargs.get("profile_timings")) else None
 
     # Configure scan options
+    scanner_selection_started_at = _start_phase_timing(phase_timings)
     config = {
         "blacklist_patterns": blacklist_patterns,
         "max_file_size": max_file_size,
@@ -291,11 +427,17 @@ def scan_model_directory_or_file(
         "strict_license": strict_license,
         **kwargs,
     }
+    config = normalize_scanner_selection_config(config)
+    scanner_selection = policy_from_config(config)
+    scanner_selection_extensions = selected_scanner_extensions(scanner_selection) if scanner_selection.active else None
+    if scanner_selection.active:
+        results.scanner_selection = scanner_selection.to_metadata()
 
     validate_scan_config(config)
+    _finish_phase_timing(phase_timings, "scanner_selection", scanner_selection_started_at)
 
     # Check if metadata scanner is available once (optimization - avoids loading scanner)
-    metadata_scanner_available = _registry.has_scanner_class("MetadataScanner")
+    metadata_scanner_available = scanner_selection.allows("metadata") and _registry.has_scanner_class("MetadataScanner")
 
     try:
         # Handle streaming paths
@@ -310,9 +452,9 @@ def scan_model_directory_or_file(
 
             scanner = get_scanner_for_file(stream_url, config=config)
             if scanner:
-                scan_result, was_complete = stream_analyze_file(stream_url, scanner)
+                scan_result, analysis_complete = stream_analyze_file(stream_url, scanner)
                 if scan_result:
-                    if not was_complete:
+                    if not analysis_complete:
                         _mark_inconclusive_scan_outcome(scan_result, "streaming_analysis_incomplete")
                     results.files_scanned += 1
 
@@ -322,10 +464,10 @@ def scan_model_directory_or_file(
                     # Add asset
                     _add_asset_to_results(results, stream_url, scan_result)
 
-                    if not was_complete:
+                    if not analysis_complete:
                         _add_issue_to_model(
                             results,
-                            "Streaming analysis was partial - only analyzed file header",
+                            "Streaming analysis incomplete - full scanner coverage was not available",
                             severity=IssueSeverity.INFO.value,
                             location=stream_url,
                             details={"analysis_complete": False},
@@ -337,12 +479,15 @@ def scan_model_directory_or_file(
 
             # Return early for streaming - finalize the model
             try:
+                streaming_scan_started_at = _start_phase_timing(phase_timings)
                 _consolidate_checks(results)
+                _finish_phase_timing(phase_timings, "result_consolidation", streaming_scan_started_at)
             except Exception as e:
                 logger.warning(f"Error consolidating checks ({type(e).__name__}): {e!s}", exc_info=e)
             results.has_errors = bool(scan_metadata.get("has_operational_errors", False))
             results.success = not _results_should_be_unsuccessful(results)
             results.finalize_statistics()
+            _attach_phase_timings(results, phase_timings)
             return results
 
         # Check if path exists (for non-streaming paths)
@@ -358,22 +503,31 @@ def scan_model_directory_or_file(
             if progress_callback:
                 progress_callback(f"Scanning directory: {path}", 0.0)
 
-            # Scan all files in the directory
-            # Use lazy file counting for better performance on large directories
+            # Scan all files in the directory. File counts are only needed for
+            # progress percentages, so avoid the extra tree walk when callers do
+            # not request progress updates.
             total_files = None  # Will be set to actual count if directory is small
             processed_files = 0
             limit_reached = False
 
-            # Quick check: count files only if directory seems reasonable in size
-            # This avoids the expensive rglob() on large directories
-            try:
-                # Do a quick count of immediate children first
-                immediate_children = len(list(Path(path).iterdir()))
-                if immediate_children < 1000:  # Only count if not too many immediate children
-                    total_files = sum(1 for _ in Path(path).rglob("*") if _.is_file())
-            except (OSError, PermissionError):
-                # If we can't count, just proceed without progress percentage
-                total_files = None
+            if progress_callback:
+                # Quick check: count files only if directory seems reasonable in size.
+                # This avoids the expensive rglob() on large directories.
+                try:
+                    directory_file_count_started_at = _start_phase_timing(phase_timings)
+                    # Do a quick count of immediate children first.
+                    immediate_children = _count_immediate_children_up_to(
+                        Path(path),
+                        _DIRECTORY_PRECOUNT_CHILD_LIMIT,
+                    )
+                    # Only run the recursive count for narrower roots.
+                    if immediate_children < _DIRECTORY_PRECOUNT_CHILD_LIMIT:
+                        total_files = _count_files_up_to(Path(path), _DIRECTORY_PRECOUNT_CHILD_LIMIT)
+                except (OSError, PermissionError):
+                    # If we can't count, just proceed without progress percentage.
+                    total_files = None
+                finally:
+                    _finish_phase_timing(phase_timings, "directory_file_count", directory_file_count_started_at)
 
             base_dir = Path(path).resolve()
             hf_cache_root = _find_hf_cache_root(base_dir)
@@ -382,6 +536,7 @@ def scan_model_directory_or_file(
 
             # First pass: collect all file paths that need scanning
             files_to_scan: list[str] = []
+            directory_discovery_started_at = _start_phase_timing(phase_timings)
             for root, _, files in os.walk(path, followlinks=False):
                 for file in files:
                     file_path = os.path.join(root, file)
@@ -405,12 +560,21 @@ def scan_model_directory_or_file(
                     # Skip non-model files early if filtering is enabled
                     # Note: skip_file_types parameter already contains the correct value
                     if skip_file_types and should_skip_file(
-                        file_path, metadata_scanner_available=metadata_scanner_available
+                        file_path,
+                        metadata_scanner_available=metadata_scanner_available,
+                        scanner_selection_extensions=scanner_selection_extensions,
                     ):
                         filename_lower = Path(file_path).name.lower()
                         if filename_lower in LICENSE_FILES:
                             try:
-                                license_metadata = collect_license_metadata(str(resolved_file))
+                                license_metadata_started_at = _start_phase_timing(phase_timings)
+                                try:
+                                    license_metadata = collect_license_metadata(
+                                        str(resolved_file),
+                                        nearby_license_cache=nearby_license_cache,
+                                    )
+                                finally:
+                                    _finish_phase_timing(phase_timings, "license_metadata", license_metadata_started_at)
                                 from .models import FileMetadataModel
 
                                 results.file_metadata[str(resolved_file)] = FileMetadataModel(**license_metadata)
@@ -446,23 +610,27 @@ def scan_model_directory_or_file(
 
                         # Add to files to scan list instead of scanning immediately
                         files_to_scan.append(target_str)
+            _finish_phase_timing(phase_timings, "directory_discovery", directory_discovery_started_at)
 
-            # Second pass: group files by content and scan unique content only once
+            # Second pass: scan every path independently. Some scanners depend on
+            # parent paths or sibling files, so content equality alone is not a
+            # safe proxy for scan-result equality.
             if files_to_scan:
-                content_groups = _group_files_by_content(files_to_scan)
-                content_processed = 0
+                top_level_hashing_started_at = _start_phase_timing(phase_timings)
+                content_hashes = _hash_files_by_path(files_to_scan)
+                _finish_phase_timing(phase_timings, "top_level_hashing", top_level_hashing_started_at)
+                duplicate_paths_by_hash: dict[str, list[str]] = {}
+                for file_path, content_hash in content_hashes.items():
+                    if not content_hash.startswith("unhashable_"):
+                        duplicate_paths_by_hash.setdefault(content_hash, []).append(file_path)
+                recorded_content_hashes: set[str] = set()
 
-                for content_hash, file_paths in content_groups.items():
-                    if limit_reached:
-                        break
-
+                for representative_file, content_hash in content_hashes.items():
                     # Collect valid content hashes for aggregate hash computation
                     # Skip "unhashable_" prefix entries (those are placeholder hashes for files that failed to hash)
-                    if not content_hash.startswith("unhashable_"):
+                    if not content_hash.startswith("unhashable_") and content_hash not in recorded_content_hashes:
                         file_hashes.append(content_hash)
-
-                    # Scan the first file in each content group (representative)
-                    representative_file = file_paths[0]
+                        recorded_content_hashes.add(content_hash)
 
                     # Check for interrupts
                     check_interrupted()
@@ -475,14 +643,12 @@ def scan_model_directory_or_file(
                     if progress_callback:
                         if total_files is not None and total_files > 0:
                             progress_callback(
-                                f"Scanning file {processed_files + 1}/{total_files}: "
-                                f"{Path(representative_file).name} ({len(file_paths)} copies)",
+                                f"Scanning file {processed_files + 1}/{total_files}: {Path(representative_file).name}",
                                 processed_files / total_files * 100,
                             )
                         else:
                             progress_callback(
-                                f"Scanning file {processed_files + 1}: "
-                                f"{Path(representative_file).name} ({len(file_paths)} copies)",
+                                f"Scanning file {processed_files + 1}: {Path(representative_file).name}",
                                 0.0,
                             )
 
@@ -490,13 +656,19 @@ def scan_model_directory_or_file(
                         # Check for interrupts before scanning each file
                         check_interrupted()
 
-                        file_result = scan_file(representative_file, config)
+                        file_scan_started_at = _start_phase_timing(phase_timings)
+                        try:
+                            file_result = scan_file(representative_file, config)
+                        finally:
+                            _finish_phase_timing(phase_timings, "file_scan_dispatch", file_scan_started_at)
+
+                        result_merge_started_at = _start_phase_timing(phase_timings)
+                        _normalize_unclassified_scan_failure(file_result)
                         if _scan_result_has_operational_error(file_result):
                             scan_metadata["has_operational_errors"] = True
                         results.bytes_scanned += file_result.bytes_scanned
-                        results.files_scanned += len(file_paths)  # Count all copies
-                        processed_files += len(file_paths)  # Count all copies for progress
-                        content_processed += 1
+                        results.files_scanned += 1
+                        processed_files += 1
 
                         # Add scanner to tracking list (different from scanner_names)
                         scanner_name = file_result.scanner_name
@@ -510,24 +682,35 @@ def scan_model_directory_or_file(
                         if scanner_name and scanner_name not in results.scanner_names and scanner_name != "unknown":
                             results.scanner_names.append(scanner_name)
 
-                        # Add issues for each file path that shares this content using Pydantic models
+                        # Add issues from this path-specific scan using Pydantic models
                         for issue in file_result.issues:
                             issue_dict = issue.to_dict() if hasattr(issue, "to_dict") else issue
                             if isinstance(issue_dict, dict):
+                                issue_details = issue_dict.get("details")
+                                issue_details = issue_details if isinstance(issue_details, dict) else {}
                                 record_issue_found(
-                                    issue_type=str(issue_dict.get("message", "unknown_issue")),
+                                    issue_type=str(issue_dict.get("type") or "unknown_issue"),
                                     severity=_to_telemetry_severity(issue_dict.get("severity", "unknown")),
                                     scanner=file_result.scanner_name,
                                     file_path=representative_file,
+                                    rule_code=(
+                                        issue_dict.get("rule_code")
+                                        if isinstance(issue_dict.get("rule_code"), str)
+                                        else None
+                                    ),
+                                    cve_id=(
+                                        issue_details.get("cve_id")
+                                        if isinstance(issue_details.get("cve_id"), str)
+                                        else None
+                                    ),
+                                    issue_message=(
+                                        issue_dict.get("message")
+                                        if isinstance(issue_dict.get("message"), str)
+                                        else None
+                                    ),
                                 )
                                 if not issue_dict.get("location"):
                                     issue_dict["location"] = representative_file
-
-                                if len(file_paths) > 1:
-                                    if "details" not in issue_dict:
-                                        issue_dict["details"] = {}
-                                    issue_dict["details"]["duplicate_files"] = file_paths
-                                    issue_dict["details"]["content_hash"] = content_hash
 
                                 # Ensure timestamp is present
                                 if "timestamp" not in issue_dict:
@@ -535,7 +718,7 @@ def scan_model_directory_or_file(
 
                                 results.issues.append(Issue(**issue_dict))
 
-                        # Add checks for each file path that shares this content using Pydantic models
+                        # Add checks from this path-specific scan using Pydantic models
                         if hasattr(file_result, "checks"):
                             from .models import Check
 
@@ -545,38 +728,38 @@ def scan_model_directory_or_file(
                                     if not check_dict.get("location"):
                                         check_dict["location"] = representative_file
 
-                                    if len(file_paths) > 1:
-                                        if "details" not in check_dict:
-                                            check_dict["details"] = {}
-                                        check_dict["details"]["duplicate_files"] = file_paths
-                                        check_dict["details"]["content_hash"] = content_hash
-
                                     # Ensure timestamp is present
                                     if "timestamp" not in check_dict:
                                         check_dict["timestamp"] = time.time()
 
                                     results.checks.append(Check(**check_dict))
 
-                        # Add assets for all file paths that share this content
-                        for file_path in file_paths:
-                            _add_asset_to_results(results, file_path, file_result)
+                        _add_asset_to_results(results, representative_file, file_result)
+                        _finish_phase_timing(phase_timings, "result_merge", result_merge_started_at)
 
-                            # Add metadata for all file paths using Pydantic models
-                            license_metadata = collect_license_metadata(file_path)
-                            combined_metadata = {**file_result.metadata, **license_metadata}
-                            # Add information about content deduplication
-                            combined_metadata["content_hash"] = content_hash
-                            combined_metadata["duplicate_files"] = file_paths if len(file_paths) > 1 else None
+                        # Add metadata for this path using Pydantic models
+                        license_metadata_started_at = _start_phase_timing(phase_timings)
+                        try:
+                            license_metadata = collect_license_metadata(
+                                representative_file,
+                                nearby_license_cache=nearby_license_cache,
+                            )
+                        finally:
+                            _finish_phase_timing(phase_timings, "license_metadata", license_metadata_started_at)
+                        combined_metadata = {**file_result.metadata, **license_metadata}
+                        combined_metadata["content_hash"] = content_hash
+                        duplicate_files = duplicate_paths_by_hash.get(content_hash, [])
+                        combined_metadata["duplicate_files"] = duplicate_files if len(duplicate_files) > 1 else None
 
-                            # Convert ml_context if present
-                            if "ml_context" in combined_metadata and isinstance(combined_metadata["ml_context"], dict):
-                                from .models import MLContextModel
+                        # Convert ml_context if present
+                        if "ml_context" in combined_metadata and isinstance(combined_metadata["ml_context"], dict):
+                            from .models import MLContextModel
 
-                                combined_metadata["ml_context"] = MLContextModel(**combined_metadata["ml_context"])
+                            combined_metadata["ml_context"] = MLContextModel(**combined_metadata["ml_context"])
 
-                            from .models import FileMetadataModel
+                        from .models import FileMetadataModel
 
-                            results.file_metadata[file_path] = FileMetadataModel(**combined_metadata)
+                        results.file_metadata[representative_file] = FileMetadataModel(**combined_metadata)
 
                         if max_total_size > 0 and results.bytes_scanned > max_total_size:
                             _add_issue_to_model(
@@ -593,16 +776,14 @@ def scan_model_directory_or_file(
                         logger.warning(f"Error scanning file {representative_file}: {e!s}")
                         scan_metadata["success"] = False
 
-                        # Add error for all files that share this content
-                        for file_path in file_paths:
-                            _add_issue_to_model(
-                                results,
-                                f"Error scanning file: {e!s}",
-                                severity=IssueSeverity.INFO.value,
-                                location=file_path,
-                                details={"exception_type": type(e).__name__},
-                            )
-                            _add_error_asset_to_results(results, file_path)
+                        _add_issue_to_model(
+                            results,
+                            f"Error scanning file: {e!s}",
+                            severity=IssueSeverity.INFO.value,
+                            location=representative_file,
+                            details={"exception_type": type(e).__name__},
+                        )
+                        _add_error_asset_to_results(results, representative_file)
 
             # Final progress update for directory scan
             if progress_callback and not limit_reached and total_files is not None and total_files > 0:
@@ -613,12 +794,14 @@ def scan_model_directory_or_file(
             # Stop scanning if size limit reached
             if limit_reached:
                 logger.warning("Scan terminated early due to total size limit")
+                scan_metadata["success"] = False
+                scan_metadata["has_operational_errors"] = True
                 _add_issue_to_model(
                     results,
                     "Scan terminated early due to total size limit",
                     severity=IssueSeverity.INFO.value,
                     location=path,
-                    details={"max_total_size": max_total_size},
+                    details={"max_total_size": max_total_size, "analysis_incomplete": True},
                 )
         else:
             # Scan a single file or DVC pointer
@@ -637,23 +820,40 @@ def scan_model_directory_or_file(
 
                 results.files_scanned += 1
 
-                # Compute hash for single file to enable aggregate hash
+                # Hash the top-level target before scanning. Archive scanners merge
+                # nested member results into their metadata, so scanner-emitted
+                # hashes are not always the bytes of this target.
                 try:
+                    top_level_hashing_started_at = _start_phase_timing(phase_timings)
                     file_hash = _calculate_file_hash(target)
                     file_hashes.append(file_hash)
                 except Exception as e:
                     logger.debug(f"Failed to hash file {target}: {e}")
-                    # Continue without hash - not a critical error
+                finally:
+                    _finish_phase_timing(phase_timings, "top_level_hashing", top_level_hashing_started_at)
 
-                file_result = scan_file(target, config)
+                file_scan_started_at = _start_phase_timing(phase_timings)
+                try:
+                    file_result = scan_file(target, config)
+                finally:
+                    _finish_phase_timing(phase_timings, "file_scan_dispatch", file_scan_started_at)
 
                 # Use helper function to add scan result to Pydantic model
+                result_merge_started_at = _start_phase_timing(phase_timings)
                 _add_scan_result_to_model(results, scan_metadata, file_result, target)
 
                 _add_asset_to_results(results, target, file_result)
+                _finish_phase_timing(phase_timings, "result_merge", result_merge_started_at)
 
                 # Collect and apply license metadata for all files
-                license_metadata = collect_license_metadata(target)
+                license_metadata_started_at = _start_phase_timing(phase_timings)
+                try:
+                    license_metadata = collect_license_metadata(
+                        target,
+                        nearby_license_cache=nearby_license_cache,
+                    )
+                finally:
+                    _finish_phase_timing(phase_timings, "license_metadata", license_metadata_started_at)
                 if license_metadata:
                     from .models import FileMetadataModel
 
@@ -699,13 +899,17 @@ def scan_model_directory_or_file(
 
     # Consolidate checks for cleaner reporting
     try:
+        result_consolidation_started_at = _start_phase_timing(phase_timings)
         _consolidate_checks(results)
+        _finish_phase_timing(phase_timings, "result_consolidation", result_consolidation_started_at)
     except Exception as e:
         logger.warning(f"Error consolidating checks ({type(e).__name__}): {e!s}", exc_info=e)
 
     # Add license warnings if any
     try:
+        commercial_use_started_at = _start_phase_timing(phase_timings)
         license_warnings = check_commercial_use_warnings(results, strict=config.get("strict_license", False))
+        _finish_phase_timing(phase_timings, "commercial_use_warnings", commercial_use_started_at)
         for warning in license_warnings:
             _add_issue_to_model(
                 results,
@@ -728,16 +932,84 @@ def scan_model_directory_or_file(
     if file_hashes:
         from .utils.helpers.secure_hasher import compute_aggregate_hash
 
+        aggregate_hash_started_at = _start_phase_timing(phase_timings)
         results.content_hash = compute_aggregate_hash(file_hashes)
+        _finish_phase_timing(phase_timings, "aggregate_hash", aggregate_hash_started_at)
         logger.info(f"Computed aggregate content hash from {len(file_hashes)} file(s): {results.content_hash}")
 
     # Finalize statistics and return Pydantic model
     results.finalize_statistics()
     results.deduplicate_issues()
+    _attach_phase_timings(results, phase_timings)
     return results
 
 
 # _should_skip_file has been moved to utils.file_filter module
+
+
+def _is_hf_hub_bookkeeping_path(path_obj: Path) -> bool:
+    """Return True for files stored under known HuggingFace hub bookkeeping directories."""
+    hf_cache_root = _find_hf_cache_root(path_obj)
+    if hf_cache_root is None:
+        return False
+
+    try:
+        relative_parts = _resolve_hf_cache_path(path_obj).relative_to(hf_cache_root).parts
+    except ValueError:
+        return False
+
+    return bool(relative_parts and relative_parts[0] in {"snapshots", "blobs", "refs"})
+
+
+def _is_hf_download_bookkeeping_path(path_obj: Path) -> bool:
+    """Return True for files stored in HuggingFace download bookkeeping directories."""
+    import os
+
+    resolved_parent = _resolve_hf_cache_path(path_obj.parent)
+    configured_download_roots = {
+        _resolve_hf_cache_path(root.parent / "download")
+        for root in _get_hf_cache_roots()
+        if root.parent.name.lower() == "huggingface"
+    }
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        configured_download_roots.add(_resolve_hf_cache_path(Path(hf_home) / "download"))
+    if resolved_parent in configured_download_roots:
+        return True
+
+    # Local snapshot downloads keep bookkeeping under the downloaded model
+    # directory rather than the global cache root.
+    parts = resolved_parent.parts
+    if len(parts) < 3 or tuple(part.lower() for part in parts[-3:]) != (".cache", "huggingface", "download"):
+        return False
+
+    local_model_root = resolved_parent.parents[2]
+    try:
+        has_local_model_assets = any(child.is_file() for child in local_model_root.iterdir() if child.name != ".cache")
+    except OSError:
+        return False
+    return has_local_model_assets and _is_benign_local_hf_download_bookkeeping_file(path_obj)
+
+
+def _is_benign_local_hf_download_bookkeeping_file(path_obj: Path) -> bool:
+    """Return True only for local download bookkeeping files that do not look scannable."""
+    import json
+
+    filename = path_obj.name
+    try:
+        if detect_file_format(str(path_obj)) != "unknown":
+            return False
+        if filename.endswith(".lock"):
+            return path_obj.stat().st_size == 0
+        if filename.endswith(".metadata"):
+            with path_obj.open(encoding="utf-8") as handle:
+                return isinstance(json.load(handle), dict)
+        if filename in {".gitignore", ".gitattributes"}:
+            content = path_obj.read_text(encoding="utf-8")
+            return "\x00" not in content and len(content) <= 64 * 1024
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return False
 
 
 def _is_huggingface_cache_file(path: str) -> bool:
@@ -753,34 +1025,12 @@ def _is_huggingface_cache_file(path: str) -> bool:
     import os
 
     filename = os.path.basename(path)
+    if not (filename.endswith((".lock", ".metadata")) or filename in {".gitignore", ".gitattributes", "main", "HEAD"}):
+        return False
+
+    # Only trust bookkeeping-shaped filenames when they actually live in a
+    # recognized HuggingFace cache layout.
     path_obj = Path(path)
-
-    # Download lock files are HuggingFace bookkeeping files regardless of cache layout.
-    if filename.endswith(".lock"):
-        return True
-
-    # Only skip HuggingFace .metadata files in known cache/download layouts.
-    if filename.endswith(".metadata"):
-        hf_cache_root = _find_hf_cache_root(path_obj)
-        if hf_cache_root is not None and hf_cache_root.parent.name.lower() == "hub":
-            try:
-                relative_parts = _resolve_hf_cache_path(path_obj).relative_to(hf_cache_root).parts
-            except ValueError:
-                relative_parts = ()
-
-            if relative_parts and relative_parts[0] in {"snapshots", "blobs", "refs"}:
-                return True
-
-        normalized_parts = [part.lower() for part in path_obj.parent.parts]
-        if len(normalized_parts) >= 3 and normalized_parts[-3:] == [".cache", "huggingface", "download"]:
-            return True
-
-    # Check for specific HuggingFace cache metadata files
-    # We no longer skip all HuggingFace cache files since we handle symlinks properly now
-
-    # Check for Git-related files that are commonly cached
-    if filename in [".gitignore", ".gitattributes"]:
-        return True
 
     if filename in ["main", "HEAD"]:
         hf_cache_root = _find_hf_cache_root(path_obj)
@@ -793,6 +1043,17 @@ def _is_huggingface_cache_file(path: str) -> bool:
             return False
 
         return bool(relative_parts and relative_parts[0] == "refs")
+
+    is_hf_bookkeeping_path = _is_hf_hub_bookkeeping_path(path_obj) or _is_hf_download_bookkeeping_path(path_obj)
+    if filename.endswith((".lock", ".metadata")):
+        return is_hf_bookkeeping_path
+
+    # Check for specific HuggingFace cache metadata files
+    # We no longer skip all HuggingFace cache files since we handle symlinks properly now
+
+    # Check for Git-related files that are commonly cached
+    if filename in [".gitignore", ".gitattributes"]:
+        return is_hf_bookkeeping_path
 
     return False
 
@@ -809,7 +1070,7 @@ def scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     Returns:
         ScanResult object with the scan results
     """
-    config = {} if config is None else dict(config)
+    config = normalize_scanner_selection_config({} if config is None else dict(config))
     config.setdefault(NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_file)
     validate_scan_config(config)
 
@@ -830,6 +1091,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     """
     if config is None:
         config = {}
+    config = normalize_scanner_selection_config(config)
+    scanner_selection = policy_from_config(config)
     validate_scan_config(config)
 
     # Skip HuggingFace cache files to reduce noise
@@ -924,20 +1187,19 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     header_format = detect_file_format(path)
     ext_format = detect_format_from_extension(path)
     ext = os.path.splitext(path)[1].lower()
+    is_xgboost_pickle_spoof = ext in _XGBOOST_BINARY_EXTENSIONS and header_format == "pickle"
 
     # Record telemetry for file type detection
     detected_format = header_format if header_format != "unknown" else ext_format
     record_file_type_detected(path, detected_format)
 
     # Validate file type consistency as a security check
-    file_type_valid = validate_file_type(path)
+    magic_format = detect_file_format_from_magic(path)
+    file_type_valid = validate_file_type_with_formats(path, magic_format, ext_format)
     discrepancy_msg = None
-    magic_format = None
 
     if not file_type_valid:
         # File type validation failed - this is a security concern
-        # Get the actual magic bytes format for accurate error message
-        magic_format = detect_file_format_from_magic(path)
         discrepancy_msg = (
             f"File type validation failed: extension indicates {ext_format} but magic bytes "
             f"indicate {magic_format}. This could indicate file spoofing or corruption."
@@ -949,6 +1211,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             (ext_format == "pytorch_binary" and header_format in ["zip", "pickle"] and ext == ".bin")
             or (ext_format == "pytorch_binary" and header_format == "pickle" and ext in [".pt", ".pth"])
             or (ext_format == "keras" and header_format in ["zip", "hdf5"])
+            or (ext_format == "protobuf" and header_format == "onnx" and ext == ".pb")
             or (ext_format == "skops" and header_format == "zip" and ext == ".skops")
         ):
             discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
@@ -957,8 +1220,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     # Prefer scanners based on trusted structure rather than the filename alone.
     preferred_scanner: type[BaseScanner] | None = None
     scanner_id = _select_preferred_scanner_id(path, header_format, ext)
-    if scanner_id:
+    skipped_preferred_scanner_id: str | None = None
+    if scanner_id and scanner_selection.allows(scanner_id):
         preferred_scanner = _registry.load_scanner_by_id(scanner_id)
+    elif scanner_id:
+        skipped_preferred_scanner_id = scanner_id
 
     result: ScanResult | None
 
@@ -967,6 +1233,12 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     use_large_handler = should_use_large_file_handler(path) and not use_extreme_handler
     progress_callback = config.get("progress_callback")
     timeout = config.get("timeout", 3600)
+    config[FORMAT_VALIDATION_CONFIG_KEY] = {
+        "path": os.path.abspath(path),
+        "header_format": magic_format,
+        "extension_format": ext_format,
+        "file_type_valid": file_type_valid,
+    }
 
     if (
         preferred_scanner
@@ -990,6 +1262,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             elif use_large_handler:
                 logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
                 result = scan_large_file(path, scanner, progress_callback, timeout)
+            elif is_xgboost_pickle_spoof:
+                result = scanner.scan(path)
             else:
                 result = scanner.scan_with_cache(path)
 
@@ -1011,7 +1285,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             result.finish(success=False)
     else:
         # Use registry's lazy loading method to avoid loading all scanners
-        scanner_class = _registry.get_scanner_for_path(path)
+        scanner_class = _registry.get_scanner_for_path(
+            path,
+            scanner_selection=scanner_selection if scanner_selection.active else None,
+        )
         if scanner_class:
             logger.debug(f"Using {scanner_class.name} scanner for {path}")
             scanner = scanner_class(config=config)
@@ -1028,6 +1305,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 elif use_large_handler:
                     logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
                     result = scan_large_file(path, scanner, progress_callback, timeout)
+                elif is_xgboost_pickle_spoof:
+                    result = scanner.scan(path)
                 else:
                     result = scanner.scan_with_cache(path)
 
@@ -1047,22 +1326,43 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 )
                 _mark_operational_scan_error(result, "scan_timeout")
                 result.finish(success=False)
+            if skipped_preferred_scanner_id and result is not None:
+                add_scanner_selection_skip_check(
+                    result,
+                    path,
+                    skipped_preferred_scanner_id,
+                    scanner_selection,
+                    context="preferred scanner",
+                    kind=SCANNER_SELECTION_PREFERRED_KIND,
+                )
         else:
-            format_ = header_format
-            sr = ScanResult(scanner_name="unknown")
-            if format_ == "unknown":
+            if scanner_selection.active:
+                candidate_scanner_id = skipped_preferred_scanner_id
+                if candidate_scanner_id is None:
+                    candidate_scanner_class = _registry.get_scanner_for_path(path)
+                    if candidate_scanner_class:
+                        candidate_scanner_id = (
+                            _registry.get_scanner_id_for_class(candidate_scanner_class.__name__)
+                            or candidate_scanner_class.name
+                        )
+                if candidate_scanner_id and not scanner_selection.allows(candidate_scanner_id):
+                    result = make_scanner_selection_skip_result(path, candidate_scanner_id, scanner_selection)
+                    if result.bytes_scanned == 0 and file_size > 0:
+                        result.bytes_scanned = file_size
+                    return result
+
+            if magic_format == XML_MODEL_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_xml_model_result(path)
+            elif magic_format == "unknown":
                 # Not a recognized model format — skip silently
+                sr = ScanResult(scanner_name="unknown")
                 logger.debug(f"Skipping unrecognized format file: {path}")
             else:
-                # Known format but no scanner available
-                sr.add_check(
-                    name="Format Detection",
-                    passed=False,
-                    message=f"Unknown or unhandled format: {format_}",
-                    severity=IssueSeverity.DEBUG,
-                    details={"format": format_, "path": path},
-                )
+                sr = _make_unavailable_recognized_format_result(path, magic_format, scanner_id)
             result = sr
+
+    if is_xgboost_pickle_spoof:
+        _mark_xgboost_pickle_extension_spoof(result, path, ext)
 
     if discrepancy_msg:
         # Determine severity based on whether it's a validation failure or just a discrepancy
@@ -1128,7 +1428,15 @@ def scan_model_streaming(
     file_hashes: list[str] = []
     files_processed = 0
     skip_file_types: bool = bool(kwargs.get("skip_file_types", False))
-    metadata_scanner_available: bool = _registry.has_scanner_class("MetadataScanner")
+    scan_kwargs = normalize_scanner_selection_config(kwargs)
+    scanner_selection = policy_from_config(scan_kwargs)
+    scanner_selection_extensions = selected_scanner_extensions(scanner_selection) if scanner_selection.active else None
+    if scanner_selection.active:
+        results.scanner_selection = scanner_selection.to_metadata()
+    metadata_scanner_available: bool = scanner_selection.allows("metadata") and _registry.has_scanner_class(
+        "MetadataScanner"
+    )
+    nearby_license_cache: dict[str, list[str]] = {}
 
     base_dir = Path(scan_root).resolve() if scan_root is not None else None
     hf_cache_root = _find_hf_cache_root(base_dir) if base_dir is not None else None
@@ -1169,11 +1477,15 @@ def scan_model_streaming(
                 if skip_file_types and should_skip_file(
                     str(source_path),
                     metadata_scanner_available=metadata_scanner_available,
+                    scanner_selection_extensions=scanner_selection_extensions,
                 ):
                     filename_lower = source_path.name.lower()
                     if filename_lower in LICENSE_FILES:
                         try:
-                            license_metadata = collect_license_metadata(str(scan_path))
+                            license_metadata = collect_license_metadata(
+                                str(scan_path),
+                                nearby_license_cache=nearby_license_cache,
+                            )
                             from .models import FileMetadataModel
 
                             results.file_metadata[report_path] = FileMetadataModel(**license_metadata)
@@ -1198,7 +1510,7 @@ def scan_model_streaming(
                 # Build config dict for scan_file
                 scan_config = {
                     "timeout": timeout - int(time.time() - start_time),
-                    **kwargs,
+                    **scan_kwargs,
                 }
 
                 scan_result = scan_file(
@@ -1208,6 +1520,7 @@ def scan_model_streaming(
 
                 # Merge results
                 if scan_result:
+                    _normalize_unclassified_scan_failure(scan_result)
                     resolved_report_path = str(scan_path)
                     metadata_dict = dict(scan_result.metadata or {})
                     metadata_dict.setdefault("file_size", scan_path.stat().st_size)
@@ -1226,9 +1539,8 @@ def scan_model_streaming(
                     scan_result_dict = {
                         "bytes_scanned": scan_result.bytes_scanned,
                         "files_scanned": 1,  # Each scan_result represents one file
-                        # Preserve the main scan semantics: success=False does not
-                        # imply an operational error when the scanner completed
-                        # and only reported informational integrity findings.
+                        # Bare success=False results were normalized above so
+                        # they fail closed as inconclusive instead of exiting 0.
                         "has_errors": operational_scan_failure,
                         "success": scan_result.success,
                         "issues": _serialize_streamed_records(

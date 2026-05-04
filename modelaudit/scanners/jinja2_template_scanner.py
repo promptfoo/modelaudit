@@ -59,9 +59,29 @@ except ImportError:
 _INCONCLUSIVE_METADATA_KEY = "scan_outcome"
 _INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
 _JINJA_TEMPLATE_INDICATORS = ("{{", "{%", "{#")
+_JINJA_TEMPLATE_INDICATOR_BYTES = tuple(indicator.encode("utf-8") for indicator in _JINJA_TEMPLATE_INDICATORS)
 _RAW_PARSE_FALLBACK_CONTEXT_BYTES = 1024
 _RAW_PARSE_FALLBACK_MAX_WINDOWS = 8
 _RAW_PARSE_FALLBACK_READ_BYTES = 256 * 1024
+
+
+def _compile_all_patterns() -> dict[str, list[tuple[re.Pattern[str], str]]]:
+    """Compile the static SSTI regex set once for all scanner instances."""
+    compiled: dict[str, list[tuple[re.Pattern[str], str]]] = {}
+
+    for category, patterns in JINJA2_SSTI_PATTERNS.items():
+        compiled[category] = []
+        for pattern in patterns:
+            try:
+                compiled_pattern = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+                compiled[category].append((compiled_pattern, pattern))
+            except re.error as e:
+                logger.warning(f"Failed to compile regex pattern '{pattern}': {e}")
+
+    return compiled
+
+
+_COMPILED_JINJA2_SSTI_PATTERNS = _compile_all_patterns()
 
 
 class MLContext:
@@ -116,23 +136,7 @@ class Jinja2TemplateScanner(BaseScanner):
         self.enable_sandbox_test = self.config.get("enable_sandbox_test", True) and HAS_JINJA2_SANDBOX
         self.skip_common_patterns = self.config.get("skip_common_patterns", True)  # Ignore common ML patterns
 
-        # Compile regex patterns for efficiency
-        self._compiled_patterns = self._compile_all_patterns()
-
-    def _compile_all_patterns(self) -> dict[str, list[tuple[re.Pattern, str]]]:
-        """Compile all regex patterns for efficient matching"""
-        compiled: dict[str, list[tuple[re.Pattern, str]]] = {}
-
-        for category, patterns in JINJA2_SSTI_PATTERNS.items():
-            compiled[category] = []
-            for pattern in patterns:
-                try:
-                    compiled_pattern = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
-                    compiled[category].append((compiled_pattern, pattern))
-                except re.error as e:
-                    logger.warning(f"Failed to compile regex pattern '{pattern}': {e}")
-
-        return compiled
+        self._compiled_patterns = _COMPILED_JINJA2_SSTI_PATTERNS
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -231,60 +235,7 @@ class Jinja2TemplateScanner(BaseScanner):
                 result.finish(success=True)
                 return result
 
-            # Analyze each extracted template
-            total_detections = 0
-            for template_location, template_content in templates.items():
-                detections = self._analyze_template(template_content, context, f"{path}:{template_location}")
-                total_detections += len(detections)
-
-                # Convert detections to issues
-                for detection in detections:
-                    severity = self._get_severity_for_detection(detection, context)
-                    why_explanation = self._get_why_explanation(detection, context)
-
-                    result.add_check(
-                        name="Jinja2 Template Injection Detection",
-                        passed=False,
-                        message=f"Potential SSTI vulnerability detected: {detection.pattern_type}",
-                        severity=severity,
-                        location=detection.location or f"{path}:{template_location}",
-                        details={
-                            "pattern_type": detection.pattern_type,
-                            "pattern": detection.pattern,
-                            "match_text": detection.match_text[:200],  # Limit output size
-                            "risk_level": detection.risk_level,
-                            "template_location": template_location,
-                            "ml_context": context.framework,
-                        },
-                        why=why_explanation,
-                    )
-
-            # Overall assessment
-            if total_detections == 0:
-                result.add_check(
-                    name="Jinja2 SSTI Analysis",
-                    passed=True,
-                    message="No template injection patterns detected",
-                    location=path,
-                    details={"templates_analyzed": len(templates)},
-                )
-            else:
-                result.add_check(
-                    name="Jinja2 SSTI Analysis Summary",
-                    passed=False,
-                    message=f"Found {total_detections} potential SSTI patterns across {len(templates)} templates",
-                    severity=IssueSeverity.WARNING,
-                    location=path,
-                    details={
-                        "total_detections": total_detections,
-                        "templates_analyzed": len(templates),
-                        "sensitivity_level": self.sensitivity_level,
-                    },
-                )
-
-            result.bytes_scanned = file_size
-            self._finish_scan_result(result)
-            return result
+            return self._scan_extracted_templates(path, templates, context, result=result, file_size=file_size)
 
         except Exception as e:
             import traceback
@@ -307,6 +258,112 @@ class Jinja2TemplateScanner(BaseScanner):
             )
             result.finish(success=False)
             return result
+
+    def scan_extracted_templates(self, path: str, templates: dict[str, str]) -> ScanResult:
+        """Analyze templates that were already extracted by another structured scanner."""
+        result = self._create_result()
+        file_size = self.get_file_size(path)
+        result.metadata["file_size"] = file_size
+        context = self._determine_context(path)
+        if any("chat_template" in template_location.lower() for template_location in templates):
+            context.is_chat_template = True
+        result.metadata["ml_context"] = {
+            "framework": context.framework,
+            "file_type": context.file_type,
+            "is_tokenizer": context.is_tokenizer,
+            "confidence": context.confidence,
+        }
+        bounded_templates: dict[str, str] = {}
+        oversized_template_locations: list[str] = []
+        for template_location, template_content in templates.items():
+            if len(template_content) <= self.max_template_size:
+                bounded_templates[template_location] = template_content
+            else:
+                oversized_template_locations.append(template_location)
+
+        if oversized_template_locations:
+            result.metadata[_INCONCLUSIVE_METADATA_KEY] = INCONCLUSIVE_SCAN_OUTCOME
+            result.metadata[_INCONCLUSIVE_REASONS_METADATA_KEY] = ["jinja2_template_size_limit_exceeded"]
+            result.add_check(
+                name="Template Size Limit",
+                passed=False,
+                message="Template analysis incomplete because one or more extracted templates exceed the size limit",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "reason": "jinja2_template_size_limit_exceeded",
+                    "max_template_size": self.max_template_size,
+                    "skipped_template_locations": oversized_template_locations,
+                },
+            )
+
+        if not bounded_templates:
+            result.bytes_scanned = file_size
+            self._finish_scan_result(result)
+            return result
+
+        return self._scan_extracted_templates(path, bounded_templates, context, result=result, file_size=file_size)
+
+    def _scan_extracted_templates(
+        self,
+        path: str,
+        templates: dict[str, str],
+        context: MLContext,
+        *,
+        result: ScanResult,
+        file_size: int,
+    ) -> ScanResult:
+        total_detections = 0
+        for template_location, template_content in templates.items():
+            detections = self._analyze_template(template_content, context, f"{path}:{template_location}")
+            total_detections += len(detections)
+
+            for detection in detections:
+                severity = self._get_severity_for_detection(detection, context)
+                why_explanation = self._get_why_explanation(detection, context)
+
+                result.add_check(
+                    name="Jinja2 Template Injection Detection",
+                    passed=False,
+                    message=f"Potential SSTI vulnerability detected: {detection.pattern_type}",
+                    severity=severity,
+                    location=detection.location or f"{path}:{template_location}",
+                    details={
+                        "pattern_type": detection.pattern_type,
+                        "pattern": detection.pattern,
+                        "match_text": detection.match_text[:200],
+                        "risk_level": detection.risk_level,
+                        "template_location": template_location,
+                        "ml_context": context.framework,
+                    },
+                    why=why_explanation,
+                )
+
+        if total_detections == 0:
+            result.add_check(
+                name="Jinja2 SSTI Analysis",
+                passed=True,
+                message="No template injection patterns detected",
+                location=path,
+                details={"templates_analyzed": len(templates)},
+            )
+        else:
+            result.add_check(
+                name="Jinja2 SSTI Analysis Summary",
+                passed=False,
+                message=f"Found {total_detections} potential SSTI patterns across {len(templates)} templates",
+                severity=IssueSeverity.WARNING,
+                location=path,
+                details={
+                    "total_detections": total_detections,
+                    "templates_analyzed": len(templates),
+                    "sensitivity_level": self.sensitivity_level,
+                },
+            )
+
+        result.bytes_scanned = file_size
+        self._finish_scan_result(result)
+        return result
 
     def _mark_inconclusive_scan_result(
         self,
@@ -484,6 +541,14 @@ class Jinja2TemplateScanner(BaseScanner):
         extraction_failures: list[dict[str, Any]] = []
 
         if not HAS_YAML:
+            extraction_failures.append(
+                {
+                    "format": "yaml",
+                    "reason": "jinja2_yaml_dependency_unavailable",
+                    "required_package": "PyYAML",
+                }
+            )
+            self._extract_raw_template_fallback(path, templates, "raw_yaml_dependency_fallback")
             return templates, extraction_failures
 
         try:
@@ -509,26 +574,56 @@ class Jinja2TemplateScanner(BaseScanner):
         }
 
     def _extract_raw_template_fallback(self, path: str, templates: dict[str, str], template_key: str) -> None:
-        try:
-            with open(path, "rb") as f:
-                raw = f.read(_RAW_PARSE_FALLBACK_READ_BYTES)
-        except OSError as exc:
-            logger.debug("Error reading raw template fallback from %s: %s", path, exc)
-            return
-
-        text = raw.decode("utf-8", errors="replace")
-        for index, fallback_text in enumerate(self._raw_template_fallback_windows(text)):
+        for index, fallback_text in enumerate(self._raw_template_fallback_windows_from_file(path)):
             fallback_key = template_key if index == 0 else f"{template_key}_{index + 1}"
             templates[fallback_key] = fallback_text
+
+    def _raw_template_fallback_windows_from_file(self, path: str) -> list[str]:
+        try:
+            file_size = os.path.getsize(path)
+        except OSError as exc:
+            logger.debug("Error sizing raw template fallback from %s: %s", path, exc)
+            return []
+
+        if file_size <= 0:
+            return []
+
+        window_size = self._raw_template_fallback_window_size(file_size)
+        marker_offsets = self._template_marker_offsets_from_file(path, file_size, window_size)
+        if not marker_offsets:
+            return []
+
+        windows: list[tuple[int, int]] = []
+        for marker_offset in marker_offsets:
+            if any(start <= marker_offset < end for start, end in windows):
+                continue
+
+            start = max(0, marker_offset - _RAW_PARSE_FALLBACK_CONTEXT_BYTES)
+            end = min(file_size, start + window_size)
+            start = max(0, end - window_size)
+            windows.append((start, end))
+
+            if len(windows) >= _RAW_PARSE_FALLBACK_MAX_WINDOWS:
+                break
+
+        fallback_windows: list[str] = []
+        try:
+            with open(path, "rb") as f:
+                for start, end in windows:
+                    f.seek(start)
+                    raw = f.read(end - start)
+                    fallback_windows.append(raw.decode("utf-8", errors="replace"))
+        except OSError as exc:
+            logger.debug("Error reading raw template fallback from %s: %s", path, exc)
+            return []
+
+        return fallback_windows
 
     def _raw_template_fallback_windows(self, text: str) -> list[str]:
         if not self._looks_like_template(text):
             return []
 
-        configured_window_size = self.max_template_size
-        if not isinstance(configured_window_size, int) or configured_window_size <= 0:
-            configured_window_size = _RAW_PARSE_FALLBACK_READ_BYTES
-        window_size = min(configured_window_size, _RAW_PARSE_FALLBACK_READ_BYTES, len(text))
+        window_size = self._raw_template_fallback_window_size(len(text))
 
         if len(text) <= window_size:
             return [text]
@@ -548,6 +643,9 @@ class Jinja2TemplateScanner(BaseScanner):
 
         return [text[start:end] for start, end in windows]
 
+    def _raw_template_fallback_window_size(self, content_size: int) -> int:
+        return self._raw_template_fallback_window_size_for_config(content_size, self.max_template_size)
+
     @staticmethod
     def _template_marker_offsets(text: str) -> list[int]:
         offsets: set[int] = set()
@@ -558,6 +656,77 @@ class Jinja2TemplateScanner(BaseScanner):
                 marker_offset = text.find(indicator, marker_offset + len(indicator))
 
         return sorted(offsets)
+
+    @staticmethod
+    def _template_marker_offsets_from_file(path: str, file_size: int, window_size: int) -> list[int]:
+        offsets: set[int] = set()
+        windows: list[tuple[int, int]] = []
+        max_indicator_size = max(len(indicator) for indicator in _JINJA_TEMPLATE_INDICATOR_BYTES)
+        overlap_size = max_indicator_size - 1
+        overlap = b""
+        chunk_start = 0
+
+        try:
+            with open(path, "rb") as f:
+                while len(windows) < _RAW_PARSE_FALLBACK_MAX_WINDOWS:
+                    chunk = f.read(_RAW_PARSE_FALLBACK_READ_BYTES)
+                    if not chunk:
+                        break
+
+                    data_start = max(0, chunk_start - len(overlap))
+                    data = overlap + chunk
+                    chunk_offsets: set[int] = set()
+                    for indicator in _JINJA_TEMPLATE_INDICATOR_BYTES:
+                        marker_offset = data.find(indicator)
+                        while marker_offset != -1:
+                            absolute_offset = data_start + marker_offset
+                            if absolute_offset not in offsets:
+                                chunk_offsets.add(absolute_offset)
+                            marker_offset = data.find(indicator, marker_offset + len(indicator))
+
+                    for absolute_offset in sorted(chunk_offsets):
+                        if Jinja2TemplateScanner._add_fallback_window_for_marker(
+                            windows,
+                            absolute_offset,
+                            file_size,
+                            window_size,
+                        ):
+                            offsets.add(absolute_offset)
+                            if len(windows) >= _RAW_PARSE_FALLBACK_MAX_WINDOWS:
+                                break
+
+                    overlap = data[-overlap_size:] if overlap_size else b""
+                    chunk_start += len(chunk)
+        except OSError as exc:
+            logger.debug("Error searching raw template fallback markers in %s: %s", path, exc)
+            return []
+
+        return sorted(offsets)
+
+    @staticmethod
+    def _raw_template_fallback_window_size_for_config(content_size: int, configured_window_size: Any) -> int:
+        if not isinstance(configured_window_size, int) or configured_window_size <= 0:
+            configured_window_size = _RAW_PARSE_FALLBACK_READ_BYTES
+        return min(configured_window_size, _RAW_PARSE_FALLBACK_READ_BYTES, content_size)
+
+    @staticmethod
+    def _fallback_window_for_marker(marker_offset: int, content_size: int, window_size: int) -> tuple[int, int]:
+        start = max(0, marker_offset - _RAW_PARSE_FALLBACK_CONTEXT_BYTES)
+        end = min(content_size, start + window_size)
+        start = max(0, end - window_size)
+        return start, end
+
+    @staticmethod
+    def _add_fallback_window_for_marker(
+        windows: list[tuple[int, int]],
+        marker_offset: int,
+        content_size: int,
+        window_size: int,
+    ) -> bool:
+        if any(start <= marker_offset < end for start, end in windows):
+            return False
+        windows.append(Jinja2TemplateScanner._fallback_window_for_marker(marker_offset, content_size, window_size))
+        return True
 
     def _extract_template_file(self, path: str) -> dict[str, str]:
         """Extract content from standalone template files"""
@@ -630,10 +799,12 @@ class Jinja2TemplateScanner(BaseScanner):
 
     def _is_common_ml_pattern(self, match_text: str, context: MLContext) -> bool:
         """Check if match is a common, benign ML pattern"""
+        match_lower = match_text.lower()
+        if context.is_chat_template and match_lower.startswith("{% macro "):
+            return True
+
         if not context.framework:
             return False
-
-        match_lower = match_text.lower()
 
         # Common HuggingFace chat template patterns
         if context.framework == "huggingface":

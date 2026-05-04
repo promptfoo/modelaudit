@@ -13,13 +13,25 @@ from modelaudit.rules import RuleRegistry, Severity
 from modelaudit.scanners.base import Issue, IssueSeverity, ScanResult
 
 
+@pytest.fixture
+def requires_symlinks(tmp_path: Path) -> None:
+    """Skip tests when creating symlinks is not supported in this environment."""
+    target = tmp_path / "target"
+    link = tmp_path / "link"
+    target.mkdir()
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("Symlinks are not supported in this environment")
+
+
 class TestRuleRegistry:
     """Test the rule registry functionality."""
 
     def test_initialize(self):
         """Test that rules are initialized properly."""
         RuleRegistry.initialize()
-        assert len(RuleRegistry.get_all_rules()) == 110  # Current count via public API
+        assert len(RuleRegistry.get_all_rules()) == len(RULE_CATALOG)
 
     def test_get_rule(self):
         """Test getting a specific rule."""
@@ -34,7 +46,7 @@ class TestRuleRegistry:
         rule = RuleRegistry.get_rule("S9999")
         assert rule is None
 
-    def test_find_matching_rule(self):
+    def test_find_matching_rule(self) -> None:
         """Test finding rules by message patterns."""
         # Test exact pattern match
         match = RuleRegistry.find_matching_rule("import os")
@@ -52,10 +64,25 @@ class TestRuleRegistry:
         match = RuleRegistry.find_matching_rule("this should not match anything")
         assert match is None
 
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "",
+            "   ",
+            None,
+            "import osx",
+            "from osx import path",
+            "import osx; import sysx",
+        ],
+    )
+    def test_find_matching_rule_edge_case_non_matches(self, message: str | None) -> None:
+        """Empty, missing, and partial messages should not match rule patterns."""
+        assert RuleRegistry.find_matching_rule(message) is None
+
     def test_get_all_rules(self):
         """Test getting all rules."""
         rules = RuleRegistry.get_all_rules()
-        assert len(rules) == 110
+        assert len(rules) == len(RULE_CATALOG)
         assert "S101" in rules
         assert "S1110" in rules
 
@@ -74,18 +101,18 @@ class TestRuleRegistry:
         assert "S201" in rules
         assert "S101" not in rules
 
-    def test_initialize_loads_catalog_order_and_clears_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Catalog order and cache reset behavior should be preserved."""
-        monkeypatch.setattr(RuleRegistry, "_rules", {})
-        monkeypatch.setattr(RuleRegistry, "_message_match_cache", {"import os": None})
-        monkeypatch.setattr(RuleRegistry, "_initialized", False)
+    def test_initialize_loads_catalog_order_after_reset(self) -> None:
+        """Catalog order should be preserved after a full registry reset."""
+        RuleRegistry.find_matching_rule("import os")
+        assert "import os" in RuleRegistry._message_match_cache
+        RuleRegistry.reset_for_testing()
+        assert RuleRegistry._message_match_cache == {}
 
         RuleRegistry.initialize()
         loaded_rules = RuleRegistry.get_all_rules()
 
         assert list(loaded_rules) == [entry.code for entry in RULE_CATALOG]
         assert len(loaded_rules) == len(RULE_CATALOG)
-        assert RuleRegistry._message_match_cache == {}
 
         RuleRegistry.initialize()
 
@@ -221,28 +248,32 @@ S301 = "HIGH"
         assert config.suppress == {"S710", "S801"}
         assert base_config.suppress == {"S710"}
 
-    def test_ignore_range_expansion(self):
+    def test_ignore_range_expansion(self) -> None:
         """Test that ignore ranges expand correctly."""
         config = ModelAuditConfig()
         config._parse_config({"ignore": {"tests/**": ["S200-S202", "S999"]}})
 
         assert "tests/**" in config.ignore
         assert set(config.ignore["tests/**"]) == {"S201", "S202", "S999"}
+        assert "S200" not in config.ignore["tests/**"]
         assert config.is_suppressed("S201", "tests/example.py")
         assert not config.is_suppressed("S203", "tests/example.py")
 
-    def test_parse_config_filters_unknown_codes(self):
+    def test_parse_config_filters_unknown_codes(self) -> None:
         """Unknown config rule codes should be ignored instead of persisted."""
         config = ModelAuditConfig()
         config._parse_config(
             {
                 "suppress": ["S710", "S700-S702", "s9999"],
                 "severity": {"s301": "HIGH", "S302": "INVALID", "S9999": "CRITICAL"},
+                # Lowercase "all" exercises keyword normalization to "ALL".
                 "ignore": {"tests/**": ["S200-S202", "S9999", "all"]},
             }
         )
 
+        # S700-S702 expands the whole numeric span, then filters out currently unknown S700.
         assert config.suppress == {"S701", "S702", "S710"}
+        assert "S700" not in config.suppress
         assert config.severity == {"S301": Severity.HIGH}
         assert set(config.ignore["tests/**"]) == {"S201", "S202", "ALL"}
 

@@ -13,6 +13,8 @@ if TYPE_CHECKING:
     from modelaudit.scanners.base import BaseScanner
 from modelaudit.utils.sources.cloud_storage import get_fs_protocol
 
+from .detection import _has_zip_magic
+
 
 def can_stream_analyze(url: str, scanner: "BaseScanner") -> bool:
     """Check if a file can be analyzed via streaming."""
@@ -41,20 +43,22 @@ def _scan_stream_accepts_source_keyword(method: Any) -> bool:
     return any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
 
 
-def _mark_streaming_analysis_incomplete(result: "ScanResult") -> None:
+def _mark_streaming_analysis_incomplete(result: "ScanResult", *, header_only_fallback: bool = False) -> None:
     from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 
     result.metadata["analysis_incomplete"] = True
     result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
     result.metadata.setdefault(
         "scan_outcome_message",
-        "Streaming analysis incomplete; failed closed after analyzing only a bounded prefix.",
+        "Streaming analysis incomplete; failed closed because full scanner coverage was not available.",
     )
 
     existing_reasons = result.metadata.get("scan_outcome_reasons")
     reasons = existing_reasons if isinstance(existing_reasons, list) else []
     if "streaming_analysis_incomplete" not in reasons:
         reasons.append("streaming_analysis_incomplete")
+    if header_only_fallback and "streaming_header_only_fallback" not in reasons:
+        reasons.append("streaming_header_only_fallback")
     result.metadata["scan_outcome_reasons"] = reasons
 
 
@@ -74,8 +78,8 @@ def stream_analyze_file(
     content, limited header checks are performed instead.
 
     Returns:
-        Tuple of (ScanResult or None, was_complete)
-        was_complete indicates if the entire file was analyzed
+        Tuple of (ScanResult or None, analysis_complete)
+        analysis_complete indicates if scanner-backed analysis covered the entire file
     """
     try:
         import fsspec
@@ -99,7 +103,7 @@ def stream_analyze_file(
 
         # Determine how much to read
         bytes_to_read = min(file_size, max_bytes)
-        was_complete = bytes_to_read >= file_size
+        bytes_complete = bytes_to_read >= file_size
 
         # Read partial content
         with fs.open(url, "rb") as f:
@@ -125,7 +129,6 @@ def stream_analyze_file(
                 ("scan_stream", True),
                 ("scan_bytes", False),
                 ("scan_fileobj", False),
-                ("_scan_pickle_bytes", True),
             ]
             for method_name, needs_size in partial_methods:
                 if hasattr(scanner, method_name):
@@ -186,7 +189,7 @@ def stream_analyze_file(
                                 "detection_method": "streaming_header_scan",
                                 "bytes_analyzed": bytes_to_read,
                                 "file_size": file_size,
-                                "analysis_complete": was_complete,
+                                "analysis_complete": False,
                             },
                             type="streaming_security_check",
                             why=(
@@ -199,7 +202,7 @@ def stream_analyze_file(
 
             if content.startswith(b"\x80"):  # Pickle protocol marker
                 protocol_version = content[1] if len(content) > 1 else 0
-                protocol_marker_only = was_complete and len(content) == 2 and protocol_version in {2, 3, 4, 5}
+                protocol_marker_only = bytes_complete and len(content) == 2 and protocol_version in {2, 3, 4, 5}
                 if protocol_version >= 3 and not protocol_marker_only:
                     issues.append(
                         Issue(
@@ -221,6 +224,9 @@ def stream_analyze_file(
         # Create a result for any successful streamed read; reserve None for
         # transport/setup failures so callers can distinguish fallback from an
         # inconclusive partial analysis.
+        scan_result_incomplete = bool(scan_result and scan_result.metadata.get("analysis_incomplete"))
+        analysis_complete = bytes_complete and scan_result is not None and not scan_result_incomplete
+
         result = ScanResult(scanner_name="streaming")
         scanned = getattr(scan_result, "bytes_scanned", 0) if scan_result is not None else 0
         result.bytes_scanned = scanned or bytes_to_read
@@ -228,15 +234,16 @@ def stream_analyze_file(
         result.metadata = {
             "streaming_analysis": True,
             "bytes_analyzed": bytes_to_read,
-            "analysis_complete": was_complete,
+            "bytes_complete": bytes_complete,
+            "analysis_complete": analysis_complete,
             "file_size": file_size,
         }
         result.metadata.update(metadata)
-        if not was_complete:
-            _mark_streaming_analysis_incomplete(result)
+        if not analysis_complete:
+            _mark_streaming_analysis_incomplete(result, header_only_fallback=scan_result is None)
         scanner_success = bool(getattr(scan_result, "success", True)) if scan_result is not None else True
-        result.finish(success=was_complete and scanner_success)
-        return result, was_complete
+        result.finish(success=analysis_complete and scanner_success)
+        return result, analysis_complete
 
     except Exception as e:
         # If streaming fails, return None to fall back to regular download
@@ -276,7 +283,7 @@ def get_streaming_preview(url: str, max_bytes: int = 1024) -> dict[str, Any] | N
         if header.startswith(b"\x80"):
             preview["detected_format"] = "pickle"
             preview["pickle_protocol"] = header[1] if len(header) > 1 else "unknown"
-        elif header.startswith(b"PK"):
+        elif _has_zip_magic(header):
             preview["detected_format"] = "zip (possibly pytorch/tensorflow)"
         elif b"HDF" in header[:10]:
             preview["detected_format"] = "HDF5 (keras/tensorflow)"

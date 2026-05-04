@@ -11,6 +11,7 @@ Part of ModelAudit's critical security validation suite.
 
 import ast
 import re
+import textwrap
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -114,6 +115,20 @@ DANGEROUS_IMPORTS = [
     "__builtins__",
 ]
 
+
+def _compile_dangerous_import_patterns(dangerous_import: str) -> tuple[re.Pattern[str], re.Pattern[str]]:
+    """Compile exact import/from-import regexes for one dangerous module name."""
+    escaped = re.escape(dangerous_import)
+    return (
+        re.compile(rf"(?m)^\s*import\s+{escaped}(?:[.\s,]|$)"),
+        re.compile(rf"(?m)^\s*from\s+{escaped}(?:[.\s]|$)"),
+    )
+
+
+_DANGEROUS_IMPORT_PATTERNS = {
+    dangerous_import: _compile_dangerous_import_patterns(dangerous_import) for dangerous_import in DANGEROUS_IMPORTS
+}
+
 # Patterns that indicate code execution attempts
 CODE_EXECUTION_PATTERNS = [
     # Direct execution patterns
@@ -164,6 +179,76 @@ class JITScriptDetector:
             if "tf" in custom_ops:
                 self.dangerous_tf_ops.extend(custom_ops["tf"])
 
+    @staticmethod
+    def _looks_like_dangerous_python_source(data: bytes) -> bool:
+        """Return whether marker-free bytes look like dangerous embedded Python source."""
+        try:
+            source = textwrap.dedent(data.decode("utf-8"))
+            tree = ast.parse(source)
+        except (SyntaxError, UnicodeDecodeError, ValueError):
+            return False
+
+        return JITScriptDetector._ast_contains_dangerous_python(tree)
+
+    @staticmethod
+    def _ast_contains_dangerous_python(tree: ast.AST) -> bool:
+        """Return whether parsed Python contains modeled dangerous operations."""
+
+        def is_dangerous_import(module_name: str) -> bool:
+            return any(
+                module_name == dangerous_import or module_name.startswith(f"{dangerous_import}.")
+                for dangerous_import in DANGEROUS_IMPORTS
+            )
+
+        def dotted_name(node: ast.AST) -> str | None:
+            if isinstance(node, ast.Name):
+                return node.id
+            if isinstance(node, ast.Attribute):
+                parent = dotted_name(node.value)
+                return f"{parent}.{node.attr}" if parent else None
+            return None
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                if any(is_dangerous_import(alias.name) for alias in node.names):
+                    return True
+            elif isinstance(node, ast.ImportFrom):
+                if node.module and is_dangerous_import(node.module):
+                    return True
+            elif isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name) and node.func.id in DANGEROUS_BUILTINS:
+                    return True
+
+                operation = dotted_name(node.func)
+                if operation is None:
+                    continue
+                if operation in {
+                    "socket.socket",
+                    "socket.create_connection",
+                    "urllib.urlopen",
+                    "urllib.request.urlopen",
+                    "requests.get",
+                    "requests.post",
+                    "requests.put",
+                    "requests.delete",
+                    "subprocess.call",
+                    "subprocess.run",
+                    "subprocess.Popen",
+                    "subprocess.check_output",
+                }:
+                    return True
+                if operation.startswith("os.") and re.fullmatch(r"os\.(?:system|popen|exec\w*|spawn\w*)", operation):
+                    return True
+
+        return False
+
+    @staticmethod
+    def _contains_dangerous_import(source: str, dangerous_import: str) -> bool:
+        """Return whether source imports the exact dangerous module or one of its submodules."""
+        patterns = _DANGEROUS_IMPORT_PATTERNS.get(dangerous_import)
+        import_pattern, from_pattern = patterns or _compile_dangerous_import_patterns(dangerous_import)
+        return import_pattern.search(source) is not None or from_pattern.search(source) is not None
+
     def scan_torchscript(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
         """Scan TorchScript model data for dangerous operations.
 
@@ -203,29 +288,29 @@ class JITScriptDetector:
                 )
 
         # Check for TorchScript markers
-        if b"TorchScript" in data or b"torch.jit" in data:
-            if self.strict_mode:
-                finding_data = {
-                    "message": "TorchScript JIT compilation detected",
-                    "severity": "WARNING",
-                    "context": context,
-                    "pattern": None,
-                    "recommendation": "JIT-compiled models can contain arbitrary code - verify source",
-                    "confidence": 0.8,
-                    "framework": "TorchScript",
-                    "code_snippet": None,
-                    "type": "jit_usage",
-                    "operation": None,
-                    "builtin": None,
-                    "import": None,
-                }
-                findings.append(create_jit_finding(**finding_data))
+        if self.strict_mode and (b"TorchScript" in data or b"torch.jit" in data):
+            finding_data = {
+                "message": "TorchScript JIT compilation detected",
+                "severity": "WARNING",
+                "context": context,
+                "pattern": None,
+                "recommendation": "JIT-compiled models can contain arbitrary code - verify source",
+                "confidence": 0.8,
+                "framework": "TorchScript",
+                "code_snippet": None,
+                "type": "jit_usage",
+                "operation": None,
+                "builtin": None,
+                "import": None,
+            }
+            findings.append(create_jit_finding(**finding_data))
 
-            # Look for embedded Python code
-            if b"def " in data or b"class " in data:
-                # Try to extract and parse Python code
-                code_findings = self._extract_and_check_python_code(data, "TorchScript", context)
-                findings.extend(code_findings)
+        # Look for embedded Python code even when framework markers are absent.
+        # Scanner callers can hand us raw code-bearing blobs, and an attacker can
+        # remove marker strings without removing the executable payload.
+        if b"def " in data or b"class " in data:
+            code_findings = self._extract_and_check_python_code(data, "TorchScript", context)
+            findings.extend(code_findings)
 
         # Check for pickle within TorchScript (common attack vector)
         if b"GLOBAL" in data and b"torch" in data:
@@ -409,7 +494,14 @@ class JITScriptDetector:
 
         return findings
 
-    def _extract_and_check_python_code(self, data: bytes, framework: str, context: str) -> list["JITScriptFinding"]:
+    def _extract_and_check_python_code(
+        self,
+        data: bytes,
+        framework: str,
+        context: str,
+        *,
+        include_full_source: bool = False,
+    ) -> list["JITScriptFinding"]:
         """Extract and analyze embedded Python code.
 
         Args:
@@ -427,9 +519,9 @@ class JITScriptDetector:
         if not self.check_ast:
             return findings
 
-        # Try to extract Python code snippets
+        bounded = data if include_full_source else data[:1000000]
         python_code_pattern = rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+"
-        matches = re.findall(python_code_pattern, data[:1000000])  # Limit search size
+        matches = [bounded] if include_full_source else re.findall(python_code_pattern, bounded)
 
         for match in matches[:10]:  # Analyze first 10 code snippets
             try:
@@ -437,7 +529,7 @@ class JITScriptDetector:
 
                 # Check for dangerous imports
                 for dangerous_import in DANGEROUS_IMPORTS:
-                    if f"import {dangerous_import}" in code_str or f"from {dangerous_import}" in code_str:
+                    if self._contains_dangerous_import(code_str, dangerous_import):
                         findings.append(
                             create_jit_finding(
                                 message=f"Dangerous import '{dangerous_import}' in embedded code",
@@ -490,7 +582,7 @@ class JITScriptDetector:
 
         # Check for common code execution patterns in binary
         for pattern, description in CODE_EXECUTION_PATTERNS:
-            if re.search(pattern, data[:1000000]):  # Limit search size
+            if re.search(pattern, bounded):  # Limit search size
                 findings.append(
                     create_jit_finding(
                         message=description,
@@ -860,6 +952,9 @@ class JITScriptDetector:
         if model_type == "onnx":
             findings.extend(self.scan_onnx(data, context))
 
+        if model_type == "pickle" and (b"def " in data or b"class " in data):
+            findings.extend(self._extract_and_check_python_code(data, "Generic Python", context))
+
         # Always check for generic dangerous patterns
         # Only run fallback scanners if model type is truly unknown
         # Don't run fallback on known types (pytorch, tensorflow, onnx) even if they have no findings
@@ -870,6 +965,16 @@ class JITScriptDetector:
             findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
             findings.extend(self.scan_tensorflow(data, context))
             findings.extend(self.scan_onnx(data, context))
+
+        if self._looks_like_dangerous_python_source(data):
+            findings.extend(
+                self._extract_and_check_python_code(
+                    data,
+                    "Generic Python",
+                    context,
+                    include_full_source=True,
+                )
+            )
 
         return findings
 

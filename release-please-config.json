@@ -17,6 +17,27 @@
           "glob": false
         }
       ]
+    },
+    "packages/modelaudit-picklescan": {
+      "release-type": "python",
+      "package-name": "modelaudit-picklescan",
+      "component": "modelaudit-picklescan",
+      "include-component-in-tag": true,
+      "changelog-path": "CHANGELOG.md",
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": true,
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "pyproject.toml",
+          "glob": false
+        },
+        {
+          "type": "generic",
+          "path": "Cargo.toml",
+          "glob": false
+        }
+      ]
     }
   }
 }

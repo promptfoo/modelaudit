@@ -24,6 +24,8 @@ from modelaudit.utils.file.detection import (
     validate_file_type,
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
+from tests.helpers import create_mock_onnx
+from tests.helpers.file_creators import create_v7_tar_archive
 
 
 def _create_mar_archive(
@@ -92,6 +94,26 @@ def test_detect_file_format_zip(tmp_path):
     assert detect_file_format(str(zip_path)) == "zip"
 
 
+def test_detect_file_format_rejects_pk_prefix_near_match(tmp_path: Path) -> None:
+    near_match = tmp_path / "not-a-zip.dat"
+    near_match.write_bytes(b"PKNOPE harmless text")
+
+    assert is_zipfile(str(near_match)) is False
+    assert detect_file_format_from_magic(str(near_match)) == "unknown"
+    assert detect_file_format(str(near_match)) == "unknown"
+
+
+def test_detect_file_format_accepts_prefixed_zip_with_central_directory_stub(tmp_path: Path) -> None:
+    prefixed_zip = tmp_path / "prefixed.zip"
+    with zipfile.ZipFile(prefixed_zip, "w") as archive:
+        archive.writestr("payload.txt", "hello")
+    prefixed_zip.write_bytes(b"PK\x01\x02stub-prefix" + prefixed_zip.read_bytes())
+
+    assert is_zipfile(str(prefixed_zip)) is True
+    assert detect_file_format_from_magic(str(prefixed_zip)) == "zip"
+    assert detect_file_format(str(prefixed_zip)) == "zip"
+
+
 def test_detect_valid_torchserve_mar_by_magic_and_validation(tmp_path: Path) -> None:
     mar_path = _create_mar_archive(
         tmp_path,
@@ -141,6 +163,7 @@ def test_detect_file_format_by_extension(tmp_path):
         ".rds": "r_serialized",
         ".rda": "r_serialized",
         ".rdata": "r_serialized",
+        ".rar": "unknown",
         ".unknown": "unknown",
     }
 
@@ -215,6 +238,59 @@ def test_detect_file_format_coreml_validation_passthrough(tmp_path: Path) -> Non
     assert detect_file_format(str(model_path)) == "coreml"
     assert detect_format_from_extension(str(model_path)) == "coreml"
     assert validate_file_type(str(model_path)) is True
+
+
+def test_detect_file_format_onnx_pb_content_hint_preempts_protobuf_extension(tmp_path: Path) -> None:
+    """ONNX protobuf payloads renamed to .pb should route to ONNX, not TensorFlow protobuf."""
+    pytest.importorskip("onnx")
+    model_path = tmp_path / "model.pb"
+    create_mock_onnx(model_path)
+
+    assert detect_file_format(str(model_path)) == "onnx"
+    assert detect_file_format_from_magic(str(model_path)) == "onnx"
+    assert validate_file_type(str(model_path)) is True
+
+
+def test_detect_file_format_rejects_incidental_onnx_pb_string(tmp_path: Path) -> None:
+    """A generic protobuf string value mentioning ONNX must not route as ONNX."""
+    model_path = tmp_path / "metadata.pb"
+    model_path.write_bytes(bytes([0x0A, 0x04]) + b"onnx" + b"\x00" * 16)
+
+    assert detect_file_format(str(model_path)) == "protobuf"
+    assert detect_file_format_from_magic(str(model_path)) == "unknown"
+    assert validate_file_type(str(model_path)) is True
+
+
+def test_detect_file_format_rejects_benign_onnx_token_near_match(tmp_path: Path) -> None:
+    """Plain text mentioning ONNX must not route to the ONNX scanner."""
+    model_path = tmp_path / "note.payload"
+    model_path.write_bytes(b"this documentation mentions onnx but is not a model")
+
+    assert detect_file_format(str(model_path)) == "unknown"
+    assert detect_file_format_from_magic(str(model_path)) == "unknown"
+    assert validate_file_type(str(model_path)) is True
+
+
+def test_detect_file_format_rar_magic(tmp_path: Path) -> None:
+    """RAR archives should be recognized for fail-closed scanner routing."""
+    rar4_path = tmp_path / "archive-rar4.payload"
+    rar4_path.write_bytes(b"Rar!\x1a\x07\x00" + b"\x00" * 32)
+    rar5_path = tmp_path / "archive-rar5.payload"
+    rar5_path.write_bytes(b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32)
+
+    assert detect_file_format(str(rar4_path)) == "rar"
+    assert detect_file_format_from_magic(str(rar4_path)) == "rar"
+    assert detect_file_format(str(rar5_path)) == "rar"
+    assert detect_file_format_from_magic(str(rar5_path)) == "rar"
+
+
+def test_detect_file_format_rejects_rar_magic_near_match(tmp_path: Path) -> None:
+    """RAR routing should require a complete RAR4/RAR5 signature."""
+    near_match = tmp_path / "archive.payload"
+    near_match.write_bytes(b"Rar!\x1a\x07ZZ" + b"\x00" * 32)
+
+    assert detect_file_format(str(near_match)) == "unknown"
+    assert detect_file_format_from_magic(str(near_match)) == "unknown"
 
 
 def test_detect_format_from_extension_mxnet_symbol(tmp_path: Path) -> None:
@@ -342,6 +418,30 @@ def test_detect_file_format_proto0_pickle_with_text_extension(tmp_path: Path) ->
 
     assert detect_file_format(str(payload)) == "pickle"
     assert detect_file_format_from_magic(str(payload)) == "pickle"
+
+
+def test_detect_file_format_accepts_forward_compatible_binary_pickle_protocol(tmp_path: Path) -> None:
+    """Future binary pickle protocol bumps should not fail extension validation."""
+    payload = tmp_path / "future-protocol.pkl"
+    payload.write_bytes(b"\x80\x06}.")
+
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+    assert validate_file_type(str(payload)) is True
+
+
+@pytest.mark.parametrize("filename", ["protocol1-binary-header", "protocol1-binary-header.bin"])
+def test_detect_file_format_accepts_protocol1_binary_pickle_header(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    """Crafted protocol-1 PROTO headers should route to pickle scanning without suffix help."""
+    payload = tmp_path / filename
+    payload.write_bytes(b"\x80\x01}.")
+
+    assert detect_file_format(str(payload)) == "pickle"
+    assert detect_file_format_from_magic(str(payload)) == "pickle"
+    assert validate_file_type(str(payload)) is True
 
 
 def test_detect_file_format_proto0_pickle_with_single_comment_token_prefix(tmp_path: Path) -> None:
@@ -519,6 +619,16 @@ def test_detect_file_format_tar(tmp_path):
         info = tarfile.TarInfo(name="test.txt")
         tar.addfile(info, io.BytesIO(b"content"))
 
+    assert detect_file_format_from_magic(str(tar_path)) == "tar"
+    assert detect_file_format(str(tar_path)) == "tar"
+
+
+def test_detect_file_format_extensionless_legacy_tar_without_ustar(tmp_path: Path) -> None:
+    """Legacy TAR headers without ustar magic should still route by checksum."""
+    tar_path = create_v7_tar_archive(tmp_path / "legacy-archive")
+
+    assert tar_path.read_bytes()[257:262] == b"\0" * 5
+    assert tarfile.is_tarfile(tar_path) is True
     assert detect_file_format_from_magic(str(tar_path)) == "tar"
     assert detect_file_format(str(tar_path)) == "tar"
 
@@ -953,8 +1063,8 @@ def test_detect_generic_xml_format(tmp_path):
     assert detect_file_format_from_magic(str(xml_path)) == "unknown"
 
 
-def test_detect_openvino_xml_net_beyond_64_bytes(tmp_path):
-    """Test that <net> tag beyond 64 bytes is not detected as OpenVINO."""
+def test_detect_openvino_xml_net_beyond_64_bytes(tmp_path: Path) -> None:
+    """Test that bounded XML root parsing still detects late OpenVINO roots."""
     # Create XML where <net> appears after 64 bytes
     xml_path = tmp_path / "late_net.xml"
     # Padding to push <net> beyond 64 bytes
@@ -962,8 +1072,7 @@ def test_detect_openvino_xml_net_beyond_64_bytes(tmp_path):
     xml_content = b'<?xml version="1.0"?>\n' + padding + b'\n<net name="Model0">\n</net>'
     xml_path.write_bytes(xml_content)
 
-    # Should return unknown since <net> is beyond the 64-byte read limit
-    assert detect_file_format_from_magic(str(xml_path)) == "unknown"
+    assert detect_file_format_from_magic(str(xml_path)) == "openvino"
 
 
 def test_detect_openvino_xml_short_file(tmp_path):
@@ -977,16 +1086,14 @@ def test_detect_openvino_xml_short_file(tmp_path):
     assert detect_file_format_from_magic(str(xml_path)) == "openvino"
 
 
-def test_detect_xml_with_net_in_comment(tmp_path):
-    """Test that <net> in XML comment doesn't trigger false positive."""
+def test_detect_xml_with_net_in_comment(tmp_path: Path) -> None:
+    """Test that <net> in XML comments does not trigger model routing."""
     # Create XML with <net> inside a comment
     xml_path = tmp_path / "commented.xml"
     xml_content = b'<?xml version="1.0"?>\n<!-- <net> -->\n<root/>'
     xml_path.write_bytes(xml_content)
 
-    # Should still detect as openvino because we're doing simple byte matching
-    # This is acceptable - the actual OpenVINO scanner will validate properly
-    assert detect_file_format_from_magic(str(xml_path)) == "openvino"
+    assert detect_file_format_from_magic(str(xml_path)) == "unknown"
 
 
 def test_xml_detection_boundary_conditions(tmp_path):
@@ -1001,8 +1108,8 @@ def test_xml_detection_boundary_conditions(tmp_path):
     assert detect_file_format_from_magic(str(xml_path)) == "openvino"
 
 
-def test_detect_pmml_xml_beyond_64_bytes(tmp_path):
-    """Test that <PMML> tag beyond 64 bytes is not detected as PMML."""
+def test_detect_pmml_xml_beyond_64_bytes(tmp_path: Path) -> None:
+    """Test that bounded XML root parsing still detects late PMML roots."""
     # Create XML where <PMML> appears after 64 bytes
     pmml_path = tmp_path / "late_pmml.pmml"
     # Padding to push <PMML> beyond 64 bytes
@@ -1010,8 +1117,18 @@ def test_detect_pmml_xml_beyond_64_bytes(tmp_path):
     pmml_content = b'<?xml version="1.0"?>\n' + padding + b'\n<PMML version="4.4">\n</PMML>'
     pmml_path.write_bytes(pmml_content)
 
-    # Should return unknown since <PMML> is beyond the 64-byte read limit
-    assert detect_file_format_from_magic(str(pmml_path)) == "unknown"
+    assert detect_file_format_from_magic(str(pmml_path)) == "pmml"
+
+
+def test_detect_pmml_xml_with_oversized_doctype_subset(tmp_path: Path) -> None:
+    """Incomplete bounded XML prologs should fail closed instead of guessing a PMML root."""
+    pmml_path = tmp_path / "oversized_doctype_pmml.txt"
+    pmml_path.write_text(
+        "<?xml version='1.0'?><!DOCTYPE PMML [" + ("x" * ((1024 * 1024) + 64)) + "]><PMML/>",
+        encoding="utf-8",
+    )
+
+    assert detect_file_format_from_magic(str(pmml_path)) == "xml_model_inconclusive"
 
 
 def test_detect_pmml_xml_short_file(tmp_path):
@@ -1025,16 +1142,14 @@ def test_detect_pmml_xml_short_file(tmp_path):
     assert detect_file_format_from_magic(str(pmml_path)) == "pmml"
 
 
-def test_detect_xml_with_pmml_in_comment(tmp_path):
-    """Test that <PMML> in XML comment still triggers detection."""
+def test_detect_xml_with_pmml_in_comment(tmp_path: Path) -> None:
+    """Test that <PMML> in XML comments does not trigger model routing."""
     # Create XML with <PMML> inside a comment
     xml_path = tmp_path / "commented.pmml"
     xml_content = b'<?xml version="1.0"?>\n<!-- <PMML> -->\n<root/>'
     xml_path.write_bytes(xml_content)
 
-    # Should still detect as pmml because we're doing simple byte matching
-    # This is acceptable - the actual PMML scanner will validate properly
-    assert detect_file_format_from_magic(str(xml_path)) == "pmml"
+    assert detect_file_format_from_magic(str(xml_path)) == "unknown"
 
 
 def test_pmml_detection_boundary_conditions(tmp_path):

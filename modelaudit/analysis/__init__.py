@@ -2,7 +2,6 @@
 
 This package contains modules for analyzing ML models and detecting framework-specific patterns:
 - anomaly_detector.py - Statistical anomaly detection
-- enhanced_pattern_detector.py - Advanced pattern matching
 - entropy_analyzer.py - Entropy-based analysis
 - framework_patterns.py - ML framework detection patterns and heuristics
 - integrated_analyzer.py - Combined analysis techniques
@@ -12,9 +11,17 @@ This package contains modules for analyzing ML models and detecting framework-sp
 - unified_context.py - Unified ML context for cross-framework analysis
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from modelaudit.analysis import framework_patterns, unified_context
+
+if TYPE_CHECKING:
+    from modelaudit.analysis.anomaly_detector import AnomalyDetector as AnomalyDetector
+    from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer as EntropyAnalyzer
+    from modelaudit.analysis.integrated_analyzer import AnalysisConfidence as AnalysisConfidence
+    from modelaudit.analysis.integrated_analyzer import IntegratedAnalyzer as IntegratedAnalyzer
+    from modelaudit.analysis.semantic_analyzer import CodeRiskLevel as CodeRiskLevel
+    from modelaudit.analysis.semantic_analyzer import SemanticAnalyzer as SemanticAnalyzer
 
 # Lazy imports to avoid circular dependencies
 # Import specific classes only when accessed via __getattr__

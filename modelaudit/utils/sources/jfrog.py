@@ -3,11 +3,13 @@
 import ipaddress
 import logging
 import os
+import re
 import shutil
 import tempfile
+from collections.abc import Collection
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, TypedDict
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import click
 import requests
@@ -18,6 +20,44 @@ logger = logging.getLogger(__name__)
 
 # Constants
 MAX_RECURSION_DEPTH = 64  # Prevent runaway recursion in folder traversal
+_SENSITIVE_QUERY_PARAM_RE = re.compile(
+    r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|token|secret|api-key|api_key|apikey|sig)[^=\s&]*=)[^\s&#]+",
+    re.IGNORECASE,
+)
+_URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
+
+
+def redact_jfrog_url_for_display(url: str) -> str:
+    """Remove credentials, query strings, and fragments from a JFrog URL for display."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return "<jfrog URL redacted>"
+
+    if not parsed.scheme:
+        return url
+
+    netloc = parsed.netloc
+    if "@" in parsed.netloc:
+        netloc = parsed.hostname or ""
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+        if port is not None:
+            netloc = f"{netloc}:{port}"
+        netloc = f"<credentials-redacted>@{netloc}"
+
+    return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
+
+
+def redact_jfrog_error_for_display(message: object, source_url: str | None = None) -> str:
+    """Remove JFrog URL credentials from exception text."""
+    redacted = str(message)
+    if source_url:
+        redacted = redacted.replace(source_url, redact_jfrog_url_for_display(source_url))
+    redacted = _URL_USERINFO_RE.sub(r"\1<credentials-redacted>@", redacted)
+    return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1<redacted>", redacted)
 
 
 def _safe_download_path(download_dir: Path, relative_path: str) -> Path:
@@ -167,8 +207,9 @@ def download_artifact(
         requests.HTTPError: If authentication fails or download fails
         Exception: For other download errors
     """
+    display_url = redact_jfrog_url_for_display(url)
     if not is_jfrog_url(url):
-        raise ValueError(f"Not a JFrog URL: {url}")
+        raise ValueError(f"Not a JFrog URL: {display_url}")
 
     filename = os.path.basename(urlparse(url).path)
     temp_dir: Path | None = None
@@ -234,24 +275,27 @@ def download_artifact(
     except requests.exceptions.HTTPError as e:  # type: ignore[attr-defined]
         if temp_dir is not None and temp_dir.exists():
             shutil.rmtree(temp_dir)
+        error_msg = redact_jfrog_error_for_display(e, url)
         if e.response.status_code == 401:
             raise Exception(
-                f"Authentication failed for JFrog URL {url}. Please provide a valid API token or access token."
+                f"Authentication failed for JFrog URL {display_url}. Please provide a valid API token or access token."
             ) from e
         if e.response.status_code == 403:
-            raise Exception(f"Access denied for JFrog URL {url}. Please check your permissions.") from e
+            raise Exception(f"Access denied for JFrog URL {display_url}. Please check your permissions.") from e
         if e.response.status_code == 404:
-            raise Exception(f"Artifact not found at {url}") from e
+            raise Exception(f"Artifact not found at {display_url}") from e
 
-        raise Exception(f"HTTP error {e.response.status_code} downloading from {url}: {e}") from e
+        raise Exception(f"HTTP error {e.response.status_code} downloading from {display_url}: {error_msg}") from e
     except requests.exceptions.RequestException as e:  # type: ignore[attr-defined]
         if temp_dir is not None and temp_dir.exists():
             shutil.rmtree(temp_dir)
-        raise Exception(f"Network error downloading from {url}: {e}") from e
+        error_msg = redact_jfrog_error_for_display(e, url)
+        raise Exception(f"Network error downloading from {display_url}: {error_msg}") from e
     except Exception as e:
         if temp_dir is not None and temp_dir.exists():
             shutil.rmtree(temp_dir)
-        raise Exception(f"Failed to download artifact from {url}: {e!s}") from e
+        error_msg = redact_jfrog_error_for_display(e, url)
+        raise Exception(f"Failed to download artifact from {display_url}: {error_msg}") from e
 
 
 def get_jfrog_base_url(url: str) -> str:
@@ -266,7 +310,7 @@ def get_jfrog_base_url(url: str) -> str:
         base_path = "/".join(path_parts[: artifactory_index + 1])
         return f"{parsed.scheme}://{parsed.netloc}{base_path}"
     except ValueError as e:
-        raise ValueError(f"Invalid JFrog Artifactory URL format: {url}") from e
+        raise ValueError(f"Invalid JFrog Artifactory URL format: {redact_jfrog_url_for_display(url)}") from e
 
 
 def get_storage_api_url(url: str) -> str:
@@ -281,7 +325,7 @@ def get_storage_api_url(url: str) -> str:
         api_path = "/".join(api_parts)
         return f"{parsed.scheme}://{parsed.netloc}{api_path}"
     except (ValueError, IndexError) as e:
-        raise ValueError(f"Invalid JFrog Artifactory URL format: {url}") from e
+        raise ValueError(f"Invalid JFrog Artifactory URL format: {redact_jfrog_url_for_display(url)}") from e
 
 
 def format_size(size_bytes: int) -> str:
@@ -294,8 +338,12 @@ def format_size(size_bytes: int) -> str:
     return f"{size:.1f} PB"
 
 
-def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def filter_scannable_files(
+    files: list[dict[str, Any]],
+    scannable_extensions: Collection[str] | None = None,
+) -> list[dict[str, Any]]:
     """Filter files to only include scannable model types."""
+    extensions = SCANNABLE_MODEL_EXTENSIONS if scannable_extensions is None else frozenset(scannable_extensions)
     scannable = []
     for file in files:
         file_path = file["path"]
@@ -311,8 +359,11 @@ def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
             path = Path(file_path)
 
         suffixes = [s.lower() for s in path.suffixes]
+        if not suffixes and "" in extensions:
+            scannable.append(file)
+            continue
         for i in range(1, len(suffixes) + 1):
-            if "".join(suffixes[-i:]) in SCANNABLE_MODEL_EXTENSIONS:
+            if "".join(suffixes[-i:]) in extensions:
                 scannable.append(file)
                 break
     return scannable
@@ -336,10 +387,12 @@ def detect_jfrog_target_type(
         ValueError: If URL is not a valid JFrog URL
         Exception: If API request fails
     """
+    display_url = redact_jfrog_url_for_display(url)
     if not is_jfrog_url(url):
-        raise ValueError(f"Not a JFrog URL: {url}")
+        raise ValueError(f"Not a JFrog URL: {display_url}")
 
     storage_api_url = get_storage_api_url(url)
+    display_storage_api_url = redact_jfrog_url_for_display(storage_api_url)
 
     # Prepare authentication headers
     headers = {}
@@ -381,14 +434,20 @@ def detect_jfrog_target_type(
             )
 
     except requests.exceptions.HTTPError as e:
+        error_msg = redact_jfrog_error_for_display(e, url)
         if e.response.status_code == 404:
-            raise Exception(f"JFrog artifact not found at {url}") from e
+            raise Exception(f"JFrog artifact not found at {display_url}") from e
         elif e.response.status_code in {401, 403}:
-            raise Exception(f"Authentication failed for JFrog URL {url}. Please provide valid credentials.") from e
+            raise Exception(
+                f"Authentication failed for JFrog URL {display_url}. Please provide valid credentials."
+            ) from e
         else:
-            raise Exception(f"HTTP error {e.response.status_code} accessing {storage_api_url}: {e}") from e
+            raise Exception(
+                f"HTTP error {e.response.status_code} accessing {display_storage_api_url}: {error_msg}"
+            ) from e
     except requests.exceptions.RequestException as e:
-        raise Exception(f"Network error accessing {storage_api_url}: {e}") from e
+        error_msg = redact_jfrog_error_for_display(e, url)
+        raise Exception(f"Network error accessing {display_storage_api_url}: {error_msg}") from e
 
 
 def list_jfrog_folder_contents(
@@ -399,6 +458,7 @@ def list_jfrog_folder_contents(
     recursive: bool = True,
     selective: bool = True,
     fetch_sizes: bool = False,
+    scannable_extensions: Collection[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Recursively list all files in a JFrog folder.
 
@@ -421,7 +481,7 @@ def list_jfrog_folder_contents(
     target_info = detect_jfrog_target_type(url, api_token, access_token, timeout)
 
     if target_info["type"] != "folder":
-        raise ValueError(f"URL is not a JFrog folder: {url}")
+        raise ValueError(f"URL is not a JFrog folder: {redact_jfrog_url_for_display(url)}")
 
     files = []
     base_url = url.rstrip("/")
@@ -433,16 +493,18 @@ def list_jfrog_folder_contents(
         on a partial file listing.
         """
         if depth > MAX_RECURSION_DEPTH:
+            display_folder_url = redact_jfrog_url_for_display(folder_url)
             raise Exception(
-                f"Maximum recursion depth ({MAX_RECURSION_DEPTH}) exceeded listing {folder_url}. "
+                f"Maximum recursion depth ({MAX_RECURSION_DEPTH}) exceeded listing {display_folder_url}. "
                 "Aborting to avoid incomplete file listing."
             )
 
         folder_info = detect_jfrog_target_type(folder_url, api_token, access_token, timeout)
 
         if folder_info["type"] != "folder":
+            display_folder_url = redact_jfrog_url_for_display(folder_url)
             raise Exception(
-                f"Expected JFrog folder while listing {folder_url}, got {folder_info['type']}. "
+                f"Expected JFrog folder while listing {display_folder_url}, got {folder_info['type']}. "
                 "Aborting to avoid incomplete file listing."
             )
 
@@ -465,7 +527,10 @@ def list_jfrog_folder_contents(
                         if file_info["type"] == "file":
                             size = file_info.get("size", 0)
                     except Exception as e:
-                        logger.warning(f"Failed to fetch size for {child_url}: {e}")
+                        logger.warning(
+                            "Failed to fetch size for "
+                            f"{redact_jfrog_url_for_display(child_url)}: {redact_jfrog_error_for_display(e)}"
+                        )
 
                 files.append(
                     {
@@ -479,7 +544,7 @@ def list_jfrog_folder_contents(
     _collect_files(base_url)
 
     if selective:
-        files = filter_scannable_files(files)
+        files = filter_scannable_files(files, scannable_extensions=scannable_extensions)
 
     return files
 
@@ -493,6 +558,7 @@ def download_jfrog_folder(
     selective: bool = True,
     show_progress: bool = True,
     fetch_sizes: bool = False,
+    scannable_extensions: Collection[str] | None = None,
 ) -> Path:
     """Download all files from a JFrog folder.
 
@@ -513,12 +579,23 @@ def download_jfrog_folder(
         ValueError: If URL is not a valid JFrog folder
         Exception: If downloads fail
     """
+    display_url = redact_jfrog_url_for_display(url)
     if not is_jfrog_url(url):
-        raise ValueError(f"Not a JFrog URL: {url}")
+        raise ValueError(f"Not a JFrog URL: {display_url}")
 
     # List all files in the folder
+    list_kwargs: dict[str, Any] = {}
+    if scannable_extensions is not None:
+        list_kwargs["scannable_extensions"] = scannable_extensions
     files = list_jfrog_folder_contents(
-        url, api_token, access_token, timeout, recursive=True, selective=selective, fetch_sizes=fetch_sizes
+        url,
+        api_token,
+        access_token,
+        timeout,
+        recursive=True,
+        selective=selective,
+        fetch_sizes=fetch_sizes,
+        **list_kwargs,
     )
 
     if not files:
@@ -599,7 +676,8 @@ def download_jfrog_folder(
             downloaded_files.append(downloaded_file)
 
         except Exception as e:
-            error_msg = f"Failed to download {file_info['name']}: {e}"
+            redacted_error = redact_jfrog_error_for_display(e)
+            error_msg = f"Failed to download {file_info['name']}: {redacted_error}"
             logger.warning(error_msg)
             if show_progress:
                 click.echo("❌ Aborting JFrog folder download to avoid scanning a partial dataset")
@@ -612,7 +690,7 @@ def download_jfrog_folder(
             )
             raise Exception(
                 "JFrog folder download failed after "
-                f"{completed_downloads} of {len(files)} file(s) completed. {file_info['name']}: {e}"
+                f"{completed_downloads} of {len(files)} file(s) completed. {file_info['name']}: {redacted_error}"
             ) from e
 
     return download_dir

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from contextlib import suppress
 from typing import Any, ClassVar
 
 try:
@@ -25,6 +26,13 @@ except Exception:  # pragma: no cover - optional dependency missing
     msgpack_exceptions = None  # type: ignore[assignment]
 
 from .base import BaseScanner, IssueSeverity, ScanResult
+
+_DANGEROUS_JAX_TRANSFORMS = ("jit_compile", "eval_jit", "exec_transform", "dynamic_eval", "runtime_eval")
+
+
+def _matching_jax_transforms(key_str: str, value_str: str) -> list[str]:
+    value_lower = value_str.lower()
+    return [transform for transform in _DANGEROUS_JAX_TRANSFORMS if transform in key_str or transform in value_lower]
 
 
 class FlaxMsgpackScanner(BaseScanner):
@@ -86,6 +94,9 @@ class FlaxMsgpackScanner(BaseScanner):
                 r"import\s+sys",
                 r"from\s+os\s+import\s+system",
             ],
+        )
+        self._compiled_suspicious_patterns = tuple(
+            (pattern, re.compile(pattern, re.IGNORECASE), pattern.lower()) for pattern in self.suspicious_patterns
         )
 
         self.suspicious_keys = self.config.get(
@@ -198,42 +209,45 @@ class FlaxMsgpackScanner(BaseScanner):
         ext = os.path.splitext(path)[1].lower()
 
         # Check file extension first
-        if ext in cls.supported_extensions and HAS_MSGPACK:
+        if ext in cls.supported_extensions:
             return True
 
         # For files without clear extensions, check if they might be msgpack
         if HAS_MSGPACK and ext in [".ckpt", ""]:  # Some JAX checkpoints have no extension
-            try:
-                with open(path, "rb") as f:
-                    # Read first few bytes to check for msgpack format
-                    header = f.read(32)
-                    if len(header) > 0 and header[0:1] in [
-                        b"\x80",
-                        b"\x81",
-                        b"\x82",
-                        b"\x83",
-                        b"\x84",
-                        b"\x85",
-                        b"\x86",
-                        b"\x87",
-                        b"\x88",
-                        b"\x89",
-                        b"\x8a",
-                        b"\x8b",
-                        b"\x8c",
-                        b"\x8d",
-                        b"\x8e",
-                        b"\x8f",
-                        b"\xde",
-                        b"\xdf",  # Common msgpack format markers
-                    ]:
-                        return True
-            except Exception:
-                pass
+            with suppress(Exception), open(path, "rb") as f:
+                # Read first few bytes to check for msgpack format
+                header = f.read(32)
+                if len(header) > 0 and header[0:1] in [
+                    b"\x80",
+                    b"\x81",
+                    b"\x82",
+                    b"\x83",
+                    b"\x84",
+                    b"\x85",
+                    b"\x86",
+                    b"\x87",
+                    b"\x88",
+                    b"\x89",
+                    b"\x8a",
+                    b"\x8b",
+                    b"\x8c",
+                    b"\x8d",
+                    b"\x8e",
+                    b"\x8f",
+                    b"\xde",
+                    b"\xdf",  # Common msgpack format markers
+                ]:
+                    return True
 
         return False
 
-    def _extract_jax_metadata(self, obj: Any, result: ScanResult) -> dict[str, Any]:
+    def _extract_jax_metadata(
+        self,
+        obj: Any,
+        result: ScanResult,
+        *,
+        ml_analysis: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Extract JAX/Flax specific metadata from the checkpoint."""
         metadata: dict[str, Any] = {
             "model_type": "unknown",
@@ -306,7 +320,8 @@ class FlaxMsgpackScanner(BaseScanner):
         metadata["parameter_count"] = count_parameters(obj)
 
         # Perform ML structure analysis to get confidence score
-        ml_analysis = self._analyze_ml_structure(obj, result)
+        if ml_analysis is None:
+            ml_analysis = self._analyze_ml_structure(obj, result)
 
         # Add confidence and ML analysis results to metadata
         metadata["confidence"] = ml_analysis["confidence"]
@@ -336,23 +351,19 @@ class FlaxMsgpackScanner(BaseScanner):
                     key_str = str(key).lower()
                     value_str = str(value)
 
-                    # Check for suspicious JAX transform patterns
-                    dangerous_transforms = ["jit_compile", "eval_jit", "exec_transform", "dynamic_eval", "runtime_eval"]
-
-                    for transform in dangerous_transforms:
-                        if transform in key_str or transform in value_str.lower():
-                            result.add_check(
-                                name="JAX Transform Security Check",
-                                passed=False,
-                                message=f"Suspicious JAX transform detected: {transform}",
-                                severity=IssueSeverity.CRITICAL,
-                                location=f"{path}/{key}",
-                                details={
-                                    "transform": transform,
-                                    "context": value_str[:200] if len(value_str) > 200 else value_str,
-                                },
-                                rule_code="S1105",  # JAX compilation risks
-                            )
+                    for transform in _matching_jax_transforms(key_str, value_str):
+                        result.add_check(
+                            name="JAX Transform Security Check",
+                            passed=False,
+                            message=f"Suspicious JAX transform detected: {transform}",
+                            severity=IssueSeverity.CRITICAL,
+                            location=f"{path}/{key}",
+                            details={
+                                "transform": transform,
+                                "context": value_str[:200] if len(value_str) > 200 else value_str,
+                            },
+                            rule_code="S1105",  # JAX compilation risks
+                        )
 
                     check_jax_transforms(value, f"{path}/{key}" if path else key)
             elif isinstance(data, list | tuple):
@@ -413,14 +424,14 @@ class FlaxMsgpackScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         """Check string values for suspicious patterns that might indicate code injection."""
-        for pattern in self.suspicious_patterns:
-            if re.search(pattern, value, re.IGNORECASE):
+        for pattern, compiled_pattern, lowered_pattern in self._compiled_suspicious_patterns:
+            if compiled_pattern.search(value):
                 # Determine appropriate rule code based on pattern
-                if "eval" in pattern.lower():
+                if "eval" in lowered_pattern:
                     rule_code = "S104"  # eval/exec usage
-                elif "compile" in pattern.lower():
+                elif "compile" in lowered_pattern:
                     rule_code = "S105"  # compile usage
-                elif "import\\s+os" in pattern.lower() or "os\\.system" in pattern.lower():
+                elif "import\\s+os" in lowered_pattern or "os\\.system" in lowered_pattern:
                     rule_code = "S101"  # os module usage
                 else:
                     rule_code = "S999"  # Unknown/generic suspicious pattern
@@ -682,9 +693,10 @@ class FlaxMsgpackScanner(BaseScanner):
         # Check for hierarchical structure (multiple layers)
         layer_evidence = 0
         layer_keywords = ["layer", "block", "attention", "ffn", "mlp", "linear", "conv"]
+        obj_text_lower = str(obj).lower()
 
         for keyword in layer_keywords:
-            if keyword in str(obj).lower():
+            if keyword in obj_text_lower:
                 layer_evidence += 1
 
         if layer_evidence >= 2:
@@ -738,7 +750,13 @@ class FlaxMsgpackScanner(BaseScanner):
 
         return analysis
 
-    def _validate_flax_structure(self, obj: Any, result: ScanResult) -> None:
+    def _validate_flax_structure(
+        self,
+        obj: Any,
+        result: ScanResult,
+        *,
+        ml_analysis: dict[str, Any] | None = None,
+    ) -> None:
         """Validate that the msgpack structure looks like a legitimate Flax checkpoint using structural analysis."""
         if not isinstance(obj, dict):
             result.add_check(
@@ -845,7 +863,8 @@ class FlaxMsgpackScanner(BaseScanner):
             return
 
         # If no standard keys, perform deep structural analysis
-        ml_analysis = self._analyze_ml_structure(obj, result)
+        if ml_analysis is None:
+            ml_analysis = self._analyze_ml_structure(obj, result)
 
         if ml_analysis["is_ml_model"]:
             # High confidence legitimate ML model based on structural analysis
@@ -1070,10 +1089,11 @@ class FlaxMsgpackScanner(BaseScanner):
                 result.metadata["msgpack_object_count"] = len(objects)
 
             # Extract JAX/Flax specific metadata and architecture information
-            self._extract_jax_metadata(obj, result)
+            ml_analysis = self._analyze_ml_structure(obj, result)
+            self._extract_jax_metadata(obj, result, ml_analysis=ml_analysis)
 
             # Validate Flax structure with enhanced analysis
-            self._validate_flax_structure(obj, result)
+            self._validate_flax_structure(obj, result, ml_analysis=ml_analysis)
 
             # Check for JAX/Flax specific security threats
             self._check_jax_specific_threats(obj, result)

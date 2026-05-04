@@ -6,12 +6,12 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import Callable, Coroutine, Iterator
+from collections.abc import Callable, Collection, Coroutine, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, TypeVar
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import click
 from yaspin import yaspin
@@ -23,6 +23,15 @@ from ..helpers.disk_space import check_disk_space
 
 logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
+
+_SENSITIVE_QUERY_PARAM_RE = re.compile(
+    (
+        r"([?&][^=\s&]*(?:signature|credential|security-token|access-key|access_key|token|"
+        r"secret|api-key|api_key|apikey|sig|sas)[^=\s&]*=)[^\s&#]+"
+    ),
+    re.IGNORECASE,
+)
+_URL_USERINFO_RE = re.compile(r"([a-z][a-z0-9+.-]*://)([^/@\s]+)@", re.IGNORECASE)
 
 
 def _run_coroutine_sync(coro_factory: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
@@ -52,6 +61,54 @@ def is_cloud_url(url: str) -> bool:
     return any(re.match(p, url) for p in patterns)
 
 
+def redact_url_for_display(url: str) -> str:
+    """Remove credentials, query strings, and fragments from a URL for display."""
+    try:
+        parts = urlsplit(url)
+    except Exception:
+        return "<cloud URL redacted>"
+
+    if not parts.scheme:
+        return url
+
+    netloc = parts.hostname or ""
+    if parts.port is not None:
+        netloc = f"{netloc}:{parts.port}"
+
+    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+
+
+def redact_cloud_error_for_display(message: object, source_url: str | None = None) -> str:
+    """Remove signed URL credentials from provider exception text."""
+    redacted = str(message)
+    if source_url:
+        redacted = redacted.replace(source_url, redact_url_for_display(source_url))
+    redacted = _URL_USERINFO_RE.sub(r"\1<credentials-redacted>@", redacted)
+    return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1<redacted>", redacted)
+
+
+def _cloud_error_sanitizer(source_url: str) -> Callable[[Exception], str]:
+    def sanitize(exc: Exception) -> str:
+        return redact_cloud_error_for_display(exc, source_url)
+
+    return sanitize
+
+
+def _cloud_url_basename(url: str) -> str:
+    """Return a local filename derived from a cloud URL without query secrets."""
+    try:
+        path = urlsplit(url).path
+    except Exception:
+        path = url
+    return Path(path).name
+
+
+def _cloud_url_without_query(url: str) -> str:
+    """Return a cloud URL without signed query or fragment material for path comparison."""
+    parsed = urlsplit(url)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+
+
 def get_fs_protocol(url: str) -> str:
     """Get the fsspec protocol for a given URL."""
     parsed = urlparse(url)
@@ -65,13 +122,13 @@ def get_fs_protocol(url: str) -> str:
         elif parsed.netloc.endswith(".r2.cloudflarestorage.com"):
             return "s3"
         else:
-            raise ValueError(f"Unsupported cloud storage URL: {url}")
+            raise ValueError(f"Unsupported cloud storage URL: {redact_url_for_display(url)}")
     elif scheme == "gcs" or scheme == "gs":
         return "gcs"
     elif scheme in {"s3", "r2"}:
         return "s3"
     else:
-        raise ValueError(f"Unsupported cloud storage URL: {url}")
+        raise ValueError(f"Unsupported cloud storage URL: {redact_url_for_display(url)}")
 
 
 def estimate_download_time(size_bytes: int, bandwidth_mbps: float = 10.0) -> str:
@@ -147,7 +204,10 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
         info = fs.info(url)
     except Exception as exc:
         if strict:
-            raise ValueError(f"Unable to read cloud object info for {url}: {exc}") from exc
+            redacted_error = redact_cloud_error_for_display(exc, url)
+            raise ValueError(
+                f"Unable to read cloud object info for {redact_url_for_display(url)}: {redacted_error}"
+            ) from exc
         return None
 
     top_level_size_error: Exception | None = None
@@ -207,12 +267,14 @@ def get_cloud_object_size(fs: Any, url: str, strict: bool = False) -> int | None
         if top_level_size_error is not None:
             error_parts.append(f"invalid size from info(): {top_level_size_error}")
         if walk_error:
-            error_parts.append(f"walk() failed: {walk_error}")
+            error_parts.append(f"walk() failed: {redact_cloud_error_for_display(walk_error, url)}")
         if ls_error:
-            error_parts.append(f"ls() failed: {ls_error}")
+            error_parts.append(f"ls() failed: {redact_cloud_error_for_display(ls_error, url)}")
         if not error_parts:
             error_parts.append("cloud provider did not return file sizes")
-        raise ValueError(f"Unable to determine cloud object size for {url}: {'; '.join(error_parts)}")
+        raise ValueError(
+            f"Unable to determine cloud object size for {redact_url_for_display(url)}: {'; '.join(error_parts)}"
+        )
 
     return None
 
@@ -235,7 +297,11 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
         fs = fsspec.filesystem(fs_protocol, **fs_args)
 
         # Get info about the target with retry
-        @retry_with_backoff(max_retries=3, verbose=True)
+        @retry_with_backoff(
+            max_retries=3,
+            verbose=True,
+            sanitize_error=_cloud_error_sanitizer(url),
+        )
         def get_info():
             return fs.info(url)
 
@@ -246,7 +312,7 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
             return {
                 "type": "file",
                 "size": info.get("size", 0),
-                "name": Path(url).name,
+                "name": _cloud_url_basename(url),
                 "estimated_time": estimate_download_time(info.get("size", 0)),
                 "human_size": format_size(info.get("size", 0)),
             }
@@ -263,7 +329,9 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
                 item_info = fs.info(item)
                 if item_info.get("type") == "file" or "size" in item_info:
                     size = item_info.get("size", 0)
-                    files.append({"path": item, "name": Path(item).name, "size": size, "human_size": format_size(size)})
+                    files.append(
+                        {"path": item, "name": _cloud_url_basename(item), "size": size, "human_size": format_size(size)}
+                    )
                     total_size += size
             except Exception:
                 continue
@@ -278,7 +346,7 @@ async def analyze_cloud_target(url: str) -> dict[str, Any]:
         }
     except Exception as e:
         # If we can't get info, assume it's a file
-        return {"type": "unknown", "error": str(e)}
+        return {"type": "unknown", "error": redact_cloud_error_for_display(e, url)}
 
 
 def prompt_for_large_download(metadata: dict[str, Any]) -> bool:
@@ -308,6 +376,8 @@ class GCSCache:
             self.cache_dir = Path(cache_dir)
 
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            self.cache_dir.chmod(0o700)
         self.metadata_file = self.cache_dir / "cache_metadata.json"
         self.metadata = self._load_metadata()
 
@@ -315,17 +385,58 @@ class GCSCache:
         """Load cache metadata from disk."""
         if self.metadata_file.exists():
             try:
-                with open(self.metadata_file) as f:
+                with open(self.metadata_file, encoding="utf-8") as f:
                     data = json.load(f)
-                    return dict(data)  # Ensure it's a dict for type checker
+                    if not isinstance(data, dict):
+                        return {}
+                    return {
+                        str(cache_key): self._sanitize_metadata_entry(entry)
+                        for cache_key, entry in data.items()
+                        if isinstance(entry, dict)
+                    }
             except Exception:
                 return {}
         return {}
 
-    def _save_metadata(self):
+    def _url_metadata(self, url: str) -> dict[str, str]:
+        """Return non-secret URL metadata safe to persist."""
+        parsed = urlsplit(url)
+        return {
+            "url_sha256": self.get_cache_key(url),
+            "url_display": redact_url_for_display(url),
+            "url_scheme": parsed.scheme,
+            "url_host": parsed.hostname or "",
+            "url_path": parsed.path,
+        }
+
+    def _sanitize_metadata_entry(self, entry: dict[str, Any]) -> dict[str, Any]:
+        """Remove legacy raw URL fields before metadata is persisted again."""
+        sanitized = dict(entry)
+        raw_url = sanitized.pop("url", None)
+        if isinstance(raw_url, str):
+            for key, value in self._url_metadata(raw_url).items():
+                sanitized.setdefault(key, value)
+        return sanitized
+
+    def _save_metadata(self) -> None:
         """Save cache metadata to disk."""
-        with open(self.metadata_file, "w") as f:
-            json.dump(self.metadata, f, indent=2)
+        self.metadata = {
+            str(cache_key): self._sanitize_metadata_entry(entry)
+            for cache_key, entry in self.metadata.items()
+            if isinstance(entry, dict)
+        }
+        temp_file = self.metadata_file.with_name(f"{self.metadata_file.name}.tmp")
+        fd = os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self.metadata, f, indent=2)
+                f.write("\n")
+            os.replace(temp_file, self.metadata_file)
+            if os.name != "nt":
+                self.metadata_file.chmod(0o600)
+        finally:
+            if temp_file.exists():
+                temp_file.unlink()
 
     def get_cache_key(self, url: str) -> str:
         """Generate cache key for URL."""
@@ -342,7 +453,7 @@ class GCSCache:
             if not _is_within_directory(self.cache_dir, cached_path):
                 logger.warning(
                     "Dropping cache entry for %s because cached path %s is outside cache dir %s",
-                    url,
+                    redact_url_for_display(url),
                     cached_path,
                     self.cache_dir,
                 )
@@ -397,7 +508,7 @@ class GCSCache:
 
         # Update metadata
         self.metadata[cache_key] = {
-            "url": url,
+            **self._url_metadata(url),
             "path": str(cache_path),
             "etag": etag,
             "size": cache_path.stat().st_size if cache_path.is_file() else 0,
@@ -439,14 +550,22 @@ class GCSCache:
             click.echo(f"Cleaned {len(keys_to_remove)} old cache entries")
 
 
-def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def filter_scannable_files(
+    files: list[dict[str, Any]],
+    scannable_extensions: Collection[str] | None = None,
+) -> list[dict[str, Any]]:
     """Filter files to only include scannable model types."""
+    extensions = SCANNABLE_MODEL_EXTENSIONS if scannable_extensions is None else frozenset(scannable_extensions)
     scannable = []
     for file in files:
-        path = Path(file["path"])
+        file_path = str(file["path"])
+        path = Path(_cloud_url_basename(file_path) if is_cloud_url(file_path) else file_path)
         suffixes = [s.lower() for s in path.suffixes]
+        if not suffixes and "" in extensions:
+            scannable.append(file)
+            continue
         for i in range(1, len(suffixes) + 1):
-            if "".join(suffixes[-i:]) in SCANNABLE_MODEL_EXTENSIONS:
+            if "".join(suffixes[-i:]) in extensions:
                 scannable.append(file)
                 break
 
@@ -455,16 +574,18 @@ def filter_scannable_files(files: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _build_safe_local_path(base_url: str, file_url: str, download_path: Path) -> Path:
     """Build a local path for a cloud object and reject traversal attempts."""
-    normalized_base = base_url.rstrip("/")
+    normalized_base = _cloud_url_without_query(base_url)
+    normalized_file_url = _cloud_url_without_query(file_url)
 
-    if file_url.startswith(f"{normalized_base}/"):
-        relative_path = file_url[len(normalized_base) + 1 :]
-    elif file_url == normalized_base:
-        relative_path = Path(file_url).name
+    if normalized_file_url.startswith(f"{normalized_base}/"):
+        relative_path = normalized_file_url[len(normalized_base) + 1 :]
+    elif normalized_file_url == normalized_base:
+        relative_path = _cloud_url_basename(file_url)
     else:
         # Fallback to basename for unexpected path shapes.
-        relative_path = Path(file_url).name
+        relative_path = _cloud_url_basename(file_url)
 
+    relative_path = urlsplit(relative_path).path
     if not relative_path:
         raise ValueError(f"Invalid cloud object path: {file_url}")
 
@@ -487,6 +608,7 @@ def download_from_cloud(
     show_progress: bool = True,
     selective: bool = True,
     stream_analyze: bool = False,
+    scannable_extensions: Collection[str] | None = None,
 ) -> Path | str:
     """Download a file or directory from cloud storage to a local path.
 
@@ -519,8 +641,8 @@ def download_from_cloud(
 
     # Ensure target was analyzed successfully
     if "error" in metadata or metadata.get("type") == "unknown":
-        error_msg = metadata.get("error", "Unknown cloud target type")
-        raise ValueError(f"Failed to analyze cloud target {url}: {error_msg}")
+        error_msg = redact_cloud_error_for_display(metadata.get("error", "Unknown cloud target type"), url)
+        raise ValueError(f"Failed to analyze cloud target {redact_url_for_display(url)}: {error_msg}")
 
     # Check if we can use streaming analysis
     if stream_analyze and metadata.get("type") == "file":
@@ -581,12 +703,15 @@ def download_from_cloud(
             else:
                 object_size = None
                 if show_progress:
-                    click.echo(f"⚠️  Unable to determine download size for {url}; continuing without disk check: {exc}")
+                    click.echo(
+                        "⚠️  Unable to determine download size for "
+                        f"{redact_url_for_display(url)}; continuing without disk check: {exc}"
+                    )
 
         if object_size is not None:
             has_space, message = check_disk_space(download_path, object_size)
             if not has_space:
-                raise Exception(f"Cannot download from {url}: {message}")
+                raise Exception(f"Cannot download from {redact_url_for_display(url)}: {message}")
 
         # Download based on type
         if metadata["type"] == "directory":
@@ -601,7 +726,7 @@ def download_from_cloud(
 
             if selective:
                 # Filter to only scannable files
-                files = filter_scannable_files(files)
+                files = filter_scannable_files(files, scannable_extensions=scannable_extensions)
                 if show_progress:
                     total = metadata.get("file_count", 0)
                     if files:
@@ -621,17 +746,25 @@ def download_from_cloud(
                 if show_progress:
                     click.echo(f"Downloading {file_info['name']} ({file_info['human_size']})")
 
-                @retry_with_backoff(max_retries=3, verbose=show_progress)
+                @retry_with_backoff(
+                    max_retries=3,
+                    verbose=show_progress,
+                    sanitize_error=_cloud_error_sanitizer(file_url),
+                )
                 def download_file(url=file_url, path=local_path):
                     fs.get(url, str(path))
 
                 download_file()
         else:
             # Single file download
-            file_name = Path(url).name
+            file_name = _cloud_url_basename(url)
             local_file = download_path / file_name
 
-            @retry_with_backoff(max_retries=3, verbose=show_progress)
+            @retry_with_backoff(
+                max_retries=3,
+                verbose=show_progress,
+                sanitize_error=_cloud_error_sanitizer(url),
+            )
             def download_single_file():
                 fs.get(url, str(local_file))
 
@@ -665,6 +798,7 @@ def download_from_cloud_streaming(
     max_size: int | None = None,
     show_progress: bool = True,
     selective: bool = True,
+    scannable_extensions: Collection[str] | None = None,
 ) -> Iterator[tuple[Path, bool]]:
     """
     Download files from cloud storage one at a time (streaming mode).
@@ -694,7 +828,7 @@ def download_from_cloud_streaming(
 
     if "error" in metadata or metadata.get("type") == "unknown":
         error_msg = metadata.get("error", "Unknown cloud target type")
-        raise ValueError(f"Failed to analyze cloud target {url}: {error_msg}")
+        raise ValueError(f"Failed to analyze cloud target {redact_url_for_display(url)}: {error_msg}")
 
     # Check size limits
     size = metadata.get("total_size", metadata.get("size", 0))
@@ -717,7 +851,7 @@ def download_from_cloud_streaming(
             raise ValueError(f"Invalid metadata for 'files': expected list, got {type(raw_files).__name__}")
 
         if selective:
-            files = filter_scannable_files(files)
+            files = filter_scannable_files(files, scannable_extensions=scannable_extensions)
             if show_progress and files:
                 click.echo(f"Found {len(files)} scannable files to stream")
 
@@ -725,7 +859,7 @@ def download_from_cloud_streaming(
             raise ValueError("No scannable model files found")
     else:
         # Single file
-        files = [{"path": url, "name": Path(url).name, "size": metadata.get("size", 0)}]
+        files = [{"path": url, "name": _cloud_url_basename(url), "size": metadata.get("size", 0)}]
 
     # Create temp directory for downloads
     temp_dir = Path(tempfile.mkdtemp(prefix="modelaudit_stream_"))
@@ -735,7 +869,7 @@ def download_from_cloud_streaming(
         total_files = len(files)
         for i, file_info in enumerate(files):
             file_url = file_info["path"]
-            file_name = file_info.get("name") or Path(file_url).name
+            file_name = file_info.get("name") or _cloud_url_basename(file_url)
             is_last = i == total_files - 1
 
             # Build a safe local path relative to the requested cloud base path.
@@ -745,7 +879,11 @@ def download_from_cloud_streaming(
             if show_progress:
                 click.echo(f"⬇️  Downloading {file_name} ({file_info.get('human_size', 'unknown size')})")
 
-            @retry_with_backoff(max_retries=3, verbose=show_progress)
+            @retry_with_backoff(
+                max_retries=3,
+                verbose=show_progress,
+                sanitize_error=_cloud_error_sanitizer(file_url),
+            )
             def download_file(url=file_url, path=local_path):
                 fs.get(url, str(path))
 

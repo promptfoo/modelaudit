@@ -6,10 +6,10 @@ from typing import ClassVar
 
 import pytest
 
-import modelaudit.scanners.base as base_module
-import modelaudit.whitelists as whitelist_module
 from modelaudit.analysis.unified_context import UnifiedMLContext
+from modelaudit.scanner_results import mark_inconclusive_scan_result
 from modelaudit.scanners.base import (
+    INCONCLUSIVE_SCAN_OUTCOME,
     BaseScanner,
     CheckStatus,
     Issue,
@@ -48,6 +48,12 @@ class MockScanner(BaseScanner):
         # Finish the scan
         result.finish(success=True)
         return result
+
+
+class TinyReadLimitScanner(MockScanner):
+    """Mock scanner with a tiny default read cap for size-limit regression tests."""
+
+    default_max_file_read_size: ClassVar[int] = 8
 
 
 def _create_hf_cache_model_path(tmp_path: Path, model_id: str, *, cache_root: Path | None = None) -> Path:
@@ -355,7 +361,7 @@ def test_base_scanner_size_limit_pass(tmp_path):
     assert checks["File Size Limit"].status == CheckStatus.PASSED
 
 
-def test_base_scanner_size_limit_fail(tmp_path):
+def test_base_scanner_size_limit_fail(tmp_path: Path) -> None:
     """_check_size_limit should return a result when file is too large."""
     scanner = MockScanner(config={"max_file_read_size": 5})
     file_path = tmp_path / "large.test"
@@ -366,7 +372,68 @@ def test_base_scanner_size_limit_fail(tmp_path):
     assert isinstance(result, ScanResult)
     checks = {check.name: check for check in result.checks}
     assert checks["File Size Limit"].status == CheckStatus.FAILED
+    assert "File too large" in checks["File Size Limit"].message
+    assert str(scanner.max_file_read_size) in checks["File Size Limit"].message
     assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
+    assert "max_file_read_size_exceeded" in result.metadata["scan_outcome_reasons"]
+
+
+def test_base_scanner_uses_bounded_default_read_limit() -> None:
+    """Scanners should default to a bounded full-file read cap."""
+    scanner = MockScanner()
+
+    assert scanner.max_file_read_size == MockScanner.default_max_file_read_size
+
+
+def test_base_scanner_default_read_limit_fails_closed(tmp_path: Path) -> None:
+    """Default read caps should stop oversized files with an inconclusive result."""
+    scanner = TinyReadLimitScanner()
+    file_path = tmp_path / "large.test"
+    file_path.write_bytes(b"this is too long")
+
+    result = scanner._check_size_limit(str(file_path))
+
+    assert isinstance(result, ScanResult)
+    checks = {check.name: check for check in result.checks}
+    assert checks["File Size Limit"].status == CheckStatus.FAILED
+    assert "File too large" in checks["File Size Limit"].message
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
+
+
+def test_base_scanner_explicit_zero_read_limit_keeps_opt_out(tmp_path: Path) -> None:
+    """Direct scanner config can still opt out of the read cap explicitly."""
+    scanner = TinyReadLimitScanner(config={"max_file_read_size": 0})
+    file_path = tmp_path / "large.test"
+    file_path.write_bytes(b"this is too long")
+
+    result = scanner._check_size_limit(str(file_path))
+
+    assert result is None
+
+
+def test_base_scanner_inherits_core_max_file_size_unlimited() -> None:
+    """Core-level unlimited max_file_size should keep scanner read caps unlimited."""
+    scanner = TinyReadLimitScanner(config={"max_file_size": 0})
+
+    assert scanner.max_file_read_size == 0
+
+
+def test_base_scanner_explicit_read_limit_overrides_core_file_size() -> None:
+    """max_file_read_size remains the scanner-specific override when both caps are set."""
+    scanner = TinyReadLimitScanner(config={"max_file_size": 0, "max_file_read_size": 4})
+
+    assert scanner.max_file_read_size == 4
+
+
+def test_base_scanner_positive_core_max_file_size_does_not_replace_read_cap() -> None:
+    """Positive max_file_size remains the top-level scan cap, not a full-read cap alias."""
+    scanner = TinyReadLimitScanner(config={"max_file_size": 4})
+
+    assert scanner.max_file_read_size == TinyReadLimitScanner.default_max_file_read_size
 
 
 def test_base_scanner_create_scan_result_after_preflight_merges_checks(tmp_path: Path) -> None:
@@ -517,10 +584,14 @@ def test_whitelist_staleness_recent_no_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Recent whitelist snapshots should not emit a staleness warning."""
+    from modelaudit.scanners.base import _warn_if_whitelist_is_stale
     from modelaudit.whitelists import POPULAR_MODELS
 
-    monkeypatch.setattr(base_module, "_has_logged_stale_whitelist_warning", False)
-    monkeypatch.setattr(whitelist_module, "WHITELIST_GENERATED_AT", datetime.now(timezone.utc).date().isoformat())
+    _warn_if_whitelist_is_stale.cache_clear()
+    monkeypatch.setattr(
+        "modelaudit.whitelists.WHITELIST_GENERATED_AT",
+        datetime.now(timezone.utc).date().isoformat(),
+    )
 
     scanner = MockScanner()
     scanner.context = UnifiedMLContext(
@@ -546,8 +617,10 @@ def test_whitelist_staleness_warning_logged_for_stale_snapshot(
     from modelaudit.whitelists import POPULAR_MODELS
 
     stale_date = (datetime.now(timezone.utc).date() - timedelta(days=180)).isoformat()
-    monkeypatch.setattr(base_module, "_has_logged_stale_whitelist_warning", False)
-    monkeypatch.setattr(whitelist_module, "WHITELIST_GENERATED_AT", stale_date)
+    from modelaudit.scanners.base import _warn_if_whitelist_is_stale
+
+    _warn_if_whitelist_is_stale.cache_clear()
+    monkeypatch.setattr("modelaudit.whitelists.WHITELIST_GENERATED_AT", stale_date)
 
     scanner = MockScanner()
     scanner.context = UnifiedMLContext(
@@ -573,8 +646,10 @@ def test_whitelist_staleness_warning_only_logs_once(
     from modelaudit.whitelists import POPULAR_MODELS
 
     stale_date = (datetime.now(timezone.utc).date() - timedelta(days=180)).isoformat()
-    monkeypatch.setattr(base_module, "_has_logged_stale_whitelist_warning", False)
-    monkeypatch.setattr(whitelist_module, "WHITELIST_GENERATED_AT", stale_date)
+    from modelaudit.scanners.base import _warn_if_whitelist_is_stale
+
+    _warn_if_whitelist_is_stale.cache_clear()
+    monkeypatch.setattr("modelaudit.whitelists.WHITELIST_GENERATED_AT", stale_date)
 
     scanner_one = MockScanner()
     scanner_one.context = UnifiedMLContext(
@@ -611,8 +686,10 @@ def test_whitelist_staleness_unknown_model_no_warning(
 ) -> None:
     """Unknown models should not emit a stale whitelist warning."""
     stale_date = (datetime.now(timezone.utc).date() - timedelta(days=180)).isoformat()
-    monkeypatch.setattr(base_module, "_has_logged_stale_whitelist_warning", False)
-    monkeypatch.setattr(whitelist_module, "WHITELIST_GENERATED_AT", stale_date)
+    from modelaudit.scanners.base import _warn_if_whitelist_is_stale
+
+    _warn_if_whitelist_is_stale.cache_clear()
+    monkeypatch.setattr("modelaudit.whitelists.WHITELIST_GENERATED_AT", stale_date)
 
     scanner = MockScanner()
     scanner.context = UnifiedMLContext(
@@ -827,7 +904,7 @@ def test_whitelist_no_downgrade_non_whitelisted_hf_cache_model(
     assert result.issues[0].details.get("whitelist_downgrade") is None
 
 
-def test_whitelist_downgrade_check_critical():
+def test_whitelist_downgrade_check_critical() -> None:
     """Test that whitelisted models have critical checks downgraded to INFO."""
     from modelaudit.whitelists import POPULAR_MODELS
 
@@ -849,7 +926,7 @@ def test_whitelist_downgrade_check_critical():
     result.add_check(
         name="Test Security Check",
         passed=False,
-        message="Dangerous pattern detected",
+        message="High confidence model anomaly detected",
         severity=IssueSeverity.CRITICAL,
     )
 
@@ -866,6 +943,312 @@ def test_whitelist_downgrade_check_critical():
     assert result.checks[0].severity == IssueSeverity.INFO
     assert result.checks[0].details.get("whitelist_downgrade") is True
     assert result.checks[0].details.get("original_severity") == "CRITICAL"
+
+
+@pytest.mark.parametrize(
+    ("name", "message", "rule_code", "details", "severity"),
+    [
+        ("Active Reducer", "Dangerous reducer invokes posix.system", "S201", {}, IssueSeverity.CRITICAL),
+        (
+            "RCE CVE",
+            "Known vulnerable deserialization construct",
+            None,
+            {"cve_id": "CVE-2026-1234"},
+            IssueSeverity.CRITICAL,
+        ),
+        (
+            "Legacy CVE",
+            "Detected CVE-2024-34997 pattern",
+            None,
+            {"cve": "CVE-2024-34997"},
+            IssueSeverity.CRITICAL,
+        ),
+        ("Traversal", "Path traversal attempt detected", None, {}, IssueSeverity.CRITICAL),
+        ("System Path", "Symlink target points to critical system path", "S408", {}, IssueSeverity.CRITICAL),
+        ("Incomplete", "Archive scan inconclusive", None, {"analysis_incomplete": True}, IssueSeverity.WARNING),
+        # S1xx active code-execution primitives. Messages are deliberately neutral
+        # ("Suspicious code pattern detected: ...") so the rule code itself carries
+        # the exemption rather than the keyword fallback. Mirrors the emission shape
+        # used by `flax_msgpack_scanner._check_suspicious_strings`.
+        ("os import", r"Suspicious code pattern detected: import\s+os", "S101", {}, IssueSeverity.CRITICAL),
+        ("sys import", r"Suspicious code pattern detected: import\s+sys", "S102", {}, IssueSeverity.CRITICAL),
+        (
+            "subprocess import",
+            r"Suspicious code pattern detected: subprocess\.",
+            "S103",
+            {},
+            IssueSeverity.CRITICAL,
+        ),
+        ("eval pattern", r"Suspicious code pattern detected: \beval\s*\(", "S104", {}, IssueSeverity.CRITICAL),
+        ("compile pattern", r"Suspicious code pattern detected: \bcompile\s*\(", "S105", {}, IssueSeverity.CRITICAL),
+        ("__import__ pattern", "Suspicious code pattern detected: __import__", "S106", {}, IssueSeverity.CRITICAL),
+        ("importlib", "Suspicious code pattern detected: importlib.import_module", "S107", {}, IssueSeverity.WARNING),
+        ("runpy", "Suspicious code pattern detected: runpy.run_module", "S108", {}, IssueSeverity.CRITICAL),
+        ("webbrowser", "Suspicious code pattern detected: webbrowser.open", "S109", {}, IssueSeverity.CRITICAL),
+        ("ctypes", "Suspicious code pattern detected: ctypes.CDLL", "S110", {}, IssueSeverity.WARNING),
+        ("pty", "Suspicious code pattern detected: pty.spawn", "S111", {}, IssueSeverity.CRITICAL),
+        ("code", "Suspicious code pattern detected: code.InteractiveConsole", "S112", {}, IssueSeverity.CRITICAL),
+        ("types", "Suspicious code pattern detected: types.FunctionType", "S113", {}, IssueSeverity.WARNING),
+        ("ast", "Suspicious code pattern detected: ast.parse", "S114", {}, IssueSeverity.WARNING),
+        ("builtins access", "Suspicious code pattern detected: __builtins__", "S115", {}, IssueSeverity.WARNING),
+        # S3xx active network primitives at HIGH severity. Lower-severity HTTP/SMTP/DNS
+        # codes are intentionally omitted so policy-grade findings remain downgradeable.
+        ("socket usage", "Network primitive detected: socket call", "S301", {}, IssueSeverity.WARNING),
+        ("ftplib usage", "Network primitive detected: ftplib session", "S304", {}, IssueSeverity.WARNING),
+        ("telnetlib usage", "Network primitive detected: telnetlib session", "S305", {}, IssueSeverity.WARNING),
+        ("exfiltration", "Potential outbound data transfer detected", "S310", {}, IssueSeverity.WARNING),
+        # S5xx embedded executable / interpreter content (regression coverage so future
+        # refactors of the exempt set do not silently drop them).
+        ("Executable", "Executable file detected in archive", "S501", {}, IssueSeverity.WARNING),
+        (
+            "Executable Fragments",
+            "Executable script fragments detected in CatBoost text-bearing sections",
+            None,
+            {},
+            IssueSeverity.WARNING,
+        ),
+        ("PowerShell", "PowerShell content found in pickle tail", "S506", {}, IssueSeverity.WARNING),
+        ("Embedded Python", "Python script embedded in tensor payload", "S507", {}, IssueSeverity.WARNING),
+        ("WebAssembly", "WASM module found in model payload", "S509", {}, IssueSeverity.WARNING),
+    ],
+)
+def test_whitelist_does_not_downgrade_active_or_incomplete_findings(
+    name: str,
+    message: str,
+    rule_code: str | None,
+    details: dict[str, object],
+    severity: IssueSeverity,
+) -> None:
+    """Trusted provenance must not hide active payloads or incomplete coverage."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    whitelisted_model = next(iter(POPULAR_MODELS))
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=whitelisted_model,
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name=name,
+        passed=False,
+        message=message,
+        severity=severity,
+        details=dict(details),
+        rule_code=rule_code,
+    )
+
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == severity
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+    assert len(result.checks) == 1
+    assert result.checks[0].severity == severity
+    assert result.checks[0].details.get("whitelist_downgrade") is None
+
+
+@pytest.mark.parametrize(
+    ("name", "message"),
+    [
+        # "executable" inside "ExecuTorch" must not exempt an unrelated informational note.
+        ("ExecuTorch substring", "ExecuTorch tensor metadata observed"),
+        # "rce" inside "enforce"/"source" must not exempt unrelated findings either.
+        ("enforce substring", "Tensor enforce_layout flag observed"),
+        ("source substring", "Source-tracked metadata observed"),
+    ],
+)
+def test_whitelist_keyword_fallback_uses_word_boundaries(name: str, message: str) -> None:
+    """Substring-only matches in unrelated words must not block whitelist downgrades."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.pkl"),
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name=name,
+        passed=False,
+        message=message,
+        severity=IssueSeverity.WARNING,
+    )
+
+    assert result.issues[0].severity == IssueSeverity.INFO
+    assert result.issues[0].details.get("whitelist_downgrade") is True
+    assert result.issues[0].details.get("original_severity") == "WARNING"
+
+
+def test_whitelist_does_not_downgrade_result_metadata_operational_errors() -> None:
+    """Operational error metadata must preserve fail-closed severities."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    whitelisted_model = next(iter(POPULAR_MODELS))
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.joblib"),
+        file_size=100,
+        file_type=".joblib",
+        model_id=whitelisted_model,
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.metadata["operational_error"] = True
+    result.metadata["operational_error_reason"] = "joblib_decompression_failed"
+    result.add_check(
+        name="Joblib Decompression",
+        passed=False,
+        message="Error decompressing joblib file",
+        severity=IssueSeverity.CRITICAL,
+    )
+
+    assert result.issues[0].severity.value == "critical"
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+    assert result.checks[0].severity == IssueSeverity.CRITICAL
+    assert result.checks[0].details.get("whitelist_downgrade") is None
+
+
+def test_whitelist_restores_downgrade_when_operational_metadata_set_after_check() -> None:
+    """Late operational metadata should restore already-downgraded checks."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    whitelisted_model = next(iter(POPULAR_MODELS))
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=Path("/tmp/test.joblib"),
+        file_size=100,
+        file_type=".joblib",
+        model_id=whitelisted_model,
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name="Joblib Decompression",
+        passed=False,
+        message="Error decompressing joblib file",
+        severity=IssueSeverity.CRITICAL,
+    )
+    assert result.issues[0].severity.value == "info"
+    assert result.issues[0].details.get("whitelist_downgrade") is True
+
+    result.metadata["operational_error"] = True
+    result.metadata["operational_error_reason"] = "joblib_decompression_failed"
+    result.finish(success=False)
+
+    assert result.issues[0].severity.value == "critical"
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+    assert result.issues[0].details.get("whitelist_downgrade_restored") is True
+    assert result.checks[0].severity == IssueSeverity.CRITICAL
+    assert result.checks[0].details.get("whitelist_downgrade") is None
+    assert result.checks[0].details.get("whitelist_downgrade_restored") is True
+
+
+def test_finish_recomputes_success_after_restoring_metadata_exempt_severity(tmp_path: Path) -> None:
+    """Restored CRITICAL findings must make finished results unsuccessful."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=tmp_path / "test.joblib",
+        file_size=100,
+        file_type=".joblib",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name="Joblib Decompression",
+        passed=False,
+        message="Error decompressing joblib file",
+        severity=IssueSeverity.CRITICAL,
+    )
+    assert result.issues[0].severity == IssueSeverity.INFO
+
+    result.metadata["operational_error"] = True
+    result.metadata["operational_error_reason"] = "joblib_decompression_failed"
+    result.finish(success=True)
+
+    assert result.issues[0].severity.value == "critical"
+    assert result.checks[0].severity == IssueSeverity.CRITICAL
+    assert result.success is False
+
+
+def test_finished_result_refreshes_whitelist_restore_after_late_inconclusive_metadata(tmp_path: Path) -> None:
+    """Post-finish inconclusive metadata should restore downgraded severities."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=tmp_path / "test.pkl",
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name="Late Coverage Check",
+        passed=False,
+        message="High confidence model anomaly detected",
+        severity=IssueSeverity.CRITICAL,
+    )
+    result.finish(success=True)
+    assert result.issues[0].severity.value == "info"
+    assert result.success is True
+
+    mark_inconclusive_scan_result(result, "streaming_analysis_incomplete")
+
+    assert result.issues[0].severity.value == "critical"
+    assert result.issues[0].details.get("whitelist_downgrade") is None
+    assert result.issues[0].details.get("whitelist_downgrade_restored") is True
+    assert result.checks[0].severity == IssueSeverity.CRITICAL
+    assert result.success is False
+
+
+def test_finish_remembers_pre_finish_metadata_restored_critical(tmp_path: Path) -> None:
+    """Pre-finish metadata refreshes must still affect final success."""
+    from modelaudit.whitelists import POPULAR_MODELS
+
+    scanner = MockScanner()
+    scanner.context = UnifiedMLContext(
+        file_path=tmp_path / "test.pkl",
+        file_size=100,
+        file_type=".pkl",
+        model_id=next(iter(POPULAR_MODELS)),
+        model_source="huggingface",
+    )
+
+    result = scanner._create_result()
+    result.add_check(
+        name="Pre-Finish Coverage Check",
+        passed=False,
+        message="High confidence model anomaly detected",
+        severity=IssueSeverity.CRITICAL,
+    )
+    assert result.issues[0].severity.value == "info"
+
+    mark_inconclusive_scan_result(result, "streaming_analysis_incomplete")
+    assert result.end_time is None
+    assert result.issues[0].severity.value == "critical"
+
+    result.finish(success=True)
+
+    assert result.checks[0].severity == IssueSeverity.CRITICAL
+    assert result.success is False
 
 
 def test_whitelist_downgrade_check_warning():

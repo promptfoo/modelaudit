@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .scanners import SCANNER_REGISTRY
+from .scanners import get_scanner_for_file
 from .utils import is_within_directory
 
 logger = logging.getLogger("modelaudit.metadata_extractor")
@@ -29,14 +29,8 @@ class ModelMetadataExtractor:
         self, file_path: str, security_only: bool = False, allow_deserialization: bool = False
     ) -> dict[str, Any]:
         """Extract metadata from a single model file."""
-        # Find appropriate scanner for this file
-        scanner_class = None
-        for scanner_cls in SCANNER_REGISTRY:
-            if scanner_cls.can_handle(file_path):
-                scanner_class = scanner_cls
-                break
-
-        if not scanner_class:
+        scanner = get_scanner_for_file(file_path, {"allow_metadata_deserialization": allow_deserialization})
+        if scanner is None:
             return {
                 "file": os.path.basename(file_path),
                 "path": file_path,
@@ -44,8 +38,7 @@ class ModelMetadataExtractor:
                 "error": "No scanner available for this file type",
             }
 
-        # Create scanner instance and extract metadata
-        scanner = scanner_class({"allow_metadata_deserialization": allow_deserialization})
+        scanner_class = type(scanner)
 
         # Start with file-level fields, then layer scanner metadata on top.
         # Scanner extract_metadata() provides format, description, file_size
@@ -59,7 +52,7 @@ class ModelMetadataExtractor:
         # Always ensure file identifiers are present
         metadata.setdefault("file", os.path.basename(file_path))
         metadata.setdefault("path", file_path)
-        metadata.setdefault("format", getattr(scanner_class, "name", "unknown"))
+        metadata.setdefault("format", getattr(scanner, "name", getattr(scanner_class, "name", "unknown")))
 
         # Filter for security-only if requested
         if security_only:
@@ -145,7 +138,8 @@ class ModelMetadataExtractor:
 
         # Add any keys containing 'security', 'suspicious', 'dangerous', etc.
         for key, value in metadata.items():
-            if any(term in key.lower() for term in ["security", "suspicious", "dangerous", "malicious", "risk"]):
+            key_lower = key.lower()
+            if any(term in key_lower for term in ["security", "suspicious", "dangerous", "malicious", "risk"]):
                 filtered[key] = value
 
         return filtered

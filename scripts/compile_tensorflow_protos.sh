@@ -104,8 +104,56 @@ echo "Compilation results: $COMPILED succeeded, $FAILED failed"
 # Only in tensorflow/ subdirectories - do NOT overwrite modelaudit/protos/__init__.py
 find "$OUTPUT_DIR/tensorflow" -type d -exec touch {}/__init__.py \;
 
-# DON'T patch imports - keep original tensorflow.* imports
-# We'll add modelaudit/protos to sys.path at runtime instead
+# Keep original tensorflow.* imports so descriptor dependencies load through
+# modelaudit/protos on sys.path at runtime.
+
+echo "Cleaning generated proto import side effects..."
+python3 - "$OUTPUT_DIR" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+output_dir = Path(sys.argv[1]) / "tensorflow"
+cleanup_marker = "# Keep generated dependency imports for descriptor registration side effects."
+descriptor_marker = "\nDESCRIPTOR = _descriptor_pool.Default().AddSerializedFile"
+symbol_database_import = "from google.protobuf import symbol_database as _symbol_database\n"
+symbol_database_default = "_sym_db = _symbol_database.Default()"
+
+for path in sorted(output_dir.rglob("*_pb2.py")):
+    text = path.read_text()
+    if descriptor_marker not in text:
+        continue
+
+    prefix, rest = text.split(descriptor_marker, 1)
+    if cleanup_marker in prefix:
+        prefix = prefix.split("\n" + cleanup_marker, 1)[0].rstrip()
+
+    prefix = prefix.replace(symbol_database_import, "")
+    if symbol_database_default in prefix:
+        before_sym_db, after_sym_db = prefix.split(symbol_database_default, 1)
+        prefix = before_sym_db + after_sym_db
+    else:
+        after_sym_db = prefix
+
+    aliases: list[str] = []
+    for line in after_sym_db.splitlines():
+        match = re.match(r"from\s+.+\s+import\s+.+\s+as\s+([A-Za-z_][A-Za-z0-9_]*)$", line.strip())
+        if match and "_dot_" in match.group(1):
+            aliases.append(match.group(1))
+
+    cleanup = ""
+    if aliases:
+        cleanup_lines = [
+            "",
+            cleanup_marker,
+            "# Reference aliases so static analysis preserves these side-effect imports.",
+        ]
+        cleanup_lines.extend(f"id({alias})" for alias in aliases)
+        cleanup_lines.extend(f"del {alias}" for alias in aliases)
+        cleanup = "\n" + "\n".join(cleanup_lines)
+
+    path.write_text(prefix.rstrip() + cleanup + descriptor_marker + rest)
+PY
 
 echo ""
 echo "Creating type stubs..."

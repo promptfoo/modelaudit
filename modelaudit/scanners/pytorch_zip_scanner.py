@@ -1,21 +1,29 @@
 """Scanner for PyTorch zip-archived model files (.pt, .pth)."""
 
+import ast
 import io
 import logging
 import os
+import pickletools
 import re
 import stat
 import tempfile
 import zipfile
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
 from ..detectors.suspicious_symbols import CVE_COMBINED_PATTERNS
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
+from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils import sanitize_archive_path
 from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTES, _looks_like_proto0_or_1_pickle
+from ._archive_config import get_archive_depth
+from ._archive_locations import rewrite_extracted_member_location
+from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
 from .archive_member_security import is_executable_archive_member_name
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 from .picklescan_adapter import apply_pickle_member_context
 from .pytorch_zip_support import (
@@ -31,6 +39,69 @@ from .pytorch_zip_support import (
 
 logger = logging.getLogger(__name__)
 _INSTALLED_PYTORCH_VERSION_UNSET = object()
+_TORCHSCRIPT_DEBUG_PAYLOAD_MARKER = b"FORMAT_WITH_STRING_TABLE"
+_TORCHSCRIPT_DEBUG_PREFIX_BYTES = 256
+_TORCHSCRIPT_SOURCE_MAX_BYTES = 1024 * 1024
+_TORCHSCRIPT_GENERATED_CLASS_PATTERN = re.compile(r"(?m)^class\s+[A-Za-z_][A-Za-z0-9_]*\(Module\):\s*$")
+_TORCHSCRIPT_GENERATED_METHOD_PATTERN = re.compile(r"(?m)^\s+def\s+\w+\(self:\s+__torch__\.")
+_TORCHSCRIPT_FORBIDDEN_SOURCE_PATTERN = re.compile(
+    r"(?im)(?:^\s*(?:import|from)\s+|\b(?:__import__|eval|exec|compile|open)\s*\(|\b(?:os|subprocess|socket|requests)\s*\.)"
+)
+_TORCHSCRIPT_FORBIDDEN_AST_NAMES: frozenset[str] = frozenset(
+    {
+        "__builtins__",
+        "__class__",
+        "__dict__",
+        "__getattribute__",
+        "__globals__",
+        "__import__",
+        "__mro__",
+        "__subclasses__",
+        "breakpoint",
+        "compile",
+        "delattr",
+        "eval",
+        "exec",
+        "getattr",
+        "globals",
+        "input",
+        "locals",
+        "load_library",
+        "open",
+        "print",
+        "setattr",
+        "vars",
+    }
+)
+_TORCHSCRIPT_UNSAFE_DEFINITION_EXPR_NODES: tuple[type[ast.AST], ...] = (
+    ast.Await,
+    ast.Call,
+    ast.DictComp,
+    ast.GeneratorExp,
+    ast.Lambda,
+    ast.ListComp,
+    ast.NamedExpr,
+    ast.SetComp,
+    ast.Yield,
+    ast.YieldFrom,
+)
+_TORCHSCRIPT_UNSAFE_BODY_NODES: tuple[type[ast.AST], ...] = (
+    ast.AsyncFor,
+    ast.AsyncFunctionDef,
+    ast.AsyncWith,
+    ast.Await,
+    ast.Delete,
+    ast.Global,
+    ast.Import,
+    ast.ImportFrom,
+    ast.Lambda,
+    ast.Nonlocal,
+    ast.Raise,
+    ast.Try,
+    ast.With,
+    ast.Yield,
+    ast.YieldFrom,
+)
 _PICKLE_BINARY_PROTOCOL_PREFIXES: tuple[bytes, ...] = (
     b"\x80\x01",
     b"\x80\x02",
@@ -39,6 +110,11 @@ _PICKLE_BINARY_PROTOCOL_PREFIXES: tuple[bytes, ...] = (
     b"\x80\x05",
 )
 _PICKLE_DISCOVERY_SHORT_PROBE_BYTES = 16
+_JIT_SCAN_MEMBER_MAX_BYTES = 32 * 1024 * 1024
+_PICKLE_DISCOVERY_LONG_PROBE_BYTES = PROTO0_1_MAX_PROBE_BYTES
+_PYTORCH_STORAGE_BLOB_MEMBER_PATTERN = re.compile(r"^(?:.+/)?data/[0-9]+$")
+_NESTED_ZIP_HEADER_PROBE_BYTES = 4
+_ZIP_LOCAL_FILE_SIGNATURES: tuple[bytes, ...] = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 
 
 @dataclass(frozen=True)
@@ -160,11 +236,12 @@ class PyTorchZipScanner(BaseScanner):
     MAX_COMPRESSION_RATIO: ClassVar[int] = 100  # 100:1 compression ratio threshold
     MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE: ClassVar[int] = 1024 * 1024
     MAX_ARCHIVE_ENTRIES: ClassVar[int] = 10000  # Maximum number of entries in archive
+    DEFAULT_MAX_NESTED_ZIP_DEPTH: ClassVar[int] = 5
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
-        # Initialize a pickle scanner for embedded pickles
-        self.pickle_scanner: PickleScanner = PickleScanner(config)
+        pickle_scanner, self.scanner_selection = embedded_pickle_scanner(self.config, PickleScanner)
+        self.pickle_scanner: PickleScanner | None = pickle_scanner
         self.current_file_path = ""  # Will be set when scanning files
         self._relaxed_crc_tracker = RelaxedZipCrcTracker()
         # Configurable limits (can override class defaults via config)
@@ -174,6 +251,23 @@ class PyTorchZipScanner(BaseScanner):
             self.MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE,
         )
         self.max_archive_entries = self.config.get("max_archive_entries", self.MAX_ARCHIVE_ENTRIES)
+        # ``max_jit_scan_member_bytes`` caps per-member reads during the JIT /
+        # network pattern pass to avoid unbounded memory blowup. Non-positive
+        # or non-integer values fall back to the default; there is *no*
+        # "0 = unlimited" escape hatch here (unlike ``ZipScanner.max_entry_size``)
+        # because this pass cannot afford to run without a bound.
+        self.max_jit_scan_member_bytes = self._normalize_positive_int_config(
+            self.config.get("max_jit_scan_member_bytes"),
+            _JIT_SCAN_MEMBER_MAX_BYTES,
+        )
+        self.max_nested_zip_member_bytes = self._normalize_positive_int_config(
+            self.config.get("max_nested_zip_member_bytes"),
+            self.default_max_file_read_size,
+        )
+        self.max_nested_zip_depth = self._normalize_positive_int_config(
+            self.config.get("max_zip_depth"),
+            self.DEFAULT_MAX_NESTED_ZIP_DEPTH,
+        )
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
@@ -229,7 +323,15 @@ class PyTorchZipScanner(BaseScanner):
                 self._check_pytorch_vulnerabilities(zip_file, safe_entries, result, path)
 
                 # Scan all discovered pickle files
-                bytes_scanned = self._scan_pickle_files(zip_file, pickle_files, result, path)
+                trusted_pytorch_storage_data_pkl_members = self._trusted_pytorch_storage_data_pkl_members(safe_entries)
+                bytes_scanned = self._scan_pickle_files(
+                    zip_file,
+                    pickle_files,
+                    result,
+                    path,
+                    trusted_pytorch_storage_data_pkl_members=trusted_pytorch_storage_data_pkl_members,
+                )
+                self._scan_nested_zip_members(zip_file, safe_entries, result, path)
                 self._check_timeout()  # Check timeout after pickle scanning
 
                 # Validate tensor metadata consistency (CVE-2026-24747)
@@ -239,7 +341,7 @@ class PyTorchZipScanner(BaseScanner):
                 bytes_scanned += self._scan_for_jit_patterns(zip_file, safe_entries, result, path)
 
                 # Detect suspicious non-pickle files
-                self._detect_suspicious_files(safe_entries, result, path)
+                self._detect_suspicious_files(zip_file, safe_entries, result, path)
 
                 # Validate PyTorch model structure
                 self._validate_pytorch_structure(pickle_files, result)
@@ -251,22 +353,23 @@ class PyTorchZipScanner(BaseScanner):
 
         except TimeoutError as e:
             # Handle timeout gracefully
+            mark_inconclusive_scan_result(result, "pytorch_zip_scan_timeout")
             result.add_check(
                 name="Scan Timeout",
                 passed=False,
                 message=f"Scan timed out: {e!s}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"timeout_seconds": self.timeout},
+                details={"timeout_seconds": self.timeout, "analysis_incomplete": True},
             )
-            result.finish(success=True)  # Partial results are still valid
+            result.finish(success=False)
             return result
         except zipfile.BadZipFile:
             return self._handle_bad_zip_error(path)
         except Exception as e:
             return self._handle_scan_error(path, e)
 
-        result.finish(success=True)
+        result.finish(success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME)
         return result
 
     @staticmethod
@@ -278,6 +381,191 @@ class PyTorchZipScanner(BaseScanner):
     def _get_zip_member_names(cls, entries: list[zipfile.ZipInfo]) -> list[str]:
         """Return archive member names while preserving duplicate entries."""
         return get_zip_member_names(entries)
+
+    @staticmethod
+    def _torchscript_debug_member_name(name: str, member_names: set[str]) -> str | None:
+        """Return the sibling TorchScript debug member name for a generated-source path."""
+        normalized = name.replace("\\", "/").lstrip("/")
+        parts = tuple(part for part in normalized.split("/") if part)
+        if not parts or not parts[-1].endswith(".py"):
+            return None
+
+        try:
+            code_index = parts.index("code")
+        except ValueError:
+            return None
+
+        # TorchScript writes generated Python directly under the archive root
+        # (optionally behind a single top-level archive prefix like "archive/").
+        if code_index > 1:
+            return None
+
+        torchscript_parts = parts[code_index + 1 :]
+        is_generated_path = torchscript_parts == ("__torch__.py",) or (
+            len(torchscript_parts) > 1 and torchscript_parts[0] == "__torch__"
+        )
+        debug_name = f"{normalized}.debug_pkl"
+        if not is_generated_path or debug_name not in member_names:
+            return None
+        return debug_name
+
+    @staticmethod
+    def _looks_like_torchscript_generated_source(source: bytes) -> bool:
+        """Return true when source text has TorchScript-generated structure and no Python escape hatches."""
+        try:
+            text = source.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+
+        if _TORCHSCRIPT_FORBIDDEN_SOURCE_PATTERN.search(text):
+            return False
+        return (
+            _TORCHSCRIPT_GENERATED_CLASS_PATTERN.search(text) is not None
+            and _TORCHSCRIPT_GENERATED_METHOD_PATTERN.search(text) is not None
+            and PyTorchZipScanner._has_torchscript_generated_ast_shape(text)
+        )
+
+    @staticmethod
+    def _has_torchscript_generated_ast_shape(text: str) -> bool:
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError):
+            return False
+
+        if not tree.body or any(not isinstance(node, ast.ClassDef) for node in tree.body):
+            return False
+
+        for node in ast.walk(tree):
+            if PyTorchZipScanner._is_torchscript_forbidden_ast_symbol(node):
+                return False
+
+            if isinstance(node, ast.ClassDef):
+                if node.decorator_list:
+                    return False
+                if not PyTorchZipScanner._is_torchscript_class_header_safe(node):
+                    return False
+                if not any(isinstance(item, ast.FunctionDef) for item in node.body):
+                    return False
+                generated_marker_assignments: set[str] = set()
+                for item in node.body:
+                    if isinstance(item, ast.Pass):
+                        continue
+                    if isinstance(item, ast.Assign):
+                        generated_marker_assignments.update(
+                            PyTorchZipScanner._torchscript_assignment_target_names(item.targets)
+                        )
+                        if not PyTorchZipScanner._is_torchscript_definition_time_expression_safe(item.value):
+                            return False
+                        continue
+                    if isinstance(item, ast.AnnAssign):
+                        generated_marker_assignments.update(
+                            PyTorchZipScanner._torchscript_assignment_target_names([item.target])
+                        )
+                        if not PyTorchZipScanner._is_torchscript_definition_time_expression_safe(item.annotation):
+                            return False
+                        if (
+                            item.value is not None
+                            and not PyTorchZipScanner._is_torchscript_definition_time_expression_safe(item.value)
+                        ):
+                            return False
+                        continue
+                    if isinstance(item, ast.FunctionDef):
+                        if not PyTorchZipScanner._is_torchscript_function_definition_safe(item):
+                            return False
+                        continue
+                    return False
+                if not {"__parameters__", "__buffers__"}.issubset(generated_marker_assignments):
+                    return False
+
+        return True
+
+    @staticmethod
+    def _torchscript_assignment_target_names(targets: list[ast.expr]) -> set[str]:
+        return {target.id for target in targets if isinstance(target, ast.Name)}
+
+    @staticmethod
+    def _is_torchscript_definition_time_expression_safe(expression: ast.expr) -> bool:
+        return not any(isinstance(node, _TORCHSCRIPT_UNSAFE_DEFINITION_EXPR_NODES) for node in ast.walk(expression))
+
+    @staticmethod
+    def _is_torchscript_forbidden_ast_symbol(node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id in _TORCHSCRIPT_FORBIDDEN_AST_NAMES
+        if isinstance(node, ast.Attribute):
+            return node.attr in _TORCHSCRIPT_FORBIDDEN_AST_NAMES
+        return (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in _TORCHSCRIPT_FORBIDDEN_AST_NAMES
+        )
+
+    @staticmethod
+    def _is_torchscript_class_header_safe(node: ast.ClassDef) -> bool:
+        if node.keywords or len(node.bases) != 1:
+            return False
+        base = node.bases[0]
+        return isinstance(base, ast.Name) and base.id == "Module"
+
+    @staticmethod
+    def _is_torchscript_function_definition_safe(node: ast.FunctionDef) -> bool:
+        if node.decorator_list:
+            return False
+        definition_expressions: list[ast.expr] = [
+            *node.args.defaults,
+            *(default for default in node.args.kw_defaults if default is not None),
+        ]
+        if node.returns is not None:
+            definition_expressions.append(node.returns)
+        for arg in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]:
+            if arg.annotation is not None:
+                definition_expressions.append(arg.annotation)
+
+        return all(
+            PyTorchZipScanner._is_torchscript_definition_time_expression_safe(expression)
+            for expression in definition_expressions
+        ) and PyTorchZipScanner._is_torchscript_function_body_safe(node.body)
+
+    @staticmethod
+    def _is_torchscript_function_body_safe(statements: list[ast.stmt]) -> bool:
+        for statement in statements:
+            for node in ast.walk(statement):
+                if isinstance(node, _TORCHSCRIPT_UNSAFE_BODY_NODES):
+                    return False
+                if PyTorchZipScanner._is_torchscript_forbidden_ast_symbol(node):
+                    return False
+        return True
+
+    def _is_torchscript_generated_python(
+        self,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        debug_entry: zipfile.ZipInfo,
+        result: ScanResult,
+    ) -> bool:
+        """Return true for validated TorchScript-generated Python source members."""
+        try:
+            debug_prefix = self._read_member_prefix(
+                zip_file,
+                debug_entry,
+                _TORCHSCRIPT_DEBUG_PREFIX_BYTES,
+                phase="torchscript generated source validation",
+                result=result,
+            )
+            if _TORCHSCRIPT_DEBUG_PAYLOAD_MARKER not in debug_prefix:
+                return False
+
+            source = self._read_member_bytes(
+                zip_file,
+                entry,
+                phase="torchscript generated source validation",
+                result=result,
+                max_bytes=_TORCHSCRIPT_SOURCE_MAX_BYTES,
+            )
+        except Exception as exc:
+            logger.debug("Unable to validate TorchScript generated source member %s: %s", entry.filename, exc)
+            return False
+
+        return self._looks_like_torchscript_generated_source(source)
 
     @staticmethod
     def _find_zip_entry(entries: list[zipfile.ZipInfo], member_name: str) -> zipfile.ZipInfo | None:
@@ -565,9 +853,11 @@ class PyTorchZipScanner(BaseScanner):
                             "threshold": self.max_compression_ratio,
                             "min_uncompressed_size": self.min_compression_bomb_uncompressed_size,
                             "risk": "High compression ratio may indicate a decompression bomb",
+                            "analysis_incomplete": True,
                         },
                         why="Decompression bombs use high compression ratios to exhaust system resources",
                     )
+                    mark_inconclusive_scan_result(result, "pytorch_zip_compression_ratio_unscanned")
                     compression_issues_found = True
                     continue
 
@@ -622,49 +912,405 @@ class PyTorchZipScanner(BaseScanner):
     ) -> list[zipfile.ZipInfo]:
         """Discover pickle files in the ZIP archive"""
         pickle_files: list[zipfile.ZipInfo] = []
+        # Identity-based dedup: the same ``ZipInfo`` instance can be considered
+        # by both the filename pass and the sniff pass, and since both iterate
+        # the same ``safe_entries`` list the ``id()`` of each entry is stable
+        # for the duration of this discovery. If a future refactor ever feeds
+        # these passes from separate ``infolist()`` walks or from reconstructed
+        # ``ZipInfo`` objects, fall back to a ``(name, header_offset)`` key.
+        seen_entries: set[int] = set()
+
+        def add_pickle_entry(entry: zipfile.ZipInfo) -> None:
+            entry_key = id(entry)
+            if entry_key in seen_entries:
+                return
+            pickle_files.append(entry)
+            seen_entries.add(entry_key)
 
         # First pass: Look for common pickle file patterns
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
             if name.endswith(".pkl") or name == "data.pkl" or name.endswith("/data.pkl"):
-                pickle_files.append(entry)
+                add_pickle_entry(entry)
 
-        # Second pass: If no obvious pickle files found, check for pickle magic bytes
-        if not pickle_files:
-            for entry in safe_entries:
-                try:
-                    data_start = self._read_member_prefix(
-                        zip_file,
-                        entry,
-                        _PICKLE_DISCOVERY_SHORT_PROBE_BYTES,
-                        phase="pickle_discovery",
-                        result=result,
-                    )
-                    if any(data_start.startswith(magic) for magic in _PICKLE_BINARY_PROTOCOL_PREFIXES):
-                        pickle_files.append(entry)
-                        continue
+        # Second pass: always sniff unselected members. A benign data.pkl must not
+        # hide an extensionless pickle payload or one placed under data/<n>.
+        # Aggregate probe failures into a single summary check so an
+        # adversarial archive with many unreadable members does not flood the
+        # checks list with one INFO finding apiece.
+        probe_failures: list[dict[str, Any]] = []
+        for entry in safe_entries:
+            if id(entry) in seen_entries or entry.is_dir():
+                continue
+            try:
+                if self._entry_looks_like_pickle(zip_file, entry, result):
+                    add_pickle_entry(entry)
+            except Exception as exc:
+                logger.debug("Unable to inspect ZIP member %s as a pickle: %s", entry.filename, exc)
+                probe_failures.append(
+                    {
+                        "zip_entry": entry.filename,
+                        "exception": str(exc),
+                        "exception_type": type(exc).__name__,
+                        "location": f"{self.current_file_path}:{entry.filename}",
+                    }
+                )
 
-                    if not data_start or data_start[0] not in PROTO0_1_START_BYTES:
-                        continue
-
-                    if entry.file_size > len(data_start):
-                        data_start = self._read_member_prefix(
-                            zip_file,
-                            entry,
-                            PROTO0_1_MAX_PROBE_BYTES,
-                            phase="pickle_discovery",
-                            result=result,
-                        )
-                    if _looks_like_proto0_or_1_pickle(
-                        data_start,
-                        sample_is_prefix=entry.file_size > len(data_start),
-                    ):
-                        pickle_files.append(entry)
-                except Exception:
-                    pass
+        if probe_failures:
+            mark_inconclusive_scan_result(result, "pytorch_zip_pickle_discovery_incomplete")
+            count = len(probe_failures)
+            noun = "member" if count == 1 else "members"
+            result.add_check(
+                name="Pickle Discovery",
+                passed=False,
+                message=f"{count} PyTorch ZIP {noun} could not be inspected for hidden pickle payloads",
+                severity=IssueSeverity.INFO,
+                location=self.current_file_path,
+                details={
+                    "zip_entries": [failure["zip_entry"] for failure in probe_failures],
+                    "entries": probe_failures,
+                    "failed_count": count,
+                    "analysis_incomplete": True,
+                },
+            )
 
         result.metadata["pickle_files"] = self._get_zip_member_names(pickle_files)
         return pickle_files
+
+    def _scan_nested_zip_members(
+        self,
+        zip_file: zipfile.ZipFile,
+        safe_entries: list[zipfile.ZipInfo],
+        result: ScanResult,
+        path: str,
+    ) -> None:
+        """Recursively route embedded ZIP members, including ZIPs named like pickle files."""
+        current_depth = get_archive_depth(self.config)
+        probe_failures: list[dict[str, str]] = []
+        size_limited_entries: list[dict[str, Any]] = []
+        depth_limited_entries: list[dict[str, Any]] = []
+        scan_failures: list[dict[str, str]] = []
+
+        for entry in safe_entries:
+            if entry.is_dir():
+                continue
+
+            try:
+                header = self._read_member_prefix(
+                    zip_file,
+                    entry,
+                    _NESTED_ZIP_HEADER_PROBE_BYTES,
+                    phase="nested_zip_probe",
+                    result=result,
+                )
+            except Exception as exc:
+                logger.debug("Unable to inspect ZIP member %s for nested archives: %s", entry.filename, exc)
+                probe_failures.append(
+                    {
+                        "zip_entry": entry.filename,
+                        "exception": str(exc),
+                        "exception_type": type(exc).__name__,
+                    }
+                )
+                continue
+
+            if not any(header.startswith(signature) for signature in _ZIP_LOCAL_FILE_SIGNATURES):
+                continue
+
+            entry_name = self._get_zip_member_name(entry)
+            if current_depth >= self.max_nested_zip_depth:
+                depth_limited_entries.append(
+                    {
+                        "zip_entry": entry_name,
+                        "depth": current_depth,
+                        "max_depth": self.max_nested_zip_depth,
+                    }
+                )
+                continue
+
+            if entry.file_size > self.max_nested_zip_member_bytes:
+                size_limited_entries.append(
+                    {
+                        "zip_entry": entry_name,
+                        "file_size": entry.file_size,
+                        "max_member_bytes": self.max_nested_zip_member_bytes,
+                    }
+                )
+                continue
+
+            temp_path: str | None = None
+            try:
+                temp_path = self._copy_nested_zip_member_to_tempfile(zip_file, entry)
+
+                nested_config = dict(self.config)
+                nested_config["_archive_depth"] = current_depth + 1
+                nested_scan_callback = self.config.get(NESTED_SCAN_CALLBACK_CONFIG_KEY)
+                if callable(nested_scan_callback):
+                    nested_result = nested_scan_callback(temp_path, nested_config)
+                else:
+                    nested_result = scan_nested_file(temp_path, nested_config)
+
+                self._rewrite_nested_result_context(nested_result, temp_path, path, self._get_zip_member_name(entry))
+                self._merge_nested_zip_result(result, nested_result, entry_name)
+            except ValueError as exc:
+                size_limited_entries.append(
+                    {
+                        "zip_entry": entry_name,
+                        "file_size": entry.file_size,
+                        "max_member_bytes": self.max_nested_zip_member_bytes,
+                        "exception": str(exc),
+                        "exception_type": type(exc).__name__,
+                    }
+                )
+            except Exception as exc:
+                logger.debug("Unable to scan nested ZIP member %s: %s", entry.filename, exc)
+                scan_failures.append(
+                    {
+                        "zip_entry": entry.filename,
+                        "exception": str(exc),
+                        "exception_type": type(exc).__name__,
+                    }
+                )
+            finally:
+                if temp_path is not None:
+                    with suppress(FileNotFoundError):
+                        os.unlink(temp_path)
+
+        if probe_failures:
+            self._record_nested_zip_incomplete(
+                result,
+                failures=probe_failures,
+                reason="pytorch_zip_nested_archive_probe_incomplete",
+                check_name="Nested ZIP Discovery",
+                message="PyTorch ZIP members could not be inspected for nested ZIP payloads",
+            )
+
+        if depth_limited_entries:
+            mark_inconclusive_scan_result(result, "pytorch_zip_nested_archive_depth_limit")
+            result.add_check(
+                name="Nested ZIP Depth Limit",
+                passed=False,
+                message=(
+                    f"{len(depth_limited_entries)} nested ZIP "
+                    f"{'member exceeds' if len(depth_limited_entries) == 1 else 'members exceed'} "
+                    f"the recursion depth limit ({self.max_nested_zip_depth})"
+                ),
+                severity=IssueSeverity.INFO,
+                location=self.current_file_path,
+                details={
+                    "zip_entries": [entry["zip_entry"] for entry in depth_limited_entries],
+                    "entries": depth_limited_entries,
+                    "failed_count": len(depth_limited_entries),
+                    "max_depth": self.max_nested_zip_depth,
+                    "analysis_incomplete": True,
+                },
+            )
+
+        if size_limited_entries:
+            mark_inconclusive_scan_result(result, "pytorch_zip_nested_archive_size_limit")
+            result.add_check(
+                name="Nested ZIP Size Limit",
+                passed=False,
+                message=(
+                    f"{len(size_limited_entries)} nested ZIP "
+                    f"{'member exceeds' if len(size_limited_entries) == 1 else 'members exceed'} "
+                    f"the bounded copy limit ({self.max_nested_zip_member_bytes} bytes)"
+                ),
+                severity=IssueSeverity.INFO,
+                location=self.current_file_path,
+                details={
+                    "zip_entries": [entry["zip_entry"] for entry in size_limited_entries],
+                    "entries": size_limited_entries,
+                    "failed_count": len(size_limited_entries),
+                    "max_member_bytes": self.max_nested_zip_member_bytes,
+                    "analysis_incomplete": True,
+                },
+            )
+
+        if scan_failures:
+            self._record_nested_zip_incomplete(
+                result,
+                failures=scan_failures,
+                reason="pytorch_zip_nested_archive_scan_incomplete",
+                check_name="Nested ZIP Scan",
+                message="Nested ZIP members could not be scanned completely",
+            )
+
+    def _copy_nested_zip_member_to_tempfile(self, zip_file: zipfile.ZipFile, entry: zipfile.ZipInfo) -> str:
+        """Copy a nested ZIP member into a bounded temporary file for rescanning."""
+        copied_bytes = 0
+        temp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_file:
+                temp_path = temp_file.name
+                with zip_file.open(entry) as source:
+                    while chunk := source.read(1024 * 1024):
+                        copied_bytes += len(chunk)
+                        if copied_bytes > self.max_nested_zip_member_bytes:
+                            raise ValueError(
+                                f"Nested ZIP member {entry.filename} exceeds bounded copy limit "
+                                f"({self.max_nested_zip_member_bytes} bytes)"
+                            )
+                        temp_file.write(chunk)
+            return temp_path
+        except Exception:
+            if temp_path is not None:
+                with suppress(FileNotFoundError):
+                    os.unlink(temp_path)
+            raise
+
+    def _record_nested_zip_incomplete(
+        self,
+        result: ScanResult,
+        *,
+        failures: list[dict[str, str]],
+        reason: str,
+        check_name: str,
+        message: str,
+    ) -> None:
+        """Record aggregated nested ZIP probe/scan failures without flooding checks."""
+        mark_inconclusive_scan_result(result, reason)
+        result.add_check(
+            name=check_name,
+            passed=False,
+            message=f"{len(failures)} {message}",
+            severity=IssueSeverity.INFO,
+            location=self.current_file_path,
+            details={
+                "zip_entries": [failure["zip_entry"] for failure in failures],
+                "entries": failures,
+                "failed_count": len(failures),
+                "analysis_incomplete": True,
+            },
+        )
+
+    @staticmethod
+    def _merge_nested_zip_result(result: ScanResult, nested_result: ScanResult, member_name: str) -> None:
+        """Merge nested findings while preserving the parent archive metadata."""
+        parent_metadata = dict(result.metadata)
+        result.merge(nested_result)
+        result.metadata = parent_metadata
+        nested_scans = result.metadata.setdefault("nested_zip_scans", [])
+        if isinstance(nested_scans, list):
+            nested_scans.append(
+                {
+                    "zip_entry": member_name,
+                    "scanner_name": nested_result.scanner_name,
+                    "success": nested_result.success,
+                    "metadata": dict(nested_result.metadata),
+                }
+            )
+
+    @staticmethod
+    def _rewrite_nested_result_context(
+        nested_result: ScanResult,
+        temp_path: str,
+        archive_path: str,
+        member_name: str,
+    ) -> None:
+        """Rewrite extracted nested ZIP paths back to archive provenance."""
+        archive_location = f"{archive_path}:{member_name}"
+
+        for issue in nested_result.issues:
+            issue.location = rewrite_extracted_member_location(
+                issue.location,
+                temp_path,
+                archive_location,
+                preserve_non_delimited_suffix=False,
+            )
+            existing_entry = issue.details.get("zip_entry")
+            issue.details["zip_entry"] = (
+                f"{member_name}:{existing_entry}" if isinstance(existing_entry, str) and existing_entry else member_name
+            )
+
+        for check in nested_result.checks:
+            check.location = rewrite_extracted_member_location(
+                check.location,
+                temp_path,
+                archive_location,
+                preserve_non_delimited_suffix=False,
+            )
+            existing_entry = check.details.get("zip_entry")
+            check.details["zip_entry"] = (
+                f"{member_name}:{existing_entry}" if isinstance(existing_entry, str) and existing_entry else member_name
+            )
+
+    def _entry_looks_like_pickle(
+        self,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        result: ScanResult,
+    ) -> bool:
+        """Return True when a bounded ZIP member prefix structurally resembles pickle."""
+        data_start = self._read_member_prefix(
+            zip_file,
+            entry,
+            _PICKLE_DISCOVERY_SHORT_PROBE_BYTES,
+            phase="pickle_discovery",
+            result=result,
+        )
+        if not data_start:
+            return False
+
+        if any(data_start.startswith(magic) for magic in _PICKLE_BINARY_PROTOCOL_PREFIXES):
+            sample = self._read_member_prefix(
+                zip_file,
+                entry,
+                _PICKLE_DISCOVERY_LONG_PROBE_BYTES,
+                phase="pickle_discovery",
+                result=result,
+            )
+            return self._looks_like_binary_pickle_prefix(sample, sample_is_prefix=entry.file_size > len(sample))
+
+        if data_start[0] not in PROTO0_1_START_BYTES:
+            return False
+
+        sample = data_start
+        if entry.file_size > len(data_start):
+            sample = self._read_member_prefix(
+                zip_file,
+                entry,
+                PROTO0_1_MAX_PROBE_BYTES,
+                phase="pickle_discovery",
+                result=result,
+            )
+        return _looks_like_proto0_or_1_pickle(
+            sample,
+            sample_is_prefix=entry.file_size > len(sample),
+        )
+
+    @staticmethod
+    def _looks_like_binary_pickle_prefix(sample: bytes, *, sample_is_prefix: bool) -> bool:
+        """Validate binary pickle-looking bytes enough to avoid random tensor false positives."""
+        if not any(sample.startswith(magic) for magic in _PICKLE_BINARY_PROTOCOL_PREFIXES):
+            return False
+
+        # Thresholds tuned for the discovery probe:
+        # * ``>= 4`` on a clean parse — a ``PROTO`` byte plus three additional
+        #   opcodes is unlikely to appear coincidentally in tensor storage noise
+        #   that just happens to start with ``\x80\x0?``, but any real pickle
+        #   (even trivial ones) will clear it quickly.
+        # * ``>= 2`` when ``genops`` either ran out of bytes mid-stream (prefix
+        #   sample) or raised a truncation-style ``ValueError``. Two valid
+        #   opcodes before the cliff is enough structural evidence to route to
+        #   the full pickle scanner, where the authoritative parse happens.
+        op_count = 0
+        try:
+            for opcode, _arg, _pos in pickletools.genops(sample):
+                op_count += 1
+                if opcode.name == "STOP":
+                    return True
+                if op_count >= 4:
+                    return True
+        except ValueError as exc:
+            message = str(exc).lower()
+            return (
+                sample_is_prefix
+                and op_count >= 2
+                and ("exhausted before seeing stop" in message or "not enough data" in message or "expected" in message)
+            )
+
+        return sample_is_prefix and op_count >= 2
 
     def _check_pytorch_vulnerabilities(
         self,
@@ -688,6 +1334,8 @@ class PyTorchZipScanner(BaseScanner):
         pickle_files: list[zipfile.ZipInfo],
         result: ScanResult,
         path: str,
+        *,
+        trusted_pytorch_storage_data_pkl_members: dict[str, set[str]],
     ) -> int:
         """Scan all discovered pickle files for malicious content"""
         bytes_scanned = 0
@@ -704,11 +1352,22 @@ class PyTorchZipScanner(BaseScanner):
         for info in pickle_files:
             name = self._get_zip_member_name(info)
             pickle_data_size = info.file_size
+            pickle_source = f"{path}:{name}"
+
+            if self.pickle_scanner is None:
+                bytes_scanned += pickle_data_size
+                add_scanner_selection_skip_check(
+                    result,
+                    pickle_source,
+                    "pickle",
+                    self.scanner_selection,
+                    context="embedded PyTorch pickle analysis",
+                )
+                continue
 
             # Choose scanning approach based on file size with spooling for seekability
             cfg = self.config or {}
             max_in_mem = int(cfg.get("pickle_max_memory_read", 32 * 1024 * 1024))  # 32MB default
-            pickle_source = f"{path}:{name}"
             if pickle_data_size <= max_in_mem:
                 data = self._read_member_bytes(
                     zip_file,
@@ -743,12 +1402,72 @@ class PyTorchZipScanner(BaseScanner):
                     )
             sub_result.metadata.setdefault("archive_file_size", original_file_size)
             apply_pickle_member_context(sub_result, archive_path=path, member_name=name)
+            normalized_name = name.replace("\\", "/").lstrip("/")
+            trusted_storage_keys = trusted_pytorch_storage_data_pkl_members.get(normalized_name)
+            if trusted_storage_keys is not None:
+                self._downgrade_trusted_storage_persistent_ids(sub_result, trusted_storage_keys)
 
             # Add CVE-2025-32434 specific warnings
             self._add_weights_only_safety_warnings(sub_result, result, path, name)
             result.merge(sub_result)
 
         return bytes_scanned
+
+    @classmethod
+    def _trusted_pytorch_storage_data_pkl_members(cls, safe_entries: list[zipfile.ZipInfo]) -> dict[str, set[str]]:
+        """Return data.pkl members with PyTorch ZIP storage keys under the same prefix."""
+        members = [(cls._get_zip_member_name(entry).replace("\\", "/").lstrip("/"), entry) for entry in safe_entries]
+        names = {name for name, _entry in members}
+        trusted_members: dict[str, set[str]] = {}
+        for name in names:
+            if name.rsplit("/", 1)[-1] != "data.pkl":
+                continue
+            prefix = name[: -len("data.pkl")]
+            if f"{prefix}version" not in names:
+                continue
+            data_prefix = f"{prefix}data/"
+            storage_keys = {
+                candidate[len(data_prefix) :]
+                for candidate, entry in members
+                if candidate.startswith(data_prefix)
+                and cls._is_ascii_decimal_digits(candidate[len(data_prefix) :])
+                and not entry.is_dir()
+            }
+            if storage_keys:
+                trusted_members[name] = storage_keys
+        return trusted_members
+
+    @staticmethod
+    def _is_ascii_decimal_digits(value: str) -> bool:
+        return value.isascii() and value.isdecimal()
+
+    @staticmethod
+    def _is_pytorch_storage_persistent_id_record(details: dict[str, Any], trusted_storage_keys: set[str]) -> bool:
+        storage_key = details.get("pytorch_storage_key")
+        return (
+            details.get("pickle_rule_code") == "PERSISTENT_ID"
+            and details.get("opcode") == "BINPERSID"
+            and details.get("pytorch_storage_persistent_id") is True
+            and isinstance(storage_key, str)
+            and storage_key in trusted_storage_keys
+        )
+
+    @classmethod
+    def _downgrade_trusted_storage_persistent_ids(cls, result: ScanResult, trusted_storage_keys: set[str]) -> None:
+        """Treat PyTorch storage persistent IDs as informational inside validated PyTorch ZIP data.pkl."""
+        for check in result.checks:
+            if not cls._is_pytorch_storage_persistent_id_record(check.details, trusted_storage_keys):
+                continue
+            check.status = CheckStatus.PASSED
+            check.severity = IssueSeverity.INFO
+            check.message = "PyTorch storage persistent ID found in validated PyTorch archive"
+            check.details["trusted_pytorch_archive_context"] = True
+
+        result.issues = [
+            issue
+            for issue in result.issues
+            if not cls._is_pytorch_storage_persistent_id_record(issue.details, trusted_storage_keys)
+        ]
 
     def _scan_for_jit_patterns(
         self,
@@ -761,13 +1480,40 @@ class PyTorchZipScanner(BaseScanner):
         bytes_scanned = 0
         all_jit_findings = []
         all_network_findings = []
+        check_jit = self._get_bool_config("check_jit_script", True)
+        check_net = self._get_bool_config("check_network_comm", True)
+        if safe_entries:
+            if not check_jit:
+                result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
+            if not check_net:
+                result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
+        if not check_jit and not check_net:
+            return 0
+
+        # Aggregate oversize and read-failure events so adversarial archives
+        # with many unreachable members produce one summary check apiece
+        # instead of one INFO finding per entry in the checks list.
+        size_limited_entries: list[dict[str, Any]] = []
+        read_failed_entries: list[dict[str, Any]] = []
 
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
+            normalized_name = name.replace("\\", "/").lstrip("/")
             try:
+                if entry.is_dir() or normalized_name.endswith("/"):
+                    continue
                 # Skip numeric tensor data files to support different versions of PyTorch ZIP files
                 # These are binary weight files that cause performance issues when scanned
-                if re.match(r"^(?:.+/)?data/\d+$", name):
+                if _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN.match(normalized_name):
+                    continue
+                if entry.file_size > self.max_jit_scan_member_bytes:
+                    size_limited_entries.append(
+                        {
+                            "zip_entry": name,
+                            "file_size": entry.file_size,
+                            "location": f"{path}:{name}",
+                        }
+                    )
                     continue
 
                 file_data = self._read_member_bytes(
@@ -775,6 +1521,7 @@ class PyTorchZipScanner(BaseScanner):
                     entry,
                     phase="jit_script_scan",
                     result=result,
+                    max_bytes=self.max_jit_scan_member_bytes,
                 )
                 bytes_scanned += len(file_data)
 
@@ -794,12 +1541,59 @@ class PyTorchZipScanner(BaseScanner):
                     all_network_findings.extend(network_findings)
 
             except Exception as e:
-                # Skip files that can't be read
                 logger.debug(f"Exception reading {name}: {e}")
+                read_failed_entries.append(
+                    {
+                        "zip_entry": name,
+                        "exception": str(e),
+                        "exception_type": type(e).__name__,
+                        "location": f"{path}:{name}",
+                    }
+                )
+
+        if size_limited_entries:
+            mark_inconclusive_scan_result(result, "pytorch_zip_jit_member_size_limit")
+            count = len(size_limited_entries)
+            noun = "member" if count == 1 else "members"
+            result.add_check(
+                name="JIT/Network Scan Size Limit",
+                passed=False,
+                message=(
+                    f"{count} PyTorch ZIP {noun} skipped by JIT/network scanning because "
+                    f"{'it exceeds' if count == 1 else 'they exceed'} the bounded read limit "
+                    f"({self.max_jit_scan_member_bytes} bytes)"
+                ),
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "zip_entries": [entry["zip_entry"] for entry in size_limited_entries],
+                    "entries": size_limited_entries,
+                    "max_scan_bytes": self.max_jit_scan_member_bytes,
+                    "skipped_count": count,
+                    "analysis_incomplete": True,
+                },
+            )
+
+        if read_failed_entries:
+            mark_inconclusive_scan_result(result, "pytorch_zip_jit_member_read_failed")
+            count = len(read_failed_entries)
+            noun = "member" if count == 1 else "members"
+            result.add_check(
+                name="JIT/Network Scan Read Failure",
+                passed=False,
+                message=(f"{count} PyTorch ZIP {noun} could not be analyzed for JIT/network patterns"),
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "zip_entries": [entry["zip_entry"] for entry in read_failed_entries],
+                    "entries": read_failed_entries,
+                    "failed_count": count,
+                    "analysis_incomplete": True,
+                },
+            )
 
         # Emit explicit checks for the entire ZIP file
         if safe_entries:  # Only create checks if we processed files
-            check_jit = self._get_bool_config("check_jit_script", True)
             if check_jit:
                 self.add_jit_script_findings(
                     all_jit_findings,
@@ -807,23 +1601,19 @@ class PyTorchZipScanner(BaseScanner):
                     model_type="pytorch",
                     context=path,
                 )
-            else:
-                result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
 
-            check_net = self._get_bool_config("check_network_comm", True)
             if check_net:
                 self.add_network_communication_findings(
                     all_network_findings,
                     result,
                     context=path,
                 )
-            else:
-                result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
 
         return bytes_scanned
 
     def _detect_suspicious_files(
         self,
+        zip_file: zipfile.ZipFile,
         safe_entries: list[zipfile.ZipInfo],
         result: ScanResult,
         path: str,
@@ -831,12 +1621,26 @@ class PyTorchZipScanner(BaseScanner):
         """Detect suspicious non-pickle files in the archive"""
         python_files_found = False
         executable_files_found = False
+        member_names = {self._get_zip_member_name(entry).replace("\\", "/").lstrip("/") for entry in safe_entries}
+        entries_by_normalized_name = {
+            self._get_zip_member_name(entry).replace("\\", "/").lstrip("/"): entry for entry in safe_entries
+        }
 
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
-            normalized_name = name.lower()
+            normalized_name = name.replace("\\", "/").lstrip("/")
+            normalized_name_lower = normalized_name.lower()
             # Check for Python code files
-            if normalized_name.endswith(".py"):
+            if normalized_name_lower.endswith(".py"):
+                debug_member_name = self._torchscript_debug_member_name(name, member_names)
+                debug_entry = entries_by_normalized_name.get(debug_member_name or "")
+                if debug_entry is not None and self._is_torchscript_generated_python(
+                    zip_file,
+                    entry,
+                    debug_entry,
+                    result,
+                ):
+                    continue
                 result.add_check(
                     name="Python Code File Detection",
                     passed=False,
@@ -847,7 +1651,7 @@ class PyTorchZipScanner(BaseScanner):
                 )
                 python_files_found = True
             # Check for shell scripts or other executable files
-            elif is_executable_archive_member_name(normalized_name):
+            elif is_executable_archive_member_name(normalized_name_lower):
                 result.add_check(
                     name="Executable File Detection",
                     passed=False,
@@ -863,7 +1667,7 @@ class PyTorchZipScanner(BaseScanner):
             result.add_check(
                 name="Python Code File Detection",
                 passed=True,
-                message="No Python code files found in model",
+                message="No unexpected Python code files found in model",
                 location=path,
             )
 
@@ -1299,15 +2103,13 @@ class PyTorchZipScanner(BaseScanner):
                 ):
                     return arg
 
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Unable to infer PyTorch version from pickle metadata: %s", exc)
 
         return None
 
     def _looks_like_version(self, text: str) -> bool:
         """Check if a string looks like a version number"""
-        import re
-
         # Match patterns like 2.5.1, 2.10.0a0, 2.2.3rc1, 1.13.0+cu117, 2.0.0.dev20230101.
         version_pattern = (
             r"^\d+\.\d+\.\d+"
@@ -1613,7 +2415,7 @@ class PyTorchZipScanner(BaseScanner):
         data_blob_sizes: dict[str, int] = {}
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
-            if re.match(r"^(?:.+/)?data/\d+$", name):
+            if _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN.match(name):
                 data_blob_sizes[name] = entry.file_size
 
         if not data_blob_sizes:
@@ -1622,10 +2424,31 @@ class PyTorchZipScanner(BaseScanner):
         # Parse pickle to look for tensor rebuild patterns and cross-reference storage
         # Use bounded reads to avoid memory spikes on large pickle entries
         max_pkl_read = 10 * 1024 * 1024  # 10 MB limit for metadata validation
+        trusted_storage_data_pkl_members = self._trusted_pytorch_storage_data_pkl_members(safe_entries)
         for pkl_info in pickle_files:
             pkl_name = self._get_zip_member_name(pkl_info)
+            normalized_name = pkl_name.replace("\\", "/").lstrip("/")
+            is_trusted_storage_data_pkl = normalized_name in trusted_storage_data_pkl_members
             try:
                 if pkl_info.file_size > max_pkl_read:
+                    if is_trusted_storage_data_pkl:
+                        mark_inconclusive_scan_result(result, "pytorch_zip_tensor_metadata_validation_truncated")
+                        result.add_check(
+                            name="CVE-2026-24747 Tensor Metadata Validation",
+                            passed=False,
+                            message=(
+                                f"Tensor metadata validation only inspected the first {max_pkl_read} bytes "
+                                f"of oversized pickle member {pkl_name}"
+                            ),
+                            severity=IssueSeverity.INFO,
+                            location=f"{path}:{pkl_name}",
+                            details={
+                                "cve_id": self.CVE_2026_24747_ID,
+                                "analysis_incomplete": True,
+                                "member_size": pkl_info.file_size,
+                                "max_read_bytes": max_pkl_read,
+                            },
+                        )
                     pkl_data = self._read_member_prefix(
                         zip_file,
                         pkl_info,
@@ -1640,7 +2463,20 @@ class PyTorchZipScanner(BaseScanner):
                         phase="tensor_metadata_validation",
                         result=result,
                     )
-                mismatches = self._check_tensor_storage_mismatches(pkl_data, data_blob_sizes)
+                mismatches, parse_complete = self._check_tensor_storage_mismatches(pkl_data, data_blob_sizes)
+                if not parse_complete and pkl_info.file_size <= max_pkl_read and is_trusted_storage_data_pkl:
+                    mark_inconclusive_scan_result(result, "pytorch_zip_tensor_metadata_validation_failed")
+                    result.add_check(
+                        name="CVE-2026-24747 Tensor Metadata Validation",
+                        passed=False,
+                        message=f"Tensor metadata validation could not parse pickle member {pkl_name}",
+                        severity=IssueSeverity.INFO,
+                        location=f"{path}:{pkl_name}",
+                        details={
+                            "cve_id": self.CVE_2026_24747_ID,
+                            "analysis_incomplete": True,
+                        },
+                    )
                 if mismatches:
                     result.add_check(
                         name="CVE-2026-24747 Tensor Metadata Validation",
@@ -1662,15 +2498,28 @@ class PyTorchZipScanner(BaseScanner):
                             "during deserialization. Legitimate models have consistent metadata."
                         ),
                     )
-            except Exception:
+            except Exception as exc:
+                mark_inconclusive_scan_result(result, "pytorch_zip_tensor_metadata_validation_failed")
+                result.add_check(
+                    name="CVE-2026-24747 Tensor Metadata Validation",
+                    passed=False,
+                    message=f"Tensor metadata validation could not be completed for {pkl_name}: {exc}",
+                    severity=IssueSeverity.INFO,
+                    location=f"{path}:{pkl_name}",
+                    details={
+                        "cve_id": self.CVE_2026_24747_ID,
+                        "analysis_incomplete": True,
+                        "exception_type": type(exc).__name__,
+                    },
+                )
                 continue
 
     def _check_tensor_storage_mismatches(
         self, pkl_data: bytes, data_blob_sizes: dict[str, int]
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], bool]:
         """Check for mismatches between pickle tensor declarations and actual blob sizes.
 
-        Best-effort parsing: returns empty list if pickle cannot be parsed.
+        Return parsed mismatches plus whether pickle parsing completed.
         """
         import pickletools
 
@@ -1714,7 +2563,7 @@ class PyTorchZipScanner(BaseScanner):
                         # Storage keys are small integer strings (e.g., "0", "1", "123")
                         if next_op.name in ("SHORT_BINUNICODE", "BINUNICODE") and next_arg:
                             arg_str = str(next_arg)
-                            if arg_str.isdigit() and storage_key is None:
+                            if self._is_ascii_decimal_digits(arg_str) and storage_key is None:
                                 storage_key = arg_str
                         # The element count is the integer argument just before
                         # TUPLE/BINPERSID in the storage constructor call.
@@ -1753,10 +2602,11 @@ class PyTorchZipScanner(BaseScanner):
                                         "expected_range": f"{min_expected}-{max_expected} bytes",
                                     }
                                 )
-        except Exception:
-            pass  # Best-effort: don't fail the scan if pickle parsing encounters issues
+        except Exception as exc:
+            logger.debug("Unable to compare PyTorch storage blob sizes: %s", exc)
+            return mismatches, False
 
-        return mismatches
+        return mismatches, True
 
     def _check_safetensors_available(self, model_path: str) -> bool:
         """Check if a SafeTensors alternative exists in the same directory"""
@@ -1779,33 +2629,91 @@ class PyTorchZipScanner(BaseScanner):
 
     def _analyze_pickle_imports(self, pickle_result: ScanResult) -> dict[str, Any]:
         """Analyze pickle imports to distinguish legitimate vs malicious patterns"""
-        # Standard PyTorch imports that are expected in legitimate models
+        # Standard PyTorch imports expected in benign state-dict archives.
+        # Keep these as exact callable/class references so lookalikes such as
+        # ``torch._utils.evil`` or ``collections.OrderedDictEvil`` are not
+        # downgraded by substring matching.
         legitimate_imports = {
-            "torch._utils",
-            "torch.LongStorage",
+            "collections.OrderedDict",
+            "numpy.dtype",
+            "numpy.ndarray",
+            "numpy.core.multiarray.scalar",
+            "numpy._core.multiarray.scalar",
+            "torch._rebuild_tensor",
+            "torch._rebuild_tensor_v2",
+            "torch.BFloat16Storage",
+            "torch.BoolStorage",
+            "torch.ByteStorage",
+            "torch.CharStorage",
+            "torch.ComplexDoubleStorage",
+            "torch.ComplexFloatStorage",
+            "torch.DoubleStorage",
             "torch.FloatStorage",
             "torch.HalfStorage",
             "torch.IntStorage",
+            "torch.LongStorage",
+            "torch.QInt32Storage",
+            "torch.QInt8Storage",
+            "torch.QUInt2x4Storage",
+            "torch.QUInt4x2Storage",
+            "torch.QUInt8Storage",
+            "torch.ShortStorage",
             "torch.Storage",
-            "collections.OrderedDict",
-            "collections",
-            "numpy",
+            "torch.UntypedStorage",
+            "torch._tensor._rebuild_from_type_v2",
+            "torch._utils._rebuild_device_tensor_from_numpy",
+            "torch._utils._rebuild_meta_tensor_no_storage",
+            "torch._utils._rebuild_nested_tensor",
+            "torch._utils._rebuild_parameter",
+            "torch._utils._rebuild_parameter_with_state",
+            "torch._utils._rebuild_qtensor",
+            "torch._utils._rebuild_sparse_tensor",
+            "torch._utils._rebuild_tensor",
+            "torch._utils._rebuild_tensor_v2",
+            "torch._utils._rebuild_tensor_v3",
+            "torch._utils._rebuild_wrapper_subclass",
         }
 
-        # Malicious imports that indicate actual attack
+        # Malicious imports that indicate actual attack. Match exact references
+        # or dotted children only; unknown imports are handled as suspicious.
         malicious_imports = {
-            "os.system",
-            "subprocess",
-            "eval",
-            "exec",
-            "compile",
-            "__builtin__",
+            "__builtin__.eval",
+            "__builtin__.exec",
+            "__builtin__.compile",
+            "__builtin__.__import__",
+            "__builtins__.eval",
+            "__builtins__.exec",
+            "__builtins__.compile",
+            "__builtins__.__import__",
+            "asyncio.subprocess",
             "builtins.eval",
             "builtins.exec",
-            "webbrowser",
+            "builtins.compile",
+            "builtins.__import__",
+            "compile",
+            "eval",
+            "exec",
+            "nt.system",
+            "os.system",
+            "posix.system",
+            "runpy.run_module",
             "socket",
+            "subprocess",
             "urllib",
+            "urllib2",
+            "urllib3",
+            "webbrowser",
         }
+        malicious_import_prefixes = (
+            "asyncio.subprocess.",
+            "os.",
+            "subprocess.",
+            "socket.",
+            "urllib.",
+            "urllib2.",
+            "urllib3.",
+            "webbrowser.",
+        )
 
         found_imports = set()
         found_malicious = set()
@@ -1819,13 +2727,11 @@ class PyTorchZipScanner(BaseScanner):
                 imp = check_details["import_reference"]
                 found_imports.add(imp)
                 # Check if this is a malicious import
-                if any(mal in imp for mal in malicious_imports):
+                if imp in malicious_imports or any(imp.startswith(prefix) for prefix in malicious_import_prefixes):
                     found_malicious.add(imp)
 
         # Determine if all imports are legitimate
-        all_legitimate = (
-            all(any(legit in imp for legit in legitimate_imports) for imp in found_imports) if found_imports else True
-        )
+        all_legitimate = bool(found_imports) and all(imp in legitimate_imports for imp in found_imports)
 
         return {
             "total_imports": len(found_imports),
@@ -1995,8 +2901,6 @@ class PyTorchZipScanner(BaseScanner):
         metadata = super().extract_metadata(file_path)
 
         try:
-            import zipfile
-
             with zipfile.ZipFile(file_path, "r") as zip_file:
                 file_list = zip_file.namelist()
 
@@ -2023,11 +2927,9 @@ class PyTorchZipScanner(BaseScanner):
 
                 # Try to read version if available
                 if "version" in file_list:
-                    try:
+                    with suppress(Exception):
                         version_data = zip_file.read("version")
                         metadata["pytorch_version"] = version_data.decode("utf-8").strip()
-                    except Exception:
-                        pass
 
                 # Estimate model complexity from file count and names
                 param_indicators = sum(

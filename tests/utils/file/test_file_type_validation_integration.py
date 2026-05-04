@@ -36,15 +36,17 @@ except ImportError:
 class TestFileTypeValidationIntegration:
     """Integration tests for file type validation feature."""
 
-    @pytest.fixture
-    def test_data_dir(self):
-        """Return path to integration test data."""
-        return Path(__file__).parent / "assets/scenarios/license_scenarios"
+    LICENSE_SCENARIOS_PATH = "assets/scenarios/license_scenarios"
 
     @pytest.fixture
-    def temp_test_dir(self, tmp_path):
+    def test_data_dir(self) -> Path:
+        """Return path to integration test data."""
+        return Path(__file__).parent / self.LICENSE_SCENARIOS_PATH
+
+    @pytest.fixture
+    def temp_test_dir(self, tmp_path: Path) -> Path:
         """Create a temporary directory with copies of test data for modification."""
-        test_data_dir = Path(__file__).parent / "assets/scenarios/license_scenarios"
+        test_data_dir = Path(__file__).parent / self.LICENSE_SCENARIOS_PATH
         temp_dir = tmp_path / "file_type_tests"
         temp_dir.mkdir()
 
@@ -62,7 +64,7 @@ class TestFileTypeValidationIntegration:
 
         return temp_dir
 
-    def test_existing_files_pass_validation(self, test_data_dir):
+    def test_existing_files_pass_validation(self, test_data_dir: Path) -> None:
         """Test that all existing integration test files pass file type validation."""
         validation_failures = []
 
@@ -91,7 +93,7 @@ class TestFileTypeValidationIntegration:
                                     "file": str(file_path.relative_to(test_data_dir)),
                                     "header_format": header_format,
                                     "ext_format": ext_format,
-                                },
+                                }
                             )
 
                         # Also test scanning doesn't produce validation errors
@@ -263,21 +265,20 @@ class TestFileTypeValidationIntegration:
             # Should complete successfully
             assert results["success"], "Mixed licenses directory scan should succeed"
 
-    def test_security_threat_scenarios(self, temp_test_dir):
+    def test_security_threat_scenarios(self, temp_test_dir: Path) -> None:
         """Test various security threat scenarios involving file type mismatches."""
-        security_threats = []
-
         # Scenario 1: Executable disguised as model file
         malicious_model = temp_test_dir / "backdoor_model.pkl"
-        # Simulate a file with executable signatures
-        malicious_content = b"\x80\x03"  # Pickle header
-        malicious_content += b"MZ"  # Windows PE signature
-        malicious_content += b"\x00" * 100
+        # Simulate a PE executable signature with DOS-stub evidence.
+        malicious_content = b"MZ" + (b"\x00" * 64) + b"This program cannot be run in DOS mode" + (b"\x00" * 100)
         malicious_model.write_bytes(malicious_content)
 
-        result = scan_file(str(malicious_model))
-        # Should detect executable patterns (this would be caught by pickle scanner)
-        # Check if any issues were detected (executable patterns would be caught by pickle scanner)
+        malicious_result = scan_file(str(malicious_model))
+        malicious_validation_issues = [
+            i for i in malicious_result.issues if "file type validation failed" in i.message.lower()
+        ]
+        assert malicious_result.success is False
+        assert len(malicious_validation_issues) > 0, "PE-like bytes disguised as pickle were not rejected"
 
         # Scenario 2: Model with suspicious file size vs content mismatch
         tiny_model = temp_test_dir / "suspicious_model.h5"
@@ -285,9 +286,7 @@ class TestFileTypeValidationIntegration:
 
         result = scan_file(str(tiny_model))
         validation_issues = [i for i in result.issues if "file type validation failed" in i.message.lower()]
-
-        if len(validation_issues) == 0:
-            security_threats.append("Tiny fake HDF5 not detected")
+        assert len(validation_issues) > 0, "Tiny fake HDF5 not detected"
 
         # Scenario 3: Model directory with mixed legitimate and malicious files
         attack_dir = temp_test_dir / "attack_scenario"
@@ -304,16 +303,7 @@ class TestFileTypeValidationIntegration:
         all_validation_issues = [
             issue for issue in results["issues"] if "file type validation failed" in issue.message.lower()
         ]
-
-        if len(all_validation_issues) == 0:
-            security_threats.append(
-                "Mixed legitimate/malicious directory not fully detected",
-            )
-
-        # Some security threats should be detected
-        total_detections = len([t for t in security_threats if "not detected" not in t])
-        print(f"Security threat detections: {total_detections}")
-        print(f"Undetected threats: {security_threats}")
+        assert len(all_validation_issues) > 0, "Mixed legitimate/malicious directory not fully detected"
 
     def test_format_compatibility_matrix(self, tmp_path: Path) -> None:
         """Test the file format compatibility matrix systematically."""

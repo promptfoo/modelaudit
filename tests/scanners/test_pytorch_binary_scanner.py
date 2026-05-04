@@ -5,6 +5,7 @@ import pytest
 
 from modelaudit.detectors.suspicious_symbols import BINARY_CODE_PATTERNS
 from modelaudit.scanners.pytorch_binary_scanner import PyTorchBinaryScanner
+from tests.helpers import create_mock_onnx
 
 
 def _write_chunk_boundary_payload(
@@ -287,8 +288,9 @@ def test_filetype_detection_for_bin_files(tmp_path):
     assert detect_file_format(str(safetensors_bin)) == "safetensors"
 
     # Test ONNX format .bin
+    pytest.importorskip("onnx")
     onnx_bin = tmp_path / "onnx.bin"
-    onnx_bin.write_bytes(b"\x08\x01\x12\x00" + b"onnx.proto" + b"\x00" * 100)
+    create_mock_onnx(onnx_bin)
     assert detect_file_format(str(onnx_bin)) == "onnx"
 
     # Test raw binary format .bin

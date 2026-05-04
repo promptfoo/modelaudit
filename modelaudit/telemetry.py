@@ -19,7 +19,7 @@ from enum import Enum
 from functools import wraps
 from pathlib import Path
 from typing import Any, TypeVar, Union, cast
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 
 import yaml
 
@@ -118,6 +118,59 @@ class TelemetryEvent(str, Enum):
 _DEFAULT_POSTHOG_KEY = "phc_E5n5uHnDo2eREJL1uqX1cIlbkoRby4yFWt3V94HqRRg"
 POSTHOG_PROJECT_KEY = os.getenv("PROMPTFOO_POSTHOG_KEY", os.getenv("MODELAUDIT_POSTHOG_KEY", _DEFAULT_POSTHOG_KEY))
 POSTHOG_HOST = os.getenv("PROMPTFOO_POSTHOG_HOST", "https://a.promptfoo.app")
+_TELEMETRY_RULE_CODE_RE = re.compile(r"\bS\d{3,4}\b", re.IGNORECASE)
+_TELEMETRY_CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
+_TELEMETRY_STABLE_ISSUE_ID_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+){1,15}$")
+_TELEMETRY_SECRETLIKE_ISSUE_ID_RE = re.compile(
+    r"^(?:sk|pk|rk|ghp|github_pat|xox[baprs]?|glpat|hf|akia|asia)[_-]",
+    re.IGNORECASE,
+)
+_TELEMETRY_FILELIKE_ISSUE_ID_RE = re.compile(
+    r"\.(?:bin|ckpt|gguf|gz|h5|hdf5|json|keras|nemo|onnx|pb|pickle|pkl|pt|pth|safetensors|tar|yaml|yml|zip)$",
+    re.IGNORECASE,
+)
+_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "yup", "yeppers"})
+# Vars whose CI providers set a truthy literal ("true"/"1").
+_CI_TRUTHY_ENV_VARS = (
+    "CI",
+    "GITHUB_ACTIONS",
+    "TRAVIS",
+    "CIRCLECI",
+    "GITLAB_CI",
+    "APPVEYOR",
+    "TF_BUILD",
+    "BUILDKITE",
+    "BUDDY",
+)
+# Vars whose CI providers set a marker value (build ID, version, commit SHA),
+# so any non-empty value indicates CI. Promptfoo's upstream `getEnvBool` misses
+# these; we diverge intentionally so analytics filters work in the wild.
+_CI_PRESENCE_ENV_VARS = (
+    "JENKINS",
+    "CODEBUILD_BUILD_ID",
+    "BITBUCKET_COMMIT",
+    "TEAMCITY_VERSION",
+)
+
+
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").lower() in _TRUE_ENV_VALUES
+
+
+def _env_present(name: str) -> bool:
+    return bool(os.getenv(name, "").strip())
+
+
+def _is_running_in_ci() -> bool:
+    """Detect CI for the `isRunningInCi` telemetry property.
+
+    Mirrors Promptfoo's variable list but uses presence-based detection for
+    marker-style vars (TEAMCITY_VERSION, CODEBUILD_BUILD_ID, BITBUCKET_COMMIT,
+    JENKINS) that providers set to non-truthy values like build IDs.
+    """
+    if any(_env_truthy(name) for name in _CI_TRUTHY_ENV_VARS):
+        return True
+    return any(_env_present(name) for name in _CI_PRESENCE_ENV_VARS)
 
 
 def _is_development_install() -> bool:
@@ -126,37 +179,39 @@ def _is_development_install() -> bool:
     This prevents polluting production analytics with development test data.
     Uses importlib.metadata to properly detect editable installs.
     See: https://stackoverflow.com/questions/43348746/how-to-detect-if-module-is-installed-in-editable-mode
-
-    Returns True if:
-    - Package is installed in editable mode (pip install -e)
-    - MODELAUDIT_DEV=1 is explicitly set
     """
-    # Explicit dev mode flag
-    if os.getenv("MODELAUDIT_DEV", "").lower() in ("1", "true", "yes"):
+    if _env_truthy("MODELAUDIT_DEV"):
         return True
 
-    # Check if installed in editable mode using importlib.metadata
     try:
         from importlib.metadata import Distribution
 
         dist = Distribution.from_name("modelaudit")
-        # Modern pip (21.3+) uses direct_url.json for editable installs
         direct_url_text = dist.read_text("direct_url.json")
         if direct_url_text:
-            import json
-
             direct_url = json.loads(direct_url_text)
             if direct_url.get("dir_info", {}).get("editable", False):
                 return True
-    except Exception:
-        # Package not installed or metadata not available - not editable
-        pass
+    except Exception as exc:
+        logger.debug("Unable to inspect editable install metadata: %s", exc)
 
     return False
 
 
 # Cache the development check at module load time
 _IS_DEVELOPMENT = _is_development_install()
+
+# Env vars that gate the telemetry client's behavior. Changes here invalidate
+# the cached client; `_CI_PRESENCE_ENV_VARS` are excluded because they only
+# tag events with `isRunningInCi` and don't change disable state.
+_BEHAVIOR_GATING_ENV_VARS = (
+    "MODELAUDIT_TELEMETRY_DEV",
+    "PROMPTFOO_DISABLE_TELEMETRY",
+    "NO_ANALYTICS",
+    "CI",
+    "IS_TESTING",
+    "MODELAUDIT_TELEMETRY_FLUSH_IMMEDIATELY",
+)
 
 
 def _runtime_signature() -> tuple[Any, ...]:
@@ -167,12 +222,7 @@ def _runtime_signature() -> tuple[Any, ...]:
         POSTHOG_PROJECT_KEY,
         POSTHOG_HOST,
         _IS_DEVELOPMENT,
-        os.getenv("MODELAUDIT_TELEMETRY_DEV", "").lower(),
-        os.getenv("PROMPTFOO_DISABLE_TELEMETRY", "").lower(),
-        os.getenv("NO_ANALYTICS", "").lower(),
-        os.getenv("CI", "").lower(),
-        os.getenv("IS_TESTING", "").lower(),
-        os.getenv("MODELAUDIT_TELEMETRY_FLUSH_IMMEDIATELY", "").lower(),
+        *(_env_truthy(name) for name in _BEHAVIOR_GATING_ENV_VARS),
     )
 
 
@@ -182,8 +232,10 @@ class UserConfig:
     def __init__(self):
         self._config_dir = Path.home() / ".modelaudit"
         self._config_file = self._config_dir / "user_config.json"
+        self._promptfoo_config_file = Path.home() / ".promptfoo" / "promptfoo.yaml"
         self._config = self._load_config()
-        self._promptfoo_user_id: str | None = None
+        self._promptfoo_config_cache: dict[str, Any] | None = None
+        self._promptfoo_config_loaded = False
 
     def _load_config(self) -> dict[str, Any]:
         """Load user configuration from file."""
@@ -207,43 +259,79 @@ class UserConfig:
         except OSError as e:
             logger.debug(f"Failed to save user config: {e}")
 
-    def _get_promptfoo_user_id(self) -> str | None:
-        """Try to read Promptfoo's user ID for cross-tool correlation.
+    def _load_promptfoo_config(self) -> dict[str, Any] | None:
+        """Load Promptfoo's global config once, caching the result.
 
-        This allows correlating ModelAudit usage with Promptfoo usage for the same user.
+        Returns the loaded mapping (possibly empty if the file is absent), or
+        None if the file is unreadable or contains non-mapping data.
         """
-        if self._promptfoo_user_id is not None:
-            return self._promptfoo_user_id
+        if self._promptfoo_config_loaded:
+            return self._promptfoo_config_cache
 
-        promptfoo_config = Path.home() / ".promptfoo" / "promptfoo.yaml"
-        if promptfoo_config.exists():
-            try:
-                with open(promptfoo_config) as f:
-                    config = yaml.safe_load(f)
-                if isinstance(config, dict) and "id" in config:
-                    self._promptfoo_user_id = str(config["id"])
-                    return self._promptfoo_user_id
-            except (OSError, yaml.YAMLError):
-                pass
-        return None
+        self._promptfoo_config_loaded = True
+
+        if not self._promptfoo_config_file.exists():
+            self._promptfoo_config_cache = {}
+            return self._promptfoo_config_cache
+
+        try:
+            with open(self._promptfoo_config_file) as f:
+                loaded = yaml.safe_load(f)
+        except (OSError, yaml.YAMLError) as exc:
+            logger.debug("Unable to read promptfoo telemetry config: %s", exc)
+            return None
+
+        if loaded is None:
+            self._promptfoo_config_cache = {}
+        elif isinstance(loaded, dict):
+            self._promptfoo_config_cache = cast(dict[str, Any], loaded)
+        else:
+            logger.debug("Ignoring non-object promptfoo telemetry config")
+            return None
+
+        return self._promptfoo_config_cache
+
+    def _persist_user_id_to_promptfoo(self, user_id: str, config: dict[str, Any]) -> bool:
+        """Write user_id into promptfoo.yaml using auth.config's hardened atomic writer.
+
+        Skips the disk write when the file already holds the same id.
+        """
+        if config.get("id") == user_id:
+            self._promptfoo_config_cache = config
+            return True
+
+        try:
+            from .auth.config import _write_yaml_atomic
+
+            self._promptfoo_config_file.parent.mkdir(parents=True, exist_ok=True)
+            updated = {**config, "id": user_id}
+            _write_yaml_atomic(self._promptfoo_config_file, updated)
+        except (OSError, ImportError) as exc:
+            logger.debug("Unable to write promptfoo telemetry config: %s", exc)
+            return False
+
+        self._promptfoo_config_cache = updated
+        return True
 
     @property
     def user_id(self) -> str:
-        """Get or generate user ID.
+        """Return a stable identifier, preferring Promptfoo's for cross-tool correlation."""
+        promptfoo_config = self._load_promptfoo_config()
+        if promptfoo_config is not None:
+            existing = promptfoo_config.get("id")
+            if isinstance(existing, str) and existing:
+                return existing
 
-        Prefers Promptfoo's user ID if available for cross-tool correlation,
-        otherwise uses ModelAudit's own user ID.
-        """
-        # Try Promptfoo's user ID first for correlation
-        promptfoo_id = self._get_promptfoo_user_id()
-        if promptfoo_id:
-            return promptfoo_id
+        legacy = self._config.get("user_id")
+        user_id = legacy if isinstance(legacy, str) and legacy else str(uuid.uuid4())
 
-        # Fall back to ModelAudit's own user ID
-        if "user_id" not in self._config:
-            self._config["user_id"] = str(uuid.uuid4())
+        if promptfoo_config is not None and self._persist_user_id_to_promptfoo(user_id, promptfoo_config):
+            return user_id
+
+        if self._config.get("user_id") != user_id:
+            self._config["user_id"] = user_id
             self._save_config()
-        return str(self._config["user_id"])
+        return user_id
 
     @property
     def email(self) -> str | None:
@@ -288,32 +376,21 @@ class TelemetryClient:
         self._session_id = str(uuid.uuid4())
         self._telemetry_disabled_recorded = False
         self._atexit_flush_registered = False
-        self._flush_immediately = os.getenv("MODELAUDIT_TELEMETRY_FLUSH_IMMEDIATELY", "").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
+        self._flush_immediately = _env_truthy("MODELAUDIT_TELEMETRY_FLUSH_IMMEDIATELY")
 
         self._ensure_posthog_client()
 
     def _is_disabled(self) -> bool:
         """Check if telemetry is disabled via environment variables or user config."""
-        # Development installs don't send telemetry by default (prevents polluting analytics)
-        # Allow explicit opt-in during development with MODELAUDIT_TELEMETRY_DEV=1
-        if _IS_DEVELOPMENT and os.getenv("MODELAUDIT_TELEMETRY_DEV", "").lower() not in ("1", "true", "yes"):
+        # Editable installs are off by default; MODELAUDIT_TELEMETRY_DEV=1 opts back in.
+        if _IS_DEVELOPMENT and not _env_truthy("MODELAUDIT_TELEMETRY_DEV"):
             return True
 
-        # Check environment variables - use Promptfoo's standard env var
-        if os.getenv("PROMPTFOO_DISABLE_TELEMETRY", "").lower() in ("1", "true", "yes"):
-            return True
-        if os.getenv("NO_ANALYTICS", "").lower() in ("1", "true", "yes"):
-            return True
-        if os.getenv("CI", "").lower() in ("1", "true", "yes"):
-            return True
-        if os.getenv("IS_TESTING", "").lower() in ("1", "true", "yes"):
+        # `CI` here is the universal opt-out flag. The broader `_is_running_in_ci()`
+        # only tags events; events from marker-only providers still get sent.
+        if any(_env_truthy(name) for name in ("PROMPTFOO_DISABLE_TELEMETRY", "NO_ANALYTICS", "CI", "IS_TESTING")):
             return True
 
-        # Check user configuration - defaults to enabled (opt-out model)
         return not self._user_config.telemetry_enabled
 
     def _identify_user(self) -> None:
@@ -331,6 +408,7 @@ class TelemetryClient:
                 "modelaudit_version": __version__,
                 "platform": os.name,
                 "python_version": f"{sys.version_info.major}.{sys.version_info.minor}",
+                "isRunningInCi": _is_running_in_ci(),
             }
 
             # PostHog v7 uses set() instead of identify()
@@ -366,11 +444,27 @@ class TelemetryClient:
             # Just mark that we've acknowledged telemetry is disabled - no actual recording
             self._telemetry_disabled_recorded = True
 
+    def _parse_url_reference(self, path: str) -> ParseResult | None:
+        """Parse URL-like model references without treating local paths as URLs."""
+        if "://" not in path:
+            return None
+        try:
+            parsed = urlparse(path)
+        except Exception:
+            return None
+        return parsed if parsed.scheme else None
+
+    def _extract_file_extension(self, path: str) -> str:
+        """Extract a file extension without URL query strings or fragments."""
+        parsed = self._parse_url_reference(path)
+        name_source = parsed.path if parsed else path
+        return Path(name_source).suffix.lower()
+
     def _build_path_properties(self, path: str) -> dict[str, Any]:
         """Build coarse telemetry properties for a file path."""
         return {
             "path_type": self._classify_path(path),
-            "file_extension": Path(path).suffix.lower(),
+            "file_extension": self._extract_file_extension(path),
             "model_name": self._extract_model_name(path),
             "model_reference": self._extract_model_reference(path),
         }
@@ -409,6 +503,80 @@ class TelemetryClient:
             counts[value] = counts.get(value, 0) + 1
         return counts
 
+    @staticmethod
+    def _issue_text_rule_or_cve(value: Any) -> str | None:
+        """Extract a stable rule/CVE token from untrusted issue text."""
+        if not isinstance(value, str):
+            return None
+
+        stripped = value.strip()
+        if not stripped:
+            return None
+
+        rule_match = _TELEMETRY_RULE_CODE_RE.search(stripped)
+        if rule_match:
+            return f"rule:{rule_match.group(0).upper()}"
+
+        cve_match = _TELEMETRY_CVE_RE.search(stripped)
+        if cve_match:
+            return f"cve:{cve_match.group(0).upper()}"
+
+        return None
+
+    @classmethod
+    def _sanitize_issue_identifier(cls, value: Any) -> str | None:
+        """Return a stable telemetry issue identifier without preserving free-form text."""
+        token_identifier = cls._issue_text_rule_or_cve(value)
+        if token_identifier:
+            return token_identifier
+
+        if not isinstance(value, str):
+            return None
+
+        stripped = value.strip()
+        if not stripped:
+            return None
+
+        if _TELEMETRY_SECRETLIKE_ISSUE_ID_RE.search(stripped) or _TELEMETRY_FILELIKE_ISSUE_ID_RE.search(stripped):
+            return None
+
+        if _TELEMETRY_STABLE_ISSUE_ID_RE.fullmatch(stripped):
+            return stripped
+
+        return None
+
+    def _stable_issue_type(
+        self,
+        *,
+        issue_type: Any = None,
+        rule_code: Any = None,
+        cve_id: Any = None,
+        issue_message: Any = None,
+    ) -> str:
+        """Build the stable issue identifier used in telemetry payloads."""
+        for candidate in (rule_code, cve_id):
+            sanitized = self._sanitize_issue_identifier(candidate)
+            if sanitized:
+                return sanitized
+        message_identifier = self._issue_text_rule_or_cve(issue_message)
+        if message_identifier:
+            return message_identifier
+        sanitized_type = self._sanitize_issue_identifier(issue_type)
+        if sanitized_type:
+            return sanitized_type
+        return "unknown_issue"
+
+    def _issue_type_from_record(self, issue: dict[str, Any]) -> str:
+        """Extract a stable issue identifier from a serialized issue record."""
+        raw_details = issue.get("details")
+        details = raw_details if isinstance(raw_details, dict) else {}
+        return self._stable_issue_type(
+            issue_type=issue.get("type"),
+            rule_code=issue.get("rule_code") or details.get("rule_code"),
+            cve_id=issue.get("cve_id") or details.get("cve_id"),
+            issue_message=issue.get("message"),
+        )
+
     def _send_event_internal(self, event: TelemetryEvent, properties: dict[str, Any]) -> None:
         """Internal method to send events without checking disabled state."""
         event_properties = {
@@ -420,6 +588,7 @@ class TelemetryClient:
             "user_id": self._user_config.user_id,
             "platform": sys.platform,
             "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+            "isRunningInCi": _is_running_in_ci(),
         }
 
         # Send to PostHog
@@ -435,9 +604,10 @@ class TelemetryClient:
 
     def _extract_model_name(self, path: str) -> str | None:
         """Extract model name from path or URL."""
-        is_http_url = path.startswith(("http://", "https://"))
-        is_hf_shorthand = path.startswith("hf://")
-        parsed = urlparse(path) if (is_http_url or is_hf_shorthand) else None
+        parsed = self._parse_url_reference(path)
+        scheme = parsed.scheme.lower() if parsed else ""
+        is_http_url = scheme in {"http", "https"}
+        is_hf_shorthand = scheme == "hf"
         url_host = self._extract_url_host(path) if parsed else None
 
         # HuggingFace format: hf://org/model or https://huggingface.co/org/model
@@ -457,28 +627,28 @@ class TelemetryClient:
 
         # PyTorch Hub format: pytorch://org/repo/model
         if "pytorch" in path.lower() and "/" in path:
-            parts = (parsed.path if is_http_url and parsed else path).split("/")
+            parts = (parsed.path if parsed and parsed.path else path).split("/")
             return "/".join(parts[-2:]) if len(parts) >= 2 else parts[-1]
 
-        # Local file: filename, or URL path leaf (query and fragments excluded for HTTP URLs).
-        name_source = parsed.path if is_http_url and parsed else path
+        # Local file: filename, or URL path leaf with query/fragment stripped.
+        name_source = parsed.path if parsed else path
         if "/" in name_source or "\\" in name_source:
             model_name = Path(name_source).name
             if model_name:
                 return model_name
 
-        if is_http_url and url_host and url_host != "unknown":
+        if parsed and url_host and url_host != "unknown":
             return url_host
 
         return name_source
 
     def _extract_model_reference(self, path: str) -> str | None:
         """Extract a secret-scrubbed model reference while preserving model identity."""
-        if "://" not in path:
+        parsed = self._parse_url_reference(path)
+        if not parsed:
             return self._extract_model_name(path)
 
         try:
-            parsed = urlparse(path)
             host = self._extract_url_host(path)
             if not parsed.scheme or host == "unknown":
                 return self._extract_model_name(path)
@@ -551,8 +721,7 @@ class TelemetryClient:
         issue_details: list[dict[str, Any]] = []
 
         for issue in issues:
-            # Prefer structured issue type when available, fall back to message for legacy payloads.
-            issue_type = str(issue.get("type") or issue.get("message") or "unknown")
+            issue_type = self._issue_type_from_record(issue)
             severity = str(issue.get("severity", "unknown"))
             issue_types[issue_type] = issue_types.get(issue_type, 0) + 1
             # Capture first 50 issues in detail without including raw paths or identifiers.
@@ -633,13 +802,22 @@ class TelemetryClient:
         severity: str,
         scanner: str,
         file_path: str | None = None,
+        *,
+        rule_code: str | None = None,
+        cve_id: str | None = None,
+        issue_message: str | None = None,
     ) -> None:
         """Record that a security issue was found."""
+        stable_issue_type = self._stable_issue_type(
+            issue_type=issue_type,
+            rule_code=rule_code,
+            cve_id=cve_id,
+            issue_message=issue_message,
+        )
         properties: dict[str, Any] = {
             "severity": severity,
             "scanner": scanner,
-            "issue_type": issue_type,
-            "issue_message": issue_type,  # Full message for analytics
+            "issue_type": stable_issue_type,
         }
 
         if file_path:
@@ -863,11 +1041,28 @@ def record_file_type_detected(file_path: str, detected_type: str, confidence: fl
 
 
 @safe_telemetry
-def record_issue_found(issue_type: str, severity: str, scanner: str, file_path: str | None = None) -> None:
+def record_issue_found(
+    issue_type: str,
+    severity: str,
+    scanner: str,
+    file_path: str | None = None,
+    *,
+    rule_code: str | None = None,
+    cve_id: str | None = None,
+    issue_message: str | None = None,
+) -> None:
     """Record that a security issue was found."""
     client = get_telemetry_client()
     if client is not None:
-        client.record_issue_found(issue_type, severity, scanner, file_path)
+        client.record_issue_found(
+            issue_type,
+            severity,
+            scanner,
+            file_path,
+            rule_code=rule_code,
+            cve_id=cve_id,
+            issue_message=issue_message,
+        )
 
 
 @safe_telemetry

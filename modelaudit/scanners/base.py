@@ -1,17 +1,21 @@
 import hashlib
 import logging
 import os
+import re
 
 # Progress tracking imports with circular dependency detection
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from typing import Any, ClassVar, Final, Literal
 
 from ..analysis.unified_context import UnifiedMLContext
 from ..scanner_results import (
     INCONCLUSIVE_SCAN_OUTCOME,
+    OPERATIONAL_ERROR_METADATA_KEY,
+    SCAN_OUTCOME_METADATA_KEY,
     Check,
     CheckStatus,
     Issue,
@@ -24,7 +28,6 @@ from .rule_mapper import get_embedded_code_rule_code, get_network_rule_code, get
 # Progress tracking imports with circular dependency detection
 PROGRESS_AVAILABLE = False
 ProgressTracker = None
-ProgressPhase = None
 
 # Try to import progress tracking, handle circular import gracefully
 try:
@@ -50,9 +53,89 @@ __all__ = [
 ]
 
 TRUSTED_HUGGINGFACE_SOURCES = frozenset({"huggingface"})
+FORMAT_VALIDATION_CONFIG_KEY: Final[str] = "_modelaudit_format_validation"
 _TRUSTED_SOURCE_PROVENANCE_TOKEN: Final[object] = object()
 _WHITELIST_STALE_WARNING_THRESHOLD_DAYS: Final[int] = 90
-_has_logged_stale_whitelist_warning = False
+_WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES: Final[frozenset[str]] = frozenset(
+    {
+        # S1xx — direct code-execution primitives (os/sys/subprocess/eval/compile/__import__/
+        # importlib/runpy/webbrowser/ctypes/builtins). The embedded payload itself is the
+        # threat, so whitelisted HF models must not hide these.
+        "S101",
+        "S102",
+        "S103",
+        "S104",
+        "S105",
+        "S106",
+        "S107",
+        "S108",
+        "S109",
+        "S110",
+        "S111",
+        "S112",
+        "S113",
+        "S114",
+        "S115",
+        # S3xx — HIGH-severity active network primitives (raw sockets, ftp, telnet,
+        # exfiltration). HTTP/SMTP/DNS/IP/URL codes stay eligible for downgrade since
+        # those are policy-grade rather than active-payload signals.
+        "S301",
+        "S304",
+        "S305",
+        "S310",
+        # S4xx — filesystem-escape and archive-bomb detections.
+        "S405",
+        "S406",
+        "S408",
+        "S410",
+        # S5xx — embedded executable / interpreter content.
+        "S501",
+        "S502",
+        "S503",
+        "S504",
+        "S505",
+        "S506",
+        "S507",
+        "S508",
+        "S509",
+    }
+)
+# Word-boundary matching prevents incidental substrings (e.g. "executable" inside
+# "ExecuTorch", "rce" inside "force") from suppressing whitelist downgrades.
+_WHITELIST_DOWNGRADE_EXEMPT_KEYWORD_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:"
+    r"arbitrary\s+code"
+    r"|dangerous"
+    r"|executable"
+    r"|inconclusive"
+    r"|path\s+traversal"
+    r"|rce"
+    r"|remote\s+code\s+execution"
+    r"|unsafe\s+deserialization"
+    r")\b",
+    re.IGNORECASE,
+)
+DEFAULT_MAX_FILE_READ_SIZE: Final[int] = 512 * 1024 * 1024
+DEFAULT_READ_CHUNK_SIZE: Final[int] = 8 * 1024 * 1024
+
+
+@lru_cache(maxsize=16)
+def _warn_if_whitelist_is_stale(generated_at: str) -> None:
+    try:
+        whitelist_generated_at = datetime.fromisoformat(generated_at).date()
+    except ValueError:
+        logger.debug(
+            "Invalid WHITELIST_GENERATED_AT value %r; skipping whitelist staleness check.",
+            generated_at,
+        )
+        return
+
+    whitelist_age_days = (datetime.now(timezone.utc).date() - whitelist_generated_at).days
+    if whitelist_age_days > _WHITELIST_STALE_WARNING_THRESHOLD_DAYS:
+        logger.warning(
+            "HuggingFace whitelist is %d days old. Consider updating for best supply chain coverage.",
+            whitelist_age_days,
+        )
 
 
 @dataclass(frozen=True)
@@ -79,6 +162,7 @@ class BaseScanner(ABC):
     name: ClassVar[str] = "base"
     description: ClassVar[str] = "Base scanner class"
     supported_extensions: ClassVar[list[str]] = []
+    default_max_file_read_size: ClassVar[int] = DEFAULT_MAX_FILE_READ_SIZE
 
     def __init__(self, config: dict[str, Any] | None = None):
         """Initialize the scanner with configuration"""
@@ -87,12 +171,9 @@ class BaseScanner(ABC):
         self.current_file_path = ""  # Track the current file being scanned
         self.chunk_size = self.config.get(
             "chunk_size",
-            10 * 1024 * 1024 * 1024,
-        )  # Default: 10GB chunks
-        self.max_file_read_size = self._normalize_positive_int_config(
-            self.config.get("max_file_read_size", 0),
-            0,
-        )  # Default unlimited
+            DEFAULT_READ_CHUNK_SIZE,
+        )
+        self.max_file_read_size = self._resolve_max_file_read_size()
         self._path_validation_result: ScanResult | None = None
         self.context: UnifiedMLContext | None = None  # Will be initialized when scanning a file
         self.scan_start_time: float | None = None  # Track scan start time for timeout
@@ -107,6 +188,23 @@ class BaseScanner(ABC):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             return default
         return value
+
+    def _resolve_max_file_read_size(self) -> int:
+        """Resolve the scanner read cap, using a bounded class default when unset."""
+        if "max_file_read_size" in self.config:
+            value = self.config["max_file_read_size"]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return self.default_max_file_read_size
+            return value
+
+        if "max_file_size" in self.config:
+            value = self.config["max_file_size"]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return self.default_max_file_read_size
+            if value == 0:
+                return 0
+
+        return self.default_max_file_read_size
 
     def _get_bool_config(self, key: str, default: bool = True) -> bool:
         """
@@ -127,7 +225,50 @@ class BaseScanner(ABC):
             return val.strip().lower() not in {"false", "0", "no", "off"}
         return bool(val)
 
-    def _should_apply_whitelist(self, severity: IssueSeverity) -> bool:
+    @staticmethod
+    def _result_metadata_whitelist_downgrade_exempt(result_metadata: dict[str, Any] | None) -> bool:
+        """Return True when result-level metadata marks incomplete operational coverage."""
+        metadata = result_metadata or {}
+        return (
+            metadata.get("analysis_incomplete") is True
+            or metadata.get(OPERATIONAL_ERROR_METADATA_KEY) is True
+            or metadata.get(SCAN_OUTCOME_METADATA_KEY) == INCONCLUSIVE_SCAN_OUTCOME
+        )
+
+    @staticmethod
+    def _whitelist_downgrade_exempt(
+        *,
+        details: dict[str, Any] | None,
+        result_metadata: dict[str, Any] | None = None,
+        message: str | None,
+        rule_code: str | None,
+        check_name: str | None,
+    ) -> bool:
+        """Return True for active payload or incomplete-coverage findings."""
+        details = details or {}
+        if details.get("analysis_incomplete") is True or details.get("operational_error") is True:
+            return True
+        if BaseScanner._result_metadata_whitelist_downgrade_exempt(result_metadata):
+            return True
+        if details.get("cve_id") or details.get("cve"):
+            return True
+
+        if rule_code and (rule_code.startswith("S2") or rule_code in _WHITELIST_DOWNGRADE_EXEMPT_RULE_CODES):
+            return True
+
+        text = " ".join(value for value in (message, check_name) if value)
+        return bool(_WHITELIST_DOWNGRADE_EXEMPT_KEYWORD_PATTERN.search(text))
+
+    def _should_apply_whitelist(
+        self,
+        severity: IssueSeverity,
+        *,
+        details: dict[str, Any] | None = None,
+        result_metadata: dict[str, Any] | None = None,
+        message: str | None = None,
+        rule_code: str | None = None,
+        check_name: str | None = None,
+    ) -> bool:
         """
         Check if the whitelist should be applied to downgrade an issue's severity.
 
@@ -139,6 +280,15 @@ class BaseScanner(ABC):
         """
         # Only downgrade severities higher than INFO
         if severity in (IssueSeverity.INFO, IssueSeverity.DEBUG):
+            return False
+
+        if self._whitelist_downgrade_exempt(
+            details=details,
+            result_metadata=result_metadata,
+            message=message,
+            rule_code=rule_code,
+            check_name=check_name,
+        ):
             return False
 
         # Check if whitelist is enabled (default: True)
@@ -155,22 +305,7 @@ class BaseScanner(ABC):
             if not is_whitelisted:
                 return False
 
-            global _has_logged_stale_whitelist_warning
-            if not _has_logged_stale_whitelist_warning:
-                try:
-                    whitelist_generated_at = datetime.fromisoformat(WHITELIST_GENERATED_AT).date()
-                    whitelist_age_days = (datetime.now(timezone.utc).date() - whitelist_generated_at).days
-                    if whitelist_age_days > _WHITELIST_STALE_WARNING_THRESHOLD_DAYS:
-                        logger.warning(
-                            "HuggingFace whitelist is %d days old. Consider updating for best supply chain coverage.",
-                            whitelist_age_days,
-                        )
-                        _has_logged_stale_whitelist_warning = True
-                except ValueError:
-                    logger.debug(
-                        "Invalid WHITELIST_GENERATED_AT value %r; skipping whitelist staleness check.",
-                        WHITELIST_GENERATED_AT,
-                    )
+            _warn_if_whitelist_is_stale(WHITELIST_GENERATED_AT)
 
             return True
 
@@ -180,6 +315,11 @@ class BaseScanner(ABC):
         self,
         severity: IssueSeverity,
         details: dict[str, Any] | None,
+        *,
+        result_metadata: dict[str, Any] | None = None,
+        message: str | None = None,
+        rule_code: str | None = None,
+        check_name: str | None = None,
     ) -> tuple[IssueSeverity, dict[str, Any]]:
         """
         Apply whitelist downgrading logic to severity and details.
@@ -192,7 +332,14 @@ class BaseScanner(ABC):
             Tuple of (potentially modified severity, details dict)
         """
         original_severity = severity
-        if self._should_apply_whitelist(severity):
+        if self._should_apply_whitelist(
+            severity,
+            details=details,
+            result_metadata=result_metadata,
+            message=message,
+            rule_code=rule_code,
+            check_name=check_name,
+        ):
             severity = IssueSeverity.INFO
             # Add note about whitelisting to the details
             if details is None:
@@ -483,6 +630,7 @@ class BaseScanner(ABC):
         model_type: str = "unknown",
         context: str = "",
         enable_check: bool = True,
+        raise_on_error: bool = False,
     ) -> list[dict]:
         """Collect JIT/script code findings without creating checks.
 
@@ -491,6 +639,7 @@ class BaseScanner(ABC):
             model_type: Type of model (pytorch, tensorflow, etc.)
             context: Context string for reporting
             enable_check: Whether to perform the check (allows disabling)
+            raise_on_error: Whether detector failures should propagate to the caller
 
         Returns:
             List of findings
@@ -519,9 +668,13 @@ class BaseScanner(ABC):
             return standardized_findings
 
         except ImportError:
+            if raise_on_error:
+                raise
             logger.debug("JITScriptDetector not available, skipping JIT/Script check")
             return []
         except Exception as e:
+            if raise_on_error:
+                raise
             logger.warning(f"Error checking for JIT/Script code: {e}")
             return []
 
@@ -702,6 +855,7 @@ class BaseScanner(ABC):
         data: bytes,
         context: str = "",
         enable_check: bool = True,
+        raise_on_error: bool = False,
     ) -> list[dict]:
         """Collect network communication findings without creating checks.
 
@@ -709,6 +863,7 @@ class BaseScanner(ABC):
             data: Binary model data to check
             context: Context string for reporting
             enable_check: Whether to perform the check (allows disabling)
+            raise_on_error: Whether detector failures should propagate to the caller
 
         Returns:
             List of findings
@@ -724,9 +879,13 @@ class BaseScanner(ABC):
             return findings
 
         except ImportError:
+            if raise_on_error:
+                raise
             logger.debug("NetworkCommDetector not available, skipping network comm check")
             return []
         except Exception as e:
+            if raise_on_error:
+                raise
             logger.warning(f"Error checking for network communication: {e}")
             return []
 
@@ -962,9 +1121,20 @@ class BaseScanner(ABC):
                     validate_file_type,
                 )
 
-                if not validate_file_type(path):
-                    header_format = detect_file_format_from_magic(path)
-                    ext_format = detect_format_from_extension(path)
+                format_validation = self.config.get(FORMAT_VALIDATION_CONFIG_KEY)
+                if isinstance(format_validation, dict) and format_validation.get("path") == os.path.abspath(path):
+                    file_type_valid = bool(format_validation.get("file_type_valid", True))
+                    header_format = str(format_validation.get("header_format", "unknown"))
+                    ext_format = str(format_validation.get("extension_format", "unknown"))
+                else:
+                    file_type_valid = validate_file_type(path)
+                    header_format = "unknown"
+                    ext_format = "unknown"
+
+                if not file_type_valid:
+                    if header_format == "unknown" and ext_format == "unknown":
+                        header_format = detect_file_format_from_magic(path)
+                        ext_format = detect_format_from_extension(path)
                     result.add_check(
                         name="File Type Validation",
                         passed=False,
@@ -1060,6 +1230,9 @@ class BaseScanner(ABC):
         if self.max_file_read_size and self.max_file_read_size > 0 and file_size > self.max_file_read_size:
             result = self._create_result()
             result.metadata["file_size"] = file_size
+            result.metadata["analysis_incomplete"] = True
+            result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+            result.metadata["scan_outcome_reasons"] = ["max_file_read_size_exceeded"]
             result.add_check(
                 name="File Size Limit",
                 passed=False,
@@ -1069,6 +1242,8 @@ class BaseScanner(ABC):
                 details={
                     "file_size": file_size,
                     "max_file_read_size": self.max_file_read_size,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "max_file_read_size_exceeded",
                 },
                 why=(
                     "Large files may consume excessive memory or processing time. "

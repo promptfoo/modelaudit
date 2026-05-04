@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from modelaudit import core
-from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.torch7_scanner import Torch7Scanner
 
 
@@ -61,6 +61,79 @@ def test_scan_comment_token_does_not_suppress_lua_execution_detection(tmp_path: 
     assert execution_findings[0].severity == IssueSeverity.CRITICAL
 
 
+def test_scan_detects_bare_string_require_for_untrusted_module(tmp_path: Path) -> None:
+    payload = b'T7\x00\x00torch.FloatTensor nn.Sequential\nlocal mod = require "socket"\n'
+    path = _write_torch7_file(tmp_path, payload, filename="bare-require.t7")
+
+    result = Torch7Scanner().scan(str(path))
+
+    dynamic_findings = [
+        check
+        for check in result.checks
+        if check.name == "Torch7 Dynamic Module Load Analysis" and check.status == CheckStatus.FAILED
+    ]
+    assert len(dynamic_findings) == 1
+    assert dynamic_findings[0].severity == IssueSeverity.WARNING
+
+
+def test_scan_detects_long_bracket_require_for_untrusted_module(tmp_path: Path) -> None:
+    payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\nlocal mod = require [[socket]]\n"
+    path = _write_torch7_file(tmp_path, payload, filename="long-bracket-require.t7")
+
+    result = Torch7Scanner().scan(str(path))
+
+    dynamic_findings = [
+        check
+        for check in result.checks
+        if check.name == "Torch7 Dynamic Module Load Analysis" and check.status == CheckStatus.FAILED
+    ]
+    assert len(dynamic_findings) == 1
+    assert dynamic_findings[0].severity == IssueSeverity.WARNING
+
+
+def test_scan_detects_comment_separated_bare_require(tmp_path: Path) -> None:
+    payload = b'T7\x00\x00torch.FloatTensor nn.Sequential\nlocal mod = require -- decoy\n"socket"\n'
+    path = _write_torch7_file(tmp_path, payload, filename="commented-bare-require.t7")
+
+    result = Torch7Scanner().scan(str(path))
+
+    dynamic_findings = [
+        check
+        for check in result.checks
+        if check.name == "Torch7 Dynamic Module Load Analysis" and check.status == CheckStatus.FAILED
+    ]
+    assert len(dynamic_findings) == 1
+    assert dynamic_findings[0].severity == IssueSeverity.WARNING
+
+
+def test_scan_allows_bare_string_require_for_safe_module(tmp_path: Path) -> None:
+    payload = b'T7\x00\x00torch.FloatTensor nn.Sequential\nlocal torch = require "torch"\n'
+    path = _write_torch7_file(tmp_path, payload, filename="safe-bare-require.t7")
+
+    result = Torch7Scanner().scan(str(path))
+
+    dynamic_findings = [
+        check
+        for check in result.checks
+        if check.name == "Torch7 Dynamic Module Load Analysis" and check.status == CheckStatus.FAILED
+    ]
+    assert dynamic_findings == []
+
+
+def test_scan_allows_long_bracket_require_for_safe_module(tmp_path: Path) -> None:
+    payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\nlocal torch = require [[torch]]\n"
+    path = _write_torch7_file(tmp_path, payload, filename="safe-long-bracket-require.t7")
+
+    result = Torch7Scanner().scan(str(path))
+
+    dynamic_findings = [
+        check
+        for check in result.checks
+        if check.name == "Torch7 Dynamic Module Load Analysis" and check.status == CheckStatus.FAILED
+    ]
+    assert dynamic_findings == []
+
+
 def test_scan_handles_corrupt_file_gracefully(tmp_path: Path) -> None:
     path = _write_torch7_file(tmp_path, b"NOT7", filename="corrupt.t7")
 
@@ -68,6 +141,17 @@ def test_scan_handles_corrupt_file_gracefully(tmp_path: Path) -> None:
     header_failures = [check for check in result.checks if check.name == "Torch7 Header Signature"]
     assert len(header_failures) == 1
     assert header_failures[0].status == CheckStatus.FAILED
+
+
+def test_scan_bounded_torch7_window_is_inconclusive(tmp_path: Path) -> None:
+    payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\n" + (b"safe\n" * 64)
+    path = _write_torch7_file(tmp_path, payload, filename="bounded.t7")
+
+    result = Torch7Scanner(config={"torch7_max_scan_bytes": 32}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "torch7_bounded_read_incomplete" in result.metadata["scan_outcome_reasons"]
     assert result.success is False
 
 

@@ -116,11 +116,10 @@ class IntegratedAnalyzer:
         total_weight = sum(self.signal_weights[k] for k in signals)
         weighted_confidence = sum(signals[k] * self.signal_weights[k] for k in signals) / total_weight
 
-        # Determine if suspicious
-        is_suspicious = weighted_confidence > 0.5
-
         # Determine risk level
         risk_level = self._calculate_risk_level(weighted_confidence, signals)
+        semantic_risk_factors = detailed.get("semantic", {}).get("analysis", {}).get("risk_factors", [])
+        is_suspicious = risk_level in {"medium", "high", "critical"} or bool(semantic_risk_factors)
 
         # Add general recommendations
         if not is_suspicious:
@@ -213,7 +212,6 @@ class IntegratedAnalyzer:
 
     def _analyze_semantics(self, code: str, context: UnifiedMLContext) -> dict[str, Any]:
         """Perform semantic analysis."""
-        confidence_safe = 0.5
         reasoning = []
         mitigations = []
 
@@ -329,7 +327,6 @@ class IntegratedAnalyzer:
 
     def _validate_code(self, code: str) -> dict[str, Any]:
         """Validate code syntax and safety."""
-        confidence_safe = 0.5
         reasoning = []
 
         # Check syntax

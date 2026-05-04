@@ -9,7 +9,15 @@ from collections import defaultdict
 from typing import Any
 
 from modelaudit.models import ModelAuditResultModel
-from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, Check, Issue, IssueSeverity, ScanResult
+from modelaudit.scanner_results import (
+    INCONCLUSIVE_SCAN_OUTCOME,
+    Check,
+    Issue,
+    IssueSeverity,
+    ScanResult,
+    mark_inconclusive_scan_result,
+    normalize_unclassified_scan_failure,
+)
 from modelaudit.telemetry import record_issue_found
 from modelaudit.utils.helpers.assets import asset_from_scan_result
 
@@ -24,22 +32,12 @@ def mark_operational_scan_error(scan_result: ScanResult, reason: str) -> None:
     """Mark a scan result as an operational failure for exit-code aggregation."""
     scan_result.metadata[OPERATIONAL_ERROR_METADATA_KEY] = True
     scan_result.metadata[OPERATIONAL_ERROR_REASON_METADATA_KEY] = reason
+    scan_result._refresh_metadata_dependent_state()
 
 
 def mark_inconclusive_scan_outcome(scan_result: ScanResult, reason: str) -> None:
     """Mark a scan result as explicitly inconclusive for exit-code aggregation."""
-    scan_result.metadata["analysis_incomplete"] = True
-    scan_result.metadata[SCAN_OUTCOME_METADATA_KEY] = INCONCLUSIVE_SCAN_OUTCOME
-    scan_result.metadata.setdefault(
-        "scan_outcome_message",
-        "Scan analysis incomplete; failed closed because full coverage was not available.",
-    )
-
-    existing_reasons = scan_result.metadata.get("scan_outcome_reasons")
-    reasons = existing_reasons if isinstance(existing_reasons, list) else []
-    if reason not in reasons:
-        reasons.append(reason)
-    scan_result.metadata["scan_outcome_reasons"] = reasons
+    mark_inconclusive_scan_result(scan_result, reason)
 
 
 def scan_result_has_operational_error(scan_result: ScanResult) -> bool:
@@ -145,6 +143,7 @@ def add_scan_result_to_model(
     from .models import FileMetadataModel
 
     results.bytes_scanned += file_result.bytes_scanned
+    normalize_unclassified_scan_failure(file_result)
 
     if file_result.scanner_name and file_result.scanner_name not in scan_metadata.get("scanners", []):
         scan_metadata.setdefault("scanners", []).append(file_result.scanner_name)
@@ -160,11 +159,16 @@ def add_scan_result_to_model(
     for issue in file_result.issues:
         issue_dict = issue.to_dict() if hasattr(issue, "to_dict") else issue
         if isinstance(issue_dict, dict):
+            issue_details = issue_dict.get("details")
+            issue_details = issue_details if isinstance(issue_details, dict) else {}
             record_issue_found(
-                issue_type=str(issue_dict.get("message", "unknown_issue")),
+                issue_type=str(issue_dict.get("type") or "unknown_issue"),
                 severity=to_telemetry_severity(issue_dict.get("severity", "unknown")),
                 scanner=file_result.scanner_name,
                 file_path=file_path,
+                rule_code=issue_dict.get("rule_code") if isinstance(issue_dict.get("rule_code"), str) else None,
+                cve_id=issue_details.get("cve_id") if isinstance(issue_details.get("cve_id"), str) else None,
+                issue_message=issue_dict.get("message") if isinstance(issue_dict.get("message"), str) else None,
             )
             results.issues.append(Issue(**issue_dict))
 
@@ -474,6 +478,9 @@ def determine_exit_code(results: ModelAuditResultModel) -> int:
     if results_have_inconclusive_outcome(results):
         return 2
 
+    if results.success is False:
+        return 2
+
     if results.files_scanned == 0:
         return 2
 
@@ -488,20 +495,29 @@ def merge_scan_result(
     if isinstance(scan_result, ScanResult):
         file_path = scan_result.file_path if hasattr(scan_result, "file_path") else None
         for issue in scan_result.issues:
+            issue_details = issue.details if isinstance(issue.details, dict) else {}
             record_issue_found(
-                issue.message,
+                issue.type or "unknown_issue",
                 issue.severity.name if hasattr(issue.severity, "name") else str(issue.severity),
                 scan_result.scanner_name,
                 file_path=file_path,
+                rule_code=issue.rule_code,
+                cve_id=issue_details.get("cve_id") if isinstance(issue_details.get("cve_id"), str) else None,
+                issue_message=issue.message,
             )
         results.aggregate_scan_result_direct(scan_result)
     else:
         file_path = scan_result.get("file_path")
         for issue in scan_result.get("issues", []):
+            raw_issue_details = issue.get("details") if isinstance(issue, dict) else None
+            issue_details = raw_issue_details if isinstance(raw_issue_details, dict) else {}
             record_issue_found(
-                issue.get("message", "unknown_issue"),
+                issue.get("type") or "unknown_issue",
                 issue.get("severity", "unknown"),
                 scan_result.get("scanner_name", "unknown"),
                 file_path=file_path,
+                rule_code=issue.get("rule_code") if isinstance(issue.get("rule_code"), str) else None,
+                cve_id=issue_details.get("cve_id") if isinstance(issue_details.get("cve_id"), str) else None,
+                issue_message=issue.get("message") if isinstance(issue.get("message"), str) else None,
             )
         results.aggregate_scan_result(scan_result)

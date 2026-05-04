@@ -8,7 +8,9 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from modelaudit_picklescan import Finding, PickleReport, ScanOptions, ScanStatus, Severity
+from modelaudit_picklescan import Finding, PickleReport, ScanError, ScanOptions, ScanStatus, Severity
+
+from modelaudit.config.explanations import get_import_explanation
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, Check, Issue, IssueSeverity, ScanResult
 from .rule_mapper import get_generic_rule_code, get_import_rule_code, get_pickle_opcode_rule_code
@@ -18,34 +20,36 @@ _INCONCLUSIVE_NOTICE_CODES = frozenset(
         "encoded_nested_payload_truncated",
         "literal_scan_truncated",
         "nested_payload_truncated",
+        "nested_probe_limit",
         "nested_pickle_incomplete",
         "opcode_budget",
         "parse_incomplete",
+        "known_stream_truncated",
         "timeout",
+        "unbounded_stream_truncated",
     }
 )
+_NESTED_PAYLOAD_NOTICE_CODES = frozenset({"nested_payload_detected", "encoded_nested_payload_detected"})
 _DEFAULT_SCAN_OPTIONS = ScanOptions()
 _IMPORT_MODULE_ALIASES = {
     "nt": "os",
     "posix": "os",
 }
 _LEGACY_NOTICE_RULE_CODES = {
-    "encoded_nested_payload_truncated": "S902",
-    "literal_scan_truncated": "S902",
-    "nested_payload_truncated": "S902",
-    "nested_pickle_incomplete": "S902",
-    "opcode_budget": "S902",
-    "parse_incomplete": "S902",
-    "timeout": "S902",
+    **dict.fromkeys(_INCONCLUSIVE_NOTICE_CODES, "S902"),
+    "nested_payload_detected": "S213",
 }
 _LEGACY_SCAN_OUTCOME_REASONS = {
     "encoded_nested_payload_truncated": "encoded_nested_payload_truncated",
     "literal_scan_truncated": "literal_scan_truncated",
     "nested_payload_truncated": "nested_payload_truncated",
+    "nested_probe_limit": "nested_probe_limit",
     "nested_pickle_incomplete": "nested_pickle_incomplete",
     "opcode_budget": "opcode_budget_exceeded",
     "parse_incomplete": "pickle_analysis_incomplete",
+    "known_stream_truncated": "known_stream_truncated",
     "timeout": "scan_timeout",
+    "unbounded_stream_truncated": "unbounded_stream_truncated",
 }
 _INT_TEXT_RE = re.compile(r"[+-]?\d+")
 _LEGACY_RULE_CODE_RE = re.compile(r"^S\d+$")
@@ -100,7 +104,7 @@ def scan_options_from_config(config: Mapping[str, Any]) -> ScanOptions:
         post_budget_scan_bytes=_parse_min_int(
             config.get(
                 "post_budget_global_scan_limit_bytes",
-                _DEFAULT_SCAN_OPTIONS.post_budget_scan_bytes,
+                config.get("post_budget_expansion_scan_limit_bytes", _DEFAULT_SCAN_OPTIONS.post_budget_scan_bytes),
             ),
             _DEFAULT_SCAN_OPTIONS.post_budget_scan_bytes,
             minimum=0,
@@ -111,6 +115,14 @@ def scan_options_from_config(config: Mapping[str, Any]) -> ScanOptions:
                 _DEFAULT_SCAN_OPTIONS.max_unbounded_stream_read_bytes,
             ),
             _DEFAULT_SCAN_OPTIONS.max_unbounded_stream_read_bytes,
+            minimum=1,
+        ),
+        max_known_stream_read_bytes=_parse_min_int(
+            config.get(
+                "max_known_stream_read_bytes",
+                _DEFAULT_SCAN_OPTIONS.max_known_stream_read_bytes,
+            ),
+            _DEFAULT_SCAN_OPTIONS.max_known_stream_read_bytes,
             minimum=1,
         ),
         max_string_literal_scan_chars=_parse_min_int(
@@ -159,6 +171,7 @@ def pickle_report_to_scan_result(
     suppress_parse_failure_escalation = _should_suppress_parse_failure_escalation(report)
     if suppress_parse_failure_escalation:
         result.metadata["trusted_incomplete_tail"] = True
+    has_only_parse_errors = bool(report.errors) and all(error.category == "parse_error" for error in report.errors)
 
     if report.status == ScanStatus.INCONCLUSIVE:
         result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
@@ -172,6 +185,9 @@ def pickle_report_to_scan_result(
         result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
         result.metadata["scan_outcome_reasons"] = ["pickle_analysis_incomplete"]
         result.metadata["analysis_incomplete"] = True
+        result.metadata["file_type"] = "pickle"
+        result.metadata["parsing_failed"] = True
+        result.metadata["failure_reason"] = "unknown_opcode_or_format_error"
 
     for finding in report.findings:
         details = _add_legacy_detail_aliases(
@@ -182,15 +198,25 @@ def pickle_report_to_scan_result(
         )
         if finding.rule_code:
             details.setdefault("pickle_rule_code", finding.rule_code)
+        severity = _to_issue_severity(finding.severity)
+        legacy_rule_code = _legacy_rule_code_for_finding(finding)
+        _add_legacy_rule_alias_metadata(finding, details, legacy_rule_code)
         result.add_check(
-            name="Standalone Pickle Finding",
+            name=_legacy_check_name_for_finding(finding),
             passed=False,
             message=finding.message,
-            severity=_to_issue_severity(finding.severity),
+            severity=severity,
             location=finding.location,
             details=details,
-            why=finding.why,
-            rule_code=_legacy_rule_code_for_finding(finding),
+            why=_legacy_why_for_finding(finding),
+            rule_code=legacy_rule_code,
+        )
+        _add_legacy_supporting_finding_checks(
+            result,
+            finding=finding,
+            details=details,
+            severity=severity,
+            primary_rule_code=legacy_rule_code,
         )
 
     for notice in report.notices:
@@ -200,36 +226,47 @@ def pickle_report_to_scan_result(
             **notice.to_dict()["details"],
         }
         details.setdefault("pickle_notice_code", notice.code)
+        notice_is_nested_payload = notice.code in _NESTED_PAYLOAD_NOTICE_CODES
         result.add_check(
             name="Standalone Pickle Notice",
-            passed=notice.code not in _INCONCLUSIVE_NOTICE_CODES,
+            passed=notice.code not in _INCONCLUSIVE_NOTICE_CODES and not notice_is_nested_payload,
             message=notice.message,
-            severity=_to_issue_severity(notice.severity),
+            severity=IssueSeverity.CRITICAL if notice_is_nested_payload else _to_issue_severity(notice.severity),
             location=notice.location,
             details=details,
-            rule_code=_legacy_rule_code_for_notice(notice.code),
+            why=_legacy_why_for_notice(notice.code),
+            rule_code=_legacy_rule_code_for_notice(notice.code, details),
         )
         if notice.code == "parse_incomplete" and not suppress_parse_failure_escalation:
-            result.add_check(
-                name="Standalone Pickle Parse Failure",
-                passed=False,
-                message="Pickle parsing failed before full scan completion",
-                severity=IssueSeverity.INFO,
-                location=notice.location,
-                details={
-                    "pickle_source": report.source,
+            parse_failure_details = {
+                "pickle_source": report.source,
+                "file_type": "pickle",
+                "category": "parse_error",
+                "parse_error": notice.details.get("exception"),
+                "exception_type": notice.details.get("exception_type"),
+                "parsing_failed": True,
+                "failure_reason": "unknown_opcode_or_format_error",
+                "analysis_incomplete": True,
+            }
+            result.metadata.update(
+                {
                     "file_type": "pickle",
-                    "category": "parse_error",
-                    "parse_error": notice.details.get("exception"),
-                    "exception_type": notice.details.get("exception_type"),
                     "parsing_failed": True,
                     "failure_reason": "unknown_opcode_or_format_error",
-                    "analysis_incomplete": True,
-                },
+                }
+            )
+            result.add_check(
+                name="Pickle Format Check",
+                passed=False,
+                message="Pickle parsing failed before full scan completion",
+                severity=IssueSeverity.WARNING,
+                location=notice.location,
+                details=parse_failure_details,
                 why=(
                     "The scanner could not fully parse this pickle payload due to an opcode or format error. "
                     "Because full opcode analysis did not complete, the payload is treated as unsafe."
                 ),
+                rule_code="S901",
             )
 
     import_references = report_metadata.get("import_references", [])
@@ -265,19 +302,30 @@ def pickle_report_to_scan_result(
             )
 
     for error in report.errors:
+        is_parse_error = error.category == "parse_error"
         result.add_check(
             name="Standalone Pickle Error",
             passed=False,
             message=error.message,
-            severity=IssueSeverity.INFO if error.category == "parse_error" else IssueSeverity.CRITICAL,
+            severity=_issue_severity_for_error(error),
             location=error.location,
             details={
                 "pickle_source": report.source,
                 "category": error.category,
                 "exception_type": error.exception_type,
-                "analysis_incomplete": error.category == "parse_error",
+                "analysis_incomplete": is_parse_error,
+                **(
+                    {
+                        "file_type": "pickle",
+                        "parsing_failed": True,
+                        "failure_reason": "unknown_opcode_or_format_error",
+                    }
+                    if is_parse_error
+                    else {}
+                ),
                 **error.to_dict()["details"],
             },
+            rule_code="S901" if is_parse_error else None,
         )
 
     operational_errors = [error for error in report.errors if error.category != "parse_error"]
@@ -294,11 +342,21 @@ def pickle_report_to_scan_result(
             details={"pickle_source": report.source},
         )
 
-    scan_success = report.status == ScanStatus.COMPLETE or (
-        report.status == ScanStatus.INCONCLUSIVE and report.has_security_findings
+    scan_success = (
+        report.status == ScanStatus.COMPLETE
+        or (report.status == ScanStatus.INCONCLUSIVE and report.has_security_findings)
+        or (report.status == ScanStatus.ERROR and has_only_parse_errors)
     )
     result.finish(success=scan_success)
     return result
+
+
+def _issue_severity_for_error(error: ScanError) -> IssueSeverity:
+    if error.category == "parse_error":
+        return IssueSeverity.WARNING
+    if error.category == "empty_input":
+        return IssueSeverity.INFO
+    return IssueSeverity.CRITICAL
 
 
 def apply_pickle_member_context(result: ScanResult, *, archive_path: str, member_name: str) -> None:
@@ -329,21 +387,35 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
         if notice.code != "parse_incomplete":
             continue
 
-        if source_ext in {".bin", ".pkl", ".pickle"} and notice.details.get("exception_type") in {
-            "UnicodeDecodeError",
-            "ValueError",
-        }:
-            return True
-
-        if notice.details.get("exception_type") == "UnicodeDecodeError":
-            return _has_only_non_dangerous_import_references(report)
-
-        if notice.details.get("exception_type") != "ValueError":
-            continue
-
+        exception_type = notice.details.get("exception_type")
         exception_message = str(notice.details.get("exception", ""))
         if (
-            source_ext in {".joblib", ".dill", ".bin"}
+            exception_type == "UnicodeDecodeError"
+            and source_ext in {".bin", ".pkl", ".pickle"}
+            and _has_no_or_only_benign_serialization_tail_imports(report)
+        ):
+            return True
+
+        if exception_type not in {"ParseError", "ValueError"}:
+            continue
+
+        if (
+            source_ext in {".bin", ".pkl", ".pickle", ".joblib", ".dill"}
+            and _is_zero_padding_tail_parse_error(exception_message)
+            and _has_no_or_only_benign_serialization_tail_imports(report)
+        ):
+            return True
+
+        if (
+            source_ext == ".joblib"
+            and "opcode b'" in exception_message
+            and exception_message.endswith(" unknown")
+            and _has_only_benign_serialization_tail_imports(report)
+        ):
+            return True
+
+        if (
+            source_ext in {".dill", ".bin"}
             and "opcode b'" in exception_message
             and exception_message.endswith(" unknown")
             and _has_only_benign_serialization_tail_imports(report)
@@ -351,6 +423,11 @@ def _should_suppress_parse_failure_escalation(report: PickleReport) -> bool:
             return True
 
     return False
+
+
+def _is_zero_padding_tail_parse_error(exception_message: str) -> bool:
+    """Return True when parsing only failed because the trusted tail is zero padding."""
+    return "opcode b'\\x00' unknown" in exception_message or 'opcode b"\\x00" unknown' in exception_message
 
 
 def _pickle_source_extension(source: str) -> str:
@@ -379,13 +456,13 @@ def _has_only_benign_serialization_tail_imports(report: PickleReport) -> bool:
     return True
 
 
-def _has_only_non_dangerous_import_references(report: PickleReport) -> bool:
+def _has_no_or_only_benign_serialization_tail_imports(report: PickleReport) -> bool:
     import_references = report.metadata.get("import_references")
-    if not _is_reference_sequence(import_references) or not import_references:
+    if not _is_reference_sequence(import_references):
         return False
-    return all(
-        isinstance(reference, Mapping) and not bool(reference.get("is_dangerous")) for reference in import_references
-    )
+    if not import_references:
+        return True
+    return _has_only_benign_serialization_tail_imports(report)
 
 
 def _is_reference_sequence(value: object) -> bool:
@@ -404,16 +481,24 @@ def _apply_member_context_to_record(
         return
     if record.location == member_location or record.location.startswith(f"{member_location} "):
         return
-    if "(pos " in record.location:
-        record.location = f"{member_location} {record.location}"
-        return
     record.location = f"{member_location} {record.location}"
 
 
-def _legacy_rule_code_for_notice(notice_code: str | None) -> str | None:
+def _legacy_rule_code_for_notice(notice_code: str | None, details: Mapping[str, Any] | None = None) -> str | None:
     if notice_code is None:
         return None
+    if notice_code == "encoded_nested_payload_detected":
+        encoding = details.get("encoding") if details is not None else None
+        return "S601" if encoding == "base64" else "S602"
     return _LEGACY_NOTICE_RULE_CODES.get(notice_code)
+
+
+def _legacy_why_for_notice(notice_code: str | None) -> str | None:
+    if notice_code == "nested_payload_detected":
+        return "Nested pickle payloads can hide code execution paths from shallow scanners."
+    if notice_code == "encoded_nested_payload_detected":
+        return "Encoded nested pickle payloads can hide deserialization gadgets inside metadata strings."
+    return None
 
 
 def _legacy_scan_outcome_reason(notice_code: str | None) -> str:
@@ -433,14 +518,30 @@ def _legacy_rule_code_for_finding(finding: Finding) -> str | None:
         if isinstance(opcode, str):
             return get_pickle_opcode_rule_code(opcode)
         return "S211"
-    if finding.rule_code in {"DANGEROUS_CALL", "DANGEROUS_GLOBAL"}:
+    if finding.rule_code == "PERSISTENT_ID":
         opcode = finding.details.get("opcode")
         if isinstance(opcode, str):
             mapped = get_pickle_opcode_rule_code(opcode)
             if mapped:
                 return mapped
+        return "S212"
+    if finding.rule_code in {"DANGEROUS_CALL", "DANGEROUS_GLOBAL"}:
         module = finding.details.get("module")
         name = finding.details.get("name")
+        if isinstance(module, str) and module.lower() in {"__builtin__", "__builtins__", "builtins"}:
+            if name in {"eval", "exec"}:
+                return "S104"
+            if name == "compile":
+                return "S105"
+            if name == "__import__":
+                return "S106"
+            return "S115"
+
+        opcode = finding.details.get("opcode")
+        if isinstance(opcode, str):
+            mapped = get_pickle_opcode_rule_code(opcode)
+            if mapped:
+                return mapped
         if isinstance(module, str):
             mapped = get_import_rule_code(
                 _IMPORT_MODULE_ALIASES.get(module.lower(), module),
@@ -448,7 +549,7 @@ def _legacy_rule_code_for_finding(finding: Finding) -> str | None:
             )
             if mapped:
                 return mapped
-        return "S201" if finding.rule_code == "DANGEROUS_CALL" else None
+        return "S201" if finding.rule_code == "DANGEROUS_CALL" else "S206"
     if finding.rule_code == "SUSPICIOUS_STRING":
         pattern = finding.details.get("pattern")
         if isinstance(pattern, str):
@@ -474,7 +575,128 @@ def _legacy_rule_code_for_finding(finding: Finding) -> str | None:
             if mapped:
                 return mapped
         return "S206"
+    if finding.rule_code == "PICKLE_EXPANSION":
+        return "S214"
+    if finding.rule_code == "STRUCTURAL_TAMPER":
+        return "S902"
     return finding.rule_code
+
+
+def _add_legacy_rule_alias_metadata(
+    finding: Finding,
+    details: dict[str, Any],
+    primary_rule_code: str | None,
+) -> None:
+    if primary_rule_code == "S115" or finding.rule_code != "DANGEROUS_CALL":
+        return
+    module = finding.details.get("module")
+    name = finding.details.get("name")
+    if (
+        isinstance(module, str)
+        and module.lower() in {"__builtin__", "__builtins__", "builtins"}
+        and name in {"eval", "exec", "compile", "__import__"}
+    ):
+        details["legacy_rule_aliases"] = ["S115"]
+
+
+def _legacy_check_name_for_finding(finding: Finding) -> str:
+    if finding.rule_code == "PICKLE_EXPANSION":
+        if finding.details.get("post_budget") is True:
+            return "Post-Budget Pickle Expansion Heuristic Check"
+        return "Pickle Expansion Heuristic Check"
+    if finding.rule_code == "STRUCTURAL_TAMPER":
+        return "Pickle Structural Tamper Check"
+    opcode = finding.details.get("opcode")
+    if finding.rule_code in {"DANGEROUS_CALL", "DANGEROUS_GLOBAL"} and isinstance(opcode, str):
+        return f"{opcode.upper()} Opcode Safety Check"
+    return "Standalone Pickle Finding"
+
+
+def _add_legacy_supporting_finding_checks(
+    result: ScanResult,
+    *,
+    finding: Finding,
+    details: dict[str, Any],
+    severity: IssueSeverity,
+    primary_rule_code: str | None,
+) -> None:
+    if severity not in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}:
+        return
+
+    if (
+        finding.rule_code == "MALFORMED_STACK_GLOBAL"
+        and primary_rule_code != "S902"
+        and finding.message.startswith("Malformed STACK_GLOBAL operands")
+    ):
+        result.add_check(
+            name="STACK_GLOBAL Context Check",
+            passed=False,
+            message="STACK_GLOBAL opcode found without sufficient string context",
+            severity=IssueSeverity.WARNING,
+            location=finding.location,
+            details=details,
+            why=(
+                "STACK_GLOBAL requires module and function string operands on the stack. "
+                "Malformed operands can hide callable resolution from shallow scanners."
+            ),
+            rule_code="S902",
+        )
+        return
+
+    if finding.rule_code == "DANGEROUS_CALL" and primary_rule_code != "S201" and finding.message.startswith("Found "):
+        module = finding.details.get("module")
+        name = finding.details.get("name")
+        if (
+            isinstance(module, str)
+            and module.lower() in {"__builtin__", "__builtins__", "builtins"}
+            and name
+            in {
+                "eval",
+                "exec",
+                "compile",
+                "__import__",
+            }
+        ):
+            supporting_details = {
+                **details,
+                "supporting_rule_code": True,
+                "primary_rule_code": primary_rule_code,
+            }
+            result.add_check(
+                name="REDUCE Opcode Safety Check",
+                passed=False,
+                message=finding.message,
+                severity=severity,
+                location=finding.location,
+                details=supporting_details,
+                why=_legacy_why_for_finding(finding),
+                rule_code="S201",
+            )
+            if primary_rule_code != "S115":
+                details.setdefault("legacy_rule_aliases", ["S115"])
+        return
+
+    if finding.rule_code == "DANGEROUS_GLOBAL":
+        module = finding.details.get("module")
+        name = finding.details.get("name")
+        if not isinstance(module, str):
+            return
+        import_rule_code = get_import_rule_code(
+            _IMPORT_MODULE_ALIASES.get(module.lower(), module),
+            name if isinstance(name, str) else None,
+        )
+        if import_rule_code is None or import_rule_code == primary_rule_code:
+            return
+        result.add_check(
+            name="GLOBAL Opcode Safety Check",
+            passed=False,
+            message=finding.message,
+            severity=severity,
+            location=finding.location,
+            details=details,
+            why=_legacy_why_for_finding(finding),
+            rule_code=import_rule_code,
+        )
 
 
 def _finding_reference_keys(findings: tuple[Finding, ...]) -> set[tuple[str, int | None]]:
@@ -533,4 +755,29 @@ def _location_position(location: str | None) -> int | None:
 def _add_legacy_detail_aliases(details: dict[str, Any]) -> dict[str, Any]:
     if "function" not in details and isinstance(details.get("name"), str):
         details["function"] = details["name"]
+    if "associated_global" not in details and isinstance(details.get("import_reference"), str):
+        details["associated_global"] = details["import_reference"]
     return details
+
+
+def _legacy_why_for_finding(finding: Finding) -> str | None:
+    if finding.rule_code not in {"DANGEROUS_CALL", "DANGEROUS_GLOBAL"}:
+        return finding.why
+
+    import_reference = finding.details.get("import_reference")
+    if isinstance(import_reference, str):
+        why = get_import_explanation(import_reference)
+        if why is not None:
+            return why
+
+    module = finding.details.get("module")
+    name = finding.details.get("name")
+    if isinstance(module, str):
+        if isinstance(name, str):
+            why = get_import_explanation(f"{module}.{name}")
+            if why is not None:
+                return why
+        why = get_import_explanation(module)
+        if why is not None:
+            return why
+    return finding.why

@@ -6,7 +6,7 @@ This file documents project roles and default ownership expectations.
 
 ### Maintainer
 
-- Owns security posture, release quality, and roadmap decisions.
+- Owns security posture, release quality, and project direction.
 - Reviews and merges pull requests.
 - Handles security escalations and incident communication.
 

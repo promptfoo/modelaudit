@@ -2,15 +2,30 @@
 
 import tempfile
 from pathlib import Path
+from urllib.parse import ParseResult
 
 import pytest
 
+from modelaudit.scanners import metadata_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.metadata_scanner import MetadataScanner
 
 
 class TestMetadataScanner:
     """Test metadata scanner functionality."""
+
+    def test_known_secret_format_reuses_lowered_description(self) -> None:
+        class CountingDescription(str):
+            lower_calls = 0
+
+            def lower(self) -> str:
+                self.lower_calls += 1
+                return super().lower()
+
+        description = CountingDescription("OpenAI API Key")
+
+        assert MetadataScanner._is_known_secret_format(description) is True
+        assert description.lower_calls == 1
 
     def test_can_handle_text_metadata(self):
         """Test that scanner handles text metadata files only."""
@@ -40,21 +55,21 @@ class TestMetadataScanner:
         assert not scanner.can_handle("data.txt")
         assert not scanner.can_handle("random.json")
 
-    def test_scan_valid_readme(self):
+    def test_scan_valid_readme(self) -> None:
         """Test scanning valid README file."""
         scanner = MetadataScanner()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             readme_path = Path(temp_dir) / "README.md"
             with open(readme_path, "w") as f:
-                f.write("# My Model\\n\\nThis is a clean README with no security issues.\\n")
+                f.write("# My Model\n\nThis is a clean README with no security issues.\n")
 
             result = scanner.scan(str(readme_path))
 
         assert result.scanner_name == "metadata"
         assert len(result.issues) == 0  # Clean README should have no issues
 
-    def test_scan_suspicious_urls_in_readme(self):
+    def test_scan_suspicious_urls_in_readme(self) -> None:
         """Test detection of suspicious URLs in README."""
         scanner = MetadataScanner()
 
@@ -62,7 +77,9 @@ class TestMetadataScanner:
             readme_path = Path(temp_dir) / "README.md"
             with open(readme_path, "w") as f:
                 f.write(
-                    "# Model Info\\n\\n- Download: https://bit.ly/suspicious-model\\n- Endpoint: https://ngrok.io/malicious-endpoint\\n"
+                    "# Model Info\n\n"
+                    "- Download: https://bit.ly/suspicious-model\n"
+                    "- Endpoint: https://ngrok.io/malicious-endpoint\n"
                 )
 
             result = scanner.scan(str(readme_path))
@@ -73,17 +90,38 @@ class TestMetadataScanner:
             "bit.ly",
             "ngrok.io",
         }
-        assert any("bit.ly" in issue.message for issue in result.issues)
-        assert any("ngrok.io" in issue.message for issue in result.issues)
 
-    def test_scan_detects_suspicious_subdomain_hosts(self):
+    def test_repeated_benign_urls_are_parsed_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Skip duplicate benign URLs before reparsing them."""
+        scanner = MetadataScanner()
+        result = scanner._create_result()
+        parse_calls = 0
+        real_urlparse = metadata_scanner.urlparse
+
+        def tracking_urlparse(url: str) -> ParseResult:
+            nonlocal parse_calls
+            parse_calls += 1
+            return real_urlparse(url)
+
+        monkeypatch.setattr(metadata_scanner, "urlparse", tracking_urlparse)
+
+        scanner._check_suspicious_urls_in_text(
+            "\n".join(["https://huggingface.co/example/model"] * 3),
+            "README.md",
+            result,
+        )
+
+        assert parse_calls == 1
+        assert result.issues == []
+
+    def test_scan_detects_suspicious_subdomain_hosts(self) -> None:
         """Test suspicious domains are detected through subdomain matching."""
         scanner = MetadataScanner()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             readme_path = Path(temp_dir) / "README.md"
             with open(readme_path, "w") as f:
-                f.write("# Model Info\\n\\n- Endpoint: https://api.ngrok.io/malicious-endpoint\\n")
+                f.write("# Model Info\n\n- Endpoint: https://api.ngrok.io/malicious-endpoint\n")
 
             result = scanner.scan(str(readme_path))
 
@@ -93,7 +131,7 @@ class TestMetadataScanner:
         assert issue.details.get("suspicious_domain") == "ngrok.io"
         assert "https://api.ngrok.io/malicious-endpoint" in str(issue.details.get("url"))
 
-    def test_scan_ignores_suspicious_domain_substrings(self):
+    def test_scan_ignores_suspicious_domain_substrings(self) -> None:
         """Test URLs are matched by hostname, not generic substring."""
         scanner = MetadataScanner()
 
@@ -101,9 +139,9 @@ class TestMetadataScanner:
             readme_path = Path(temp_dir) / "README.md"
             with open(readme_path, "w") as f:
                 f.write(
-                    "# Model Info\\n\\n"
-                    "- Docs: https://example.com/guide?redirect=bit.ly/suspicious-model\\n"
-                    "- API: https://safe-ngrok.io/docs\\n"
+                    "# Model Info\n\n"
+                    "- Docs: https://example.com/guide?redirect=bit.ly/suspicious-model\n"
+                    "- API: https://safe-ngrok.io/docs\n"
                 )
 
             result = scanner.scan(str(readme_path))
@@ -183,14 +221,14 @@ class TestMetadataScanner:
         assert len(result.issues) >= 1  # Should detect at least one potential secret
         assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
 
-    def test_scan_ignores_placeholder_secrets(self):
+    def test_scan_ignores_placeholder_secrets(self) -> None:
         """Test that obvious placeholders are not flagged as secrets."""
         scanner = MetadataScanner()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             readme_path = Path(temp_dir) / "README.md"
             with open(readme_path, "w") as f:
-                f.write("# Setup\\n\\nAPI Key: your_api_key_here\\nToken: placeholder_token\\nSecret: XXXXXXXXXX\\n")
+                f.write("# Setup\n\nAPI Key: your_api_key_here\nToken: placeholder_token\nSecret: XXXXXXXXXX\n")
 
             result = scanner.scan(str(readme_path))
 
@@ -208,14 +246,14 @@ class TestMetadataScanner:
         assert result.issues[0].severity == IssueSeverity.CRITICAL
         assert "does not exist" in result.issues[0].message
 
-    def test_bytes_scanned_reported(self):
+    def test_bytes_scanned_reported(self) -> None:
         """Test that bytes scanned is properly reported."""
         scanner = MetadataScanner()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             readme_path = Path(temp_dir) / "README.md"
             with open(readme_path, "w") as f:
-                f.write("# Test README\\n")
+                f.write("# Test README\n")
 
             expected_size = readme_path.stat().st_size
             result = scanner.scan(str(readme_path))

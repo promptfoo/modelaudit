@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "modelaudit/**"
+      - "packages/modelaudit-picklescan/**"
       - "tests/benchmarks/**"
       - "tests/helpers/**"
       - "tests/conftest.py"
@@ -17,6 +18,7 @@ on:
       - main
     paths:
       - "modelaudit/**"
+      - "packages/modelaudit-picklescan/**"
       - "tests/benchmarks/**"
       - "tests/helpers/**"
       - "tests/conftest.py"
@@ -42,18 +44,27 @@ jobs:
     timeout-minutes: 25
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
         with:
           enable-cache: true
 
       - name: Pin Python version
         run: |
           uv python pin 3.11
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Run standalone picklescan Rust tests
+        run: |
+          cargo test --manifest-path packages/modelaudit-picklescan/Cargo.toml
 
       - name: Prepare benchmark temp directories
         id: paths
@@ -78,16 +89,24 @@ jobs:
             echo "Base branch does not include the benchmark suite yet; skipping baseline run."
             exit 0
           fi
+          benchmark_tests=(tests/benchmarks/test_scan_benchmarks.py)
+          if [ -f "$BENCHMARK_BASE_WORKTREE/tests/benchmarks/test_picklescan_benchmarks.py" ]; then
+            benchmark_tests+=(tests/benchmarks/test_picklescan_benchmarks.py)
+          fi
           uv run --directory "$BENCHMARK_BASE_WORKTREE" --python 3.11 --locked --with pytest-benchmark pytest \
-            tests/benchmarks/test_scan_benchmarks.py \
+            "${benchmark_tests[@]}" \
             --benchmark-json="$BENCHMARK_ARTIFACT_DIR/benchmark-base.json" \
             -q
 
       - name: Benchmark current commit
         run: |
           # Keep this lane single-process; pytest-benchmark disables itself under xdist.
+          benchmark_tests=(tests/benchmarks/test_scan_benchmarks.py)
+          if [ -f tests/benchmarks/test_picklescan_benchmarks.py ]; then
+            benchmark_tests+=(tests/benchmarks/test_picklescan_benchmarks.py)
+          fi
           uv run --locked --with pytest-benchmark pytest \
-            tests/benchmarks/test_scan_benchmarks.py \
+            "${benchmark_tests[@]}" \
             --benchmark-json="$BENCHMARK_ARTIFACT_DIR/benchmark-head.json" \
             -q
 
@@ -139,7 +158,7 @@ jobs:
           always() &&
           github.event_name == 'pull_request' &&
           github.event.pull_request.head.repo.full_name == github.repository
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
           COMMENT_BODY_PATH: ${{ steps.paths.outputs.artifact_dir }}/benchmark-comment.md
         with:
@@ -183,7 +202,7 @@ jobs:
 
       - name: Upload benchmark artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: benchmark-results-python-3.11
           path: ${{ steps.paths.outputs.artifact_dir }}

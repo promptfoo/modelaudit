@@ -224,6 +224,16 @@ DANGEROUS_OPCODES = {
         "The BUILD opcode updates object state and can trigger code execution through __setstate__ or __setattr__ "
         "methods."
     ),
+    "PERSID": (
+        "The PERSID opcode resolves an object through the unpickler's persistent_load callback. Model framework "
+        "loaders can use this callback for external storage resolution, so untrusted persistent IDs should be "
+        "reviewed instead of treated as ordinary scalar data."
+    ),
+    "BINPERSID": (
+        "The BINPERSID opcode resolves an object through the unpickler's persistent_load callback using a stack "
+        "operand as the persistent ID. Model framework loaders can use this callback for external storage "
+        "resolution, so untrusted persistent IDs should be reviewed instead of treated as ordinary scalar data."
+    ),
     "STACK_GLOBAL": (
         "The STACK_GLOBAL opcode imports modules and retrieves attributes dynamically. Outside ML contexts, this "
         "often indicates attempts to access dangerous functionality."

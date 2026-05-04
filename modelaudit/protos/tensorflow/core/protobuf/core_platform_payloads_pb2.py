@@ -7,7 +7,6 @@
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import runtime_version as _runtime_version
-from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
 _runtime_version.ValidateProtobufRuntimeVersion(
     _runtime_version.Domain.PUBLIC,
@@ -18,12 +17,6 @@ _runtime_version.ValidateProtobufRuntimeVersion(
     'tensorflow/core/protobuf/core_platform_payloads.proto'
 )
 # @@protoc_insertion_point(imports)
-
-_sym_db = _symbol_database.Default()
-
-
-
-
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n5tensorflow/core/protobuf/core_platform_payloads.proto\x12\x18tensorflow.core.platform\"\xec\x01\n\x10\x45rrorSourceProto\x12L\n\x0c\x65rror_source\x18\x01 \x01(\x0e\x32\x36.tensorflow.core.platform.ErrorSourceProto.ErrorSource\"\x89\x01\n\x0b\x45rrorSource\x12\x0b\n\x07UNKNOWN\x10\x00\x12\x12\n\x0eTPU_COMPILE_OP\x10\x01\x12\x11\n\rTF_XLA_BRIDGE\x10\x02\x12\x17\n\x13MLIR_BRIDGE_PHASE_1\x10\x03\x12\x17\n\x13MLIR_BRIDGE_PHASE_2\x10\x04\x12\x14\n\x10\x45\x41GER_REMOTE_MGR\x10\x05\x42ZZUgithub.com/tensorflow/tensorflow/tensorflow/go/core/protobuf/for_core_protos_go_proto\xf8\x01\x01\x62\x06proto3')
 
 _globals = globals()

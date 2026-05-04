@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from modelaudit_picklescan import (
     CoverageSummary,
     Finding,
@@ -25,20 +26,41 @@ from modelaudit.scanners.pytorch_zip_scanner import PyTorchZipScanner
 from tests.helpers import create_mock_pytorch_zip
 
 
-def test_scan_options_from_config_parses_string_values_and_falls_back_for_bad_values() -> None:
-    defaults = ScanOptions()
+def _benign_tail_import_references() -> list[dict[str, object]]:
+    return [
+        {
+            "import_reference": "numpy.core.multiarray.scalar",
+            "module": "numpy.core.multiarray",
+            "name": "scalar",
+            "opcode": "GLOBAL",
+            "position": 3,
+            "is_dangerous": False,
+        },
+    ]
 
+
+def test_scan_options_from_config_parses_string_values() -> None:
     parsed = scan_options_from_config(
         {
             "timeout": "2.5",
             "max_opcodes": "4096",
-            "post_budget_global_scan_limit_bytes": "not-an-int",
+            "post_budget_global_scan_limit_bytes": "8192",
         }
     )
 
     assert parsed.timeout_s == 2.5
     assert parsed.max_opcodes == 4096
-    assert parsed.post_budget_scan_bytes == defaults.post_budget_scan_bytes
+    assert parsed.post_budget_scan_bytes == 8192
+
+
+def test_scan_options_from_config_accepts_legacy_expansion_limit_key() -> None:
+    parsed = scan_options_from_config({"post_budget_expansion_scan_limit_bytes": "4096"})
+
+    assert parsed.post_budget_scan_bytes == 4096
+
+
+def test_scan_options_from_config_falls_back_for_bad_values() -> None:
+    defaults = ScanOptions()
 
     fallback = scan_options_from_config(
         {
@@ -114,6 +136,159 @@ def test_pickle_report_to_scan_result_preserves_security_findings() -> None:
     assert result.issues[0].details["pickle_source"] == "payload.pkl"
 
 
+def test_pickle_report_to_scan_result_preserves_legacy_import_rule_for_global_opcode() -> None:
+    report = PickleReport(
+        source="payload.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="Found dangerous global reference: posix.system",
+                severity=Severity.CRITICAL,
+                location="payload.pkl (pos 12)",
+                rule_code="DANGEROUS_GLOBAL",
+                details={"opcode": "GLOBAL", "module": "posix", "name": "system"},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert {issue.rule_code for issue in result.issues} >= {"S101", "S206"}
+
+
+def test_pickle_report_to_scan_result_preserves_reduce_associated_global_alias() -> None:
+    report = PickleReport(
+        source="runpy.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="Found REDUCE opcode invoking dangerous global: runpy.run_module",
+                severity=Severity.CRITICAL,
+                location="runpy.pkl (pos 45)",
+                rule_code="DANGEROUS_CALL",
+                details={
+                    "opcode": "REDUCE",
+                    "module": "runpy",
+                    "name": "run_module",
+                    "import_reference": "runpy.run_module",
+                    "global_position": 2,
+                },
+            ),
+        ),
+        coverage=CoverageSummary(bytes_scanned=48, bytes_total=48, opcode_count=9),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert len(result.issues) == 1
+    assert result.issues[0].rule_code == "S201"
+    assert result.issues[0].details["function"] == "run_module"
+    assert result.issues[0].details["associated_global"] == "runpy.run_module"
+    assert result.issues[0].details["import_reference"] == "runpy.run_module"
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_primary_rule"),
+    [
+        ("eval", "S104"),
+        ("exec", "S104"),
+        ("compile", "S105"),
+        ("__import__", "S106"),
+    ],
+)
+def test_pickle_report_to_scan_result_preserves_legacy_builtin_call_rule_alias(
+    name: str,
+    expected_primary_rule: str,
+) -> None:
+    report = PickleReport(
+        source=f"{name}.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message=f"Found REDUCE opcode invoking dangerous global: builtins.{name}",
+                severity=Severity.CRITICAL,
+                location="eval.pkl (pos 12)",
+                rule_code="DANGEROUS_CALL",
+                details={"opcode": "REDUCE", "module": "builtins", "name": name},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert [issue.rule_code for issue in result.issues] == [expected_primary_rule, "S201"]
+    assert all(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert all(issue.details["legacy_rule_aliases"] == ["S115"] for issue in result.issues)
+    assert result.issues[0].details.get("supporting_rule_code") is None
+    assert result.issues[1].details["supporting_rule_code"] is True
+    assert result.issues[1].details["primary_rule_code"] == expected_primary_rule
+
+
+def test_pickle_report_to_scan_result_preserves_warning_dangerous_calls() -> None:
+    report = PickleReport(
+        source="partial.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(
+            Finding(
+                message="Found REDUCE opcode invoking dangerous global: functools.partial",
+                severity=Severity.WARNING,
+                location="partial.pkl (pos 34)",
+                rule_code="DANGEROUS_CALL",
+                details={
+                    "opcode": "REDUCE",
+                    "module": "functools",
+                    "name": "partial",
+                    "import_reference": "functools.partial",
+                    "global_position": 0,
+                },
+            ),
+        ),
+        coverage=CoverageSummary(bytes_scanned=37, bytes_total=37, opcode_count=5),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == IssueSeverity.WARNING
+    assert result.issues[0].rule_code == "S201"
+    assert result.issues[0].details["pickle_rule_code"] == "DANGEROUS_CALL"
+    assert result.issues[0].details["associated_global"] == "functools.partial"
+
+
+def test_pickle_report_to_scan_result_derives_legacy_import_explanation() -> None:
+    report = PickleReport(
+        source="system.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="Found REDUCE opcode invoking dangerous global: posix.system",
+                severity=Severity.CRITICAL,
+                location="system.pkl (pos 45)",
+                rule_code="DANGEROUS_CALL",
+                details={
+                    "opcode": "REDUCE",
+                    "module": "posix",
+                    "name": "system",
+                    "import_reference": "posix.system",
+                    "global_position": 2,
+                },
+            ),
+        ),
+        coverage=CoverageSummary(bytes_scanned=48, bytes_total=48, opcode_count=9),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert len(result.issues) == 1
+    assert result.issues[0].why is not None
+    assert "system" in result.issues[0].why.lower()
+
+
 def test_pickle_report_to_scan_result_maps_post_budget_rule_codes_to_legacy_namespace() -> None:
     report = PickleReport(
         source="budget.pkl",
@@ -136,6 +311,88 @@ def test_pickle_report_to_scan_result_maps_post_budget_rule_codes_to_legacy_name
     assert len(result.issues) == 1
     assert result.issues[0].rule_code == "S101"
     assert result.issues[0].details["pickle_rule_code"] == "POST_BUDGET_GLOBAL"
+
+
+def test_pickle_report_to_scan_result_falls_back_for_unmapped_persistent_id_opcode() -> None:
+    report = PickleReport(
+        source="persistent-id.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(
+            Finding(
+                message="Found custom opcode using a persistent_load callback",
+                severity=Severity.WARNING,
+                location="persistent-id.pkl (pos 4)",
+                rule_code="PERSISTENT_ID",
+                details={"opcode": "CUSTOM_PERSISTENT_OPCODE"},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is True
+    assert len(result.issues) == 1
+    assert result.issues[0].rule_code == "S212"
+    assert result.issues[0].details["pickle_rule_code"] == "PERSISTENT_ID"
+
+
+@pytest.mark.parametrize(
+    ("pickle_rule_code", "details", "expected_legacy_rule_code"),
+    [
+        ("S203", {}, "S203"),
+        ("MALFORMED_STACK_GLOBAL", {}, "S205"),
+        ("EXTENSION_REF", {"opcode": "EXT1"}, "S211"),
+        ("EXTENSION_REF", {}, "S211"),
+        ("PERSISTENT_ID", {"opcode": "BINPERSID"}, "S212"),
+        ("PERSISTENT_ID", {"opcode": "CUSTOM_PERSISTENT_OPCODE"}, "S212"),
+        ("DANGEROUS_CALL", {"opcode": "REDUCE"}, "S201"),
+        ("DANGEROUS_CALL", {"module": "sys", "name": "exit"}, "S102"),
+        ("DANGEROUS_CALL", {"module": "builtins", "name": "exec"}, "S104"),
+        ("DANGEROUS_CALL", {"module": "custom", "name": "loader"}, "S201"),
+        ("DANGEROUS_GLOBAL", {"opcode": "GLOBAL"}, "S206"),
+        ("DANGEROUS_GLOBAL", {"module": "posix", "name": "system"}, "S101"),
+        ("DANGEROUS_GLOBAL", {"module": "custom", "name": "loader"}, "S206"),
+        ("SUSPICIOUS_STRING", {"pattern": "eval(user_input)"}, "S104"),
+        ("SUSPICIOUS_STRING", {"pattern": "os.system(payload)"}, "S101"),
+        ("SUSPICIOUS_STRING", {"pattern": "subprocess.Popen(payload)"}, "S103"),
+        ("SUSPICIOUS_STRING", {"pattern": "__import__('os')"}, "S106"),
+        ("SUSPICIOUS_STRING", {"pattern": "compile(source, path, mode)"}, "S105"),
+        ("SUSPICIOUS_STRING", {"pattern": "base64 encoded string literal"}, "S601"),
+        ("SUSPICIOUS_STRING", {"pattern": "ordinary string literal"}, None),
+        ("POST_BUDGET_GLOBAL", {"pattern": "posix\nsystem"}, "S101"),
+        ("POST_BUDGET_GLOBAL", {"pattern": "custom\nloader"}, "S206"),
+        ("PICKLE_EXPANSION", {}, "S214"),
+        ("UNKNOWN_PICKLE_RULE", {}, "UNKNOWN_PICKLE_RULE"),
+    ],
+)
+def test_pickle_report_to_scan_result_maps_pickle_rule_codes_to_legacy_namespace(
+    pickle_rule_code: str,
+    details: dict[str, str],
+    expected_legacy_rule_code: str | None,
+) -> None:
+    """Verify standalone pickle findings preserve legacy rule-code mappings."""
+    report = PickleReport(
+        source="mapped.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.SUSPICIOUS,
+        findings=(
+            Finding(
+                message="Mapped pickle finding",
+                severity=Severity.WARNING,
+                location="mapped.pkl (pos 1)",
+                rule_code=pickle_rule_code,
+                details=details,
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is True
+    assert len(result.issues) == 1
+    assert result.issues[0].rule_code == expected_legacy_rule_code
+    assert result.issues[0].details["pickle_rule_code"] == pickle_rule_code
 
 
 def test_pickle_report_to_scan_result_emits_passed_import_checks() -> None:
@@ -354,6 +611,54 @@ def test_pickle_report_to_scan_result_fails_closed_for_encoded_nested_truncation
     assert notice_check.message == "Encoded pickle payload exceeds configured deep-scan byte limit"
 
 
+def test_pickle_report_to_scan_result_preserves_critical_s601_for_encoded_nested_payload_missing_encoding() -> None:
+    report = PickleReport(
+        source="encoded.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="Encoded pickle payload detected in string literal",
+                severity=Severity.CRITICAL,
+                location="encoded.pkl (pos 16)",
+                rule_code="S601",
+                details={},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is True
+    assert len(result.issues) == 1
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].rule_code == "S601"
+
+
+def test_pickle_report_to_scan_result_preserves_nested_payload_finding_severity() -> None:
+    report = PickleReport(
+        source="nested-benign.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="Nested pickle payload detected",
+                severity=Severity.CRITICAL,
+                location="nested-benign.pkl (pos 16)",
+                rule_code="S213",
+                details={"encoding": "raw", "nested_has_execution_opcode": False},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is True
+    assert result.issues[0].severity == IssueSeverity.CRITICAL
+    assert result.issues[0].rule_code == "S213"
+    assert result.issues[0].details["pickle_rule_code"] == "S213"
+
+
 def test_pickle_report_to_scan_result_fails_closed_for_raw_nested_truncation_notice() -> None:
     report = PickleReport(
         source="oversized-raw.pkl",
@@ -395,6 +700,55 @@ def test_pickle_report_to_scan_result_fails_closed_for_raw_nested_truncation_not
         and check.details["pickle_notice_code"] == "nested_payload_truncated"
     )
     assert notice_check.message == "Nested pickle payload exceeds configured deep-scan byte limit"
+
+
+def test_pickle_report_to_scan_result_fails_closed_for_nested_probe_limit_notice() -> None:
+    report = PickleReport(
+        source="probe-limit.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.MALICIOUS,
+        findings=(
+            Finding(
+                message="Nested pickle probe candidate limit exceeded",
+                severity=Severity.CRITICAL,
+                location="probe-limit.pkl (pos 16)",
+                rule_code="S213",
+                details={"analysis_incomplete": True, "max_nested_payload_probes": 64},
+            ),
+        ),
+        notices=(
+            Notice(
+                message="Nested pickle probe candidate limit exceeded",
+                severity=Severity.INFO,
+                location="probe-limit.pkl (pos 16)",
+                code="nested_probe_limit",
+                details={"analysis_incomplete": True, "max_nested_payload_probes": 64},
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["nested_probe_limit"]
+    assert result.metadata["analysis_incomplete"] is True
+    finding_issue = next(
+        issue
+        for issue in result.issues
+        if issue.message == "Nested pickle probe candidate limit exceeded" and issue.rule_code == "S213"
+    )
+    assert finding_issue.severity == IssueSeverity.CRITICAL
+    assert finding_issue.details["analysis_incomplete"] is True
+    notice_check = next(
+        check
+        for check in result.checks
+        if check.name == "Standalone Pickle Notice"
+        and check.status.value == "failed"
+        and check.rule_code == "S902"
+        and check.details["pickle_notice_code"] == "nested_probe_limit"
+    )
+    assert notice_check.message == "Nested pickle probe candidate limit exceeded"
 
 
 def test_pickle_report_to_scan_result_fails_closed_for_nested_incomplete_notice() -> None:
@@ -459,13 +813,13 @@ def test_pickle_report_to_scan_result_keeps_parse_incomplete_notices_inconclusiv
     parse_issue = next(
         issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
     )
-    assert parse_issue.severity == IssueSeverity.INFO
+    assert parse_issue.severity == IssueSeverity.WARNING
+    assert parse_issue.rule_code == "S901"
     assert parse_issue.location == "truncated.pkl (pos 4)"
     assert parse_issue.details["category"] == "parse_error"
     assert parse_issue.details["parse_error"] == "pickle exhausted before seeing STOP"
     assert parse_issue.details["failure_reason"] == "unknown_opcode_or_format_error"
     assert parse_issue.details["analysis_incomplete"] is True
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_pickle_report_to_scan_result_keeps_truncated_bin_parse_failure_inconclusive() -> None:
@@ -495,13 +849,13 @@ def test_pickle_report_to_scan_result_keeps_truncated_bin_parse_failure_inconclu
     parse_issue = next(
         issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
     )
-    assert parse_issue.severity == IssueSeverity.INFO
+    assert parse_issue.severity == IssueSeverity.WARNING
+    assert parse_issue.rule_code == "S901"
     assert parse_issue.location == "truncated.bin (pos 57)"
     assert parse_issue.details["category"] == "parse_error"
     assert parse_issue.details["parse_error"] == "pickle exhausted before seeing STOP"
     assert parse_issue.details["failure_reason"] == "unknown_opcode_or_format_error"
     assert parse_issue.details["analysis_incomplete"] is True
-    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_pickle_report_to_scan_result_keeps_trusted_bin_padding_tails_as_inconclusive_notices() -> None:
@@ -522,7 +876,7 @@ def test_pickle_report_to_scan_result_keeps_trusted_bin_padding_tails_as_inconcl
                 },
             ),
         ),
-        metadata={"first_pickle_end_pos": 56},
+        metadata={"first_pickle_end_pos": 56, "import_references": _benign_tail_import_references()},
     )
 
     result = pickle_report_to_scan_result(report)
@@ -556,7 +910,7 @@ def test_pickle_report_to_scan_result_keeps_unicode_decode_tails_as_inconclusive
                 },
             ),
         ),
-        metadata={"first_pickle_end_pos": 20},
+        metadata={"first_pickle_end_pos": 20, "import_references": _benign_tail_import_references()},
     )
 
     result = pickle_report_to_scan_result(report)
@@ -590,7 +944,7 @@ def test_pickle_report_to_scan_result_keeps_zero_padding_tails_as_inconclusive_n
                 },
             ),
         ),
-        metadata={"first_pickle_end_pos": 19},
+        metadata={"first_pickle_end_pos": 19, "import_references": _benign_tail_import_references()},
     )
 
     result = pickle_report_to_scan_result(report)
@@ -604,6 +958,187 @@ def test_pickle_report_to_scan_result_keeps_zero_padding_tails_as_inconclusive_n
         and issue.message == "Pickle parsing stopped before the stream was fully consumed: ValueError"
         for issue in result.issues
     )
+
+
+@pytest.mark.parametrize(
+    ("source", "exception_type", "exception_message"),
+    [
+        ("dangerous-unicode-tail.pkl", "UnicodeDecodeError", "'utf-8' codec can't decode byte 0xff in position 0"),
+        ("dangerous-padding-tail.pkl", "ValueError", "at position 4096, opcode b'\\x00' unknown"),
+    ],
+)
+def test_pickle_report_to_scan_result_requires_no_dangerous_imports_for_tail_suppression(
+    source: str,
+    exception_type: str,
+    exception_message: str,
+) -> None:
+    report = PickleReport(
+        source=source,
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message=f"Pickle parsing stopped before the stream was fully consumed: {exception_type}",
+                severity=Severity.INFO,
+                location=f"{source} (pos 20)",
+                code="parse_incomplete",
+                details={
+                    "exception": exception_message,
+                    "exception_type": exception_type,
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+        metadata={
+            "first_pickle_end_pos": 19,
+            "import_references": [
+                {
+                    "import_reference": "posix.system",
+                    "module": "posix",
+                    "name": "system",
+                    "opcode": "GLOBAL",
+                    "position": 3,
+                    "is_dangerous": True,
+                },
+            ],
+        },
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert "trusted_incomplete_tail" not in result.metadata
+    parse_issue = next(
+        issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
+    )
+    assert parse_issue.severity == IssueSeverity.WARNING
+    assert parse_issue.rule_code == "S901"
+    assert parse_issue.details["analysis_incomplete"] is True
+
+
+@pytest.mark.parametrize(
+    ("source", "exception_type", "exception_message"),
+    [
+        ("empty-evidence-unicode-tail.pkl", "UnicodeDecodeError", "'utf-8' codec can't decode byte 0xff in position 0"),
+        ("empty-evidence-padding-tail.pkl", "ValueError", "at position 4096, opcode b'\\x00' unknown"),
+    ],
+)
+def test_pickle_report_to_scan_result_requires_import_metadata_for_tail_suppression(
+    source: str,
+    exception_type: str,
+    exception_message: str,
+) -> None:
+    report = PickleReport(
+        source=source,
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message=f"Pickle parsing stopped before the stream was fully consumed: {exception_type}",
+                severity=Severity.INFO,
+                location=f"{source} (pos 20)",
+                code="parse_incomplete",
+                details={
+                    "exception": exception_message,
+                    "exception_type": exception_type,
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+        metadata={"first_pickle_end_pos": 19},
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert "trusted_incomplete_tail" not in result.metadata
+    parse_issue = next(
+        issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
+    )
+    assert parse_issue.severity == IssueSeverity.WARNING
+    assert parse_issue.rule_code == "S901"
+    assert parse_issue.details["analysis_incomplete"] is True
+
+
+@pytest.mark.parametrize(
+    ("source", "exception_type", "exception_message"),
+    [
+        ("empty-imports-unicode-tail.pkl", "UnicodeDecodeError", "'utf-8' codec can't decode byte 0xff in position 0"),
+        ("empty-imports-padding-tail.pkl", "ValueError", "at position 4096, opcode b'\\x00' unknown"),
+    ],
+)
+def test_pickle_report_to_scan_result_suppresses_trusted_tails_with_empty_imports(
+    source: str,
+    exception_type: str,
+    exception_message: str,
+) -> None:
+    report = PickleReport(
+        source=source,
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message=f"Pickle parsing stopped before the stream was fully consumed: {exception_type}",
+                severity=Severity.INFO,
+                location=f"{source} (pos 20)",
+                code="parse_incomplete",
+                details={
+                    "exception": exception_message,
+                    "exception_type": exception_type,
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+        metadata={"first_pickle_end_pos": 19, "import_references": []},
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["trusted_incomplete_tail"] is True
+    assert not any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
+    assert any(
+        issue.severity == IssueSeverity.INFO
+        and issue.rule_code == "S902"
+        and issue.message == f"Pickle parsing stopped before the stream was fully consumed: {exception_type}"
+        for issue in result.issues
+    )
+
+
+def test_pickle_report_to_scan_result_fails_closed_for_raw_pickle_unknown_opcode_tail() -> None:
+    report = PickleReport(
+        source="unknown-tail.pkl",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
+                severity=Severity.INFO,
+                location="unknown-tail.pkl (pos 20)",
+                code="parse_incomplete",
+                details={
+                    "exception": "at position 20, opcode b'A' unknown",
+                    "exception_type": "ValueError",
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+        metadata={"first_pickle_end_pos": 19},
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert "trusted_incomplete_tail" not in result.metadata
+    parse_issue = next(
+        issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
+    )
+    assert parse_issue.severity == IssueSeverity.WARNING
+    assert parse_issue.rule_code == "S901"
+    assert parse_issue.details["category"] == "parse_error"
+    assert parse_issue.details["failure_reason"] == "unknown_opcode_or_format_error"
+    assert parse_issue.details["analysis_incomplete"] is True
 
 
 def test_pickle_report_to_scan_result_keeps_joblib_unknown_opcode_tails_as_inconclusive_notices() -> None:
@@ -715,7 +1250,7 @@ def test_pickle_report_to_scan_result_ignores_decompressed_wrapper_suffix_for_jo
     )
 
 
-def test_pickle_report_to_scan_result_requires_boundary_for_tail_suppression() -> None:
+def test_pickle_report_to_scan_result_requires_boundary_for_joblib_serialization_tail() -> None:
     report = PickleReport(
         source="numpy_arrays.joblib",
         status=ScanStatus.INCONCLUSIVE,
@@ -749,13 +1284,81 @@ def test_pickle_report_to_scan_result_requires_boundary_for_tail_suppression() -
 
     result = pickle_report_to_scan_result(report)
 
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
+    assert "trusted_incomplete_tail" not in result.metadata
+    assert any(issue.message == "Pickle parsing failed before full scan completion" for issue in result.issues)
+
+
+def test_pickle_report_to_scan_result_requires_boundary_for_non_joblib_tail_suppression() -> None:
+    report = PickleReport(
+        source="numpy_arrays.dill",
+        status=ScanStatus.INCONCLUSIVE,
+        verdict=SafetyVerdict.UNKNOWN,
+        notices=(
+            Notice(
+                message="Pickle parsing stopped before the stream was fully consumed: ValueError",
+                severity=Severity.INFO,
+                location="numpy_arrays.dill (pos 231)",
+                code="parse_incomplete",
+                details={
+                    "exception": "at position 230, opcode b'\\t' unknown",
+                    "exception_type": "ValueError",
+                    "analysis_incomplete": True,
+                },
+            ),
+        ),
+        metadata={
+            "import_references": [
+                {
+                    "import_reference": "joblib.numpy_pickle.NumpyArrayWrapper",
+                    "module": "joblib.numpy_pickle",
+                    "name": "NumpyArrayWrapper",
+                    "opcode": "STACK_GLOBAL",
+                    "position": 66,
+                    "is_dangerous": False,
+                },
+            ],
+        },
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["analysis_incomplete"] is True
     assert "trusted_incomplete_tail" not in result.metadata
     parse_issue = next(
         issue for issue in result.issues if issue.message == "Pickle parsing failed before full scan completion"
     )
-    assert parse_issue.severity == IssueSeverity.INFO
+    assert parse_issue.severity == IssueSeverity.WARNING
+    assert parse_issue.rule_code == "S901"
     assert parse_issue.details["category"] == "parse_error"
     assert parse_issue.details["analysis_incomplete"] is True
+
+
+def test_pickle_report_to_scan_result_maps_empty_input_to_info_issue() -> None:
+    report = PickleReport(
+        source="empty.pkl",
+        status=ScanStatus.ERROR,
+        verdict=SafetyVerdict.UNKNOWN,
+        errors=(
+            ScanError(
+                message="Input is empty and does not contain a pickle stream",
+                category="empty_input",
+                location="empty.pkl",
+            ),
+        ),
+    )
+
+    result = pickle_report_to_scan_result(report)
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "empty_input"
+    assert result.has_errors is False
+    issue = next(issue for issue in result.issues if issue.details.get("category") == "empty_input")
+    assert issue.severity == IssueSeverity.INFO
 
 
 def test_pickle_report_to_scan_result_keeps_parse_errors_inconclusive() -> None:
@@ -775,16 +1378,20 @@ def test_pickle_report_to_scan_result_keeps_parse_errors_inconclusive() -> None:
 
     result = pickle_report_to_scan_result(report)
 
-    assert result.success is False
+    assert result.success is True
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata["scan_outcome_reasons"] == ["pickle_analysis_incomplete"]
     assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["parsing_failed"] is True
+    assert result.metadata["failure_reason"] == "unknown_opcode_or_format_error"
     assert "operational_error" not in result.metadata
     assert "operational_error_reason" not in result.metadata
     assert len(result.issues) == 1
-    assert result.issues[0].severity == IssueSeverity.INFO
+    assert result.issues[0].severity == IssueSeverity.WARNING
+    assert result.issues[0].rule_code == "S901"
     assert result.issues[0].details["category"] == "parse_error"
     assert result.issues[0].details["analysis_incomplete"] is True
+    assert result.issues[0].details["parsing_failed"] is True
 
 
 def test_pickle_report_to_scan_result_maps_non_parse_errors_to_operational_errors() -> None:

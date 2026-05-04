@@ -16,9 +16,10 @@ try:
 except ImportError:
     HAS_YAML = False
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.nemo_scanner import NemoScanner
+from modelaudit.scanners.nemo_scanner import NemoScanner, _get_nested_scanner_for_file
 
 
 def _create_nemo_file_from_bytes(
@@ -110,10 +111,8 @@ class TestNemoScannerBasic:
 
     def test_missing_yaml_dependency_is_reported_as_warning(self, tmp_path, monkeypatch):
         """Missing PyYAML should be a non-passing warning, not a pass."""
-        import modelaudit.scanners.nemo_scanner as nemo_scanner_mod
-
         path = _create_nemo_file(tmp_path, {"model": "test"})
-        monkeypatch.setattr(nemo_scanner_mod, "HAS_YAML", False)
+        monkeypatch.setattr("modelaudit.scanners.nemo_scanner.HAS_YAML", False)
         scanner = NemoScanner()
         result = scanner.scan(str(path))
 
@@ -121,6 +120,26 @@ class TestNemoScannerBasic:
         assert len(checks) == 1
         assert checks[0].status != CheckStatus.PASSED
         assert checks[0].severity == IssueSeverity.WARNING
+
+    def test_get_nested_scanner_for_file_delegates_to_registry(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured: dict[str, object] = {}
+        sentinel = object()
+
+        def fake_get_scanner_for_file(path: str, *, config: dict[str, Any]) -> object:
+            captured["path"] = path
+            captured["config"] = config
+            return sentinel
+
+        monkeypatch.setattr("modelaudit.scanners.get_scanner_for_file", fake_get_scanner_for_file)
+
+        config = {"max_nemo_checkpoint_scan_bytes": 1024}
+
+        assert _get_nested_scanner_for_file("/tmp/model_weights.ckpt", config=config) is sentinel
+        assert captured["path"] == "/tmp/model_weights.ckpt"
+        assert captured["config"] is config
 
 
 @pytest.mark.skipif(not HAS_YAML, reason="PyYAML not installed")
@@ -184,7 +203,7 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23360"]
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23250"]
 
-    def test_malicious_checkpoint_detects_ne_mo_deserialization_cve(self, tmp_path: Path) -> None:
+    def test_malicious_checkpoint_detects_nemo_deserialization_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-rce.nemo"
         with tarfile.open(nemo_path, "w") as tar:
             _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
@@ -201,7 +220,7 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert "CVE-2026-24157" in details["related_cves"]
         assert details["nested_scanner"] == "pickle"
 
-    def test_symlink_checkpoint_alias_detects_ne_mo_deserialization_cve(self, tmp_path: Path) -> None:
+    def test_symlink_checkpoint_alias_detects_nemo_deserialization_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-symlink-alias.nemo"
         with tarfile.open(nemo_path, "w") as tar:
             _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
@@ -251,11 +270,8 @@ class TestNemoArchiveVulnerabilityCoverage:
             def scan(self, _path: str) -> None:
                 raise RuntimeError("nested boom")
 
-        import modelaudit.scanners as scanner_registry
-
         monkeypatch.setattr(
-            scanner_registry,
-            "get_scanner_for_file",
+            "modelaudit.scanners.nemo_scanner._get_nested_scanner_for_file",
             lambda _path, config=None: RaisingScanner(),
         )
 
@@ -282,11 +298,8 @@ class TestNemoArchiveVulnerabilityCoverage:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        import modelaudit.scanners as scanner_registry
-
         monkeypatch.setattr(
-            scanner_registry,
-            "get_scanner_for_file",
+            "modelaudit.scanners.nemo_scanner._get_nested_scanner_for_file",
             lambda _path, config=None: None,
         )
 
@@ -307,7 +320,7 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert len(unsupported_checks) == 1
         assert unsupported_checks[0].details["entry"] == "model_weights.ckpt"
 
-    def test_benign_checkpoint_pickle_no_ne_mo_deserialization_cve(self, tmp_path: Path) -> None:
+    def test_benign_checkpoint_pickle_no_nemo_deserialization_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-safe.nemo"
         with tarfile.open(nemo_path, "w") as tar:
             _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
@@ -316,6 +329,167 @@ class TestNemoArchiveVulnerabilityCoverage:
         result = NemoScanner().scan(str(nemo_path))
 
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+
+    def test_metadata_referenced_misnamed_payload_detects_nemo_deserialization_cve(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "referenced-misnamed-payload.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "tokenizer": {"model": "nemo:artifacts/payload.jpg"},
+        }
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "artifacts/payload.jpg", _build_malicious_pickle())
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        cve_checks = [
+            check
+            for check in result.checks
+            if check.details.get("cve_id") == "CVE-2025-23249" and check.details.get("entry") == "artifacts/payload.jpg"
+        ]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["config_file"] == "model_config.yaml"
+        assert cve_checks[0].details["config_path"] == "tokenizer.model"
+        assert cve_checks[0].details["source_entry"] == "artifacts/payload.jpg"
+
+    def test_config_referenced_checkpoint_suffix_is_not_scanned_twice(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "referenced-checkpoint.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "checkpoint": "nemo:model_weights.ckpt",
+        }
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "model_weights.ckpt", _build_malicious_pickle())
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].details["entry"] == "model_weights.ckpt"
+        assert cve_checks[0].details["config_file"] == "model_config.yaml"
+        assert cve_checks[0].details["config_path"] == "checkpoint"
+
+    def test_large_config_referenced_member_fails_closed(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "referenced-large-artifact.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "tokenizer": {"model": "nemo:artifacts/tokenizer.model"},
+        }
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "artifacts/tokenizer.model", b"not scanned")
+
+        result = NemoScanner({"max_nemo_checkpoint_scan_bytes": 1}).scan(str(nemo_path))
+
+        skipped_checks = [
+            check
+            for check in result.checks
+            if check.details.get("scan_outcome_reason") == "nemo_checkpoint_scan_skipped_size_limit"
+        ]
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert len(skipped_checks) == 1
+        assert skipped_checks[0].details["entry"] == "artifacts/tokenizer.model"
+        assert skipped_checks[0].details["source_entry"] == "artifacts/tokenizer.model"
+        assert skipped_checks[0].details["config_file"] == "model_config.yaml"
+        assert skipped_checks[0].details["config_path"] == "tokenizer.model"
+        assert skipped_checks[0].details["max_scan_bytes"] == 1
+
+    def test_unextractable_config_referenced_member_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def fail_extract(
+            _tar: tarfile.TarFile,
+            _member: tarfile.TarInfo,
+            *,
+            suffix_source: str | None = None,
+        ) -> str | None:
+            return None
+
+        monkeypatch.setattr(NemoScanner, "_extract_member_to_tempfile", staticmethod(fail_extract))
+
+        nemo_path = tmp_path / "referenced-unextractable-artifact.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "tokenizer": {"model": "nemo:artifacts/tokenizer.model"},
+        }
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "artifacts/tokenizer.model", b"payload")
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        failed_checks = [
+            check
+            for check in result.checks
+            if check.details.get("scan_outcome_reason") == "nemo_checkpoint_extract_failed"
+        ]
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert len(failed_checks) == 1
+        assert failed_checks[0].details["entry"] == "artifacts/tokenizer.model"
+        assert failed_checks[0].details["source_entry"] == "artifacts/tokenizer.model"
+        assert failed_checks[0].details["config_file"] == "model_config.yaml"
+        assert failed_checks[0].details["config_path"] == "tokenizer.model"
+
+    def test_config_referenced_nested_scan_failure_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from modelaudit.scanners import archive_dispatch
+
+        def raise_nested_scan(_path: str, config: dict[str, Any] | None = None) -> Any:
+            _ = config
+            raise RuntimeError("referenced nested boom")
+
+        monkeypatch.setattr(archive_dispatch, "scan_nested_file", raise_nested_scan)
+
+        nemo_path = tmp_path / "referenced-nested-fails.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "tokenizer": {"model": "nemo:artifacts/tokenizer.model"},
+        }
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "artifacts/tokenizer.model", b"payload")
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        failed_checks = [
+            check
+            for check in result.checks
+            if check.details.get("scan_outcome_reason") == "nemo_referenced_nested_scan_failed"
+        ]
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert len(failed_checks) == 1
+        assert failed_checks[0].details["entry"] == "artifacts/tokenizer.model"
+        assert failed_checks[0].details["source_entry"] == "artifacts/tokenizer.model"
+        assert failed_checks[0].details["config_file"] == "model_config.yaml"
+        assert failed_checks[0].details["config_path"] == "tokenizer.model"
+        assert failed_checks[0].details["exception_type"] == "RuntimeError"
+        assert failed_checks[0].details["exception_message"] == "referenced nested boom"
+
+    def test_metadata_referenced_benign_non_checkpoint_suffix_stays_clean(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "referenced-benign-artifact.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "tokenizer": {"model": "nemo:artifacts/tokenizer.model"},
+        }
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "artifacts/tokenizer.model", b"plain tokenizer bytes")
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert result.success is True
+        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert "scan_outcome" not in result.metadata
 
     def test_nested_checkpoint_archive_traversal_not_labeled_deserialization_cve(self, tmp_path: Path) -> None:
         nested_checkpoint = io.BytesIO()
@@ -385,6 +559,126 @@ class TestCVE202523304HydraTarget:
         cve_checks = [c for c in result.checks if "CVE-2025-23304" in c.name]
         assert len(cve_checks) > 0, "Should detect subprocess.Popen"
         assert cve_checks[0].details.get("target") == "subprocess.Popen"
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "cloudpickle.load",
+            "cloudpickle.loads",
+            "dill.load",
+            "dill.loads",
+            "torch.load",
+            "torch.jit.load",
+            "torch.hub.load",
+            "torch.hub.load_state_dict_from_url",
+            "torch.package.PackageImporter",
+            "torch.package.PackageImporter.load_pickle",
+            "torch.serialization.load",
+            "torch.utils.model_zoo.load_url",
+            "joblib.load",
+            "sklearn.externals.joblib.load",
+            "keras.models.load_model",
+            "tensorflow.keras.models.load_model",
+            "tensorflow.saved_model.load",
+            "tf.keras.models.load_model",
+            "mlflow.pyfunc.load_model",
+            "pandas.read_pickle",
+        ],
+    )
+    def test_ml_deserialization_targets_detected_as_dangerous(self, tmp_path: Path, target: str) -> None:
+        """Hydra targets that deserialize model artifacts should not fall through to INFO review."""
+        config = {"model": {"_target_": target, "f": "weights.bin"}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        cve_checks = [c for c in result.checks if c.name == "CVE-2025-23304: Dangerous Hydra _target_"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["target"] == target
+
+    def test_numpy_load_without_pickle_is_safe_target(self, tmp_path: Path) -> None:
+        """Default numpy.load calls should not be treated as pickle deserialization."""
+        config = {"model": {"_target_": "numpy.load", "file": "weights.npy"}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert not [
+            check
+            for check in result.checks
+            if check.name == "CVE-2025-23304: Dangerous Hydra _target_" and check.details.get("target") == "numpy.load"
+        ]
+        assert any(
+            check.name == "Hydra _target_ Safety Check"
+            and check.status == CheckStatus.PASSED
+            and check.details.get("target") == "numpy.load"
+            for check in result.checks
+        )
+
+    @pytest.mark.parametrize(
+        "model_config",
+        [
+            {"_target_": "numpy.load", "file": "weights.npy", "allow_pickle": True},
+            {"_target_": "numpy.load", "_args_": ["weights.npy", None, True]},
+        ],
+        ids=["kwarg_allow_pickle", "positional_allow_pickle"],
+    )
+    def test_numpy_load_with_pickle_enabled_is_dangerous(
+        self,
+        tmp_path: Path,
+        model_config: dict[str, Any],
+    ) -> None:
+        """numpy.load becomes a pickle sink only when allow_pickle is enabled."""
+        path = _create_nemo_file(tmp_path, {"model": model_config})
+
+        result = NemoScanner().scan(str(path))
+
+        cve_checks = [
+            check
+            for check in result.checks
+            if check.name == "CVE-2025-23304: Dangerous Hydra _target_" and check.details.get("target") == "numpy.load"
+        ]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].status == CheckStatus.FAILED
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+
+    def test_skops_load_target_is_review_only(self, tmp_path: Path) -> None:
+        """skops.io.load should not be CVE-critical without vulnerable content context."""
+        config = {"model": {"_target_": "skops.io.load", "file": "model.skops"}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        assert not [
+            check
+            for check in result.checks
+            if check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.details.get("target") == "skops.io.load"
+        ]
+        review_checks = [
+            check
+            for check in result.checks
+            if check.name == "Hydra _target_ Review" and check.details.get("target") == "skops.io.load"
+        ]
+        assert len(review_checks) == 1
+        assert review_checks[0].severity == IssueSeverity.INFO
+
+    def test_torch_load_target_fails_aggregate_scan(self, tmp_path: Path) -> None:
+        """A NeMo config using torch.load should produce a security failure, not exit 0."""
+        config = {"model": {"_target_": "torch.load", "f": "payload.pt"}}
+        path = _create_nemo_file(tmp_path, config)
+
+        result = scan_model_directory_or_file(
+            str(path),
+            config={"cache_scan_results": False},
+        )
+
+        assert determine_exit_code(result) == 1
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL and "torch.load" in issue.message for issue in result.issues
+        )
 
     def test_top_level_list_target_detected(self, tmp_path: Path) -> None:
         """Top-level YAML lists must be traversed, not mistaken for absent config."""
@@ -553,6 +847,31 @@ class TestCVE202523304HydraTarget:
         assert len(size_checks) == 1
         assert size_checks[0].status == CheckStatus.FAILED
         assert size_checks[0].severity == IssueSeverity.WARNING
+        assert size_checks[0].message == (f"Config file too large: model_config.yaml ({len(oversized_config)} bytes)")
+        assert size_checks[0].details["scan_outcome_reason"] == "nemo_config_size_limit"
+        assert size_checks[0].details["max_config_size"] == NemoScanner.MAX_CONFIG_SIZE
+        assert result.success is True
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_config_size_limit" in result.metadata["scan_outcome_reasons"]
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            aggregate = scan_model_directory_or_file(
+                str(path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            metadata = aggregate.file_metadata[str(path)]
+
+            assert aggregate.success is True
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert metadata["scan_outcome_reasons"] == ["nemo_config_size_limit"]
+            assert determine_exit_code(aggregate) == 1
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
 
     def test_safe_nemo_target_passes(self, tmp_path):
         """Known-safe NeMo/PyTorch targets should pass."""
@@ -580,6 +899,31 @@ class TestCVE202523304HydraTarget:
         assert len(cve_checks) == 0, (
             f"Safe-prefixed target with 'eval' should not trigger CVE. Checks: {[c.name for c in result.checks]}"
         )
+
+    def test_safe_prefix_does_not_suppress_suspicious_leaf_target(self, tmp_path: Path) -> None:
+        """Trusted namespaces must not hide obviously dangerous target components."""
+        config = {
+            "model": {"_target_": "nemo.eval_utils.system"},
+        }
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        suspicious_checks = [c for c in result.checks if c.name == "CVE-2025-23304: Suspicious Hydra _target_"]
+        assert len(suspicious_checks) == 1
+        assert suspicious_checks[0].details["pattern"] == "system"
+
+    def test_safe_prefix_ignores_suspicious_intermediate_component(self, tmp_path: Path) -> None:
+        """Namespace segments alone should not make an otherwise safe callable suspicious."""
+        config = {
+            "model": {"_target_": "nemo.eval.Factory"},
+        }
+        path = _create_nemo_file(tmp_path, config)
+
+        result = NemoScanner().scan(str(path))
+
+        cve_checks = [c for c in result.checks if "CVE-2025-23304" in c.name]
+        assert len(cve_checks) == 0
 
     def test_nested_target_detected(self, tmp_path):
         """Deeply nested _target_ should still be found."""
@@ -649,8 +993,8 @@ class TestCVE202523304HydraTarget:
         suspicious = [c for c in result.checks if "Suspicious File" in c.name]
         assert len(suspicious) > 0, "Should detect executable in archive"
 
-    def test_no_yaml_configs(self, tmp_path):
-        """Archive with no YAML should note absence."""
+    def test_no_yaml_configs_fail_closed_as_inconclusive(self, tmp_path: Path) -> None:
+        """Archives with no YAML should not report a clean complete scan."""
         nemo_path = tmp_path / "model.nemo"
         with tarfile.open(nemo_path, "w") as tar:
             data = b"binary weights data"
@@ -658,7 +1002,45 @@ class TestCVE202523304HydraTarget:
             info.size = len(data)
             tar.addfile(info, io.BytesIO(data))
 
-        result = NemoScanner().scan(str(nemo_path))
+        direct_result = NemoScanner().scan(str(nemo_path))
+        aggregate_result = scan_model_directory_or_file(
+            str(nemo_path),
+            config={"cache_scan_results": False},
+        )
 
-        no_config = [c for c in result.checks if "Config Presence" in c.name and c.status != CheckStatus.PASSED]
-        assert len(no_config) > 0, "Should note missing YAML configs"
+        assert direct_result.success is False
+        assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_config_missing" in direct_result.metadata["scan_outcome_reasons"]
+        no_config = [
+            check
+            for check in direct_result.checks
+            if check.name == "NeMo Config Presence" and check.status == CheckStatus.FAILED
+        ]
+        assert len(no_config) == 1
+        assert no_config[0].message == "No YAML configuration found in NeMo archive"
+        assert no_config[0].details["scan_outcome_reason"] == "nemo_config_missing"
+
+        metadata = aggregate_result.file_metadata[str(nemo_path)]
+        assert aggregate_result.success is False
+        assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_config_missing" in metadata.get("scan_outcome_reasons", [])
+        assert determine_exit_code(aggregate_result) == 2
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            cached_aggregate = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            cached_metadata = cached_aggregate.file_metadata[str(nemo_path)]
+
+            assert cached_aggregate.success is False
+            assert cached_metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            assert "nemo_config_missing" in cached_metadata.get("scan_outcome_reasons", [])
+            assert determine_exit_code(cached_aggregate) == 2
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()

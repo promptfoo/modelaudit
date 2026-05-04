@@ -1,57 +1,4 @@
-"""
-Consolidated suspicious symbols used by ModelAudit security scanners.
-
-This module centralizes all security pattern definitions used across ModelAudit scanners
-to ensure consistency, maintainability, and comprehensive threat detection.
-
-Architecture Overview:
-    The suspicious symbols system provides a centralized repository of security patterns
-    that are imported by individual scanners (PickleScanner, TensorFlowScanner, etc.).
-    This approach ensures:
-
-    1. **Consistency**: All scanners use the same threat definitions
-    2. **Maintainability**: Security patterns are updated in one location
-    3. **Extensibility**: New patterns can be added without modifying multiple files
-    4. **Performance**: Compiled regex patterns are shared across scanners
-
-Usage Examples:
-    >>> from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_GLOBALS, SUSPICIOUS_OPS
-    >>>
-    >>> # Check if a global reference is suspicious
-    >>> if "os" in SUSPICIOUS_GLOBALS:
-    >>>     print("os module flagged as suspicious")
-    >>>
-    >>> # Check TensorFlow operations
-    >>> if "PyFunc" in SUSPICIOUS_OPS:
-    >>>     print("PyFunc operation flagged as suspicious")
-
-Security Pattern Categories:
-    - SUSPICIOUS_GLOBALS: Dangerous Python modules/functions (pickle files)
-    - SUSPICIOUS_STRING_PATTERNS: Regex patterns for malicious code strings
-    - SUSPICIOUS_OPS: Dangerous TensorFlow operations
-    - SUSPICIOUS_LAYER_TYPES: Risky Keras layer types
-    - SUSPICIOUS_CONFIG_PROPERTIES: Dangerous configuration keys
-    - SUSPICIOUS_CONFIG_PATTERNS: Manifest file security patterns
-    - JINJA2_SSTI_PATTERNS: Jinja2 Server-Side Template Injection patterns
-
-Maintenance Guidelines:
-    When adding new patterns:
-    1. Document the security rationale in comments
-    2. Add corresponding test cases
-    3. Consider false positive impact on legitimate ML models
-    4. Test against real-world model samples
-    5. Update this module's docstring with new pattern categories
-
-Performance Considerations:
-    - String patterns use compiled regex for efficiency
-    - Dictionary lookups are O(1) for module checks
-    - Patterns are loaded once at import time
-    - Consider pattern complexity for large model files
-
-Version History:
-    - v1.0: Initial consolidation from individual scanner files
-    - v1.1: Added documentation and architecture overview
-"""
+"""Security pattern definitions shared across ModelAudit scanners."""
 
 from typing import Any
 
@@ -103,6 +50,7 @@ SUSPICIOUS_GLOBALS = {
     "builtins": [
         "eval",
         "exec",
+        "exit",
         "compile",
         "open",
         "input",
@@ -115,27 +63,32 @@ SUSPICIOUS_GLOBALS = {
         "delattr",  # Can delete attributes
         "vars",  # Access to object's namespace
         "dir",  # Can enumerate available attributes
+        "quit",  # Terminates the interpreter when invoked
     ],  # Dynamic code evaluation and file access
     # Python 2 style builtins - CRITICAL RISK
     "__builtin__": [
         "eval",
         "exec",
         "execfile",
+        "exit",
         "compile",
         "open",
         "input",
         "raw_input",
         "__import__",
+        "quit",
         "reload",
     ],  # Python 2 style builtin functions (still exploitable in many contexts)
     # Alternative builtin references - CRITICAL RISK
     "__builtins__": [
         "eval",
         "exec",
+        "exit",
         "compile",
         "open",
         "input",
         "__import__",
+        "quit",
     ],  # Sometimes used as dict or module reference
     "operator": ["attrgetter"],  # Attribute access bypass
     "importlib.machinery": "*",  # Module machinery manipulation
@@ -213,6 +166,17 @@ SUSPICIOUS_GLOBALS = {
     "py_compile": "*",
     # FFI / native code
     "_ctypes": "*",
+    "_posixsubprocess": ["fork_exec"],
+    # Crash and process-resource primitives
+    "faulthandler": [
+        "_fatal_error_c_thread",
+        "_read_null",
+        "_sigabrt",
+        "_sigfpe",
+        "_sigsegv",
+        "_stack_overflow",
+    ],
+    "resource": ["setrlimit"],
     # Profiling / debugging (can execute code)
     "cProfile": "*",
     "profile": "*",
@@ -278,10 +242,12 @@ SUSPICIOUS_GLOBALS.update({alias: data["functions"] for alias, data in OS_MODULE
 DANGEROUS_BUILTINS = [
     "eval",
     "exec",
+    "exit",
     "compile",
     "open",
     "input",
     "__import__",
+    "quit",
     "globals",  # Access to global namespace
     "locals",  # Access to local namespace
     "setattr",  # Can set arbitrary attributes

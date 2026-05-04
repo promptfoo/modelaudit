@@ -3,6 +3,7 @@
 import json
 import os
 import re
+from contextlib import suppress
 from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import (
@@ -557,9 +558,10 @@ class KerasH5Scanner(BaseScanner):
                 layer_counts[layer_class] = 1
 
             # Check for suspicious layer types
-            if layer_class in self.suspicious_layer_types:
+            is_lambda_layer = self._is_lambda_layer_class(layer_class)
+            if layer_class in self.suspicious_layer_types or is_lambda_layer:
                 # Special handling for Lambda layers - validate Python code
-                if layer_class == "Lambda":
+                if is_lambda_layer:
                     raw_layer_name = layer.get("name")
                     if not raw_layer_name and isinstance(layer_config, dict):
                         raw_layer_name = layer_config.get("name")
@@ -703,7 +705,7 @@ class KerasH5Scanner(BaseScanner):
                             "description": self.suspicious_layer_types[layer_class],
                             "layer_config": layer_config,
                         },
-                        why=get_pattern_explanation("lambda_layer") if layer_class == "Lambda" else None,
+                        why=get_pattern_explanation("lambda_layer") if is_lambda_layer else None,
                         rule_code="S902",
                     )
 
@@ -899,6 +901,29 @@ class KerasH5Scanner(BaseScanner):
         # Don't flag Lambda layers without code - they might just be placeholders
 
     @staticmethod
+    def _is_lambda_layer_class(layer_class: Any) -> bool:
+        """Return True for serialized Lambda variants such as `keras.layers.Lambda`."""
+        if not isinstance(layer_class, str):
+            return False
+
+        normalized = layer_class.strip()
+        if normalized == "Lambda":
+            return True
+
+        module_path, _, class_name = normalized.rpartition(".")
+        if class_name != "Lambda":
+            return False
+
+        framework_prefixes = (
+            "keras.",
+            "tensorflow.keras.",
+            "tensorflow.python.keras.",
+            "tf.keras.",
+            "tf_keras.",
+        )
+        return any(f"{module_path.lower()}.".startswith(prefix) for prefix in framework_prefixes)
+
+    @staticmethod
     def _is_vulnerable_to_cve_2024_3660(version: str) -> bool | None:
         """Return True/False for parseable Keras versions, else None.
 
@@ -1069,9 +1094,7 @@ class KerasH5Scanner(BaseScanner):
 
                 # Try to extract model configuration
                 if "model_config" in h5_file.attrs:
-                    try:
-                        import json
-
+                    with suppress(Exception):
                         config_json = h5_file.attrs["model_config"]
                         if isinstance(config_json, bytes):
                             config_json = config_json.decode("utf-8")
@@ -1097,12 +1120,9 @@ class KerasH5Scanner(BaseScanner):
                                 }
                             )
 
-                    except Exception:
-                        pass
-
                 # Analyze model weights structure
                 if "model_weights" in h5_file:
-                    try:
+                    with suppress(Exception):
                         weights_group = h5_file["model_weights"]
 
                         # Count parameters
@@ -1132,9 +1152,6 @@ class KerasH5Scanner(BaseScanner):
                                 "parameter_details": weight_layers[:10],  # First 10 layers
                             }
                         )
-
-                    except Exception:
-                        pass
 
         except Exception as e:
             metadata["extraction_error"] = str(e)

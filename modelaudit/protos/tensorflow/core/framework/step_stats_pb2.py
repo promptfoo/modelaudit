@@ -7,7 +7,6 @@
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import runtime_version as _runtime_version
-from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
 _runtime_version.ValidateProtobufRuntimeVersion(
     _runtime_version.Domain.PUBLIC,
@@ -19,13 +18,18 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 )
 # @@protoc_insertion_point(imports)
 
-_sym_db = _symbol_database.Default()
+
 
 
 from tensorflow.core.framework import allocation_description_pb2 as tensorflow_dot_core_dot_framework_dot_allocation__description__pb2
 from tensorflow.core.framework import tensor_description_pb2 as tensorflow_dot_core_dot_framework_dot_tensor__description__pb2
 
-
+# Keep generated dependency imports for descriptor registration side effects.
+# Reference aliases so static analysis preserves these side-effect imports.
+id(tensorflow_dot_core_dot_framework_dot_allocation__description__pb2)
+id(tensorflow_dot_core_dot_framework_dot_tensor__description__pb2)
+del tensorflow_dot_core_dot_framework_dot_allocation__description__pb2
+del tensorflow_dot_core_dot_framework_dot_tensor__description__pb2
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n*tensorflow/core/framework/step_stats.proto\x12\ntensorflow\x1a\x36tensorflow/core/framework/allocation_description.proto\x1a\x32tensorflow/core/framework/tensor_description.proto\"=\n\x10\x41llocationRecord\x12\x14\n\x0c\x61lloc_micros\x18\x01 \x01(\x03\x12\x13\n\x0b\x61lloc_bytes\x18\x02 \x01(\x03\"\xc4\x01\n\x13\x41llocatorMemoryUsed\x12\x16\n\x0e\x61llocator_name\x18\x01 \x01(\t\x12\x13\n\x0btotal_bytes\x18\x02 \x01(\x03\x12\x12\n\npeak_bytes\x18\x03 \x01(\x03\x12\x12\n\nlive_bytes\x18\x04 \x01(\x03\x12\x38\n\x12\x61llocation_records\x18\x06 \x03(\x0b\x32\x1c.tensorflow.AllocationRecord\x12\x1e\n\x16\x61llocator_bytes_in_use\x18\x05 \x01(\x03\"U\n\nNodeOutput\x12\x0c\n\x04slot\x18\x01 \x01(\x05\x12\x39\n\x12tensor_description\x18\x03 \x01(\x0b\x32\x1d.tensorflow.TensorDescription\"\xec\x01\n\x0bMemoryStats\x12\x18\n\x10temp_memory_size\x18\x01 \x01(\x03\x12\x1e\n\x16persistent_memory_size\x18\x03 \x01(\x03\x12#\n\x1bpersistent_tensor_alloc_ids\x18\x05 \x03(\x03\x12#\n\x17\x64\x65vice_temp_memory_size\x18\x02 \x01(\x03\x42\x02\x18\x01\x12)\n\x1d\x64\x65vice_persistent_memory_size\x18\x04 \x01(\x03\x42\x02\x18\x01\x12.\n\"device_persistent_tensor_alloc_ids\x18\x06 \x03(\x03\x42\x02\x18\x01\"\x9e\x04\n\rNodeExecStats\x12\x11\n\tnode_name\x18\x01 \x01(\t\x12\x18\n\x10\x61ll_start_micros\x18\x02 \x01(\x03\x12\x1b\n\x13op_start_rel_micros\x18\x03 \x01(\x03\x12\x19\n\x11op_end_rel_micros\x18\x04 \x01(\x03\x12\x1a\n\x12\x61ll_end_rel_micros\x18\x05 \x01(\x03\x12/\n\x06memory\x18\x06 \x03(\x0b\x32\x1f.tensorflow.AllocatorMemoryUsed\x12&\n\x06output\x18\x07 \x03(\x0b\x32\x16.tensorflow.NodeOutput\x12\x16\n\x0etimeline_label\x18\x08 \x01(\t\x12\x18\n\x10scheduled_micros\x18\t \x01(\x03\x12\x11\n\tthread_id\x18\n \x01(\r\x12<\n\x11referenced_tensor\x18\x0b \x03(\x0b\x32!.tensorflow.AllocationDescription\x12-\n\x0cmemory_stats\x18\x0c \x01(\x0b\x32\x17.tensorflow.MemoryStats\x12\x17\n\x0f\x61ll_start_nanos\x18\r \x01(\x03\x12\x1a\n\x12op_start_rel_nanos\x18\x0e \x01(\x03\x12\x18\n\x10op_end_rel_nanos\x18\x0f \x01(\x03\x12\x19\n\x11\x61ll_end_rel_nanos\x18\x10 \x01(\x03\x12\x17\n\x0fscheduled_nanos\x18\x11 \x01(\x03\"\xc8\x01\n\x0f\x44\x65viceStepStats\x12\x0e\n\x06\x64\x65vice\x18\x01 \x01(\t\x12-\n\nnode_stats\x18\x02 \x03(\x0b\x32\x19.tensorflow.NodeExecStats\x12\x42\n\x0cthread_names\x18\x03 \x03(\x0b\x32,.tensorflow.DeviceStepStats.ThreadNamesEntry\x1a\x32\n\x10ThreadNamesEntry\x12\x0b\n\x03key\x18\x01 \x01(\r\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\";\n\tStepStats\x12.\n\tdev_stats\x18\x01 \x03(\x0b\x32\x1b.tensorflow.DeviceStepStatsB\x83\x01\n\x18org.tensorflow.frameworkB\x0fStepStatsProtosP\x01ZQgithub.com/tensorflow/tensorflow/tensorflow/go/core/framework/step_stats_go_proto\xf8\x01\x01\x62\x06proto3')
 
 _globals = globals()

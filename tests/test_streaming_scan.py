@@ -93,8 +93,8 @@ def test_scan_model_directory_or_file_streaming_path() -> None:
         assert determine_exit_code(result) == 0
 
 
-def test_scan_model_directory_or_file_partial_streaming_path_returns_exit_code_2() -> None:
-    """Partial stream:// analysis without findings should be explicit and fail closed."""
+def test_scan_model_directory_or_file_incomplete_streaming_path_returns_exit_code_2() -> None:
+    """Incomplete stream:// analysis without findings should be explicit and fail closed."""
     stream_url = "s3://bucket/model.pkl"
     scan_result = ScanResult(scanner_name="streaming")
     scan_result.bytes_scanned = 128
@@ -115,7 +115,10 @@ def test_scan_model_directory_or_file_partial_streaming_path_returns_exit_code_2
     assert metadata["analysis_incomplete"] is True
     assert "streaming_analysis_incomplete" in metadata["scan_outcome_reasons"]
     assert "failed closed" in metadata["scan_outcome_message"]
-    assert any(issue.message == "Streaming analysis was partial - only analyzed file header" for issue in result.issues)
+    assert any(
+        issue.message == "Streaming analysis incomplete - full scanner coverage was not available"
+        for issue in result.issues
+    )
     assert result.has_errors is False
     assert result.files_scanned == 1
     assert result.success is False
@@ -644,6 +647,37 @@ def test_scan_model_streaming_informational_failed_scan_does_not_set_operational
     assert result.success is True
     assert result.has_errors is False
     assert determine_exit_code(result) == 1
+
+
+def test_scan_model_streaming_bare_failed_scan_fails_closed(
+    temp_test_files: list[Path],
+) -> None:
+    """Streaming dict aggregation should preserve bare failed-scan inconclusive metadata."""
+
+    def file_generator() -> Iterator[tuple[Path, bool]]:
+        yield (temp_test_files[0], True)
+
+    info_result = ScanResult(scanner_name="numpy")
+    info_result.add_issue(
+        "Object-dtype payload contains trailing bytes after the embedded pickle stream",
+        severity=IssueSeverity.INFO,
+        location=str(temp_test_files[0]),
+    )
+    info_result.finish(success=False)
+
+    with patch("modelaudit.core.scan_file", return_value=info_result):
+        result = scan_model_streaming(
+            file_generator=file_generator(),
+            timeout=30,
+            delete_after_scan=False,
+        )
+
+    metadata = result.file_metadata[str(temp_test_files[0])]
+    assert metadata["scan_outcome"] == "inconclusive"
+    assert "scanner_reported_unsuccessful_without_outcome" in metadata["scan_outcome_reasons"]
+    assert result.has_errors is False
+    assert result.success is False
+    assert determine_exit_code(result) == 2
 
 
 def test_scan_model_streaming_operational_info_failure_sets_exit_code_2(

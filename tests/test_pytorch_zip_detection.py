@@ -1,14 +1,14 @@
 """Test PyTorch ZIP scanner's ability to detect and scan .bin files."""
 
-import io
-import pickle
-import zipfile
-from pathlib import Path
-
 import pytest
 
 # Skip if torch is not available before importing it
 pytest.importorskip("torch")
+
+import io
+import pickle
+import zipfile
+from pathlib import Path
 
 import torch
 
@@ -18,13 +18,26 @@ from modelaudit.utils.file.detection import detect_file_format
 from tests.helpers import write_mock_pytorch_zip_metadata
 
 
+class _MaliciousPicklePayload:
+    def __reduce__(self):
+        import os
+
+        return (os.system, ("echo pwned",))
+
+
+@pytest.fixture
+def simple_model_data():
+    """Shared simple PyTorch model payload used across tests."""
+    return {"weights": torch.tensor([1.0, 2.0, 3.0])}
+
+
 class TestPyTorchZipDetection:
     """Test PyTorch ZIP file detection and scanning."""
 
-    def test_detect_zip_bin_file(self, tmp_path):
+    def test_detect_zip_bin_file(self, tmp_path, simple_model_data):
         """Test that .bin files with ZIP format are detected correctly."""
         # Create a simple PyTorch model
-        model_data = {"weights": torch.tensor([1.0, 2.0, 3.0])}
+        model_data = simple_model_data
 
         # Save as .bin file using torch.save (creates a ZIP)
         bin_file = tmp_path / "pytorch_model.bin"
@@ -40,9 +53,9 @@ class TestPyTorchZipDetection:
         assert result.scanner_name == "pytorch_zip"
         assert result.bytes_scanned > 0
 
-    def test_detect_zip_ckpt_file(self, tmp_path):
+    def test_detect_zip_ckpt_file(self, tmp_path, simple_model_data):
         """ZIP-backed .ckpt files should route through the PyTorch ZIP scanner."""
-        model_data = {"weights": torch.tensor([1.0, 2.0, 3.0])}
+        model_data = simple_model_data
 
         ckpt_file = tmp_path / "pytorch_model.ckpt"
         torch.save(model_data, ckpt_file)
@@ -58,20 +71,13 @@ class TestPyTorchZipDetection:
     def test_scan_malicious_bin_file(self, tmp_path):
         """Test detection of malicious code in .bin PyTorch files."""
 
-        # Create a malicious pickle payload
-        class MaliciousClass:
-            def __reduce__(self):
-                import os
-
-                return (os.system, ("echo pwned",))
-
         # Create a ZIP file with the malicious pickle
         bin_file = tmp_path / "malicious_model.bin"
         with zipfile.ZipFile(bin_file, "w") as zf:
             # PyTorch models typically have data.pkl in archive/ directory
             write_mock_pytorch_zip_metadata(zf, prefix="archive")
             pickle_data = io.BytesIO()
-            pickle.dump({"model": MaliciousClass()}, pickle_data)
+            pickle.dump({"model": _MaliciousPicklePayload()}, pickle_data)
             zf.writestr("archive/data.pkl", pickle_data.getvalue())
 
         # Scan the file
@@ -90,6 +96,8 @@ class TestPyTorchZipDetection:
             "weights": torch.randn(10, 10),
             "bias": torch.randn(10),
             "config": {"layers": 3, "hidden_size": 10},
+            "device": torch.device("cpu"),
+            "dtype": torch.float32,
         }
 
         # Save as .bin file
@@ -110,6 +118,14 @@ class TestPyTorchZipDetection:
         with zipfile.ZipFile(bin_file, "w") as zf:
             write_mock_pytorch_zip_metadata(zf)
             write_mock_pytorch_zip_metadata(zf, prefix="archive")
+
+            names = zf.namelist()
+            root_metadata_entries = [name for name in names if "/" not in name and not name.endswith(".pkl")]
+            archive_metadata_entries = [
+                name for name in names if name.startswith("archive/") and not name.endswith(".pkl")
+            ]
+            assert root_metadata_entries, f"Expected root metadata entries, got: {names}"
+            assert archive_metadata_entries, f"Expected archive metadata entries, got: {names}"
 
             # Add multiple pickle files
             safe_data = {"weights": [1, 2, 3]}

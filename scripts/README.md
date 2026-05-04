@@ -16,19 +16,23 @@ Script to regenerate vendored TensorFlow protobuf stubs from `.proto` files.
 
 Utilities for fetching model metadata from HuggingFace for testing and validation.
 
+### `benchmark_report.py` / `profile_scan.py`
+
+Utilities for summarizing benchmark output and profiling scanner performance.
+
+### `large_pickle_corpus_qa.py`
+
+Maintainer utility for running large-corpus pickle scanner QA outside the
+repository tree. Corpus artifacts and generated reports should not be committed.
+
+### `generate_keras_layer_inventory.py`
+
+Utility for building Keras layer inventories used when validating Keras scanner
+coverage and allowlists.
+
 ### `jax_flax_scanning_demo.py`
 
 Demonstrates JAX/Flax model scanning capabilities including Msgpack-based checkpoints, Orbax format, and JAX-specific threat detection.
-
-### `compare_pickle_scanners.py`
-
-Differential harness for comparing the legacy in-repo `PickleScanner` against the
-standalone `modelaudit-picklescan` package on committed pickle fixtures. The
-harness uses a pure legacy baseline (without package-result merging) and prints
-label-aware drift summaries so safe-fixture false-positive regressions are easy
-to spot. Use `--json` for a machine-readable report. Add `--include-root` to
-compare the actual root scanner result, or `--root-standalone-primary` to audit
-the opt-in standalone-primary migration mode.
 
 ## Development Use Only
 

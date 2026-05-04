@@ -24,7 +24,7 @@ Transfer `wheelhouse/` to the air-gapped environment, then install:
 pip install --no-index --find-links wheelhouse "modelaudit[all]"
 ```
 
-If you only need specific scanners, replace `[all]` with targeted extras.
+If you only need specific scanners, replace `[all]` with targeted extras. ONNX is included by `onnx`/`all` on Python 3.10-3.12; add `tensorflow` on Python 3.11-3.12 only when TensorFlow-dependent checkpoint or weight analysis is required.
 
 ## 2. Disable telemetry
 
@@ -70,7 +70,7 @@ Optional controls:
 
 - `--max-size` to enforce artifact size boundaries
 - `--timeout` for deterministic runtime limits
-- `--stream` when scanning very large local directories with constrained disk
+- `--stream` to process large local directories one file at a time while preserving the source files
 
 ## 6. Operational checklist
 

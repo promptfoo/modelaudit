@@ -102,6 +102,23 @@ class TestHuggingFaceURLParsing:
             with pytest.raises(ValueError):
                 parse_huggingface_url(url)
 
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://huggingface.co/%2e%2e/model",
+            "https://huggingface.co/org/%2e%2e",
+            "https://huggingface.co/org/repo%2F..%2Fescape",
+            "hf://org%2F..%2Fescape/model",
+            "hf://org/repo%5Cescape",
+        ],
+    )
+    def test_parse_rejects_unsafe_repo_components(self, url: str) -> None:
+        """Decoded repo-id components must not become path traversal segments."""
+        with pytest.raises(ValueError):
+            parse_huggingface_url(url)
+
+        assert is_huggingface_url(url) is False
+
 
 class TestExtractModelIdFromPath:
     """Test HuggingFace model ID extraction from local paths."""
@@ -257,6 +274,30 @@ class TestModelDownload:
         # Verify cache directory was used (we now use local_dir instead of cache_dir for safety)
         call_args = mock_snapshot_download.call_args
         assert call_args[1]["local_dir"] == str(cache_dir / "huggingface" / "test" / "model")
+
+    @patch("modelaudit.utils.sources.huggingface.get_model_size", return_value=None)
+    @patch("modelaudit.utils.sources.huggingface._list_repo_files_with_timeout", return_value=(["model.bin"], None))
+    @patch("huggingface_hub.snapshot_download")
+    def test_download_model_revalidates_existing_cache(
+        self,
+        mock_snapshot_download: MagicMock,
+        _mock_list_repo_files: MagicMock,
+        _mock_get_model_size: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Existing local cache directories should still delegate freshness checks to the HF SDK."""
+        cache_dir = tmp_path / "custom_cache"
+        existing_path = cache_dir / "huggingface" / "test" / "model"
+        existing_path.mkdir(parents=True)
+        (existing_path / "config.json").write_text("{}", encoding="utf-8")
+        (existing_path / "model.bin").write_bytes(b"stale bytes")
+        mock_snapshot_download.return_value = str(existing_path)
+
+        result = download_model("hf://test/model", cache_dir=cache_dir)
+
+        assert result == existing_path
+        mock_snapshot_download.assert_called_once()
+        assert mock_snapshot_download.call_args.kwargs["local_dir"] == str(existing_path)
 
     @patch("modelaudit.utils.sources.huggingface._get_model_extensions", return_value={".bin", ".json"})
     @patch(
@@ -709,6 +750,21 @@ class TestHuggingFaceFileURLs:
         for url in invalid_urls:
             with pytest.raises(ValueError):
                 parse_huggingface_file_url(url)
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://huggingface.co/%2e%2e/repo/resolve/main/model.bin",
+            "https://huggingface.co/org/%2e%2e/resolve/main/model.bin",
+            "https://huggingface.co/org/repo%2Fescape/resolve/main/model.bin",
+        ],
+    )
+    def test_parse_file_url_rejects_unsafe_repo_components(self, url: str) -> None:
+        """Direct file URLs should validate repo-id components before download."""
+        with pytest.raises(ValueError):
+            parse_huggingface_file_url(url)
+
+        assert is_huggingface_file_url(url) is False
 
     @patch("huggingface_hub.hf_hub_download")
     def test_download_file_success(self, mock_hf_hub_download):

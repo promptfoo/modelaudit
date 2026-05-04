@@ -7,7 +7,6 @@
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import runtime_version as _runtime_version
-from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
 _runtime_version.ValidateProtobufRuntimeVersion(
     _runtime_version.Domain.PUBLIC,
@@ -18,12 +17,6 @@ _runtime_version.ValidateProtobufRuntimeVersion(
     'tensorflow/core/framework/dataset_metadata.proto'
 )
 # @@protoc_insertion_point(imports)
-
-_sym_db = _symbol_database.Default()
-
-
-
-
 DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n0tensorflow/core/framework/dataset_metadata.proto\x12\x0ftensorflow.data\"\x18\n\x08Metadata\x12\x0c\n\x04name\x18\x01 \x01(\x0c\x42YZWgithub.com/tensorflow/tensorflow/tensorflow/go/core/framework/dataset_metadata_go_protob\x06proto3')
 
 _globals = globals()

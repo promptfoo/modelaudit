@@ -33,7 +33,7 @@ def _get_onnx_mapping() -> Any:
         if hasattr(onnx, "_mapping"):
             return onnx._mapping
     except (ImportError, AttributeError):
-        pass
+        logger.debug("ONNX mapping module is unavailable in the installed onnx package", exc_info=True)
 
     try:
         # Try older ONNX location
@@ -41,7 +41,7 @@ def _get_onnx_mapping() -> Any:
 
         return mapping_export
     except (ImportError, AttributeError):
-        pass
+        logger.debug("Legacy ONNX mapping export is unavailable", exc_info=True)
 
     return None
 
@@ -58,6 +58,8 @@ STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset(
     }
 )
 ONNX_STRUCTURE_INCONCLUSIVE_REASON = "onnx_structure_validation_failed"
+ONNX_RAW_DETECTION_INCONCLUSIVE_REASON = "onnx_raw_detection_analysis_incomplete"
+ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON = "onnx_weight_distribution_analysis_incomplete"
 _PYTHON_OPERATOR_TYPES: frozenset[str] = frozenset(
     {
         "pyfunc",
@@ -149,8 +151,8 @@ def _tensor_data_type_to_np_dtype(data_type: int) -> Any:
 
     try:
         return np.dtype(onnx.helper.tensor_dtype_to_np_dtype(data_type))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Unable to resolve ONNX dtype through helper API: %s", exc)
 
     if mapping is None:
         raise ValueError(f"ONNX tensor dtype mapping unavailable for data_type={data_type}")
@@ -238,13 +240,38 @@ class OnnxScanner(BaseScanner):
             result.finish(success=False)
             return result
 
+        # Read raw bytes first so successful scans can parse and run raw
+        # detectors from the same buffer. If this read fails, fall back to
+        # ONNX's path-based loader so structural analysis still has a chance
+        # to complete while raw detector coverage stays explicitly incomplete.
+        model_data: bytes | None = None
+        try:
+            self.check_interrupted()
+            with open(path, "rb") as f:
+                model_data = f.read()
+            self.check_interrupted()
+        except Exception as e:
+            logger.warning("Raw ONNX detector input read failed: %s", e)
+            self._mark_raw_detection_incomplete(
+                result,
+                path,
+                detector="raw_file_read",
+                reason="file_read_failed",
+                message=f"Raw ONNX detector input read failed: {e!s}",
+                details={"exception": str(e), "exception_type": type(e).__name__},
+            )
+
         try:
             import onnx
 
-            # Check for interrupts before starting the potentially long-running load
+            # Check for interrupts before starting the potentially long-running load.
             self.check_interrupted()
-            model = onnx.load(path, load_external_data=False)
-            # Check for interrupts after loading completes
+            model = (
+                onnx.load(path, load_external_data=False)
+                if model_data is None
+                else onnx.load_model_from_string(model_data)
+            )
+            # Check for interrupts after loading completes.
             self.check_interrupted()
             result.bytes_scanned = file_size
         except KeyboardInterrupt:
@@ -270,59 +297,62 @@ class OnnxScanner(BaseScanner):
             },
         )
 
-        # Check for JIT/Script code execution risks in the ONNX model
-        # Read the file as binary to scan for patterns
-        try:
-            # Check for interrupts before file reading
-            self.check_interrupted()
-            with open(path, "rb") as f:
-                model_data = f.read()
-            # Check for interrupts after file reading
-            self.check_interrupted()
-            # Collect findings without creating individual checks
-            jit_findings = self.collect_jit_script_findings(
-                model_data,
-                model_type="onnx",
-                context=path,
-            )
-            network_findings = self.collect_network_communication_findings(
-                model_data,
-                context=path,
-            )
-
-            # Emit explicit checks for the file (only if checks are enabled)
+        if model_data is not None:
             check_jit = self._get_bool_config("check_jit_script", True)
             if check_jit:
-                self.add_jit_script_findings(
-                    jit_findings,
-                    result,
-                    model_type="onnx",
-                    context=path,
-                )
+                try:
+                    jit_findings = self.collect_jit_script_findings(
+                        model_data,
+                        model_type="onnx",
+                        context=path,
+                        raise_on_error=True,
+                    )
+                except Exception as e:
+                    logger.warning("ONNX JIT/script detector analysis failed: %s", e)
+                    self._mark_raw_detection_incomplete(
+                        result,
+                        path,
+                        detector="jit_script",
+                        reason="analysis_failed",
+                        message=f"ONNX JIT/script detector analysis failed: {e!s}",
+                        details={"exception": str(e), "exception_type": type(e).__name__},
+                    )
+                else:
+                    self.add_jit_script_findings(
+                        jit_findings,
+                        result,
+                        model_type="onnx",
+                        context=path,
+                    )
             else:
                 result.metadata.setdefault("disabled_checks", []).append("JIT/Script Code Execution Detection")
 
             check_net = self._get_bool_config("check_network_comm", True)
             if check_net:
-                self.add_network_communication_findings(
-                    network_findings,
-                    result,
-                    context=path,
-                )
+                try:
+                    network_findings = self.collect_network_communication_findings(
+                        model_data,
+                        context=path,
+                        raise_on_error=True,
+                    )
+                except Exception as e:
+                    logger.warning("ONNX network detector analysis failed: %s", e)
+                    self._mark_raw_detection_incomplete(
+                        result,
+                        path,
+                        detector="network_communication",
+                        reason="analysis_failed",
+                        message=f"ONNX network detector analysis failed: {e!s}",
+                        details={"exception": str(e), "exception_type": type(e).__name__},
+                    )
+                else:
+                    self.add_network_communication_findings(
+                        network_findings,
+                        result,
+                        context=path,
+                    )
             else:
                 result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
-
-        except Exception as e:
-            # Log but don't fail the scan
-            result.add_check(
-                name="JIT/Script Code Execution Detection",
-                passed=False,
-                message=f"Failed to check for JIT/Script code: {e}",
-                severity=IssueSeverity.DEBUG,
-                location=path,
-                details={"exception": str(e)},
-                rule_code="S507",
-            )
 
         self._check_custom_ops(model, path, result)
         self._check_external_data(model, path, result)
@@ -331,6 +361,32 @@ class OnnxScanner(BaseScanner):
 
         _finish_scan_result(result)
         return result
+
+    def _mark_raw_detection_incomplete(
+        self,
+        result: ScanResult,
+        path: str,
+        *,
+        detector: str,
+        reason: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        _mark_inconclusive_scan_result(result, ONNX_RAW_DETECTION_INCONCLUSIVE_REASON)
+        result.add_check(
+            name="Raw Detector Analysis Coverage",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=path,
+            rule_code="S902",
+            details={
+                "scan_outcome_reason": ONNX_RAW_DETECTION_INCONCLUSIVE_REASON,
+                "coverage_gap": reason,
+                "detector": detector,
+                **(details or {}),
+            },
+        )
 
     def _check_custom_ops(self, model: Any, path: str, result: ScanResult) -> None:
         custom_domains = set()
@@ -771,40 +827,46 @@ class OnnxScanner(BaseScanner):
         """
         try:
             import onnx
-
-            # Lazy-import the weight distribution scanner to avoid circular deps
-            # and heavy library loads when the scanner is not needed.
-            from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
-        except ImportError:
-            # numpy / scipy / onnx not available — silently skip
+        except Exception as e:
+            self._mark_weight_distribution_incomplete(
+                result,
+                path,
+                reason="missing_dependency",
+                message=f"Weight distribution analysis dependency unavailable: {e!s}",
+                details={"exception": str(e), "exception_type": type(e).__name__},
+            )
             return
 
         # Max in-memory array size (default 100 MB)
         max_array_size = self.config.get("max_array_size", 100 * 1024 * 1024)
 
-        import numpy as np
-
+        eligible_initializers = 0
+        external_initializers_skipped = 0
+        oversized_initializers_skipped = 0
         extraction_failures = 0
         weights_info: dict[str, Any] = {}
         for initializer in model.graph.initializer:
             try:
                 self.check_interrupted()
 
-                # Skip external-data tensors — their bytes were not loaded.
-                if initializer.data_location == onnx.TensorProto.EXTERNAL:
-                    continue
-
                 # Only 2-D+ tensors are interesting for distribution analysis.
                 if len(initializer.dims) < 2:
+                    continue
+                eligible_initializers += 1
+
+                # Skip external-data tensors — their bytes were not loaded.
+                if initializer.data_location == onnx.TensorProto.EXTERNAL:
+                    external_initializers_skipped += 1
                     continue
 
                 # Pre-check estimated size before materializing the array.
                 # Use math.prod for arbitrary-precision arithmetic (np.prod
                 # can silently overflow for very large dimension products).
                 numel = math.prod(int(dim) for dim in initializer.dims)
-                itemsize = int(np.dtype(onnx.helper.tensor_dtype_to_np_dtype(initializer.data_type)).itemsize)
+                itemsize = int(_tensor_data_type_to_np_dtype(initializer.data_type).itemsize)
                 estimated_bytes = numel * itemsize
                 if max_array_size and max_array_size > 0 and estimated_bytes > max_array_size:
+                    oversized_initializers_skipped += 1
                     continue
 
                 array = onnx.numpy_helper.to_array(initializer)
@@ -819,8 +881,40 @@ class OnnxScanner(BaseScanner):
                 )
                 continue
 
+        if external_initializers_skipped or oversized_initializers_skipped or extraction_failures:
+            self._mark_weight_distribution_incomplete(
+                result,
+                path,
+                reason="partial_initializer_coverage",
+                message="Weight distribution analysis skipped one or more eligible ONNX initializers",
+                details={
+                    "eligible_initializers": eligible_initializers,
+                    "analyzed_initializers": len(weights_info),
+                    "external_initializers_skipped": external_initializers_skipped,
+                    "oversized_initializers_skipped": oversized_initializers_skipped,
+                    "extraction_failures": extraction_failures,
+                    "max_array_size": max_array_size,
+                },
+            )
+
         if not weights_info:
             # Nothing to analyse (external-only model, or all tensors too small / too large).
+            return
+
+        try:
+            from scipy import stats as _stats  # noqa: F401
+
+            # Lazy-import the weight distribution scanner to avoid circular deps
+            # and heavy library loads when the scanner is not needed.
+            from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
+        except Exception as e:
+            self._mark_weight_distribution_incomplete(
+                result,
+                path,
+                reason="missing_dependency",
+                message=f"Weight distribution analysis dependency unavailable: {e!s}",
+                details={"exception": str(e), "exception_type": type(e).__name__},
+            )
             return
 
         # Delegate the actual statistical analysis to WeightDistributionScanner.
@@ -853,6 +947,37 @@ class OnnxScanner(BaseScanner):
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
+            self._mark_weight_distribution_incomplete(
+                result,
+                path,
+                reason="analysis_failed",
+                message=f"Weight distribution analysis failed: {e!s}",
+                details={"exception": str(e), "exception_type": type(e).__name__},
+            )
+
+    def _mark_weight_distribution_incomplete(
+        self,
+        result: ScanResult,
+        path: str,
+        *,
+        reason: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        _mark_inconclusive_scan_result(result, ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON)
+        result.add_check(
+            name="Weight Distribution Analysis Coverage",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=path,
+            rule_code="S902",
+            details={
+                "scan_outcome_reason": ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON,
+                "coverage_gap": reason,
+                **(details or {}),
+            },
+        )
 
     def extract_metadata(self, file_path: str) -> dict[str, Any]:
         """Extract ONNX model metadata."""

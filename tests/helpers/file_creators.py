@@ -13,6 +13,33 @@ from pathlib import Path
 from typing import Any
 
 
+def _tar_octal_field(value: int, length: int) -> bytes:
+    return f"{value:0{length - 1}o}\0".encode("ascii")[-length:]
+
+
+def create_v7_tar_archive(path: Path, *, member_name: str = "payload.txt", payload: bytes = b"payload") -> Path:
+    """Create a legacy TAR archive without a ustar magic marker."""
+    header = bytearray(512)
+    encoded_name = member_name.encode("utf-8")
+    if not encoded_name or len(encoded_name) > 100:
+        raise ValueError("member_name must encode to 1-100 bytes")
+
+    header[: len(encoded_name)] = encoded_name
+    header[100:108] = _tar_octal_field(0o644, 8)
+    header[108:116] = _tar_octal_field(0, 8)
+    header[116:124] = _tar_octal_field(0, 8)
+    header[124:136] = _tar_octal_field(len(payload), 12)
+    header[136:148] = _tar_octal_field(0, 12)
+    header[148:156] = b"        "
+    header[156:157] = b"0"
+    checksum = sum(header)
+    header[148:156] = f"{checksum:06o}\0 ".encode("ascii")
+
+    padding = b"\0" * ((512 - (len(payload) % 512)) % 512)
+    path.write_bytes(bytes(header) + payload + padding + (b"\0" * 1024))
+    return path
+
+
 def create_safe_pickle(path: Path, data: dict[str, Any] | None = None) -> Path:
     """Create a safe pickle file for testing.
 
@@ -105,7 +132,7 @@ def write_mock_pytorch_zip_metadata(zf: zipfile.ZipFile, *, prefix: str = "") ->
     zf.writestr(f"{member_prefix}byteorder", "little")
 
 
-def create_mock_gguf(path: Path, *, version: int = 3) -> Path:
+def create_mock_gguf(path: Path, *, version: int = 3, metadata: dict[str, str] | None = None) -> Path:
     """Create a mock GGUF file for testing.
 
     Args:
@@ -115,14 +142,44 @@ def create_mock_gguf(path: Path, *, version: int = 3) -> Path:
     Returns:
         Path to created file
     """
-    # GGUF magic: "GGUF" + version (little-endian uint32)
-    magic = b"GGUF"
-    version_bytes = struct.pack("<I", version)
-    # Minimal header: tensor_count=0, metadata_kv_count=0
-    tensor_count = struct.pack("<Q", 0)
-    metadata_count = struct.pack("<Q", 0)
+    payload = bytearray()
+    payload.extend(b"GGUF")
+    payload.extend(struct.pack("<I", version))
+    payload.extend(struct.pack("<Q", 0))
 
-    path.write_bytes(magic + version_bytes + tensor_count + metadata_count)
+    metadata = metadata or {}
+    payload.extend(struct.pack("<Q", len(metadata)))
+    for key, value in metadata.items():
+        encoded_key = key.encode("utf-8")
+        encoded_value = value.encode("utf-8")
+        payload.extend(struct.pack("<Q", len(encoded_key)))
+        payload.extend(encoded_key)
+        payload.extend(struct.pack("<I", 8))
+        payload.extend(struct.pack("<Q", len(encoded_value)))
+        payload.extend(encoded_value)
+
+    path.write_bytes(bytes(payload))
+    return path
+
+
+def create_mock_onnx(
+    path: Path,
+    *,
+    op_type: str = "Relu",
+    domain: str = "",
+    tensor_shape: tuple[int, ...] = (1,),
+) -> Path:
+    """Create a small ONNX model for routing and scanner tests."""
+    import onnx
+    from onnx import TensorProto, helper
+
+    shape = list(tensor_shape) or [1]
+    x_value = helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)
+    y_value = helper.make_tensor_value_info("output", TensorProto.FLOAT, shape)
+    node = helper.make_node(op_type, ["input"], ["output"], domain=domain, name="node")
+    graph = helper.make_graph([node], "graph", [x_value], [y_value])
+    model = helper.make_model(graph)
+    onnx.save(model, str(path))
     return path
 
 

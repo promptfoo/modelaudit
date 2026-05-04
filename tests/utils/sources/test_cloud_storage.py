@@ -1,12 +1,17 @@
 import asyncio
+import json
 import logging
+import os
+import stat
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from modelaudit.utils.helpers.retry import RetryError
 from modelaudit.utils.sources.cloud_storage import (
     GCSCache,
+    _build_safe_local_path,
     _run_coroutine_sync,
     analyze_cloud_target,
     download_from_cloud,
@@ -14,13 +19,19 @@ from modelaudit.utils.sources.cloud_storage import (
     filter_scannable_files,
     get_cloud_object_size,
     is_cloud_url,
+    redact_cloud_error_for_display,
+    redact_url_for_display,
 )
 
 
 def make_fs_mock() -> MagicMock:
     fs = MagicMock()
     fs.__enter__.return_value = fs
-    fs.__exit__.side_effect = lambda exc_type, exc, tb: fs.close()
+
+    def close_context(_exc_type: object, _exc: object, _tb: object) -> None:
+        fs.close()
+
+    fs.__exit__.side_effect = close_context
     return fs
 
 
@@ -35,7 +46,7 @@ def test_run_coroutine_sync_without_running_loop() -> None:
 
 
 class TestCloudURLDetection:
-    def test_valid_cloud_urls(self):
+    def test_detects_valid_cloud_url_patterns(self):
         valid = [
             "s3://bucket/key",
             "gs://my-bucket/model.pt",
@@ -47,7 +58,7 @@ class TestCloudURLDetection:
         for url in valid:
             assert is_cloud_url(url), f"Failed to detect {url}"
 
-    def test_invalid_cloud_urls(self):
+    def test_rejects_invalid_cloud_url_patterns(self):
         invalid = [
             "https://huggingface.co/model",
             "ftp://example.com/file",
@@ -57,8 +68,95 @@ class TestCloudURLDetection:
             assert not is_cloud_url(url), f"Incorrectly detected {url}"
 
 
+class TestCloudURLRedaction:
+    def test_redact_url_for_display_strips_credentials_and_query(self) -> None:
+        url = "https://user:pass@example.com:8443/path/to/model.bin?X-Amz-Signature=secret#fragment"
+        assert redact_url_for_display(url) == "https://example.com:8443/path/to/model.bin"
+
+    def test_redact_url_for_display_strips_cloud_query_params(self) -> None:
+        url = "s3://bucket/model.bin?X-Amz-Credential=secret&X-Amz-Signature=secret"
+        assert redact_url_for_display(url) == "s3://bucket/model.bin"
+
+    def test_redact_cloud_error_for_display_redacts_embedded_signed_urls(self) -> None:
+        url = "s3://bucket/model.bin?X-Amz-Credential=cred&X-Amz-Signature=secret"
+        message = f"Forbidden while opening {url}"
+
+        redacted = redact_cloud_error_for_display(message, url)
+
+        assert "s3://bucket/model.bin" in redacted
+        assert "X-Amz-Credential" not in redacted
+        assert "X-Amz-Signature" not in redacted
+        assert "secret" not in redacted
+
+    def test_redact_cloud_error_for_display_redacts_query_credentials_without_exact_url(self) -> None:
+        message = (
+            "provider failed: https://storage.googleapis.com/bucket/model.bin?X-Goog-Signature=secret&token=abc123"
+        )
+
+        redacted = redact_cloud_error_for_display(message)
+
+        assert "X-Goog-Signature=<redacted>" in redacted
+        assert "token=<redacted>" in redacted
+        assert "secret" not in redacted
+        assert "abc123" not in redacted
+
+
+@patch("modelaudit.utils.helpers.retry.time.sleep")
 @patch("fsspec.filesystem")
-def test_download_from_cloud(mock_fs, tmp_path):
+def test_analyze_cloud_target_redacts_signed_url_retry_logs(
+    mock_fs: MagicMock, mock_sleep: MagicMock, caplog: pytest.LogCaptureFixture
+) -> None:
+    url = "s3://bucket/model.bin?X-Amz-Signature=secret"
+    fs = make_fs_mock()
+    fs.info.side_effect = OSError(f"Forbidden while opening {url}")
+    mock_fs.return_value = fs
+    caplog.set_level(logging.DEBUG, logger="modelaudit.utils.helpers.retry")
+
+    result = asyncio.run(analyze_cloud_target(url))
+
+    assert "X-Amz-Signature" not in result["error"]
+    assert "secret" not in result["error"]
+    assert "s3://bucket/model.bin" in caplog.text
+    assert "X-Amz-Signature" not in caplog.text
+    assert "secret" not in caplog.text
+    mock_sleep.assert_called()
+
+
+@patch("fsspec.filesystem")
+def test_analyze_cloud_target_directory_success(mock_fs: MagicMock) -> None:
+    url = "s3://bucket/path/"
+    model_url = "s3://bucket/path/model.bin"
+    fs = make_fs_mock()
+
+    def info_side_effect(path: str) -> dict[str, object]:
+        if path == url:
+            return {"type": "directory", "name": "bucket/path/"}
+        if path == model_url:
+            return {"type": "file", "size": 2048}
+        raise FileNotFoundError(path)
+
+    fs.info.side_effect = info_side_effect
+    fs.glob.return_value = [model_url]
+    mock_fs.return_value = fs
+
+    result = asyncio.run(analyze_cloud_target(url))
+
+    assert result["type"] == "directory"
+    assert result["file_count"] == 1
+    assert result["total_size"] == 2048
+    assert result["human_size"] == "2.0 KB"
+    assert result["files"] == [{"path": model_url, "name": "model.bin", "size": 2048, "human_size": "2.0 KB"}]
+    fs.glob.assert_called_once_with("s3://bucket/path/**")
+
+
+def test_filter_scannable_files_handles_signed_cloud_urls() -> None:
+    files = [{"path": "s3://bucket/model.pkl?X-Amz-Signature=secret"}]
+
+    assert filter_scannable_files(files) == files
+
+
+@patch("fsspec.filesystem")
+def test_download_from_cloud(mock_fs: MagicMock, tmp_path: Path) -> None:
     fs_meta = make_fs_mock()
     fs_meta.info.return_value = {"type": "file", "size": 1024}
 
@@ -79,9 +177,133 @@ def test_download_from_cloud(mock_fs, tmp_path):
     # Result should be a path containing the filename
     assert isinstance(result, Path)
     assert result.name == "model.pt"
-    assert result.exists() or True  # Mock doesn't create actual files
 
     # Note: fsspec filesystems don't need explicit cleanup according to implementation
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("modelaudit.utils.sources.cloud_storage.check_disk_space")
+@patch("fsspec.filesystem")
+def test_download_from_cloud_strips_query_params_from_local_path(
+    mock_fs: MagicMock, mock_disk_space: MagicMock, mock_analyze: AsyncMock, tmp_path: Path
+) -> None:
+    url = "s3://bucket/model.bin?X-Amz-Signature=secret"
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": 1024}
+    fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
+    mock_fs.return_value = fs
+    mock_analyze.return_value = {
+        "type": "file",
+        "size": 1024,
+        "name": "model.bin",
+        "human_size": "1.0 KB",
+        "estimated_time": "1 second",
+    }
+    mock_disk_space.return_value = (True, "")
+
+    result = download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
+
+    assert isinstance(result, Path)
+    assert result.name == "model.bin"
+    assert "X-Amz-Signature" not in str(result)
+    assert "secret" not in str(result)
+    assert "X-Amz-Signature" not in fs.get.call_args.args[1]
+    assert "secret" not in fs.get.call_args.args[1]
+
+
+def test_build_safe_local_path_preserves_signed_directory_relative_paths(tmp_path: Path) -> None:
+    """Signed directory URLs should keep object-relative paths without query secrets."""
+    base_url = "s3://bucket/models?X-Amz-Signature=base-secret"
+    first = "s3://bucket/models/a/model.pkl?X-Amz-Signature=first-secret"
+    second = "s3://bucket/models/b/model.pkl?X-Amz-Signature=second-secret"
+
+    first_path = _build_safe_local_path(base_url, first, tmp_path)
+    second_path = _build_safe_local_path(base_url, second, tmp_path)
+
+    assert first_path == tmp_path / "a" / "model.pkl"
+    assert second_path == tmp_path / "b" / "model.pkl"
+    assert "X-Amz-Signature" not in str(first_path)
+    assert "X-Amz-Signature" not in str(second_path)
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("modelaudit.utils.sources.cloud_storage.check_disk_space")
+@patch("fsspec.filesystem")
+def test_download_from_cloud_redacts_sensitive_url_in_errors(
+    mock_fs: MagicMock, mock_disk_space: MagicMock, mock_analyze: AsyncMock, tmp_path: Path
+) -> None:
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": 1024}
+    mock_fs.return_value = fs
+    mock_analyze.return_value = {
+        "type": "file",
+        "size": 1024,
+        "name": "model.bin",
+        "human_size": "1.0 KB",
+        "estimated_time": "1 second",
+    }
+    mock_disk_space.return_value = (False, "not enough space")
+
+    url = "s3://bucket/model.bin?X-Amz-Signature=secret"
+
+    with pytest.raises(Exception) as excinfo:
+        download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
+
+    assert "s3://bucket/model.bin" in str(excinfo.value)
+    assert "X-Amz-Signature" not in str(excinfo.value)
+
+
+@patch("modelaudit.utils.helpers.retry.time.sleep")
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+@patch("modelaudit.utils.sources.cloud_storage.check_disk_space")
+@patch("fsspec.filesystem")
+def test_download_from_cloud_redacts_signed_url_retry_logs(
+    mock_fs: MagicMock,
+    mock_disk_space: MagicMock,
+    mock_analyze: MagicMock,
+    mock_sleep: MagicMock,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    url = "s3://bucket/model.bin?X-Amz-Signature=secret"
+    fs = make_fs_mock()
+    fs.info.return_value = {"type": "file", "size": 1024}
+    fs.get.side_effect = OSError(f"Forbidden while opening {url}")
+    mock_fs.return_value = fs
+    mock_analyze.return_value = {
+        "type": "file",
+        "size": 1024,
+        "name": "model.bin",
+        "human_size": "1.0 KB",
+        "estimated_time": "1 second",
+    }
+    mock_disk_space.return_value = (True, "")
+    caplog.set_level(logging.DEBUG, logger="modelaudit.utils.helpers.retry")
+
+    with pytest.raises(RetryError):
+        download_from_cloud(url, cache_dir=tmp_path, use_cache=False, show_progress=False)
+
+    assert "s3://bucket/model.bin" in caplog.text
+    assert "X-Amz-Signature" not in caplog.text
+    assert "secret" not in caplog.text
+    mock_sleep.assert_called()
+
+
+@patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
+def test_download_from_cloud_redacts_raw_analyzer_error_url(mock_analyze):
+    url = "s3://bucket/model.bin?X-Amz-Signature=secret"
+    mock_analyze.return_value = {
+        "type": "unknown",
+        "error": f"Forbidden while opening {url}",
+    }
+
+    with pytest.raises(ValueError) as excinfo:
+        download_from_cloud(url, use_cache=False, show_progress=False)
+
+    message = str(excinfo.value)
+    assert "s3://bucket/model.bin" in message
+    assert "X-Amz-Signature" not in message
+    assert "secret" not in message
 
 
 @pytest.mark.asyncio
@@ -89,6 +311,12 @@ async def test_download_from_cloud_async_context(tmp_path: Path) -> None:
     """download_from_cloud should work from an active event loop context."""
     fs = make_fs_mock()
     fs.info.return_value = {"type": "file", "size": 1024}
+    downloaded_content = b"async test payload"
+
+    def mock_get(remote_path: str, local_path: str, **_kwargs: object) -> None:
+        Path(local_path).write_bytes(downloaded_content)
+
+    fs.get.side_effect = mock_get
 
     async def mock_analyze(_url: str) -> dict[str, object]:
         return {
@@ -112,6 +340,12 @@ async def test_download_from_cloud_async_context(tmp_path: Path) -> None:
 
     assert isinstance(result, Path)
     assert result.name == "model.pt"
+    fs.get.assert_called_once()
+    get_args = fs.get.call_args.args
+    assert get_args[0] == "s3://bucket/model.pt"
+    assert Path(get_args[1]) == result
+    assert result.exists()
+    assert result.read_bytes() == downloaded_content
 
 
 @patch("modelaudit.utils.sources.cloud_storage.analyze_cloud_target", new_callable=AsyncMock)
@@ -133,11 +367,12 @@ def test_download_from_cloud_streaming_returns_stream_url(mock_preview, mock_ana
 
 
 @pytest.mark.asyncio
-async def test_download_from_cloud_streaming_async_context() -> None:
+async def test_download_from_cloud_streaming_async_context(tmp_path: Path) -> None:
     """download_from_cloud_streaming should work from an active event loop context."""
     fs = make_fs_mock()
     fs.info.return_value = {"type": "file", "size": 1024}
     fs.get.side_effect = lambda _src, dst: Path(dst).write_bytes(b"data")
+    temp_dir = tmp_path / "streaming-tempdir"
 
     async def mock_analyze(_url: str) -> dict[str, object]:
         return {
@@ -156,6 +391,7 @@ async def test_download_from_cloud_streaming_async_context() -> None:
             "modelaudit.utils.sources.cloud_storage.asyncio.run_coroutine_threadsafe",
             side_effect=AssertionError("run_coroutine_threadsafe should not be used"),
         ),
+        patch("modelaudit.utils.sources.cloud_storage.tempfile.mkdtemp", return_value=str(temp_dir)) as mock_mkdtemp,
     ):
         streamed = list(download_from_cloud_streaming("s3://bucket/model.pt", show_progress=False))
 
@@ -163,6 +399,9 @@ async def test_download_from_cloud_streaming_async_context() -> None:
     streamed_path, is_last = streamed[0]
     assert streamed_path.name == "model.pt"
     assert is_last is True
+    fs.get.assert_called_once()
+    mock_mkdtemp.assert_called_once_with(prefix="modelaudit_stream_")
+    assert not temp_dir.exists()
 
 
 @patch("builtins.__import__")
@@ -507,7 +746,7 @@ class TestCloudCacheSafety:
         cached_path = cache.get_cached_path("s3://bucket/model.bin")
         assert cached_path is not None
         assert cached_path.resolve() != source_file.resolve()
-        cached_path.resolve().relative_to(cache.cache_dir.resolve())
+        assert cached_path.resolve().is_relative_to(cache.cache_dir.resolve())
         assert source_file.exists()
 
     def test_clean_old_cache_does_not_delete_outside_cache(
@@ -537,6 +776,31 @@ class TestCloudCacheSafety:
         assert outside_file.exists()
         assert poisoned_key not in cache.metadata
         assert "outside cache dir" in caplog.text
+
+    def test_cache_metadata_redacts_signed_urls_and_uses_private_permissions(self, tmp_path: Path) -> None:
+        """Cache metadata should not persist raw signed URL credentials."""
+        cache = GCSCache(cache_dir=tmp_path / "cache")
+        source_file = tmp_path / "artifact.bin"
+        source_file.write_bytes(b"artifact")
+        signed_url = (
+            "https://user:pass@bucket.s3.amazonaws.com/path/model.bin"
+            "?X-Amz-Credential=secret&X-Amz-Signature=sig#fragment"
+        )
+
+        cache.cache_file(signed_url, source_file, etag="etag-value")
+
+        raw_metadata = cache.metadata_file.read_text(encoding="utf-8")
+        metadata = json.loads(raw_metadata)
+        entry = metadata[cache.get_cache_key(signed_url)]
+        assert "url" not in entry
+        assert entry["url_sha256"] == cache.get_cache_key(signed_url)
+        assert entry["url_display"] == "https://bucket.s3.amazonaws.com/path/model.bin"
+        assert "X-Amz-Credential" not in raw_metadata
+        assert "X-Amz-Signature" not in raw_metadata
+        assert "user:pass" not in raw_metadata
+        assert "fragment" not in raw_metadata
+        if os.name != "nt":
+            assert stat.S_IMODE(cache.metadata_file.stat().st_mode) == 0o600
 
 
 class TestCloudDownloadCleanup:
@@ -578,9 +842,10 @@ class TestCloudDownloadCleanup:
         assert not temp_download_dir.exists()
 
 
-def test_filter_scannable_files_recognizes_pdiparams():
-    files = [{"path": "model.pdiparams"}]
-    assert filter_scannable_files(files) == files
+def test_filter_scannable_files_recognizes_pdiparams() -> None:
+    files = [{"path": "model.pdiparams"}, {"path": "notes.csv"}, {"path": "preview.png"}]
+
+    assert filter_scannable_files(files) == [{"path": "model.pdiparams"}]
 
 
 def test_filter_scannable_files_uses_registry_extensions():

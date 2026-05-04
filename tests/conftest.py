@@ -37,6 +37,11 @@ _FRAMEWORK_MODULES = {
 }
 _FRAMEWORK_AVAILABILITY: dict[str, bool] = {}
 
+# Reduced CI lanes only install the dependency set needed for this curated test
+# subset. Keep this centralized so adding a supported Python version requires one
+# deliberate update instead of duplicating version checks in hook logic.
+RESTRICTED_PYTHON_VERSIONS = frozenset({(3, 10), (3, 12), (3, 13)})
+
 
 def _check_framework(name: str) -> bool:
     """Check whether a framework package can be imported, with lazy caching."""
@@ -80,8 +85,8 @@ HAS_SYMLINKS = _detect_symlink_support()
 
 def pytest_runtest_setup(item):
     """Skip tests based on Python version and framework availability."""
-    # Skip problematic tests on Python 3.10, 3.12, and 3.13 to ensure CI passes
-    if sys.version_info[:2] in [(3, 10), (3, 12), (3, 13)]:
+    # Skip problematic tests on restricted Python versions to ensure CI passes
+    if sys.version_info[:2] in RESTRICTED_PYTHON_VERSIONS:
         test_file = str(item.fspath)
 
         # Only allow core XGBoost scanner tests and basic unit tests on problematic Python versions
@@ -91,6 +96,7 @@ def pytest_runtest_setup(item):
             "test_picklescan_adapter.py",
             "test_joblib_scanner.py",
             "test_scanner_registry.py",  # Scanner registry routing and metadata tests
+            "test_scanner_selection.py",  # Scanner selection policy and routing tests
             "test_lazy_loading.py",  # Lazy scanner descriptor/catalog tests
             "test_graceful_degradation.py",  # Scanner dependency degradation tests
             "test_joblib_scanner_codecs.py",  # Joblib raw/compressed pickle fallback regression tests
@@ -111,14 +117,20 @@ def pytest_runtest_setup(item):
             "test_core_asset_extraction.py",  # Check consolidation and location parsing regressions
             "test_manifest_scanner.py",  # Manifest scanner tests
             "test_metadata_scanner.py",  # Metadata scanner tests
+            "test_metadata_extractor.py",  # Metadata extractor helper routing and CLI tests
             "test_weak_hash_detection.py",  # Weak hash detection tests
             "test_cloud_url_detection.py",  # Cloud storage URL detection tests
+            "test_license_checker.py",  # License metadata and nearby-license caching tests
+            "test_license_integration.py",  # End-to-end license metadata integration tests
             "tests/utils/sources/test_cloud_storage.py",  # Cloud storage source tests
             "test_skops_scanner.py",  # Skops scanner CVE detection tests
             "test_keras_zip_scanner.py",  # Keras ZIP scanner tests
+            "test_flax_msgpack_scanner.py",  # Flax msgpack scanner performance and safety tests
+            "test_keras_utils.py",  # Shared Keras scanner helper tests
             "test_nemo_scanner.py",  # NeMo scanner CVE-2025-23304 tests
             "test_numpy_scanner.py",  # NumPy scanner CVE-2019-6446 tests
             "test_onnx_scanner.py",  # ONNX scanner CVE-2025-51480 tests
+            "test_pmml_scanner.py",  # PMML suspicious-content false-positive regressions
             "test_safetensors_scanner.py",  # SafeTensors scanner dtype and metadata tests
             "test_rule_mapper.py",  # Rule mapper validity and network mapping tests
             "test_rule_code_registry_consistency.py",  # Scanner literal rule-code registry consistency
@@ -151,6 +163,7 @@ def pytest_runtest_setup(item):
             "test_auth_config.py",  # auth config path and secret-storage hardening tests
             "test_utils.py",  # archive path sanitization regression coverage
             "test_exit_codes.py",  # exit-code precedence regression tests
+            "test_models.py",  # aggregate result model and exit-code propagation tests
             "test_file_filter.py",  # Directory file prefilter tests
             "test_huggingface.py",  # HuggingFace provenance and cache path tests
             "test_oci_layer_scanner.py",  # OCI layer path safety regression tests
@@ -161,6 +174,7 @@ def pytest_runtest_setup(item):
             "test_zip_scanner.py",  # ZIP archive scanner tests
             "test_sevenzip_scanner.py",  # 7-Zip archive scanner tests
             "test_regression_corpus.py",  # malicious/safe fixture regression gate
+            "test_committed_fixture_hygiene.py",  # committed fixture artifact inventory guardrails
             "test_nested_pickle_integration.py",  # nested pickle false-positive/true-positive integration tests
             "test_ml_context_false_positives.py",  # ML-context executable filtering regression tests
             "test_cli_output.py",  # CliRunner JSON parsing helper regression tests
@@ -169,9 +183,19 @@ def pytest_runtest_setup(item):
             "test_optimized_config.py",  # optimized cache config regression tests
             "test_large_file_handler.py",  # Large file handler regression tests
             "test_file_iterator.py",  # Streaming file iterator memory regression tests
-            "test_benchmark_report.py",  # benchmark CI summary and regression gate tests
-            "test_compare_pickle_scanners.py",  # standalone pickle differential harness regression tests
+            "test_large_pickle_corpus_qa.py",  # large PickleScan Rust corpus QA harness tests
+            "test_call_graph_click.py",  # standalone picklescan Click editor call-graph RCE regressions
+            "test_call_graph_execnet.py",  # standalone picklescan execnet call-graph RCE regressions
+            "test_call_graph_instance_defaults.py",  # standalone picklescan constructor-default alias RCE regressions
+            "test_call_graph_import_statements.py",  # standalone picklescan import-statement call-graph RCE regressions
+            "test_call_graph_local_imports.py",  # standalone picklescan function-local import RCE regressions
+            "test_call_graph_six.py",  # standalone picklescan six.moves alias RCE regressions
+            "test_call_graph_tkinter.py",  # standalone picklescan Tcl call-graph RCE regressions
+            "test_dill_joblib_enhanced.py",  # Dill/joblib pickle routing regression tests
+            "test_pickle_context_filtering.py",  # Pickle context filtering regression tests
             "test_xdist_status.py",  # xdist worker progress reporting tests
+            "test_release_workflow.py",  # release workflow regression tests
+            "test_docker_workflow.py",  # Docker workflow regression tests
         ]
 
         # Check if this is an allowed test file
@@ -282,20 +306,21 @@ def temp_model_dir(tmp_path):
 
 
 @pytest.fixture
-def mock_progress_callback():
-    """Return a mock progress callback function that records calls."""
-    progress_messages = []
-    progress_percentages = []
+def mock_progress_callback() -> "ProgressCallbackRecorder":
+    """Return a mock progress callback object that records calls."""
+    return ProgressCallbackRecorder()
 
-    def progress_callback(message, percentage):
-        progress_messages.append(message)
-        progress_percentages.append(percentage)
 
-    # Add the recorded messages and percentages as attributes
-    progress_callback.messages = progress_messages  # type: ignore[attr-defined]
-    progress_callback.percentages = progress_percentages  # type: ignore[attr-defined]
+class ProgressCallbackRecorder:
+    """Record progress callback calls for assertions in integration tests."""
 
-    return progress_callback
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+        self.percentages: list[float] = []
+
+    def __call__(self, message: str, percentage: float) -> None:
+        self.messages.append(message)
+        self.percentages.append(percentage)
 
 
 @pytest.fixture
@@ -396,7 +421,16 @@ def pytest_configure_node(node: Any) -> None:
     global _xdist_status_reporter
 
     if _xdist_status_reporter is None:
-        status_dir = node.config._tmp_path_factory.mktemp("modelaudit-pytest-xdist")  # type: ignore[attr-defined]
+        # pytest does not expose a public API at this xdist hook point for creating
+        # a controller-owned temp directory. Pytest 8.4+ provides this internal
+        # factory; fail clearly if a future pytest release removes it.
+        tmp_path_factory = getattr(node.config, "_tmp_path_factory", None)
+        if tmp_path_factory is None:
+            raise RuntimeError(
+                "pytest internal API changed: '_tmp_path_factory' is unavailable in pytest_configure_node"
+            )
+
+        status_dir = tmp_path_factory.mktemp("modelaudit-pytest-xdist")
         _xdist_status_reporter = XdistWorkerStatusReporter.from_environment(status_dir)
         if _xdist_status_reporter is None:
             return

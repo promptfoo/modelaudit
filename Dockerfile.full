@@ -1,41 +1,63 @@
-FROM python:3.13-slim@sha256:d168b8d9eb761f4d3fe305ebd04aeb7e7f2de0297cec5fb2f8f6403244621664
+ARG PYTHON_IMAGE=python:3.13-slim@sha256:a0779d7c12fc20be6ec6b4ddc901a4fd7657b8a6bc9def9d3fde89ed5efe0a3d
+# Keep the major/minor version in sync with packages/modelaudit-picklescan/Cargo.toml rust-version.
+ARG PICKLESCAN_RUST_TOOLCHAIN=1.83.0
+
+FROM ${PYTHON_IMAGE} AS builder
+ARG PICKLESCAN_RUST_TOOLCHAIN
+
+WORKDIR /build
+
+COPY . .
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 \
+    && apt-get install --yes --no-install-recommends build-essential ca-certificates curl \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain "${PICKLESCAN_RUST_TOOLCHAIN}" \
+    && PATH="/root/.cargo/bin:${PATH}" pip wheel --no-cache-dir --wheel-dir /wheels \
+        ./packages/modelaudit-picklescan \
+        .
+
+FROM ${PYTHON_IMAGE} AS runtime
 
 WORKDIR /app
 
-# Pull in current Debian security fixes from the configured apt sources.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 \
+    && apt-get install --yes --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy source code first
-COPY . .
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/*.whl \
+    && rm -rf /wheels
 
-# Copy and make entrypoint script executable
 COPY docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# Install core dependencies first (lightweight)
-RUN pip install --no-cache-dir .
-
-# Install ML frameworks with minimal dependencies to avoid disk space issues
-# Skip CUDA/GPU dependencies that cause disk space problems in Docker
 RUN pip install --no-cache-dir \
     "tensorflow-cpu>=2.13.0,<3.0" \
     "h5py>=3.1,<4.0" \
     "onnx>=1.12.0,<2.0" \
     "scikit-learn>=1.0.0,<2.0"
 
-# Install PyTorch CPU-only from separate index to avoid CUDA dependencies
 RUN pip install --no-cache-dir \
     "torch>=2.6.0,<3.0" --index-url https://download.pytorch.org/whl/cpu
 
-# The PyTorch CPU index currently carries an older setuptools wheel; restore a
-# PyPI build that satisfies torch's <82 constraint and clears image scanners.
 RUN pip install --no-cache-dir "setuptools>=78.1.1,<82"
 
-# For CI testing purposes, we'll run as root to avoid volume mount permission issues
-# In production, users can override with --user flag if needed
+ARG UID=10001
+RUN adduser \
+    --disabled-password \
+    --gecos "" \
+    --home "/nonexistent" \
+    --shell "/sbin/nologin" \
+    --no-create-home \
+    --uid "${UID}" \
+    appuser \
+    && mkdir -p /data \
+    && chown appuser:appuser /data
 
-# Set the flexible entrypoint
+USER appuser
+
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["--help"] 
+CMD ["--help"]

@@ -1,12 +1,23 @@
 """Tests for network communication detection."""
 
+import os
+from pathlib import Path
+from urllib.parse import urlparse
+
+import pytest
+
 from modelaudit.detectors.network_comm import NetworkCommDetector, detect_network_communication
+
+
+def _is_ci_environment() -> bool:
+    """Check CI/GitHub Actions env vars to determine whether tests run in CI."""
+    return bool(os.getenv("CI") or os.getenv("GITHUB_ACTIONS"))
 
 
 class TestNetworkCommDetector:
     """Test the NetworkCommDetector class."""
 
-    def test_detect_urls(self):
+    def test_detect_urls(self) -> None:
         """Test detection of URLs in binary data."""
         detector = NetworkCommDetector()
 
@@ -26,8 +37,8 @@ class TestNetworkCommDetector:
 
         # Check specific URLs are detected
         urls = [f["url"] for f in url_findings]
-        assert any("example.com" in url for url in urls)
-        assert any("malware.net" in url for url in urls)
+        assert any(urlparse(url).hostname == "example.com" for url in urls)
+        assert any(urlparse(url).hostname == "malware.net" for url in urls)
 
     def test_detect_urls_redacts_credentials_and_query(self) -> None:
         """URL findings should not preserve credentialed or signed URL secrets."""
@@ -78,7 +89,7 @@ class TestNetworkCommDetector:
         assert "SECRET_SIGNATURE" not in serialized
         assert cloud_finding["provider"] == "s3"
 
-    def test_detect_ipv4_addresses(self):
+    def test_detect_ipv4_addresses(self) -> None:
         """Test detection of IPv4 addresses."""
         detector = NetworkCommDetector()
 
@@ -101,7 +112,25 @@ class TestNetworkCommDetector:
         assert len(private_ips) == 3  # 192.168, 10.0, 172.16
         assert len(public_ips) == 1  # 8.8.8.8
 
-    def test_detect_ipv6_addresses(self):
+    def test_nearby_version_word_does_not_hide_ipv4(self) -> None:
+        """Nearby prose should not hide an actual IP address."""
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(b"callback version 8.8.8.8 now")
+
+        assert any(finding["type"] == "ipv4_address" and finding["ip"] == "8.8.8.8" for finding in findings)
+
+    def test_explicit_version_literals_are_not_reported_as_ipv4(self) -> None:
+        """Version-shaped metadata should not be reported as network endpoints."""
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(
+            b"version 1.2.3.4\nmodel version 2.3.4.5\nrelease 3.4.5.6\nver=4.5.6.7 build=5.6.7.8\n"
+        )
+
+        assert not [finding for finding in findings if finding["type"] == "ipv4_address"]
+
+    def test_detect_ipv6_addresses(self) -> None:
         """Test detection of IPv6 addresses."""
         detector = NetworkCommDetector()
 
@@ -115,7 +144,7 @@ class TestNetworkCommDetector:
 
         assert len(ipv6_findings) == 2
 
-    def test_detect_domain_names(self):
+    def test_detect_domain_names(self) -> None:
         """Test detection of domain names."""
         detector = NetworkCommDetector()
 
@@ -134,7 +163,25 @@ class TestNetworkCommDetector:
         suspicious = [f for f in domain_findings if f["confidence"] > 0.6]
         assert len(suspicious) >= 2  # .tk and .ml are suspicious
 
-    def test_detect_network_libraries(self):
+    def test_ml_word_inside_real_domain_is_still_detected(self) -> None:
+        """DNS-shaped endpoints containing ML terms should not be suppressed."""
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(b"connect to evil-weight-domain.com")
+
+        assert any(
+            finding["type"] == "domain_name" and finding["domain"] == "evil-weight-domain.com" for finding in findings
+        )
+
+    def test_tensor_method_calls_are_not_reported_as_domains(self) -> None:
+        """Common tensor method calls should not be mistaken for DNS names."""
+        detector = NetworkCommDetector()
+
+        findings = detector.scan(b"weight.to(device)\nbias.to(device)\n")
+
+        assert not [finding for finding in findings if finding["type"] == "domain_name"]
+
+    def test_detect_network_libraries(self) -> None:
         """Test detection of network library imports."""
         detector = NetworkCommDetector()
 
@@ -161,7 +208,17 @@ class TestNetworkCommDetector:
         critical = [f for f in lib_findings if f["severity"] == "CRITICAL"]
         assert len(critical) >= 2  # socket and paramiko are critical
 
-    def test_detect_network_functions(self):
+    def test_network_library_scan_uses_shared_patterns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Derived library patterns should come from the shared class table."""
+        detector = NetworkCommDetector()
+        monkeypatch.setattr(NetworkCommDetector, "NETWORK_LIBRARIES", [b"socket"])
+        monkeypatch.setattr(NetworkCommDetector, "NETWORK_LIBRARY_PATTERNS", {b"socket": (b"CUSTOM_SOCKET_PATTERN",)})
+
+        detector._scan_network_libraries(b"CUSTOM_SOCKET_PATTERN", "payload.bin")
+
+        assert any(finding["library"] == "socket" for finding in detector.findings)
+
+    def test_detect_network_functions(self) -> None:
         """Test detection of network function calls."""
         detector = NetworkCommDetector()
 
@@ -285,7 +342,7 @@ class TestNetworkCommDetector:
         lib_findings = [finding for finding in findings if finding["type"] == "network_library"]
         assert any(finding["library"] == "socket" for finding in lib_findings)
 
-    def test_detect_cc_patterns(self):
+    def test_detect_cc_patterns(self) -> None:
         """Test detection of command & control patterns."""
         detector = NetworkCommDetector()
 
@@ -310,6 +367,24 @@ class TestNetworkCommDetector:
         assert "malware" in patterns
         assert "backdoor" in patterns
         assert "botnet" in patterns
+
+    def test_cc_pattern_scan_reuses_lowered_payload(self) -> None:
+        """Reuse one lowercase payload view across all C&C pattern checks."""
+
+        class TrackingBytes(bytes):
+            lower_calls = 0
+
+            def lower(self) -> bytes:
+                self.lower_calls += 1
+                return super().lower()
+
+        detector = NetworkCommDetector()
+        data = TrackingBytes(b'payload = {"malware": True, "backdoor": True}')
+
+        detector._scan_cc_patterns(data, "payload.bin")
+
+        assert data.lower_calls == 1
+        assert {finding["pattern"] for finding in detector.findings} >= {"malware", "backdoor"}
 
     def test_benign_metadata_reference_keys_are_not_cc_patterns(self) -> None:
         """Common model metadata URL keys are not C&C indicators by themselves."""
@@ -342,7 +417,7 @@ class TestNetworkCommDetector:
             }
         )
 
-    def test_detect_suspicious_ports(self):
+    def test_detect_suspicious_ports(self) -> None:
         """Test detection of suspicious port numbers."""
         detector = NetworkCommDetector()
 
@@ -365,18 +440,17 @@ class TestNetworkCommDetector:
         assert 4444 in ports  # Metasploit
         assert 6379 in ports  # Redis
 
-    def test_suspicious_port_scan_performance(self):
+    def test_suspicious_port_scan_performance(self) -> None:
         """Ensure port scanning remains performant with precompiled patterns."""
         detector = NetworkCommDetector()
         data = b"connect to server:1337" * 100
         context = "model.bin"
 
-        import os
         import time
 
         start = time.perf_counter()
         # Fewer iterations in CI environments
-        iterations = 20 if (os.getenv("CI") or os.getenv("GITHUB_ACTIONS")) else 50
+        iterations = 20 if _is_ci_environment() else 50
         for _ in range(iterations):
             detector.findings = []
             detector._scan_suspicious_ports(data, context)
@@ -384,7 +458,15 @@ class TestNetworkCommDetector:
 
         assert duration < 1.0
 
-    def test_blacklist_detection(self):
+    def test_port_name_lookup_uses_shared_mapping(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Port-name lookup should reuse the shared class mapping."""
+        detector = NetworkCommDetector()
+        monkeypatch.setattr(NetworkCommDetector, "PORT_NAMES", {9999: "Custom Service"})
+
+        assert detector._get_port_name(9999) == "Custom Service"
+        assert detector._get_port_name(22) == "Unknown"
+
+    def test_blacklist_detection(self) -> None:
         """Test detection of blacklisted domains when configured."""
         # Configure with specific blacklisted domains
         config = {"custom_blacklist": [b"malicious-site.com", b"known-c2.net", b"phishing-domain.org"]}
@@ -405,7 +487,43 @@ class TestNetworkCommDetector:
         assert all(f["confidence"] == 1.0 for f in blacklist_findings)
         assert all(f["severity"] == "CRITICAL" for f in blacklist_findings)
 
-    def test_custom_config(self):
+    def test_blacklist_scan_reuses_lowered_payload(self) -> None:
+        """Reuse one lowercase payload view across configured blacklist checks."""
+
+        class TrackingBytes(bytes):
+            lower_calls = 0
+
+            def lower(self) -> bytes:
+                self.lower_calls += 1
+                return super().lower()
+
+        detector = NetworkCommDetector({"custom_blacklist": [b"blocked.example", b"evil.example"]})
+        data = TrackingBytes(b"https://blocked.example/payload")
+
+        detector._check_blacklist(data, "payload.bin")
+
+        assert data.lower_calls == 1
+        assert [finding["domain"] for finding in detector.findings] == ["blocked.example"]
+
+    def test_blacklist_scan_skips_lowering_without_configured_domains(self) -> None:
+        """Avoid touching payload bytes when no blacklist entries are configured."""
+
+        class TrackingBytes(bytes):
+            lower_calls = 0
+
+            def lower(self) -> bytes:
+                self.lower_calls += 1
+                return super().lower()
+
+        detector = NetworkCommDetector()
+        data = TrackingBytes(b"https://blocked.example/payload")
+
+        detector._check_blacklist(data, "payload.bin")
+
+        assert data.lower_calls == 0
+        assert detector.findings == []
+
+    def test_custom_config(self) -> None:
         """Test custom configuration options."""
         config = {
             "custom_cc_patterns": [b"custom_beacon", b"my_backdoor"],
@@ -431,10 +549,10 @@ class TestNetworkCommDetector:
         # Check custom blacklist
         blacklist_findings = [f for f in findings if f["type"] == "blacklisted_domain"]
         domains = [f["domain"] for f in blacklist_findings]
-        assert "custom-evil.com" in domains
-        assert "my-c2.net" in domains
+        assert any(domain == "custom-evil.com" for domain in domains)
+        assert any(domain == "my-c2.net" for domain in domains)
 
-    def test_custom_patterns_isolated_between_instances(self):
+    def test_custom_patterns_isolated_between_instances(self) -> None:
         """Ensure custom patterns and blacklists do not leak between instances."""
         config = {
             "custom_cc_patterns": ["LEAK_PATTERN"],
@@ -453,7 +571,7 @@ class TestNetworkCommDetector:
         assert all(f["type"] != "cc_pattern" for f in findings_default)
         assert all(f["type"] != "blacklisted_domain" for f in findings_default)
 
-    def test_confidence_scoring(self):
+    def test_confidence_scoring(self) -> None:
         """Test confidence scoring for different patterns."""
         detector = NetworkCommDetector()
 
@@ -487,7 +605,7 @@ class TestNetworkCommDetector:
         malware_findings = [f for f in cc_findings if "malware" in f["pattern"]]
         assert all(f["confidence"] >= 0.95 for f in malware_findings)
 
-    def test_no_false_positives_on_clean_data(self):
+    def test_no_false_positives_on_clean_data(self) -> None:
         """Test that clean model data doesn't trigger false positives."""
         detector = NetworkCommDetector()
 
@@ -509,7 +627,7 @@ class TestNetworkCommDetector:
         # Should not detect any network patterns
         assert len(findings) == 0
 
-    def test_context_extraction(self):
+    def test_context_extraction(self) -> None:
         """Test that context/snippets are properly extracted."""
         detector = NetworkCommDetector()
 
@@ -532,23 +650,23 @@ class TestNetworkCommDetector:
 class TestDetectNetworkCommunication:
     """Test the convenience function."""
 
-    def test_scan_file(self, tmp_path):
+    def test_scan_file(self, tmp_path: Path) -> None:
         """Test scanning a file for network patterns."""
         test_file = tmp_path / "model.pkl"
         test_file.write_bytes(b"http://malicious.com/payload")
 
         findings = detect_network_communication(str(test_file))
         assert len(findings) > 0
-        assert any("malicious.com" in f.get("url", "") for f in findings)
+        assert any(urlparse(f.get("url", "")).hostname == "malicious.com" for f in findings)
 
-    def test_file_not_found(self):
+    def test_file_not_found(self) -> None:
         """Test handling of non-existent files."""
         findings = detect_network_communication("/non/existent/file.pkl")
         assert len(findings) == 1
         assert findings[0]["type"] == "error"
         assert "not found" in findings[0]["message"]
 
-    def test_with_config(self, tmp_path):
+    def test_with_config(self, tmp_path: Path) -> None:
         """Test scanning with custom configuration."""
         test_file = tmp_path / "model.pkl"
         test_file.write_bytes(b"my_custom_pattern")

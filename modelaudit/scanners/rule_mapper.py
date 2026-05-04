@@ -4,6 +4,7 @@ Centralizes the logic for assigning rule codes to specific security issues.
 """
 
 import logging
+from collections.abc import Callable
 
 from modelaudit.rules import RuleRegistry
 
@@ -80,7 +81,7 @@ def get_import_rule_code(module: str, function: str | None = None) -> str | None
         return _rule("S404")
 
     # Pickle/serialization
-    elif module_lower in ["pickle", "cpickle", "_pickle"] or module_lower in ["dill", "cloudpickle"]:
+    elif module_lower in ["pickle", "cpickle", "_pickle", "dill", "cloudpickle"]:
         return _rule("S213")
 
     return None
@@ -112,6 +113,8 @@ def get_pickle_opcode_rule_code(opcode_name: str) -> str | None:
         return _rule("S210")
     elif opcode_upper in ["EXT1", "EXT2", "EXT4"]:
         return _rule("S211")
+    elif opcode_upper in ["PERSID", "BINPERSID"]:
+        return _rule("S212")
 
     return None
 
@@ -191,7 +194,9 @@ def get_secret_rule_code(secret_type: str) -> str | None:
         return _rule("S704")
     elif "azure" in secret_lower or "gcp" in secret_lower:
         return _rule("S705")
-    elif any(db in secret_lower for db in ["mongodb", "postgresql", "mysql", "sqlite"]):
+    elif (
+        "mongodb" in secret_lower or "postgresql" in secret_lower or "mysql" in secret_lower or "sqlite" in secret_lower
+    ):
         return _rule("S706")
     elif "jwt" in secret_lower or "bearer" in secret_lower:
         return _rule("S707")
@@ -301,6 +306,16 @@ def get_model_rule_code(issue_type: str) -> str | None:
     return None
 
 
+_GENERIC_RULE_MAPPERS: tuple[Callable[[str], str | None], ...] = (
+    get_file_issue_rule_code,
+    get_network_rule_code,
+    get_encoding_rule_code,
+    get_secret_rule_code,
+    get_embedded_code_rule_code,
+    get_model_rule_code,
+)
+
+
 def get_generic_rule_code(message: str) -> str | None:
     """
     Try to determine rule code from a generic message.
@@ -308,30 +323,24 @@ def get_generic_rule_code(message: str) -> str | None:
     """
     msg_lower = message.lower()
 
-    # Try each specialized mapper
-    for mapper in [
-        lambda: get_file_issue_rule_code(msg_lower),
-        lambda: get_network_rule_code(msg_lower),
-        lambda: get_encoding_rule_code(msg_lower),
-        lambda: get_secret_rule_code(msg_lower),
-        lambda: get_embedded_code_rule_code(msg_lower),
-        lambda: get_model_rule_code(msg_lower),
-    ]:
-        code = mapper()
-        if code:
-            return code
-
     # Check for specific patterns
     if "protocol" in msg_lower and "version" in msg_lower:
-        return _rule("S212")
+        # Informational protocol/version context; intentionally not a security rule.
+        return None
     elif (
         ("stack" in msg_lower and "depth" in msg_lower)
         or "timeout" in msg_lower
         or "timed out" in msg_lower
-        or ("opcode" in msg_lower and "count" in msg_lower)
+        or "opcode count" in msg_lower
     ):
         return None  # Internal check, no rule
     elif "unknown" in msg_lower and ("opcode" in msg_lower or "operation" in msg_lower):
         return _rule("S999")  # Unknown opcode/operation
+
+    # Try each specialized mapper
+    for mapper in _GENERIC_RULE_MAPPERS:
+        code = mapper(msg_lower)
+        if code:
+            return code
 
     return None

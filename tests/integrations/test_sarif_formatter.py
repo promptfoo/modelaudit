@@ -2,25 +2,28 @@
 
 import json
 import time
+from types import SimpleNamespace
 
-from modelaudit.integrations.sarif_formatter import (
-    _create_artifacts,
-    _create_results,
-    _create_rules,
-    _create_run,
-    _get_mime_type,
-    _get_rule_full_description,
-    _get_rule_id,
-    _get_rule_name,
-    _get_rule_short_description,
-    _get_tags_for_issue,
-    _normalize_path_to_uri,
-    _severity_to_rank,
-    _severity_to_sarif_level,
-    format_sarif_output,
-)
+import pytest
+
+import modelaudit.integrations.sarif_formatter as sarif_formatter
 from modelaudit.models import AssetModel, FileHashesModel, FileMetadataModel, create_initial_audit_result
 from modelaudit.scanners.base import Issue, IssueSeverity
+
+_create_artifacts = sarif_formatter._create_artifacts
+_create_results = sarif_formatter._create_results
+_create_rules = sarif_formatter._create_rules
+_create_run = sarif_formatter._create_run
+_get_mime_type = sarif_formatter._get_mime_type
+_get_rule_full_description = sarif_formatter._get_rule_full_description
+_get_rule_id = sarif_formatter._get_rule_id
+_get_rule_name = sarif_formatter._get_rule_name
+_get_rule_short_description = sarif_formatter._get_rule_short_description
+_get_tags_for_issue = sarif_formatter._get_tags_for_issue
+_normalize_path_to_uri = sarif_formatter._normalize_path_to_uri
+_severity_to_rank = sarif_formatter._severity_to_rank
+_severity_to_sarif_level = sarif_formatter._severity_to_sarif_level
+format_sarif_output = sarif_formatter.format_sarif_output
 
 
 class TestFormatSarifOutput:
@@ -77,6 +80,35 @@ class TestFormatSarifOutput:
         parsed = json.loads(output)
         assert len(parsed["runs"][0]["results"]) == 2
 
+    def test_supporting_rule_code_issues_are_not_emitted_as_primary_results(self) -> None:
+        """Compatibility-only supporting rows should not duplicate SARIF findings."""
+        result = create_initial_audit_result()
+        result.issues = [
+            Issue(
+                message="Primary dangerous call",
+                severity=IssueSeverity.CRITICAL,
+                location="/test/file.pkl",
+                details={"pickle_rule_code": "DANGEROUS_CALL"},
+                rule_code="S104",
+                timestamp=time.time(),
+            ),
+            Issue(
+                message="Supporting REDUCE opcode row",
+                severity=IssueSeverity.CRITICAL,
+                location="/test/file.pkl",
+                details={"supporting_rule_code": True, "primary_rule_code": "S104"},
+                rule_code="S201",
+                timestamp=time.time(),
+            ),
+        ]
+        result.finalize_statistics()
+
+        output = format_sarif_output(result, ["/test"], verbose=True)
+        run = json.loads(output)["runs"][0]
+
+        assert [item["ruleId"] for item in run["results"]] == ["S104"]
+        assert [rule["id"] for rule in run["tool"]["driver"]["rules"]] == ["S104"]
+
 
 class TestCreateRun:
     """Tests for _create_run function."""
@@ -105,6 +137,45 @@ class TestCreateRun:
         assert driver["name"] == "ModelAudit"
         assert "version" in driver
         assert "rules" in driver
+
+    def test_primary_issue_filter_runs_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Prefiltered issues should not be filtered again while building one run."""
+        result = create_initial_audit_result()
+        result.issues = [
+            Issue(
+                message="Primary dangerous call",
+                severity=IssueSeverity.CRITICAL,
+                location="/test/file.pkl",
+                details={"pickle_rule_code": "DANGEROUS_CALL"},
+                rule_code="S104",
+                timestamp=time.time(),
+            ),
+            Issue(
+                message="Supporting import module",
+                severity=IssueSeverity.WARNING,
+                location="/test/file.pkl",
+                details={"supporting_rule_code": True, "primary_rule_code": "S104"},
+                rule_code="S100",
+                timestamp=time.time(),
+            ),
+        ]
+        result.finalize_statistics()
+
+        call_count = 0
+        original_primary_sarif_issues = sarif_formatter._primary_sarif_issues
+
+        def counting_primary_sarif_issues(issues: list[Issue]) -> list[Issue]:
+            nonlocal call_count
+            call_count += 1
+            return original_primary_sarif_issues(issues)
+
+        monkeypatch.setattr(sarif_formatter, "_primary_sarif_issues", counting_primary_sarif_issues)
+
+        run = _create_run(result, ["/test"], verbose=False)
+
+        assert call_count == 1
+        assert len(run["results"]) == 1
+        assert run["results"][0]["message"]["text"] == "Primary dangerous call"
 
     def test_invocation_properties(self):
         """Test invocation includes scan properties."""
@@ -277,6 +348,41 @@ class TestCreateResults:
         assert critical_results[0]["kind"] == "fail"
         assert info_results[0]["kind"] == "informational"
 
+    def test_supporting_rule_code_issue_is_filtered(self) -> None:
+        issues = [
+            Issue(message="Primary", severity=IssueSeverity.CRITICAL, rule_code="S104", timestamp=time.time()),
+            Issue(
+                message="Supporting",
+                severity=IssueSeverity.CRITICAL,
+                details={"supporting_rule_code": True, "primary_rule_code": "S104"},
+                rule_code="S201",
+                timestamp=time.time(),
+            ),
+        ]
+
+        results = _create_results(issues)
+
+        assert [result["ruleId"] for result in results] == ["S104"]
+
+    def test_pickle_rule_codes_are_preserved_as_sarif_rule_ids(self) -> None:
+        pickle_rule_codes = ["S209", "S213", "S214", "S601", "S602", "S604", "S902"]
+        issues = [
+            Issue(
+                message=f"Pickle rule {rule_code}",
+                severity=IssueSeverity.WARNING,
+                rule_code=rule_code,
+                timestamp=time.time(),
+            )
+            for rule_code in pickle_rule_codes
+        ]
+
+        results = _create_results(issues)
+        rules = _create_rules(issues)
+
+        assert [result["ruleId"] for result in results] == pickle_rule_codes
+        assert [rule["id"] for rule in rules] == pickle_rule_codes
+        assert [result["properties"]["rule_code"] for result in results] == pickle_rule_codes
+
 
 class TestCreateArtifacts:
     """Tests for _create_artifacts function."""
@@ -352,6 +458,22 @@ class TestHelperFunctions:
 
         desc = _get_rule_short_description(issue)
         assert "pickle" in desc.lower()
+
+    def test_get_rule_short_description_reuses_lowered_message(self):
+        """Short-description matching should normalize the issue message once."""
+
+        class CountingMessage(str):
+            lower_calls = 0
+
+            def lower(self) -> str:
+                self.lower_calls += 1
+                return super().lower()
+
+        message = CountingMessage("Potential exposed secret")
+        issue = SimpleNamespace(message=message)
+
+        assert _get_rule_short_description(issue) == "Potential secrets or keys exposed"
+        assert message.lower_calls == 1
 
     def test_get_rule_short_description_import(self):
         """Test short description for import issues."""
@@ -439,9 +561,9 @@ class TestHelperFunctions:
         assert "pickle" in tags
         assert "deserialization" in tags
 
-    def test_get_tags_for_issue_code_execution(self):
+    def test_get_tags_for_issue_code_execution(self) -> None:
         """Test tags for code execution issues."""
-        issue = Issue(message="eval() import detected", severity=IssueSeverity.WARNING, timestamp=time.time())
+        issue = Issue(message="eval() call detected", severity=IssueSeverity.WARNING, timestamp=time.time())
 
         tags = _get_tags_for_issue(issue)
         assert "code-execution" in tags

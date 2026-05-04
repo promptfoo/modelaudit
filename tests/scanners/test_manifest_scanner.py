@@ -1,13 +1,15 @@
+import builtins
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-import modelaudit.scanners.manifest_scanner as manifest_scanner_module
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners import manifest_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.manifest_scanner import ManifestScanner, _is_trusted_url_domain
+from modelaudit.scanners.manifest_scanner import _PARSE_FAILED, ManifestScanner, _is_trusted_url_domain
 
 
 def _https_url(host: str, path: str = "/model.bin") -> str:
@@ -49,6 +51,49 @@ def test_manifest_scanner_blacklist(tmp_path):
         issue.details.get("blacklisted_term", "") for issue in blacklist_issues if hasattr(issue, "details")
     ]
     assert "unsafe" in blacklisted_terms
+
+
+def test_manifest_scanner_reuses_manifest_text_during_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_file = tmp_path / "manifest.json"
+    test_file.write_text(
+        json.dumps(
+            {
+                "model_name": "safe-model",
+                "description": "ordinary manifest",
+                "source": _https_url("huggingface.co"),
+            }
+        )
+    )
+
+    original_open = builtins.open
+    open_count = 0
+
+    def counting_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal open_count
+        if file == str(test_file) and kwargs.get("encoding") == "utf-8":
+            open_count += 1
+        return original_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", counting_open)
+
+    result = ManifestScanner(config={"blacklist_patterns": ["blocked"]}).scan(str(test_file))
+
+    assert result.success is True
+    assert open_count == 1
+
+
+def test_manifest_scanner_clears_manifest_text_after_scan(tmp_path: Path) -> None:
+    test_file = tmp_path / "manifest.json"
+    test_file.write_text(json.dumps({"model_name": "safe-model"}))
+    scanner = ManifestScanner(config={"blacklist_patterns": ["blocked"]})
+
+    result = scanner.scan(str(test_file))
+
+    assert result.scanner is scanner
+    assert scanner._manifest_text_cache == {}
 
 
 def test_manifest_scanner_case_insensitive_blacklist(tmp_path):
@@ -176,7 +221,7 @@ def test_parse_file_logs_warning(caplog, capsys):
         result = ScanResult(scanner.name)
         content = scanner._parse_file("nonexistent.json", ".json", result)
 
-    assert content is manifest_scanner_module._PARSE_FAILED
+    assert content is _PARSE_FAILED
     assert any("Error parsing file nonexistent.json" in record.getMessage() for record in caplog.records)
     assert capsys.readouterr().out == ""
     assert any(issue.severity == IssueSeverity.DEBUG for issue in result.issues)
@@ -200,7 +245,7 @@ def test_manifest_scanner_yml_not_handled(tmp_path):
     assert scanner.can_handle(str(yml_file)) is False
 
 
-def test_manifest_scanner_can_handle(tmp_path):
+def test_manifest_scanner_can_handle(tmp_path: Path) -> None:
     """Test that scanner correctly identifies supported files."""
     scanner = ManifestScanner()
 
@@ -208,6 +253,13 @@ def test_manifest_scanner_can_handle(tmp_path):
     (tmp_path / "config.json").write_text('{"model_type": "test"}')
     (tmp_path / "generation_config.json").write_text("{}")
     (tmp_path / "model_index.json").write_text("{}")
+    (tmp_path / "manifest.json").write_text("{}")
+    (tmp_path / "hyperparams.yaml").write_text("model_type: bert\n")
+    (tmp_path / "environment.yml").write_text("name: model-env\n")
+    (tmp_path / "conda.yaml").write_text("name: model-env\n")
+    (tmp_path / "artifact.manifest").write_text('{"model_type": "bert"}')
+    (tmp_path / "weights.model").write_text('{"blob": true}')
+    (tmp_path / "weights.metadata").write_text('{"blob": true}')
     (tmp_path / "tokenizer_config.json").write_text("{}")
     (tmp_path / "package.json").write_text("{}")
     (tmp_path / "tsconfig.json").write_text("{}")
@@ -216,6 +268,13 @@ def test_manifest_scanner_can_handle(tmp_path):
     assert scanner.can_handle(str(tmp_path / "config.json")) is True
     assert scanner.can_handle(str(tmp_path / "generation_config.json")) is True
     assert scanner.can_handle(str(tmp_path / "model_index.json")) is True
+    assert scanner.can_handle(str(tmp_path / "manifest.json")) is True
+    assert scanner.can_handle(str(tmp_path / "hyperparams.yaml")) is True
+    assert scanner.can_handle(str(tmp_path / "environment.yml")) is True
+    assert scanner.can_handle(str(tmp_path / "conda.yaml")) is True
+    assert scanner.can_handle(str(tmp_path / "artifact.manifest")) is True
+    assert scanner.can_handle(str(tmp_path / "weights.model")) is False
+    assert scanner.can_handle(str(tmp_path / "weights.metadata")) is False
 
     # Should not handle tokenizer configs (excluded)
     assert scanner.can_handle(str(tmp_path / "tokenizer_config.json")) is False
@@ -223,6 +282,19 @@ def test_manifest_scanner_can_handle(tmp_path):
     # Should not handle non-ML configs
     assert scanner.can_handle(str(tmp_path / "package.json")) is False
     assert scanner.can_handle(str(tmp_path / "tsconfig.json")) is False
+
+
+def test_manifest_scanner_flags_blacklist_on_manifest_suffix(tmp_path: Path) -> None:
+    test_file = tmp_path / "artifact.manifest"
+    test_file.write_text(json.dumps({"description": "unsafe model"}), encoding="utf-8")
+
+    result = ManifestScanner(config={"blacklist_patterns": ["unsafe"]}).scan(str(test_file))
+
+    assert result.success is True
+    assert any(
+        issue.details.get("blacklisted_term") == "unsafe" and issue.severity == IssueSeverity.CRITICAL
+        for issue in result.issues
+    )
 
 
 def test_manifest_scanner_url_shortener_flagged(tmp_path):
@@ -246,6 +318,69 @@ def test_manifest_scanner_url_shortener_flagged(tmp_path):
     failed_url_checks = [c for c in url_checks if c.status == CheckStatus.FAILED]
     assert len(failed_url_checks) == 1
     assert "bit.ly" in failed_url_checks[0].details.get("url", "")
+
+
+def test_manifest_scanner_delegates_malicious_chat_templates_to_jinja_analysis(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "chat_template": "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner().scan(str(config_path))
+
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_manifest_scanner_keeps_benign_chat_templates_clean(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "chat_template": "{% for message in messages %}{{ message['content'] }}{% endfor %}",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = ManifestScanner().scan(str(config_path))
+
+    assert any(check.name == "Jinja2 SSTI Analysis" and check.status == CheckStatus.PASSED for check in result.checks)
+    assert not any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_manifest_scanner_delegates_templates_from_parsed_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text('{"chat_template": "{{ harmless }}"}', encoding="utf-8")
+    captured: dict[str, dict[str, str]] = {}
+
+    def capture_templates(self: object, path: str, templates: dict[str, str]) -> ScanResult:
+        captured[path] = templates
+        return ScanResult("jinja2_template")
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.jinja2_template_scanner.Jinja2TemplateScanner.scan_extracted_templates",
+        capture_templates,
+    )
+
+    ManifestScanner().scan(str(config_path))
+
+    assert captured[str(config_path)] == {"chat_template": "{{ harmless }}"}
 
 
 def test_manifest_scanner_redacts_untrusted_url_credentials(tmp_path: Path) -> None:
@@ -860,7 +995,7 @@ def test_manifest_scanner_parse_timeout_reports_only_timeout(
     def raise_timeout(_content: str) -> dict:
         raise TimeoutError("parse helper timed out")
 
-    monkeypatch.setattr(manifest_scanner_module.json, "loads", raise_timeout)
+    monkeypatch.setattr(json, "loads", raise_timeout)
 
     result = scanner.scan(str(test_file))
 
@@ -936,6 +1071,10 @@ class TestIsTrustedUrlDomain:
         assert _is_trusted_url_domain("https://github.com/repo") is True
         assert _is_trusted_url_domain("https://huggingface.co/model") is True
 
+    def test_exact_trusted_domain_skips_suffix_scan(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(manifest_scanner, "_TRUSTED_URL_SUBDOMAIN_SUFFIXES", ())
+        assert _is_trusted_url_domain("https://github.com/repo") is True
+
     def test_s3_endpoint_host_patterns_trusted(self) -> None:
         assert _is_trusted_url_domain("https://bucket.s3.amazonaws.com/model.bin") is True
         assert _is_trusted_url_domain("https://bucket.s3.us-east-1.amazonaws.com/model.bin") is True
@@ -963,6 +1102,7 @@ class TestIsTrustedUrlDomain:
         assert _is_trusted_url_domain("https://evil.gradio.app/p") is False
         assert _is_trusted_url_domain("https://evil.fastly.net/p") is False
         assert _is_trusted_url_domain("https://evil.azureedge.net/p") is False
+        # sourceforge.net is exact-match only; attacker-controlled subdomains stay untrusted.
         assert _is_trusted_url_domain("https://evil.sourceforge.net/p") is False
         assert _is_trusted_url_domain("https://evil.quay.io/p") is False
 
@@ -975,6 +1115,7 @@ class TestIsTrustedUrlDomain:
         assert _is_trusted_url_domain("https://github.io/page") is True
         assert _is_trusted_url_domain("https://cloudfront.net/res") is True
         assert _is_trusted_url_domain("https://readthedocs.io/docs") is True
+        assert _is_trusted_url_domain("https://sourceforge.net/project") is True
 
     def test_userinfo_bypass_blocked(self) -> None:
         """URLs with userinfo (user@host) must NOT be trusted."""

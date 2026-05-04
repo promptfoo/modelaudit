@@ -6,6 +6,7 @@ on:
       - "Dockerfile*"
       - ".dockerignore"
       - "modelaudit/**"
+      - "packages/modelaudit-picklescan/**"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/docker-image-test.yml"
@@ -36,10 +37,14 @@ jobs:
               - 'Dockerfile*'
               - '.dockerignore'
               - 'modelaudit/**'
+              - 'packages/modelaudit-picklescan/**'
               - 'pyproject.toml'
               - 'uv.lock'
+              - '.github/workflows/docker-image-test.yml'
             full-image:
               - 'Dockerfile.full'
+              - 'packages/modelaudit-picklescan/**'
+              - '.github/workflows/docker-image-test.yml'
 
   build-test-lightweight:
     name: Build and Test Lightweight Docker Image
@@ -52,10 +57,10 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
 
       - name: Build lightweight image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
           file: Dockerfile
@@ -85,7 +90,7 @@ jobs:
           docker run --rm modelaudit:lightweight invalid-command && exit 1 || echo "Command properly rejected invalid input"
 
       - name: Scan image for vulnerabilities
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
           # Pin an explicit released Trivy binary to avoid setup failures when
           # auto-resolved tags exist without matching release assets.
@@ -114,13 +119,13 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
 
       - name: Build full image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
         with:
           context: .
           file: Dockerfile.full
@@ -145,8 +150,12 @@ jobs:
           # Test that the package is properly installed
           docker run --rm modelaudit:full --version
 
+      - name: Test full container runs as non-root
+        run: |
+          docker run --rm modelaudit:full python -c "import os; uid = os.getuid(); print(f'Container UID: {uid}'); assert uid == 10001"
+
       - name: Scan image for vulnerabilities
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
         with:
           # Keep full-image scan on the same pinned released Trivy version.
           version: v0.69.2
@@ -159,30 +168,32 @@ jobs:
       - name: Verify ML dependencies in full image
         run: |
           # Test that ML dependencies are available
-          docker run --rm modelaudit:full python -c "import tensorflow, torch, onnx; print('All ML dependencies available')" || echo "Warning: Some ML dependencies missing"
+          docker run --rm modelaudit:full python -c "import tensorflow, torch, onnx; print('All ML dependencies available')"
 
       - name: Test full container with ML model scan
         run: |
-          # Create test models for different frameworks
-          docker run --rm -v $(pwd):/data modelaudit:full python -c "import pickle; import numpy as np; pickle.dump({'weights': np.random.rand(10, 10)}, open('/data/test_numpy.pkl', 'wb')); print('Created test model')"
-          # Scan the model
+          # Create the fixture with a root Python image because the full image intentionally runs as UID 10001.
+          docker run --rm -v $(pwd):/data python:3.11-slim@sha256:543d6cace00ffc96bc95d332493bb28a4332c6dd614aab5fcbd649ae8a7953d9 sh -c "python -c \"import pickle; pickle.dump({'test': 'data', 'numbers': [1, 2, 3]}, open('/data/test_numpy.pkl', 'wb')); print('Created test model')\""
+          # Scan the bind-mounted model as the non-root full image.
           docker run --rm -v $(pwd):/data modelaudit:full /data/test_numpy.pkl
 
   docker-ci-success:
     name: Docker CI Success
-    needs: [build-test-lightweight]
-    # Don't require full image test to pass since it's conditional
+    needs: [build-test-lightweight, build-test-full]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check if required jobs succeeded
         run: |
           LIGHTWEIGHT_RESULT="${{ needs.build-test-lightweight.result }}"
+          FULL_RESULT="${{ needs.build-test-full.result }}"
           echo "Lightweight Docker build result: $LIGHTWEIGHT_RESULT"
+          echo "Full Docker build result: $FULL_RESULT"
 
           # Success or skipped are both acceptable
           # (skipped means the path filters determined the job wasn't needed)
-          if [[ "$LIGHTWEIGHT_RESULT" == "success" || "$LIGHTWEIGHT_RESULT" == "skipped" ]]; then
+          if [[ ("$LIGHTWEIGHT_RESULT" == "success" || "$LIGHTWEIGHT_RESULT" == "skipped") && \
+                ("$FULL_RESULT" == "success" || "$FULL_RESULT" == "skipped") ]]; then
             echo "Docker CI checks passed (or were skipped due to path filters)!"
             exit 0
           else

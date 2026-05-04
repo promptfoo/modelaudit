@@ -1,8 +1,10 @@
 """Entropy-based analysis to distinguish code from data."""
 
 import math
+import re
 import struct
 from collections import Counter
+from contextlib import suppress
 
 import numpy as np
 
@@ -57,14 +59,12 @@ class EntropyAnalyzer:
         valid_floats = 0
 
         for i in range(0, len(data) - 3, 4):
-            try:
+            with suppress(struct.error, ValueError):
                 value = struct.unpack("<f", data[i : i + 4])[0]
                 # Check if it's a reasonable float (not NaN or Inf)
                 if -1e10 < value < 1e10 and not math.isnan(value) and not math.isinf(value):
                     float_values.append(value)
                     valid_floats += 1
-            except (struct.error, ValueError):
-                pass
 
         float_ratio = valid_floats / (len(data) // 4) if len(data) >= 4 else 0
 
@@ -221,6 +221,9 @@ class EntropyAnalyzer:
 
         # High confidence ML weights - skip most pattern searches
         if data_type == "ml_weights" and confidence > 0.8:
+            if pattern and re.search(rb"(?<![A-Za-z0-9_])" + re.escape(pattern) + rb"(?![A-Za-z0-9_])", data):
+                return False
+
             # Only search for extremely suspicious patterns
             extremely_suspicious = [b"exec", b"eval", b"__import__"]
             return pattern not in extremely_suspicious

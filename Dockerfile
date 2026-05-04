@@ -1,21 +1,38 @@
-FROM python:3.13-slim@sha256:d168b8d9eb761f4d3fe305ebd04aeb7e7f2de0297cec5fb2f8f6403244621664
+ARG PYTHON_IMAGE=python:3.13-slim@sha256:a0779d7c12fc20be6ec6b4ddc901a4fd7657b8a6bc9def9d3fde89ed5efe0a3d
+# Keep the major/minor version in sync with packages/modelaudit-picklescan/Cargo.toml rust-version.
+ARG PICKLESCAN_RUST_TOOLCHAIN=1.83.0
+
+FROM ${PYTHON_IMAGE} AS builder
+ARG PICKLESCAN_RUST_TOOLCHAIN
+
+WORKDIR /build
+
+COPY pyproject.toml README.md ./
+COPY packages/modelaudit-picklescan ./packages/modelaudit-picklescan
+COPY modelaudit ./modelaudit
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 \
+    && apt-get install --yes --no-install-recommends build-essential ca-certificates curl \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain "${PICKLESCAN_RUST_TOOLCHAIN}" \
+    && PATH="/root/.cargo/bin:${PATH}" pip wheel --no-cache-dir --wheel-dir /wheels \
+        ./packages/modelaudit-picklescan \
+        .
+
+FROM ${PYTHON_IMAGE} AS runtime
 
 WORKDIR /app
 
-# Pull in current Debian security fixes from the configured apt sources.
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 \
+    && apt-get install --yes --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy only necessary files for installation
-COPY pyproject.toml README.md ./
-COPY modelaudit ./modelaudit
+COPY --from=builder /wheels /wheels
+RUN pip install --no-cache-dir /wheels/*.whl \
+    && rm -rf /wheels
 
-# Install only the base package without heavy ML dependencies
-# This keeps the lightweight image small and fast to build
-RUN pip install --no-cache-dir .
-
-# Create a non-root user
 ARG UID=10001
 RUN adduser \
     --disabled-password \
@@ -28,6 +45,5 @@ RUN adduser \
 
 USER appuser
 
-# Set the entrypoint
 ENTRYPOINT ["modelaudit"]
-CMD ["--help"] 
+CMD ["--help"]

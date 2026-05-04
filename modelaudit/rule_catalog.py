@@ -163,11 +163,32 @@ RULE_CATALOG: tuple[RuleCatalogEntry, ...] = (
         patterns=(r"pickle.*SETITEMS", r"SETITEMS.*opcode"),
     ),
     RuleCatalogEntry(
+        code="S211",
+        name="Pickle extension opcode",
+        severity="HIGH",
+        description="Copyreg extension reference via pickle EXT opcode",
+        patterns=(r"pickle.*EXT[124]", r"EXT[124].*opcode", r"copyreg.*extension"),
+    ),
+    RuleCatalogEntry(
+        code="S212",
+        name="Pickle persistent ID opcode",
+        severity="MEDIUM",
+        description="Persistent object resolution via pickle persistent_load callback",
+        patterns=(r"pickle.*PERSID", r"PERSID.*opcode", r"persistent_load"),
+    ),
+    RuleCatalogEntry(
         code="S213",
         name="Nested/encoded pickle payload",
         severity="CRITICAL",
         description="Nested or encoded pickle payload detected",
         patterns=(r"nested.*pickle", r"encoded.*pickle", r"pickle.*payload"),
+    ),
+    RuleCatalogEntry(
+        code="S214",
+        name="Pickle expansion denial-of-service",
+        severity="HIGH",
+        description="Pickle graph expansion pattern can consume excessive memory or CPU",
+        patterns=(r"pickle.*expansion", r"memo.*growth", r"excessive.*dup"),
     ),
     RuleCatalogEntry(
         code="S301",

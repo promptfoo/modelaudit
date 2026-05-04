@@ -45,9 +45,7 @@ def test_numpy_format_module_unavailable_is_operational_not_critical(
     path = tmp_path / "array.npy"
     np.save(path, arr)
 
-    import modelaudit.scanners.numpy_scanner as numpy_scanner_module
-
-    monkeypatch.setattr(numpy_scanner_module, "NUMPY_FORMAT_AVAILABLE", False)
+    monkeypatch.setattr("modelaudit.scanners.numpy_scanner.NUMPY_FORMAT_AVAILABLE", False)
 
     result = NumPyScanner().scan(str(path))
 
@@ -238,7 +236,9 @@ def test_object_dtype_numpy_recurses_into_pickle_exec(tmp_path: Path) -> None:
     failed = _failed_checks(result)
     assert any("CVE-2019-6446" in (c.name + c.message) for c in failed)
     assert any("exec" in (c.message.lower()) for c in failed)
-    assert any(issue.rule_code == "S115" for issue in result.issues)
+    assert any(
+        issue.rule_code == "S104" and "S115" in issue.details.get("legacy_rule_aliases", []) for issue in result.issues
+    )
 
 
 def test_object_dtype_numpy_recurses_into_pickle_ssl(tmp_path: Path) -> None:
@@ -371,7 +371,7 @@ def test_truncated_npy_fails_safely(tmp_path: Path) -> None:
     scanner = NumPyScanner()
     result = scanner.scan(str(path))
 
-    assert result.success is True
+    assert result.success is False
     assert result.has_errors is True
     assert any("exec" in i.message.lower() and i.severity == IssueSeverity.CRITICAL for i in result.issues)
     assert any(

@@ -38,6 +38,20 @@ _TF_METAGRAPH_MIN_BYTES = 8
 _TF_METAGRAPH_MAX_VALIDATE_BYTES = 20 * 1024 * 1024
 _TORCH7_SIGNATURE_READ_BYTES = 4096
 _LIGHTGBM_SIGNATURE_READ_BYTES = 8192
+_ONNX_PROTO_SIGNATURE_READ_BYTES = 1024 * 1024
+_ONNX_MODEL_TOP_LEVEL_TAG_START_BYTES = frozenset(
+    {
+        0x08,  # ir_version
+        0x12,  # producer_name
+        0x1A,  # producer_version
+        0x22,  # domain
+        0x28,  # model_version
+        0x32,  # doc_string
+        0x3A,  # graph
+        0x42,  # opset_import
+        0x72,  # metadata_props
+    }
+)
 _LIGHTGBM_HEADER_MARKERS = (
     "version=",
     "num_class=",
@@ -57,7 +71,30 @@ _GZIP_MAGIC = b"\x1f\x8b"
 _BZIP2_MAGIC = b"BZh"
 _XZ_MAGIC = b"\xfd7zXZ\x00"
 _SEVENZIP_MAGIC = b"7z\xbc\xaf\x27\x1c"
+_RAR4_MAGIC = b"Rar!\x1a\x07\x00"
+_RAR5_MAGIC = b"Rar!\x1a\x07\x01\x00"
 _LZ4_FRAME_MAGIC = b"\x04\x22\x4d\x18"
+_ZIP_MAGIC_SIGNATURES = (
+    b"PK\x03\x04",  # local file header
+    b"PK\x01\x02",  # central directory file header
+    b"PK\x05\x06",  # end of central directory
+    b"PK\x06\x06",  # ZIP64 end of central directory
+    b"PK\x06\x07",  # ZIP64 end of central directory locator
+    b"PK\x07\x08",  # data descriptor
+)
+_TAR_BLOCK_SIZE = 512
+_TAR_USTAR_OFFSET = 257
+_TAR_USTAR_MAGIC_SIZE = 5
+_TAR_USTAR_MIN_BYTES = _TAR_USTAR_OFFSET + _TAR_USTAR_MAGIC_SIZE
+_TAR_CHECKSUM_OFFSET = 148
+_TAR_CHECKSUM_SIZE = 8
+_TAR_NUMERIC_FIELD_SLICES = (
+    (100, 108),  # mode
+    (108, 116),  # uid
+    (116, 124),  # gid
+    (124, 136),  # size
+    (136, 148),  # mtime
+)
 _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_SIZE = 4
 _TFLITE_MIN_HEADER_SIZE = _TFLITE_MAGIC_OFFSET + _TFLITE_MAGIC_SIZE
@@ -78,6 +115,13 @@ _KERAS_CONFIG_PREFIX_HINT_RE = re.compile(
 _PYTORCH_ZIP_METADATA_MAX_BYTES = 64
 _SKOPS_SCHEMA_ENTRIES = frozenset({"schema", "schema.json"})
 _SKOPS_SCHEMA_MAX_BYTES = 4 * 1024 * 1024
+_XML_MODEL_SIGNATURE_READ_BYTES = 1024 * 1024
+_XML_MODEL_ROOT_FORMATS = {
+    "model": "openvino",
+    "net": "openvino",
+    "pmml": "pmml",
+}
+XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -85,6 +129,105 @@ _COMPRESSED_EXTENSION_CODECS = {
     ".lz4": "lz4",
     ".zlib": "zlib",
 }
+
+
+def _has_rar_magic(data: bytes) -> bool:
+    """Return True for complete RAR4/RAR5 signatures."""
+    return data.startswith(_RAR4_MAGIC) or data.startswith(_RAR5_MAGIC)
+
+
+def _skip_xml_doctype_declaration(xml_prefix: bytes, start_offset: int) -> int | None:
+    """Skip a DOCTYPE declaration without expanding entities."""
+    index = start_offset + len(b"<!DOCTYPE")
+    bracket_depth = 0
+    quote_char: int | None = None
+
+    while index < len(xml_prefix):
+        byte = xml_prefix[index]
+        if quote_char is not None:
+            if byte == quote_char:
+                quote_char = None
+        elif byte in {ord("'"), ord('"')}:
+            quote_char = byte
+        elif byte == ord("["):
+            bracket_depth += 1
+        elif byte == ord("]") and bracket_depth > 0:
+            bracket_depth -= 1
+        elif byte == ord(">") and bracket_depth == 0:
+            return index + 1
+        index += 1
+    return None
+
+
+def _xml_root_tag_from_prefix(xml_prefix: bytes) -> tuple[str | None, bool]:
+    """Return the normalized first XML element name and whether the probe ran out first."""
+    index = 3 if xml_prefix.startswith(b"\xef\xbb\xbf") else 0
+    prefix_length = len(xml_prefix)
+
+    while index < prefix_length:
+        while index < prefix_length and chr(xml_prefix[index]).isspace():
+            index += 1
+
+        if xml_prefix.startswith(b"<?", index):
+            end_offset = xml_prefix.find(b"?>", index + 2)
+            if end_offset == -1:
+                return None, True
+            index = end_offset + 2
+            continue
+
+        if xml_prefix.startswith(b"<!--", index):
+            end_offset = xml_prefix.find(b"-->", index + 4)
+            if end_offset == -1:
+                return None, True
+            index = end_offset + 3
+            continue
+
+        if xml_prefix[index : index + len(b"<!DOCTYPE")].upper() == b"<!DOCTYPE":
+            next_index = _skip_xml_doctype_declaration(xml_prefix, index)
+            if next_index is None:
+                return None, True
+            index = next_index
+            continue
+
+        break
+
+    if index >= prefix_length:
+        return None, True
+    if xml_prefix[index : index + 1] != b"<":
+        return None, False
+    if xml_prefix[index + 1 : index + 2] in {b"/", b"!", b"?"}:
+        return None, False
+
+    tag_end = index + 1
+    while tag_end < prefix_length and xml_prefix[tag_end : tag_end + 1] not in b" \t\r\n\f/>":
+        tag_end += 1
+    if tag_end == index + 1:
+        return None, tag_end >= prefix_length
+    if tag_end >= prefix_length:
+        return None, True
+
+    raw_tag = xml_prefix[index + 1 : tag_end].decode("utf-8", "ignore")
+    return raw_tag.rsplit(":", 1)[-1].lower(), False
+
+
+def _detect_xml_model_format(xml_prefix: bytes, *, sample_is_prefix: bool) -> str:
+    """Return a model format for recognized XML roots within a bounded prefix."""
+    root_tag, prefix_exhausted_before_root = _xml_root_tag_from_prefix(xml_prefix)
+    if prefix_exhausted_before_root and sample_is_prefix:
+        return XML_MODEL_INCONCLUSIVE_FORMAT
+    if root_tag is None:
+        return "unknown"
+    return _XML_MODEL_ROOT_FORMATS.get(root_tag, "unknown")
+
+
+def _could_be_xml_prefix(prefix: bytes) -> bool:
+    """Return whether a bounded prefix plausibly begins an XML document."""
+    trimmed = prefix[3:] if prefix.startswith(b"\xef\xbb\xbf") else prefix
+    return trimmed.lstrip().startswith(b"<")
+
+
+_MIN_BINARY_PICKLE_PROTOCOL = 1
+_MAX_FORWARD_COMPAT_BINARY_PICKLE_PROTOCOL = 6
 
 # Pickle protocol 0/1 GLOBAL opcode signatures used for .bin fallback detection.
 # Format: c<module>\n<name>\n
@@ -135,6 +278,222 @@ PROTO0_1_TRIVIAL_LEADING_OPCODES: frozenset[str] = frozenset(
         "SHORT_BINUNICODE",
     },
 )
+
+
+def _read_proto_varint(data: bytes, offset: int, end: int | None = None) -> tuple[int, int] | None:
+    """Read a protobuf varint from bounded data."""
+    limit = len(data) if end is None else min(end, len(data))
+    value = 0
+    shift = 0
+    cursor = offset
+    while cursor < limit and cursor - offset < 10:
+        byte = data[cursor]
+        cursor += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, cursor
+        shift += 7
+    return None
+
+
+def _has_onnx_model_tag_start(data: bytes) -> bool:
+    """Return True when data starts with a plausible ONNX ModelProto field tag."""
+    return bool(data) and data[0] in _ONNX_MODEL_TOP_LEVEL_TAG_START_BYTES
+
+
+def _read_length_delimited_proto_value(
+    data: bytes,
+    offset: int,
+    end: int | None = None,
+) -> tuple[int, int, int, int] | None:
+    """Return protobuf length-delimited value bounds within the sampled prefix."""
+    limit = len(data) if end is None else min(end, len(data))
+    length_result = _read_proto_varint(data, offset, limit)
+    if length_result is None:
+        return None
+    length, value_start = length_result
+    value_end = value_start + length
+    if value_start > limit:
+        return None
+    return length, value_start, min(value_end, limit), value_end
+
+
+def _skip_proto_value(data: bytes, offset: int, wire_type: int, end: int | None = None) -> int | None:
+    """Skip one protobuf value, returning the next offset when the sample contains it."""
+    limit = len(data) if end is None else min(end, len(data))
+    if wire_type == 0:
+        value_result = _read_proto_varint(data, offset, limit)
+        return None if value_result is None else value_result[1]
+    if wire_type == 1:
+        next_offset = offset + 8
+        return next_offset if next_offset <= limit else None
+    if wire_type == 2:
+        bounds = _read_length_delimited_proto_value(data, offset, limit)
+        if bounds is None:
+            return None
+        _length, _value_start, _sampled_value_end, value_end = bounds
+        return value_end if value_end <= limit else None
+    if wire_type == 5:
+        next_offset = offset + 4
+        return next_offset if next_offset <= limit else None
+    return None
+
+
+def _looks_like_onnx_node_proto_prefix(data: bytes) -> bool:
+    """Return True when a bounded prefix resembles an ONNX NodeProto."""
+    offset = 0
+    fields_seen = 0
+    has_input_or_output = False
+    has_op_type = False
+    while offset < len(data) and fields_seen < 128:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            break
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+
+        if wire_type == 2 and field_number in {1, 2, 4}:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                break
+            length, value_start, value_end, actual_value_end = bounds
+            if field_number in {1, 2} and 0 < length <= 1024:
+                has_input_or_output = True
+            elif field_number == 4 and 0 < length <= 1024:
+                op_type = data[value_start:value_end]
+                has_op_type = bool(op_type) and all(32 <= byte < 127 for byte in op_type)
+            offset = actual_value_end
+        else:
+            next_offset = _skip_proto_value(data, value_offset, wire_type)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        fields_seen += 1
+        if has_input_or_output and has_op_type:
+            return True
+
+    return False
+
+
+def _looks_like_onnx_graph_proto_prefix(data: bytes) -> bool:
+    """Return True when a bounded prefix resembles an ONNX GraphProto."""
+    offset = 0
+    fields_seen = 0
+    has_node = False
+    has_initializer = False
+    value_info_fields: set[int] = set()
+
+    while offset < len(data) and fields_seen < 512:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            break
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+
+        if wire_type == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                break
+            _length, value_start, value_end, actual_value_end = bounds
+            if field_number == 1 and _looks_like_onnx_node_proto_prefix(data[value_start:value_end]):
+                has_node = True
+            elif field_number == 5:
+                has_initializer = True
+            elif field_number in {11, 12, 13}:
+                value_info_fields.add(field_number)
+            offset = actual_value_end
+        else:
+            next_offset = _skip_proto_value(data, value_offset, wire_type)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        fields_seen += 1
+        if (has_node and value_info_fields) or len(value_info_fields) >= 2:
+            return True
+
+    return has_initializer and bool(value_info_fields)
+
+
+def _looks_like_onnx_model_proto_prefix(data: bytes) -> bool:
+    """Return True when a bounded prefix resembles an ONNX ModelProto."""
+    if not _has_onnx_model_tag_start(data):
+        return False
+
+    offset = 0
+    fields_seen = 0
+    has_plausible_ir_version = False
+    has_graph = False
+
+    while offset < len(data) and fields_seen < 512:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            break
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+
+        if field_number == 1 and wire_type == 0:
+            value_result = _read_proto_varint(data, value_offset)
+            if value_result is None:
+                break
+            ir_version, offset = value_result
+            has_plausible_ir_version = 0 < ir_version <= 1000
+        elif field_number == 7 and wire_type == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                break
+            length, value_start, value_end, actual_value_end = bounds
+            if length > 0 and _looks_like_onnx_graph_proto_prefix(data[value_start:value_end]):
+                has_graph = True
+            offset = actual_value_end
+        else:
+            next_offset = _skip_proto_value(data, value_offset, wire_type)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        fields_seen += 1
+        if has_plausible_ir_version and has_graph:
+            return True
+
+    return False
+
+
+def _looks_like_onnx_model_file(path: Path, size: int) -> bool:
+    """Detect real ONNX ModelProto structure with a bounded prefix read."""
+    if size < 4:
+        return False
+    try:
+        with path.open("rb") as handle:
+            prefix = handle.read(min(size, _ONNX_PROTO_SIGNATURE_READ_BYTES))
+    except OSError:
+        return False
+    return _looks_like_onnx_model_proto_prefix(prefix)
+
+
+def _looks_like_onnx_model_candidate_file(path: Path, size: int, header: bytes) -> bool:
+    """Run the bounded ONNX parser only for plausible protobuf tag starts."""
+    return _has_onnx_model_tag_start(header) and _looks_like_onnx_model_file(path, size)
+
+
+def _looks_like_binary_pickle_protocol(header: bytes) -> bool:
+    return (
+        len(header) >= 2
+        and header[0] == 0x80
+        and _MIN_BINARY_PICKLE_PROTOCOL <= header[1] <= _MAX_FORWARD_COMPAT_BINARY_PICKLE_PROTOCOL
+    )
+
+
 SAFETENSORS_MAX_HEADER_BYTES: int = 100 * 1024 * 1024
 
 
@@ -416,6 +775,18 @@ def _looks_like_pytorch_zip_metadata(archive: zipfile.ZipFile, prefix: str) -> b
     return False
 
 
+def _looks_like_pytorch_zip_storage_members(member_names: set[str], prefix: str) -> bool:
+    """Detect PyTorch tensor storage members next to data.pkl."""
+    storage_prefix = f"{prefix}/data/" if prefix else "data/"
+    for name in member_names:
+        if not name.startswith(storage_prefix):
+            continue
+        storage_key = name[len(storage_prefix) :]
+        if "/" not in storage_key and storage_key.isascii() and storage_key.isdecimal():
+            return True
+    return False
+
+
 def is_torchserve_mar_archive(path: str) -> bool:
     """Return whether a ZIP-backed `.mar` looks like a real TorchServe archive."""
     file_path = Path(path)
@@ -524,6 +895,8 @@ def is_pytorch_zip_archive(path: str) -> bool:
 
                 if _looks_like_pytorch_zip_metadata(archive, prefix):
                     return True
+                if _looks_like_pytorch_zip_storage_members(member_names, prefix):
+                    return True
     except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
 
@@ -610,6 +983,60 @@ def _is_tar_archive(path: str) -> bool:
         return False
 
 
+def _tar_octal_value(field: bytes) -> int | None:
+    stripped = field.split(b"\0", 1)[0].strip()
+    if not stripped or any(byte < ord("0") or byte > ord("7") for byte in stripped):
+        return None
+    try:
+        return int(stripped, 8)
+    except ValueError:
+        return None
+
+
+def _tar_name_looks_plausible(name_field: bytes) -> bool:
+    name = name_field.split(b"\0", 1)[0]
+    return bool(name) and all(byte >= 0x20 and byte != 0x7F for byte in name)
+
+
+def _has_tar_ustar_signature(header: bytes) -> bool:
+    return len(header) >= _TAR_USTAR_MIN_BYTES and header[
+        _TAR_USTAR_OFFSET : _TAR_USTAR_OFFSET + _TAR_USTAR_MAGIC_SIZE
+    ].startswith(b"ustar")
+
+
+def _has_valid_tar_checksum_header(header: bytes) -> bool:
+    """Return whether a 512-byte TAR header block has a valid v7/POSIX checksum."""
+    if len(header) < _TAR_BLOCK_SIZE:
+        return False
+
+    block = header[:_TAR_BLOCK_SIZE]
+    if block == b"\0" * _TAR_BLOCK_SIZE or not _tar_name_looks_plausible(block[:100]):
+        return False
+
+    if any(_tar_octal_value(block[start:end]) is None for start, end in _TAR_NUMERIC_FIELD_SLICES):
+        return False
+
+    expected_checksum = _tar_octal_value(block[_TAR_CHECKSUM_OFFSET : _TAR_CHECKSUM_OFFSET + _TAR_CHECKSUM_SIZE])
+    if expected_checksum is None:
+        return False
+
+    checksum = (
+        sum(block[:_TAR_CHECKSUM_OFFSET])
+        + (_TAR_CHECKSUM_SIZE * ord(" "))
+        + sum(block[_TAR_CHECKSUM_OFFSET + _TAR_CHECKSUM_SIZE :])
+    )
+    return checksum == expected_checksum
+
+
+def _looks_like_uncompressed_tar_header(header: bytes) -> bool:
+    return _has_tar_ustar_signature(header) or _has_valid_tar_checksum_header(header)
+
+
+def _has_zip_magic(prefix: bytes) -> bool:
+    """Return whether a prefix starts with a recognized ZIP signature."""
+    return prefix.startswith(_ZIP_MAGIC_SIGNATURES)
+
+
 def is_zipfile(path: str) -> bool:
     """Check if file is a ZIP by reading the signature."""
     file_path = Path(path)
@@ -617,7 +1044,7 @@ def is_zipfile(path: str) -> bool:
         return False
     try:
         signature = read_magic_bytes(path, 4)
-        return signature.startswith(b"PK")
+        return _has_zip_magic(signature)
     except OSError:
         return False
 
@@ -778,17 +1205,20 @@ def detect_format_from_magic_bytes(
             return "gguf"
         case magic if magic in GGML_MAGIC_VARIANTS:
             return "ggml"
-        case magic if magic.startswith(b"PK"):
+        case magic if _has_zip_magic(magic):
             return "zip"
-        case b"\x08\x01\x12\x00":  # ONNX protobuf magic
-            return "onnx"
         case _:
             pass
+
+    if file_path is not None and _looks_like_onnx_model_candidate_file(file_path, file_size, magic4):
+        return "onnx"
 
     # Check longer magic sequences
     match magic8:
         case magic if magic.startswith(_SEVENZIP_MAGIC):
             return "sevenzip"
+        case magic if _has_rar_magic(magic):
+            return "rar"
         case magic if magic == _CNTK_LEGACY_MAGIC:
             return "cntk"
         case b"\x89HDF\r\n\x1a\n":  # HDF5 magic
@@ -803,18 +1233,11 @@ def detect_format_from_magic_bytes(
     if any(magic16.startswith(marker) for marker in R_SERIALIZATION_MARKERS):
         return "r_serialized"
 
-    # Check pickle magic bytes using pattern matching
-    match magic4[:2]:
-        case b"\x80\x02" | b"\x80\x03" | b"\x80\x04" | b"\x80\x05":
-            return "pickle"
-        case _:
-            pass
+    if _looks_like_binary_pickle_protocol(magic4):
+        return "pickle"
     if _looks_like_safetensors_structure(file_path, magic8, file_size):
         return "safetensors"
 
-    # Check for patterns in first 16 bytes
-    if b"onnx" in magic16:
-        return "onnx"
     if b'"__metadata__"' in magic16 and _looks_like_safetensors_structure(file_path, magic8, file_size):
         return "safetensors"
 
@@ -841,15 +1264,10 @@ def detect_file_format_from_magic(path: str) -> str:
             return "tf_metagraph" if _is_tensorflow_metagraph_file(path) else "unknown"
 
         with file_path.open("rb") as f:
-            header = f.read(16)
+            header = f.read(min(size, _TAR_BLOCK_SIZE))
 
-            # Check for TAR format by looking for the "ustar" signature
-            if size >= 262:
-                f.seek(257)
-                if f.read(5).startswith(b"ustar"):
-                    return "tar"
-            # Reset to read from header for further checks
-            f.seek(0)
+            if _looks_like_uncompressed_tar_header(header):
+                return "tar"
 
             magic4 = header[:4]
             magic8 = header[:8]
@@ -893,15 +1311,17 @@ def detect_file_format_from_magic(path: str) -> str:
             ):
                 return "pickle"
 
-            # Check for XML-based formats (OpenVINO and PMML)
-            if magic16.startswith(b"<?xml"):
-                # Read first 64 bytes to check for format-specific tags
+            # Check for XML-based formats (OpenVINO and PMML) using the first
+            # structural root tag rather than a short raw-byte substring.
+            if _could_be_xml_prefix(header):
                 f.seek(0)
-                xml_header = f.read(64)
-                if b"<net" in xml_header:
-                    return "openvino"
-                if b"<PMML" in xml_header:
-                    return "pmml"
+                xml_prefix = f.read(min(size, _XML_MODEL_SIGNATURE_READ_BYTES))
+                xml_format = _detect_xml_model_format(
+                    xml_prefix,
+                    sample_is_prefix=size > len(xml_prefix),
+                )
+                if xml_format != "unknown":
+                    return xml_format
 
     except OSError:
         return "unknown"
@@ -909,7 +1329,6 @@ def detect_file_format_from_magic(path: str) -> str:
     # Fallback: use strict safetensors framing; plain JSON must not be routed as safetensors.
     magic4 = header[:4]
     magic8 = header[:8]
-    magic16 = header[:16]
 
     if _looks_like_tflite_header(magic8):
         return "tflite"
@@ -917,8 +1336,92 @@ def detect_file_format_from_magic(path: str) -> str:
     if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
 
-    if magic4 == b"\x08\x01\x12\x00" or b"onnx" in magic16:
+    if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
         return "onnx"
+
+    return "unknown"
+
+
+def _could_start_proto0_or_1_pickle(sample: bytes) -> bool:
+    if not sample:
+        return False
+    if sample[0] in PROTO0_1_START_BYTES:
+        return True
+    return len(sample) >= 2 and sample[0] == ord("#") and sample[1] in PROTO0_1_START_BYTES
+
+
+def detect_file_format_for_skip_filter(path: str) -> str:
+    """Cheap content detection for skipped-extension preservation.
+
+    This intentionally recognizes only content-derived format signals. It avoids
+    extension-based routing and uses one bounded prefix read for common skipped
+    files, while still preserving disguised model/archive payloads for full scans.
+    """
+    file_path = Path(path)
+    if file_path.is_dir():
+        if (file_path / "saved_model.pb").exists():
+            return "tensorflow_directory"
+        return "directory"
+    if not file_path.is_file():
+        return "unknown"
+
+    size = file_path.stat().st_size
+    if size < 4:
+        return "unknown"
+
+    initial_read_size = min(size, max(64, _TAR_BLOCK_SIZE))
+    with file_path.open("rb") as f:
+        prefix = f.read(initial_read_size)
+
+        header = prefix[:16]
+        magic4 = header[:4]
+        magic8 = header[:8]
+        magic16 = header[:16]
+
+        if _looks_like_uncompressed_tar_header(prefix):
+            return "tar"
+
+        if _looks_like_tflite_header(magic8):
+            return "tflite"
+        if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
+            return "executorch"
+
+        format_result = detect_format_from_magic_bytes(magic4, magic8, magic16, size, file_path)
+        if format_result == "zip":
+            return "zip"
+        if format_result in {"gzip", "bzip2", "xz", "lz4", "zlib"}:
+            if _is_tar_archive(path):
+                return "tar"
+            return format_result
+        if format_result != "unknown":
+            return format_result
+
+        lightgbm_probe_size = min(size, _LIGHTGBM_SIGNATURE_READ_BYTES)
+        if len(prefix) < lightgbm_probe_size:
+            prefix += f.read(lightgbm_probe_size - len(prefix))
+        if _is_lightgbm_signature(prefix):
+            return "lightgbm"
+
+        if _could_start_proto0_or_1_pickle(prefix):
+            max_probe_size = min(size, PROTO0_1_MAX_PROBE_BYTES)
+            if len(prefix) < max_probe_size:
+                prefix += f.read(max_probe_size - len(prefix))
+            if _looks_like_proto0_or_1_pickle(
+                prefix[:PROTO0_1_MAX_PROBE_BYTES],
+                sample_is_prefix=size > min(size, PROTO0_1_MAX_PROBE_BYTES),
+            ):
+                return "pickle"
+
+        if _could_be_xml_prefix(prefix):
+            xml_probe_size = min(size, _XML_MODEL_SIGNATURE_READ_BYTES)
+            if len(prefix) < xml_probe_size:
+                prefix += f.read(xml_probe_size - len(prefix))
+            xml_format = _detect_xml_model_format(
+                prefix,
+                sample_is_prefix=size > len(prefix),
+            )
+            if xml_format != "unknown":
+                return xml_format
 
     return "unknown"
 
@@ -949,7 +1452,7 @@ def detect_file_format(path: str) -> str:
 
     # Read first bytes for format detection using a single file handle
     with file_path.open("rb") as f:
-        header = f.read(16)
+        header = f.read(min(size, _TAR_BLOCK_SIZE))
 
     magic4 = header[:4]
     magic8 = header[:8]
@@ -957,7 +1460,7 @@ def detect_file_format(path: str) -> str:
 
     if magic8.startswith(b"\x93NUMPY"):
         return "numpy"
-    if magic4 == b"\x08\x01\x12\x00":
+    if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
         return "onnx"
 
     # Check first 8 bytes for HDF5 magic
@@ -990,24 +1493,21 @@ def detect_file_format(path: str) -> str:
         return "unknown"
     if magic8.startswith(_SEVENZIP_MAGIC):
         return "sevenzip"
-    if _is_tar_archive(path):
+    if _has_rar_magic(magic8):
+        return "rar"
+    if _looks_like_uncompressed_tar_header(header):
         return "tar"
     if compression_format:
+        if _is_tar_archive(path):
+            return "tar"
         return compression_format
     # Check ZIP magic first (for .pt/.pth files that are actually zips)
-    if magic4.startswith(b"PK"):
+    if _has_zip_magic(magic4):
         if ext == ".mar" and is_torchserve_mar_archive(path):
             return "torchserve_mar"
         return "zip"
 
-    # Check pickle magic patterns
-    pickle_magics = [
-        b"\x80\x02",  # Protocol 2
-        b"\x80\x03",  # Protocol 3
-        b"\x80\x04",  # Protocol 4
-        b"\x80\x05",  # Protocol 5
-    ]
-    if any(magic4.startswith(m) for m in pickle_magics):
+    if _looks_like_binary_pickle_protocol(magic4):
         return "pickle"
     pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
     if _looks_like_proto0_or_1_pickle(
@@ -1015,6 +1515,14 @@ def detect_file_format(path: str) -> str:
         sample_is_prefix=size > len(pickle_probe_sample),
     ):
         return "pickle"
+    if _could_be_xml_prefix(header):
+        xml_prefix = read_magic_bytes(path, _XML_MODEL_SIGNATURE_READ_BYTES)
+        xml_format = _detect_xml_model_format(
+            xml_prefix,
+            sample_is_prefix=size > len(xml_prefix),
+        )
+        if xml_format != "unknown":
+            return xml_format
 
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
@@ -1022,10 +1530,9 @@ def detect_file_format(path: str) -> str:
         if _looks_like_tflite_header(magic8):
             return "tflite"
         # IMPORTANT: Check ZIP format first (PyTorch models saved with torch.save())
-        if magic4.startswith(b"PK"):
+        if _has_zip_magic(magic4):
             return "zip"
-        # Check if it's a pickle file (protocol 2-5)
-        if any(magic4.startswith(m) for m in pickle_magics):
+        if _looks_like_binary_pickle_protocol(magic4):
             return "pickle"
         # CVE-2025-10155: Detect protocol 0/1 pickles that lack magic bytes.
         # Protocol 0 GLOBAL opcode: c<module>\n<name>\n
@@ -1043,7 +1550,7 @@ def detect_file_format(path: str) -> str:
             return "safetensors"
 
         # Check for ONNX format (protobuf)
-        if magic4 == b"\x08\x01\x12\x00" or b"onnx" in magic16:
+        if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
             return "onnx"
 
         # Otherwise, assume raw binary format (PyTorch weights)
@@ -1053,7 +1560,7 @@ def detect_file_format(path: str) -> str:
     # For .pt/.pth/.ckpt files, check if they're ZIP format first
     if ext in (".pt", ".pth", ".ckpt"):
         # These files can be either ZIP or pickle format
-        if magic4.startswith(b"PK"):
+        if _has_zip_magic(magic4):
             return "zip"
         # If not ZIP, assume pickle format
         return "pickle"
@@ -1062,7 +1569,7 @@ def detect_file_format(path: str) -> str:
             return "tf_metagraph"
         return "unknown"
     if ext in (".ptl", ".pte"):
-        if magic4.startswith(b"PK"):
+        if _has_zip_magic(magic4):
             return "executorch"
         return "executorch"
     if ext in (".pkl", ".pickle", ".dill"):
@@ -1132,7 +1639,7 @@ def detect_file_format(path: str) -> str:
     if ext == ".npz":
         return "zip"
     if ext == ".joblib":
-        if magic4.startswith(b"PK"):
+        if _has_zip_magic(magic4):
             return "zip"
         return "pickle"
     if ext in (".rds", ".rda", ".rdata"):
@@ -1193,12 +1700,9 @@ def detect_format_from_extension(path: FilePath) -> FileFormat:
     return detect_format_from_extension_pattern_matching(file_path.suffix)
 
 
-def validate_file_type(path: str) -> bool:
-    """Validate that a file's magic bytes match its extension-based format."""
+def validate_file_type_with_formats(path: str, header_format: str, ext_format: str) -> bool:
+    """Validate file type using precomputed magic/header and extension formats."""
     try:
-        header_format = detect_file_format_from_magic(path)
-        ext_format = detect_format_from_extension(path)
-
         # If extension format is unknown, we can't validate - assume valid
         if ext_format == "unknown":
             return True
@@ -1226,7 +1730,7 @@ def validate_file_type(path: str) -> bool:
             return True
 
         # TensorFlow protobuf files (.pb extension)
-        if ext_format == "protobuf" and header_format in {"protobuf", "unknown"}:
+        if ext_format == "protobuf" and header_format in {"protobuf", "unknown", "onnx"}:
             return True
 
         # TensorFlow MetaGraph files (.meta extension) require strict protobuf validation.
@@ -1394,3 +1898,10 @@ def validate_file_type(path: str) -> bool:
     except Exception:
         # If validation fails due to error, assume valid to avoid breaking scans
         return True
+
+
+def validate_file_type(path: str) -> bool:
+    """Validate that a file's magic bytes match its extension-based format."""
+    header_format = detect_file_format_from_magic(path)
+    ext_format = detect_format_from_extension(path)
+    return validate_file_type_with_formats(path, header_format, ext_format)

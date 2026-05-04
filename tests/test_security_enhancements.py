@@ -9,8 +9,9 @@ import zlib
 from pathlib import Path
 
 import numpy as np
+import pytest
 
-from modelaudit.scanners.base import CheckStatus, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.joblib_scanner import JoblibScanner
 from modelaudit.scanners.numpy_scanner import NumPyScanner
 
@@ -286,6 +287,38 @@ class TestNumPyScannerSecurity:
         assert not any(
             check.name == "Data Type Safety Check" and check.status.value == "failed" for check in result.checks
         )
+
+    def test_object_dtype_propagates_inconclusive_embedded_pickle_metadata(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        scanner = NumPyScanner()
+        npy_file = tmp_path / "object_dtype_incomplete.npy"
+        np.save(npy_file, np.array([{"key": "value"}], dtype=object), allow_pickle=True)
+
+        def fake_embedded_scan(
+            self: NumPyScanner,
+            file_obj: object,
+            payload_size: int,
+            context_path: str,
+        ) -> ScanResult:
+            embedded_result = ScanResult(scanner_name="pickle")
+            embedded_result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+            embedded_result.metadata["scan_outcome_reasons"] = ["opcode_budget_exceeded"]
+            embedded_result.metadata["analysis_incomplete"] = True
+            embedded_result.finish(success=False)
+            return embedded_result
+
+        monkeypatch.setattr(NumPyScanner, "_scan_embedded_pickle_payload", fake_embedded_scan)
+
+        result = scanner.scan(str(npy_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "opcode_budget_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert "numpy_object_embedded_pickle_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert result.metadata["analysis_incomplete"] is True
 
     def test_array_size_overflow_protection(self, tmp_path):
         """Test protection against integer overflow in size calculation."""

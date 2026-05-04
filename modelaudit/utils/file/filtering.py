@@ -3,6 +3,7 @@
 import logging
 import os
 import zipfile
+from collections.abc import Collection
 from pathlib import Path
 
 # Default extensions to skip when scanning directories
@@ -106,6 +107,7 @@ DEFAULT_SCANNABLE_SKIP_OVERRIDES = {
     ".bz2",
     ".xz",
     ".7z",
+    ".rar",
 }
 
 _ARCHIVE_SIGNAL_EXTENSION_EXCLUSIONS: frozenset[str] = frozenset(
@@ -135,14 +137,7 @@ _ARCHIVE_SIGNAL_EXTENSION_EXCLUSIONS: frozenset[str] = frozenset(
 )
 
 _ZIP_MEMBER_SNIFF_LIMIT: int = 256
-_OFFICE_ARCHIVE_PREFIXES: tuple[str, ...] = ("word/", "xl/", "ppt/")
-_OFFICE_ARCHIVE_MARKER_FILES: frozenset[str] = frozenset(
-    {
-        "word/document.xml",
-        "xl/workbook.xml",
-        "ppt/presentation.xml",
-    }
-)
+_ZIP_LOCAL_FILE_SIGNATURES: tuple[bytes, ...] = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 _MODEL_ARCHIVE_SIGNAL_BASENAMES: frozenset[str] = frozenset(
     {
         "pytorch_model.bin",
@@ -151,6 +146,7 @@ _MODEL_ARCHIVE_SIGNAL_BASENAMES: frozenset[str] = frozenset(
         "flax_model.msgpack",
     }
 )
+_MODEL_ARCHIVE_BINARY_SIGNAL_EXTENSIONS: frozenset[str] = frozenset({".bin"})
 
 
 def _get_scannable_extensions() -> set[str]:
@@ -178,15 +174,41 @@ def _get_candidate_extensions(filename: str) -> list[str]:
     return candidates
 
 
+def _zip_member_has_scannable_binary_signal(archive: zipfile.ZipFile, member: zipfile.ZipInfo) -> bool | None:
+    """Return whether a low-signal binary member is model-like, or None if unknown."""
+    member_ext = Path(member.filename).suffix.lower()
+    if member_ext not in _MODEL_ARCHIVE_BINARY_SIGNAL_EXTENSIONS or member.file_size <= 0:
+        return False
+
+    try:
+        from .detection import (
+            PROTO0_1_MAX_PROBE_BYTES,
+            _looks_like_binary_pickle_protocol,
+            _looks_like_proto0_or_1_pickle,
+        )
+
+        with archive.open(member) as member_file:
+            sample = member_file.read(min(member.file_size, PROTO0_1_MAX_PROBE_BYTES))
+    except Exception as exc:
+        logger.debug("Binary member sniffing failed for %s: %s", member.filename, exc)
+        return None
+
+    if sample.startswith(_ZIP_LOCAL_FILE_SIGNATURES):
+        return True
+    if _looks_like_binary_pickle_protocol(sample[:4]):
+        return True
+    return _looks_like_proto0_or_1_pickle(sample, sample_is_prefix=member.file_size > len(sample))
+
+
 def _has_scannable_content(path: str) -> bool:
     """Return whether on-disk file contents map to a supported format."""
     if not os.path.isfile(path):
         return False
 
     try:
-        from .detection import detect_file_format
+        from .detection import detect_file_format_for_skip_filter, is_keras_zip_archive
 
-        detected_format = detect_file_format(path)
+        detected_format = detect_file_format_for_skip_filter(path)
         if detected_format == "unknown":
             return False
 
@@ -194,21 +216,21 @@ def _has_scannable_content(path: str) -> bool:
             return True
 
         with zipfile.ZipFile(path, "r") as archive:
+            if is_keras_zip_archive(path):
+                return True
+
             model_archive_signal_extensions = _get_model_archive_signal_extensions()
             has_keras_config = False
             has_keras_marker = False
             has_pytorch_data = False
             has_pytorch_marker = False
             processed_members = 0
-            archive_names = archive.NameToInfo
-            saw_content_types = "[Content_Types].xml" in archive_names
-            saw_office_prefix = any(marker in archive_names for marker in _OFFICE_ARCHIVE_MARKER_FILES)
             for member in archive.filelist:
                 if processed_members >= _ZIP_MEMBER_SNIFF_LIMIT:
                     # If we cannot finish classifying the archive within the
-                    # prefilter budget, preserve it for full scanning unless it
-                    # already looks like a standard Office document container.
-                    return not (saw_content_types and saw_office_prefix)
+                    # prefilter budget, preserve it for full scanning. Office
+                    # markers do not prove that later members are benign.
+                    return True
 
                 if not member.filename or member.is_dir():
                     continue
@@ -218,11 +240,7 @@ def _has_scannable_content(path: str) -> bool:
                 member_basename = Path(member_name).name.lower()
 
                 if member_name == "[Content_Types].xml":
-                    saw_content_types = True
                     continue
-
-                if member_name.startswith(_OFFICE_ARCHIVE_PREFIXES):
-                    saw_office_prefix = True
 
                 # Preserve Keras, TorchServe, and PyTorch ZIP containers even
                 # when the outer filename uses a skipped suffix.
@@ -258,6 +276,12 @@ def _has_scannable_content(path: str) -> bool:
                 if member_basename in _MODEL_ARCHIVE_SIGNAL_BASENAMES:
                     return True
 
+                binary_signal = _zip_member_has_scannable_binary_signal(archive, member)
+                if binary_signal is None:
+                    return True
+                if binary_signal:
+                    return True
+
             if has_keras_config and has_keras_marker:
                 return True
 
@@ -276,6 +300,7 @@ def should_skip_file(
     skip_filenames: set[str] | None = None,
     skip_hidden: bool = True,
     metadata_scanner_available: bool = True,
+    scanner_selection_extensions: Collection[str] | None = None,
 ) -> bool:
     """
     Check if a file should be skipped based on its extension or name.
@@ -286,6 +311,7 @@ def should_skip_file(
         skip_filenames: Set of filenames to skip (defaults to DEFAULT_SKIP_FILENAMES)
         skip_hidden: Whether to skip hidden files (starting with .)
         metadata_scanner_available: Whether metadata scanner is available to handle metadata files
+        scanner_selection_extensions: Selected scanner suffixes that should be preserved from default skips
 
     Returns:
         True if the file should be skipped
@@ -305,15 +331,21 @@ def should_skip_file(
     # Special handling for metadata files that scanners can handle
     metadata_extensions = {".md", ".yml", ".yaml"}
     metadata_filenames = {"readme", "model_card", "model-index"}
+    filename_lower = filename.lower()
 
     # Special handling for specific .txt files that are README-like
-    is_readme_txt = ext == ".txt" and (filename.lower() in metadata_filenames or filename.lower().startswith("readme."))
+    is_readme_txt = ext == ".txt" and (filename_lower in metadata_filenames or filename_lower.startswith("readme."))
 
     # If metadata scanner is available, don't skip metadata files
     if metadata_scanner_available and (
-        ext in metadata_extensions or filename.lower() in metadata_filenames or is_readme_txt
+        ext in metadata_extensions or filename_lower in metadata_filenames or is_readme_txt
     ):
         return False
+
+    if use_default_skip_extensions and scanner_selection_extensions is not None:
+        selected_extensions = {candidate.lower() for candidate in scanner_selection_extensions}
+        if any(candidate in selected_extensions for candidate in candidate_extensions):
+            return False
 
     # Preserve scanner coverage for archive/metadata formats that are otherwise
     # part of the default skip list.
@@ -338,10 +370,13 @@ def should_skip_file(
         and ext != ".dvc"
         and not any(candidate in scannable_extensions for candidate in candidate_extensions)
     ):
-        return True
+        return not (use_default_skip_extensions and _has_scannable_content(path))
 
     # Skip specific filenames
-    return filename in skip_filenames
+    if filename in skip_filenames:
+        return not (use_default_skip_extensions and _has_scannable_content(path))
+
+    return False
 
 
 logger = logging.getLogger(__name__)

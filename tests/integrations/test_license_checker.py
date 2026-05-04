@@ -1,10 +1,13 @@
 """Tests for the license checking functionality in ModelAudit."""
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
+import pytest
 from pydantic import HttpUrl
 
+from modelaudit.integrations import license_checker
 from modelaudit.integrations.license_checker import (
     _LICENSE_HEADER_MAX_BYTES,
     CopyrightInfo,
@@ -21,20 +24,48 @@ from modelaudit.integrations.license_checker import (
     scan_for_license_headers,
 )
 
+MIT_HEADER = """# Copyright 2024 Example Corp
+# SPDX-License-Identifier: MIT
+# Licensed under the MIT License
+"""
+
+APACHE_HEADER = """# Licensed under the Apache License, Version 2.0
+# Copyright 2024 Apache Foundation
+"""
+
+AGPL_HEADER = """# Licensed under the GNU Affero General Public License
+# SPDX-License-Identifier: AGPL-3.0
+"""
+
+CC_BY_NC_HEADER = """Creative Commons Attribution NonCommercial License
+This work is licensed under CC BY-NC 4.0
+"""
+
+RAIL_HEADER = """# Released under the Responsible AI License
+# BigScience Open RAIL-M
+"""
+
+BIGSCIENCE_DATASET_NOTICE = """
+{
+  "_license": "BigScience Open RAIL-M",
+  "_notice": "Dataset released under BigScience Open RAIL-M"
+}
+"""
+
 
 class TestLicenseDetection:
     """Test license detection from file headers."""
 
-    def test_mit_license_detection(self, tmp_path):
+    def test_mit_license_detection(self, tmp_path: Path) -> None:
         """Test detection of MIT license."""
         test_file = tmp_path / "mit_file.py"
-        content = """# Copyright 2024 Example Corp
-# SPDX-License-Identifier: MIT
-# Licensed under the MIT License
-
+        content = (
+            MIT_HEADER
+            + """
 def example_function():
     pass
 """
+        )
         test_file.write_text(content)
 
         licenses = scan_for_license_headers(str(test_file))
@@ -46,14 +77,15 @@ def example_function():
         assert licenses[0].source == "file_header"
         assert licenses[0].confidence == 0.8
 
-    def test_apache_license_detection(self, tmp_path):
+    def test_apache_license_detection(self, tmp_path: Path) -> None:
         """Test detection of Apache 2.0 license."""
         test_file = tmp_path / "apache_file.py"
-        content = """# Licensed under the Apache License, Version 2.0
-# Copyright 2024 Apache Foundation
-
+        content = (
+            APACHE_HEADER
+            + """
 import numpy as np
 """
+        )
         test_file.write_text(content)
 
         licenses = scan_for_license_headers(str(test_file))
@@ -62,15 +94,16 @@ import numpy as np
         assert licenses[0].spdx_id == "Apache-2.0"
         assert licenses[0].commercial_allowed is True
 
-    def test_agpl_license_detection(self, tmp_path):
+    def test_agpl_license_detection(self, tmp_path: Path) -> None:
         """Test detection of AGPL license."""
         test_file = tmp_path / "agpl_file.py"
-        content = """# Licensed under the GNU Affero General Public License
-# SPDX-License-Identifier: AGPL-3.0
-
+        content = (
+            AGPL_HEADER
+            + """
 def network_service():
     pass
 """
+        )
         test_file.write_text(content)
 
         licenses = scan_for_license_headers(str(test_file))
@@ -81,14 +114,15 @@ def network_service():
         assert len(agpl_licenses) == 1
         assert agpl_licenses[0].commercial_allowed is True  # But with strong obligations
 
-    def test_cc_by_nc_license_detection(self, tmp_path):
+    def test_cc_by_nc_license_detection(self, tmp_path: Path) -> None:
         """Test detection of Creative Commons NonCommercial license."""
         test_file = tmp_path / "cc_nc_file.txt"
-        content = """Creative Commons Attribution NonCommercial License
-This work is licensed under CC BY-NC 4.0
-
+        content = (
+            CC_BY_NC_HEADER
+            + """
 Some dataset content here...
 """
+        )
         test_file.write_text(content)
 
         licenses = scan_for_license_headers(str(test_file))
@@ -97,14 +131,15 @@ Some dataset content here...
         assert licenses[0].spdx_id == "CC-BY-NC-4.0"
         assert licenses[0].commercial_allowed is False
 
-    def test_rail_license_detection(self, tmp_path):
+    def test_rail_license_detection(self, tmp_path: Path) -> None:
         """Test detection of RAIL license."""
         test_file = tmp_path / "rail_file.py"
-        content = """# Released under the Responsible AI License
-# BigScience Open RAIL-M
-def do_something():
+        content = (
+            RAIL_HEADER
+            + """def do_something():
     pass
 """
+        )
         test_file.write_text(content)
 
         licenses = scan_for_license_headers(str(test_file))
@@ -113,16 +148,10 @@ def do_something():
         spdx_ids = {lic.spdx_id for lic in licenses}
         assert "RAIL" in spdx_ids or "BigScience-OpenRAIL-M" in spdx_ids
 
-    def test_bigscience_dataset_notice_detection(self, tmp_path):
+    def test_bigscience_dataset_notice_detection(self, tmp_path: Path) -> None:
         """Test detection of BigScience dataset license notice."""
         dataset_file = tmp_path / "dataset.json"
-        content = """
-{
-  "_license": "BigScience Open RAIL-M",
-  "_notice": "Dataset released under BigScience Open RAIL-M"
-}
-"""
-        dataset_file.write_text(content)
+        dataset_file.write_text(BIGSCIENCE_DATASET_NOTICE)
 
         licenses = scan_for_license_headers(str(dataset_file))
 
@@ -162,7 +191,9 @@ def some_function():
         """Binary payloads should not be re-read as one huge text line."""
         test_file = tmp_path / "model.pt"
         test_file.write_bytes(
-            b"PK\x03\x04\x00" + b"A" * (_LICENSE_HEADER_MAX_BYTES * 2) + b"\nSPDX-License-Identifier: MIT\n",
+            b"PK\x03\x04\x00"  # ZIP local file header signature plus one extra binary byte.
+            + b"A" * (_LICENSE_HEADER_MAX_BYTES * 2)
+            + b"\nSPDX-License-Identifier: MIT\n",
         )
 
         content = _read_header_text(str(test_file), max_lines=50)
@@ -184,6 +215,39 @@ def some_function():
         licenses = scan_for_license_headers(str(test_file), max_lines=1)
 
         assert [license_info.spdx_id for license_info in licenses] == ["MIT"]
+
+    def test_long_one_line_non_license_text_header_is_bounded(self, tmp_path: Path) -> None:
+        """Ordinary text-like payloads should not force a full-file line read."""
+        test_file = tmp_path / "payload.dat"
+        test_file.write_text(
+            "A" * (_LICENSE_HEADER_MAX_BYTES + 256) + " SPDX-License-Identifier: MIT\n",
+            encoding="utf-8",
+        )
+
+        content = _read_header_text(str(test_file), max_lines=1)
+        licenses = scan_for_license_headers(str(test_file), max_lines=1)
+
+        assert content is not None
+        assert len(content) <= _LICENSE_HEADER_MAX_BYTES
+        assert "SPDX-License-Identifier: MIT" not in content
+        assert licenses == []
+
+    def test_large_non_license_text_header_still_respects_max_lines(self, tmp_path: Path) -> None:
+        """Ordinary files should stay line-bounded even when the byte probe truncates."""
+        test_file = tmp_path / "payload.dat"
+        test_file.write_text(
+            "".join(f"line {index}\n" for index in range(10))
+            + "SPDX-License-Identifier: MIT\n"
+            + "A" * _LICENSE_HEADER_MAX_BYTES,
+            encoding="utf-8",
+        )
+
+        content = _read_header_text(str(test_file), max_lines=10)
+        licenses = scan_for_license_headers(str(test_file), max_lines=10)
+
+        assert content is not None
+        assert "SPDX-License-Identifier: MIT" not in content
+        assert licenses == []
 
 
 class TestCopyrightExtraction:
@@ -300,17 +364,14 @@ class TestUnlicensedDatasetDetection:
         assert len(unlicensed) == 1
         assert str(json_file) in unlicensed
 
-    def test_skip_small_single_files(self, tmp_path):
-        """Test that small single files are not flagged."""
+    def test_small_single_files_are_reported_by_raw_detection(self, tmp_path: Path) -> None:
+        """Raw detection reports unlicensed datasets before warning significance filtering."""
         small_json = tmp_path / "small.json"
-        small_json.write_text('{"test": "data"}')  # Small file
+        small_json.write_text('{"test": "data"}')
 
         unlicensed = detect_unlicensed_datasets([str(small_json)])
 
-        # Note: Small JSON files may still be flagged if they don't have license info
-        # This test verifies the behavior - small files in multi-file contexts are skipped
-        # but single small files may still be checked
-        assert len(unlicensed) <= 1  # May or may not be flagged depending on size threshold
+        assert unlicensed == [str(small_json)]
 
     def test_dataset_with_nearby_license(self, tmp_path):
         """Test dataset with license file in same directory."""
@@ -324,14 +385,39 @@ class TestUnlicensedDatasetDetection:
 
         assert len(unlicensed) == 0  # Should not be flagged due to nearby license
 
-    def test_ml_model_directory_skip(self, tmp_path):
+    def test_reuses_sibling_directory_listing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Reuse same-directory license discovery across sibling datasets."""
+        files = []
+        for index in range(3):
+            csv_file = tmp_path / f"data_{index}.csv"
+            csv_file.write_text("name,age\nAlice,25\n")
+            files.append(str(csv_file))
+
+        original_iterdir = Path.iterdir
+        listing_count = 0
+
+        def counting_iterdir(path: Path) -> Iterator[Path]:
+            nonlocal listing_count
+            if path == tmp_path:
+                listing_count += 1
+            yield from original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", counting_iterdir)
+
+        unlicensed = detect_unlicensed_datasets(files, license_info_by_path={file_path: [] for file_path in files})
+
+        assert unlicensed == files
+        assert listing_count == 1
+
+    def test_ml_model_directory_skip(self, tmp_path: Path) -> None:
         """Test that ML model files in model directories are skipped."""
         # Create ML model directory
         (tmp_path / "config.json").write_text('{"model_type": "gpt2"}')
         (tmp_path / "pytorch_model.bin").write_bytes(b"model weights")
+        # This would normally be flagged outside an ML model directory.
         (tmp_path / "data.pkl").write_bytes(
             b"some data",
-        )  # This would normally be flagged
+        )
 
         file_paths = [str(f) for f in tmp_path.glob("*")]
         unlicensed = detect_unlicensed_datasets(file_paths)
@@ -544,6 +630,57 @@ Bob,30
 
         assert metadata["is_dataset"] is True  # .pkl is both dataset and model extension
         assert metadata["is_model"] is True
+
+    def test_collect_license_metadata_reuses_lowered_header(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Reuse one lowercase view across the shared metadata collectors."""
+
+        class TrackingStr(str):
+            lower_calls = 0
+
+            def lower(self) -> str:
+                self.lower_calls += 1
+                return super().lower()
+
+        test_file = tmp_path / "header.py"
+        test_file.write_text("placeholder")
+        content = TrackingStr("# SPDX-License-Identifier: MIT\n# Copyright 2024 Test Corp\n")
+        monkeypatch.setattr(license_checker, "_read_header_text", lambda *_args, **_kwargs: content)
+
+        metadata = collect_license_metadata(str(test_file))
+
+        assert content.lower_calls == 1
+        assert metadata["license_info"][0]["spdx_id"] == "MIT"
+        assert metadata["copyright_notices"][0]["holder"] == "Test Corp"
+
+    def test_collect_license_metadata_reuses_nearby_license_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Repeated same-directory metadata scans should reuse nearby-license discovery."""
+        first_file = tmp_path / "first.pkl"
+        second_file = tmp_path / "second.pkl"
+        first_file.write_bytes(b"first")
+        second_file.write_bytes(b"second")
+        calls = 0
+
+        def fake_find_license_files(directory: str) -> list[str]:
+            nonlocal calls
+            calls += 1
+            return [str(Path(directory) / "LICENSE")]
+
+        monkeypatch.setattr("modelaudit.integrations.license_checker.find_license_files", fake_find_license_files)
+        nearby_license_cache: dict[str, list[str]] = {}
+
+        first_metadata = collect_license_metadata(str(first_file), nearby_license_cache=nearby_license_cache)
+        second_metadata = collect_license_metadata(str(second_file), nearby_license_cache=nearby_license_cache)
+
+        assert calls == 1
+        assert first_metadata["license_files_nearby"] == second_metadata["license_files_nearby"]
 
 
 class TestIntegration:

@@ -8,6 +8,7 @@ import pickletools
 import re
 from collections import OrderedDict
 from collections.abc import Iterator
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -55,6 +56,7 @@ class JaxCheckpointScanner(BaseScanner):
         "jaxlib",
         "device_array",
     )
+    _NON_JAX_NEAR_MATCH_PREFIXES: ClassVar[frozenset[str]] = frozenset({"a"})
     _DOCUMENTATION_CONTEXT_HINTS: ClassVar[frozenset[str]] = frozenset(
         {
             "description",
@@ -410,6 +412,21 @@ class JaxCheckpointScanner(BaseScanner):
             )
             finding_budget.recorded_findings += 1
 
+    def scan_pickle_pattern_text(self, path: str, text: str) -> ScanResult:
+        """Run the JAX-specific pickle text checks on already-read data."""
+        result = self._create_result()
+        self._add_suspicious_pattern_checks(
+            text,
+            context="pickle_checkpoint",
+            check_name="JAX Pattern Security Check",
+            message_prefix="Suspicious JAX pattern in pickle",
+            location=path,
+            result=result,
+            finding_budget=_PatternFindingBudget(self.max_metadata_pattern_findings),
+        )
+        result.finish(success=True)
+        return result
+
     @staticmethod
     def _parse_pickle_global_reference(arg: str) -> tuple[str, str] | None:
         """Parse pickle GLOBAL/INST opcode args into ``(module, name)``."""
@@ -474,34 +491,29 @@ class JaxCheckpointScanner(BaseScanner):
         try:
             with open(path, "rb") as f:
                 header = f.read(512)
-
-            # Check for pickle format with JAX indicators
-            if header.startswith(b"\x80"):  # Pickle protocol
-                # Read more to check for JAX-specific content
-                try:
-                    with open(path, "rb") as f:
-                        data = f.read(8192)  # Read first 8KB
+                # Check for pickle formats with JAX indicators. Protocol 0
+                # pickles are textual and can begin directly with a string
+                # opcode such as `Vjax`, so they do not have the binary
+                # protocol marker.
+                if header.startswith(b"\x80") or header[:1] in b"(cdgINRSUV":
+                    with suppress(Exception):
+                        data = header + f.read(max(0, 8192 - len(header)))
                         data_str = data.decode("utf-8", errors="ignore").lower()
-
-                    return any(indicator in data_str for indicator in cls._JAX_INDICATORS)
-                except Exception:
-                    pass
+                        return cls._contains_jax_indicator(data_str)
 
             decoded_header = header.decode("utf-8", errors="ignore").lower()
 
             # Check for JSON metadata files, including extensionful `.checkpoint`
             # files that contain JAX/Orbax metadata rather than pickle bytes.
             if cls._header_looks_like_json(header):
-                return any(
-                    indicator in decoded_header for indicator in cls._JAX_INDICATORS
-                ) or cls._file_contains_jax_indicator(path)
+                return cls._contains_jax_indicator(decoded_header) or cls._file_contains_jax_indicator(path)
 
             # Check for NumPy files in JAX context
-            if header.startswith(b"\x93NUMPY") and "jax" in path.lower():
+            if header.startswith(b"\x93NUMPY") and cls._contains_jax_indicator(path.lower()):
                 return True
 
         except Exception:
-            pass
+            return False
 
         return False
 
@@ -516,12 +528,25 @@ class JaxCheckpointScanner(BaseScanner):
                 while chunk := f.read(cls._JAX_INDICATOR_SCAN_CHUNK_BYTES):
                     decoded_chunk = chunk.decode("utf-8", errors="ignore").lower()
                     search_text = chunk_tail + decoded_chunk
-                    if any(indicator in search_text for indicator in cls._JAX_INDICATORS):
+                    if cls._contains_jax_indicator(search_text):
                         return True
                     chunk_tail = search_text[-tail_length:]
         except Exception:
             return False
 
+        return False
+
+    @classmethod
+    def _contains_jax_indicator(cls, text: str) -> bool:
+        """Return True when text contains a JAX-family indicator that is not a suffix."""
+        lowered_text = text.lower()
+        for indicator in cls._JAX_INDICATORS:
+            start = 0
+            while (index := lowered_text.find(indicator, start)) != -1:
+                prefix = lowered_text[index - 1] if index > 0 else ""
+                if prefix not in cls._NON_JAX_NEAR_MATCH_PREFIXES:
+                    return True
+                start = index + 1
         return False
 
     def _scan_orbax_checkpoint(self, path: str, result: ScanResult) -> None:
@@ -911,17 +936,7 @@ class JaxCheckpointScanner(BaseScanner):
                 if not pickle_prefix_truncated:
                     raise
 
-            # Check for JAX-specific suspicious content
-            data_str = data.decode("utf-8", errors="ignore")
-            self._add_suspicious_pattern_checks(
-                data_str,
-                context="pickle_checkpoint",
-                check_name="JAX Pattern Security Check",
-                message_prefix="Suspicious JAX pattern in pickle",
-                location=path,
-                result=result,
-                finding_budget=_PatternFindingBudget(self.max_metadata_pattern_findings),
-            )
+            result.merge(self.scan_pickle_pattern_text(path, data.decode("utf-8", errors="ignore")))
 
         except Exception as e:
             result.add_check(

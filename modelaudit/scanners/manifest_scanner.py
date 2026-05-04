@@ -57,6 +57,21 @@ MANIFEST_EXTENSIONS = [
     ".model",
     ".metadata",
 ]
+MANIFEST_EXACT_FILENAMES = frozenset(
+    {
+        "manifest.json",
+        "model.json",
+        "params.json",
+        "hyperparams.yaml",
+        "training_args.json",
+        "dataset_info.json",
+        "environment.yml",
+        "conda.yaml",
+        "metadata.json",
+        "index.json",
+    }
+)
+MANIFEST_EXACT_EXTENSIONS = frozenset({".manifest"})
 
 # Keys that might contain model names
 MODEL_NAME_KEYS_LOWER = [
@@ -157,6 +172,7 @@ HASH_INTEGRITY_KEYS = [
 
 # Regex pattern for hexadecimal strings (used to detect hash values)
 HEX_PATTERN = re.compile(r"^[a-fA-F0-9]+$")
+JINJA_TEMPLATE_FIELD_NAMES = frozenset({"chat_template", "template", "jinja_template", "custom_chat_template"})
 
 # Comprehensive allowlist of trusted domains for ML model configs
 # URLs from domains NOT in this list will be flagged as untrusted
@@ -403,6 +419,19 @@ TRUSTED_URL_EXACT_DOMAINS = {
     "sourceforge.net",
     "streamlit.io",
 }
+_NORMALIZED_TRUSTED_URL_DOMAINS: Final[frozenset[str]] = frozenset(
+    domain.lower().rstrip(".") for domain in TRUSTED_URL_DOMAINS
+)
+_NORMALIZED_TRUSTED_URL_EXACT_DOMAINS: Final[frozenset[str]] = frozenset(
+    domain.lower().rstrip(".") for domain in TRUSTED_URL_EXACT_DOMAINS
+)
+_TRUSTED_URL_SUBDOMAIN_SUFFIXES: Final[tuple[str, ...]] = tuple(
+    dict.fromkeys(
+        normalized_domain
+        for domain in TRUSTED_URL_DOMAINS
+        if (normalized_domain := domain.lower().rstrip(".")) not in _NORMALIZED_TRUSTED_URL_EXACT_DOMAINS
+    )
+)
 
 # Regex to find URLs in text
 URL_PATTERN = re.compile(r'https?://[^\s<>"\']+[^\s<>"\',.]')
@@ -469,15 +498,10 @@ def _is_trusted_url_domain(url: str) -> bool:
     if _is_trusted_s3_endpoint_host(host):
         return True
 
-    for domain in TRUSTED_URL_DOMAINS:
-        trusted = domain.lower().rstrip(".")
-        if host == trusted:
-            return True
-        if trusted in TRUSTED_URL_EXACT_DOMAINS:
-            continue
-        if host.endswith(f".{trusted}"):
-            return True
-    return False
+    if host in _NORMALIZED_TRUSTED_URL_DOMAINS:
+        return True
+
+    return any(host.endswith(f".{trusted}") for trusted in _TRUSTED_URL_SUBDOMAIN_SUFFIXES)
 
 
 class ManifestScanner(BaseScanner):
@@ -546,6 +570,12 @@ class ManifestScanner(BaseScanner):
         if filename in web_configs:
             return False
 
+        if filename in MANIFEST_EXACT_FILENAMES:
+            return True
+
+        if os.path.splitext(filename)[1] in MANIFEST_EXACT_EXTENSIONS:
+            return True
+
         if any(filename == pattern or filename.endswith(pattern) for pattern in aiml_specific_patterns):
             return True
 
@@ -582,6 +612,7 @@ class ManifestScanner(BaseScanner):
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
+        self._manifest_text_cache: dict[str, str] = {}
 
         try:
             # Store the file path for use in issue locations
@@ -653,6 +684,12 @@ class ManifestScanner(BaseScanner):
                 self._check_weak_hashes(content, result)
                 self._check_timeout()
 
+                # Manifest-owned configs can still carry executable chat
+                # templates, so preserve manifest checks while delegating those
+                # embedded fields to the dedicated Jinja analyzer.
+                self._scan_embedded_jinja_templates(path, content, result)
+                self._check_timeout()
+
             else:
                 result.add_check(
                     name="Manifest Structure",
@@ -694,6 +731,8 @@ class ManifestScanner(BaseScanner):
             )
             result.finish(success=False)
             return result
+        finally:
+            self._manifest_text_cache.clear()
 
         self._finish_manifest_result(result)
         return result
@@ -726,8 +765,7 @@ class ManifestScanner(BaseScanner):
             return
 
         try:
-            with open(path, encoding="utf-8") as f:
-                content = f.read().lower()
+            content = self._read_manifest_text(path).lower()
 
             found_blacklisted = False
             for pattern in self.blacklist_patterns:
@@ -779,8 +817,7 @@ class ManifestScanner(BaseScanner):
     ) -> Any:
         """Parse the file based on its extension"""
         try:
-            with open(path, encoding="utf-8") as f:
-                content = f.read()
+            content = self._read_manifest_text(path)
 
             stripped_content = content.strip()
 
@@ -833,6 +870,33 @@ class ManifestScanner(BaseScanner):
                 )
 
         return _PARSE_FAILED
+
+    def _scan_embedded_jinja_templates(self, path: str, content: Any, result: ScanResult) -> None:
+        templates = self._collect_jinja_template_fields(content)
+        if not templates:
+            return
+
+        from .jinja2_template_scanner import Jinja2TemplateScanner
+
+        result.merge(Jinja2TemplateScanner(config=self.config).scan_extracted_templates(path, templates))
+
+    @classmethod
+    def _collect_jinja_template_fields(cls, value: Any, path: str = "") -> dict[str, str]:
+        if isinstance(value, dict):
+            templates: dict[str, str] = {}
+            for key, item in value.items():
+                child_path = f"{path}.{key}" if path else str(key)
+                if key in JINJA_TEMPLATE_FIELD_NAMES and isinstance(item, str) and item.strip():
+                    templates[child_path] = item
+                templates.update(cls._collect_jinja_template_fields(item, child_path))
+            return templates
+        if isinstance(value, list):
+            templates = {}
+            for index, item in enumerate(value):
+                child_path = f"{path}[{index}]" if path else f"[{index}]"
+                templates.update(cls._collect_jinja_template_fields(item, child_path))
+            return templates
+        return {}
 
     def _parse_ini_file(self, content: str) -> dict[str, Any]:
         """Parse INI-style manifests into nested dictionaries."""
@@ -955,8 +1019,7 @@ class ManifestScanner(BaseScanner):
         - Supply chain risks from external resources
         """
         try:
-            with open(path, encoding="utf-8") as f:
-                content = f.read()
+            content = self._read_manifest_text(path)
 
             self._check_timeout()
             seen_urls: set[str] = set()
@@ -1005,6 +1068,18 @@ class ManifestScanner(BaseScanner):
             raise
         except Exception as e:
             logger.debug(f"Error checking cloud storage URLs in {path}: {e}")
+
+    def _read_manifest_text(self, path: str) -> str:
+        cached_content = getattr(self, "_manifest_text_cache", {}).get(path)
+        if cached_content is not None:
+            return cached_content
+
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+
+        if hasattr(self, "_manifest_text_cache"):
+            self._manifest_text_cache[path] = content
+        return content
 
     def _check_suspicious_urls(self, content: Any, result: ScanResult) -> None:
         """Check for untrusted URLs in config values using allowlist approach.
