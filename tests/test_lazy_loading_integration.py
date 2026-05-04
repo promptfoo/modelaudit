@@ -133,40 +133,32 @@ class TestPerformanceCharacteristics:
         # First access loads scanners, but should still be reasonable
         assert access_time < 5.0  # Much better than 7+ seconds
 
-    def test_single_scanner_access_performance(self):
+    def test_single_scanner_access_performance(self) -> None:
         """Test that accessing a single scanner is fast."""
         _registry._loaded_scanners.clear()
 
         start_time = time.time()
-
-        # Access a lightweight scanner
+        from modelaudit.scanners import PickleScanner
 
         access_time = time.time() - start_time
 
         # Should be very fast (no heavy dependencies)
         assert access_time < 0.5
+        assert _registry._loaded_scanners["pickle"] is PickleScanner
 
-    def test_heavy_scanner_access_expected_slow(self) -> None:
-        """Test that heavy scanners are slower but only when accessed."""
+    def test_heavy_scanner_loads_only_when_accessed(self) -> None:
+        """Heavy scanners should remain unloaded until their class is requested."""
         _registry._loaded_scanners.clear()
-
-        # First verify that we haven't loaded tensorflow yet
-        import sys
-
-        _ = "tensorflow" in sys.modules
+        assert "tf_savedmodel" not in _registry._loaded_scanners
 
         try:
-            # This might be slow due to tensorflow import
             from modelaudit.scanners import TensorFlowSavedModelScanner
-
-            # This is expected to be slower due to tensorflow
-            # But we can't assert exact time since it depends on system
-            # Just verify it doesn't crash and returns a valid scanner
-            assert TensorFlowSavedModelScanner is not None
 
         except ImportError:
             # TensorFlow might not be installed, which is fine
             pytest.skip("TensorFlow not available")
+
+        assert _registry._loaded_scanners["tf_savedmodel"] is TensorFlowSavedModelScanner
 
 
 class TestErrorRecovery:
