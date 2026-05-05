@@ -16,11 +16,8 @@ from typing import Any, BinaryIO, ClassVar, TypeGuard, cast
 from modelaudit_picklescan import PickleScanner as StandalonePickleScanner
 
 from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
-from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
-from modelaudit.analysis.framework_patterns import FrameworkKnowledgeBase
 from modelaudit.analysis.ml_context_analyzer import MLContextAnalyzer
 from modelaudit.analysis.opcode_sequence_analyzer import OpcodeSequenceAnalyzer
-from modelaudit.analysis.semantic_analyzer import SemanticAnalyzer
 from modelaudit.detectors.suspicious_symbols import (
     BINARY_CODE_PATTERNS,
     CVE_BINARY_PATTERNS,
@@ -4290,12 +4287,7 @@ class PickleScanner(BaseScanner):
                 _POST_BUDGET_EXPANSION_SCAN_LIMIT_BYTES,
             )
         self.post_budget_expansion_scan_limit_bytes = max(0, parsed_post_budget_expansion_limit)
-        # Initialize analyzers
-        self.entropy_analyzer = EntropyAnalyzer()
-        self.semantic_analyzer = SemanticAnalyzer()
-        self.framework_kb = FrameworkKnowledgeBase()
-
-        # Initialize enhanced analysis components
+        # Initialize active analysis components
         self.opcode_sequence_analyzer = OpcodeSequenceAnalyzer()
         self.ml_context_analyzer = MLContextAnalyzer()
         self.enhanced_pattern_detector = EnhancedPatternDetector()
