@@ -115,7 +115,12 @@ class ShardedModelDetector:
         return None
 
     @classmethod
-    def detect_shards(cls, file_path: str) -> dict[str, Any] | None:
+    def detect_shards(
+        cls,
+        file_path: str,
+        *,
+        allowed_paths: list[str] | None = None,
+    ) -> dict[str, Any] | None:
         """
         Detect if a file is part of a sharded model.
 
@@ -127,6 +132,7 @@ class ShardedModelDetector:
         """
         file_name = Path(file_path).name
         dir_path = Path(file_path).parent
+        allowed_path_set = {str(Path(path).resolve()) for path in allowed_paths} if allowed_paths is not None else None
 
         for pattern in cls.SHARD_PATTERNS:
             match = re.fullmatch(pattern, file_name)
@@ -140,6 +146,8 @@ class ShardedModelDetector:
                 for file in dir_path.glob("*"):
                     file_match = re.fullmatch(pattern, file.name)
                     if file_match:
+                        if allowed_path_set is not None and str(file.resolve()) not in allowed_path_set:
+                            continue
                         shard_info["shards"].append(str(file))
                         if file_match.lastindex:
                             with suppress(IndexError, ValueError):
@@ -431,6 +439,7 @@ class AdvancedFileHandler:
         scanner: Any,
         progress_callback: Callable[[str, float], None] | None = None,
         timeout: int = 7200,  # 2 hours for large models
+        allowed_shard_paths: list[str] | None = None,
     ):
         """
         Initialize advanced file handler.
@@ -448,7 +457,7 @@ class AdvancedFileHandler:
         self.start_time = time.time()
 
         # Check for sharded model
-        self.shard_info = ShardedModelDetector.detect_shards(file_path)
+        self.shard_info = ShardedModelDetector.detect_shards(file_path, allowed_paths=allowed_shard_paths)
 
         # Get file/model size
         if self.shard_info:
@@ -653,6 +662,7 @@ def scan_advanced_large_file(
     scanner: Any,
     progress_callback: Callable[[str, float], None] | None = None,
     timeout: int = 7200,
+    allowed_shard_paths: list[str] | None = None,
 ) -> "ScanResult":
     """
     Scan a large file with advanced handler.
@@ -673,7 +683,13 @@ def scan_advanced_large_file(
 
     # If caching is disabled, proceed with direct scan
     if not cache_enabled:
-        return _scan_advanced_large_file_internal(file_path, scanner, progress_callback, timeout)
+        return _scan_advanced_large_file_internal(
+            file_path,
+            scanner,
+            progress_callback,
+            timeout,
+            allowed_shard_paths=allowed_shard_paths,
+        )
 
     # Use cache manager for advanced large file scans
     try:
@@ -685,7 +701,13 @@ def scan_advanced_large_file(
 
         # Create wrapper function for cache manager
         def cached_advanced_scan_wrapper(fpath: str) -> dict:
-            result = _scan_advanced_large_file_internal(fpath, scanner, progress_callback, timeout)
+            result = _scan_advanced_large_file_internal(
+                fpath,
+                scanner,
+                progress_callback,
+                timeout,
+                allowed_shard_paths=allowed_shard_paths,
+            )
             return result.to_dict()
 
         # Get cached result or perform scan
@@ -703,7 +725,13 @@ def scan_advanced_large_file(
     except Exception as e:
         # If cache system fails, fall back to direct scanning
         logger.warning(f"Advanced file cache error for {file_path}: {e}. Falling back to direct scan.")
-        return _scan_advanced_large_file_internal(file_path, scanner, progress_callback, timeout)
+        return _scan_advanced_large_file_internal(
+            file_path,
+            scanner,
+            progress_callback,
+            timeout,
+            allowed_shard_paths=allowed_shard_paths,
+        )
 
 
 def _scan_advanced_large_file_internal(
@@ -711,6 +739,7 @@ def _scan_advanced_large_file_internal(
     scanner: Any,
     progress_callback: Callable[[str, float], None] | None = None,
     timeout: int = 7200,
+    allowed_shard_paths: list[str] | None = None,
 ) -> "ScanResult":
     """
     Internal implementation of advanced large file scanning (cache-agnostic).
@@ -724,5 +753,11 @@ def _scan_advanced_large_file_internal(
     Returns:
         ScanResult with findings
     """
-    handler = AdvancedFileHandler(file_path, scanner, progress_callback, timeout)
+    handler = AdvancedFileHandler(
+        file_path,
+        scanner,
+        progress_callback,
+        timeout,
+        allowed_shard_paths=allowed_shard_paths,
+    )
     return handler.scan()

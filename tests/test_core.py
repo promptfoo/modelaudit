@@ -168,6 +168,46 @@ def test_directory_scan_preserves_per_shard_sizes(
     assert {asset.path: asset.size for asset in result.assets} == expected_sizes
 
 
+def test_directory_scan_rejects_shard_siblings_outside_scan_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    first_shard = model_dir / "model-00001-of-00002.safetensors"
+    first_shard.write_bytes(b"inside-shard")
+    outside_shard = outside_dir / "model-00002-of-00002.safetensors"
+    outside_shard.write_bytes(b"outside-shard")
+    (model_dir / outside_shard.name).symlink_to(outside_shard)
+    calls: list[str] = []
+    captured_configs: list[dict[str, Any]] = []
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        calls.append(path)
+        captured_configs.append(dict(config or {}))
+        return _mock_sharded_scan_result(first_shard.stat().st_size)
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+    outside_path = str(outside_shard.resolve())
+
+    assert len(calls) == 1
+    assert outside_path not in result.file_metadata
+    assert outside_path not in {asset.path for asset in result.assets}
+    material_config = normalize_material_scan_config(captured_configs[0])
+    fingerprint = material_config[core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY]
+    assert outside_path not in {member["path"] for member in fingerprint["members"]}
+    assert any(
+        issue.message == "Path traversal outside scanned directory"
+        and issue.location == outside_path
+        and issue.details["resolved_path"] == outside_path
+        for issue in result.issues
+    )
+
+
 def test_directory_scan_reports_incomplete_sharded_model_family_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
