@@ -90,6 +90,31 @@ class ShardedModelDetector:
     ]
 
     @classmethod
+    def match_shard_filename(cls, file_name: str) -> dict[str, int | str | None] | None:
+        """Return shard metadata for a filename when it matches a known shard pattern."""
+        for pattern in cls.SHARD_PATTERNS:
+            match = re.fullmatch(pattern, file_name)
+            if not match:
+                continue
+
+            current_shard_index: int | None = None
+            expected_total_shards: int | None = None
+            if match.lastindex:
+                with suppress(IndexError, ValueError):
+                    current_shard_index = int(match.group(1))
+            if (match.lastindex or 0) >= 2:
+                with suppress(IndexError, ValueError):
+                    expected_total_shards = int(match.group(2))
+
+            return {
+                "pattern": pattern,
+                "current_shard_index": current_shard_index,
+                "expected_total_shards": expected_total_shards,
+            }
+
+        return None
+
+    @classmethod
     def detect_shards(cls, file_path: str) -> dict[str, Any] | None:
         """
         Detect if a file is part of a sharded model.
