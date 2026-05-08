@@ -11,11 +11,15 @@ import pytest
 from modelaudit import core
 from modelaudit.scanners import _registry
 
+MAX_SCANNERS_FOR_SINGLE_FILE_SCAN = 5
+MAX_SCANNERS_FOR_DIRECTORY_SCAN = 10
+MAX_SCANNERS_FOR_INCREMENTAL_SCAN = 15
+
 
 class TestCoreIntegration:
     """Test integration of lazy loading with core scanning functionality."""
 
-    def test_scan_file_uses_lazy_loading(self):
+    def test_scan_file_uses_lazy_loading(self) -> None:
         """Test that scan_file uses lazy loading correctly."""
         # Reset loaded scanners
         _registry._loaded_scanners.clear()
@@ -36,11 +40,11 @@ class TestCoreIntegration:
 
                 # Should have loaded minimal scanners
                 loaded_count = len(_registry._loaded_scanners)
-                assert loaded_count <= 5  # Should be minimal
+                assert loaded_count <= MAX_SCANNERS_FOR_SINGLE_FILE_SCAN
             finally:
                 Path(f.name).unlink(missing_ok=True)
 
-    def test_scan_directory_uses_lazy_loading(self):
+    def test_scan_directory_uses_lazy_loading(self) -> None:
         """Test that directory scanning uses lazy loading efficiently."""
         _registry._loaded_scanners.clear()
 
@@ -61,7 +65,7 @@ class TestCoreIntegration:
 
             # Should have loaded only necessary scanners
             loaded_count = len(_registry._loaded_scanners)
-            assert loaded_count <= 10  # Should be reasonable
+            assert loaded_count <= MAX_SCANNERS_FOR_DIRECTORY_SCAN
 
     def test_preferred_scanner_lazy_loading(self, tmp_path: Path) -> None:
         """Test that preferred scanner detection uses lazy loading."""
@@ -79,7 +83,7 @@ class TestCoreIntegration:
         # Should have loaded pickle scanner
         assert "pickle" in _registry._loaded_scanners
 
-    def test_multiple_file_types_incremental_loading(self):
+    def test_multiple_file_types_incremental_loading(self) -> None:
         """Test that scanning multiple file types loads scanners incrementally."""
         _registry._loaded_scanners.clear()
 
@@ -106,13 +110,13 @@ class TestCoreIntegration:
             # Should show incremental loading (or at least not loading everything at once)
             assert loaded_counts[0] > 0  # Some scanners loaded for first file
             # Later scans might load more, but shouldn't load everything
-            assert max(loaded_counts) <= 15  # Reasonable upper bound
+            assert max(loaded_counts) <= MAX_SCANNERS_FOR_INCREMENTAL_SCAN
 
 
 class TestPerformanceCharacteristics:
     """Test performance characteristics of lazy loading."""
 
-    def test_import_performance(self):
+    def test_import_performance(self) -> None:
         """Test that importing scanners is fast with lazy loading."""
         # This test measures import time
         start_time = time.time()
@@ -122,7 +126,8 @@ class TestPerformanceCharacteristics:
 
         import_time = time.time() - start_time
 
-        # Should be much faster than 1 second (was 7+ seconds before)
+        # The historical eager-loading baseline was 7+ seconds; 1 second leaves
+        # room for local and CI variance while still catching a real regression.
         assert import_time < 1.0
 
         # Accessing the registry should also be fast
@@ -130,8 +135,9 @@ class TestPerformanceCharacteristics:
         _ = scanners.SCANNER_REGISTRY
         access_time = time.time() - start_time
 
-        # First access loads scanners, but should still be reasonable
-        assert access_time < 5.0  # Much better than 7+ seconds
+        # First access performs one-time lazy-loading work, so keep this looser
+        # than the import guard while still catching a return to the old 7+ second path.
+        assert access_time < 5.0
 
     def test_single_scanner_access_performance(self) -> None:
         """Test that accessing a single scanner is fast."""

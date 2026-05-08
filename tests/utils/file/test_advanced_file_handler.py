@@ -29,10 +29,10 @@ class CompletingShardScanner:
         return result
 
 
-class FailingShardScanner:
+class OperationalFailureScanner:
     """Scanner that simulates an operational shard scan failure."""
 
-    name = "failing_shard_scanner"
+    name = "operational_failure_scanner"
 
     def scan(self, shard_path: str) -> ScanResult:
         raise RuntimeError(f"cannot scan {Path(shard_path).name}")
@@ -297,6 +297,11 @@ class TestAdvancedFileHandler:
         class ScannerWithoutBoundedSupport:
             name = "test_scanner"
 
+            def scan(self, _file_path: str) -> ScanResult:
+                result = ScanResult(scanner_name=self.name)
+                result.finish(success=True)
+                return result
+
         handler = AdvancedFileHandler(str(model_path), ScannerWithoutBoundedSupport())
         result = handler.scan()
 
@@ -356,7 +361,7 @@ class TestAdvancedFileHandler:
                 "total_shards": 1,
                 "total_size": shard_path.stat().st_size,
             },
-            FailingShardScanner,
+            OperationalFailureScanner,
         )
 
         result = handler.scan_shards()
