@@ -143,6 +143,31 @@ def test_directory_scan_scans_sharded_model_family_once(
     assert {asset.path for asset in result.assets} == {str(shard) for shard in shards}
 
 
+def test_directory_scan_preserves_per_shard_sizes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shards: list[Path] = []
+    for shard_index, payload in enumerate((b"a", b"second-shard", b"third-shard-is-longer"), start=1):
+        shard_path = tmp_path / f"model-{shard_index:05d}-of-00003.safetensors"
+        shard_path.write_bytes(payload)
+        shards.append(shard_path.resolve())
+    family_size = sum(shard.stat().st_size for shard in shards)
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        result = _mock_sharded_scan_result(family_size)
+        result.metadata["file_size"] = family_size
+        return result
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    expected_sizes = {str(shard): shard.stat().st_size for shard in shards}
+    assert {path: metadata.file_size for path, metadata in result.file_metadata.items()} == expected_sizes
+    assert {asset.path: asset.size for asset in result.assets} == expected_sizes
+
+
 def test_directory_scan_reports_incomplete_sharded_model_family_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

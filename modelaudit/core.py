@@ -6,6 +6,7 @@ import logging
 import os
 import time
 from collections.abc import Iterator
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -820,10 +821,6 @@ def scan_model_directory_or_file(
 
                                     results.checks.append(Check(**check_dict))
 
-                        for scanned_file_path in scanned_file_paths:
-                            _add_asset_to_results(results, scanned_file_path, file_result)
-                        _finish_phase_timing(phase_timings, "result_merge", result_merge_started_at)
-
                         # Add metadata for this path using Pydantic models
                         from .models import FileMetadataModel
 
@@ -837,6 +834,9 @@ def scan_model_directory_or_file(
                             finally:
                                 _finish_phase_timing(phase_timings, "license_metadata", license_metadata_started_at)
                             combined_metadata = {**file_result.metadata, **license_metadata}
+                            if len(scanned_file_paths) > 1 and "file_size" in combined_metadata:
+                                with suppress(OSError):
+                                    combined_metadata["file_size"] = os.path.getsize(scanned_file_path)
                             path_content_hash = content_hashes.get(scanned_file_path)
                             if path_content_hash is not None:
                                 combined_metadata["content_hash"] = path_content_hash
@@ -851,7 +851,14 @@ def scan_model_directory_or_file(
 
                                 combined_metadata["ml_context"] = MLContextModel(**combined_metadata["ml_context"])
 
+                            _add_asset_to_results(
+                                results,
+                                scanned_file_path,
+                                file_result,
+                                metadata=combined_metadata,
+                            )
                             results.file_metadata[scanned_file_path] = FileMetadataModel(**combined_metadata)
+                        _finish_phase_timing(phase_timings, "result_merge", result_merge_started_at)
 
                         if max_total_size > 0 and results.bytes_scanned > max_total_size:
                             _add_issue_to_model(
