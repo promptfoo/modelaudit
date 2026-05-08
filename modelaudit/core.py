@@ -664,7 +664,26 @@ def scan_model_directory_or_file(
                                 if shard_info is not None:
                                     for shard_path in shard_info.get("shards", []):
                                         if isinstance(shard_path, str):
-                                            family_paths.add(str(Path(shard_path).resolve()))
+                                            resolved_shard_path = str(Path(shard_path).resolve())
+                                            shard_in_base_dir = is_within_directory(str(base_dir), resolved_shard_path)
+                                            shard_in_hf_blobs = bool(
+                                                is_hf_cache
+                                                and hf_cache_root is not None
+                                                and is_within_directory(
+                                                    str(hf_cache_root / "blobs"),
+                                                    resolved_shard_path,
+                                                )
+                                            )
+                                            if shard_in_base_dir or shard_in_hf_blobs:
+                                                family_paths.add(resolved_shard_path)
+                                            else:
+                                                _add_issue_to_model(
+                                                    results,
+                                                    "Path traversal outside scanned directory",
+                                                    severity=IssueSeverity.CRITICAL.value,
+                                                    location=resolved_shard_path,
+                                                    details={"resolved_path": resolved_shard_path},
+                                                )
                             continue
 
                         files_to_scan.append(target_str)
