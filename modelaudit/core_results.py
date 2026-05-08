@@ -119,11 +119,13 @@ def add_asset_to_results(
     results: ModelAuditResultModel,
     file_path: str,
     file_result: ScanResult,
+    *,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     """Add an asset entry to the aggregate results."""
     from .models import AssetModel
 
-    asset_dict = asset_from_scan_result(file_path, file_result)
+    asset_dict = asset_from_scan_result(file_path, file_result, metadata=metadata)
     asset = AssetModel(**asset_dict)
     results.assets.append(asset)
 

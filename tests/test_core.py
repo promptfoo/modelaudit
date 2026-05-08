@@ -15,9 +15,11 @@ import pytest
 
 from modelaudit import core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cache.optimized_config import normalize_material_scan_config
 from modelaudit.core import scan_file, scan_model_directory_or_file
 from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
+from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from tests.helpers import create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
@@ -79,6 +81,180 @@ def _assert_system_pickle_detected(result: ScanResult, entry_name: str) -> None:
         and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
         for issue in result.issues
     ), f"Expected S201 finding for {entry_name}, got: {[(i.location, i.message, i.details) for i in result.issues]}"
+
+
+def _mock_sharded_scan_result(bytes_scanned: int, *, missing_shards: int = 0) -> ScanResult:
+    """Return a ScanResult shaped like the advanced sharded-model handler."""
+    result = ScanResult(scanner_name="safetensors")
+    result.bytes_scanned = bytes_scanned
+    result.add_check(
+        name="Mock Shard Scan",
+        passed=True,
+        message="Mock shard family scanned",
+        severity=IssueSeverity.INFO,
+    )
+    if missing_shards:
+        result.add_check(
+            name="Sharded Model Coverage Check",
+            passed=False,
+            message=f"Missing {missing_shards} expected model shard(s); scan coverage is incomplete.",
+            severity=IssueSeverity.INFO,
+            details={
+                "expected_total_shards": 3,
+                "present_total_shards": 2,
+                "missing_shard_count": missing_shards,
+                "analysis_incomplete": True,
+                "scan_outcome": "inconclusive",
+                "scan_outcome_reason": "missing_model_shards",
+            },
+        )
+        result.metadata["analysis_incomplete"] = True
+        result.metadata["scan_outcome"] = "inconclusive"
+        result.metadata["scan_outcome_reasons"] = ["missing_model_shards"]
+    result.finish(success=missing_shards == 0)
+    return result
+
+
+def test_directory_scan_scans_sharded_model_family_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shards: list[Path] = []
+    for shard_index in range(1, 4):
+        shard_path = tmp_path / f"model-{shard_index:05d}-of-00003.safetensors"
+        shard_path.write_bytes(f"shard-{shard_index}".encode())
+        shards.append(shard_path.resolve())
+    family_size = sum(shard.stat().st_size for shard in shards)
+    calls: list[str] = []
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        calls.append(path)
+        return _mock_sharded_scan_result(family_size)
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    assert len(calls) == 1
+    assert Path(calls[0]).name in {shard.name for shard in shards}
+    assert result.files_scanned == len(shards)
+    assert result.bytes_scanned == family_size
+    assert set(result.file_metadata) == {str(shard) for shard in shards}
+    assert {asset.path for asset in result.assets} == {str(shard) for shard in shards}
+
+
+def test_directory_scan_preserves_per_shard_sizes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shards: list[Path] = []
+    for shard_index, payload in enumerate((b"a", b"second-shard", b"third-shard-is-longer"), start=1):
+        shard_path = tmp_path / f"model-{shard_index:05d}-of-00003.safetensors"
+        shard_path.write_bytes(payload)
+        shards.append(shard_path.resolve())
+    family_size = sum(shard.stat().st_size for shard in shards)
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        result = _mock_sharded_scan_result(family_size)
+        result.metadata["file_size"] = family_size
+        return result
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    expected_sizes = {str(shard): shard.stat().st_size for shard in shards}
+    assert {path: metadata.file_size for path, metadata in result.file_metadata.items()} == expected_sizes
+    assert {asset.path: asset.size for asset in result.assets} == expected_sizes
+
+
+def test_directory_scan_reports_incomplete_sharded_model_family_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shards: list[Path] = []
+    for shard_index in range(1, 3):
+        shard_path = tmp_path / f"model-{shard_index:05d}-of-00003.safetensors"
+        shard_path.write_bytes(f"shard-{shard_index}".encode())
+        shards.append(shard_path.resolve())
+    family_size = sum(shard.stat().st_size for shard in shards)
+    calls: list[str] = []
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        calls.append(path)
+        return _mock_sharded_scan_result(family_size, missing_shards=1)
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    coverage_checks = [check for check in result.checks if check.name == "Sharded Model Coverage Check"]
+    assert len(calls) == 1
+    assert result.files_scanned == len(shards)
+    assert result.bytes_scanned == family_size
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["missing_shard_count"] == 1
+
+
+def test_directory_scan_sharded_family_cache_fingerprint_tracks_sibling_shards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shards: list[Path] = []
+    for shard_index in range(1, 3):
+        shard_path = tmp_path / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_path.write_bytes(f"shard-{shard_index}".encode())
+        shards.append(shard_path.resolve())
+    captured_configs: list[dict[str, Any]] = []
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        captured_configs.append(dict(config or {}))
+        return _mock_sharded_scan_result(sum(shard.stat().st_size for shard in shards))
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    core_module.scan_model_directory_or_file(str(tmp_path))
+    first_material_config = normalize_material_scan_config(captured_configs[0])
+    first_fingerprint = first_material_config[core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY]
+
+    shards[1].write_bytes(b"changed-shard-2")
+    captured_configs.clear()
+
+    core_module.scan_model_directory_or_file(str(tmp_path))
+    second_material_config = normalize_material_scan_config(captured_configs[0])
+    second_fingerprint = second_material_config[core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY]
+
+    assert {member["path"] for member in first_fingerprint["members"]} == {str(shard) for shard in shards}
+    assert first_fingerprint != second_fingerprint
+
+
+def test_directory_scan_content_hash_excludes_files_skipped_by_total_size_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_files: list[Path] = []
+    for index in range(3):
+        model_path = tmp_path / f"model-{index}.safetensors"
+        model_path.write_bytes(f"model-{index}".encode())
+        model_files.append(model_path.resolve())
+    calls: list[str] = []
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        calls.append(path)
+        result = ScanResult(scanner_name="safetensors")
+        result.bytes_scanned = 2
+        result.finish(success=True)
+        return result
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(tmp_path), max_total_size=1)
+
+    all_file_hashes = [core_module._calculate_file_hash(str(model_path)) for model_path in model_files]
+    scanned_file_hashes = [core_module._calculate_file_hash(path) for path in calls]
+    assert len(calls) == 1
+    assert result.content_hash == compute_aggregate_hash(scanned_file_hashes)
+    assert result.content_hash != compute_aggregate_hash(all_file_hashes)
 
 
 def test_scan_file_detects_malicious_zip_with_misleading_extension(tmp_path: Path) -> None:
