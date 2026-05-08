@@ -196,6 +196,7 @@ def pytest_runtest_setup(item):
             "test_xdist_status.py",  # xdist worker progress reporting tests
             "test_release_workflow.py",  # release workflow regression tests
             "test_docker_workflow.py",  # Docker workflow regression tests
+            "test_perf_workflow.py",  # Performance benchmark workflow regression tests
         ]
 
         # Check if this is an allowed test file
