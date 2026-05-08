@@ -182,9 +182,11 @@ def test_directory_scan_rejects_shard_siblings_outside_scan_root(
     outside_shard.write_bytes(b"outside-shard")
     (model_dir / outside_shard.name).symlink_to(outside_shard)
     calls: list[str] = []
+    captured_configs: list[dict[str, Any]] = []
 
     def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
         calls.append(path)
+        captured_configs.append(dict(config or {}))
         return _mock_sharded_scan_result(first_shard.stat().st_size)
 
     monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
@@ -195,6 +197,9 @@ def test_directory_scan_rejects_shard_siblings_outside_scan_root(
     assert len(calls) == 1
     assert outside_path not in result.file_metadata
     assert outside_path not in {asset.path for asset in result.assets}
+    material_config = normalize_material_scan_config(captured_configs[0])
+    fingerprint = material_config[core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY]
+    assert outside_path not in {member["path"] for member in fingerprint["members"]}
     assert any(
         issue.message == "Path traversal outside scanned directory"
         and issue.location == outside_path

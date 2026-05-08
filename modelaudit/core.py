@@ -167,6 +167,22 @@ def _build_shard_family_cache_fingerprint(
     }
 
 
+def _allowed_shard_paths_from_config(config: dict[str, Any]) -> list[str] | None:
+    """Return validated shard paths embedded in a grouped directory-scan config."""
+    fingerprint = config.get(_SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY)
+    if not isinstance(fingerprint, dict):
+        return None
+
+    members = fingerprint.get("members")
+    if not isinstance(members, list):
+        return None
+
+    allowed_paths = [
+        str(member["path"]) for member in members if isinstance(member, dict) and isinstance(member.get("path"), str)
+    ]
+    return allowed_paths or None
+
+
 def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
     """Select a scanner by trusted file structure, not just suffix."""
     if header_format == "zip":
@@ -1376,7 +1392,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             if use_extreme_handler:
                 logger.debug(f"Large file optimization enabled: {path}")
                 result = scan_advanced_large_file(
-                    path, scanner, progress_callback, timeout * 2
+                    path,
+                    scanner,
+                    progress_callback,
+                    timeout * 2,
+                    allowed_shard_paths=_allowed_shard_paths_from_config(config),
                 )  # Double timeout for extreme files
             elif use_large_handler:
                 logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")
@@ -1419,7 +1439,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 if use_extreme_handler:
                     logger.debug(f"Large file optimization enabled: {path}")
                     result = scan_advanced_large_file(
-                        path, scanner, progress_callback, timeout * 2
+                        path,
+                        scanner,
+                        progress_callback,
+                        timeout * 2,
+                        allowed_shard_paths=_allowed_shard_paths_from_config(config),
                     )  # Double timeout for extreme files
                 elif use_large_handler:
                     logger.debug(f"File size optimization: {path} ({file_size:,} bytes)")

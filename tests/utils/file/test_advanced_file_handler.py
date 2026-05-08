@@ -140,6 +140,22 @@ class TestShardedModelDetector:
         assert shard_info["shards"] == [str(shard_one)]
         assert shard_info["total_shards"] == 1
 
+    def test_detect_shards_respects_allowed_paths(self, tmp_path: Path) -> None:
+        """Directory scans should be able to constrain shard expansion to validated paths."""
+        shard_one = tmp_path / "model-00001-of-00002.safetensors"
+        shard_two = tmp_path / "model-00002-of-00002.safetensors"
+        shard_one.write_bytes(b"one")
+        shard_two.write_bytes(b"two")
+
+        shard_info = ShardedModelDetector.detect_shards(
+            str(shard_one),
+            allowed_paths=[str(shard_one.resolve())],
+        )
+
+        assert shard_info is not None
+        assert shard_info["shards"] == [str(shard_one)]
+        assert shard_info["total_shards"] == 1
+
     def test_no_shards_detected(self) -> None:
         """Test when file is not sharded."""
         with tempfile.NamedTemporaryFile(suffix=".bin") as f:
@@ -311,6 +327,24 @@ class TestAdvancedFileHandler:
         assert coverage_checks[0].details["missing_shard_count"] == 1
         assert coverage_checks[0].details["missing_shard_indices"] == [2]
         assert coverage_checks[0].details["missing_shard_indices_truncated"] is False
+
+    def test_sharded_model_honors_allowed_shard_paths(self, tmp_path: Path) -> None:
+        """Restricted shard scans must not expand beyond the validated allowlist."""
+        shard_one = tmp_path / "model-00001-of-00002.safetensors"
+        shard_two = tmp_path / "model-00002-of-00002.safetensors"
+        shard_one.write_bytes(b"one")
+        shard_two.write_bytes(b"two")
+
+        handler = AdvancedFileHandler(
+            str(shard_one),
+            CompletingShardScanner(),
+            allowed_shard_paths=[str(shard_one.resolve())],
+        )
+        result = handler.scan()
+
+        shard_detection = next(check for check in result.checks if check.name == "Sharded Model Detection")
+        assert shard_detection.details["shards"] == [str(shard_one)]
+        assert result.bytes_scanned == shard_one.stat().st_size
 
     def test_parallel_shard_errors_mark_scan_inconclusive(self, tmp_path: Path) -> None:
         """Shard scan exceptions are incomplete coverage, not security findings."""
