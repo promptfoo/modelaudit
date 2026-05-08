@@ -124,6 +124,21 @@ def _env_without_pythonpath() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
 
 
+def _pickle_exec_child_code(body: str) -> str:
+    return f"""
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+
+sys.path.insert(0, str(module_dir))
+{body}
+"""
+
+
 def test_iter_call_nodes_reuses_cached_walk(monkeypatch: pytest.MonkeyPatch) -> None:
     module = ast.parse(
         """
@@ -1482,20 +1497,13 @@ def test_scan_bytes_ignores_uninvoked_nested_function_body_calls(
 
     assert report.verdict == SafetyVerdict.CLEAN
     assert not _has_critical_call_graph_finding(report, module_name, function_name, "subprocess.run")
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-
-sys.path.insert(0, str(module_dir))
+    child_code = _pickle_exec_child_code(
+        """
 pickle.loads(payload)
 if marker.exists():
     raise SystemExit("nested body unexpectedly executed")
 """
+    )
     result = _run_python_subprocess(
         [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
         cwd=tmp_path.parent,
@@ -1532,22 +1540,15 @@ def test_scan_bytes_does_not_treat_newobj_as_init_invocation(
 
     assert report.verdict == SafetyVerdict.CLEAN
     assert not _has_critical_call_graph_finding(report, module_name, "InitImports", "os.system")
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-
-sys.path.insert(0, str(module_dir))
+    child_code = _pickle_exec_child_code(
+        """
 result = pickle.loads(payload)
 if getattr(result, "value", None) != "safe":
     raise SystemExit(f"unexpected state: {result.__dict__!r}")
 if marker.exists():
     raise SystemExit("NEWOBJ unexpectedly executed __init__")
 """
+    )
     result = _run_python_subprocess(
         [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
         cwd=tmp_path.parent,
