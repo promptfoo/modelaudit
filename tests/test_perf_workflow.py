@@ -7,7 +7,17 @@ import yaml
 
 
 def _load_perf_workflow() -> dict[str, Any]:
-    workflow_path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "perf.yml"
+    current_path = Path(__file__).resolve()
+    workflow_path = next(
+        (
+            candidate_root / ".github" / "workflows" / "perf.yml"
+            for candidate_root in [current_path.parent, *current_path.parents]
+            if (candidate_root / ".github" / "workflows" / "perf.yml").is_file()
+        ),
+        None,
+    )
+    if workflow_path is None:
+        raise AssertionError("Could not locate .github/workflows/perf.yml from test file path")
     workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
     assert isinstance(workflow, dict)
     return workflow

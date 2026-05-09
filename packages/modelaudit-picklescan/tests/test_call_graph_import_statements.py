@@ -83,10 +83,10 @@ def test_wildcard_summary_and_analysis_share_module_parse(
     parse_calls = 0
     real_parse = call_graph.ast.parse
 
-    def tracking_parse(source: str, filename: str = "<unknown>") -> ast.Module:
+    def tracking_parse(source_code: str, filename: str = "<unknown>") -> ast.Module:
         nonlocal parse_calls
         parse_calls += 1
-        return real_parse(source, filename=filename)
+        return real_parse(source_code, filename=filename)
 
     monkeypatch.setattr(
         call_graph, "_resolve_module_source", lambda module_name: module_path if module_name == "module" else None
@@ -122,6 +122,21 @@ def test_shared_source_sensitive_caches_clears_once_per_scope(monkeypatch: pytes
 
 def _env_without_pythonpath() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+
+
+def _pickle_exec_child_code(body: str) -> str:
+    return f"""
+import pickle
+import sys
+from pathlib import Path
+
+module_dir = Path(sys.argv[1])
+marker = Path(sys.argv[2])
+payload = bytes.fromhex(sys.argv[3])
+
+sys.path.insert(0, str(module_dir))
+{body}
+"""
 
 
 def test_iter_call_nodes_reuses_cached_walk(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -224,9 +239,12 @@ def bridge(command):
 def test_split_function_name_reuses_cached_resolution(monkeypatch: pytest.MonkeyPatch) -> None:
     analyze_calls: list[str] = []
 
-    def fake_analyze_module(module_name: str) -> object | None:
+    class _AnalyzedModule:
+        pass
+
+    def fake_analyze_module(module_name: str) -> _AnalyzedModule | None:
         analyze_calls.append(module_name)
-        return object() if module_name == "pkg.mod" else None
+        return _AnalyzedModule() if module_name == "pkg.mod" else None
 
     monkeypatch.setattr(call_graph, "_analyze_module", fake_analyze_module)
     call_graph._split_function_name.cache_clear()
@@ -1479,20 +1497,13 @@ def test_scan_bytes_ignores_uninvoked_nested_function_body_calls(
 
     assert report.verdict == SafetyVerdict.CLEAN
     assert not _has_critical_call_graph_finding(report, module_name, function_name, "subprocess.run")
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-
-sys.path.insert(0, str(module_dir))
+    child_code = _pickle_exec_child_code(
+        """
 pickle.loads(payload)
 if marker.exists():
     raise SystemExit("nested body unexpectedly executed")
 """
+    )
     result = _run_python_subprocess(
         [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
         cwd=tmp_path.parent,
@@ -1529,22 +1540,15 @@ def test_scan_bytes_does_not_treat_newobj_as_init_invocation(
 
     assert report.verdict == SafetyVerdict.CLEAN
     assert not _has_critical_call_graph_finding(report, module_name, "InitImports", "os.system")
-    child_code = """
-import pickle
-import sys
-from pathlib import Path
-
-module_dir = Path(sys.argv[1])
-marker = Path(sys.argv[2])
-payload = bytes.fromhex(sys.argv[3])
-
-sys.path.insert(0, str(module_dir))
+    child_code = _pickle_exec_child_code(
+        """
 result = pickle.loads(payload)
 if getattr(result, "value", None) != "safe":
     raise SystemExit(f"unexpected state: {result.__dict__!r}")
 if marker.exists():
     raise SystemExit("NEWOBJ unexpectedly executed __init__")
 """
+    )
     result = _run_python_subprocess(
         [sys.executable, "-c", child_code, str(module_dir), str(marker), payload.hex()],
         cwd=tmp_path.parent,
@@ -3642,7 +3646,7 @@ if marker.read_text() != marker_content:
 
 
 @pytest.mark.parametrize(
-    ("payload", "values_literal", "expected_repr", "requires_python311"),
+    ("payload", "values_literal", "expected_repr", "requires_python_3_11_plus"),
     [
         (
             _builtins_help_call_iterator_stdlib_materializer_payload("array", "array", _unicode_operand("i"), b"h\x00"),
@@ -3859,7 +3863,7 @@ def test_scan_bytes_blocks_stdlib_eager_call_iterator_consumption_rce(
     payload: bytes,
     values_literal: str,
     expected_repr: str,
-    requires_python311: bool,
+    requires_python_3_11_plus: bool,
 ) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
@@ -3891,7 +3895,7 @@ def test_scan_bytes_blocks_stdlib_eager_call_iterator_consumption_rce(
     )
 
     assert not marker.exists()
-    if requires_python311 and sys.version_info < (3, 11):
+    if requires_python_3_11_plus and sys.version_info < (3, 11):
         return
     child_code = """
 import ast
@@ -3945,7 +3949,7 @@ if marker.read_text() != marker_content:
 
 
 @pytest.mark.parametrize(
-    ("payload", "values_literal", "expected_repr", "requires_python311"),
+    ("payload", "values_literal", "expected_repr", "requires_python_3_11_plus"),
     [
         (
             _builtins_help_call_iterator_stdlib_materializer_payload(
@@ -3976,7 +3980,7 @@ def test_scan_bytes_blocks_weighted_statistics_call_iterator_consumption_rce(
     payload: bytes,
     values_literal: str,
     expected_repr: str,
-    requires_python311: bool,
+    requires_python_3_11_plus: bool,
 ) -> None:
     module_dir = tmp_path / "modules"
     module_dir.mkdir()
@@ -4008,7 +4012,7 @@ def test_scan_bytes_blocks_weighted_statistics_call_iterator_consumption_rce(
     )
 
     assert not marker.exists()
-    if requires_python311 and sys.version_info < (3, 11):
+    if requires_python_3_11_plus and sys.version_info < (3, 11):
         return
 
     child_code = """

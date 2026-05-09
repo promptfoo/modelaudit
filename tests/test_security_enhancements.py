@@ -19,18 +19,21 @@ from modelaudit.scanners.numpy_scanner import NumPyScanner
 class TestJoblibScannerSecurity:
     """Test security enhancements for Joblib scanner."""
 
-    def test_compression_bomb_detection(self, tmp_path):
+    def test_compression_bomb_detection(self, tmp_path: Path) -> None:
         """Test that compression bombs are detected."""
         # Create a compression bomb (large data that compresses well)
         bomb_data = b"A" * (10 * 1024 * 1024)  # 10MB of 'A's
         compressed = zlib.compress(bomb_data, level=9)
+        max_decompression_ratio = 50.0
+        actual_ratio = len(bomb_data) / len(compressed)
+        assert actual_ratio > max_decompression_ratio
 
         # Write to a .joblib file
         joblib_file = tmp_path / "bomb.joblib"
         joblib_file.write_bytes(compressed)
 
         # Configure scanner with low compression ratio limit
-        config = {"max_decompression_ratio": 50.0}  # Lower than actual ratio
+        config = {"max_decompression_ratio": max_decompression_ratio}  # Lower than actual ratio
         scanner = JoblibScanner(config)
 
         result = scanner.scan(str(joblib_file))
@@ -151,11 +154,11 @@ class TestJoblibScannerSecurity:
         # Should delegate to ZIP scanner and succeed
         assert result.success is True
 
-    def test_direct_pickle_joblib(self, tmp_path):
+    def test_direct_pickle_joblib(self, tmp_path: Path) -> None:
         """Test joblib files that are direct pickle (not compressed)."""
         # Create direct pickle data with pickle magic bytes
         data = {"test": "direct_pickle"}
-        pickled = pickle.dumps(data, protocol=2)  # Protocol 2 starts with 0x80
+        pickled = pickle.dumps(data, protocol=2)  # Protocol 2 starts with 0x80 0x02
 
         joblib_file = tmp_path / "direct.joblib"
         joblib_file.write_bytes(pickled)
@@ -204,7 +207,7 @@ class TestJoblibScannerSecurity:
 class TestNumPyScannerSecurity:
     """Test security enhancements for NumPy scanner."""
 
-    def test_negative_dimension_rejection(self, tmp_path):
+    def test_negative_dimension_rejection(self, tmp_path: Path) -> None:
         """Test rejection of arrays with negative dimensions."""
         # We'll need to create a malformed numpy file manually
         # since numpy.save() won't create invalid files
@@ -219,8 +222,8 @@ class TestNumPyScannerSecurity:
             header_len = len(header)
             f.write(header_len.to_bytes(2, "little"))
             f.write(header.encode("latin1"))
-            # Add some dummy data
-            f.write(b"\x00" * 1600)  # 20 * 8 bytes per float64
+            # The scanner should reject the invalid header before reading a full payload.
+            f.write(b"\x00")
 
         scanner = NumPyScanner()
         result = scanner.scan(str(npy_file))
@@ -273,7 +276,13 @@ class TestNumPyScannerSecurity:
         assert len(size_issues) > 0
 
     def test_dangerous_dtype_reports_cve_info(self, tmp_path: Path) -> None:
-        """Object dtype arrays should scan successfully while emitting CVE-2019-6446 info."""
+        """Object dtype arrays should emit informational CVE-2019-6446 context.
+
+        CVE-2019-6446 concerns unsafe loading of NumPy object arrays when pickle
+        deserialization is allowed. Object dtypes can embed pickled Python objects,
+        so the scanner should surface that context while still allowing a clean file
+        to scan successfully.
+        """
         scanner = NumPyScanner()
         npy_file = tmp_path / "object_dtype.npy"
         np.save(npy_file, np.array([{"key": "value"}], dtype=object), allow_pickle=True)
@@ -363,23 +372,15 @@ class TestNumPyScannerSecurity:
         assert "shape" in result.metadata
         assert "dtype" in result.metadata
 
-    def test_numpy_version_2_format(self, tmp_path):
+    def test_numpy_version_2_format(self, tmp_path: Path) -> None:
         """Test NumPy format version 2.0 handling."""
-        # Create array that will use version 2.0 format
-        # Use a very long array description to trigger v2.0 format
-
-        # Create a large 4D array that should trigger version 2.0
-        # due to large header size, not structured dtype
-        arr = np.zeros((100, 50, 20, 10), dtype=np.float64)
-
+        arr = np.zeros((2, 2), dtype=np.float64)
         npy_file = tmp_path / "version2.npy"
-        np.save(npy_file, arr)
+        with npy_file.open("wb") as file_obj:
+            np.lib.format.write_array(file_obj, arr, version=(2, 0))
+        assert npy_file.read_bytes()[6:8] == b"\x02\x00"
 
-        # Allow structured arrays for this test
-        config = {
-            "max_array_bytes": 10 * 1024 * 1024 * 1024,
-        }  # 10GB limit to allow large test array
-        scanner = NumPyScanner(config)
+        scanner = NumPyScanner()
         result = scanner.scan(str(npy_file))
 
         # Should succeed
