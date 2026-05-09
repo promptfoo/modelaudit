@@ -334,6 +334,36 @@ def test_directory_scan_sharded_family_cache_fingerprint_tracks_sibling_shards(
     assert first_fingerprint != second_fingerprint
 
 
+def test_directory_scan_groups_shard_family_without_declared_total(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shards: list[Path] = []
+    for shard_index in range(1, 3):
+        shard_path = tmp_path / f"checkpoint_{shard_index}.pt"
+        shard_path.write_bytes(f"checkpoint-shard-{shard_index}".encode())
+        shards.append(shard_path.resolve())
+    captured_configs: list[dict[str, Any]] = []
+    calls: list[str] = []
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        calls.append(path)
+        captured_configs.append(dict(config or {}))
+        return _mock_sharded_scan_result(sum(shard.stat().st_size for shard in shards))
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+    material_config = normalize_material_scan_config(captured_configs[0])
+    fingerprint = material_config[core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY]
+    assert len(calls) == 1
+    assert Path(calls[0]).name in {shard.name for shard in shards}
+    assert result.files_scanned == len(shards)
+    assert fingerprint["expected_total_shards"] is None
+    assert {member["path"] for member in fingerprint["members"]} == {str(shard) for shard in shards}
+
+
 def test_directory_scan_content_hash_excludes_files_skipped_by_total_size_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
