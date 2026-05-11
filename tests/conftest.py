@@ -104,6 +104,7 @@ def pytest_runtest_setup(item):
             "test_core.py",
             "test_cli.py",
             "test_directory_file_filtering.py",  # Directory prefilter regression tests
+            "test_dependency_lock.py",  # Security-sensitive uv.lock dependency guardrails
             "test_bug1_confidence_exploit.py",  # Security bug test
             "test_gguf_scanner.py",  # GGUF scanner tests
             "test_jax_checkpoint_scanner.py",  # JAX checkpoint scanner tests
