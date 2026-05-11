@@ -6,6 +6,7 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[1]
 LOCKFILE = ROOT_DIR / "uv.lock"
 PATCHED_GITPYTHON_FLOOR = (3, 1, 50)
+PATCHED_URLLIB3_FLOOR = (2, 7, 0)
 
 
 def _lock_package_block(name: str) -> str:
@@ -46,6 +47,13 @@ def test_gitpython_lock_stays_on_patched_release_floor() -> None:
 
     assert _locked_version(gitpython_block) >= PATCHED_GITPYTHON_FLOOR
     assert "gitpython-3.1.49" not in gitpython_block
+
+
+def test_urllib3_lock_stays_on_patched_release_floor() -> None:
+    urllib3_block = _lock_package_block("urllib3")
+
+    assert _locked_version(urllib3_block) >= PATCHED_URLLIB3_FLOOR
+    assert "urllib3-2.6.3" not in urllib3_block
 
 
 def test_mlflow_skinny_transitive_gitpython_dependency_is_guarded() -> None:
