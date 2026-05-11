@@ -1,16 +1,39 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_PINNED_PYTHON_IMAGE_RE = re.compile(r"^python:(?P<version>\d+\.\d+-slim)@sha256:(?P<digest>[0-9a-f]{64})$")
+
 
 def _load_docker_workflow() -> dict[str, Any]:
-    workflow_path = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "docker-image-test.yml"
+    workflow_path = _REPO_ROOT / ".github" / "workflows" / "docker-image-test.yml"
     workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
     assert isinstance(workflow, dict)
     return workflow
+
+
+def _dockerfile_lines(path: str) -> list[str]:
+    return (_REPO_ROOT / path).read_text(encoding="utf-8").splitlines()
+
+
+def _python_image_from_arg(path: str) -> str:
+    lines = _dockerfile_lines(path)
+    prefix = "ARG PYTHON_IMAGE="
+    for line in lines:
+        if line.startswith(prefix):
+            return line.removeprefix(prefix)
+    raise AssertionError(f"{path} does not define PYTHON_IMAGE")
+
+
+def _assert_pinned_python_image(image: str, expected_version: str) -> None:
+    match = _PINNED_PYTHON_IMAGE_RE.fullmatch(image)
+    assert match is not None
+    assert match.group("version") == expected_version
 
 
 def _jobs(workflow: dict[str, Any]) -> dict[str, Any]:
@@ -32,6 +55,22 @@ def _step_by_name(steps: list[dict[str, Any]], name: str) -> dict[str, Any]:
         if step.get("name") == name:
             return step
     raise AssertionError(f"Step {name!r} not found")
+
+
+def test_dockerfiles_pin_python_base_images_by_digest() -> None:
+    lightweight_image = _python_image_from_arg("Dockerfile")
+    full_image = _python_image_from_arg("Dockerfile.full")
+
+    assert full_image == lightweight_image
+    _assert_pinned_python_image(lightweight_image, "3.13-slim")
+
+    for path in ("Dockerfile", "Dockerfile.full"):
+        lines = _dockerfile_lines(path)
+        assert lines.count("FROM ${PYTHON_IMAGE} AS builder") == 1
+        assert lines.count("FROM ${PYTHON_IMAGE} AS runtime") == 1
+
+    tensorflow_from = _dockerfile_lines("Dockerfile.tensorflow")[0].removeprefix("FROM ")
+    _assert_pinned_python_image(tensorflow_from, "3.12-slim")
 
 
 def test_docker_success_job_waits_for_full_image_result() -> None:
