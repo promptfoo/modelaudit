@@ -1,4 +1,4 @@
-ARG PYTHON_IMAGE=python:3.13-slim@sha256:264c0eeef6549fa9e202c0e39c4bed7ab93693c75b1a942f11f44744c291b326
+ARG PYTHON_IMAGE=python:3.13-slim@sha256:d49c1ff87eb98eac346fc250f52925f726eb913c43a92854246dd03c9692ad67
 # Keep the major/minor version in sync with packages/modelaudit-picklescan/Cargo.toml rust-version.
 ARG PICKLESCAN_RUST_TOOLCHAIN=1.83.0
 
