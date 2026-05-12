@@ -274,6 +274,77 @@ def test_scan_file_passes_shard_allowlist_to_advanced_handler(
     assert captured_allowed_paths == [[allowed_path]]
 
 
+def test_scan_file_passes_shard_allowlist_to_preferred_advanced_handler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shard = tmp_path / "model-00001-of-00002.safetensors"
+    shard.write_bytes(b"inside-shard")
+    allowed_path = str(shard.resolve())
+    captured_allowed_paths: list[list[str] | None] = []
+
+    class DummyPreferredScanner:
+        name = "dummy_preferred"
+
+        def __init__(self, config: dict[str, Any] | None = None) -> None:
+            self.config = config or {}
+
+        @staticmethod
+        def can_handle(path: str) -> bool:
+            return path == str(shard)
+
+    def fake_select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
+        assert path == str(shard)
+        assert isinstance(header_format, str)
+        assert ext == ".safetensors"
+        return "dummy_preferred"
+
+    def fake_scan_advanced_large_file(
+        path: str,
+        scanner: DummyPreferredScanner,
+        progress_callback: Any,
+        timeout: int,
+        *,
+        allowed_shard_paths: list[str] | None = None,
+    ) -> ScanResult:
+        assert path == str(shard)
+        assert scanner.name == "dummy_preferred"
+        assert progress_callback is None
+        assert timeout == 7200
+        captured_allowed_paths.append(allowed_shard_paths)
+        result = ScanResult(scanner_name=scanner.name)
+        result.bytes_scanned = shard.stat().st_size
+        result.finish(success=True)
+        return result
+
+    monkeypatch.setattr(core_module, "should_use_advanced_handler", lambda path: path == str(shard))
+    monkeypatch.setattr(core_module, "_select_preferred_scanner_id", fake_select_preferred_scanner_id)
+    monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda scanner_id: DummyPreferredScanner)
+    monkeypatch.setattr(
+        core_module._registry,
+        "get_scanner_for_path",
+        lambda *args, **kwargs: pytest.fail("preferred scanner path should not use registry fallback"),
+    )
+    monkeypatch.setattr(core_module, "scan_advanced_large_file", fake_scan_advanced_large_file)
+
+    result = scan_file(
+        str(shard),
+        config={
+            "cache_scan_results": False,
+            core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY: {
+                "members": [
+                    {"path": allowed_path, "content_hash": "sha256:inside"},
+                    {"path": None, "content_hash": "invalid"},
+                    "not-a-member",
+                ],
+            },
+        },
+    )
+
+    assert result.scanner_name == "dummy_preferred"
+    assert captured_allowed_paths == [[allowed_path]]
+
+
 def test_directory_scan_reports_incomplete_sharded_model_family_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
