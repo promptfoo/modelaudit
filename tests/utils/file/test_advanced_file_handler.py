@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+from modelaudit.cache.cache_manager import reset_cache_manager
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
 from modelaudit.utils.file.handlers import (
     MAX_RECORDED_MISSING_SHARD_INDICES,
@@ -13,6 +14,7 @@ from modelaudit.utils.file.handlers import (
     MemoryMappedHandler,
     ParallelShardHandler,
     ShardedModelDetector,
+    scan_advanced_large_file,
     should_use_advanced_handler,
 )
 
@@ -350,6 +352,45 @@ class TestAdvancedFileHandler:
         shard_detection = next(check for check in result.checks if check.name == "Sharded Model Detection")
         assert shard_detection.details["shards"] == [str(shard_one)]
         assert result.bytes_scanned == shard_one.stat().st_size
+
+    def test_cached_advanced_scan_keys_allowed_shard_paths(self, tmp_path: Path) -> None:
+        """Different validated shard allowlists must not share advanced-scan cache entries."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        shard_one.write_bytes(b"one")
+        shard_two.write_bytes(b"two-two")
+        cache_dir = tmp_path / "cache"
+
+        class CachedCompletingShardScanner(CompletingShardScanner):
+            def __init__(self, config: dict[str, Any] | None = None) -> None:
+                self.config = config or {}
+
+        scanner = CachedCompletingShardScanner(
+            {
+                "cache_enabled": True,
+                "cache_dir": str(cache_dir),
+            }
+        )
+        restricted_paths = [str(shard_one.resolve())]
+        expanded_paths = [str(shard_one.resolve()), str(shard_two.resolve())]
+
+        reset_cache_manager()
+        try:
+            restricted = scan_advanced_large_file(
+                str(shard_one),
+                scanner,
+                allowed_shard_paths=restricted_paths,
+            )
+            expanded = scan_advanced_large_file(
+                str(shard_one),
+                scanner,
+                allowed_shard_paths=expanded_paths,
+            )
+        finally:
+            reset_cache_manager()
+
+        assert restricted.bytes_scanned == shard_one.stat().st_size
+        assert expanded.bytes_scanned == shard_one.stat().st_size + shard_two.stat().st_size
 
     def test_parallel_shard_errors_mark_scan_inconclusive(self, tmp_path: Path) -> None:
         """Shard scan exceptions are incomplete coverage, not security findings."""
