@@ -697,7 +697,13 @@ def scan_advanced_large_file(
         from ...cache.optimized_config import build_cache_version_context
 
         cache_manager = get_cache_manager(cache_dir, enabled=True)
-        version_context = build_cache_version_context(config)
+        version_config = dict(config)
+        if allowed_shard_paths is not None:
+            # The allowlist changes shard expansion, so direct advanced scans need distinct cache keys.
+            version_config["advanced_allowed_shard_paths"] = sorted(
+                {str(Path(path).resolve()) for path in allowed_shard_paths}
+            )
+        version_context = build_cache_version_context(version_config)
 
         # Create wrapper function for cache manager
         def cached_advanced_scan_wrapper(fpath: str) -> dict:
