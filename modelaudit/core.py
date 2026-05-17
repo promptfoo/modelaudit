@@ -617,6 +617,7 @@ def scan_model_directory_or_file(
                     )
                     if resolved_file is None:
                         continue
+                    scan_source = Path(file_path).absolute() if is_hf_cache_symlink else resolved_file
 
                     # Skip non-model files early if filtering is enabled
                     # Note: skip_file_types parameter already contains the correct value
@@ -647,7 +648,7 @@ def scan_model_directory_or_file(
                         continue
 
                     # Handle DVC files and get target paths
-                    target_paths = [resolved_file]
+                    target_paths = [scan_source]
                     if file.endswith(".dvc"):
                         dvc_targets = resolve_dvc_file(file_path)
                         if dvc_targets:
@@ -690,7 +691,9 @@ def scan_model_directory_or_file(
                                                     resolved_shard_path,
                                                 )
                                             )
-                                            if shard_in_base_dir or shard_in_hf_blobs:
+                                            if shard_in_hf_blobs:
+                                                family_paths.add(str(Path(shard_path).absolute()))
+                                            elif shard_in_base_dir:
                                                 family_paths.add(resolved_shard_path)
                                             else:
                                                 _add_issue_to_model(

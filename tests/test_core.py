@@ -208,6 +208,52 @@ def test_directory_scan_rejects_shard_siblings_outside_scan_root(
     )
 
 
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_groups_hf_cache_sharded_symlinks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--model"
+    snapshots_dir = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshots_dir.mkdir(parents=True)
+    blobs_dir.mkdir()
+
+    blob_paths: list[Path] = []
+    shard_links: list[Path] = []
+    for shard_index in range(1, 3):
+        blob_path = blobs_dir / f"blob-{shard_index}"
+        blob_path.write_bytes(f"hf-shard-{shard_index}".encode())
+        shard_link = snapshots_dir / f"model-{shard_index:05d}-of-00002.safetensors"
+        shard_link.symlink_to(Path("../../blobs") / blob_path.name)
+        blob_paths.append(blob_path.resolve())
+        shard_links.append(shard_link)
+
+    captured_configs: list[dict[str, Any]] = []
+    calls: list[str] = []
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        calls.append(path)
+        captured_configs.append(dict(config or {}))
+        return _mock_sharded_scan_result(sum(blob_path.stat().st_size for blob_path in blob_paths))
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(snapshots_dir), cache_scan_results=False)
+
+    material_config = normalize_material_scan_config(captured_configs[0])
+    fingerprint = material_config[core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY]
+    assert len(calls) == 1
+    assert Path(calls[0]).name in {shard_link.name for shard_link in shard_links}
+    assert result.files_scanned == len(shard_links)
+    assert set(result.file_metadata) == {str(shard_link) for shard_link in shard_links}
+    assert {asset.path for asset in result.assets} == {str(shard_link) for shard_link in shard_links}
+    assert {member["path"] for member in fingerprint["members"]} == {str(blob_path) for blob_path in blob_paths}
+    assert not any("path traversal" in issue.message.lower() for issue in result.issues)
+
+
 def test_scan_file_passes_shard_allowlist_to_advanced_handler(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
