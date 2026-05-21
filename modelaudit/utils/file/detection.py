@@ -1101,6 +1101,10 @@ def _is_torch7_signature(prefix: bytes) -> bool:
     lowered = prefix.lower()
     if prefix.startswith(b"T7\x00\x00"):
         return True
+    # Marker-only matches must still look serialized. PyTorch source commonly
+    # mentions both ``torch`` and ``nn.`` and must not route as Torch7.
+    if b"\x00" not in prefix:
+        return False
     has_torch_marker = b"torch" in lowered or b"luat" in lowered
     has_structure_marker = b"nn." in lowered or b"tensor" in lowered or b"thnn" in lowered
     return has_torch_marker and has_structure_marker
