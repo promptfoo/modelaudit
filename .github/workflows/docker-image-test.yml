@@ -8,6 +8,7 @@ on:
       - "modelaudit/**"
       - "packages/modelaudit-picklescan/**"
       - "pyproject.toml"
+      - "requirements-tensorflow.txt"
       - "uv.lock"
       - ".github/workflows/docker-image-test.yml"
   push:
@@ -27,6 +28,7 @@ jobs:
     outputs:
       docker: ${{ steps.filter.outputs.docker }}
       full-image: ${{ steps.filter.outputs.full-image }}
+      tensorflow-image: ${{ steps.filter.outputs.tensorflow-image }}
     steps:
       - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v4
@@ -44,6 +46,12 @@ jobs:
             full-image:
               - 'Dockerfile.full'
               - 'packages/modelaudit-picklescan/**'
+              - '.github/workflows/docker-image-test.yml'
+            tensorflow-image:
+              - 'Dockerfile.tensorflow'
+              - 'requirements-tensorflow.txt'
+              - 'modelaudit/**'
+              - 'pyproject.toml'
               - '.github/workflows/docker-image-test.yml'
 
   build-test-lightweight:
@@ -177,9 +185,49 @@ jobs:
           # Scan the bind-mounted model as the non-root full image.
           docker run --rm -v $(pwd):/data modelaudit:full /data/test_numpy.pkl
 
+  build-test-tensorflow:
+    name: Build and Test TensorFlow Docker Image
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    if: needs.changes.outputs.tensorflow-image == 'true'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Build TensorFlow image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7
+        with:
+          context: .
+          file: Dockerfile.tensorflow
+          tags: modelaudit:tensorflow
+          load: true
+          cache-from: type=gha,scope=tensorflow
+          cache-to: type=gha,mode=max,scope=tensorflow
+
+      - name: Test TensorFlow container help command
+        run: |
+          docker run --rm modelaudit:tensorflow --help
+
+      - name: Verify TensorFlow dependency and non-root runtime
+        run: |
+          docker run --rm --entrypoint python modelaudit:tensorflow -c "import os, tensorflow; print(tensorflow.__version__); assert os.getuid() == 10001"
+
+      - name: Scan TensorFlow image for vulnerabilities
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # 0.35.0
+        with:
+          version: v0.69.2
+          image-ref: modelaudit:tensorflow
+          format: table
+          exit-code: "1"
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
   docker-ci-success:
     name: Docker CI Success
-    needs: [build-test-lightweight, build-test-full]
+    needs: [build-test-lightweight, build-test-full, build-test-tensorflow]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -187,13 +235,16 @@ jobs:
         run: |
           LIGHTWEIGHT_RESULT="${{ needs.build-test-lightweight.result }}"
           FULL_RESULT="${{ needs.build-test-full.result }}"
+          TENSORFLOW_RESULT="${{ needs.build-test-tensorflow.result }}"
           echo "Lightweight Docker build result: $LIGHTWEIGHT_RESULT"
           echo "Full Docker build result: $FULL_RESULT"
+          echo "TensorFlow Docker build result: $TENSORFLOW_RESULT"
 
           # Success or skipped are both acceptable
           # (skipped means the path filters determined the job wasn't needed)
           if [[ ("$LIGHTWEIGHT_RESULT" == "success" || "$LIGHTWEIGHT_RESULT" == "skipped") && \
-                ("$FULL_RESULT" == "success" || "$FULL_RESULT" == "skipped") ]]; then
+                ("$FULL_RESULT" == "success" || "$FULL_RESULT" == "skipped") && \
+                ("$TENSORFLOW_RESULT" == "success" || "$TENSORFLOW_RESULT" == "skipped") ]]; then
             echo "Docker CI checks passed (or were skipped due to path filters)!"
             exit 0
           else
