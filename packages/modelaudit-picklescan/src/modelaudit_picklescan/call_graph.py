@@ -1664,15 +1664,16 @@ def _collect_assignment_aliases(
 ) -> dict[str, str]:
     node_list = tuple(nodes)
     assignment_aliases: dict[str, str] = {}
-    # Track every (target, resolved) pair already applied. A target can be
-    # reassigned across passes (e.g. distinct `if`/`else` branches both bind
-    # the same name), so the fixpoint may oscillate without ever growing the
-    # dict. Re-applying a previously seen pair must not count as progress, or
-    # the loop never terminates (see imaplib/http.server/nntplib stdlib hangs).
-    seen_assignments: set[tuple[str, str]] = set()
+    # A source-flattened branch may rebind one name indefinitely. Track full
+    # states so each distinct state gets a propagation pass before a cycle ends.
+    seen_states: set[tuple[tuple[str, str], ...]] = set()
 
     changed = True
     while changed and len(assignment_aliases) < _MAX_ASSIGNMENT_ALIASES:
+        state = tuple(sorted(assignment_aliases.items()))
+        if state in seen_states:
+            break
+        seen_states.add(state)
         changed = False
         scoped_aliases = {**aliases, **assignment_aliases}
         for node in node_list:
@@ -1690,9 +1691,7 @@ def _collect_assignment_aliases(
                 if assignment_aliases.get(target_name) == resolved:
                     continue
                 assignment_aliases[target_name] = resolved
-                if (target_name, resolved) not in seen_assignments:
-                    seen_assignments.add((target_name, resolved))
-                    changed = True
+                changed = True
                 if len(assignment_aliases) >= _MAX_ASSIGNMENT_ALIASES:
                     break
     return assignment_aliases

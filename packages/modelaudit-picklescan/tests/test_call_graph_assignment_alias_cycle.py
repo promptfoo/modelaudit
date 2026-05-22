@@ -38,6 +38,22 @@ else:
     m = B()
 """
 
+_DEPENDENT_CYCLE_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+a = A()
+a = b
+b = B()
+b = a
+c = a
+"""
+
 
 def _run_with_timeout(target: object, timeout: float = 10.0) -> None:
     thread = threading.Thread(target=target)  # type: ignore[arg-type]
@@ -71,6 +87,28 @@ def test_collect_assignment_aliases_terminates_on_branch_rebind() -> None:
     # The rebinding name still resolves to one of the two local classes; the
     # exact branch is order-dependent, but the loop must converge.
     assert aliases.get("m") in {"testmod.A", "testmod.B"}
+
+
+def test_collect_assignment_aliases_terminates_after_cyclic_dependency_propagation() -> None:
+    tree = ast.parse(_DEPENDENT_CYCLE_SOURCE)
+    statements = _module_level_statements(tree)
+    local_defs = _collect_local_defs(statements)
+    local_class_targets = {"testmod.A", "testmod.B"}
+
+    result: dict[str, dict[str, str]] = {}
+
+    def _collect() -> None:
+        result["aliases"] = _collect_assignment_aliases(
+            statements,
+            "testmod",
+            {},
+            local_defs,
+            local_class_targets,
+        )
+
+    _run_with_timeout(_collect)
+
+    assert result["aliases"].get("c") in local_class_targets
 
 
 def _stack_global_payload(module: str, name: str) -> bytes:
