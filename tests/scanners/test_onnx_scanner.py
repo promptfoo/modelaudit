@@ -508,6 +508,31 @@ def test_onnx_scanner_subgraph_pyop_still_flagged(tmp_path: Path) -> None:
     assert all(issue.severity == IssueSeverity.CRITICAL for issue in python_operator_issues)
 
 
+@pytest.mark.parametrize("training_graph_field", ["initialization", "algorithm"])
+def test_onnx_scanner_training_graph_pyop_still_flagged(tmp_path: Path, training_graph_field: str) -> None:
+    """A PyOp in either training graph must not be discarded as weight-data noise."""
+    model_path = _save_model_with_int8_weight(tmp_path, _PYOP_WEIGHT_BYTES)
+    model = onnx.load(str(model_path))
+    training_info = onnx.TrainingInfoProto()
+    getattr(training_info, training_graph_field).CopyFrom(
+        helper.make_graph(
+            [helper.make_node("PyOp", ["X"], ["Y"], domain="com.attacker")],
+            f"training_{training_graph_field}",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+        )
+    )
+    model.training_info.append(training_info)
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    python_operator_issues = _python_operator_issues(result)
+    assert python_operator_issues
+    assert all(issue.severity == IssueSeverity.CRITICAL for issue in python_operator_issues)
+
+
 class TestCVE202551480SavePathTraversal:
     """Tests for CVE-2025-51480: ONNX save_external_data arbitrary file overwrite."""
 

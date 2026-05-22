@@ -125,6 +125,15 @@ def _iter_graph_nodes(graph: Any) -> Any:
                 yield from _iter_graph_nodes(subgraph)
 
 
+def _iter_model_graphs(model: Any) -> Any:
+    """Yield graph-bearing ONNX model fields that may declare operators."""
+    yield model.graph
+    yield from getattr(model, "functions", [])
+    for training_info in getattr(model, "training_info", []):
+        yield training_info.initialization
+        yield training_info.algorithm
+
+
 def _model_declares_python_operator(model: Any) -> bool:
     """Return True when the parsed ONNX model actually declares a Python operator.
 
@@ -133,8 +142,11 @@ def _model_declares_python_operator(model: Any) -> bool:
     with arbitrary tensor weight bytes. The parsed graph is the authoritative
     operator inventory, so it is consulted before trusting a raw-byte match.
     """
-    graphs = [model.graph, *getattr(model, "functions", [])]
-    return any(_is_python_operator(node.op_type or "") for graph in graphs for node in _iter_graph_nodes(graph))
+    return any(
+        _is_python_operator(node.op_type or "")
+        for graph in _iter_model_graphs(model)
+        for node in _iter_graph_nodes(graph)
+    )
 
 
 def _jit_finding_type(finding: Any) -> Any:
