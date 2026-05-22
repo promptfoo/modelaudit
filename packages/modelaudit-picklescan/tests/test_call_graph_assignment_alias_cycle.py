@@ -67,28 +67,26 @@ def _run_with_timeout(target: object, timeout: float = 10.0) -> None:
         pytest.fail(f"call-graph analysis did not terminate within {timeout}s")
 
 
-def test_collect_assignment_aliases_fails_closed_on_branch_rebind() -> None:
+def test_collect_assignment_aliases_converges_on_stable_branch_rebind() -> None:
     tree = ast.parse(_OSCILLATING_MODULE_SOURCE)
     statements = _module_level_statements(tree)
     local_defs = _collect_local_defs(statements)
     local_class_targets = {"testmod.A", "testmod.B"}
 
-    result: dict[str, bool] = {}
+    result: dict[str, dict[str, str]] = {}
 
     def _collect() -> None:
-        with pytest.raises(_CallGraphAnalysisLimitError, match="entered a propagation cycle"):
-            _collect_assignment_aliases(
-                statements,
-                "testmod",
-                {},
-                local_defs,
-                local_class_targets,
-            )
-        result["limited"] = True
+        result["aliases"] = _collect_assignment_aliases(
+            statements,
+            "testmod",
+            {},
+            local_defs,
+            local_class_targets,
+        )
 
     _run_with_timeout(_collect)
 
-    assert result == {"limited": True}
+    assert result["aliases"]["m"] == "testmod.B"
 
 
 def test_collect_assignment_aliases_fails_closed_on_cyclic_dependency_propagation() -> None:

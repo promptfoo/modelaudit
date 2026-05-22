@@ -1673,9 +1673,9 @@ def _collect_assignment_aliases(
 ) -> dict[str, str]:
     node_list = tuple(nodes)
     assignment_aliases: dict[str, str] = {}
-    # A source-flattened branch may rebind one name indefinitely. Track full
-    # states so each distinct state gets a propagation pass before a cycle ends.
-    seen_states: set[tuple[tuple[str, str], ...]] = set()
+    # A source-flattened branch may rebind one name during every pass while its
+    # final state stays stable. Only completed-pass state cycles are incomplete.
+    seen_states: set[tuple[tuple[str, str], ...]] = {()}
     passes = 0
 
     changed = True
@@ -1686,9 +1686,6 @@ def _collect_assignment_aliases(
             )
         passes += 1
         state = tuple(sorted(assignment_aliases.items()))
-        if state in seen_states:
-            raise _CallGraphAnalysisLimitError("assignment alias analysis entered a propagation cycle")
-        seen_states.add(state)
         changed = False
         scoped_aliases = {**aliases, **assignment_aliases}
         for node in node_list:
@@ -1709,6 +1706,12 @@ def _collect_assignment_aliases(
                 changed = True
                 if len(assignment_aliases) >= _MAX_ASSIGNMENT_ALIASES:
                     break
+        next_state = tuple(sorted(assignment_aliases.items()))
+        if next_state == state:
+            break
+        if next_state in seen_states:
+            raise _CallGraphAnalysisLimitError("assignment alias analysis entered a propagation cycle")
+        seen_states.add(next_state)
     return assignment_aliases
 
 
