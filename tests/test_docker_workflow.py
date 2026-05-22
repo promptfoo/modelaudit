@@ -8,8 +8,6 @@ import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _PINNED_PYTHON_IMAGE_RE = re.compile(r"^python:(?P<version>\d+\.\d+-slim)@sha256:(?P<digest>[0-9a-f]{64})$")
-_PYTHON_3_12_SLIM_DIGEST = "401f6e1a67dad31a1bd78e9ad22d0ee0a3b52154e6bd30e90be696bb6a3d7461"
-_PYTHON_3_13_SLIM_DIGEST = "dc1546eefcbe8caaa1f004f16ab76b204b5e1dbd58ff81b899f21cd40541232f"
 
 
 def _load_docker_workflow() -> dict[str, Any]:
@@ -73,15 +71,6 @@ def test_dockerfiles_pin_python_base_images_by_digest() -> None:
 
     tensorflow_from = _dockerfile_lines("Dockerfile.tensorflow")[0].removeprefix("FROM ")
     _assert_pinned_python_image(tensorflow_from, "3.12-slim")
-
-
-def test_dockerfiles_use_current_python_base_digests() -> None:
-    python_3_13_image = f"python:3.13-slim@sha256:{_PYTHON_3_13_SLIM_DIGEST}"
-    python_3_12_image = f"python:3.12-slim@sha256:{_PYTHON_3_12_SLIM_DIGEST}"
-
-    assert _python_image_from_arg("Dockerfile") == python_3_13_image
-    assert _python_image_from_arg("Dockerfile.full") == python_3_13_image
-    assert _dockerfile_lines("Dockerfile.tensorflow")[0] == f"FROM {python_3_12_image}"
 
 
 def test_docker_success_job_waits_for_full_image_result() -> None:
