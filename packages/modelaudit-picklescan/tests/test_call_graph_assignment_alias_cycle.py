@@ -15,9 +15,11 @@ from importlib.util import find_spec
 
 import pytest
 
+import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import PickleReport, Severity, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
 from modelaudit_picklescan.call_graph import (
+    _CallGraphAnalysisLimitError,
     _collect_assignment_aliases,
     _collect_local_defs,
     _module_level_statements,
@@ -109,6 +111,52 @@ def test_collect_assignment_aliases_terminates_after_cyclic_dependency_propagati
     _run_with_timeout(_collect)
 
     assert result["aliases"].get("c") in local_class_targets
+
+
+def test_collect_assignment_aliases_fails_closed_on_long_period_cycles() -> None:
+    periods = (7, 11, 13, 17, 19)
+    source_lines: list[str] = []
+    local_class_targets: set[str] = set()
+    for ring_index, period in enumerate(periods):
+        for position in range(period):
+            class_name = f"Ring{ring_index}Class{position}"
+            variable_name = f"ring_{ring_index}_{position}"
+            source_lines.extend((f"class {class_name}:", "    pass", "", f"{variable_name} = {class_name}()", ""))
+            local_class_targets.add(f"testmod.{class_name}")
+        for position in range(period):
+            next_position = (position + 1) % period
+            source_lines.append(f"ring_{ring_index}_{position} = ring_{ring_index}_{next_position}")
+
+    tree = ast.parse("\n".join(source_lines))
+    statements = _module_level_statements(tree)
+    local_defs = _collect_local_defs(statements)
+    result: dict[str, bool] = {}
+
+    def _collect() -> None:
+        with pytest.raises(_CallGraphAnalysisLimitError):
+            _collect_assignment_aliases(
+                statements,
+                "testmod",
+                {},
+                local_defs,
+                local_class_targets,
+            )
+        result["limited"] = True
+
+    _run_with_timeout(_collect)
+
+    assert result == {"limited": True}
+
+
+def test_assignment_alias_limit_is_not_hidden_by_safe_entrypoint_wrapper(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise_limit(_function_name: str) -> tuple[str, ...]:
+        raise _CallGraphAnalysisLimitError("assignment alias limit")
+
+    monkeypatch.setattr(call_graph, "_call_graph_entrypoints", _raise_limit)
+    call_graph._safe_call_graph_entrypoints.cache_clear()
+
+    with pytest.raises(_CallGraphAnalysisLimitError, match="assignment alias limit"):
+        call_graph._safe_call_graph_entrypoints("long_period.module")
 
 
 def _stack_global_payload(module: str, name: str) -> bytes:

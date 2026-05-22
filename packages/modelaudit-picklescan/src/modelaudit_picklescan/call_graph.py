@@ -30,6 +30,7 @@ _MAX_CALL_GRAPH_DEPTH = 4
 _MAX_VISITED_FUNCTIONS = 64
 _MAX_CALLS_PER_FUNCTION = 128
 _MAX_ASSIGNMENT_ALIASES = 128
+_MAX_ASSIGNMENT_ALIAS_PASSES = 256
 _MAX_FUNCTION_INSTANCE_ALIASES = 32
 _MAX_CLASS_INSTANCE_ALIASES = 128
 _MAX_INHERITED_CLASS_METHODS = 128
@@ -64,6 +65,10 @@ class _CacheClearable(Protocol):
 
 
 _SOURCE_SENSITIVE_CACHED_FUNCTIONS: set[_CacheClearable] = set()
+
+
+class _CallGraphAnalysisLimitError(RuntimeError):
+    """Raised when bounded call-graph enrichment cannot complete safely."""
 
 
 def _register_source_sensitive_cache(function: _CachedFunctionT) -> _CachedFunctionT:
@@ -497,6 +502,8 @@ def shared_source_sensitive_caches() -> Iterator[None]:
 def _safe_call_graph_entrypoints(function_name: str) -> tuple[str, ...]:
     try:
         return _call_graph_entrypoints(function_name)
+    except _CallGraphAnalysisLimitError:
+        raise
     except Exception:
         return ()
 
@@ -1667,9 +1674,15 @@ def _collect_assignment_aliases(
     # A source-flattened branch may rebind one name indefinitely. Track full
     # states so each distinct state gets a propagation pass before a cycle ends.
     seen_states: set[tuple[tuple[str, str], ...]] = set()
+    passes = 0
 
     changed = True
     while changed and len(assignment_aliases) < _MAX_ASSIGNMENT_ALIASES:
+        if passes >= _MAX_ASSIGNMENT_ALIAS_PASSES:
+            raise _CallGraphAnalysisLimitError(
+                f"assignment alias analysis exceeded {_MAX_ASSIGNMENT_ALIAS_PASSES} propagation passes"
+            )
+        passes += 1
         state = tuple(sorted(assignment_aliases.items()))
         if state in seen_states:
             break
