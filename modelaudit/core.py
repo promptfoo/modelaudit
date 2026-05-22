@@ -617,7 +617,12 @@ def scan_model_directory_or_file(
                     )
                     if resolved_file is None:
                         continue
-                    scan_source = Path(file_path).absolute() if is_hf_cache_symlink else resolved_file
+                    snapshot_path = Path(file_path).absolute()
+                    scan_source = (
+                        snapshot_path
+                        if is_hf_cache_symlink and _shard_family_key_for_path(str(snapshot_path)) is not None
+                        else resolved_file
+                    )
 
                     # Skip non-model files early if filtering is enabled
                     # Note: skip_file_types parameter already contains the correct value

@@ -254,6 +254,38 @@ def test_directory_scan_groups_hf_cache_sharded_symlinks(
     assert not any("path traversal" in issue.message.lower() for issue in result.issues)
 
 
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_keeps_nonsharded_hf_snapshot_aliases_deduplicated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--model"
+    blobs_dir = cache_dir / "blobs"
+    blobs_dir.mkdir(parents=True)
+    blob_path = blobs_dir / "shared-blob"
+    blob_path.write_bytes(b"shared-model")
+
+    for revision in ("abc123", "def456"):
+        snapshots_dir = cache_dir / "snapshots" / revision
+        snapshots_dir.mkdir(parents=True)
+        (snapshots_dir / "model.safetensors").symlink_to(Path("../../blobs") / blob_path.name)
+
+    calls: list[str] = []
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        calls.append(path)
+        return _mock_sharded_scan_result(blob_path.stat().st_size)
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(cache_dir / "snapshots"), cache_scan_results=False)
+
+    assert calls == [str(blob_path.resolve())]
+    assert result.files_scanned == 1
+
+
 def test_scan_file_passes_shard_allowlist_to_advanced_handler(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
