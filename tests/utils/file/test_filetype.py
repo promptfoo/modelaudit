@@ -378,6 +378,20 @@ def test_detect_torch7_formats_by_signature(tmp_path: Path) -> None:
     assert validate_file_type(str(torch7_path)) is True
 
 
+def test_torch7_magic_rejects_pytorch_source_markers(tmp_path: Path) -> None:
+    source_path = tmp_path / "model.py"
+    source_path.write_text("import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    pass\n")
+
+    assert detect_file_format_from_magic(str(source_path)) == "unknown"
+
+
+def test_torch7_magic_keeps_binary_marker_only_routing(tmp_path: Path) -> None:
+    torch7_path = tmp_path / "renamed.bin"
+    torch7_path.write_bytes(b"\x01\x00torch.FloatTensor nn.Sequential\n")
+
+    assert detect_file_format_from_magic(str(torch7_path)) == "torch7"
+
+
 def test_detect_executorch_binary_requires_valid_flatbuffer_structure(tmp_path: Path) -> None:
     executorch_path = tmp_path / "program.pte"
     executorch_path.write_bytes(b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x04\x00\x00\x00")
