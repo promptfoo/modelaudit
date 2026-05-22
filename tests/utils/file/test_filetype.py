@@ -385,6 +385,15 @@ def test_torch7_magic_rejects_pytorch_source_markers(tmp_path: Path) -> None:
     assert detect_file_format_from_magic(str(source_path)) == "unknown"
 
 
+def test_torch7_magic_routes_ascii_serialized_models(tmp_path: Path) -> None:
+    torch7_path = tmp_path / "ascii-model.t7"
+    torch7_path.write_bytes(b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n")
+
+    assert detect_file_format(str(torch7_path)) == "torch7"
+    assert detect_file_format_from_magic(str(torch7_path)) == "torch7"
+    assert validate_file_type(str(torch7_path)) is True
+
+
 def test_torch7_magic_keeps_binary_marker_only_routing(tmp_path: Path) -> None:
     torch7_path = tmp_path / "renamed.bin"
     torch7_path.write_bytes(b"\x01\x00torch.FloatTensor nn.Sequential\n")
