@@ -12,7 +12,7 @@ COPY packages/modelaudit-picklescan ./packages/modelaudit-picklescan
 COPY modelaudit ./modelaudit
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 \
+    && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 libcap2 libsystemd0 libudev1 \
     && apt-get install --yes --no-install-recommends build-essential ca-certificates curl \
     && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --profile minimal --default-toolchain "${PICKLESCAN_RUST_TOOLCHAIN}" \
@@ -25,7 +25,7 @@ FROM ${PYTHON_IMAGE} AS runtime
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 \
+    && apt-get install --yes --no-install-recommends --only-upgrade libc-bin libc6 libcap2 libsystemd0 libudev1 \
     && apt-get install --yes --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

