@@ -661,9 +661,10 @@ def scan_model_directory_or_file(
 
                     for target_path in target_paths:
                         target_str = str(target_path)
-                        if target_str in scanned_paths:
+                        dedupe_target_str = str(target_path.resolve()) if is_hf_cache_symlink else target_str
+                        if dedupe_target_str in scanned_paths:
                             continue
-                        scanned_paths.add(target_str)
+                        scanned_paths.add(dedupe_target_str)
 
                         if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(target_path)):
                             _add_issue_to_model(

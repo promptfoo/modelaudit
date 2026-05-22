@@ -286,6 +286,48 @@ def test_directory_scan_keeps_nonsharded_hf_snapshot_aliases_deduplicated(
     assert result.files_scanned == 1
 
 
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_deduplicates_identical_hf_shard_families_across_snapshots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--model"
+    blobs_dir = cache_dir / "blobs"
+    blobs_dir.mkdir(parents=True)
+    blob_paths: list[Path] = []
+    for shard_index in range(1, 3):
+        blob_path = blobs_dir / f"blob-{shard_index}"
+        blob_path.write_bytes(f"shared-hf-shard-{shard_index}".encode())
+        blob_paths.append(blob_path.resolve())
+        for revision in ("abc123", "def456"):
+            snapshots_dir = cache_dir / "snapshots" / revision
+            snapshots_dir.mkdir(parents=True, exist_ok=True)
+            (snapshots_dir / f"model-{shard_index:05d}-of-00002.safetensors").symlink_to(
+                Path("../../blobs") / blob_path.name
+            )
+
+    captured_configs: list[dict[str, Any]] = []
+    calls: list[str] = []
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        calls.append(path)
+        captured_configs.append(dict(config or {}))
+        return _mock_sharded_scan_result(sum(blob_path.stat().st_size for blob_path in blob_paths))
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(cache_dir / "snapshots"), cache_scan_results=False)
+
+    material_config = normalize_material_scan_config(captured_configs[0])
+    fingerprint = material_config[core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY]
+    assert len(calls) == 1
+    assert result.files_scanned == len(blob_paths)
+    assert result.bytes_scanned == sum(blob_path.stat().st_size for blob_path in blob_paths)
+    assert {member["path"] for member in fingerprint["members"]} == {str(blob_path) for blob_path in blob_paths}
+
+
 def test_scan_file_passes_shard_allowlist_to_advanced_handler(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
