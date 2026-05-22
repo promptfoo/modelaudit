@@ -395,6 +395,104 @@ def test_onnx_scanner_uppercase_snake_python_near_match_not_flagged(tmp_path: Pa
     assert not [c for c in result.checks if c.name == "Python Operator Detection" and c.status == CheckStatus.FAILED]
 
 
+def _save_model_with_int8_weight(tmp_path: Path, weight_bytes: bytes, *, extra_node: Any = None) -> Path:
+    """Build a clean ai.onnx-only model whose int8 initializer holds ``weight_bytes``."""
+    weight = helper.make_tensor("W", TensorProto.INT8, [len(weight_bytes)], weight_bytes, raw=True)
+    scale = helper.make_tensor("scale", TensorProto.FLOAT, [], [1.0])
+    zero_point = helper.make_tensor("zp", TensorProto.INT8, [], [0])
+    nodes = [helper.make_node("DequantizeLinear", ["W", "scale", "zp"], ["Y"], name="dq")]
+    if extra_node is not None:
+        nodes.append(extra_node)
+    graph = helper.make_graph(
+        nodes,
+        "quant_graph",
+        [],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [len(weight_bytes)])],
+        initializer=[weight, scale, zero_point],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    path = tmp_path / "model.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def _python_operator_issues(result: Any) -> list[Any]:
+    return [
+        issue
+        for issue in result.issues
+        if issue.details.get("type") == "python_operator" or "Python operator" in issue.message
+    ]
+
+
+# Bytes "PyOp" (0x50 0x79 0x4F 0x70) bracketed by non-alphanumeric bytes: a
+# realistic byte run inside quantized int8 weight data that the raw-byte JIT
+# regex matches case-insensitively. See GitHub issue #1254.
+_PYOP_WEIGHT_BYTES = bytes([0x00, 0x50, 0x79, 0x4F, 0x70, 0x00, 0x01, 0x02])
+
+
+def test_onnx_scanner_pyop_bytes_in_weight_data_not_flagged(tmp_path: Path) -> None:
+    """A clean ai.onnx-only model is not flagged when weight bytes spell 'PyOp'."""
+    model_path = _save_model_with_int8_weight(tmp_path, _PYOP_WEIGHT_BYTES)
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert _python_operator_issues(result) == []
+
+
+def test_onnx_scanner_real_pyop_node_still_flagged_despite_weight_bytes(tmp_path: Path) -> None:
+    """A genuine PyOp node stays CRITICAL even when weight bytes also spell 'PyOp'."""
+    pyop_node = helper.make_node("PyOp", ["Y"], ["Z"], name="evil", domain="com.attacker")
+    model_path = _save_model_with_int8_weight(tmp_path, _PYOP_WEIGHT_BYTES, extra_node=pyop_node)
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    python_operator_issues = _python_operator_issues(result)
+    assert python_operator_issues
+    assert all(issue.severity == IssueSeverity.CRITICAL for issue in python_operator_issues)
+
+
+def test_onnx_scanner_subgraph_pyop_still_flagged(tmp_path: Path) -> None:
+    """A PyOp hidden inside an If-branch subgraph is still detected."""
+    then_branch = helper.make_graph(
+        [helper.make_node("PyOp", ["X"], ["Z"], domain="com.attacker")],
+        "then",
+        [],
+        [helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1])],
+    )
+    else_branch = helper.make_graph(
+        [helper.make_node("Identity", ["X"], ["Z"])],
+        "else",
+        [],
+        [helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1])],
+    )
+    if_node = helper.make_node("If", ["cond"], ["Y"], then_branch=then_branch, else_branch=else_branch)
+    graph = helper.make_graph(
+        [if_node],
+        "graph",
+        [
+            helper.make_tensor_value_info("cond", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("X", TensorProto.FLOAT, [1]),
+        ],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("com.attacker", 1)],
+    )
+    model.ir_version = 8
+    model_path = tmp_path / "subgraph.onnx"
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    python_operator_issues = _python_operator_issues(result)
+    assert python_operator_issues
+    assert all(issue.severity == IssueSeverity.CRITICAL for issue in python_operator_issues)
+
+
 class TestCVE202551480SavePathTraversal:
     """Tests for CVE-2025-51480: ONNX save_external_data arbitrary file overwrite."""
 
