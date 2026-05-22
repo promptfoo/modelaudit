@@ -15,14 +15,15 @@ from importlib.util import find_spec
 
 import pytest
 
-import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import PickleReport, Severity, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
 from modelaudit_picklescan.call_graph import (
     _CallGraphAnalysisLimitError,
     _collect_assignment_aliases,
     _collect_local_defs,
+    _first_matching_path,
     _module_level_statements,
+    _safe_call_graph_entrypoints,
 )
 
 _OSCILLATING_MODULE_SOURCE = """\
@@ -66,51 +67,52 @@ def _run_with_timeout(target: object, timeout: float = 10.0) -> None:
         pytest.fail(f"call-graph analysis did not terminate within {timeout}s")
 
 
-def test_collect_assignment_aliases_terminates_on_branch_rebind() -> None:
+def test_collect_assignment_aliases_fails_closed_on_branch_rebind() -> None:
     tree = ast.parse(_OSCILLATING_MODULE_SOURCE)
     statements = _module_level_statements(tree)
     local_defs = _collect_local_defs(statements)
     local_class_targets = {"testmod.A", "testmod.B"}
 
-    result: dict[str, dict[str, str]] = {}
+    result: dict[str, bool] = {}
 
     def _collect() -> None:
-        result["aliases"] = _collect_assignment_aliases(
-            statements,
-            "testmod",
-            {},
-            local_defs,
-            local_class_targets,
-        )
+        with pytest.raises(_CallGraphAnalysisLimitError, match="entered a propagation cycle"):
+            _collect_assignment_aliases(
+                statements,
+                "testmod",
+                {},
+                local_defs,
+                local_class_targets,
+            )
+        result["limited"] = True
 
     _run_with_timeout(_collect)
 
-    aliases = result["aliases"]
-    # The rebinding name still resolves to one of the two local classes; the
-    # exact branch is order-dependent, but the loop must converge.
-    assert aliases.get("m") in {"testmod.A", "testmod.B"}
+    assert result == {"limited": True}
 
 
-def test_collect_assignment_aliases_terminates_after_cyclic_dependency_propagation() -> None:
+def test_collect_assignment_aliases_fails_closed_on_cyclic_dependency_propagation() -> None:
     tree = ast.parse(_DEPENDENT_CYCLE_SOURCE)
     statements = _module_level_statements(tree)
     local_defs = _collect_local_defs(statements)
     local_class_targets = {"testmod.A", "testmod.B"}
 
-    result: dict[str, dict[str, str]] = {}
+    result: dict[str, bool] = {}
 
     def _collect() -> None:
-        result["aliases"] = _collect_assignment_aliases(
-            statements,
-            "testmod",
-            {},
-            local_defs,
-            local_class_targets,
-        )
+        with pytest.raises(_CallGraphAnalysisLimitError, match="entered a propagation cycle"):
+            _collect_assignment_aliases(
+                statements,
+                "testmod",
+                {},
+                local_defs,
+                local_class_targets,
+            )
+        result["limited"] = True
 
     _run_with_timeout(_collect)
 
-    assert result["aliases"].get("c") in local_class_targets
+    assert result == {"limited": True}
 
 
 def test_collect_assignment_aliases_fails_closed_on_long_period_cycles() -> None:
@@ -152,11 +154,19 @@ def test_assignment_alias_limit_is_not_hidden_by_safe_entrypoint_wrapper(monkeyp
     def _raise_limit(_function_name: str) -> tuple[str, ...]:
         raise _CallGraphAnalysisLimitError("assignment alias limit")
 
-    monkeypatch.setattr(call_graph, "_call_graph_entrypoints", _raise_limit)
-    call_graph._safe_call_graph_entrypoints.cache_clear()
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._call_graph_entrypoints", _raise_limit)
+    _safe_call_graph_entrypoints.cache_clear()
 
     with pytest.raises(_CallGraphAnalysisLimitError, match="assignment alias limit"):
-        call_graph._safe_call_graph_entrypoints("long_period.module")
+        _safe_call_graph_entrypoints("long_period.module")
+
+
+def test_assignment_alias_limit_is_not_hidden_by_path_search() -> None:
+    def _raise_limit(_entrypoint: str) -> tuple[str, ...] | None:
+        raise _CallGraphAnalysisLimitError("assignment alias limit")
+
+    with pytest.raises(_CallGraphAnalysisLimitError, match="assignment alias limit"):
+        _first_matching_path(("wrapper.entrypoint",), _raise_limit)
 
 
 def _stack_global_payload(module: str, name: str) -> bytes:

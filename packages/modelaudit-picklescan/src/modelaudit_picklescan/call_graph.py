@@ -515,6 +515,8 @@ def _first_matching_path(
     for entrypoint in entrypoints:
         try:
             path = path_for(entrypoint)
+        except _CallGraphAnalysisLimitError:
+            raise
         except Exception:
             continue
         if path is not None:
@@ -1685,7 +1687,7 @@ def _collect_assignment_aliases(
         passes += 1
         state = tuple(sorted(assignment_aliases.items()))
         if state in seen_states:
-            break
+            raise _CallGraphAnalysisLimitError("assignment alias analysis entered a propagation cycle")
         seen_states.add(state)
         changed = False
         scoped_aliases = {**aliases, **assignment_aliases}
