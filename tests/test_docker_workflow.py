@@ -73,12 +73,12 @@ def test_dockerfiles_pin_python_base_images_by_digest() -> None:
     _assert_pinned_python_image(tensorflow_from, "3.12-slim")
 
 
-def test_docker_success_job_waits_for_full_image_result() -> None:
+def test_docker_success_job_waits_for_all_image_results() -> None:
     workflow = _load_docker_workflow()
 
     success_job = _jobs(workflow)["docker-ci-success"]
     assert isinstance(success_job, dict)
-    assert success_job["needs"] == ["build-test-lightweight", "build-test-full"]
+    assert success_job["needs"] == ["build-test-lightweight", "build-test-full", "build-test-tensorflow"]
     assert success_job["if"] == "always()"
 
     steps = _job_steps(workflow, "docker-ci-success")
@@ -86,9 +86,12 @@ def test_docker_success_job_waits_for_full_image_result() -> None:
     check_run = check_step["run"]
     assert 'LIGHTWEIGHT_RESULT="${{ needs.build-test-lightweight.result }}"' in check_run
     assert 'FULL_RESULT="${{ needs.build-test-full.result }}"' in check_run
+    assert 'TENSORFLOW_RESULT="${{ needs.build-test-tensorflow.result }}"' in check_run
     assert 'echo "Full Docker build result: $FULL_RESULT"' in check_run
+    assert 'echo "TensorFlow Docker build result: $TENSORFLOW_RESULT"' in check_run
     assert '"$LIGHTWEIGHT_RESULT" == "success" || "$LIGHTWEIGHT_RESULT" == "skipped"' in check_run
     assert '"$FULL_RESULT" == "success" || "$FULL_RESULT" == "skipped"' in check_run
+    assert '"$TENSORFLOW_RESULT" == "success" || "$TENSORFLOW_RESULT" == "skipped"' in check_run
 
 
 def test_full_image_ml_dependency_probe_fails_hard() -> None:
@@ -108,3 +111,20 @@ def test_full_image_ml_dependency_probe_fails_hard() -> None:
     ) in dependency_run
     assert "|| echo" not in dependency_run
     assert "Some ML dependencies missing" not in dependency_run
+
+
+def test_tensorflow_image_changes_are_built_and_probed() -> None:
+    workflow = _load_docker_workflow()
+
+    tensorflow_job = _jobs(workflow)["build-test-tensorflow"]
+    assert isinstance(tensorflow_job, dict)
+    assert tensorflow_job["needs"] == "changes"
+    assert tensorflow_job["if"] == "needs.changes.outputs.tensorflow-image == 'true'"
+
+    steps = _job_steps(workflow, "build-test-tensorflow")
+    build_step = _step_by_name(steps, "Build TensorFlow image")
+    assert build_step["with"]["file"] == "Dockerfile.tensorflow"
+    dependency_step = _step_by_name(steps, "Verify TensorFlow dependency and non-root runtime")
+    dependency_run = dependency_step["run"]
+    assert "import os, tensorflow" in dependency_run
+    assert "assert os.getuid() == 10001" in dependency_run
