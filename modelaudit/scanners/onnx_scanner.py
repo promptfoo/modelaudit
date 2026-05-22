@@ -137,6 +137,11 @@ def _model_declares_python_operator(model: Any) -> bool:
     return any(_is_python_operator(node.op_type or "") for graph in graphs for node in _iter_graph_nodes(graph))
 
 
+def _jit_finding_type(finding: Any) -> Any:
+    """Return the detector finding type across dict and object results."""
+    return finding.get("type") if hasattr(finding, "get") else getattr(finding, "type", None)
+
+
 def _confirmed_python_operator_findings(findings: list[Any], model: Any) -> list[Any]:
     """Drop raw-byte ``python_operator`` findings the parsed graph does not confirm.
 
@@ -144,6 +149,9 @@ def _confirmed_python_operator_findings(findings: list[Any], model: Any) -> list
     false positive from the raw-byte regex colliding with tensor weight data.
     If the graph cannot be inspected, the finding is kept (fail closed).
     """
+    if not any(_jit_finding_type(finding) == "python_operator" for finding in findings):
+        return findings
+
     try:
         if _model_declares_python_operator(model):
             return findings
@@ -153,9 +161,7 @@ def _confirmed_python_operator_findings(findings: list[Any], model: Any) -> list
 
     confirmed: list[Any] = []
     for finding in findings:
-        # collect_jit_script_findings yields dicts; tolerate objects defensively.
-        finding_type = finding.get("type") if hasattr(finding, "get") else getattr(finding, "type", None)
-        if finding_type == "python_operator":
+        if _jit_finding_type(finding) == "python_operator":
             logger.debug("Suppressing unconfirmed raw-byte ONNX python_operator finding (no PyOp node in graph)")
             continue
         confirmed.append(finding)

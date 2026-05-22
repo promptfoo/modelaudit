@@ -17,7 +17,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.detectors.jit_script import JITScriptDetector
 from modelaudit.detectors.network_comm import NetworkCommDetector
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.onnx_scanner import OnnxScanner
+from modelaudit.scanners.onnx_scanner import OnnxScanner, _confirmed_python_operator_findings
 
 
 def create_onnx_model(
@@ -428,6 +428,21 @@ def _python_operator_issues(result: Any) -> list[Any]:
 # realistic byte run inside quantized int8 weight data that the raw-byte JIT
 # regex matches case-insensitively. See GitHub issue #1254.
 _PYOP_WEIGHT_BYTES = bytes([0x00, 0x50, 0x79, 0x4F, 0x70, 0x00, 0x01, 0x02])
+
+
+def test_onnx_scanner_skips_graph_confirmation_without_python_operator_candidate() -> None:
+    accessed: list[bool] = []
+
+    class UnreadableModel:
+        @property
+        def graph(self) -> Any:
+            accessed.append(True)
+            raise RuntimeError("graph should not be inspected")
+
+    findings = [{"type": "embedded_script", "content": "harmless"}]
+
+    assert _confirmed_python_operator_findings(findings, UnreadableModel()) == findings
+    assert accessed == []
 
 
 def test_onnx_scanner_pyop_bytes_in_weight_data_not_flagged(tmp_path: Path) -> None:
