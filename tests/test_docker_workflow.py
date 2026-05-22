@@ -9,7 +9,7 @@ import yaml
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _PINNED_PYTHON_IMAGE_RE = re.compile(r"^python:(?P<version>\d+\.\d+-slim)@sha256:(?P<digest>[0-9a-f]{64})$")
 _PYTHON_3_12_SLIM_DIGEST = "401f6e1a67dad31a1bd78e9ad22d0ee0a3b52154e6bd30e90be696bb6a3d7461"
-_PYTHON_3_13_SLIM_DIGEST = "dc1546eefcbe8caaa1f004f16ab76b204b5e1dbd58ff81b899f21cd40541232f"
+_PYTHON_3_13_SLIM_DIGEST = "e544a7fcbdf8555eceda66bf86cafb006c736339f76141918bcb812f3174c00a"
 
 
 def _load_docker_workflow() -> dict[str, Any]:
