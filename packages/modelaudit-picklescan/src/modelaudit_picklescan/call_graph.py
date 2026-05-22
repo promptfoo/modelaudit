@@ -1664,6 +1664,12 @@ def _collect_assignment_aliases(
 ) -> dict[str, str]:
     node_list = tuple(nodes)
     assignment_aliases: dict[str, str] = {}
+    # Track every (target, resolved) pair already applied. A target can be
+    # reassigned across passes (e.g. distinct `if`/`else` branches both bind
+    # the same name), so the fixpoint may oscillate without ever growing the
+    # dict. Re-applying a previously seen pair must not count as progress, or
+    # the loop never terminates (see imaplib/http.server/nntplib stdlib hangs).
+    seen_assignments: set[tuple[str, str]] = set()
 
     changed = True
     while changed and len(assignment_aliases) < _MAX_ASSIGNMENT_ALIASES:
@@ -1684,7 +1690,9 @@ def _collect_assignment_aliases(
                 if assignment_aliases.get(target_name) == resolved:
                     continue
                 assignment_aliases[target_name] = resolved
-                changed = True
+                if (target_name, resolved) not in seen_assignments:
+                    seen_assignments.add((target_name, resolved))
+                    changed = True
                 if len(assignment_aliases) >= _MAX_ASSIGNMENT_ALIASES:
                     break
     return assignment_aliases
