@@ -1114,7 +1114,7 @@ def _has_torch7_ascii_object_signature(prefix: bytes) -> bool:
         class_name = fields[offset + 5]
         if object_index <= 0 or version_length != len(version) or class_name_length != len(class_name):
             continue
-        if not version.startswith(b"V "):
+        if re.fullmatch(rb"V [+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", version) is None:
             continue
         if class_name.startswith((b"torch.", b"nn.", b"cunn.", b"cutorch.")):
             return True

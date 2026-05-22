@@ -394,6 +394,13 @@ def test_torch7_magic_routes_ascii_serialized_models(tmp_path: Path) -> None:
     assert validate_file_type(str(torch7_path)) is True
 
 
+def test_torch7_magic_rejects_malformed_ascii_version_header(tmp_path: Path) -> None:
+    source_path = tmp_path / "malformed-header.py"
+    source_path.write_bytes(b"4\n1\n9\nV payload\n13\nnn.Sequential\n")
+
+    assert detect_file_format_from_magic(str(source_path)) == "unknown"
+
+
 def test_torch7_magic_keeps_binary_marker_only_routing(tmp_path: Path) -> None:
     torch7_path = tmp_path / "renamed.bin"
     torch7_path.write_bytes(b"\x01\x00torch.FloatTensor nn.Sequential\n")
