@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
+from ..utils.file.detection import _is_torch7_signature as is_torch7_signature
 from ._string_extraction import extract_bounded_printable_strings
 from .base import BaseScanner, IssueSeverity, ScanResult
 
@@ -50,20 +51,6 @@ SAFE_REQUIRE_MODULES = frozenset(
         "optim",
     }
 )
-
-
-def is_torch7_signature(prefix: bytes) -> bool:
-    """Return True if the prefix resembles a Torch7 serialization header/marker."""
-    lowered = prefix.lower()
-    if prefix.startswith(b"T7\x00\x00"):
-        return True
-    # Marker-only matches must still look serialized. PyTorch source commonly
-    # mentions both ``torch`` and ``nn.`` and must not route as Torch7.
-    if b"\x00" not in prefix:
-        return False
-    has_torch_marker = b"torch" in lowered or b"luat" in lowered
-    has_structure_marker = b"nn." in lowered or b"tensor" in lowered or b"thnn" in lowered
-    return has_torch_marker and has_structure_marker
 
 
 class Torch7Scanner(BaseScanner):
