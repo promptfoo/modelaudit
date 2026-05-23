@@ -75,9 +75,11 @@ class _CallGraphAnalysisLimitError(RuntimeError):
         message: str,
         *,
         partial_findings: tuple[CallGraphFinding, ...] = (),
+        partial_startup_hook_write_findings: tuple[StartupHookWriteFinding, ...] = (),
     ) -> None:
         super().__init__(message)
         self.partial_findings = partial_findings
+        self.partial_startup_hook_write_findings = partial_startup_hook_write_findings
 
 
 def _register_source_sensitive_cache(function: _CachedFunctionT) -> _CachedFunctionT:
@@ -406,32 +408,45 @@ def find_startup_hook_write_call_graphs(
             continue
         seen.add((module, name))
 
-        entrypoints = _safe_call_graph_entrypoints(f"{module}.{name}")
-        if not entrypoints:
-            continue
-        if _first_matching_path(entrypoints, _find_sink_path) is not None:
-            continue
-        open_path = _first_matching_path(entrypoints, _find_file_open_path)
-        if open_path is not None:
-            openers.append(
-                _ImportCallPath(
-                    module=module,
-                    name=name,
-                    import_reference=f"{module}.{name}",
-                    call_path=open_path,
+        try:
+            entrypoints = _safe_call_graph_entrypoints(f"{module}.{name}")
+            if not entrypoints:
+                continue
+            if _first_matching_path(entrypoints, _find_sink_path) is not None:
+                continue
+            open_path = _first_matching_path(entrypoints, _find_file_open_path)
+            if open_path is not None:
+                openers.append(
+                    _ImportCallPath(
+                        module=module,
+                        name=name,
+                        import_reference=f"{module}.{name}",
+                        call_path=open_path,
+                    )
                 )
-            )
-        write_path = _first_matching_path(entrypoints, _find_file_write_path)
-        if write_path is not None:
-            writers.append(
-                _ImportCallPath(
-                    module=module,
-                    name=name,
-                    import_reference=f"{module}.{name}",
-                    call_path=write_path,
+            write_path = _first_matching_path(entrypoints, _find_file_write_path)
+            if write_path is not None:
+                writers.append(
+                    _ImportCallPath(
+                        module=module,
+                        name=name,
+                        import_reference=f"{module}.{name}",
+                        call_path=write_path,
+                    )
                 )
-            )
+        except _CallGraphAnalysisLimitError as error:
+            raise _CallGraphAnalysisLimitError(
+                str(error),
+                partial_startup_hook_write_findings=_materialize_startup_hook_write_findings(openers, writers),
+            ) from error
 
+    return _materialize_startup_hook_write_findings(openers, writers)
+
+
+def _materialize_startup_hook_write_findings(
+    openers: list[_ImportCallPath],
+    writers: list[_ImportCallPath],
+) -> tuple[StartupHookWriteFinding, ...]:
     if not openers or not writers:
         return ()
 

@@ -38,6 +38,7 @@ from modelaudit_picklescan import (
 )
 from modelaudit_picklescan.call_graph import (
     CallGraphFinding,
+    StartupHookWriteFinding,
     _CallGraphAnalysisLimitError,
     find_startup_hook_write_call_graphs,
 )
@@ -3590,6 +3591,55 @@ def test_with_call_graph_findings_marks_startup_hook_enrichment_failures_incompl
         and error.exception_type == "RuntimeError"
         and error.details["analysis"] == "python_call_graph_startup_hook_write"
         and error.details["analysis_incomplete"] is True
+        for error in updated.errors
+    )
+
+
+def test_with_call_graph_findings_preserves_startup_hook_findings_before_limit_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    partial_finding = StartupHookWriteFinding(
+        opener_module="click",
+        opener_name="open_file",
+        writer_module="click",
+        writer_name="echo",
+        opener_import_reference="click.open_file",
+        writer_import_reference="click.echo",
+        open_sink="builtins.open",
+        write_sink="binary_file.write",
+        opener_call_path=("click.open_file", "builtins.open"),
+        writer_call_path=("click.echo", "binary_file.write"),
+    )
+
+    def raise_startup_hook_limit(*_args: object, **_kwargs: object) -> tuple[StartupHookWriteFinding, ...]:
+        raise _CallGraphAnalysisLimitError(
+            "assignment alias analysis entered a propagation cycle",
+            partial_startup_hook_write_findings=(partial_finding,),
+        )
+
+    monkeypatch.setattr(package_api, "find_startup_hook_write_call_graphs", raise_startup_hook_limit)
+    report = PickleReport(
+        source="partial-startup-hook-findings.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={"import_references": ()},
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.MALICIOUS
+    assert updated.metadata["analysis_incomplete"] is True
+    startup_findings = [
+        finding for finding in updated.findings if finding.rule_code == "DANGEROUS_CALL_GRAPH_FILE_WRITE"
+    ]
+    assert len(startup_findings) == 1
+    assert startup_findings[0].details["opener_name"] == "open_file"
+    assert startup_findings[0].details["name"] == "echo"
+    assert any(
+        error.category == "call_graph_analysis_error"
+        and error.exception_type == "_CallGraphAnalysisLimitError"
+        and error.details["analysis"] == "python_call_graph_startup_hook_write"
         for error in updated.errors
     )
 

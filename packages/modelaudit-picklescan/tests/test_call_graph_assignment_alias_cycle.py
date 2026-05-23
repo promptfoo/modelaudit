@@ -20,6 +20,7 @@ from modelaudit_picklescan import PickleReport, Severity, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
 from modelaudit_picklescan.call_graph import (
     CallGraphFinding,
+    StartupHookWriteFinding,
     _CallGraphAnalysisLimitError,
     _collect_assignment_aliases,
     _collect_local_defs,
@@ -27,6 +28,7 @@ from modelaudit_picklescan.call_graph import (
     _module_level_statements,
     _safe_call_graph_entrypoints,
     find_dangerous_call_graphs,
+    find_startup_hook_write_call_graphs,
 )
 
 _OSCILLATING_MODULE_SOURCE = """\
@@ -207,6 +209,51 @@ def test_assignment_alias_limit_preserves_prior_call_graph_findings(
             import_reference="dangerous.entry",
             sink="builtins.exec",
             call_path=("dangerous.entry", "builtins.exec"),
+        ),
+    )
+
+
+def test_assignment_alias_limit_preserves_prior_startup_hook_findings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    references = (
+        {"module": "opener", "name": "entry"},
+        {"module": "writer", "name": "entry"},
+        {"module": "limited", "name": "entry"},
+    )
+
+    def _entrypoints(function_name: str) -> tuple[str, ...]:
+        if function_name == "limited.entry":
+            raise _CallGraphAnalysisLimitError("assignment alias limit")
+        return (function_name,)
+
+    def _path(entrypoints: Iterable[str], path_for: object) -> tuple[str, ...] | None:
+        entrypoint = next(iter(entrypoints))
+        path_name = getattr(path_for, "__name__", "")
+        if path_name == "_find_file_open_path" and entrypoint == "opener.entry":
+            return ("opener.entry", "builtins.open")
+        if path_name == "_find_file_write_path" and entrypoint == "writer.entry":
+            return ("writer.entry", "binary_file.write")
+        return None
+
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._safe_call_graph_entrypoints", _entrypoints)
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._first_matching_path", _path)
+
+    with pytest.raises(_CallGraphAnalysisLimitError, match="assignment alias limit") as exc_info:
+        find_startup_hook_write_call_graphs(references)
+
+    assert exc_info.value.partial_startup_hook_write_findings == (
+        StartupHookWriteFinding(
+            opener_module="opener",
+            opener_name="entry",
+            writer_module="writer",
+            writer_name="entry",
+            opener_import_reference="opener.entry",
+            writer_import_reference="writer.entry",
+            open_sink="builtins.open",
+            write_sink="binary_file.write",
+            opener_call_path=("opener.entry", "builtins.open"),
+            writer_call_path=("writer.entry", "binary_file.write"),
         ),
     )
 

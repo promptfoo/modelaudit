@@ -1024,6 +1024,9 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
                 import_references,
                 callable_invocations,
             )
+        except _CallGraphAnalysisLimitError as error:
+            startup_hook_write_findings = error.partial_startup_hook_write_findings
+            enrichment_errors.append(("python_call_graph_startup_hook_write", error))
         except Exception as error:
             startup_hook_write_findings = ()
             enrichment_errors.append(("python_call_graph_startup_hook_write", error))
