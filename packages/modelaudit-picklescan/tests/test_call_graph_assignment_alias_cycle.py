@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 import threading
+from collections.abc import Iterable
 from importlib.util import find_spec
 
 import pytest
@@ -18,12 +19,14 @@ import pytest
 from modelaudit_picklescan import PickleReport, Severity, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
 from modelaudit_picklescan.call_graph import (
+    CallGraphFinding,
     _CallGraphAnalysisLimitError,
     _collect_assignment_aliases,
     _collect_local_defs,
     _first_matching_path,
     _module_level_statements,
     _safe_call_graph_entrypoints,
+    find_dangerous_call_graphs,
 )
 
 _OSCILLATING_MODULE_SOURCE = """\
@@ -165,6 +168,47 @@ def test_assignment_alias_limit_is_not_hidden_by_path_search() -> None:
 
     with pytest.raises(_CallGraphAnalysisLimitError, match="assignment alias limit"):
         _first_matching_path(("wrapper.entrypoint",), _raise_limit)
+
+
+def test_assignment_alias_limit_preserves_prior_call_graph_findings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    references = (
+        {"module": "dangerous", "name": "entry"},
+        {"module": "limited", "name": "entry"},
+    )
+
+    def _iter_references(
+        _import_references: object,
+        _callable_references: tuple[dict[str, object], ...],
+        _invoked_references: set[tuple[str, str]],
+    ) -> tuple[dict[str, str], ...]:
+        return references
+
+    def _entrypoints(module: str, name: str, _reference: dict[str, object]) -> tuple[str, ...]:
+        return (f"{module}.{name}",)
+
+    def _path(entrypoints: Iterable[str], _path_for: object) -> tuple[str, ...] | None:
+        if tuple(entrypoints) == ("limited.entry",):
+            raise _CallGraphAnalysisLimitError("assignment alias limit")
+        return ("dangerous.entry", "builtins.exec")
+
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._iter_call_graph_references", _iter_references)
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._call_graph_entrypoints_for_reference", _entrypoints)
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._first_matching_path", _path)
+
+    with pytest.raises(_CallGraphAnalysisLimitError, match="assignment alias limit") as exc_info:
+        find_dangerous_call_graphs(())
+
+    assert exc_info.value.partial_findings == (
+        CallGraphFinding(
+            module="dangerous",
+            name="entry",
+            import_reference="dangerous.entry",
+            sink="builtins.exec",
+            call_path=("dangerous.entry", "builtins.exec"),
+        ),
+    )
 
 
 def _stack_global_payload(module: str, name: str) -> bytes:

@@ -36,7 +36,11 @@ from modelaudit_picklescan import (
     scan_bytes,
     scan_file,
 )
-from modelaudit_picklescan.call_graph import find_startup_hook_write_call_graphs
+from modelaudit_picklescan.call_graph import (
+    CallGraphFinding,
+    _CallGraphAnalysisLimitError,
+    find_startup_hook_write_call_graphs,
+)
 
 
 def _expected_system_global() -> str:
@@ -3510,6 +3514,48 @@ def test_scan_bytes_marks_call_graph_enrichment_failures_incomplete(monkeypatch:
         and error.details["analysis"] == "python_call_graph"
         and error.details["analysis_incomplete"] is True
         for error in report.errors
+    )
+
+
+def test_with_call_graph_findings_preserves_critical_findings_before_limit_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    partial_finding = CallGraphFinding(
+        module="click",
+        name="edit",
+        import_reference="click.edit",
+        sink="os.system",
+        call_path=("click.edit", "os.system"),
+    )
+
+    def raise_call_graph_limit(*_args: object, **_kwargs: object) -> tuple[CallGraphFinding, ...]:
+        raise _CallGraphAnalysisLimitError(
+            "assignment alias analysis entered a propagation cycle",
+            partial_findings=(partial_finding,),
+        )
+
+    monkeypatch.setattr(package_api, "find_dangerous_call_graphs", raise_call_graph_limit)
+    report = PickleReport(
+        source="partial-call-graph-findings.pkl",
+        status=ScanStatus.COMPLETE,
+        verdict=SafetyVerdict.CLEAN,
+        metadata={"import_references": ()},
+    )
+
+    updated = package_api._with_call_graph_findings(report)
+
+    assert updated.status == ScanStatus.INCONCLUSIVE
+    assert updated.verdict == SafetyVerdict.MALICIOUS
+    assert updated.metadata["analysis_incomplete"] is True
+    call_graph_findings = [finding for finding in updated.findings if finding.rule_code == "DANGEROUS_CALL_GRAPH"]
+    assert len(call_graph_findings) == 1
+    assert call_graph_findings[0].details["module"] == "click"
+    assert call_graph_findings[0].details["name"] == "edit"
+    assert any(
+        error.category == "call_graph_analysis_error"
+        and error.exception_type == "_CallGraphAnalysisLimitError"
+        and error.details["analysis_incomplete"] is True
+        for error in updated.errors
     )
 
 

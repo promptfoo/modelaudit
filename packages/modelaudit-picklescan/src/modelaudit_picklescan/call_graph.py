@@ -70,6 +70,15 @@ _SOURCE_SENSITIVE_CACHED_FUNCTIONS: set[_CacheClearable] = set()
 class _CallGraphAnalysisLimitError(RuntimeError):
     """Raised when bounded call-graph enrichment cannot complete safely."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        partial_findings: tuple[CallGraphFinding, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.partial_findings = partial_findings
+
 
 def _register_source_sensitive_cache(function: _CachedFunctionT) -> _CachedFunctionT:
     _SOURCE_SENSITIVE_CACHED_FUNCTIONS.add(cast(_CacheClearable, function))
@@ -325,48 +334,51 @@ def find_dangerous_call_graphs(
         if str(reference.get("module", "")) and str(reference.get("name", ""))
     }
 
-    for reference in _iter_call_graph_references(import_references, callable_references, invoked_references):
-        module = str(reference.get("module", ""))
-        name = str(reference.get("name", ""))
-        if not module or not name:
-            continue
+    try:
+        for reference in _iter_call_graph_references(import_references, callable_references, invoked_references):
+            module = str(reference.get("module", ""))
+            name = str(reference.get("name", ""))
+            if not module or not name:
+                continue
 
-        entrypoints = _call_graph_entrypoints_for_reference(module, name, reference)
-        if not entrypoints:
-            continue
-        allow_invoked_non_lifecycle_entrypoint = _is_explicit_method_import_reference(name)
-        sink_path = _first_matching_path(entrypoints, _find_sink_path)
-        if sink_path is None:
-            for positional_arg_count in positional_arg_counts.get((module, name), ()):
-                sink_path = _first_matching_path(
-                    entrypoints,
-                    _invoked_import_execution_path_callback(
-                        positional_arg_count,
-                        allow_non_lifecycle_entrypoint=allow_invoked_non_lifecycle_entrypoint,
-                    ),
+            entrypoints = _call_graph_entrypoints_for_reference(module, name, reference)
+            if not entrypoints:
+                continue
+            allow_invoked_non_lifecycle_entrypoint = _is_explicit_method_import_reference(name)
+            sink_path = _first_matching_path(entrypoints, _find_sink_path)
+            if sink_path is None:
+                for positional_arg_count in positional_arg_counts.get((module, name), ()):
+                    sink_path = _first_matching_path(
+                        entrypoints,
+                        _invoked_import_execution_path_callback(
+                            positional_arg_count,
+                            allow_non_lifecycle_entrypoint=allow_invoked_non_lifecycle_entrypoint,
+                        ),
+                    )
+                    if sink_path is not None:
+                        break
+            if sink_path is None:
+                continue
+
+            finding_key = (module, name, sink_path)
+            if finding_key in seen_findings:
+                continue
+            seen_findings.add(finding_key)
+
+            sink = sink_path[-1]
+            findings.append(
+                CallGraphFinding(
+                    module=module,
+                    name=name,
+                    import_reference=f"{module}.{name}",
+                    sink=sink,
+                    call_path=sink_path,
                 )
-                if sink_path is not None:
-                    break
-        if sink_path is None:
-            continue
-
-        finding_key = (module, name, sink_path)
-        if finding_key in seen_findings:
-            continue
-        seen_findings.add(finding_key)
-
-        sink = sink_path[-1]
-        findings.append(
-            CallGraphFinding(
-                module=module,
-                name=name,
-                import_reference=f"{module}.{name}",
-                sink=sink,
-                call_path=sink_path,
             )
-        )
-        if len(findings) >= _MAX_IMPORT_REFERENCES:
-            break
+            if len(findings) >= _MAX_IMPORT_REFERENCES:
+                break
+    except _CallGraphAnalysisLimitError as error:
+        raise _CallGraphAnalysisLimitError(str(error), partial_findings=tuple(findings)) from error
     return tuple(findings)
 
 
