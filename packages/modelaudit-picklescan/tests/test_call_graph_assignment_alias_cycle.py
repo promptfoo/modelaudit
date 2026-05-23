@@ -142,6 +142,48 @@ else:
 m = Final()
 """
 
+_READ_BEFORE_UNCONDITIONAL_OVERWRITE_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+class Final:
+    pass
+
+
+if cond:
+    m = A()
+else:
+    m = B()
+exposed = m
+m = Final()
+"""
+
+_OVERWRITE_BEFORE_READ_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+class Final:
+    pass
+
+
+if cond:
+    m = A()
+else:
+    m = B()
+m = Final()
+exposed = m
+"""
+
 _TRY_FINALLY_REBIND_SOURCE = """\
 class A:
     pass
@@ -175,8 +217,13 @@ def _run_with_timeout(target: object, timeout: float = 10.0) -> None:
 
 @pytest.mark.parametrize(
     "source",
-    (_OSCILLATING_MODULE_SOURCE, _TRY_REBIND_SOURCE, _LOOP_ELSE_REBIND_SOURCE),
-    ids=("if-else", "try-except", "loop-else"),
+    (
+        _OSCILLATING_MODULE_SOURCE,
+        _TRY_REBIND_SOURCE,
+        _LOOP_ELSE_REBIND_SOURCE,
+        _READ_BEFORE_UNCONDITIONAL_OVERWRITE_SOURCE,
+    ),
+    ids=("if-else", "try-except", "loop-else", "read-before-overwrite"),
 )
 def test_collect_assignment_aliases_fails_closed_on_stable_branch_rebind(source: str) -> None:
     tree = ast.parse(source)
@@ -230,6 +277,23 @@ def test_collect_assignment_aliases_converges_on_deterministic_final_rebind(
     )
 
     assert aliases["m"] == expected_target
+
+
+def test_collect_assignment_aliases_allows_alias_read_after_deterministic_overwrite() -> None:
+    tree = ast.parse(_OVERWRITE_BEFORE_READ_SOURCE)
+    statements = _module_level_statements(tree)
+    local_defs = _collect_local_defs(statements)
+
+    aliases = _collect_assignment_aliases(
+        statements,
+        "testmod",
+        {},
+        local_defs,
+        {"testmod.A", "testmod.B", "testmod.Final"},
+    )
+
+    assert aliases["m"] == "testmod.Final"
+    assert aliases["exposed"] == "testmod.Final"
 
 
 def test_collect_assignment_aliases_fails_closed_on_cyclic_dependency_propagation() -> None:

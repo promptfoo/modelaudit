@@ -1717,10 +1717,15 @@ def _contains_current_loop_break(nodes: Iterable[ast.stmt]) -> bool:
     return any(contains_break(node) for node in nodes)
 
 
-def _conditionally_rebound_assignment_nodes(nodes: Iterable[ast.AST]) -> dict[str, set[int]]:
+def _conditionally_rebound_assignment_nodes(
+    nodes: Iterable[ast.AST],
+    *,
+    propagate_reads: bool,
+) -> dict[str, set[int]]:
     """Return alternate-path assignment nodes grouped by ambiguously rebound name."""
+    node_list = tuple(nodes)
     ambiguous_assignment_nodes: dict[str, set[int]] = {}
-    for node in nodes:
+    for node in node_list:
         branch_bodies: tuple[Iterable[ast.stmt], ...]
         if isinstance(node, ast.If):
             branch_bodies = (node.body, node.orelse)
@@ -1751,6 +1756,24 @@ def _conditionally_rebound_assignment_nodes(nodes: Iterable[ast.AST]) -> dict[st
                     target_nodes.update(previous_assignments.get(target_name, set()))
             branch_assignments.append(assignments)
             seen_targets.update(branch_targets)
+
+    if not propagate_reads:
+        return ambiguous_assignment_nodes
+
+    active_ambiguous_targets: set[str] = set()
+    for node in node_list:
+        target_names = _assignment_alias_target_names(node)
+        if not target_names:
+            continue
+        reads_ambiguous_target = bool(_assignment_alias_read_names(node) & active_ambiguous_targets)
+        for target_name in target_names:
+            conditional_node_ids = ambiguous_assignment_nodes.get(target_name, set())
+            if id(node) in conditional_node_ids or reads_ambiguous_target:
+                if reads_ambiguous_target:
+                    ambiguous_assignment_nodes.setdefault(target_name, set()).add(id(node))
+                active_ambiguous_targets.add(target_name)
+            else:
+                active_ambiguous_targets.discard(target_name)
     return ambiguous_assignment_nodes
 
 
@@ -1765,7 +1788,12 @@ def _collect_assignment_aliases(
 ) -> dict[str, str]:
     node_list = tuple(nodes)
     assignment_aliases: dict[str, str] = {}
-    conditionally_rebound_node_ids = _conditionally_rebound_assignment_nodes(node_list)
+    source_path = _resolve_module_source(module_name)
+    enforce_transient_rebinding = source_path is None or not _is_library_source_path(str(source_path))
+    conditionally_rebound_node_ids = _conditionally_rebound_assignment_nodes(
+        node_list,
+        propagate_reads=enforce_transient_rebinding,
+    )
     seen_states: set[tuple[tuple[str, str], ...]] = {()}
     passes = 0
 
@@ -1779,6 +1807,7 @@ def _collect_assignment_aliases(
         state = tuple(sorted(assignment_aliases.items()))
         changed = False
         last_changed_node_ids: dict[str, int] = {}
+        last_resolved_node_ids: dict[str, int] = {}
         scoped_aliases = {**aliases, **assignment_aliases}
         for node in node_list:
             resolved = _assignment_alias_value(
@@ -1792,6 +1821,7 @@ def _collect_assignment_aliases(
             if resolved is None:
                 continue
             for target_name in _assignment_alias_target_names(node):
+                last_resolved_node_ids[target_name] = id(node)
                 if assignment_aliases.get(target_name) == resolved:
                     continue
                 assignment_aliases[target_name] = resolved
@@ -1801,9 +1831,10 @@ def _collect_assignment_aliases(
                     break
         next_state = tuple(sorted(assignment_aliases.items()))
         if next_state == state:
+            final_node_ids = last_resolved_node_ids if enforce_transient_rebinding else last_changed_node_ids
             if any(
                 node_id in conditionally_rebound_node_ids.get(target_name, set())
-                for target_name, node_id in last_changed_node_ids.items()
+                for target_name, node_id in final_node_ids.items()
             ):
                 raise _CallGraphAnalysisLimitError(
                     "assignment alias analysis encountered ambiguous conditional rebinding"
@@ -1877,6 +1908,12 @@ def _assignment_alias_target_names(node: ast.AST) -> set[str]:
         return targets
     if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
         return {node.target.id}
+    return set()
+
+
+def _assignment_alias_read_names(node: ast.AST) -> set[str]:
+    if isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None:
+        return {child.id for child in ast.walk(node.value) if isinstance(child, ast.Name)}
     return set()
 
 
