@@ -1097,9 +1097,35 @@ def _is_tensorflow_metagraph_file(path: str) -> bool:
         return False
 
 
+def _has_torch7_ascii_object_signature(prefix: bytes) -> bool:
+    """Return whether text contains a Torch7 ASCII serialized Torch object header."""
+    fields = prefix.splitlines()
+    for offset in range(len(fields) - 5):
+        if fields[offset] != b"4":
+            continue
+        try:
+            object_index = int(fields[offset + 1])
+            version_length = int(fields[offset + 2])
+            class_name_length = int(fields[offset + 4])
+        except ValueError:
+            continue
+
+        version = fields[offset + 3]
+        class_name = fields[offset + 5]
+        if object_index <= 0 or version_length != len(version) or class_name_length != len(class_name):
+            continue
+        if re.fullmatch(rb"V [+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", version) is None:
+            continue
+        if class_name.startswith((b"torch.", b"nn.", b"cunn.", b"cutorch.")):
+            return True
+    return False
+
+
 def _is_torch7_signature(prefix: bytes) -> bool:
     lowered = prefix.lower()
     if prefix.startswith(b"T7\x00\x00"):
+        return True
+    if _has_torch7_ascii_object_signature(prefix):
         return True
     # Marker-only matches must still look serialized. PyTorch source commonly
     # mentions both ``torch`` and ``nn.`` and must not route as Torch7.
