@@ -127,16 +127,36 @@ class A:
     pass
 
 
-class B:
+class Final:
     pass
 
 
 m = A()
 for value in values:
-    m = B()
+    m = Final()
     break
 else:
-    m = B()
+    m = Final()
+exposed = m
+"""
+
+_LOOP_EARLY_BREAK_BEFORE_TERMINAL_REBIND_SOURCE = """\
+class A:
+    pass
+
+
+class Final:
+    pass
+
+
+m = A()
+for value in values:
+    if cond:
+        break
+    m = Final()
+    break
+else:
+    m = Final()
 exposed = m
 """
 
@@ -235,6 +255,54 @@ match value:
 exposed = m
 """
 
+_CONDITIONALLY_REBOUND_TERMINAL_DEPENDENCY_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+class Final:
+    pass
+
+
+if cond:
+    F = A
+else:
+    F = B
+if cond:
+    m = F()
+else:
+    m = F()
+F = Final
+exposed = m
+"""
+
+_BRANCH_READ_BEFORE_MATCHING_TERMINAL_OVERWRITE_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+class Final:
+    pass
+
+
+if cond:
+    m = A()
+    exposed = m
+    m = Final()
+else:
+    m = B()
+    exposed = m
+    m = Final()
+"""
+
 _MATCHING_BRANCH_OVERWRITE_SOURCE = """\
 class A:
     pass
@@ -254,6 +322,77 @@ if cond:
 else:
     m = B()
     m = Final()
+exposed = m
+"""
+
+_RESOLVED_MATCHING_BRANCH_OVERWRITE_SOURCE = """\
+class Final:
+    pass
+
+
+F = Final
+if cond:
+    m = F()
+else:
+    m = Final()
+exposed = m
+"""
+
+_MATCHING_TRY_EXCEPT_OVERWRITE_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+class Final:
+    pass
+
+
+try:
+    m = A()
+    m = Final()
+except Exception:
+    m = B()
+    m = Final()
+exposed = m
+"""
+
+_EXHAUSTIVE_MATCH_OVERWRITE_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+class Final:
+    pass
+
+
+match value:
+    case 1:
+        m = A()
+        m = Final()
+        exposed = m
+    case _:
+        m = B()
+        m = Final()
+        exposed = m
+"""
+
+_TRY_FINALLY_NO_HANDLER_SOURCE = """\
+class Final:
+    pass
+
+
+try:
+    m = Final()
+finally:
+    cleanup()
 exposed = m
 """
 
@@ -294,26 +433,30 @@ def _run_with_timeout(target: object, timeout: float = 10.0) -> None:
         _OSCILLATING_MODULE_SOURCE,
         _TRY_REBIND_SOURCE,
         _LOOP_ELSE_REBIND_SOURCE,
-        _LOOP_MATCHING_TERMINAL_REBIND_SOURCE,
+        _LOOP_EARLY_BREAK_BEFORE_TERMINAL_REBIND_SOURCE,
         _READ_BEFORE_UNCONDITIONAL_OVERWRITE_SOURCE,
         _ONE_SIDED_REBIND_SOURCE,
         _NONEXHAUSTIVE_MATCH_OVERWRITE_SOURCE,
+        _CONDITIONALLY_REBOUND_TERMINAL_DEPENDENCY_SOURCE,
+        _BRANCH_READ_BEFORE_MATCHING_TERMINAL_OVERWRITE_SOURCE,
     ),
     ids=(
         "if-else",
         "try-except",
         "loop-else",
-        "loop-matching-terminal",
+        "loop-early-break",
         "read-before-overwrite",
         "one-sided-rebind",
         "match-no-default",
+        "conditional-terminal-dependency",
+        "branch-read-before-terminal-overwrite",
     ),
 )
 def test_collect_assignment_aliases_fails_closed_on_stable_branch_rebind(source: str) -> None:
     tree = ast.parse(source)
     statements = _module_level_statements(tree)
     local_defs = _collect_local_defs(statements)
-    local_class_targets = {"testmod.A", "testmod.B"}
+    local_class_targets = {"testmod.A", "testmod.B", "testmod.Final"}
 
     result: dict[str, bool] = {}
 
@@ -380,8 +523,27 @@ def test_collect_assignment_aliases_allows_alias_read_after_deterministic_overwr
     assert aliases["exposed"] == "testmod.Final"
 
 
-def test_collect_assignment_aliases_allows_matching_terminal_branch_overwrites() -> None:
-    tree = ast.parse(_MATCHING_BRANCH_OVERWRITE_SOURCE)
+@pytest.mark.parametrize(
+    "source",
+    (
+        _MATCHING_BRANCH_OVERWRITE_SOURCE,
+        _RESOLVED_MATCHING_BRANCH_OVERWRITE_SOURCE,
+        _MATCHING_TRY_EXCEPT_OVERWRITE_SOURCE,
+        _EXHAUSTIVE_MATCH_OVERWRITE_SOURCE,
+        _LOOP_MATCHING_TERMINAL_REBIND_SOURCE,
+        _TRY_FINALLY_NO_HANDLER_SOURCE,
+    ),
+    ids=(
+        "if-else",
+        "if-semantic-resolution",
+        "try-except",
+        "exhaustive-match",
+        "loop-terminal-break",
+        "try-finally-no-handler",
+    ),
+)
+def test_collect_assignment_aliases_allows_matching_terminal_branch_overwrites(source: str) -> None:
+    tree = ast.parse(source)
     statements = _module_level_statements(tree)
     local_defs = _collect_local_defs(statements)
 

@@ -1759,28 +1759,64 @@ def _contains_current_loop_break(nodes: Iterable[ast.stmt]) -> bool:
     return any(contains_break(node) for node in nodes)
 
 
+def _is_exhaustive_match(node: ast.Match) -> bool:
+    return any(
+        isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None and case.guard is None
+        for case in node.cases
+    )
+
+
+_TerminalAssignmentGroup = tuple[str, tuple[ast.Assign | ast.AnnAssign, ...]]
+
+
+def _terminal_assignment_groups(
+    branch_bodies: tuple[tuple[ast.stmt, ...], ...],
+) -> tuple[_TerminalAssignmentGroup, ...]:
+    terminal_assignments: list[dict[str, ast.Assign | ast.AnnAssign]] = []
+    for branch_body in branch_bodies:
+        suffix_assignments: dict[str, ast.Assign | ast.AnnAssign] = {}
+        for statement in reversed(branch_body):
+            if not isinstance(statement, ast.Assign | ast.AnnAssign) or statement.value is None:
+                break
+            for target_name in _assignment_alias_target_names(statement):
+                suffix_assignments.setdefault(target_name, statement)
+        terminal_assignments.append(suffix_assignments)
+    if not terminal_assignments:
+        return ()
+    terminal_targets = set.intersection(*(set(assignments) for assignments in terminal_assignments))
+    return tuple(
+        (target_name, tuple(assignments[target_name] for assignments in terminal_assignments))
+        for target_name in sorted(terminal_targets)
+    )
+
+
 def _conditionally_rebound_assignment_nodes(
     nodes: Iterable[ast.AST],
-    *,
-    propagate_reads: bool,
-) -> tuple[dict[str, set[int]], dict[str, set[int]]]:
+) -> tuple[dict[str, set[int]], tuple[tuple[_TerminalAssignmentGroup, ...], ...]]:
     """Return alternate-path assignment nodes grouped by ambiguously rebound name."""
     node_list = tuple(nodes)
     ambiguous_assignment_nodes: dict[str, set[int]] = {}
-    propagated_assignment_nodes: dict[str, set[int]] = {}
+    terminal_assignment_group_sets: list[tuple[_TerminalAssignmentGroup, ...]] = []
     for node in node_list:
         branch_bodies: tuple[Iterable[ast.stmt], ...]
+        deterministic_terminal_bodies: tuple[Iterable[ast.stmt], ...] | None = None
         if isinstance(node, ast.If):
             branch_bodies = (node.body, node.orelse)
-        elif isinstance(node, ast.Try):
+            deterministic_terminal_bodies = branch_bodies
+        elif isinstance(node, ast.Try) and node.handlers:
             branch_bodies = (
                 (*node.body, *node.orelse),
                 *(handler.body for handler in node.handlers),
             )
+            deterministic_terminal_bodies = branch_bodies
         elif isinstance(node, ast.For | ast.AsyncFor | ast.While) and _contains_current_loop_break(node.body):
             branch_bodies = (node.body, node.orelse)
+            if node.body and isinstance(node.body[-1], ast.Break) and not _contains_current_loop_break(node.body[:-1]):
+                deterministic_terminal_bodies = (node.body[:-1], node.orelse)
         elif isinstance(node, ast.Match):
             branch_bodies = tuple(case.body for case in node.cases)
+            if _is_exhaustive_match(node):
+                deterministic_terminal_bodies = branch_bodies
         else:
             continue
 
@@ -1790,48 +1826,108 @@ def _conditionally_rebound_assignment_nodes(
                 for target_name in _assignment_alias_target_names(statement):
                     ambiguous_assignment_nodes.setdefault(target_name, set()).add(id(statement))
 
-        terminal_assignments: list[dict[str, ast.Assign | ast.AnnAssign]] = []
-        for branch_body in branch_statement_bodies:
-            if not branch_body or not isinstance(branch_body[-1], ast.Assign | ast.AnnAssign):
-                terminal_assignments.append({})
-                continue
-            terminal_statement = branch_body[-1]
-            if terminal_statement.value is None:
-                terminal_assignments.append({})
-                continue
-            terminal_assignments.append(
-                dict.fromkeys(_assignment_alias_target_names(terminal_statement), terminal_statement)
+        if deterministic_terminal_bodies is not None:
+            groups = _terminal_assignment_groups(
+                tuple(tuple(branch_body) for branch_body in deterministic_terminal_bodies)
             )
-        if isinstance(node, ast.If) and terminal_assignments:
-            terminal_targets = set.intersection(*(set(assignments) for assignments in terminal_assignments))
-            for target_name in terminal_targets:
-                statements = tuple(assignments[target_name] for assignments in terminal_assignments)
-                values = tuple(statement.value for statement in statements if statement.value is not None)
-                if (
-                    len(values) == len(statements)
-                    and len({ast.dump(value, include_attributes=False) for value in values}) == 1
+            if groups:
+                terminal_assignment_group_sets.append(groups)
+    return ambiguous_assignment_nodes, tuple(terminal_assignment_group_sets)
+
+
+def _resolved_terminal_assignment_nodes(
+    terminal_assignment_group_sets: tuple[tuple[_TerminalAssignmentGroup, ...], ...],
+    ambiguous_assignment_nodes: dict[str, set[int]],
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+    local_class_targets: set[str],
+    *,
+    class_name: str | None,
+) -> dict[str, set[int]]:
+    deterministic_node_ids: dict[str, set[int]] = {}
+    ambiguous_target_names = set(ambiguous_assignment_nodes)
+    for terminal_assignment_groups in terminal_assignment_group_sets:
+        unresolved_groups = list(terminal_assignment_groups)
+        deterministic_targets: set[str] = set()
+        deterministic_statements: dict[str, tuple[ast.Assign | ast.AnnAssign, ...]] = {}
+        while unresolved_groups:
+            deferred_groups: list[_TerminalAssignmentGroup] = []
+            resolved_group = False
+            for target_name, statements in unresolved_groups:
+                conditional_dependencies: set[str] = set()
+                for statement in statements:
+                    conditional_dependencies.update(_assignment_value_read_names(statement) & ambiguous_target_names)
+                if conditional_dependencies - deterministic_targets:
+                    deferred_groups.append((target_name, statements))
+                    continue
+                if any(
+                    any(
+                        dependency_statement.lineno >= statement.lineno
+                        for dependency_statement, statement in zip(
+                            deterministic_statements[dependency],
+                            statements,
+                            strict=True,
+                        )
+                    )
+                    for dependency in conditional_dependencies
                 ):
-                    ambiguous_assignment_nodes[target_name].difference_update(id(statement) for statement in statements)
+                    continue
+                resolved_values = tuple(
+                    _assignment_alias_value(
+                        statement,
+                        module_name,
+                        aliases,
+                        local_defs,
+                        local_class_targets,
+                        class_name=class_name,
+                    )
+                    for statement in statements
+                )
+                if None not in resolved_values and len(set(resolved_values)) == 1:
+                    deterministic_node_ids.setdefault(target_name, set()).update(
+                        id(statement) for statement in statements
+                    )
+                    deterministic_targets.add(target_name)
+                    deterministic_statements[target_name] = statements
+                    resolved_group = True
+            if not resolved_group:
+                break
+            unresolved_groups = deferred_groups
+    return deterministic_node_ids
 
+
+def _propagated_ambiguous_assignment_nodes(
+    nodes: tuple[ast.AST, ...],
+    ambiguous_assignment_nodes: dict[str, set[int]],
+    deterministic_node_ids: dict[str, set[int]],
+    *,
+    propagate_reads: bool,
+) -> tuple[dict[str, set[int]], dict[str, set[int]]]:
+    effective_ambiguous_node_ids = {
+        target_name: node_ids - deterministic_node_ids.get(target_name, set())
+        for target_name, node_ids in ambiguous_assignment_nodes.items()
+        if node_ids - deterministic_node_ids.get(target_name, set())
+    }
+    propagated_assignment_nodes: dict[str, set[int]] = {}
     if not propagate_reads:
-        return ambiguous_assignment_nodes, propagated_assignment_nodes
-
+        return effective_ambiguous_node_ids, propagated_assignment_nodes
     active_ambiguous_targets: set[str] = set()
-    for node in node_list:
+    for node in nodes:
         target_names = _assignment_alias_target_names(node)
         if not target_names:
             continue
         reads_ambiguous_target = bool(_assignment_alias_read_names(node) & active_ambiguous_targets)
         for target_name in target_names:
-            conditional_node_ids = ambiguous_assignment_nodes.get(target_name, set())
+            conditional_node_ids = effective_ambiguous_node_ids.get(target_name, set())
             if id(node) in conditional_node_ids or reads_ambiguous_target:
                 if reads_ambiguous_target:
-                    ambiguous_assignment_nodes.setdefault(target_name, set()).add(id(node))
+                    effective_ambiguous_node_ids.setdefault(target_name, set()).add(id(node))
                     propagated_assignment_nodes.setdefault(target_name, set()).add(id(node))
                 active_ambiguous_targets.add(target_name)
             else:
                 active_ambiguous_targets.discard(target_name)
-    return ambiguous_assignment_nodes, propagated_assignment_nodes
+    return effective_ambiguous_node_ids, propagated_assignment_nodes
 
 
 def _collect_assignment_aliases(
@@ -1846,10 +1942,7 @@ def _collect_assignment_aliases(
     node_list = tuple(nodes)
     assignment_aliases: dict[str, str] = {}
     source_path = _resolve_module_source(module_name)
-    conditionally_rebound_node_ids, propagated_rebound_node_ids = _conditionally_rebound_assignment_nodes(
-        node_list,
-        propagate_reads=source_path is None or not _is_stdlib_source_path(str(source_path)),
-    )
+    conditionally_rebound_node_ids, terminal_assignment_group_sets = _conditionally_rebound_assignment_nodes(node_list)
     seen_states: set[tuple[tuple[str, str], ...]] = {()}
     passes = 0
 
@@ -1887,8 +1980,25 @@ def _collect_assignment_aliases(
                     break
         next_state = tuple(sorted(assignment_aliases.items()))
         if next_state == state:
+            deterministic_node_ids = _resolved_terminal_assignment_nodes(
+                terminal_assignment_group_sets,
+                conditionally_rebound_node_ids,
+                module_name,
+                {**aliases, **assignment_aliases},
+                local_defs,
+                local_class_targets,
+                class_name=class_name,
+            )
+            effective_conditionally_rebound_node_ids, propagated_rebound_node_ids = (
+                _propagated_ambiguous_assignment_nodes(
+                    node_list,
+                    conditionally_rebound_node_ids,
+                    deterministic_node_ids,
+                    propagate_reads=source_path is None or not _is_stdlib_source_path(str(source_path)),
+                )
+            )
             changed_conditionally = any(
-                node_id in conditionally_rebound_node_ids.get(target_name, set())
+                node_id in effective_conditionally_rebound_node_ids.get(target_name, set())
                 for target_name, node_id in last_changed_node_ids.items()
             )
             resolved_from_conditional_read = any(
@@ -1980,6 +2090,12 @@ def _assignment_alias_read_names(node: ast.AST) -> set[str]:
     if isinstance(value, ast.Name):
         return {value.id}
     return set()
+
+
+def _assignment_value_read_names(node: ast.Assign | ast.AnnAssign) -> set[str]:
+    if node.value is None:
+        return set()
+    return {child.id for child in ast.walk(node.value) if isinstance(child, ast.Name)}
 
 
 def _is_local_class_member_alias(resolved: str, local_class_targets: set[str]) -> bool:
