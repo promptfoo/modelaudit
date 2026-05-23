@@ -353,6 +353,27 @@ class TestAdvancedFileHandler:
         assert shard_detection.details["shards"] == [str(shard_one)]
         assert result.bytes_scanned == shard_one.stat().st_size
 
+    def test_sharded_model_preserves_scanner_config_for_each_shard(self, tmp_path: Path) -> None:
+        """Shard fanout should retain caller configuration for each scanner instance."""
+        shard_one = tmp_path / "model-00001-of-00002.safetensors"
+        shard_two = tmp_path / "model-00002-of-00002.safetensors"
+        shard_one.write_bytes(b"one")
+        shard_two.write_bytes(b"two")
+        captured_configs: list[dict[str, Any]] = []
+
+        class ConfiguredShardScanner(CompletingShardScanner):
+            def __init__(self, config: dict[str, Any] | None = None) -> None:
+                self.config = dict(config or {})
+                captured_configs.append(self.config)
+
+        scanner = ConfiguredShardScanner({"max_tensor_bytes": 7})
+        captured_configs.clear()
+
+        result = AdvancedFileHandler(str(shard_one), scanner).scan()
+
+        assert result.success is True
+        assert captured_configs == [{"max_tensor_bytes": 7}, {"max_tensor_bytes": 7}]
+
     def test_cached_advanced_scan_keys_allowed_shard_paths(self, tmp_path: Path) -> None:
         """Different validated shard allowlists must not share advanced-scan cache entries."""
         shard_one = tmp_path / "checkpoint_1.pt"

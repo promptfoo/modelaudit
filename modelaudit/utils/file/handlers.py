@@ -340,16 +340,23 @@ class MemoryMappedHandler:
 class ParallelShardHandler:
     """Scan multiple model shards in parallel."""
 
-    def __init__(self, shard_info: dict[str, Any], scanner_class: type):
+    def __init__(
+        self,
+        shard_info: dict[str, Any],
+        scanner_class: type,
+        scanner_config: dict[str, Any] | None = None,
+    ):
         """
         Initialize parallel shard scanner.
 
         Args:
             shard_info: Information about model shards
             scanner_class: Scanner class to use
+            scanner_config: Configuration to preserve for each shard scanner
         """
         self.shard_info = shard_info
         self.scanner_class = scanner_class
+        self.scanner_config = scanner_config
 
     def scan_shards(self, progress_callback: Callable[[str, float], None] | None = None) -> "ScanResult":
         from ...scanner_results import IssueSeverity, ScanResult
@@ -425,7 +432,11 @@ class ParallelShardHandler:
         from ...scanner_results import ScanResult
 
         """Scan a single shard file."""
-        scanner = self.scanner_class()
+        scanner = (
+            self.scanner_class(config=dict(self.scanner_config))
+            if self.scanner_config is not None
+            else self.scanner_class()
+        )
         result: ScanResult = scanner.scan(shard_path)
         return result
 
@@ -560,7 +571,12 @@ class AdvancedFileHandler:
         # Scan shards in parallel
         shard_scan_success = True
         if self.shard_info:
-            parallel_scanner = ParallelShardHandler(self.shard_info, self.scanner.__class__)
+            scanner_config = getattr(self.scanner, "config", None)
+            parallel_scanner = ParallelShardHandler(
+                self.shard_info,
+                self.scanner.__class__,
+                scanner_config=dict(scanner_config) if isinstance(scanner_config, dict) else None,
+            )
             shard_results = parallel_scanner.scan_shards(self.progress_callback)
             shard_scan_success = bool(shard_results.success)
             result.merge(shard_results)

@@ -328,6 +328,58 @@ def test_directory_scan_deduplicates_identical_hf_shard_families_across_snapshot
     assert {member["path"] for member in fingerprint["members"]} == {str(blob_path) for blob_path in blob_paths}
 
 
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_reports_incomplete_hf_snapshot_after_shared_blob_dedupe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--model"
+    blobs_dir = cache_dir / "blobs"
+    blobs_dir.mkdir(parents=True)
+    blob_paths: list[Path] = []
+    for shard_index in range(1, 3):
+        blob_path = blobs_dir / f"blob-{shard_index}"
+        blob_path.write_bytes(f"shared-hf-shard-{shard_index}".encode())
+        blob_paths.append(blob_path.resolve())
+        full_snapshot = cache_dir / "snapshots" / "abc123"
+        full_snapshot.mkdir(parents=True, exist_ok=True)
+        (full_snapshot / f"model-{shard_index:05d}-of-00002.safetensors").symlink_to(
+            Path("../../blobs") / blob_path.name
+        )
+
+    partial_snapshot = cache_dir / "snapshots" / "def456"
+    partial_snapshot.mkdir(parents=True)
+    (partial_snapshot / "model-00001-of-00002.safetensors").symlink_to(Path("../../blobs") / blob_paths[0].name)
+
+    captured_configs: list[dict[str, Any]] = []
+    calls: list[str] = []
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        calls.append(path)
+        captured_configs.append(dict(config or {}))
+        material_config = normalize_material_scan_config(captured_configs[-1])
+        fingerprint = material_config[core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY]
+        member_paths = [Path(member["path"]) for member in fingerprint["members"]]
+        return _mock_sharded_scan_result(
+            sum(member_path.stat().st_size for member_path in member_paths),
+            missing_shards=1 if len(member_paths) == 1 else 0,
+        )
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(cache_dir / "snapshots"), cache_scan_results=False)
+
+    material_configs = [normalize_material_scan_config(config) for config in captured_configs]
+    fingerprints = [config[core_module._SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY] for config in material_configs]
+    coverage_checks = [check for check in result.checks if check.name == "Sharded Model Coverage Check"]
+    assert len(calls) == 2
+    assert sorted(len(fingerprint["members"]) for fingerprint in fingerprints) == [1, 2]
+    assert len(coverage_checks) == 1
+    assert coverage_checks[0].details["missing_shard_count"] == 1
+
+
 def test_scan_file_passes_shard_allowlist_to_advanced_handler(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
