@@ -110,6 +110,76 @@ def _is_python_operator(op_type: str) -> bool:
     return False
 
 
+def _iter_graph_nodes(graph: Any) -> Any:
+    """Yield every node in an ONNX graph or function, recursing into subgraphs."""
+    for node in graph.node:
+        yield node
+        for attribute in node.attribute:
+            subgraphs = list(attribute.graphs)
+            try:
+                if attribute.HasField("g"):
+                    subgraphs.append(attribute.g)
+            except (ValueError, AttributeError):  # pragma: no cover - proto edge case
+                pass
+            for subgraph in subgraphs:
+                yield from _iter_graph_nodes(subgraph)
+
+
+def _iter_model_graphs(model: Any) -> Any:
+    """Yield graph-bearing ONNX model fields that may declare operators."""
+    yield model.graph
+    yield from getattr(model, "functions", [])
+    for training_info in getattr(model, "training_info", []):
+        yield training_info.initialization
+        yield training_info.algorithm
+
+
+def _model_declares_python_operator(model: Any) -> bool:
+    """Return True when the parsed ONNX model actually declares a Python operator.
+
+    The raw-byte JIT detector matches short, case-insensitive operator-name
+    tokens (e.g. ``PyOp``) anywhere in the file, so on large models it collides
+    with arbitrary tensor weight bytes. The parsed graph is the authoritative
+    operator inventory, so it is consulted before trusting a raw-byte match.
+    """
+    return any(
+        _is_python_operator(node.op_type or "")
+        for graph in _iter_model_graphs(model)
+        for node in _iter_graph_nodes(graph)
+    )
+
+
+def _jit_finding_type(finding: Any) -> Any:
+    """Return the detector finding type across dict and object results."""
+    return finding.get("type") if hasattr(finding, "get") else getattr(finding, "type", None)
+
+
+def _confirmed_python_operator_findings(findings: list[Any], model: Any) -> list[Any]:
+    """Drop raw-byte ``python_operator`` findings the parsed graph does not confirm.
+
+    A ``python_operator`` finding with no matching node in the parsed graph is a
+    false positive from the raw-byte regex colliding with tensor weight data.
+    If the graph cannot be inspected, the finding is kept (fail closed).
+    """
+    if not any(_jit_finding_type(finding) == "python_operator" for finding in findings):
+        return findings
+
+    try:
+        if _model_declares_python_operator(model):
+            return findings
+    except Exception as exc:  # pragma: no cover - defensive: keep finding if unsure
+        logger.debug("Unable to validate ONNX python operator finding against graph: %s", exc)
+        return findings
+
+    confirmed: list[Any] = []
+    for finding in findings:
+        if _jit_finding_type(finding) == "python_operator":
+            logger.debug("Suppressing unconfirmed raw-byte ONNX python_operator finding (no PyOp node in graph)")
+            continue
+        confirmed.append(finding)
+    return confirmed
+
+
 def _is_windows_absolute_path(path: str) -> bool:
     """Return True when a serialized path is absolute in Windows syntax."""
     return ntpath.isabs(path.replace("/", "\\"))
@@ -319,7 +389,7 @@ class OnnxScanner(BaseScanner):
                     )
                 else:
                     self.add_jit_script_findings(
-                        jit_findings,
+                        _confirmed_python_operator_findings(jit_findings, model),
                         result,
                         model_type="onnx",
                         context=path,
