@@ -592,11 +592,13 @@ def scan_model_directory_or_file(
             hf_cache_root = _find_hf_cache_root(base_dir)
             is_hf_cache = hf_cache_root is not None
             scanned_paths: set[str] = set()
+            hf_shard_blob_paths: set[str] = set()
 
             # First pass: collect all file paths that need scanning
             files_to_scan: list[str] = []
             shard_family_representatives: dict[_ShardFamilyKey, str] = {}
             shard_family_paths: dict[_ShardFamilyKey, set[str]] = {}
+            complete_hf_shard_families: set[_ShardFamilyKey] = set()
             directory_discovery_started_at = _start_phase_timing(phase_timings)
             for root, _, files in os.walk(path, followlinks=False):
                 for file in files:
@@ -617,6 +619,12 @@ def scan_model_directory_or_file(
                     )
                     if resolved_file is None:
                         continue
+                    snapshot_path = Path(file_path).absolute()
+                    snapshot_shard_family_key = _shard_family_key_for_path(str(snapshot_path))
+                    route_hf_shard_alias = (
+                        is_hf_cache_symlink and resolved_file.exists() and snapshot_shard_family_key is not None
+                    )
+                    scan_source = snapshot_path if route_hf_shard_alias else resolved_file
 
                     # Skip non-model files early if filtering is enabled
                     # Note: skip_file_types parameter already contains the correct value
@@ -647,7 +655,7 @@ def scan_model_directory_or_file(
                         continue
 
                     # Handle DVC files and get target paths
-                    target_paths = [resolved_file]
+                    target_paths = [scan_source]
                     if file.endswith(".dvc"):
                         dvc_targets = resolve_dvc_file(file_path)
                         if dvc_targets:
@@ -655,9 +663,18 @@ def scan_model_directory_or_file(
 
                     for target_path in target_paths:
                         target_str = str(target_path)
-                        if target_str in scanned_paths:
+                        shard_family_key = _shard_family_key_for_path(target_str)
+                        is_hf_shard_alias = route_hf_shard_alias and target_path == scan_source
+                        if is_hf_shard_alias:
+                            hf_shard_blob_paths.add(str(target_path.resolve()))
+                        dedupe_target_str = (
+                            str(target_path.resolve())
+                            if is_hf_cache_symlink and shard_family_key is None
+                            else target_str
+                        )
+                        if dedupe_target_str in scanned_paths:
                             continue
-                        scanned_paths.add(target_str)
+                        scanned_paths.add(dedupe_target_str)
 
                         if not is_hf_cache_symlink and not is_within_directory(str(base_dir), str(target_path)):
                             _add_issue_to_model(
@@ -670,7 +687,6 @@ def scan_model_directory_or_file(
                             continue
 
                         # Add to files to scan list instead of scanning immediately
-                        shard_family_key = _shard_family_key_for_path(target_str)
                         if shard_family_key is not None:
                             family_paths = shard_family_paths.setdefault(shard_family_key, set())
                             family_paths.add(target_str)
@@ -678,6 +694,15 @@ def scan_model_directory_or_file(
                                 shard_family_representatives[shard_family_key] = target_str
                                 shard_info = ShardedModelDetector.detect_shards(target_str)
                                 if shard_info is not None:
+                                    expected_total_shards = shard_info.get("expected_total_shards")
+                                    if (
+                                        is_hf_cache_symlink
+                                        and isinstance(expected_total_shards, int)
+                                        and shard_info.get("total_shards") == expected_total_shards
+                                        and "missing_shard_count" not in shard_info
+                                        and "inconsistent_expected_total_shards" not in shard_info
+                                    ):
+                                        complete_hf_shard_families.add(shard_family_key)
                                     for shard_path in shard_info.get("shards", []):
                                         if isinstance(shard_path, str):
                                             resolved_shard_path = str(Path(shard_path).resolve())
@@ -690,7 +715,9 @@ def scan_model_directory_or_file(
                                                     resolved_shard_path,
                                                 )
                                             )
-                                            if shard_in_base_dir or shard_in_hf_blobs:
+                                            if shard_in_hf_blobs:
+                                                family_paths.add(str(Path(shard_path).absolute()))
+                                            elif shard_in_base_dir:
                                                 family_paths.add(resolved_shard_path)
                                             else:
                                                 _add_issue_to_model(
@@ -705,9 +732,28 @@ def scan_model_directory_or_file(
                         files_to_scan.append(target_str)
             _finish_phase_timing(phase_timings, "directory_discovery", directory_discovery_started_at)
 
+            if hf_shard_blob_paths:
+                files_to_scan = [
+                    file_path
+                    for file_path in files_to_scan
+                    if str(Path(file_path).resolve()) not in hf_shard_blob_paths
+                ]
             scan_entries: list[_ScanEntry] = [(file_path, [file_path], None) for file_path in files_to_scan]
+            seen_complete_hf_shard_families: set[tuple[str, tuple[str, ...]]] = set()
             for shard_family_key, representative_file in shard_family_representatives.items():
                 ordered_family_paths = sorted(shard_family_paths.get(shard_family_key, {representative_file}))
+                expected_total_shards = shard_family_key[2]
+                if (
+                    is_hf_cache
+                    and expected_total_shards is not None
+                    and shard_family_key in complete_hf_shard_families
+                    and len(ordered_family_paths) == expected_total_shards
+                ):
+                    resolved_family_paths = tuple(sorted(str(Path(path).resolve()) for path in ordered_family_paths))
+                    family_dedupe_key = (shard_family_key[1], resolved_family_paths)
+                    if family_dedupe_key in seen_complete_hf_shard_families:
+                        continue
+                    seen_complete_hf_shard_families.add(family_dedupe_key)
                 scan_entries.append((representative_file, ordered_family_paths, shard_family_key))
 
             # Second pass: scan every non-shard path independently and every shard
