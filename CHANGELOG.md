@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - keep shard sibling discovery within the requested scan root
 - preserve per-shard metadata when aggregating sharded model families
 - prevent picklescan call-graph alias cycles from hanging scans
+- stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
 
 ## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
