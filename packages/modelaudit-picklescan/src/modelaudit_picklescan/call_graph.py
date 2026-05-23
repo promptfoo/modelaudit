@@ -1865,7 +1865,8 @@ def _resolved_terminal_assignment_nodes(
                     continue
                 if any(
                     any(
-                        dependency_statement.lineno >= statement.lineno
+                        (dependency_statement.lineno, dependency_statement.col_offset)
+                        >= (statement.lineno, statement.col_offset)
                         for dependency_statement, statement in zip(
                             deterministic_statements[dependency],
                             statements,
