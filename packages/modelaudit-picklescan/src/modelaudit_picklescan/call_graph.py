@@ -76,10 +76,12 @@ class _CallGraphAnalysisLimitError(RuntimeError):
         *,
         partial_findings: tuple[CallGraphFinding, ...] = (),
         partial_startup_hook_write_findings: tuple[StartupHookWriteFinding, ...] = (),
+        partial_path: tuple[str, ...] | None = None,
     ) -> None:
         super().__init__(message)
         self.partial_findings = partial_findings
         self.partial_startup_hook_write_findings = partial_startup_hook_write_findings
+        self.partial_path = partial_path
 
 
 def _register_source_sensitive_cache(function: _CachedFunctionT) -> _CachedFunctionT:
@@ -357,7 +359,7 @@ def find_dangerous_call_graphs(
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
-            sink_path = None
+            sink_path = error.partial_path
         if sink_path is None:
             for positional_arg_count in positional_arg_counts.get((module, name), ()):
                 try:
@@ -371,7 +373,7 @@ def find_dangerous_call_graphs(
                 except _CallGraphAnalysisLimitError as error:
                     if analysis_limit_error is None:
                         analysis_limit_error = error
-                    continue
+                    sink_path = error.partial_path
                 if sink_path is not None:
                     break
         if sink_path is None:
@@ -440,7 +442,7 @@ def find_startup_hook_write_call_graphs(
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
-            has_sink_path = False
+            has_sink_path = error.partial_path is not None
         if has_sink_path:
             continue
         try:
@@ -448,7 +450,7 @@ def find_startup_hook_write_call_graphs(
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
-            open_path = None
+            open_path = error.partial_path
         if open_path is not None:
             openers.append(
                 _ImportCallPath(
@@ -463,7 +465,7 @@ def find_startup_hook_write_call_graphs(
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
-            write_path = None
+            write_path = error.partial_path
         if write_path is not None:
             writers.append(
                 _ImportCallPath(
@@ -579,15 +581,24 @@ def _first_matching_path(
     entrypoints: Iterable[str],
     path_for: Callable[[str], tuple[str, ...] | None],
 ) -> tuple[str, ...] | None:
+    analysis_limit_error: _CallGraphAnalysisLimitError | None = None
     for entrypoint in entrypoints:
         try:
             path = path_for(entrypoint)
-        except _CallGraphAnalysisLimitError:
-            raise
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            continue
         except Exception:
             continue
         if path is not None:
+            if analysis_limit_error is not None:
+                raise _CallGraphAnalysisLimitError(
+                    str(analysis_limit_error), partial_path=path
+                ) from analysis_limit_error
             return path
+    if analysis_limit_error is not None:
+        raise analysis_limit_error
     return None
 
 
@@ -1773,10 +1784,34 @@ def _conditionally_rebound_assignment_nodes(
         else:
             continue
 
-        for branch_body in branch_bodies:
+        branch_statement_bodies = tuple(tuple(branch_body) for branch_body in branch_bodies)
+        for branch_body in branch_statement_bodies:
             for statement in _definition_scope_statements(branch_body):
                 for target_name in _assignment_alias_target_names(statement):
                     ambiguous_assignment_nodes.setdefault(target_name, set()).add(id(statement))
+
+        terminal_assignments: list[dict[str, ast.Assign | ast.AnnAssign]] = []
+        for branch_body in branch_statement_bodies:
+            if not branch_body or not isinstance(branch_body[-1], ast.Assign | ast.AnnAssign):
+                terminal_assignments.append({})
+                continue
+            terminal_statement = branch_body[-1]
+            if terminal_statement.value is None:
+                terminal_assignments.append({})
+                continue
+            terminal_assignments.append(
+                dict.fromkeys(_assignment_alias_target_names(terminal_statement), terminal_statement)
+            )
+        if isinstance(node, ast.If) and terminal_assignments:
+            terminal_targets = set.intersection(*(set(assignments) for assignments in terminal_assignments))
+            for target_name in terminal_targets:
+                statements = tuple(assignments[target_name] for assignments in terminal_assignments)
+                values = tuple(statement.value for statement in statements if statement.value is not None)
+                if (
+                    len(values) == len(statements)
+                    and len({ast.dump(value, include_attributes=False) for value in values}) == 1
+                ):
+                    ambiguous_assignment_nodes[target_name].difference_update(id(statement) for statement in statements)
 
     if not propagate_reads:
         return ambiguous_assignment_nodes, propagated_assignment_nodes

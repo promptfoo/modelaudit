@@ -122,6 +122,24 @@ else:
     m = B()
 """
 
+_LOOP_MATCHING_TERMINAL_REBIND_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+m = A()
+for value in values:
+    m = B()
+    break
+else:
+    m = B()
+exposed = m
+"""
+
 _UNCONDITIONAL_OVERWRITE_SOURCE = """\
 class A:
     pass
@@ -199,6 +217,46 @@ if cond:
 exposed = m
 """
 
+_NONEXHAUSTIVE_MATCH_OVERWRITE_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+m = A()
+match value:
+    case 1:
+        m = B()
+    case 2:
+        m = B()
+exposed = m
+"""
+
+_MATCHING_BRANCH_OVERWRITE_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+class Final:
+    pass
+
+
+if cond:
+    m = A()
+    m = Final()
+else:
+    m = B()
+    m = Final()
+exposed = m
+"""
+
 _TRY_FINALLY_REBIND_SOURCE = """\
 class A:
     pass
@@ -236,10 +294,20 @@ def _run_with_timeout(target: object, timeout: float = 10.0) -> None:
         _OSCILLATING_MODULE_SOURCE,
         _TRY_REBIND_SOURCE,
         _LOOP_ELSE_REBIND_SOURCE,
+        _LOOP_MATCHING_TERMINAL_REBIND_SOURCE,
         _READ_BEFORE_UNCONDITIONAL_OVERWRITE_SOURCE,
         _ONE_SIDED_REBIND_SOURCE,
+        _NONEXHAUSTIVE_MATCH_OVERWRITE_SOURCE,
     ),
-    ids=("if-else", "try-except", "loop-else", "read-before-overwrite", "one-sided-rebind"),
+    ids=(
+        "if-else",
+        "try-except",
+        "loop-else",
+        "loop-matching-terminal",
+        "read-before-overwrite",
+        "one-sided-rebind",
+        "match-no-default",
+    ),
 )
 def test_collect_assignment_aliases_fails_closed_on_stable_branch_rebind(source: str) -> None:
     tree = ast.parse(source)
@@ -297,6 +365,23 @@ def test_collect_assignment_aliases_converges_on_deterministic_final_rebind(
 
 def test_collect_assignment_aliases_allows_alias_read_after_deterministic_overwrite() -> None:
     tree = ast.parse(_OVERWRITE_BEFORE_READ_SOURCE)
+    statements = _module_level_statements(tree)
+    local_defs = _collect_local_defs(statements)
+
+    aliases = _collect_assignment_aliases(
+        statements,
+        "testmod",
+        {},
+        local_defs,
+        {"testmod.A", "testmod.B", "testmod.Final"},
+    )
+
+    assert aliases["m"] == "testmod.Final"
+    assert aliases["exposed"] == "testmod.Final"
+
+
+def test_collect_assignment_aliases_allows_matching_terminal_branch_overwrites() -> None:
+    tree = ast.parse(_MATCHING_BRANCH_OVERWRITE_SOURCE)
     statements = _module_level_statements(tree)
     local_defs = _collect_local_defs(statements)
 
@@ -388,6 +473,18 @@ def test_assignment_alias_limit_is_not_hidden_by_path_search() -> None:
 
     with pytest.raises(_CallGraphAnalysisLimitError, match="assignment alias limit"):
         _first_matching_path(("wrapper.entrypoint",), _raise_limit)
+
+
+def test_assignment_alias_limit_retains_later_matching_entrypoint_path() -> None:
+    def _path(entrypoint: str) -> tuple[str, ...] | None:
+        if entrypoint == "constructor.__new__":
+            raise _CallGraphAnalysisLimitError("assignment alias limit")
+        return ("constructor.__init__", "builtins.exec")
+
+    with pytest.raises(_CallGraphAnalysisLimitError, match="assignment alias limit") as exc_info:
+        _first_matching_path(("constructor.__new__", "constructor.__init__"), _path)
+
+    assert exc_info.value.partial_path == ("constructor.__init__", "builtins.exec")
 
 
 def test_assignment_alias_limit_preserves_prior_call_graph_findings(
@@ -512,6 +609,44 @@ def test_assignment_alias_limit_preserves_invoked_finding_after_sink_limit(
             import_reference="invoked.entry",
             sink="builtins.exec",
             call_path=("invoked.entry", "builtins.exec"),
+        ),
+    )
+
+
+def test_assignment_alias_limit_preserves_later_entrypoint_finding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = {"module": "constructor", "name": "Type"}
+
+    def _iter_references(
+        _import_references: object,
+        _callable_references: tuple[dict[str, object], ...],
+        _invoked_references: set[tuple[str, str]],
+    ) -> tuple[dict[str, str], ...]:
+        return (reference,)
+
+    def _entrypoints(_module: str, _name: str, _reference: dict[str, object]) -> tuple[str, ...]:
+        return ("constructor.Type.__new__", "constructor.Type.__init__")
+
+    def _path(entrypoint: str) -> tuple[str, ...] | None:
+        if entrypoint.endswith(".__new__"):
+            raise _CallGraphAnalysisLimitError("assignment alias limit")
+        return ("constructor.Type.__init__", "builtins.exec")
+
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._iter_call_graph_references", _iter_references)
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._call_graph_entrypoints_for_reference", _entrypoints)
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._find_sink_path", _path)
+
+    with pytest.raises(_CallGraphAnalysisLimitError, match="assignment alias limit") as exc_info:
+        find_dangerous_call_graphs(())
+
+    assert exc_info.value.partial_findings == (
+        CallGraphFinding(
+            module="constructor",
+            name="Type",
+            import_reference="constructor.Type",
+            sink="builtins.exec",
+            call_path=("constructor.Type.__init__", "builtins.exec"),
         ),
     )
 
