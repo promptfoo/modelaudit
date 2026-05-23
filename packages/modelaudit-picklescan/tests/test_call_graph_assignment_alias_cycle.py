@@ -222,6 +222,24 @@ exposed = m()
 m = Final()
 """
 
+_TERMINATING_ALIAS_BRANCH_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+if cond:
+    m = A()
+    consumed = m
+    raise ImportError
+else:
+    m = B()
+exposed = m
+"""
+
 _OVERWRITE_BEFORE_READ_SOURCE = """\
 class A:
     pass
@@ -395,6 +413,72 @@ else:
 exposed = m
 """
 
+_OVERWRITTEN_TERMINAL_DEPENDENCY_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+class Final:
+    pass
+
+
+if cond:
+    F = A
+else:
+    F = B
+F = Final
+if cond:
+    m = F()
+else:
+    m = F()
+exposed = m
+"""
+
+_MUTUALLY_DEPENDENT_TERMINAL_ALIAS_SOURCE = """\
+class Final:
+    pass
+
+
+if cond:
+    m = Final()
+    exposed = m
+else:
+    exposed = Final()
+    m = exposed
+"""
+
+_TERMINATING_ALTERNATIVE_SOURCE = """\
+class Final:
+    pass
+
+
+if cond:
+    m = Final()
+else:
+    raise ImportError
+exposed = m
+"""
+
+_SCOPED_TERMINAL_DEPENDENCY_SOURCE = """\
+class Final:
+    pass
+
+
+if cond:
+    F = first_value
+else:
+    F = second_value
+if cond:
+    m = Final([F for F in values])
+else:
+    m = Final(lambda F: F)
+exposed = m
+"""
+
 _MATCHING_TRY_EXCEPT_OVERWRITE_SOURCE = """\
 class A:
     pass
@@ -493,6 +577,7 @@ def _run_with_timeout(target: object, timeout: float = 10.0) -> None:
         _LOOP_EARLY_BREAK_BEFORE_TERMINAL_REBIND_SOURCE,
         _READ_BEFORE_UNCONDITIONAL_OVERWRITE_SOURCE,
         _CALL_READ_BEFORE_UNCONDITIONAL_OVERWRITE_SOURCE,
+        _TERMINATING_ALIAS_BRANCH_SOURCE,
         _ONE_SIDED_REBIND_SOURCE,
         _NONEXHAUSTIVE_MATCH_OVERWRITE_SOURCE,
         _CONDITIONALLY_REBOUND_TERMINAL_DEPENDENCY_SOURCE,
@@ -505,6 +590,7 @@ def _run_with_timeout(target: object, timeout: float = 10.0) -> None:
         "loop-early-break",
         "read-before-overwrite",
         "call-read-before-overwrite",
+        "terminating-alias-branch",
         "one-sided-rebind",
         "match-no-default",
         "conditional-terminal-dependency",
@@ -589,6 +675,10 @@ def test_collect_assignment_aliases_allows_alias_read_after_deterministic_overwr
         _MATCHING_BRANCH_EPILOGUE_SOURCE,
         _RESOLVED_MATCHING_BRANCH_OVERWRITE_SOURCE,
         _SAME_LINE_RESOLVED_MATCHING_BRANCH_OVERWRITE_SOURCE,
+        _OVERWRITTEN_TERMINAL_DEPENDENCY_SOURCE,
+        _MUTUALLY_DEPENDENT_TERMINAL_ALIAS_SOURCE,
+        _TERMINATING_ALTERNATIVE_SOURCE,
+        _SCOPED_TERMINAL_DEPENDENCY_SOURCE,
         _MATCHING_TRY_EXCEPT_OVERWRITE_SOURCE,
         _EXHAUSTIVE_MATCH_OVERWRITE_SOURCE,
         _LOOP_MATCHING_TERMINAL_REBIND_SOURCE,
@@ -599,6 +689,10 @@ def test_collect_assignment_aliases_allows_alias_read_after_deterministic_overwr
         "if-expression-epilogue",
         "if-semantic-resolution",
         "if-same-line-semantic-resolution",
+        "overwritten-terminal-dependency",
+        "mutually-dependent-terminal-alias",
+        "terminating-alternative",
+        "scoped-terminal-dependency",
         "try-except",
         "exhaustive-match",
         "loop-terminal-break",

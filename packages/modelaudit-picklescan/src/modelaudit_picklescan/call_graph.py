@@ -1769,6 +1769,15 @@ def _is_exhaustive_match(node: ast.Match) -> bool:
 _TerminalAssignmentGroup = tuple[str, tuple[ast.Assign | ast.AnnAssign, ...]]
 
 
+def _can_complete_normally(branch_body: Iterable[ast.stmt]) -> bool:
+    statements = tuple(branch_body)
+    return not statements or not isinstance(statements[-1], ast.Raise | ast.Return)
+
+
+def _contains_assignment_alias(branch_body: Iterable[ast.stmt]) -> bool:
+    return any(_assignment_alias_target_names(statement) for statement in _definition_scope_statements(branch_body))
+
+
 def _terminal_assignment_groups(
     branch_bodies: tuple[tuple[ast.stmt, ...], ...],
 ) -> tuple[_TerminalAssignmentGroup, ...]:
@@ -1800,16 +1809,38 @@ def _conditionally_rebound_assignment_nodes(
     ambiguous_assignment_nodes: dict[str, set[int]] = {}
     terminal_assignment_group_sets: list[tuple[_TerminalAssignmentGroup, ...]] = []
     for node in node_list:
+        alternate_bodies: tuple[Iterable[ast.stmt], ...]
         branch_bodies: tuple[Iterable[ast.stmt], ...]
+        terminating_bodies: tuple[Iterable[ast.stmt], ...]
         deterministic_terminal_bodies: tuple[Iterable[ast.stmt], ...] | None = None
         if isinstance(node, ast.If):
-            branch_bodies = (node.body, node.orelse)
+            alternate_bodies = (node.body, node.orelse)
+            terminating_bodies = tuple(
+                branch_body for branch_body in alternate_bodies if not _can_complete_normally(branch_body)
+            )
+            branch_bodies = tuple(
+                branch_body for branch_body in alternate_bodies if _can_complete_normally(branch_body)
+            )
+            if any(_contains_assignment_alias(branch_body) for branch_body in terminating_bodies):
+                branch_bodies = alternate_bodies
+            if len(branch_bodies) < 2:
+                continue
             deterministic_terminal_bodies = branch_bodies
         elif isinstance(node, ast.Try) and node.handlers:
-            branch_bodies = (
+            alternate_bodies = (
                 (*node.body, *node.orelse),
                 *(handler.body for handler in node.handlers),
             )
+            terminating_bodies = tuple(
+                branch_body for branch_body in alternate_bodies if not _can_complete_normally(branch_body)
+            )
+            branch_bodies = tuple(
+                branch_body for branch_body in alternate_bodies if _can_complete_normally(branch_body)
+            )
+            if any(_contains_assignment_alias(branch_body) for branch_body in terminating_bodies):
+                branch_bodies = alternate_bodies
+            if len(branch_bodies) < 2:
+                continue
             deterministic_terminal_bodies = branch_bodies
         elif isinstance(node, ast.For | ast.AsyncFor | ast.While) and _contains_current_loop_break(node.body):
             branch_bodies = (node.body, node.orelse)
@@ -1838,6 +1869,7 @@ def _conditionally_rebound_assignment_nodes(
 
 
 def _resolved_terminal_assignment_nodes(
+    nodes: tuple[ast.AST, ...],
     terminal_assignment_group_sets: tuple[tuple[_TerminalAssignmentGroup, ...], ...],
     ambiguous_assignment_nodes: dict[str, set[int]],
     module_name: str,
@@ -1848,55 +1880,72 @@ def _resolved_terminal_assignment_nodes(
     class_name: str | None,
 ) -> dict[str, set[int]]:
     deterministic_node_ids: dict[str, set[int]] = {}
-    ambiguous_target_names = set(ambiguous_assignment_nodes)
-    for terminal_assignment_groups in terminal_assignment_group_sets:
-        unresolved_groups = list(terminal_assignment_groups)
-        deterministic_targets: set[str] = set()
-        deterministic_statements: dict[str, tuple[ast.Assign | ast.AnnAssign, ...]] = {}
-        while unresolved_groups:
-            deferred_groups: list[_TerminalAssignmentGroup] = []
-            resolved_group = False
-            for target_name, statements in unresolved_groups:
-                conditional_dependencies: set[str] = set()
-                for statement in statements:
-                    conditional_dependencies.update(_assignment_value_read_names(statement) & ambiguous_target_names)
-                if conditional_dependencies - deterministic_targets:
-                    deferred_groups.append((target_name, statements))
-                    continue
-                if any(
-                    any(
-                        (dependency_statement.lineno, dependency_statement.col_offset)
-                        >= (statement.lineno, statement.col_offset)
-                        for dependency_statement, statement in zip(
-                            deterministic_statements[dependency],
-                            statements,
-                            strict=True,
-                        )
-                    )
-                    for dependency in conditional_dependencies
+    while True:
+        effective_ambiguous_node_ids = {
+            target_name: node_ids - deterministic_node_ids.get(target_name, set())
+            for target_name, node_ids in ambiguous_assignment_nodes.items()
+            if node_ids - deterministic_node_ids.get(target_name, set())
+        }
+        active_ambiguous_targets: set[str] = set()
+        ambiguous_before_statement: dict[int, set[str]] = {}
+        for node in nodes:
+            target_names = _assignment_alias_target_names(node)
+            if not target_names:
+                continue
+            ambiguous_before_statement[id(node)] = set(active_ambiguous_targets)
+            for target_name in target_names:
+                if id(node) in effective_ambiguous_node_ids.get(target_name, set()):
+                    active_ambiguous_targets.add(target_name)
+                else:
+                    active_ambiguous_targets.discard(target_name)
+
+        changed = False
+        for terminal_assignment_groups in terminal_assignment_group_sets:
+            branch_count = len(terminal_assignment_groups[0][1])
+            resolved_by_branch: list[dict[str, str]] = []
+            for branch_index in range(branch_count):
+                branch_statements = {
+                    id(statements[branch_index]): statements[branch_index]
+                    for _, statements in terminal_assignment_groups
+                }
+                branch_aliases = dict(aliases)
+                branch_local_targets: set[str] = set()
+                branch_resolved: dict[str, str] = {}
+                for statement in sorted(
+                    branch_statements.values(),
+                    key=lambda statement: (statement.lineno, statement.col_offset),
                 ):
-                    continue
-                resolved_values = tuple(
-                    _assignment_alias_value(
+                    blocked_dependencies = (
+                        _assignment_value_read_names(statement)
+                        & ambiguous_before_statement.get(id(statement), set()) - branch_local_targets
+                    )
+                    if blocked_dependencies:
+                        continue
+                    resolved = _assignment_alias_value(
                         statement,
                         module_name,
-                        aliases,
+                        branch_aliases,
                         local_defs,
                         local_class_targets,
                         class_name=class_name,
                     )
-                    for statement in statements
-                )
+                    if resolved is None:
+                        continue
+                    for target_name in _assignment_alias_target_names(statement):
+                        branch_aliases[target_name] = resolved
+                        branch_local_targets.add(target_name)
+                        branch_resolved[target_name] = resolved
+                resolved_by_branch.append(branch_resolved)
+
+            for target_name, statements in terminal_assignment_groups:
+                resolved_values = tuple(resolved.get(target_name) for resolved in resolved_by_branch)
                 if None not in resolved_values and len(set(resolved_values)) == 1:
-                    deterministic_node_ids.setdefault(target_name, set()).update(
-                        id(statement) for statement in statements
-                    )
-                    deterministic_targets.add(target_name)
-                    deterministic_statements[target_name] = statements
-                    resolved_group = True
-            if not resolved_group:
-                break
-            unresolved_groups = deferred_groups
+                    node_ids = deterministic_node_ids.setdefault(target_name, set())
+                    prior_count = len(node_ids)
+                    node_ids.update(id(statement) for statement in statements)
+                    changed = changed or len(node_ids) != prior_count
+        if not changed:
+            break
     return deterministic_node_ids
 
 
@@ -1984,6 +2033,7 @@ def _collect_assignment_aliases(
         next_state = tuple(sorted(assignment_aliases.items()))
         if next_state == state:
             deterministic_node_ids = _resolved_terminal_assignment_nodes(
+                node_list,
                 terminal_assignment_group_sets,
                 conditionally_rebound_node_ids,
                 module_name,
@@ -2100,7 +2150,55 @@ def _assignment_alias_read_names(node: ast.AST) -> set[str]:
 def _assignment_value_read_names(node: ast.Assign | ast.AnnAssign) -> set[str]:
     if node.value is None:
         return set()
-    return {child.id for child in ast.walk(node.value) if isinstance(child, ast.Name)}
+
+    names: set[str] = set()
+
+    def binding_names(target: ast.AST) -> set[str]:
+        return {child.id for child in ast.walk(target) if isinstance(child, ast.Name)}
+
+    def visit(value: ast.AST, bound_names: set[str]) -> None:
+        if isinstance(value, ast.Name):
+            if isinstance(value.ctx, ast.Load) and value.id not in bound_names:
+                names.add(value.id)
+            return
+        if isinstance(value, ast.Lambda):
+            for default in (
+                *value.args.defaults,
+                *(default for default in value.args.kw_defaults if default is not None),
+            ):
+                visit(default, bound_names)
+            lambda_bound_names = {
+                argument.arg
+                for argument in (
+                    *value.args.posonlyargs,
+                    *value.args.args,
+                    *value.args.kwonlyargs,
+                )
+            }
+            if value.args.vararg is not None:
+                lambda_bound_names.add(value.args.vararg.arg)
+            if value.args.kwarg is not None:
+                lambda_bound_names.add(value.args.kwarg.arg)
+            visit(value.body, bound_names | lambda_bound_names)
+            return
+        if isinstance(value, ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp):
+            comprehension_bound_names = set(bound_names)
+            for generator in value.generators:
+                visit(generator.iter, comprehension_bound_names)
+                comprehension_bound_names.update(binding_names(generator.target))
+                for condition in generator.ifs:
+                    visit(condition, comprehension_bound_names)
+            if isinstance(value, ast.DictComp):
+                visit(value.key, comprehension_bound_names)
+                visit(value.value, comprehension_bound_names)
+            else:
+                visit(value.elt, comprehension_bound_names)
+            return
+        for child in ast.iter_child_nodes(value):
+            visit(child, bound_names)
+
+    visit(node.value, set())
+    return names
 
 
 def _is_local_class_member_alias(resolved: str, local_class_targets: set[str]) -> bool:
