@@ -1752,10 +1752,11 @@ def _conditionally_rebound_assignment_nodes(
     nodes: Iterable[ast.AST],
     *,
     propagate_reads: bool,
-) -> dict[str, set[int]]:
+) -> tuple[dict[str, set[int]], dict[str, set[int]]]:
     """Return alternate-path assignment nodes grouped by ambiguously rebound name."""
     node_list = tuple(nodes)
     ambiguous_assignment_nodes: dict[str, set[int]] = {}
+    propagated_assignment_nodes: dict[str, set[int]] = {}
     for node in node_list:
         branch_bodies: tuple[Iterable[ast.stmt], ...]
         if isinstance(node, ast.If):
@@ -1778,7 +1779,7 @@ def _conditionally_rebound_assignment_nodes(
                     ambiguous_assignment_nodes.setdefault(target_name, set()).add(id(statement))
 
     if not propagate_reads:
-        return ambiguous_assignment_nodes
+        return ambiguous_assignment_nodes, propagated_assignment_nodes
 
     active_ambiguous_targets: set[str] = set()
     for node in node_list:
@@ -1791,10 +1792,11 @@ def _conditionally_rebound_assignment_nodes(
             if id(node) in conditional_node_ids or reads_ambiguous_target:
                 if reads_ambiguous_target:
                     ambiguous_assignment_nodes.setdefault(target_name, set()).add(id(node))
+                    propagated_assignment_nodes.setdefault(target_name, set()).add(id(node))
                 active_ambiguous_targets.add(target_name)
             else:
                 active_ambiguous_targets.discard(target_name)
-    return ambiguous_assignment_nodes
+    return ambiguous_assignment_nodes, propagated_assignment_nodes
 
 
 def _collect_assignment_aliases(
@@ -1809,10 +1811,9 @@ def _collect_assignment_aliases(
     node_list = tuple(nodes)
     assignment_aliases: dict[str, str] = {}
     source_path = _resolve_module_source(module_name)
-    enforce_transient_rebinding = source_path is None or not _is_library_source_path(str(source_path))
-    conditionally_rebound_node_ids = _conditionally_rebound_assignment_nodes(
+    conditionally_rebound_node_ids, propagated_rebound_node_ids = _conditionally_rebound_assignment_nodes(
         node_list,
-        propagate_reads=enforce_transient_rebinding,
+        propagate_reads=source_path is None or not _is_stdlib_source_path(str(source_path)),
     )
     seen_states: set[tuple[tuple[str, str], ...]] = {()}
     passes = 0
@@ -1851,11 +1852,15 @@ def _collect_assignment_aliases(
                     break
         next_state = tuple(sorted(assignment_aliases.items()))
         if next_state == state:
-            final_node_ids = last_resolved_node_ids if enforce_transient_rebinding else last_changed_node_ids
-            if any(
+            changed_conditionally = any(
                 node_id in conditionally_rebound_node_ids.get(target_name, set())
-                for target_name, node_id in final_node_ids.items()
-            ):
+                for target_name, node_id in last_changed_node_ids.items()
+            )
+            resolved_from_conditional_read = any(
+                node_id in propagated_rebound_node_ids.get(target_name, set())
+                for target_name, node_id in last_resolved_node_ids.items()
+            )
+            if changed_conditionally or resolved_from_conditional_read:
                 raise _CallGraphAnalysisLimitError(
                     "assignment alias analysis encountered ambiguous conditional rebinding"
                 )
@@ -1932,8 +1937,13 @@ def _assignment_alias_target_names(node: ast.AST) -> set[str]:
 
 
 def _assignment_alias_read_names(node: ast.AST) -> set[str]:
-    if isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None:
-        return {child.id for child in ast.walk(node.value) if isinstance(child, ast.Name)}
+    if not isinstance(node, ast.Assign | ast.AnnAssign) or node.value is None:
+        return set()
+    value = node.value
+    while isinstance(value, ast.Attribute):
+        value = value.value
+    if isinstance(value, ast.Name):
+        return {value.id}
     return set()
 
 
