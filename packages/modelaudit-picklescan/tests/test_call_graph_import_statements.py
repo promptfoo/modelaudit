@@ -2102,6 +2102,55 @@ def test_scan_bytes_analyzes_shadowed_torch_extension_callable_invocation(
     assert _has_critical_call_graph_finding(report, "torch", "device", "os.system")
 
 
+def test_scan_bytes_fails_closed_when_shadowed_torch_extension_analysis_hits_alias_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    (module_dir / "torch.py").write_text(
+        """\
+import os
+
+
+class Dangerous:
+    def __call__(self, command):
+        os.system(command)
+
+
+class Safe:
+    def __call__(self, command):
+        return command
+
+
+if cond:
+    device = Dangerous()
+else:
+    device = Safe()
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+
+    try:
+        report = scan_bytes(
+            _global_call_payload("torch", "device", _unicode_operand("echo shadowed-torch-device")),
+            source="shadowed-torch-device-alias-limit.pkl",
+        )
+    finally:
+        _clear_call_graph_caches()
+
+    assert report.status == ScanStatus.INCONCLUSIVE
+    assert report.metadata["analysis_incomplete"] is True
+    assert not any(error.category == "rust_engine_error" for error in report.errors)
+    assert any(
+        error.category == "call_graph_analysis_error" and error.exception_type == "_CallGraphAnalysisLimitError"
+        for error in report.errors
+    )
+
+
 def test_call_graph_analyzes_shadowed_torch_storage_persistent_id_reference(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

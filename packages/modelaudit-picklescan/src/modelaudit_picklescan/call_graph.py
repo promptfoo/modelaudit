@@ -775,7 +775,10 @@ def _is_skippable_torch_extension_global_reference(module: str, name: str) -> bo
     source_path = _resolve_module_source(module)
     if source_path is not None and not _is_library_source_path(str(source_path)):
         return False
-    return not _has_static_torch_extension_global_target(module, name)
+    try:
+        return not _has_static_torch_extension_global_target(module, name)
+    except _CallGraphAnalysisLimitError:
+        return False
 
 
 @_register_source_sensitive_cache
