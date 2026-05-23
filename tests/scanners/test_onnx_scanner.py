@@ -17,7 +17,7 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.detectors.jit_script import JITScriptDetector
 from modelaudit.detectors.network_comm import NetworkCommDetector
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.onnx_scanner import OnnxScanner
+from modelaudit.scanners.onnx_scanner import OnnxScanner, _confirmed_python_operator_findings
 
 
 def create_onnx_model(
@@ -393,6 +393,144 @@ def test_onnx_scanner_uppercase_snake_python_near_match_not_flagged(tmp_path: Pa
 
     assert result.success is True
     assert not [c for c in result.checks if c.name == "Python Operator Detection" and c.status == CheckStatus.FAILED]
+
+
+def _save_model_with_int8_weight(tmp_path: Path, weight_bytes: bytes, *, extra_node: Any = None) -> Path:
+    """Build a clean ai.onnx-only model whose int8 initializer holds ``weight_bytes``."""
+    weight = helper.make_tensor("W", TensorProto.INT8, [len(weight_bytes)], weight_bytes, raw=True)
+    scale = helper.make_tensor("scale", TensorProto.FLOAT, [], [1.0])
+    zero_point = helper.make_tensor("zp", TensorProto.INT8, [], [0])
+    nodes = [helper.make_node("DequantizeLinear", ["W", "scale", "zp"], ["Y"], name="dq")]
+    if extra_node is not None:
+        nodes.append(extra_node)
+    graph = helper.make_graph(
+        nodes,
+        "quant_graph",
+        [],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [len(weight_bytes)])],
+        initializer=[weight, scale, zero_point],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    path = tmp_path / "model.onnx"
+    onnx.save(model, str(path))
+    return path
+
+
+def _python_operator_issues(result: Any) -> list[Any]:
+    return [
+        issue
+        for issue in result.issues
+        if issue.details.get("type") == "python_operator" or "Python operator" in issue.message
+    ]
+
+
+# Bytes "PyOp" (0x50 0x79 0x4F 0x70) bracketed by non-alphanumeric bytes: a
+# realistic byte run inside quantized int8 weight data that the raw-byte JIT
+# regex matches case-insensitively. See GitHub issue #1254.
+_PYOP_WEIGHT_BYTES = bytes([0x00, 0x50, 0x79, 0x4F, 0x70, 0x00, 0x01, 0x02])
+
+
+def test_onnx_scanner_skips_graph_confirmation_without_python_operator_candidate() -> None:
+    accessed: list[bool] = []
+
+    class UnreadableModel:
+        @property
+        def graph(self) -> Any:
+            accessed.append(True)
+            raise RuntimeError("graph should not be inspected")
+
+    findings = [{"type": "embedded_script", "content": "harmless"}]
+
+    assert _confirmed_python_operator_findings(findings, UnreadableModel()) == findings
+    assert accessed == []
+
+
+def test_onnx_scanner_pyop_bytes_in_weight_data_not_flagged(tmp_path: Path) -> None:
+    """A clean ai.onnx-only model is not flagged when weight bytes spell 'PyOp'."""
+    model_path = _save_model_with_int8_weight(tmp_path, _PYOP_WEIGHT_BYTES)
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert _python_operator_issues(result) == []
+
+
+def test_onnx_scanner_real_pyop_node_still_flagged_despite_weight_bytes(tmp_path: Path) -> None:
+    """A genuine PyOp node stays CRITICAL even when weight bytes also spell 'PyOp'."""
+    pyop_node = helper.make_node("PyOp", ["Y"], ["Z"], name="evil", domain="com.attacker")
+    model_path = _save_model_with_int8_weight(tmp_path, _PYOP_WEIGHT_BYTES, extra_node=pyop_node)
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    python_operator_issues = _python_operator_issues(result)
+    assert python_operator_issues
+    assert all(issue.severity == IssueSeverity.CRITICAL for issue in python_operator_issues)
+
+
+def test_onnx_scanner_subgraph_pyop_still_flagged(tmp_path: Path) -> None:
+    """A PyOp hidden inside an If-branch subgraph is still detected."""
+    then_branch = helper.make_graph(
+        [helper.make_node("PyOp", ["X"], ["Z"], domain="com.attacker")],
+        "then",
+        [],
+        [helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1])],
+    )
+    else_branch = helper.make_graph(
+        [helper.make_node("Identity", ["X"], ["Z"])],
+        "else",
+        [],
+        [helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1])],
+    )
+    if_node = helper.make_node("If", ["cond"], ["Y"], then_branch=then_branch, else_branch=else_branch)
+    graph = helper.make_graph(
+        [if_node],
+        "graph",
+        [
+            helper.make_tensor_value_info("cond", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("X", TensorProto.FLOAT, [1]),
+        ],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("com.attacker", 1)],
+    )
+    model.ir_version = 8
+    model_path = tmp_path / "subgraph.onnx"
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    python_operator_issues = _python_operator_issues(result)
+    assert python_operator_issues
+    assert all(issue.severity == IssueSeverity.CRITICAL for issue in python_operator_issues)
+
+
+@pytest.mark.parametrize("training_graph_field", ["initialization", "algorithm"])
+def test_onnx_scanner_training_graph_pyop_still_flagged(tmp_path: Path, training_graph_field: str) -> None:
+    """A PyOp in either training graph must not be discarded as weight-data noise."""
+    model_path = _save_model_with_int8_weight(tmp_path, _PYOP_WEIGHT_BYTES)
+    model = onnx.load(str(model_path))
+    training_info = onnx.TrainingInfoProto()
+    getattr(training_info, training_graph_field).CopyFrom(
+        helper.make_graph(
+            [helper.make_node("PyOp", ["X"], ["Y"], domain="com.attacker")],
+            f"training_{training_graph_field}",
+            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [1])],
+            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+        )
+    )
+    model.training_info.append(training_info)
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    python_operator_issues = _python_operator_issues(result)
+    assert python_operator_issues
+    assert all(issue.severity == IssueSeverity.CRITICAL for issue in python_operator_issues)
 
 
 class TestCVE202551480SavePathTraversal:
