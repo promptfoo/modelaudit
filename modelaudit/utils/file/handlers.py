@@ -141,6 +141,7 @@ class ShardedModelDetector:
                 shard_info: dict[str, Any] = {"pattern": pattern, "current_file": file_path, "shards": []}
                 expected_totals: set[int] = set()
                 present_indices: set[int] = set()
+                total_size = 0
 
                 # Find all related shards
                 for file in dir_path.glob("*"):
@@ -148,13 +149,21 @@ class ShardedModelDetector:
                     if file_match:
                         if allowed_path_set is not None and str(file.resolve()) not in allowed_path_set:
                             continue
+                        try:
+                            shard_size = os.path.getsize(file)
+                        except OSError:
+                            continue
                         shard_info["shards"].append(str(file))
+                        total_size += shard_size
                         if file_match.lastindex:
                             with suppress(IndexError, ValueError):
                                 present_indices.add(int(file_match.group(1)))
                         if (file_match.lastindex or 0) >= 2:
                             with suppress(IndexError, ValueError):
                                 expected_totals.add(int(file_match.group(2)))
+
+                if not shard_info["shards"]:
+                    return None
 
                 shard_info["shards"].sort()
                 shard_info["total_shards"] = len(shard_info["shards"])
@@ -173,8 +182,6 @@ class ShardedModelDetector:
                             shard_info["missing_shard_indices"] = missing_indices
                             shard_info["missing_shard_indices_truncated"] = missing_indices_truncated
 
-                # Calculate total size
-                total_size = sum(os.path.getsize(s) for s in shard_info["shards"])
                 shard_info["total_size"] = total_size
 
                 return shard_info

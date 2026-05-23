@@ -380,6 +380,123 @@ def test_directory_scan_reports_incomplete_hf_snapshot_after_shared_blob_dedupe(
     assert coverage_checks[0].details["missing_shard_count"] == 1
 
 
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_keeps_distinct_hf_shard_filename_patterns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--model"
+    blobs_dir = cache_dir / "blobs"
+    blobs_dir.mkdir(parents=True)
+    blob_paths: list[Path] = []
+    for shard_index in range(1, 3):
+        blob_path = blobs_dir / f"blob-{shard_index}"
+        blob_path.write_bytes(f"shared-hf-shard-{shard_index}".encode())
+        blob_paths.append(blob_path.resolve())
+        for revision, filename in (
+            ("abc123", f"model-{shard_index:05d}-of-00002.safetensors"),
+            ("def456", f"pytorch_model-{shard_index:05d}-of-00002.bin"),
+        ):
+            snapshot = cache_dir / "snapshots" / revision
+            snapshot.mkdir(parents=True, exist_ok=True)
+            (snapshot / filename).symlink_to(Path("../../blobs") / blob_path.name)
+
+    calls: list[str] = []
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        calls.append(path)
+        return _mock_sharded_scan_result(sum(blob_path.stat().st_size for blob_path in blob_paths))
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(cache_dir / "snapshots"), cache_scan_results=False)
+
+    assert len(calls) == 2
+    assert {Path(call).suffix for call in calls} == {".bin", ".safetensors"}
+    assert result.files_scanned == 4
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_deduplicates_hf_shard_aliases_against_raw_blobs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--model"
+    snapshot = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs_dir.mkdir()
+    blob_paths: list[Path] = []
+    for shard_index in range(1, 3):
+        blob_path = blobs_dir / f"blob-{shard_index}.safetensors"
+        blob_path.write_bytes(f"hf-shard-{shard_index}".encode())
+        blob_paths.append(blob_path.resolve())
+        (snapshot / f"model-{shard_index:05d}-of-00002.safetensors").symlink_to(Path("../../blobs") / blob_path.name)
+
+    calls: list[str] = []
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        calls.append(path)
+        return _mock_sharded_scan_result(sum(blob_path.stat().st_size for blob_path in blob_paths))
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(cache_dir), cache_scan_results=False)
+
+    assert len(calls) == 1
+    assert Path(calls[0]).parent == snapshot
+    assert result.files_scanned == 2
+
+
+@pytest.mark.usefixtures("requires_symlinks")
+def test_directory_scan_handles_broken_hf_shard_alias_per_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hf_home = tmp_path / "hf-home"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    cache_dir = hf_home / "hub" / "models--org--model"
+    snapshot = cache_dir / "snapshots" / "abc123"
+    blobs_dir = cache_dir / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs_dir.mkdir()
+    blob_path = blobs_dir / "blob-1"
+    blob_path.write_bytes(b"hf-shard-1")
+    (snapshot / "model-00001-of-00002.safetensors").symlink_to(Path("../../blobs") / blob_path.name)
+    missing_blob = blobs_dir / "missing-blob"
+    (snapshot / "model-00002-of-00002.safetensors").symlink_to(Path("../../blobs") / missing_blob.name)
+
+    calls: list[str] = []
+
+    def fake_scan_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+        calls.append(path)
+        if Path(path) == missing_blob:
+            result = ScanResult(scanner_name="error")
+            result.add_check(
+                name="File Size Check",
+                passed=False,
+                message="Error checking file size: missing blob",
+                severity=IssueSeverity.INFO,
+            )
+            result.finish(success=False)
+            return result
+        return _mock_sharded_scan_result(blob_path.stat().st_size, missing_shards=1)
+
+    monkeypatch.setattr(core_module, "scan_file", fake_scan_file)
+
+    result = core_module.scan_model_directory_or_file(str(snapshot), cache_scan_results=False)
+
+    coverage_checks = [check for check in result.checks if check.name == "Sharded Model Coverage Check"]
+    assert len(calls) == 2
+    assert str(missing_blob) in calls
+    assert len(coverage_checks) == 1
+    assert any(check.name == "File Size Check" for check in result.checks)
+
+
 def test_scan_file_passes_shard_allowlist_to_advanced_handler(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

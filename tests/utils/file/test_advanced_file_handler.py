@@ -335,6 +335,26 @@ class TestAdvancedFileHandler:
         assert coverage_checks[0].details["missing_shard_indices"] == [2]
         assert coverage_checks[0].details["missing_shard_indices_truncated"] is False
 
+    def test_sharded_model_broken_shard_marks_scan_inconclusive(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Unreadable shard links should be reported as missing instead of aborting expansion."""
+        shard_one = tmp_path / "model-00001-of-00002.safetensors"
+        shard_two = tmp_path / "model-00002-of-00002.safetensors"
+        shard_one.write_bytes(b"safe")
+        shard_two.symlink_to(tmp_path / "missing-shard")
+
+        handler = AdvancedFileHandler(str(shard_one), CompletingShardScanner())
+        result = handler.scan()
+
+        coverage_checks = [check for check in result.checks if check.name == "Sharded Model Coverage Check"]
+        assert result.success is False
+        assert result.bytes_scanned == shard_one.stat().st_size
+        assert len(coverage_checks) == 1
+        assert coverage_checks[0].details["missing_shard_count"] == 1
+
     def test_sharded_model_honors_allowed_shard_paths(self, tmp_path: Path) -> None:
         """Restricted shard scans must not expand beyond the validated allowlist."""
         shard_one = tmp_path / "model-00001-of-00002.safetensors"
