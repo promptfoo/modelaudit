@@ -1701,6 +1701,22 @@ def _local_class_node_from_target(
     return local_class_nodes.get(class_name)
 
 
+def _contains_current_loop_break(nodes: Iterable[ast.stmt]) -> bool:
+    """Return whether this loop body can break without entering a nested scope or loop."""
+
+    def contains_break(node: ast.AST) -> bool:
+        if isinstance(node, ast.Break):
+            return True
+        if isinstance(
+            node,
+            ast.For | ast.AsyncFor | ast.While | ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef,
+        ):
+            return False
+        return any(contains_break(child) for child in ast.iter_child_nodes(node))
+
+    return any(contains_break(node) for node in nodes)
+
+
 def _conditionally_rebound_assignment_nodes(nodes: Iterable[ast.AST]) -> dict[str, set[int]]:
     """Return alternate-path assignment nodes grouped by ambiguously rebound name."""
     ambiguous_assignment_nodes: dict[str, set[int]] = {}
@@ -1713,7 +1729,7 @@ def _conditionally_rebound_assignment_nodes(nodes: Iterable[ast.AST]) -> dict[st
                 (*node.body, *node.orelse),
                 *(handler.body for handler in node.handlers),
             )
-        elif isinstance(node, ast.For | ast.AsyncFor | ast.While):
+        elif isinstance(node, ast.For | ast.AsyncFor | ast.While) and _contains_current_loop_break(node.body):
             branch_bodies = (node.body, node.orelse)
         elif isinstance(node, ast.Match):
             branch_bodies = tuple(case.body for case in node.cases)

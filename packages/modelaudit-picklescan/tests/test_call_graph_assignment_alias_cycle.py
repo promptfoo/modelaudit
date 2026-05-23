@@ -107,6 +107,21 @@ else:
     m = B()
 """
 
+_LOOP_ELSE_COMPLETION_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+for value in values:
+    m = A()
+else:
+    m = B()
+"""
+
 _UNCONDITIONAL_OVERWRITE_SOURCE = """\
 class A:
     pass
@@ -191,10 +206,11 @@ def test_collect_assignment_aliases_fails_closed_on_stable_branch_rebind(source:
     ("source", "expected_target"),
     (
         (_SEQUENTIAL_REBIND_SOURCE, "testmod.B"),
+        (_LOOP_ELSE_COMPLETION_SOURCE, "testmod.B"),
         (_UNCONDITIONAL_OVERWRITE_SOURCE, "testmod.Final"),
         (_TRY_FINALLY_REBIND_SOURCE, "testmod.Final"),
     ),
-    ids=("sequential", "unconditional-overwrite", "try-finally-overwrite"),
+    ids=("sequential", "loop-else-completion", "unconditional-overwrite", "try-finally-overwrite"),
 )
 def test_collect_assignment_aliases_converges_on_deterministic_final_rebind(
     source: str,
