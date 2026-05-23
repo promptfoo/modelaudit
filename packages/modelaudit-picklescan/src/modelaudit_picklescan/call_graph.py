@@ -1766,7 +1766,8 @@ def _is_exhaustive_match(node: ast.Match) -> bool:
     )
 
 
-_TerminalAssignmentGroup = tuple[str, tuple[ast.Assign | ast.AnnAssign, ...]]
+_TerminalAssignment = ast.Assign | ast.AnnAssign
+_TerminalAssignmentGroup = tuple[str, tuple[_TerminalAssignment | None, ...]]
 
 
 def _can_complete_normally(branch_body: Iterable[ast.stmt]) -> bool:
@@ -1774,16 +1775,19 @@ def _can_complete_normally(branch_body: Iterable[ast.stmt]) -> bool:
     return not statements or not isinstance(statements[-1], ast.Raise | ast.Return)
 
 
-def _contains_assignment_alias(branch_body: Iterable[ast.stmt]) -> bool:
-    return any(_assignment_alias_target_names(statement) for statement in _definition_scope_statements(branch_body))
+def _assignment_alias_targets(branch_body: Iterable[ast.stmt]) -> set[str]:
+    targets: set[str] = set()
+    for statement in _definition_scope_statements(branch_body):
+        targets.update(_assignment_alias_target_names(statement))
+    return targets
 
 
 def _terminal_assignment_groups(
     branch_bodies: tuple[tuple[ast.stmt, ...], ...],
 ) -> tuple[_TerminalAssignmentGroup, ...]:
-    terminal_assignments: list[dict[str, ast.Assign | ast.AnnAssign]] = []
+    terminal_assignments: list[dict[str, _TerminalAssignment]] = []
     for branch_body in branch_bodies:
-        suffix_assignments: dict[str, ast.Assign | ast.AnnAssign] = {}
+        suffix_assignments: dict[str, _TerminalAssignment] = {}
         for statement in reversed(branch_body):
             if isinstance(statement, ast.Expr | ast.Pass):
                 continue
@@ -1794,9 +1798,9 @@ def _terminal_assignment_groups(
         terminal_assignments.append(suffix_assignments)
     if not terminal_assignments:
         return ()
-    terminal_targets = set.intersection(*(set(assignments) for assignments in terminal_assignments))
+    terminal_targets = set().union(*(set(assignments) for assignments in terminal_assignments))
     return tuple(
-        (target_name, tuple(assignments[target_name] for assignments in terminal_assignments))
+        (target_name, tuple(assignments.get(target_name) for assignments in terminal_assignments))
         for target_name in sorted(terminal_targets)
     )
 
@@ -1821,7 +1825,11 @@ def _conditionally_rebound_assignment_nodes(
             branch_bodies = tuple(
                 branch_body for branch_body in alternate_bodies if _can_complete_normally(branch_body)
             )
-            if any(_contains_assignment_alias(branch_body) for branch_body in terminating_bodies):
+            continuing_targets = set().union(*(_assignment_alias_targets(branch_body) for branch_body in branch_bodies))
+            terminating_targets = set().union(
+                *(_assignment_alias_targets(branch_body) for branch_body in terminating_bodies)
+            )
+            if continuing_targets & terminating_targets:
                 branch_bodies = alternate_bodies
             if len(branch_bodies) < 2:
                 continue
@@ -1837,7 +1845,11 @@ def _conditionally_rebound_assignment_nodes(
             branch_bodies = tuple(
                 branch_body for branch_body in alternate_bodies if _can_complete_normally(branch_body)
             )
-            if any(_contains_assignment_alias(branch_body) for branch_body in terminating_bodies):
+            continuing_targets = set().union(*(_assignment_alias_targets(branch_body) for branch_body in branch_bodies))
+            terminating_targets = set().union(
+                *(_assignment_alias_targets(branch_body) for branch_body in terminating_bodies)
+            )
+            if continuing_targets & terminating_targets:
                 branch_bodies = alternate_bodies
             if len(branch_bodies) < 2:
                 continue
@@ -1880,6 +1892,32 @@ def _resolved_terminal_assignment_nodes(
     class_name: str | None,
 ) -> dict[str, set[int]]:
     deterministic_node_ids: dict[str, set[int]] = {}
+
+    def incoming_alias_value(
+        target_name: str,
+        statements: tuple[_TerminalAssignment | None, ...],
+        effective_ambiguous_node_ids: dict[str, set[int]],
+    ) -> tuple[bool, str | None]:
+        statement_ids = {id(statement) for statement in statements if statement is not None}
+        first_index = min(index for index, node in enumerate(nodes) if id(node) in statement_ids)
+        found_prior_assignment = False
+        incoming_value: str | None = None
+        for node in nodes[:first_index]:
+            if target_name not in _assignment_alias_target_names(node):
+                continue
+            if id(node) in effective_ambiguous_node_ids.get(target_name, set()):
+                continue
+            found_prior_assignment = True
+            incoming_value = _assignment_alias_value(
+                node,
+                module_name,
+                aliases,
+                local_defs,
+                local_class_targets,
+                class_name=class_name,
+            )
+        return found_prior_assignment, incoming_value
+
     while True:
         effective_ambiguous_node_ids = {
             target_name: node_ids - deterministic_node_ids.get(target_name, set())
@@ -1904,10 +1942,11 @@ def _resolved_terminal_assignment_nodes(
             branch_count = len(terminal_assignment_groups[0][1])
             resolved_by_branch: list[dict[str, str]] = []
             for branch_index in range(branch_count):
-                branch_statements = {
-                    id(statements[branch_index]): statements[branch_index]
-                    for _, statements in terminal_assignment_groups
-                }
+                branch_statements: dict[int, _TerminalAssignment] = {}
+                for _, statements in terminal_assignment_groups:
+                    statement = statements[branch_index]
+                    if statement is not None:
+                        branch_statements[id(statement)] = statement
                 branch_aliases = dict(aliases)
                 branch_local_targets: set[str] = set()
                 branch_resolved: dict[str, str] = {}
@@ -1938,11 +1977,34 @@ def _resolved_terminal_assignment_nodes(
                 resolved_by_branch.append(branch_resolved)
 
             for target_name, statements in terminal_assignment_groups:
-                resolved_values = tuple(resolved.get(target_name) for resolved in resolved_by_branch)
-                if None not in resolved_values and len(set(resolved_values)) == 1:
+                present_values = tuple(
+                    resolved_by_branch[index].get(target_name)
+                    for index, statement in enumerate(statements)
+                    if statement is not None
+                )
+                if None in present_values:
+                    continue
+                resolved_values = list(present_values)
+                if any(statement is None for statement in statements):
+                    present_statements = tuple(statement for statement in statements if statement is not None)
+                    if any(
+                        target_name in ambiguous_before_statement.get(id(statement), set())
+                        for statement in present_statements
+                    ):
+                        continue
+                    found_incoming, incoming_value = incoming_alias_value(
+                        target_name,
+                        statements,
+                        effective_ambiguous_node_ids,
+                    )
+                    if found_incoming:
+                        if incoming_value is None:
+                            continue
+                        resolved_values.append(incoming_value)
+                if resolved_values and len(set(resolved_values)) == 1:
                     node_ids = deterministic_node_ids.setdefault(target_name, set())
                     prior_count = len(node_ids)
-                    node_ids.update(id(statement) for statement in statements)
+                    node_ids.update(id(statement) for statement in statements if statement is not None)
                     changed = changed or len(node_ids) != prior_count
         if not changed:
             break

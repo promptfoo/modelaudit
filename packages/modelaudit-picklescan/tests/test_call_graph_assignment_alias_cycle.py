@@ -479,6 +479,44 @@ else:
 exposed = m
 """
 
+_MATCHING_ONE_SIDED_REBIND_SOURCE = """\
+class Final:
+    pass
+
+
+m = Final()
+if cond:
+    m = Final()
+exposed = m
+"""
+
+_UNBOUND_ONE_SIDED_REBIND_SOURCE = """\
+class Final:
+    pass
+
+
+if cond:
+    m = Final()
+exposed = m
+"""
+
+_TERMINATING_UNRELATED_ALIAS_SOURCE = """\
+class A:
+    pass
+
+
+class Final:
+    pass
+
+
+if cond:
+    unused = A()
+    raise ImportError
+else:
+    m = Final()
+exposed = m
+"""
+
 _MATCHING_TRY_EXCEPT_OVERWRITE_SOURCE = """\
 class A:
     pass
@@ -679,6 +717,9 @@ def test_collect_assignment_aliases_allows_alias_read_after_deterministic_overwr
         _MUTUALLY_DEPENDENT_TERMINAL_ALIAS_SOURCE,
         _TERMINATING_ALTERNATIVE_SOURCE,
         _SCOPED_TERMINAL_DEPENDENCY_SOURCE,
+        _MATCHING_ONE_SIDED_REBIND_SOURCE,
+        _UNBOUND_ONE_SIDED_REBIND_SOURCE,
+        _TERMINATING_UNRELATED_ALIAS_SOURCE,
         _MATCHING_TRY_EXCEPT_OVERWRITE_SOURCE,
         _EXHAUSTIVE_MATCH_OVERWRITE_SOURCE,
         _LOOP_MATCHING_TERMINAL_REBIND_SOURCE,
@@ -693,6 +734,9 @@ def test_collect_assignment_aliases_allows_alias_read_after_deterministic_overwr
         "mutually-dependent-terminal-alias",
         "terminating-alternative",
         "scoped-terminal-dependency",
+        "matching-one-sided-rebind",
+        "unbound-one-sided-rebind",
+        "terminating-unrelated-alias",
         "try-except",
         "exhaustive-match",
         "loop-terminal-break",
