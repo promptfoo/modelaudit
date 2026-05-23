@@ -325,6 +325,30 @@ else:
 exposed = m
 """
 
+_MATCHING_BRANCH_EPILOGUE_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+class Final:
+    pass
+
+
+if cond:
+    m = A()
+    m = Final()
+    log()
+else:
+    m = B()
+    m = Final()
+    log()
+exposed = m
+"""
+
 _RESOLVED_MATCHING_BRANCH_OVERWRITE_SOURCE = """\
 class Final:
     pass
@@ -527,6 +551,7 @@ def test_collect_assignment_aliases_allows_alias_read_after_deterministic_overwr
     "source",
     (
         _MATCHING_BRANCH_OVERWRITE_SOURCE,
+        _MATCHING_BRANCH_EPILOGUE_SOURCE,
         _RESOLVED_MATCHING_BRANCH_OVERWRITE_SOURCE,
         _MATCHING_TRY_EXCEPT_OVERWRITE_SOURCE,
         _EXHAUSTIVE_MATCH_OVERWRITE_SOURCE,
@@ -535,6 +560,7 @@ def test_collect_assignment_aliases_allows_alias_read_after_deterministic_overwr
     ),
     ids=(
         "if-else",
+        "if-expression-epilogue",
         "if-semantic-resolution",
         "try-except",
         "exhaustive-match",

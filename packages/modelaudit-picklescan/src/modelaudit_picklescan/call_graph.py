@@ -1776,6 +1776,8 @@ def _terminal_assignment_groups(
     for branch_body in branch_bodies:
         suffix_assignments: dict[str, ast.Assign | ast.AnnAssign] = {}
         for statement in reversed(branch_body):
+            if isinstance(statement, ast.Expr | ast.Pass):
+                continue
             if not isinstance(statement, ast.Assign | ast.AnnAssign) or statement.value is None:
                 break
             for target_name in _assignment_alias_target_names(statement):
