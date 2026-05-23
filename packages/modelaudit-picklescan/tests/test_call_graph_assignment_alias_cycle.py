@@ -184,6 +184,21 @@ m = Final()
 exposed = m
 """
 
+_ONE_SIDED_REBIND_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+m = A()
+if cond:
+    m = B()
+exposed = m
+"""
+
 _TRY_FINALLY_REBIND_SOURCE = """\
 class A:
     pass
@@ -222,8 +237,9 @@ def _run_with_timeout(target: object, timeout: float = 10.0) -> None:
         _TRY_REBIND_SOURCE,
         _LOOP_ELSE_REBIND_SOURCE,
         _READ_BEFORE_UNCONDITIONAL_OVERWRITE_SOURCE,
+        _ONE_SIDED_REBIND_SOURCE,
     ),
-    ids=("if-else", "try-except", "loop-else", "read-before-overwrite"),
+    ids=("if-else", "try-except", "loop-else", "read-before-overwrite", "one-sided-rebind"),
 )
 def test_collect_assignment_aliases_fails_closed_on_stable_branch_rebind(source: str) -> None:
     tree = ast.parse(source)
@@ -456,6 +472,50 @@ def test_assignment_alias_limit_preserves_later_call_graph_findings(
     )
 
 
+def test_assignment_alias_limit_preserves_invoked_finding_after_sink_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = {"module": "invoked", "name": "entry"}
+    path_calls = 0
+
+    def _iter_references(
+        _import_references: object,
+        _callable_references: tuple[dict[str, object], ...],
+        _invoked_references: set[tuple[str, str]],
+    ) -> tuple[dict[str, str], ...]:
+        return (reference,)
+
+    def _entrypoints(module: str, name: str, _reference: dict[str, object]) -> tuple[str, ...]:
+        return (f"{module}.{name}",)
+
+    def _path(_entrypoints: Iterable[str], _path_for: object) -> tuple[str, ...] | None:
+        nonlocal path_calls
+        path_calls += 1
+        if path_calls == 1:
+            raise _CallGraphAnalysisLimitError("assignment alias limit")
+        return ("invoked.entry", "builtins.exec")
+
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._iter_call_graph_references", _iter_references)
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._call_graph_entrypoints_for_reference", _entrypoints)
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._first_matching_path", _path)
+
+    with pytest.raises(_CallGraphAnalysisLimitError, match="assignment alias limit") as exc_info:
+        find_dangerous_call_graphs(
+            (),
+            ({"module": "invoked", "name": "entry", "positional_arg_count": 1},),
+        )
+
+    assert exc_info.value.partial_findings == (
+        CallGraphFinding(
+            module="invoked",
+            name="entry",
+            import_reference="invoked.entry",
+            sink="builtins.exec",
+            call_path=("invoked.entry", "builtins.exec"),
+        ),
+    )
+
+
 def test_assignment_alias_limit_preserves_prior_startup_hook_findings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -518,6 +578,50 @@ def test_assignment_alias_limit_preserves_later_startup_hook_findings(
     def _path(entrypoints: Iterable[str], path_for: object) -> tuple[str, ...] | None:
         entrypoint = next(iter(entrypoints))
         path_name = getattr(path_for, "__name__", "")
+        if path_name == "_find_file_open_path" and entrypoint == "opener.entry":
+            return ("opener.entry", "builtins.open")
+        if path_name == "_find_file_write_path" and entrypoint == "writer.entry":
+            return ("writer.entry", "binary_file.write")
+        return None
+
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._safe_call_graph_entrypoints", _entrypoints)
+    monkeypatch.setattr("modelaudit_picklescan.call_graph._first_matching_path", _path)
+
+    with pytest.raises(_CallGraphAnalysisLimitError, match="assignment alias limit") as exc_info:
+        find_startup_hook_write_call_graphs(references)
+
+    assert exc_info.value.partial_startup_hook_write_findings == (
+        StartupHookWriteFinding(
+            opener_module="opener",
+            opener_name="entry",
+            writer_module="writer",
+            writer_name="entry",
+            opener_import_reference="opener.entry",
+            writer_import_reference="writer.entry",
+            open_sink="builtins.open",
+            write_sink="binary_file.write",
+            opener_call_path=("opener.entry", "builtins.open"),
+            writer_call_path=("writer.entry", "binary_file.write"),
+        ),
+    )
+
+
+def test_assignment_alias_limit_preserves_startup_hook_findings_after_sink_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    references = (
+        {"module": "opener", "name": "entry"},
+        {"module": "writer", "name": "entry"},
+    )
+
+    def _entrypoints(function_name: str) -> tuple[str, ...]:
+        return (function_name,)
+
+    def _path(entrypoints: Iterable[str], path_for: object) -> tuple[str, ...] | None:
+        entrypoint = next(iter(entrypoints))
+        path_name = getattr(path_for, "__name__", "")
+        if path_name == "_find_sink_path":
+            raise _CallGraphAnalysisLimitError("assignment alias limit")
         if path_name == "_find_file_open_path" and entrypoint == "opener.entry":
             return ("opener.entry", "builtins.open")
         if path_name == "_find_file_write_path" and entrypoint == "writer.entry":

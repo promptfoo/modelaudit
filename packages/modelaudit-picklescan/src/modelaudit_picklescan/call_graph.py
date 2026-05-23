@@ -338,19 +338,29 @@ def find_dangerous_call_graphs(
 
     analysis_limit_error: _CallGraphAnalysisLimitError | None = None
     for reference in _iter_call_graph_references(import_references, callable_references, invoked_references):
-        try:
-            module = str(reference.get("module", ""))
-            name = str(reference.get("name", ""))
-            if not module or not name:
-                continue
+        module = str(reference.get("module", ""))
+        name = str(reference.get("name", ""))
+        if not module or not name:
+            continue
 
+        try:
             entrypoints = _call_graph_entrypoints_for_reference(module, name, reference)
-            if not entrypoints:
-                continue
-            allow_invoked_non_lifecycle_entrypoint = _is_explicit_method_import_reference(name)
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            continue
+        if not entrypoints:
+            continue
+        allow_invoked_non_lifecycle_entrypoint = _is_explicit_method_import_reference(name)
+        try:
             sink_path = _first_matching_path(entrypoints, _find_sink_path)
-            if sink_path is None:
-                for positional_arg_count in positional_arg_counts.get((module, name), ()):
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            sink_path = None
+        if sink_path is None:
+            for positional_arg_count in positional_arg_counts.get((module, name), ()):
+                try:
                     sink_path = _first_matching_path(
                         entrypoints,
                         _invoked_import_execution_path_callback(
@@ -358,31 +368,32 @@ def find_dangerous_call_graphs(
                             allow_non_lifecycle_entrypoint=allow_invoked_non_lifecycle_entrypoint,
                         ),
                     )
-                    if sink_path is not None:
-                        break
-            if sink_path is None:
-                continue
+                except _CallGraphAnalysisLimitError as error:
+                    if analysis_limit_error is None:
+                        analysis_limit_error = error
+                    continue
+                if sink_path is not None:
+                    break
+        if sink_path is None:
+            continue
 
-            finding_key = (module, name, sink_path)
-            if finding_key in seen_findings:
-                continue
-            seen_findings.add(finding_key)
+        finding_key = (module, name, sink_path)
+        if finding_key in seen_findings:
+            continue
+        seen_findings.add(finding_key)
 
-            sink = sink_path[-1]
-            findings.append(
-                CallGraphFinding(
-                    module=module,
-                    name=name,
-                    import_reference=f"{module}.{name}",
-                    sink=sink,
-                    call_path=sink_path,
-                )
+        sink = sink_path[-1]
+        findings.append(
+            CallGraphFinding(
+                module=module,
+                name=name,
+                import_reference=f"{module}.{name}",
+                sink=sink,
+                call_path=sink_path,
             )
-            if len(findings) >= _MAX_IMPORT_REFERENCES:
-                break
-        except _CallGraphAnalysisLimitError as error:
-            if analysis_limit_error is None:
-                analysis_limit_error = error
+        )
+        if len(findings) >= _MAX_IMPORT_REFERENCES:
+            break
     if analysis_limit_error is not None:
         raise _CallGraphAnalysisLimitError(
             str(analysis_limit_error),
@@ -418,33 +429,50 @@ def find_startup_hook_write_call_graphs(
 
         try:
             entrypoints = _safe_call_graph_entrypoints(f"{module}.{name}")
-            if not entrypoints:
-                continue
-            if _first_matching_path(entrypoints, _find_sink_path) is not None:
-                continue
-            open_path = _first_matching_path(entrypoints, _find_file_open_path)
-            if open_path is not None:
-                openers.append(
-                    _ImportCallPath(
-                        module=module,
-                        name=name,
-                        import_reference=f"{module}.{name}",
-                        call_path=open_path,
-                    )
-                )
-            write_path = _first_matching_path(entrypoints, _find_file_write_path)
-            if write_path is not None:
-                writers.append(
-                    _ImportCallPath(
-                        module=module,
-                        name=name,
-                        import_reference=f"{module}.{name}",
-                        call_path=write_path,
-                    )
-                )
         except _CallGraphAnalysisLimitError as error:
             if analysis_limit_error is None:
                 analysis_limit_error = error
+            continue
+        if not entrypoints:
+            continue
+        try:
+            has_sink_path = _first_matching_path(entrypoints, _find_sink_path) is not None
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            has_sink_path = False
+        if has_sink_path:
+            continue
+        try:
+            open_path = _first_matching_path(entrypoints, _find_file_open_path)
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            open_path = None
+        if open_path is not None:
+            openers.append(
+                _ImportCallPath(
+                    module=module,
+                    name=name,
+                    import_reference=f"{module}.{name}",
+                    call_path=open_path,
+                )
+            )
+        try:
+            write_path = _first_matching_path(entrypoints, _find_file_write_path)
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            write_path = None
+        if write_path is not None:
+            writers.append(
+                _ImportCallPath(
+                    module=module,
+                    name=name,
+                    import_reference=f"{module}.{name}",
+                    call_path=write_path,
+                )
+            )
 
     findings = _materialize_startup_hook_write_findings(openers, writers)
     if analysis_limit_error is not None:
@@ -1744,21 +1772,10 @@ def _conditionally_rebound_assignment_nodes(
         else:
             continue
 
-        branch_assignments: list[dict[str, set[int]]] = []
-        seen_targets: set[str] = set()
         for branch_body in branch_bodies:
-            assignments: dict[str, set[int]] = {}
             for statement in _definition_scope_statements(branch_body):
                 for target_name in _assignment_alias_target_names(statement):
-                    assignments.setdefault(target_name, set()).add(id(statement))
-            branch_targets = set(assignments)
-            for target_name in seen_targets & branch_targets:
-                target_nodes = ambiguous_assignment_nodes.setdefault(target_name, set())
-                target_nodes.update(assignments[target_name])
-                for previous_assignments in branch_assignments:
-                    target_nodes.update(previous_assignments.get(target_name, set()))
-            branch_assignments.append(assignments)
-            seen_targets.update(branch_targets)
+                    ambiguous_assignment_nodes.setdefault(target_name, set()).add(id(statement))
 
     if not propagate_reads:
         return ambiguous_assignment_nodes
