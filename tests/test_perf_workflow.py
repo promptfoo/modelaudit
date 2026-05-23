@@ -6,21 +6,25 @@ from typing import Any
 import yaml
 
 
-def _load_perf_workflow() -> dict[str, Any]:
+def _load_workflow(filename: str) -> dict[str, Any]:
     current_path = Path(__file__).resolve()
     workflow_path = next(
         (
-            candidate_root / ".github" / "workflows" / "perf.yml"
+            candidate_root / ".github" / "workflows" / filename
             for candidate_root in [current_path.parent, *current_path.parents]
-            if (candidate_root / ".github" / "workflows" / "perf.yml").is_file()
+            if (candidate_root / ".github" / "workflows" / filename).is_file()
         ),
         None,
     )
     if workflow_path is None:
-        raise AssertionError("Could not locate .github/workflows/perf.yml from test file path")
+        raise AssertionError(f"Could not locate .github/workflows/{filename} from test file path")
     workflow = yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
     assert isinstance(workflow, dict)
     return workflow
+
+
+def _load_perf_workflow() -> dict[str, Any]:
+    return _load_workflow("perf.yml")
 
 
 def _benchmarks_job(workflow: dict[str, Any]) -> dict[str, Any]:
@@ -100,3 +104,19 @@ def test_perf_workflow_comments_only_on_same_repo_prs() -> None:
     assert "<!-- modelaudit-perf-benchmarks -->" in script
     assert "github.rest.issues.updateComment" in script
     assert "github.rest.issues.createComment" in script
+
+
+def test_nightly_windows_lane_defers_performance_benchmarks_to_linux() -> None:
+    workflow = _load_workflow("nightly.yml")
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+
+    linux_steps = jobs["full-matrix"]["steps"]
+    assert isinstance(linux_steps, list)
+    linux_run = _step_by_name(linux_steps, "Run all tests (fast + slow + integration + performance)")["run"]
+    assert '-m "not performance"' not in linux_run
+
+    windows_steps = jobs["windows-full"]["steps"]
+    assert isinstance(windows_steps, list)
+    windows_run = _step_by_name(windows_steps, "Run all Windows tests except performance benchmarks")["run"]
+    assert '-m "not performance"' in windows_run
