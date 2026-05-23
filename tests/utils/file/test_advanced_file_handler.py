@@ -354,6 +354,30 @@ class TestAdvancedFileHandler:
         assert result.bytes_scanned == shard_one.stat().st_size
         assert len(coverage_checks) == 1
         assert coverage_checks[0].details["missing_shard_count"] == 1
+        assert coverage_checks[0].details["unreadable_shard_count"] == 1
+        assert coverage_checks[0].details["unreadable_shards"] == [str(shard_two)]
+
+    def test_sharded_model_broken_shard_without_declared_total_marks_scan_inconclusive(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Unreadable members cannot be silently dropped when a family has no declared total."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        shard_one.write_bytes(b"safe")
+        shard_two.symlink_to(tmp_path / "missing-shard")
+
+        handler = AdvancedFileHandler(str(shard_one), CompletingShardScanner())
+        result = handler.scan()
+
+        coverage_checks = [check for check in result.checks if check.name == "Sharded Model Coverage Check"]
+        assert result.success is False
+        assert result.bytes_scanned == shard_one.stat().st_size
+        assert "unreadable_model_shards" in result.metadata["scan_outcome_reasons"]
+        assert len(coverage_checks) == 1
+        assert coverage_checks[0].details["unreadable_shard_count"] == 1
+        assert coverage_checks[0].details["unreadable_shards"] == [str(shard_two)]
 
     def test_sharded_model_honors_allowed_shard_paths(self, tmp_path: Path) -> None:
         """Restricted shard scans must not expand beyond the validated allowlist."""
