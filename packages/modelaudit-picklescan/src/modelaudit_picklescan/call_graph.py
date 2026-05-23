@@ -336,8 +336,9 @@ def find_dangerous_call_graphs(
         if str(reference.get("module", "")) and str(reference.get("name", ""))
     }
 
-    try:
-        for reference in _iter_call_graph_references(import_references, callable_references, invoked_references):
+    analysis_limit_error: _CallGraphAnalysisLimitError | None = None
+    for reference in _iter_call_graph_references(import_references, callable_references, invoked_references):
+        try:
             module = str(reference.get("module", ""))
             name = str(reference.get("name", ""))
             if not module or not name:
@@ -379,8 +380,14 @@ def find_dangerous_call_graphs(
             )
             if len(findings) >= _MAX_IMPORT_REFERENCES:
                 break
-    except _CallGraphAnalysisLimitError as error:
-        raise _CallGraphAnalysisLimitError(str(error), partial_findings=tuple(findings)) from error
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+    if analysis_limit_error is not None:
+        raise _CallGraphAnalysisLimitError(
+            str(analysis_limit_error),
+            partial_findings=tuple(findings),
+        ) from analysis_limit_error
     return tuple(findings)
 
 
@@ -399,6 +406,7 @@ def find_startup_hook_write_call_graphs(
         for reference in _iter_callable_invocation_references(callable_invocations)
     }
     require_invocations = callable_invocations is not None and callable_invocations_complete
+    analysis_limit_error: _CallGraphAnalysisLimitError | None = None
     for reference in _iter_import_references(import_references):
         module = str(reference.get("module", ""))
         name = str(reference.get("name", ""))
@@ -435,12 +443,16 @@ def find_startup_hook_write_call_graphs(
                     )
                 )
         except _CallGraphAnalysisLimitError as error:
-            raise _CallGraphAnalysisLimitError(
-                str(error),
-                partial_startup_hook_write_findings=_materialize_startup_hook_write_findings(openers, writers),
-            ) from error
+            if analysis_limit_error is None:
+                analysis_limit_error = error
 
-    return _materialize_startup_hook_write_findings(openers, writers)
+    findings = _materialize_startup_hook_write_findings(openers, writers)
+    if analysis_limit_error is not None:
+        raise _CallGraphAnalysisLimitError(
+            str(analysis_limit_error),
+            partial_startup_hook_write_findings=findings,
+        ) from analysis_limit_error
+    return findings
 
 
 def _materialize_startup_hook_write_findings(
@@ -1689,9 +1701,9 @@ def _local_class_node_from_target(
     return local_class_nodes.get(class_name)
 
 
-def _conditionally_rebound_assignment_targets(nodes: Iterable[ast.AST]) -> set[str]:
-    """Return names assigned in multiple flattened alternate control-flow paths."""
-    ambiguous_targets: set[str] = set()
+def _conditionally_rebound_assignment_nodes(nodes: Iterable[ast.AST]) -> dict[str, set[int]]:
+    """Return alternate-path assignment nodes grouped by ambiguously rebound name."""
+    ambiguous_assignment_nodes: dict[str, set[int]] = {}
     for node in nodes:
         branch_bodies: tuple[Iterable[ast.stmt], ...]
         if isinstance(node, ast.If):
@@ -1708,16 +1720,22 @@ def _conditionally_rebound_assignment_targets(nodes: Iterable[ast.AST]) -> set[s
         else:
             continue
 
+        branch_assignments: list[dict[str, set[int]]] = []
         seen_targets: set[str] = set()
         for branch_body in branch_bodies:
-            branch_targets = {
-                target_name
-                for statement in _definition_scope_statements(branch_body)
-                for target_name in _assignment_alias_target_names(statement)
-            }
-            ambiguous_targets.update(seen_targets & branch_targets)
+            assignments: dict[str, set[int]] = {}
+            for statement in _definition_scope_statements(branch_body):
+                for target_name in _assignment_alias_target_names(statement):
+                    assignments.setdefault(target_name, set()).add(id(statement))
+            branch_targets = set(assignments)
+            for target_name in seen_targets & branch_targets:
+                target_nodes = ambiguous_assignment_nodes.setdefault(target_name, set())
+                target_nodes.update(assignments[target_name])
+                for previous_assignments in branch_assignments:
+                    target_nodes.update(previous_assignments.get(target_name, set()))
+            branch_assignments.append(assignments)
             seen_targets.update(branch_targets)
-    return ambiguous_targets
+    return ambiguous_assignment_nodes
 
 
 def _collect_assignment_aliases(
@@ -1731,7 +1749,7 @@ def _collect_assignment_aliases(
 ) -> dict[str, str]:
     node_list = tuple(nodes)
     assignment_aliases: dict[str, str] = {}
-    conditionally_rebound_targets = _conditionally_rebound_assignment_targets(node_list)
+    conditionally_rebound_node_ids = _conditionally_rebound_assignment_nodes(node_list)
     seen_states: set[tuple[tuple[str, str], ...]] = {()}
     passes = 0
 
@@ -1744,7 +1762,7 @@ def _collect_assignment_aliases(
         passes += 1
         state = tuple(sorted(assignment_aliases.items()))
         changed = False
-        changed_targets: set[str] = set()
+        last_changed_node_ids: dict[str, int] = {}
         scoped_aliases = {**aliases, **assignment_aliases}
         for node in node_list:
             resolved = _assignment_alias_value(
@@ -1762,12 +1780,15 @@ def _collect_assignment_aliases(
                     continue
                 assignment_aliases[target_name] = resolved
                 changed = True
-                changed_targets.add(target_name)
+                last_changed_node_ids[target_name] = id(node)
                 if len(assignment_aliases) >= _MAX_ASSIGNMENT_ALIASES:
                     break
         next_state = tuple(sorted(assignment_aliases.items()))
         if next_state == state:
-            if changed_targets & conditionally_rebound_targets:
+            if any(
+                node_id in conditionally_rebound_node_ids.get(target_name, set())
+                for target_name, node_id in last_changed_node_ids.items()
+            ):
                 raise _CallGraphAnalysisLimitError(
                     "assignment alias analysis encountered ambiguous conditional rebinding"
                 )
