@@ -30,6 +30,7 @@ _MAX_CALL_GRAPH_DEPTH = 4
 _MAX_VISITED_FUNCTIONS = 64
 _MAX_CALLS_PER_FUNCTION = 128
 _MAX_ASSIGNMENT_ALIASES = 128
+_MAX_ASSIGNMENT_ALIAS_PASSES = 256
 _MAX_FUNCTION_INSTANCE_ALIASES = 32
 _MAX_CLASS_INSTANCE_ALIASES = 128
 _MAX_INHERITED_CLASS_METHODS = 128
@@ -64,6 +65,23 @@ class _CacheClearable(Protocol):
 
 
 _SOURCE_SENSITIVE_CACHED_FUNCTIONS: set[_CacheClearable] = set()
+
+
+class _CallGraphAnalysisLimitError(RuntimeError):
+    """Raised when bounded call-graph enrichment cannot complete safely."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        partial_findings: tuple[CallGraphFinding, ...] = (),
+        partial_startup_hook_write_findings: tuple[StartupHookWriteFinding, ...] = (),
+        partial_path: tuple[str, ...] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.partial_findings = partial_findings
+        self.partial_startup_hook_write_findings = partial_startup_hook_write_findings
+        self.partial_path = partial_path
 
 
 def _register_source_sensitive_cache(function: _CachedFunctionT) -> _CachedFunctionT:
@@ -320,26 +338,42 @@ def find_dangerous_call_graphs(
         if str(reference.get("module", "")) and str(reference.get("name", ""))
     }
 
+    analysis_limit_error: _CallGraphAnalysisLimitError | None = None
     for reference in _iter_call_graph_references(import_references, callable_references, invoked_references):
         module = str(reference.get("module", ""))
         name = str(reference.get("name", ""))
         if not module or not name:
             continue
 
-        entrypoints = _call_graph_entrypoints_for_reference(module, name, reference)
+        try:
+            entrypoints = _call_graph_entrypoints_for_reference(module, name, reference)
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            continue
         if not entrypoints:
             continue
         allow_invoked_non_lifecycle_entrypoint = _is_explicit_method_import_reference(name)
-        sink_path = _first_matching_path(entrypoints, _find_sink_path)
+        try:
+            sink_path = _first_matching_path(entrypoints, _find_sink_path)
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            sink_path = error.partial_path
         if sink_path is None:
             for positional_arg_count in positional_arg_counts.get((module, name), ()):
-                sink_path = _first_matching_path(
-                    entrypoints,
-                    _invoked_import_execution_path_callback(
-                        positional_arg_count,
-                        allow_non_lifecycle_entrypoint=allow_invoked_non_lifecycle_entrypoint,
-                    ),
-                )
+                try:
+                    sink_path = _first_matching_path(
+                        entrypoints,
+                        _invoked_import_execution_path_callback(
+                            positional_arg_count,
+                            allow_non_lifecycle_entrypoint=allow_invoked_non_lifecycle_entrypoint,
+                        ),
+                    )
+                except _CallGraphAnalysisLimitError as error:
+                    if analysis_limit_error is None:
+                        analysis_limit_error = error
+                    sink_path = error.partial_path
                 if sink_path is not None:
                     break
         if sink_path is None:
@@ -362,6 +396,11 @@ def find_dangerous_call_graphs(
         )
         if len(findings) >= _MAX_IMPORT_REFERENCES:
             break
+    if analysis_limit_error is not None:
+        raise _CallGraphAnalysisLimitError(
+            str(analysis_limit_error),
+            partial_findings=tuple(findings),
+        ) from analysis_limit_error
     return tuple(findings)
 
 
@@ -380,6 +419,7 @@ def find_startup_hook_write_call_graphs(
         for reference in _iter_callable_invocation_references(callable_invocations)
     }
     require_invocations = callable_invocations is not None and callable_invocations_complete
+    analysis_limit_error: _CallGraphAnalysisLimitError | None = None
     for reference in _iter_import_references(import_references):
         module = str(reference.get("module", ""))
         name = str(reference.get("name", ""))
@@ -389,12 +429,28 @@ def find_startup_hook_write_call_graphs(
             continue
         seen.add((module, name))
 
-        entrypoints = _safe_call_graph_entrypoints(f"{module}.{name}")
+        try:
+            entrypoints = _safe_call_graph_entrypoints(f"{module}.{name}")
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            continue
         if not entrypoints:
             continue
-        if _first_matching_path(entrypoints, _find_sink_path) is not None:
+        try:
+            has_sink_path = _first_matching_path(entrypoints, _find_sink_path) is not None
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            has_sink_path = error.partial_path is not None
+        if has_sink_path:
             continue
-        open_path = _first_matching_path(entrypoints, _find_file_open_path)
+        try:
+            open_path = _first_matching_path(entrypoints, _find_file_open_path)
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            open_path = error.partial_path
         if open_path is not None:
             openers.append(
                 _ImportCallPath(
@@ -404,7 +460,12 @@ def find_startup_hook_write_call_graphs(
                     call_path=open_path,
                 )
             )
-        write_path = _first_matching_path(entrypoints, _find_file_write_path)
+        try:
+            write_path = _first_matching_path(entrypoints, _find_file_write_path)
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            write_path = error.partial_path
         if write_path is not None:
             writers.append(
                 _ImportCallPath(
@@ -415,6 +476,19 @@ def find_startup_hook_write_call_graphs(
                 )
             )
 
+    findings = _materialize_startup_hook_write_findings(openers, writers)
+    if analysis_limit_error is not None:
+        raise _CallGraphAnalysisLimitError(
+            str(analysis_limit_error),
+            partial_startup_hook_write_findings=findings,
+        ) from analysis_limit_error
+    return findings
+
+
+def _materialize_startup_hook_write_findings(
+    openers: list[_ImportCallPath],
+    writers: list[_ImportCallPath],
+) -> tuple[StartupHookWriteFinding, ...]:
     if not openers or not writers:
         return ()
 
@@ -497,6 +571,8 @@ def shared_source_sensitive_caches() -> Iterator[None]:
 def _safe_call_graph_entrypoints(function_name: str) -> tuple[str, ...]:
     try:
         return _call_graph_entrypoints(function_name)
+    except _CallGraphAnalysisLimitError:
+        raise
     except Exception:
         return ()
 
@@ -505,13 +581,24 @@ def _first_matching_path(
     entrypoints: Iterable[str],
     path_for: Callable[[str], tuple[str, ...] | None],
 ) -> tuple[str, ...] | None:
+    analysis_limit_error: _CallGraphAnalysisLimitError | None = None
     for entrypoint in entrypoints:
         try:
             path = path_for(entrypoint)
+        except _CallGraphAnalysisLimitError as error:
+            if analysis_limit_error is None:
+                analysis_limit_error = error
+            continue
         except Exception:
             continue
         if path is not None:
+            if analysis_limit_error is not None:
+                raise _CallGraphAnalysisLimitError(
+                    str(analysis_limit_error), partial_path=path
+                ) from analysis_limit_error
             return path
+    if analysis_limit_error is not None:
+        raise analysis_limit_error
     return None
 
 
@@ -727,7 +814,10 @@ def _is_skippable_torch_extension_global_reference(module: str, name: str) -> bo
     source_path = _resolve_module_source(module)
     if source_path is not None and not _is_library_source_path(str(source_path)):
         return False
-    return not _has_static_torch_extension_global_target(module, name)
+    try:
+        return not _has_static_torch_extension_global_target(module, name)
+    except _CallGraphAnalysisLimitError:
+        return False
 
 
 @_register_source_sensitive_cache
@@ -1653,6 +1743,307 @@ def _local_class_node_from_target(
     return local_class_nodes.get(class_name)
 
 
+def _contains_current_loop_break(nodes: Iterable[ast.stmt]) -> bool:
+    """Return whether this loop body can break without entering a nested scope or loop."""
+
+    def contains_break(node: ast.AST) -> bool:
+        if isinstance(node, ast.Break):
+            return True
+        if isinstance(
+            node,
+            ast.For | ast.AsyncFor | ast.While | ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef,
+        ):
+            return False
+        return any(contains_break(child) for child in ast.iter_child_nodes(node))
+
+    return any(contains_break(node) for node in nodes)
+
+
+def _is_exhaustive_match(node: ast.Match) -> bool:
+    return any(
+        isinstance(case.pattern, ast.MatchAs) and case.pattern.pattern is None and case.guard is None
+        for case in node.cases
+    )
+
+
+_TerminalAssignment = ast.Assign | ast.AnnAssign
+_TerminalAssignmentGroup = tuple[str, tuple[_TerminalAssignment | None, ...]]
+
+
+def _can_complete_normally(branch_body: Iterable[ast.stmt]) -> bool:
+    statements = tuple(branch_body)
+    return not statements or not isinstance(statements[-1], ast.Raise | ast.Return)
+
+
+def _assignment_alias_targets(branch_body: Iterable[ast.stmt]) -> set[str]:
+    targets: set[str] = set()
+    for statement in _definition_scope_statements(branch_body):
+        targets.update(_assignment_alias_target_names(statement))
+    return targets
+
+
+def _terminal_assignment_groups(
+    branch_bodies: tuple[tuple[ast.stmt, ...], ...],
+) -> tuple[_TerminalAssignmentGroup, ...]:
+    terminal_assignments: list[dict[str, _TerminalAssignment]] = []
+    for branch_body in branch_bodies:
+        suffix_assignments: dict[str, _TerminalAssignment] = {}
+        for statement in reversed(branch_body):
+            if isinstance(statement, ast.Expr | ast.Pass):
+                continue
+            if not isinstance(statement, ast.Assign | ast.AnnAssign) or statement.value is None:
+                break
+            for target_name in _assignment_alias_target_names(statement):
+                suffix_assignments.setdefault(target_name, statement)
+        terminal_assignments.append(suffix_assignments)
+    if not terminal_assignments:
+        return ()
+    terminal_targets = set().union(*(set(assignments) for assignments in terminal_assignments))
+    return tuple(
+        (target_name, tuple(assignments.get(target_name) for assignments in terminal_assignments))
+        for target_name in sorted(terminal_targets)
+    )
+
+
+def _conditionally_rebound_assignment_nodes(
+    nodes: Iterable[ast.AST],
+) -> tuple[dict[str, set[int]], tuple[tuple[_TerminalAssignmentGroup, ...], ...]]:
+    """Return alternate-path assignment nodes grouped by ambiguously rebound name."""
+    node_list = tuple(nodes)
+    ambiguous_assignment_nodes: dict[str, set[int]] = {}
+    terminal_assignment_group_sets: list[tuple[_TerminalAssignmentGroup, ...]] = []
+    for node in node_list:
+        alternate_bodies: tuple[Iterable[ast.stmt], ...]
+        branch_bodies: tuple[Iterable[ast.stmt], ...]
+        terminating_bodies: tuple[Iterable[ast.stmt], ...]
+        deterministic_terminal_bodies: tuple[Iterable[ast.stmt], ...] | None = None
+        if isinstance(node, ast.If):
+            alternate_bodies = (node.body, node.orelse)
+            terminating_bodies = tuple(
+                branch_body for branch_body in alternate_bodies if not _can_complete_normally(branch_body)
+            )
+            branch_bodies = tuple(
+                branch_body for branch_body in alternate_bodies if _can_complete_normally(branch_body)
+            )
+            continuing_targets = set().union(*(_assignment_alias_targets(branch_body) for branch_body in branch_bodies))
+            terminating_targets = set().union(
+                *(_assignment_alias_targets(branch_body) for branch_body in terminating_bodies)
+            )
+            if continuing_targets & terminating_targets:
+                branch_bodies = alternate_bodies
+            if len(branch_bodies) < 2:
+                continue
+            deterministic_terminal_bodies = branch_bodies
+        elif isinstance(node, ast.Try) and node.handlers:
+            alternate_bodies = (
+                (*node.body, *node.orelse),
+                *(handler.body for handler in node.handlers),
+            )
+            terminating_bodies = tuple(
+                branch_body for branch_body in alternate_bodies if not _can_complete_normally(branch_body)
+            )
+            branch_bodies = tuple(
+                branch_body for branch_body in alternate_bodies if _can_complete_normally(branch_body)
+            )
+            continuing_targets = set().union(*(_assignment_alias_targets(branch_body) for branch_body in branch_bodies))
+            terminating_targets = set().union(
+                *(_assignment_alias_targets(branch_body) for branch_body in terminating_bodies)
+            )
+            if continuing_targets & terminating_targets:
+                branch_bodies = alternate_bodies
+            if len(branch_bodies) < 2:
+                continue
+            deterministic_terminal_bodies = branch_bodies
+        elif isinstance(node, ast.For | ast.AsyncFor | ast.While) and _contains_current_loop_break(node.body):
+            branch_bodies = (node.body, node.orelse)
+            if node.body and isinstance(node.body[-1], ast.Break) and not _contains_current_loop_break(node.body[:-1]):
+                deterministic_terminal_bodies = (node.body[:-1], node.orelse)
+        elif isinstance(node, ast.Match):
+            branch_bodies = tuple(case.body for case in node.cases)
+            if _is_exhaustive_match(node):
+                deterministic_terminal_bodies = branch_bodies
+        else:
+            continue
+
+        branch_statement_bodies = tuple(tuple(branch_body) for branch_body in branch_bodies)
+        for branch_body in branch_statement_bodies:
+            for statement in _definition_scope_statements(branch_body):
+                for target_name in _assignment_alias_target_names(statement):
+                    ambiguous_assignment_nodes.setdefault(target_name, set()).add(id(statement))
+
+        if deterministic_terminal_bodies is not None:
+            groups = _terminal_assignment_groups(
+                tuple(tuple(branch_body) for branch_body in deterministic_terminal_bodies)
+            )
+            if groups:
+                terminal_assignment_group_sets.append(groups)
+    return ambiguous_assignment_nodes, tuple(terminal_assignment_group_sets)
+
+
+def _resolved_terminal_assignment_nodes(
+    nodes: tuple[ast.AST, ...],
+    terminal_assignment_group_sets: tuple[tuple[_TerminalAssignmentGroup, ...], ...],
+    ambiguous_assignment_nodes: dict[str, set[int]],
+    module_name: str,
+    aliases: dict[str, str],
+    local_defs: set[str],
+    local_class_targets: set[str],
+    *,
+    class_name: str | None,
+) -> dict[str, set[int]]:
+    deterministic_node_ids: dict[str, set[int]] = {}
+
+    def incoming_alias_value(
+        target_name: str,
+        statements: tuple[_TerminalAssignment | None, ...],
+        effective_ambiguous_node_ids: dict[str, set[int]],
+    ) -> tuple[bool, str | None]:
+        statement_ids = {id(statement) for statement in statements if statement is not None}
+        first_index = min(index for index, node in enumerate(nodes) if id(node) in statement_ids)
+        found_prior_assignment = False
+        incoming_value: str | None = None
+        for node in nodes[:first_index]:
+            if target_name not in _assignment_alias_target_names(node):
+                continue
+            if id(node) in effective_ambiguous_node_ids.get(target_name, set()):
+                continue
+            found_prior_assignment = True
+            incoming_value = _assignment_alias_value(
+                node,
+                module_name,
+                aliases,
+                local_defs,
+                local_class_targets,
+                class_name=class_name,
+            )
+        return found_prior_assignment, incoming_value
+
+    while True:
+        effective_ambiguous_node_ids = {
+            target_name: node_ids - deterministic_node_ids.get(target_name, set())
+            for target_name, node_ids in ambiguous_assignment_nodes.items()
+            if node_ids - deterministic_node_ids.get(target_name, set())
+        }
+        active_ambiguous_targets: set[str] = set()
+        ambiguous_before_statement: dict[int, set[str]] = {}
+        for node in nodes:
+            target_names = _assignment_alias_target_names(node)
+            if not target_names:
+                continue
+            ambiguous_before_statement[id(node)] = set(active_ambiguous_targets)
+            for target_name in target_names:
+                if id(node) in effective_ambiguous_node_ids.get(target_name, set()):
+                    active_ambiguous_targets.add(target_name)
+                else:
+                    active_ambiguous_targets.discard(target_name)
+
+        changed = False
+        for terminal_assignment_groups in terminal_assignment_group_sets:
+            branch_count = len(terminal_assignment_groups[0][1])
+            resolved_by_branch: list[dict[str, str]] = []
+            for branch_index in range(branch_count):
+                branch_statements: dict[int, _TerminalAssignment] = {}
+                for _, statements in terminal_assignment_groups:
+                    statement = statements[branch_index]
+                    if statement is not None:
+                        branch_statements[id(statement)] = statement
+                branch_aliases = dict(aliases)
+                branch_local_targets: set[str] = set()
+                branch_resolved: dict[str, str] = {}
+                for statement in sorted(
+                    branch_statements.values(),
+                    key=lambda statement: (statement.lineno, statement.col_offset),
+                ):
+                    blocked_dependencies = (
+                        _assignment_value_read_names(statement)
+                        & ambiguous_before_statement.get(id(statement), set()) - branch_local_targets
+                    )
+                    if blocked_dependencies:
+                        continue
+                    resolved = _assignment_alias_value(
+                        statement,
+                        module_name,
+                        branch_aliases,
+                        local_defs,
+                        local_class_targets,
+                        class_name=class_name,
+                    )
+                    if resolved is None:
+                        continue
+                    for target_name in _assignment_alias_target_names(statement):
+                        branch_aliases[target_name] = resolved
+                        branch_local_targets.add(target_name)
+                        branch_resolved[target_name] = resolved
+                resolved_by_branch.append(branch_resolved)
+
+            for target_name, statements in terminal_assignment_groups:
+                present_values = tuple(
+                    resolved_by_branch[index].get(target_name)
+                    for index, statement in enumerate(statements)
+                    if statement is not None
+                )
+                if None in present_values:
+                    continue
+                resolved_values = list(present_values)
+                if any(statement is None for statement in statements):
+                    present_statements = tuple(statement for statement in statements if statement is not None)
+                    if any(
+                        target_name in ambiguous_before_statement.get(id(statement), set())
+                        for statement in present_statements
+                    ):
+                        continue
+                    found_incoming, incoming_value = incoming_alias_value(
+                        target_name,
+                        statements,
+                        effective_ambiguous_node_ids,
+                    )
+                    if found_incoming:
+                        if incoming_value is None:
+                            continue
+                        resolved_values.append(incoming_value)
+                if resolved_values and len(set(resolved_values)) == 1:
+                    node_ids = deterministic_node_ids.setdefault(target_name, set())
+                    prior_count = len(node_ids)
+                    node_ids.update(id(statement) for statement in statements if statement is not None)
+                    changed = changed or len(node_ids) != prior_count
+        if not changed:
+            break
+    return deterministic_node_ids
+
+
+def _propagated_ambiguous_assignment_nodes(
+    nodes: tuple[ast.AST, ...],
+    ambiguous_assignment_nodes: dict[str, set[int]],
+    deterministic_node_ids: dict[str, set[int]],
+    *,
+    propagate_reads: bool,
+) -> tuple[dict[str, set[int]], dict[str, set[int]]]:
+    effective_ambiguous_node_ids = {
+        target_name: node_ids - deterministic_node_ids.get(target_name, set())
+        for target_name, node_ids in ambiguous_assignment_nodes.items()
+        if node_ids - deterministic_node_ids.get(target_name, set())
+    }
+    propagated_assignment_nodes: dict[str, set[int]] = {}
+    if not propagate_reads:
+        return effective_ambiguous_node_ids, propagated_assignment_nodes
+    active_ambiguous_targets: set[str] = set()
+    for node in nodes:
+        target_names = _assignment_alias_target_names(node)
+        if not target_names:
+            continue
+        reads_ambiguous_target = bool(_assignment_alias_read_names(node) & active_ambiguous_targets)
+        for target_name in target_names:
+            conditional_node_ids = effective_ambiguous_node_ids.get(target_name, set())
+            if id(node) in conditional_node_ids or reads_ambiguous_target:
+                if reads_ambiguous_target:
+                    effective_ambiguous_node_ids.setdefault(target_name, set()).add(id(node))
+                    propagated_assignment_nodes.setdefault(target_name, set()).add(id(node))
+                active_ambiguous_targets.add(target_name)
+            else:
+                active_ambiguous_targets.discard(target_name)
+    return effective_ambiguous_node_ids, propagated_assignment_nodes
+
+
 def _collect_assignment_aliases(
     nodes: Iterable[ast.AST],
     module_name: str,
@@ -1664,10 +2055,22 @@ def _collect_assignment_aliases(
 ) -> dict[str, str]:
     node_list = tuple(nodes)
     assignment_aliases: dict[str, str] = {}
+    source_path = _resolve_module_source(module_name)
+    conditionally_rebound_node_ids, terminal_assignment_group_sets = _conditionally_rebound_assignment_nodes(node_list)
+    seen_states: set[tuple[tuple[str, str], ...]] = {()}
+    passes = 0
 
     changed = True
     while changed and len(assignment_aliases) < _MAX_ASSIGNMENT_ALIASES:
+        if passes >= _MAX_ASSIGNMENT_ALIAS_PASSES:
+            raise _CallGraphAnalysisLimitError(
+                f"assignment alias analysis exceeded {_MAX_ASSIGNMENT_ALIAS_PASSES} propagation passes"
+            )
+        passes += 1
+        state = tuple(sorted(assignment_aliases.items()))
         changed = False
+        last_changed_node_ids: dict[str, int] = {}
+        last_resolved_node_ids: dict[str, int] = {}
         scoped_aliases = {**aliases, **assignment_aliases}
         for node in node_list:
             resolved = _assignment_alias_value(
@@ -1681,12 +2084,50 @@ def _collect_assignment_aliases(
             if resolved is None:
                 continue
             for target_name in _assignment_alias_target_names(node):
+                last_resolved_node_ids[target_name] = id(node)
                 if assignment_aliases.get(target_name) == resolved:
                     continue
                 assignment_aliases[target_name] = resolved
                 changed = True
+                last_changed_node_ids[target_name] = id(node)
                 if len(assignment_aliases) >= _MAX_ASSIGNMENT_ALIASES:
                     break
+        next_state = tuple(sorted(assignment_aliases.items()))
+        if next_state == state:
+            deterministic_node_ids = _resolved_terminal_assignment_nodes(
+                node_list,
+                terminal_assignment_group_sets,
+                conditionally_rebound_node_ids,
+                module_name,
+                {**aliases, **assignment_aliases},
+                local_defs,
+                local_class_targets,
+                class_name=class_name,
+            )
+            effective_conditionally_rebound_node_ids, propagated_rebound_node_ids = (
+                _propagated_ambiguous_assignment_nodes(
+                    node_list,
+                    conditionally_rebound_node_ids,
+                    deterministic_node_ids,
+                    propagate_reads=source_path is None or not _is_stdlib_source_path(str(source_path)),
+                )
+            )
+            changed_conditionally = any(
+                node_id in effective_conditionally_rebound_node_ids.get(target_name, set())
+                for target_name, node_id in last_changed_node_ids.items()
+            )
+            resolved_from_conditional_read = any(
+                node_id in propagated_rebound_node_ids.get(target_name, set())
+                for target_name, node_id in last_resolved_node_ids.items()
+            )
+            if changed_conditionally or resolved_from_conditional_read:
+                raise _CallGraphAnalysisLimitError(
+                    "assignment alias analysis encountered ambiguous conditional rebinding"
+                )
+            break
+        if next_state in seen_states:
+            raise _CallGraphAnalysisLimitError("assignment alias analysis entered a propagation cycle")
+        seen_states.add(next_state)
     return assignment_aliases
 
 
@@ -1753,6 +2194,73 @@ def _assignment_alias_target_names(node: ast.AST) -> set[str]:
     if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
         return {node.target.id}
     return set()
+
+
+def _assignment_alias_read_names(node: ast.AST) -> set[str]:
+    if not isinstance(node, ast.Assign | ast.AnnAssign) or node.value is None:
+        return set()
+    value = node.value
+    if isinstance(value, ast.Call):
+        value = value.func
+    while isinstance(value, ast.Attribute):
+        value = value.value
+    if isinstance(value, ast.Name):
+        return {value.id}
+    return set()
+
+
+def _assignment_value_read_names(node: ast.Assign | ast.AnnAssign) -> set[str]:
+    if node.value is None:
+        return set()
+
+    names: set[str] = set()
+
+    def binding_names(target: ast.AST) -> set[str]:
+        return {child.id for child in ast.walk(target) if isinstance(child, ast.Name)}
+
+    def visit(value: ast.AST, bound_names: set[str]) -> None:
+        if isinstance(value, ast.Name):
+            if isinstance(value.ctx, ast.Load) and value.id not in bound_names:
+                names.add(value.id)
+            return
+        if isinstance(value, ast.Lambda):
+            for default in (
+                *value.args.defaults,
+                *(default for default in value.args.kw_defaults if default is not None),
+            ):
+                visit(default, bound_names)
+            lambda_bound_names = {
+                argument.arg
+                for argument in (
+                    *value.args.posonlyargs,
+                    *value.args.args,
+                    *value.args.kwonlyargs,
+                )
+            }
+            if value.args.vararg is not None:
+                lambda_bound_names.add(value.args.vararg.arg)
+            if value.args.kwarg is not None:
+                lambda_bound_names.add(value.args.kwarg.arg)
+            visit(value.body, bound_names | lambda_bound_names)
+            return
+        if isinstance(value, ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp):
+            comprehension_bound_names = set(bound_names)
+            for generator in value.generators:
+                visit(generator.iter, comprehension_bound_names)
+                comprehension_bound_names.update(binding_names(generator.target))
+                for condition in generator.ifs:
+                    visit(condition, comprehension_bound_names)
+            if isinstance(value, ast.DictComp):
+                visit(value.key, comprehension_bound_names)
+                visit(value.value, comprehension_bound_names)
+            else:
+                visit(value.elt, comprehension_bound_names)
+            return
+        for child in ast.iter_child_nodes(value):
+            visit(child, bound_names)
+
+    visit(node.value, set())
+    return names
 
 
 def _is_local_class_member_alias(resolved: str, local_class_targets: set[str]) -> bool:

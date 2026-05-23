@@ -14,6 +14,7 @@ from .call_graph import (
     CallGraphFinding,
     StartupHookWriteFinding,
     UnanalyzedCallGraphReference,
+    _CallGraphAnalysisLimitError,
     find_dangerous_call_graphs,
     find_startup_hook_write_call_graphs,
     find_unanalyzed_callable_call_graph_references,
@@ -1012,6 +1013,9 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
     with shared_source_sensitive_caches():
         try:
             call_graph_findings = find_dangerous_call_graphs(import_references, callable_invocations)
+        except _CallGraphAnalysisLimitError as error:
+            call_graph_findings = error.partial_findings
+            enrichment_errors.append(("python_call_graph", error))
         except Exception as error:
             call_graph_findings = ()
             enrichment_errors.append(("python_call_graph", error))
@@ -1020,6 +1024,9 @@ def _with_call_graph_findings(report: PickleReport) -> PickleReport:
                 import_references,
                 callable_invocations,
             )
+        except _CallGraphAnalysisLimitError as error:
+            startup_hook_write_findings = error.partial_startup_hook_write_findings
+            enrichment_errors.append(("python_call_graph_startup_hook_write", error))
         except Exception as error:
             startup_hook_write_findings = ()
             enrichment_errors.append(("python_call_graph_startup_hook_write", error))

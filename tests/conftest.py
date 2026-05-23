@@ -192,6 +192,7 @@ def pytest_runtest_setup(item):
             "test_call_graph_local_imports.py",  # standalone picklescan function-local import RCE regressions
             "test_call_graph_six.py",  # standalone picklescan six.moves alias RCE regressions
             "test_call_graph_tkinter.py",  # standalone picklescan Tcl call-graph RCE regressions
+            "test_call_graph_assignment_alias_cycle.py",  # standalone picklescan alias fixpoint termination regressions
             "test_dill_joblib_enhanced.py",  # Dill/joblib pickle routing regression tests
             "test_pickle_context_filtering.py",  # Pickle context filtering regression tests
             "test_xdist_status.py",  # xdist worker progress reporting tests
