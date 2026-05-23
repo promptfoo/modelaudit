@@ -335,6 +335,50 @@ class TestAdvancedFileHandler:
         assert coverage_checks[0].details["missing_shard_indices"] == [2]
         assert coverage_checks[0].details["missing_shard_indices_truncated"] is False
 
+    def test_sharded_model_broken_shard_marks_scan_inconclusive(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Unreadable shard links should be reported as missing instead of aborting expansion."""
+        shard_one = tmp_path / "model-00001-of-00002.safetensors"
+        shard_two = tmp_path / "model-00002-of-00002.safetensors"
+        shard_one.write_bytes(b"safe")
+        shard_two.symlink_to(tmp_path / "missing-shard")
+
+        handler = AdvancedFileHandler(str(shard_one), CompletingShardScanner())
+        result = handler.scan()
+
+        coverage_checks = [check for check in result.checks if check.name == "Sharded Model Coverage Check"]
+        assert result.success is False
+        assert result.bytes_scanned == shard_one.stat().st_size
+        assert len(coverage_checks) == 1
+        assert coverage_checks[0].details["missing_shard_count"] == 1
+        assert coverage_checks[0].details["unreadable_shard_count"] == 1
+        assert coverage_checks[0].details["unreadable_shards"] == [str(shard_two)]
+
+    def test_sharded_model_broken_shard_without_declared_total_marks_scan_inconclusive(
+        self,
+        tmp_path: Path,
+        requires_symlinks: None,
+    ) -> None:
+        """Unreadable members cannot be silently dropped when a family has no declared total."""
+        shard_one = tmp_path / "checkpoint_1.pt"
+        shard_two = tmp_path / "checkpoint_2.pt"
+        shard_one.write_bytes(b"safe")
+        shard_two.symlink_to(tmp_path / "missing-shard")
+
+        handler = AdvancedFileHandler(str(shard_one), CompletingShardScanner())
+        result = handler.scan()
+
+        coverage_checks = [check for check in result.checks if check.name == "Sharded Model Coverage Check"]
+        assert result.success is False
+        assert result.bytes_scanned == shard_one.stat().st_size
+        assert "unreadable_model_shards" in result.metadata["scan_outcome_reasons"]
+        assert len(coverage_checks) == 1
+        assert coverage_checks[0].details["unreadable_shard_count"] == 1
+        assert coverage_checks[0].details["unreadable_shards"] == [str(shard_two)]
+
     def test_sharded_model_honors_allowed_shard_paths(self, tmp_path: Path) -> None:
         """Restricted shard scans must not expand beyond the validated allowlist."""
         shard_one = tmp_path / "model-00001-of-00002.safetensors"
@@ -352,6 +396,27 @@ class TestAdvancedFileHandler:
         shard_detection = next(check for check in result.checks if check.name == "Sharded Model Detection")
         assert shard_detection.details["shards"] == [str(shard_one)]
         assert result.bytes_scanned == shard_one.stat().st_size
+
+    def test_sharded_model_preserves_scanner_config_for_each_shard(self, tmp_path: Path) -> None:
+        """Shard fanout should retain caller configuration for each scanner instance."""
+        shard_one = tmp_path / "model-00001-of-00002.safetensors"
+        shard_two = tmp_path / "model-00002-of-00002.safetensors"
+        shard_one.write_bytes(b"one")
+        shard_two.write_bytes(b"two")
+        captured_configs: list[dict[str, Any]] = []
+
+        class ConfiguredShardScanner(CompletingShardScanner):
+            def __init__(self, config: dict[str, Any] | None = None) -> None:
+                self.config = dict(config or {})
+                captured_configs.append(self.config)
+
+        scanner = ConfiguredShardScanner({"max_tensor_bytes": 7})
+        captured_configs.clear()
+
+        result = AdvancedFileHandler(str(shard_one), scanner).scan()
+
+        assert result.success is True
+        assert captured_configs == [{"max_tensor_bytes": 7}, {"max_tensor_bytes": 7}]
 
     def test_cached_advanced_scan_keys_allowed_shard_paths(self, tmp_path: Path) -> None:
         """Different validated shard allowlists must not share advanced-scan cache entries."""

@@ -141,6 +141,8 @@ class ShardedModelDetector:
                 shard_info: dict[str, Any] = {"pattern": pattern, "current_file": file_path, "shards": []}
                 expected_totals: set[int] = set()
                 present_indices: set[int] = set()
+                unreadable_shards: list[str] = []
+                total_size = 0
 
                 # Find all related shards
                 for file in dir_path.glob("*"):
@@ -148,7 +150,13 @@ class ShardedModelDetector:
                     if file_match:
                         if allowed_path_set is not None and str(file.resolve()) not in allowed_path_set:
                             continue
+                        try:
+                            shard_size = os.path.getsize(file)
+                        except OSError:
+                            unreadable_shards.append(str(file))
+                            continue
                         shard_info["shards"].append(str(file))
+                        total_size += shard_size
                         if file_match.lastindex:
                             with suppress(IndexError, ValueError):
                                 present_indices.add(int(file_match.group(1)))
@@ -156,8 +164,14 @@ class ShardedModelDetector:
                             with suppress(IndexError, ValueError):
                                 expected_totals.add(int(file_match.group(2)))
 
+                if not shard_info["shards"]:
+                    return None
+
                 shard_info["shards"].sort()
                 shard_info["total_shards"] = len(shard_info["shards"])
+                if unreadable_shards:
+                    shard_info["unreadable_shards"] = sorted(unreadable_shards)
+                    shard_info["unreadable_shard_count"] = len(unreadable_shards)
                 if expected_totals:
                     expected_total = max(expected_totals)
                     shard_info["expected_total_shards"] = expected_total
@@ -173,8 +187,6 @@ class ShardedModelDetector:
                             shard_info["missing_shard_indices"] = missing_indices
                             shard_info["missing_shard_indices_truncated"] = missing_indices_truncated
 
-                # Calculate total size
-                total_size = sum(os.path.getsize(s) for s in shard_info["shards"])
                 shard_info["total_size"] = total_size
 
                 return shard_info
@@ -340,16 +352,23 @@ class MemoryMappedHandler:
 class ParallelShardHandler:
     """Scan multiple model shards in parallel."""
 
-    def __init__(self, shard_info: dict[str, Any], scanner_class: type):
+    def __init__(
+        self,
+        shard_info: dict[str, Any],
+        scanner_class: type,
+        scanner_config: dict[str, Any] | None = None,
+    ):
         """
         Initialize parallel shard scanner.
 
         Args:
             shard_info: Information about model shards
             scanner_class: Scanner class to use
+            scanner_config: Configuration to preserve for each shard scanner
         """
         self.shard_info = shard_info
         self.scanner_class = scanner_class
+        self.scanner_config = scanner_config
 
     def scan_shards(self, progress_callback: Callable[[str, float], None] | None = None) -> "ScanResult":
         from ...scanner_results import IssueSeverity, ScanResult
@@ -425,7 +444,11 @@ class ParallelShardHandler:
         from ...scanner_results import ScanResult
 
         """Scan a single shard file."""
-        scanner = self.scanner_class()
+        scanner = (
+            self.scanner_class(config=dict(self.scanner_config))
+            if self.scanner_config is not None
+            else self.scanner_class()
+        )
         result: ScanResult = scanner.scan(shard_path)
         return result
 
@@ -560,11 +583,17 @@ class AdvancedFileHandler:
         # Scan shards in parallel
         shard_scan_success = True
         if self.shard_info:
-            parallel_scanner = ParallelShardHandler(self.shard_info, self.scanner.__class__)
+            scanner_config = getattr(self.scanner, "config", None)
+            parallel_scanner = ParallelShardHandler(
+                self.shard_info,
+                self.scanner.__class__,
+                scanner_config=dict(scanner_config) if isinstance(scanner_config, dict) else None,
+            )
             shard_results = parallel_scanner.scan_shards(self.progress_callback)
             shard_scan_success = bool(shard_results.success)
             result.merge(shard_results)
             missing_count = self.shard_info.get("missing_shard_count")
+            unreadable_count = self.shard_info.get("unreadable_shard_count")
             if isinstance(missing_count, int) and missing_count > 0:
                 _mark_inconclusive_scan_outcome(result, "missing_model_shards")
                 result.add_check(
@@ -580,9 +609,27 @@ class AdvancedFileHandler:
                         "missing_shard_indices_truncated": self.shard_info.get(
                             "missing_shard_indices_truncated", False
                         ),
+                        "unreadable_shard_count": self.shard_info.get("unreadable_shard_count", 0),
+                        "unreadable_shards": self.shard_info.get("unreadable_shards", []),
                         "analysis_incomplete": True,
                         "scan_outcome": "inconclusive",
                         "scan_outcome_reason": "missing_model_shards",
+                    },
+                )
+            elif isinstance(unreadable_count, int) and unreadable_count > 0:
+                _mark_inconclusive_scan_outcome(result, "unreadable_model_shards")
+                result.add_check(
+                    name="Sharded Model Coverage Check",
+                    passed=False,
+                    message=f"Unable to read {unreadable_count} model shard(s); scan coverage is incomplete.",
+                    severity=IssueSeverity.INFO,
+                    details={
+                        "present_total_shards": self.shard_info.get("total_shards"),
+                        "unreadable_shard_count": unreadable_count,
+                        "unreadable_shards": self.shard_info.get("unreadable_shards", []),
+                        "analysis_incomplete": True,
+                        "scan_outcome": "inconclusive",
+                        "scan_outcome_reason": "unreadable_model_shards",
                     },
                 )
 
