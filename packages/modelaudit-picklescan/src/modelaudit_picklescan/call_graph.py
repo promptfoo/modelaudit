@@ -2087,6 +2087,8 @@ def _assignment_alias_read_names(node: ast.AST) -> set[str]:
     if not isinstance(node, ast.Assign | ast.AnnAssign) or node.value is None:
         return set()
     value = node.value
+    if isinstance(value, ast.Call):
+        value = value.func
     while isinstance(value, ast.Attribute):
         value = value.value
     if isinstance(value, ast.Name):

@@ -201,6 +201,27 @@ exposed = m
 m = Final()
 """
 
+_CALL_READ_BEFORE_UNCONDITIONAL_OVERWRITE_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+class Final:
+    pass
+
+
+if cond:
+    m = A()
+else:
+    m = B()
+exposed = m()
+m = Final()
+"""
+
 _OVERWRITE_BEFORE_READ_SOURCE = """\
 class A:
     pass
@@ -459,6 +480,7 @@ def _run_with_timeout(target: object, timeout: float = 10.0) -> None:
         _LOOP_ELSE_REBIND_SOURCE,
         _LOOP_EARLY_BREAK_BEFORE_TERMINAL_REBIND_SOURCE,
         _READ_BEFORE_UNCONDITIONAL_OVERWRITE_SOURCE,
+        _CALL_READ_BEFORE_UNCONDITIONAL_OVERWRITE_SOURCE,
         _ONE_SIDED_REBIND_SOURCE,
         _NONEXHAUSTIVE_MATCH_OVERWRITE_SOURCE,
         _CONDITIONALLY_REBOUND_TERMINAL_DEPENDENCY_SOURCE,
@@ -470,6 +492,7 @@ def _run_with_timeout(target: object, timeout: float = 10.0) -> None:
         "loop-else",
         "loop-early-break",
         "read-before-overwrite",
+        "call-read-before-overwrite",
         "one-sided-rebind",
         "match-no-default",
         "conditional-terminal-dependency",
