@@ -62,6 +62,51 @@ b = a
 c = a
 """
 
+_SEQUENTIAL_REBIND_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+m = A()
+m = B()
+"""
+
+_TRY_REBIND_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+try:
+    m = A()
+    operation()
+except Exception:
+    m = B()
+"""
+
+_LOOP_ELSE_REBIND_SOURCE = """\
+class A:
+    pass
+
+
+class B:
+    pass
+
+
+for value in values:
+    m = A()
+    break
+else:
+    m = B()
+"""
+
 
 def _run_with_timeout(target: object, timeout: float = 10.0) -> None:
     thread = threading.Thread(target=target)  # type: ignore[arg-type]
@@ -72,26 +117,50 @@ def _run_with_timeout(target: object, timeout: float = 10.0) -> None:
         pytest.fail(f"call-graph analysis did not terminate within {timeout}s")
 
 
-def test_collect_assignment_aliases_converges_on_stable_branch_rebind() -> None:
-    tree = ast.parse(_OSCILLATING_MODULE_SOURCE)
+@pytest.mark.parametrize(
+    "source",
+    (_OSCILLATING_MODULE_SOURCE, _TRY_REBIND_SOURCE, _LOOP_ELSE_REBIND_SOURCE),
+    ids=("if-else", "try-except", "loop-else"),
+)
+def test_collect_assignment_aliases_fails_closed_on_stable_branch_rebind(source: str) -> None:
+    tree = ast.parse(source)
     statements = _module_level_statements(tree)
     local_defs = _collect_local_defs(statements)
     local_class_targets = {"testmod.A", "testmod.B"}
 
-    result: dict[str, dict[str, str]] = {}
+    result: dict[str, bool] = {}
 
     def _collect() -> None:
-        result["aliases"] = _collect_assignment_aliases(
-            statements,
-            "testmod",
-            {},
-            local_defs,
-            local_class_targets,
-        )
+        with pytest.raises(_CallGraphAnalysisLimitError, match="ambiguous conditional rebinding"):
+            _collect_assignment_aliases(
+                statements,
+                "testmod",
+                {},
+                local_defs,
+                local_class_targets,
+            )
+        result["limited"] = True
 
     _run_with_timeout(_collect)
 
-    assert result["aliases"]["m"] == "testmod.B"
+    assert result == {"limited": True}
+
+
+def test_collect_assignment_aliases_converges_on_sequential_rebind() -> None:
+    tree = ast.parse(_SEQUENTIAL_REBIND_SOURCE)
+    statements = _module_level_statements(tree)
+    local_defs = _collect_local_defs(statements)
+    local_class_targets = {"testmod.A", "testmod.B"}
+
+    aliases = _collect_assignment_aliases(
+        statements,
+        "testmod",
+        {},
+        local_defs,
+        local_class_targets,
+    )
+
+    assert aliases["m"] == "testmod.B"
 
 
 def test_collect_assignment_aliases_fails_closed_on_cyclic_dependency_propagation() -> None:

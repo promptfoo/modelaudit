@@ -1689,6 +1689,37 @@ def _local_class_node_from_target(
     return local_class_nodes.get(class_name)
 
 
+def _conditionally_rebound_assignment_targets(nodes: Iterable[ast.AST]) -> set[str]:
+    """Return names assigned in multiple flattened alternate control-flow paths."""
+    ambiguous_targets: set[str] = set()
+    for node in nodes:
+        branch_bodies: tuple[Iterable[ast.stmt], ...]
+        if isinstance(node, ast.If):
+            branch_bodies = (node.body, node.orelse)
+        elif isinstance(node, ast.Try):
+            branch_bodies = (
+                (*node.body, *node.orelse),
+                *(handler.body for handler in node.handlers),
+            )
+        elif isinstance(node, ast.For | ast.AsyncFor | ast.While):
+            branch_bodies = (node.body, node.orelse)
+        elif isinstance(node, ast.Match):
+            branch_bodies = tuple(case.body for case in node.cases)
+        else:
+            continue
+
+        seen_targets: set[str] = set()
+        for branch_body in branch_bodies:
+            branch_targets = {
+                target_name
+                for statement in _definition_scope_statements(branch_body)
+                for target_name in _assignment_alias_target_names(statement)
+            }
+            ambiguous_targets.update(seen_targets & branch_targets)
+            seen_targets.update(branch_targets)
+    return ambiguous_targets
+
+
 def _collect_assignment_aliases(
     nodes: Iterable[ast.AST],
     module_name: str,
@@ -1700,8 +1731,7 @@ def _collect_assignment_aliases(
 ) -> dict[str, str]:
     node_list = tuple(nodes)
     assignment_aliases: dict[str, str] = {}
-    # A source-flattened branch may rebind one name during every pass while its
-    # final state stays stable. Only completed-pass state cycles are incomplete.
+    conditionally_rebound_targets = _conditionally_rebound_assignment_targets(node_list)
     seen_states: set[tuple[tuple[str, str], ...]] = {()}
     passes = 0
 
@@ -1714,6 +1744,7 @@ def _collect_assignment_aliases(
         passes += 1
         state = tuple(sorted(assignment_aliases.items()))
         changed = False
+        changed_targets: set[str] = set()
         scoped_aliases = {**aliases, **assignment_aliases}
         for node in node_list:
             resolved = _assignment_alias_value(
@@ -1731,10 +1762,15 @@ def _collect_assignment_aliases(
                     continue
                 assignment_aliases[target_name] = resolved
                 changed = True
+                changed_targets.add(target_name)
                 if len(assignment_aliases) >= _MAX_ASSIGNMENT_ALIASES:
                     break
         next_state = tuple(sorted(assignment_aliases.items()))
         if next_state == state:
+            if changed_targets & conditionally_rebound_targets:
+                raise _CallGraphAnalysisLimitError(
+                    "assignment alias analysis encountered ambiguous conditional rebinding"
+                )
             break
         if next_state in seen_states:
             raise _CallGraphAnalysisLimitError("assignment alias analysis entered a propagation cycle")
