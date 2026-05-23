@@ -508,6 +508,45 @@ def test_onnx_scanner_subgraph_pyop_still_flagged(tmp_path: Path) -> None:
     assert all(issue.severity == IssueSeverity.CRITICAL for issue in python_operator_issues)
 
 
+def test_onnx_scanner_subgraph_snake_python_op_still_flagged(tmp_path: Path) -> None:
+    """A nested structural Python op must not depend on the raw-byte detector."""
+    then_branch = helper.make_graph(
+        [helper.make_node("Python_Op", ["X"], ["Z"])],
+        "then",
+        [],
+        [helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1])],
+    )
+    else_branch = helper.make_graph(
+        [helper.make_node("Identity", ["X"], ["Z"])],
+        "else",
+        [],
+        [helper.make_tensor_value_info("Z", TensorProto.FLOAT, [1])],
+    )
+    graph = helper.make_graph(
+        [helper.make_node("If", ["cond"], ["Y"], then_branch=then_branch, else_branch=else_branch)],
+        "graph",
+        [
+            helper.make_tensor_value_info("cond", TensorProto.BOOL, []),
+            helper.make_tensor_value_info("X", TensorProto.FLOAT, [1]),
+        ],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1])],
+    )
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 13)])
+    model.ir_version = 8
+    model_path = tmp_path / "subgraph_snake_python_op.onnx"
+    onnx.save(model, str(model_path))
+
+    result = OnnxScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "Python Operator Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("op_type") == "Python_Op"
+        for check in result.checks
+    )
+
+
 @pytest.mark.parametrize("training_graph_field", ["initialization", "algorithm"])
 def test_onnx_scanner_training_graph_pyop_still_flagged(tmp_path: Path, training_graph_field: str) -> None:
     """A PyOp in either training graph must not be discarded as weight-data noise."""
