@@ -1376,8 +1376,9 @@ def test_scan_file_detects_hidden_pytorch_zip_pickle_member_without_data_pickle(
 
 def test_scan_file_leaves_hidden_pickle_like_zip_without_pytorch_metadata_unrecognized(tmp_path: Path) -> None:
     archive_path = tmp_path / "hidden-only.zip"
+    entry = zipfile.ZipInfo("archive/payload", (1980, 1, 1, 0, 0, 0))
     with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("archive/payload", pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
+        archive.writestr(entry, pickle.dumps({"weights": [1, 2, 3]}, protocol=4))
 
     report = scan_file(archive_path)
 
