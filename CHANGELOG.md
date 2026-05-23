@@ -12,8 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - avoid repeatedly scanning sharded model families during directory scans
 - keep shard sibling discovery within the requested scan root
 - preserve per-shard metadata when aggregating sharded model families
-- reject plain PyTorch source text from Torch7 content routing
 - prevent picklescan call-graph alias cycles from hanging scans
+- distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
 
 ## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
 

