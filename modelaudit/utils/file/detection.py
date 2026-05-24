@@ -1320,7 +1320,7 @@ def detect_file_format_from_magic(path: str) -> str:
             # Use bounded signature markers for deterministic identification.
             f.seek(0)
             cntk_prefix = f.read(_CNTK_SIGNATURE_READ_BYTES)
-            if _is_cntk_signature(cntk_prefix):
+            if file_path.suffix.lower() != ".model" and _is_cntk_signature(cntk_prefix):
                 return "cntk"
 
             f.seek(0)
@@ -1426,10 +1426,16 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if format_result != "unknown":
             return format_result
 
+        cntk_probe_size = min(size, _CNTK_SIGNATURE_READ_BYTES)
+        if len(prefix) < cntk_probe_size:
+            prefix += f.read(cntk_probe_size - len(prefix))
+        if file_path.suffix.lower() != ".model" and _is_cntk_signature(prefix[:cntk_probe_size]):
+            return "cntk"
+
         lightgbm_probe_size = min(size, _LIGHTGBM_SIGNATURE_READ_BYTES)
         if len(prefix) < lightgbm_probe_size:
             prefix += f.read(lightgbm_probe_size - len(prefix))
-        if _is_lightgbm_signature(prefix):
+        if _is_lightgbm_signature(prefix[:lightgbm_probe_size]):
             return "lightgbm"
 
         if _could_start_proto0_or_1_pickle(prefix):
@@ -1553,6 +1559,12 @@ def detect_file_format(path: str) -> str:
         )
         if xml_format != "unknown":
             return xml_format
+
+    signature_prefix = read_magic_bytes(path, max(_CNTK_SIGNATURE_READ_BYTES, _LIGHTGBM_SIGNATURE_READ_BYTES))
+    if ext != ".model" and _is_cntk_signature(signature_prefix[:_CNTK_SIGNATURE_READ_BYTES]):
+        return "cntk"
+    if _is_lightgbm_signature(signature_prefix[:_LIGHTGBM_SIGNATURE_READ_BYTES]):
+        return "lightgbm"
 
     # For .bin files, do more sophisticated detection
     if ext == ".bin":

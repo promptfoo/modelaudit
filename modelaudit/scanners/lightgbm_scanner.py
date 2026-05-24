@@ -153,9 +153,6 @@ class LightGBMScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        if os.path.splitext(path)[1].lower() not in cls.supported_extensions:
-            return False
-
         try:
             with open(path, "rb") as file_obj:
                 preview = file_obj.read(cls._SIGNATURE_READ_BYTES)

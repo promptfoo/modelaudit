@@ -327,6 +327,46 @@ def test_detect_cntk_formats_by_signature(tmp_path: Path) -> None:
     assert detect_file_format_from_magic(str(v2_path)) == "cntk"
 
 
+def test_detect_renamed_cntk_by_strict_signature_only(tmp_path: Path) -> None:
+    renamed = tmp_path / "graph.jpg"
+    renamed.write_bytes(
+        b"\x0a\x07version\x12\x031.0\x12\x09\x0a\x03uid\x12\x02ab CompositeFunction primitive_functions"
+    )
+    near_match = tmp_path / "notes.jpg"
+    near_match.write_bytes(b"\x0a\x07version\x12\x031.0\x12\x09\x0a\x03uid\x12\x02ab")
+
+    assert detect_file_format(str(renamed)) == "cntk"
+    assert detect_file_format_from_magic(str(renamed)) == "cntk"
+    assert detect_file_format(str(near_match)) == "unknown"
+    assert detect_file_format_from_magic(str(near_match)) == "unknown"
+
+
+def test_detect_cntk_model_extension_remains_excluded_for_xgboost_overlap(tmp_path: Path) -> None:
+    deferred = tmp_path / "deferred.model"
+    deferred.write_bytes(
+        b"\x0a\x07version\x12\x031.0\x12\x09\x0a\x03uid\x12\x02ab CompositeFunction primitive_functions"
+    )
+
+    assert detect_file_format(str(deferred)) != "cntk"
+    assert detect_file_format_from_magic(str(deferred)) != "cntk"
+
+
+def test_detect_renamed_lightgbm_by_strict_signature_only(tmp_path: Path) -> None:
+    renamed = tmp_path / "tree.jpg"
+    renamed.write_text(
+        "tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
+        "tree_sizes=12\nTree=0\nnum_leaves=2\nsplit_feature=0\nleaf_value=0.1 0.2\n",
+        encoding="utf-8",
+    )
+    near_match = tmp_path / "tree-notes.jpg"
+    near_match.write_text("tree=0\nversion=v4\nnum_class=1\n", encoding="utf-8")
+
+    assert detect_file_format(str(renamed)) == "lightgbm"
+    assert detect_file_format_from_magic(str(renamed)) == "lightgbm"
+    assert detect_file_format(str(near_match)) == "unknown"
+    assert detect_file_format_from_magic(str(near_match)) == "unknown"
+
+
 def test_detect_tf_metagraph_by_strict_parse(tmp_path: Path) -> None:
     """Detect TensorFlow MetaGraph `.meta` files through strict protobuf parsing."""
     if not _has_tf_protos():

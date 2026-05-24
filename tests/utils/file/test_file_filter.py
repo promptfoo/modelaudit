@@ -33,6 +33,12 @@ def _build_lightgbm_text() -> str:
     )
 
 
+def _write_cntkv2(path: Path, include_structure: bool = True) -> None:
+    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+    structure = b" CompositeFunction primitive_functions " if include_structure else b""
+    path.write_bytes(prefix + structure + b" inputs outputs ")
+
+
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
     """Patch a ZIP member CRC so reading the member raises BadZipFile."""
     with zipfile.ZipFile(path) as archive:
@@ -255,11 +261,27 @@ class TestFileFilter:
 
     def test_disguised_lightgbm_text_model_bypasses_default_skip(self, tmp_path: Path) -> None:
         """Default skip filtering must preserve supported text models under skipped suffixes."""
-        disguised_lightgbm = tmp_path / "model.txt"
+        disguised_lightgbm = tmp_path / "model.jpg"
         disguised_lightgbm.write_text(("# preface\n" * 64) + _build_lightgbm_text(), encoding="utf-8")
+        near_match = tmp_path / "near_match.jpg"
+        near_match.write_text("tree=0\nversion=v4\nnum_class=1\n", encoding="utf-8")
 
         assert detect_file_format_for_skip_filter(str(disguised_lightgbm)) == "lightgbm"
+        assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
         assert not should_skip_file(str(disguised_lightgbm))
+        assert should_skip_file(str(near_match))
+
+    def test_disguised_cntk_model_bypasses_default_skip(self, tmp_path: Path) -> None:
+        """Default skip filtering must preserve strict CNTK signatures under skipped suffixes."""
+        disguised_cntk = tmp_path / "model.jpg"
+        _write_cntkv2(disguised_cntk)
+        near_match = tmp_path / "near_match.jpg"
+        _write_cntkv2(near_match, include_structure=False)
+
+        assert detect_file_format_for_skip_filter(str(disguised_cntk)) == "cntk"
+        assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+        assert not should_skip_file(str(disguised_cntk))
+        assert should_skip_file(str(near_match))
 
     def test_disguised_xml_models_with_long_prologs_bypass_default_skip(self, tmp_path: Path) -> None:
         """Skipped suffixes must not hide XML model roots after long benign prologs."""
