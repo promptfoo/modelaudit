@@ -45,7 +45,7 @@ This page shows which model formats work in base install and which require optio
 ## Notes
 
 - Scanner selection is extension- and content-aware; overlapping extensions may be dispatched to different scanners based on file content.
-- TensorFlow MetaGraph content routing recognizes renamed protobufs only after strict structural validation; oversized plausible candidates are retained for fail-closed bounded analysis.
+- TensorFlow SavedModel/MetaGraph content routing recognizes renamed protobufs only after strict structural validation; oversized plausible candidates are retained for fail-closed bounded analysis.
 - Runtime scanner selection is available with `modelaudit scan --scanners ...` and `--exclude-scanner ...`; use `modelaudit scan --list-scanners` to discover scanner IDs.
 - Compressed wrappers enforce limits via `compressed_max_decompressed_bytes`, `compressed_max_decompression_ratio`, and `compressed_max_depth`.
 - R serialized (`.rds/.rda/.rdata`) support is static-only: ModelAudit does not execute R code or evaluate objects in an R runtime.

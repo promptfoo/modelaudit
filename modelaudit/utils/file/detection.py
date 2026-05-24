@@ -1099,6 +1099,35 @@ def _is_tensorflow_metagraph_file(path: str) -> bool:
         return False
 
 
+def _is_tensorflow_saved_model_file(path: str) -> bool:
+    file_path = Path(path)
+    if not file_path.is_file():
+        return False
+
+    try:
+        size = file_path.stat().st_size
+        if size < _TF_METAGRAPH_MIN_BYTES or size > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+            return False
+
+        import modelaudit.protos  # noqa: F401, I001
+
+        from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
+
+        saved_model = SavedModel()
+        saved_model.ParseFromString(file_path.read_bytes())
+        return any(
+            metagraph.HasField("graph_def")
+            and (
+                len(metagraph.graph_def.node) > 0
+                or any(function.node_def for function in metagraph.graph_def.library.function)
+                or len(metagraph.collection_def) > 0
+            )
+            for metagraph in saved_model.meta_graphs
+        )
+    except Exception:
+        return False
+
+
 def _read_proto_varint_stream(stream: BinaryIO) -> int | None:
     value = 0
     shift = 0
@@ -1135,8 +1164,8 @@ def _skip_proto_stream_value(stream: BinaryIO, wire_type: int, file_size: int) -
     return True
 
 
-def _has_bounded_metagraph_graph_field(path: Path, file_size: int) -> bool:
-    """Seek past top-level protobuf values while looking for MetaGraph graph_def."""
+def _has_bounded_tensorflow_graph_field(path: Path, file_size: int) -> bool:
+    """Seek past top-level protobuf values while looking for TensorFlow graph content."""
     try:
         with path.open("rb") as stream:
             for _ in range(_TF_METAGRAPH_MAX_ROUTING_FIELDS):
@@ -1162,13 +1191,18 @@ def _has_bounded_metagraph_graph_field(path: Path, file_size: int) -> bool:
     return True
 
 
-def _could_be_renamed_tensorflow_metagraph(file_path: Path, file_size: int) -> bool:
-    """Recognize renamed MetaGraphs by strict parsing after bounded field discovery."""
-    if file_path.suffix.lower() == ".meta" or not _has_bounded_metagraph_graph_field(file_path, file_size):
-        return False
+def _detect_renamed_tensorflow_protobuf(file_path: Path, file_size: int) -> str:
+    """Recognize renamed MetaGraph/SavedModel protobufs after bounded field discovery."""
+    if file_path.suffix.lower() in {".meta", ".pb"} or not _has_bounded_tensorflow_graph_field(file_path, file_size):
+        return "unknown"
     if file_size > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
-        return True
-    return _is_tensorflow_metagraph_file(str(file_path))
+        # Preserve plausible oversized content for bounded fail-closed MetaGraph handling.
+        return "tf_metagraph"
+    if _is_tensorflow_metagraph_file(str(file_path)):
+        return "tf_metagraph"
+    if _is_tensorflow_saved_model_file(str(file_path)):
+        return "tf_savedmodel"
+    return "unknown"
 
 
 def _has_torch7_ascii_object_signature(prefix: bytes) -> bool:
@@ -1427,8 +1461,9 @@ def detect_file_format_from_magic(path: str) -> str:
                 if xml_format != "unknown":
                     return xml_format
 
-            if _could_be_renamed_tensorflow_metagraph(file_path, size):
-                return "tf_metagraph"
+            renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
+            if renamed_tensorflow_format != "unknown":
+                return renamed_tensorflow_format
 
     except OSError:
         return "unknown"
@@ -1530,8 +1565,9 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             if xml_format != "unknown":
                 return xml_format
 
-    if _could_be_renamed_tensorflow_metagraph(file_path, size):
-        return "tf_metagraph"
+    renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
+    if renamed_tensorflow_format != "unknown":
+        return renamed_tensorflow_format
 
     return "unknown"
 
@@ -1634,8 +1670,9 @@ def detect_file_format(path: str) -> str:
         if xml_format != "unknown":
             return xml_format
 
-    if _could_be_renamed_tensorflow_metagraph(file_path, size):
-        return "tf_metagraph"
+    renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
+    if renamed_tensorflow_format != "unknown":
+        return renamed_tensorflow_format
 
     # For .bin files, do more sophisticated detection
     if ext == ".bin":

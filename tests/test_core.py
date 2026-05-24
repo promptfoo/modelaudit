@@ -54,6 +54,19 @@ def _build_malicious_tf_metagraph() -> bytes:
     return cast(bytes, metagraph.SerializeToString())
 
 
+def _build_malicious_tf_savedmodel() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
+    saved_model = saved_model_pb2.SavedModel()
+    saved_model.saved_model_schema_version = 1
+    metagraph = saved_model.meta_graphs.add()
+    node = metagraph.graph_def.node.add()
+    node.name = "pyfunc_node"
+    node.op = "PyFunc"
+    return cast(bytes, saved_model.SerializeToString())
+
+
 def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
     """Write a ZIP archive at an intentionally misleading file path."""
     with zipfile.ZipFile(path, "w") as archive:
@@ -1814,6 +1827,20 @@ def test_scan_file_detects_malicious_renamed_tf_metagraph_by_content(tmp_path: P
         issue.severity == IssueSeverity.CRITICAL
         and issue.message == "Dangerous TensorFlow operation: PyFunc"
         and issue.details.get("op_type") == "PyFunc"
+        for issue in result.issues
+    )
+
+
+def test_scan_file_detects_malicious_renamed_tf_savedmodel_by_content(tmp_path: Path) -> None:
+    disguised_savedmodel = tmp_path / "saved.jpg"
+    disguised_savedmodel.write_bytes(_build_malicious_tf_savedmodel())
+
+    result = scan_file(str(disguised_savedmodel), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "tf_savedmodel"
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "PyFunc operation detected" in issue.message
         for issue in result.issues
     )
 

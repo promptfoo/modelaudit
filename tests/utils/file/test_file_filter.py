@@ -29,6 +29,19 @@ def _build_tf_metagraph_bytes() -> bytes:
     return cast(bytes, metagraph.SerializeToString())
 
 
+def _build_tf_savedmodel_bytes() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
+    saved_model = saved_model_pb2.SavedModel()
+    saved_model.saved_model_schema_version = 1
+    metagraph = saved_model.meta_graphs.add()
+    node = metagraph.graph_def.node.add()
+    node.name = "const_node"
+    node.op = "Const"
+    return cast(bytes, saved_model.SerializeToString())
+
+
 def _build_lightgbm_text() -> str:
     return "\n".join(
         [
@@ -254,6 +267,17 @@ class TestFileFilter:
 
         assert detect_file_format_for_skip_filter(str(disguised_metagraph)) == "tf_metagraph"
         assert not should_skip_file(str(disguised_metagraph))
+        assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
+        assert should_skip_file(str(generic_protobuf))
+
+    def test_disguised_tf_savedmodel_bypasses_skip_without_promoting_generic_protobuf(self, tmp_path: Path) -> None:
+        disguised_savedmodel = tmp_path / "saved.jpg"
+        generic_protobuf = tmp_path / "generic.jpg"
+        disguised_savedmodel.write_bytes(_build_tf_savedmodel_bytes())
+        generic_protobuf.write_bytes(b"\x12\x02\x08\x01")
+
+        assert detect_file_format_for_skip_filter(str(disguised_savedmodel)) == "tf_savedmodel"
+        assert not should_skip_file(str(disguised_savedmodel))
         assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
         assert should_skip_file(str(generic_protobuf))
 

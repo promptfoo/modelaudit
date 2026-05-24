@@ -31,6 +31,19 @@ def _build_malicious_tf_metagraph() -> bytes:
     return cast(bytes, metagraph.SerializeToString())
 
 
+def _build_malicious_tf_savedmodel() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
+    saved_model = saved_model_pb2.SavedModel()
+    saved_model.saved_model_schema_version = 1
+    metagraph = saved_model.meta_graphs.add()
+    node = metagraph.graph_def.node.add()
+    node.name = "pyfunc_node"
+    node.op = "PyFunc"
+    return cast(bytes, saved_model.SerializeToString())
+
+
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
     """Patch a ZIP member CRC so full scanning sees a malformed entry."""
     with zipfile.ZipFile(path) as archive:
@@ -243,6 +256,17 @@ class TestDirectoryFileFiltering:
         assert "tf_metagraph" in results.scanner_names
         assert determine_exit_code(results) == 1
         assert any(issue.message == "Dangerous TensorFlow operation: PyFunc" for issue in results.issues)
+
+    def test_disguised_malicious_tf_savedmodel_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        disguised_payload = tmp_path / "saved.jpg"
+        disguised_payload.write_bytes(_build_malicious_tf_savedmodel())
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "tf_savedmodel" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any("PyFunc operation detected" in issue.message for issue in results.issues)
 
     @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
     def test_disguised_pickle_with_default_hidden_or_basename_skip_is_scanned(

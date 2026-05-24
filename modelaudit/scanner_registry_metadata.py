@@ -101,7 +101,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "class": "TensorFlowSavedModelScanner",
         "description": "Scans TensorFlow SavedModel for suspicious operations",
         "extensions": [".pb", ""],
-        "header_formats": ["tensorflow_directory", "protobuf"],
+        "header_formats": ["tensorflow_directory", "protobuf", "tf_savedmodel"],
         "priority": 4,
         "dependencies": ["tensorflow"],
         "numpy_sensitive": True,
