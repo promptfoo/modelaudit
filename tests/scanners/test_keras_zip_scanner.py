@@ -317,6 +317,31 @@ class TestKerasZipScanner:
             check.name == "Keras ZIP Format Check" and check.status == CheckStatus.FAILED for check in result.checks
         )
 
+    def test_read_failure_returns_inconclusive_exit2(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Unavailable Keras ZIP content is incomplete analysis, not a security finding."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            file_name="unavailable_content.keras",
+        )
+
+        def raise_os_error(
+            _self: KerasZipScanner,
+            _archive: zipfile.ZipFile,
+            _member_name: str,
+        ) -> None:
+            raise OSError("simulated Keras ZIP member read failure")
+
+        monkeypatch.setattr(KerasZipScanner, "_get_archive_member_info", raise_os_error)
+
+        _assert_inconclusive_keras_zip_scan(keras_path, "keras_zip_read_failed", "Keras ZIP File Read")
+        result = KerasZipScanner().scan(str(keras_path))
+        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
     def test_malformed_config_json_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
         """Malformed config.json without security evidence should exit 2, not 1."""
         keras_path = tmp_path / "malformed_config.keras"

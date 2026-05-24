@@ -405,6 +405,32 @@ def test_keras_h5_malformed_model_config_json_returns_inconclusive_exit2(tmp_pat
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_keras_h5_read_failure_returns_inconclusive_exit2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unavailable Keras H5 content is incomplete analysis, not evidence of malicious content."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {"class_name": "Sequential", "config": {"layers": []}},
+        file_name="unavailable_content.h5",
+    )
+
+    def raise_os_error(_self: KerasH5Scanner, _h5_file: Any, _result: Any, _path: str) -> None:
+        raise OSError("simulated Keras H5 content read failure")
+
+    monkeypatch.setattr(KerasH5Scanner, "_check_hdf5_external_references", raise_os_error)
+
+    _assert_inconclusive_keras_h5_scan(
+        model_path,
+        "keras_h5_read_failed",
+        "Keras H5 File Read",
+        "Unable to read Keras H5 content",
+    )
+    result = KerasH5Scanner().scan(str(model_path))
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
 @pytest.mark.parametrize(
     ("training_config", "reason", "expected_check_name", "expected_message_substring"),
     [
@@ -549,8 +575,8 @@ def test_keras_h5_scanner_malicious_model(tmp_path):
     )
 
 
-def test_keras_h5_scanner_invalid_h5(tmp_path):
-    """Test scanning an invalid H5 file."""
+def test_keras_h5_scanner_invalid_h5(tmp_path: Path) -> None:
+    """Corrupt H5 input should fail closed without becoming a security finding."""
     # Create an invalid H5 file (without magic bytes)
     invalid_path = tmp_path / "invalid.h5"
     invalid_path.write_bytes(b"This is not a valid HDF5 file")
@@ -558,12 +584,11 @@ def test_keras_h5_scanner_invalid_h5(tmp_path):
     scanner = KerasH5Scanner()
     result = scanner.scan(str(invalid_path))
 
-    # Should have an error about invalid H5
-    assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
-    assert any(
-        "invalid" in issue.message.lower() or "not an hdf5" in issue.message.lower() or "error" in issue.message.lower()
-        for issue in result.issues
-    )
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "keras_h5_read_failed" in result.metadata["scan_outcome_reasons"]
+    assert any("Unable to read Keras H5 content" in issue.message for issue in result.issues)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
 def test_keras_h5_scanner_with_blacklist(tmp_path):

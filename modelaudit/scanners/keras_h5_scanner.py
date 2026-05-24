@@ -243,6 +243,24 @@ class KerasH5Scanner(BaseScanner):
                     if training_config is not self._JSON_ATTRIBUTE_PARSE_FAILED:
                         self._scan_training_config(training_config, result)
 
+        except OSError as e:
+            self._mark_inconclusive_scan_result(result, "keras_h5_read_failed")
+            result.add_check(
+                name="Keras H5 File Read",
+                passed=False,
+                message=f"Unable to read Keras H5 content: {e!s}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "keras_h5_read_failed",
+                },
+                rule_code="S902",
+            )
+            self._finish_scan_result(result)
+            return result
         except Exception as e:
             result.add_check(
                 name="Keras H5 File Scan",
