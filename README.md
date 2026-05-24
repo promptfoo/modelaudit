@@ -74,7 +74,7 @@ ModelAudit includes 44 registered scanners covering model, archive, and configur
 | **TensorFlow**          | `.pb`, `.meta`, SavedModel dirs                                           | MEDIUM |
 | **Keras**               | `.h5`, `.hdf5`, `.keras`                                                  | MEDIUM |
 | **ONNX**                | `.onnx`                                                                   | MEDIUM |
-| **CoreML**              | `.mlmodel`                                                                | LOW    |
+| **CoreML**              | `.mlmodel`, structurally valid renamed artifacts                          | LOW    |
 | **MXNet**               | `*-symbol.json`, `*-NNNN.params`                                          | LOW    |
 | **NeMo**                | `.nemo`                                                                   | MEDIUM |
 | **CNTK**                | `.dnn`, `.cmf`                                                            | MEDIUM |

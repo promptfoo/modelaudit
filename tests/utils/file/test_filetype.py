@@ -17,6 +17,7 @@ from modelaudit.scanner_registry_metadata import get_extension_format_map
 from modelaudit.utils.file.detection import (
     PROTO0_1_MAX_PROBE_BYTES,
     detect_file_format,
+    detect_file_format_for_skip_filter,
     detect_file_format_from_magic,
     detect_format_from_extension,
     find_sharded_files,
@@ -24,7 +25,7 @@ from modelaudit.utils.file.detection import (
     validate_file_type,
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
-from tests.helpers import create_mock_onnx
+from tests.helpers import create_mock_coreml, create_mock_onnx
 from tests.helpers.file_creators import create_v7_tar_archive
 
 
@@ -238,6 +239,19 @@ def test_detect_file_format_coreml_validation_passthrough(tmp_path: Path) -> Non
     assert detect_file_format(str(model_path)) == "coreml"
     assert detect_format_from_extension(str(model_path)) == "coreml"
     assert validate_file_type(str(model_path)) is True
+
+
+def test_detect_file_format_routes_renamed_coreml_structure_and_rejects_near_match(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(tmp_path / "model.jpg")
+    near_match = tmp_path / "near-match.jpg"
+    near_match.write_bytes(b"\x08\x08\x12\x03\xa2\x06\x00")
+
+    assert detect_file_format(str(model_path)) == "coreml"
+    assert detect_file_format_from_magic(str(model_path)) == "coreml"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "coreml"
+    assert detect_file_format(str(near_match)) == "unknown"
+    assert detect_file_format_from_magic(str(near_match)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
 
 
 def test_detect_file_format_onnx_pb_content_hint_preempts_protobuf_extension(tmp_path: Path) -> None:

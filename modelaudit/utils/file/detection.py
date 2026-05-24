@@ -39,6 +39,7 @@ _TF_METAGRAPH_MAX_VALIDATE_BYTES = 20 * 1024 * 1024
 _TORCH7_SIGNATURE_READ_BYTES = 4096
 _LIGHTGBM_SIGNATURE_READ_BYTES = 8192
 _ONNX_PROTO_SIGNATURE_READ_BYTES = 1024 * 1024
+_COREML_PROTO_SIGNATURE_READ_BYTES = 1024 * 1024
 _ONNX_MODEL_TOP_LEVEL_TAG_START_BYTES = frozenset(
     {
         0x08,  # ir_version
@@ -52,6 +53,48 @@ _ONNX_MODEL_TOP_LEVEL_TAG_START_BYTES = frozenset(
         0x72,  # metadata_props
     }
 )
+_COREML_MODEL_TOP_LEVEL_TAG_START_BYTES = frozenset({0x08})  # specificationVersion
+_COREML_MODEL_TYPE_FIELDS = frozenset(
+    {
+        200,
+        201,
+        202,
+        300,
+        301,
+        302,
+        303,
+        304,
+        400,
+        401,
+        402,
+        403,
+        404,
+        500,
+        501,
+        502,
+        555,
+        556,
+        560,
+        600,
+        601,
+        602,
+        603,
+        604,
+        606,
+        607,
+        609,
+        610,
+        900,
+        2000,
+        2001,
+        2002,
+        2003,
+        2004,
+        2005,
+        2006,
+    }
+)
+_COREML_DESCRIPTION_FIELD_HINTS = frozenset({1, 10, 20, 21, 100})
 _LIGHTGBM_HEADER_MARKERS = (
     "version=",
     "num_class=",
@@ -484,6 +527,104 @@ def _looks_like_onnx_model_file(path: Path, size: int) -> bool:
 def _looks_like_onnx_model_candidate_file(path: Path, size: int, header: bytes) -> bool:
     """Run the bounded ONNX parser only for plausible protobuf tag starts."""
     return _has_onnx_model_tag_start(header) and _looks_like_onnx_model_file(path, size)
+
+
+def _looks_like_coreml_description_proto_prefix(data: bytes) -> bool:
+    """Return True when a bounded prefix resembles a CoreML ModelDescription."""
+    offset = 0
+    fields_seen = 0
+    while offset < len(data) and fields_seen < 512:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            return False
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+
+        if wire_type == 2 and field_number in _COREML_DESCRIPTION_FIELD_HINTS:
+            return True
+
+        next_offset = _skip_proto_value(data, value_offset, wire_type)
+        if next_offset is None:
+            return False
+        offset = next_offset
+        fields_seen += 1
+
+    return False
+
+
+def _looks_like_coreml_model_proto_prefix(data: bytes) -> bool:
+    """Return True when a bounded prefix resembles a CoreML Model protobuf."""
+    if not data or data[0] not in _COREML_MODEL_TOP_LEVEL_TAG_START_BYTES:
+        return False
+
+    offset = 0
+    fields_seen = 0
+    has_specification_version = False
+    has_description = False
+    has_model_type = False
+    while offset < len(data) and fields_seen < 10000:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            break
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+
+        if field_number == 1 and wire_type == 0:
+            value_result = _read_proto_varint(data, value_offset)
+            if value_result is None:
+                break
+            specification_version, offset = value_result
+            has_specification_version = 0 < specification_version <= 10000
+        elif wire_type == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                break
+            _length, value_start, value_end, actual_value_end = bounds
+            if actual_value_end > len(data):
+                break
+            if field_number == 2 and _looks_like_coreml_description_proto_prefix(data[value_start:value_end]):
+                has_description = True
+            elif field_number in _COREML_MODEL_TYPE_FIELDS:
+                has_model_type = True
+            offset = actual_value_end
+        else:
+            next_offset = _skip_proto_value(data, value_offset, wire_type)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        fields_seen += 1
+        if has_specification_version and has_description and has_model_type:
+            return True
+
+    return False
+
+
+def _looks_like_coreml_model_file(path: Path, size: int) -> bool:
+    """Detect recognizable CoreML Model structure with a bounded prefix read."""
+    if size < 8:
+        return False
+    try:
+        with path.open("rb") as handle:
+            prefix = handle.read(min(size, _COREML_PROTO_SIGNATURE_READ_BYTES))
+    except OSError:
+        return False
+    return _looks_like_coreml_model_proto_prefix(prefix)
+
+
+def _looks_like_coreml_model_candidate_file(path: Path, size: int, header: bytes) -> bool:
+    """Run bounded CoreML structure recognition only for plausible model starts."""
+    return (
+        bool(header)
+        and header[0] in _COREML_MODEL_TOP_LEVEL_TAG_START_BYTES
+        and _looks_like_coreml_model_file(path, size)
+    )
 
 
 def _looks_like_binary_pickle_protocol(header: bytes) -> bool:
@@ -1242,6 +1383,8 @@ def detect_format_from_magic_bytes(
 
     if file_path is not None and _looks_like_onnx_model_candidate_file(file_path, file_size, magic4):
         return "onnx"
+    if file_path is not None and _looks_like_coreml_model_candidate_file(file_path, file_size, magic4):
+        return "coreml"
 
     # Check longer magic sequences
     match magic8:
@@ -1368,6 +1511,8 @@ def detect_file_format_from_magic(path: str) -> str:
 
     if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
         return "onnx"
+    if _looks_like_coreml_model_candidate_file(file_path, size, magic4):
+        return "coreml"
 
     return "unknown"
 
@@ -1492,6 +1637,8 @@ def detect_file_format(path: str) -> str:
         return "numpy"
     if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
         return "onnx"
+    if _looks_like_coreml_model_candidate_file(file_path, size, magic4):
+        return "coreml"
 
     # Check first 8 bytes for HDF5 magic
     hdf5_magic = b"\x89HDF\r\n\x1a\n"
