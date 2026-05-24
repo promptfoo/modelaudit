@@ -22,6 +22,7 @@ __all__ = ["LLAMAFILE_MARKER", "LLAMAFILE_ROUTE_SCAN_BYTES", "LLAMAFILE_ROUTE_TA
 
 GGUF_MARKER = b"GGUF"
 LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON = "llamafile_payload_scan_limited"
+LLAMAFILE_RUNTIME_PREVIEW_READ_REASON = "llamafile_runtime_preview_read_failed"
 
 ELF_MAGIC = b"\x7fELF"
 PE_MAGIC = b"MZ"
@@ -206,13 +207,19 @@ class LlamafileScanner(BaseScanner):
                 runtime_blobs.append(middle)
                 runtime_preview_bytes += len(middle)
         except OSError as exc:
+            self._mark_inconclusive(result, LLAMAFILE_RUNTIME_PREVIEW_READ_REASON)
             result.add_check(
                 name="Llamafile Runtime Preview Read",
                 passed=False,
                 message=f"Failed reading runtime preview bytes: {exc!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(exc), "exception_type": type(exc).__name__},
+                details={
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": LLAMAFILE_RUNTIME_PREVIEW_READ_REASON,
+                },
             )
             result.finish(success=False)
             return result

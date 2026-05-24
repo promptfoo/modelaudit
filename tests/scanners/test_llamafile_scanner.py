@@ -7,11 +7,12 @@ import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.llamafile_scanner import (
     LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    LLAMAFILE_RUNTIME_PREVIEW_READ_REASON,
     LlamafileScanner,
 )
 
@@ -146,6 +147,40 @@ def test_llamafile_scanner_benign_sample_has_no_high_severity(tmp_path: Path) ->
     ]
     assert high_severity == []
     assert result.metadata.get("embedded_payload_offset") is not None
+
+
+def test_llamafile_runtime_preview_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "unavailable-preview.llamafile"
+    binary.write_bytes(_build_llamafile_blob())
+
+    def raise_os_error(_path: Path, _num_bytes: int) -> bytes:
+        raise OSError("simulated runtime preview read failure")
+
+    monkeypatch.setattr(LlamafileScanner, "_read_prefix", staticmethod(raise_os_error))
+
+    direct = LlamafileScanner().scan(str(binary))
+
+    assert direct.success is False
+    assert direct.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert LLAMAFILE_RUNTIME_PREVIEW_READ_REASON in direct.metadata.get("scan_outcome_reasons", [])
+    read_checks = [check for check in direct.checks if check.name == "Llamafile Runtime Preview Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details.get("analysis_incomplete") is True
+    assert read_checks[0].details.get("scan_outcome_reason") == LLAMAFILE_RUNTIME_PREVIEW_READ_REASON
+
+    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
+    high_severity = [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    metadata = aggregate.file_metadata[str(binary)]
+    assert high_severity == []
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert LLAMAFILE_RUNTIME_PREVIEW_READ_REASON in metadata.get("scan_outcome_reasons", [])
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_llamafile_scanner_flags_suspicious_runtime_strings(tmp_path: Path) -> None:
