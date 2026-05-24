@@ -233,6 +233,17 @@ class TestFileFilter:
 
         assert should_skip_file(str(near_match))
 
+    def test_disguised_llamafile_bypasses_default_skip(self, tmp_path: Path) -> None:
+        disguised_llamafile = tmp_path / "payload.jpg"
+        disguised_llamafile.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile runtime")
+        near_match = tmp_path / "tool.jpg"
+        near_match.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llama-file runtime")
+
+        assert detect_file_format_for_skip_filter(str(disguised_llamafile)) == "llamafile"
+        assert not should_skip_file(str(disguised_llamafile))
+        assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+        assert should_skip_file(str(near_match))
+
     def test_prefixed_zip_with_central_directory_stub_stays_scannable(self, tmp_path: Path) -> None:
         disguised_zip = tmp_path / "archive.jpg"
         with zipfile.ZipFile(disguised_zip, "w") as archive:

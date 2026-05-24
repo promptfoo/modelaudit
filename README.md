@@ -83,7 +83,7 @@ ModelAudit includes 44 registered scanners covering model, archive, and configur
 | **CatBoost**            | `.cbm`                                                                    | MEDIUM |
 | **XGBoost**             | `.bst`, `.model`, `.json`, `.ubj`                                         | MEDIUM |
 | **LightGBM**            | `.lgb`, `.lightgbm`, `.model`                                             | MEDIUM |
-| **Llamafile**           | `.llamafile`, extensionless, `.exe`                                       | MEDIUM |
+| **Llamafile**           | Executable wrappers (`.llamafile`, `.exe`, extensionless or renamed)      | MEDIUM |
 | **TorchServe**          | `.mar`                                                                    | HIGH   |
 | **SafeTensors**         | `.safetensors`                                                            | LOW    |
 | **GGUF/GGML**           | `.gguf`, `.ggml`, `.ggmf`, `.ggjt`, `.ggla`, `.ggsa`                      | LOW    |

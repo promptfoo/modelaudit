@@ -38,6 +38,13 @@ def test_llamafile_scanner_can_handle_detected_llamafile(tmp_path: Path) -> None
     assert LlamafileScanner.can_handle(str(binary))
 
 
+def test_llamafile_scanner_can_handle_detected_llamafile_with_misleading_suffix(tmp_path: Path) -> None:
+    binary = tmp_path / "payload.jpg"
+    binary.write_bytes(_build_llamafile_blob())
+
+    assert LlamafileScanner.can_handle(str(binary))
+
+
 def test_llamafile_scanner_does_not_misclassify_generic_executable(tmp_path: Path) -> None:
     generic_exe = tmp_path / "tool.exe"
     generic_exe.write_bytes(b"MZ" + b"\x00" * 512 + b"normal executable")

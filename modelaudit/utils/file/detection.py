@@ -99,6 +99,20 @@ _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_SIZE = 4
 _TFLITE_MIN_HEADER_SIZE = _TFLITE_MAGIC_OFFSET + _TFLITE_MAGIC_SIZE
 _TFLITE_MAGIC_BYTES = b"TFL3"
+LLAMAFILE_MARKER = b"llamafile"
+LLAMAFILE_ROUTE_SCAN_BYTES = 8 * 1024 * 1024
+LLAMAFILE_ROUTE_TAIL_SCAN_BYTES = 2 * 1024 * 1024
+_LLAMAFILE_EXECUTABLE_MAGICS = frozenset(
+    {
+        b"\xfe\xed\xfa\xce",
+        b"\xfe\xed\xfa\xcf",
+        b"\xce\xfa\xed\xfe",
+        b"\xcf\xfa\xed\xfe",
+        b"\xca\xfe\xba\xbe",
+        b"\xbe\xba\xfe\xca",
+    }
+)
+_LLAMAFILE_ROUTE_CHUNK_BYTES = 1024 * 1024
 _TORCHSERVE_MANIFEST_PATH = "MAR-INF/MANIFEST.json"
 _TORCHSERVE_MANIFEST_MAX_BYTES = 1 * 1024 * 1024
 _KERAS_ZIP_REQUIRED_ENTRY = "config.json"
@@ -129,6 +143,54 @@ _COMPRESSED_EXTENSION_CODECS = {
     ".lz4": "lz4",
     ".zlib": "zlib",
 }
+
+
+def _is_supported_llamafile_executable_header(header: bytes) -> bool:
+    return header.startswith((b"\x7fELF", b"MZ")) or header[:4] in _LLAMAFILE_EXECUTABLE_MAGICS
+
+
+def _contains_casefolded_marker_in_prefix(path: Path, marker: bytes, max_scan_bytes: int) -> bool:
+    """Search for a case-insensitive marker within a bounded file prefix."""
+    marker = marker.lower()
+    overlap = len(marker) - 1
+    remaining = min(path.stat().st_size, max_scan_bytes)
+    carry = b""
+
+    with path.open("rb") as handle:
+        while remaining > 0:
+            chunk = handle.read(min(_LLAMAFILE_ROUTE_CHUNK_BYTES, remaining))
+            if not chunk:
+                break
+            haystack = carry + chunk.lower()
+            if marker in haystack:
+                return True
+            carry = haystack[-overlap:] if overlap > 0 else b""
+            remaining -= len(chunk)
+
+    return False
+
+
+def is_llamafile_executable(path: str | Path, header: bytes | None = None) -> bool:
+    """Recognize an executable Llamafile using bounded content inspection."""
+    file_path = Path(path)
+    try:
+        if header is None:
+            if not file_path.is_file():
+                return False
+            with file_path.open("rb") as handle:
+                header = handle.read(4)
+        if not _is_supported_llamafile_executable_header(header):
+            return False
+        if _contains_casefolded_marker_in_prefix(file_path, LLAMAFILE_MARKER, LLAMAFILE_ROUTE_SCAN_BYTES):
+            return True
+        size = file_path.stat().st_size
+        if size <= LLAMAFILE_ROUTE_TAIL_SCAN_BYTES:
+            return False
+        with file_path.open("rb") as handle:
+            handle.seek(size - LLAMAFILE_ROUTE_TAIL_SCAN_BYTES)
+            return LLAMAFILE_MARKER in handle.read(LLAMAFILE_ROUTE_TAIL_SCAN_BYTES).lower()
+    except OSError:
+        return False
 
 
 def _has_rar_magic(data: bytes) -> bool:
@@ -1309,6 +1371,9 @@ def detect_file_format_from_magic(path: str) -> str:
             if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
                 return "executorch"
 
+            if is_llamafile_executable(file_path, magic4):
+                return "llamafile"
+
             # Try the new pattern matching approach first
             format_result = detect_format_from_magic_bytes(magic4, magic8, magic16, size, file_path)
             if format_result == "zip" and file_path.suffix.lower() == ".mar" and is_torchserve_mar_archive(path):
@@ -1415,6 +1480,8 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             return "tflite"
         if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
             return "executorch"
+        if is_llamafile_executable(file_path, magic4):
+            return "llamafile"
 
         format_result = detect_format_from_magic_bytes(magic4, magic8, magic16, size, file_path)
         if format_result == "zip":
@@ -1505,6 +1572,8 @@ def detect_file_format(path: str) -> str:
         return "gguf"
     if magic4 in GGML_MAGIC_VARIANTS:
         return "ggml"
+    if is_llamafile_executable(file_path, magic4):
+        return "llamafile"
 
     ext = file_path.suffix.lower()
     filename_lower = file_path.name.lower()

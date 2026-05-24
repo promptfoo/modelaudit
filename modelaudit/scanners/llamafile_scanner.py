@@ -9,12 +9,17 @@ import tempfile
 from pathlib import Path
 from typing import Any, ClassVar
 
+from ..utils.file.detection import (
+    LLAMAFILE_MARKER,
+    LLAMAFILE_ROUTE_SCAN_BYTES,
+    LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    is_llamafile_executable,
+)
 from ._evidence_redaction import redact_evidence_string
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 
-LLAMAFILE_MARKER = b"llamafile"
-LLAMAFILE_ROUTE_SCAN_BYTES = 8 * 1024 * 1024
-LLAMAFILE_ROUTE_TAIL_SCAN_BYTES = 2 * 1024 * 1024
+__all__ = ["LLAMAFILE_MARKER", "LLAMAFILE_ROUTE_SCAN_BYTES", "LLAMAFILE_ROUTE_TAIL_SCAN_BYTES", "LlamafileScanner"]
+
 GGUF_MARKER = b"GGUF"
 LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON = "llamafile_payload_scan_limited"
 
@@ -125,32 +130,7 @@ class LlamafileScanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
-        path_obj = Path(path)
-        if not path_obj.is_file():
-            return False
-
-        suffix = path_obj.suffix.lower()
-        if suffix not in cls.supported_extensions:
-            return False
-
-        executable_format = cls._detect_executable_format(path_obj)
-        if executable_format is None:
-            return False
-
-        try:
-            marker_offset = cls._find_casefolded_marker_offset(
-                path_obj,
-                LLAMAFILE_MARKER,
-                LLAMAFILE_ROUTE_SCAN_BYTES,
-            )
-            if marker_offset is None:
-                tail = cls._read_suffix(path_obj, LLAMAFILE_ROUTE_TAIL_SCAN_BYTES).lower()
-                tail_marker_index = tail.find(LLAMAFILE_MARKER)
-                marker_offset = tail_marker_index if tail_marker_index != -1 else None
-        except OSError:
-            return False
-
-        return marker_offset is not None
+        return is_llamafile_executable(path)
 
     @classmethod
     def _detect_executable_format(cls, path: Path) -> str | None:
