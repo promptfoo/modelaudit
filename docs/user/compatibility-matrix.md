@@ -49,6 +49,7 @@ This page shows which model formats work in base install and which require optio
 - Compressed wrappers enforce limits via `compressed_max_decompressed_bytes`, `compressed_max_decompression_ratio`, and `compressed_max_depth`.
 - R serialized (`.rds/.rda/.rdata`) support is static-only: ModelAudit does not execute R code or evaluate objects in an R runtime.
 - CNTK scanner scope in v1 is `.dnn`/`.cmf`; `.model` remains owned by XGBoost overlap handling.
+- MXNet content routing recognizes structurally valid symbol JSON renamed to non-JSON suffixes; raw params blobs remain suffix-routed because they do not expose a reliable standalone signature.
 - Llamafile wrappers are executable by design: executable presence is reported at `INFO`, and severity escalates only when suspicious runtime indicators or malformed embedded payloads are found.
 - RAR archives are recognized so they do not disappear from directory scans; ModelAudit reports them as unsupported coverage with a non-clean result.
 - `modelaudit doctor --show-failed` shows unavailable scanners and missing dependencies in your environment.

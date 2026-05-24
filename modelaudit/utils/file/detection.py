@@ -122,6 +122,9 @@ _XML_MODEL_ROOT_FORMATS = {
     "pmml": "pmml",
 }
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
+MXNET_SYMBOL_SIGNATURE_READ_BYTES = 10 * 1024 * 1024
+_MXNET_SYMBOL_REQUIRED_MARKERS = (b'"nodes"', b'"arg_nodes"', b'"heads"')
+_MXNET_SYMBOL_PREFIX_NODE_MARKERS = (b'"nodes"', b'"op"', b'"name"')
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -224,6 +227,67 @@ def _could_be_xml_prefix(prefix: bytes) -> bool:
     """Return whether a bounded prefix plausibly begins an XML document."""
     trimmed = prefix[3:] if prefix.startswith(b"\xef\xbb\xbf") else prefix
     return trimmed.lstrip().startswith(b"<")
+
+
+def _has_mxnet_symbol_graph_structure(payload: object) -> bool:
+    """Return whether decoded JSON has the minimum MXNet symbol graph contract."""
+    if not isinstance(payload, dict):
+        return False
+
+    nodes = payload.get("nodes")
+    arg_nodes = payload.get("arg_nodes")
+    heads = payload.get("heads")
+    if not isinstance(nodes, list) or not isinstance(arg_nodes, list) or not isinstance(heads, list):
+        return False
+    if not nodes:
+        return False
+
+    return any(
+        isinstance(node, dict) and isinstance(node.get("op"), str) and isinstance(node.get("name"), str)
+        for node in nodes
+    )
+
+
+def is_mxnet_symbol_graph_file(path: str | Path) -> bool:
+    """Recognize JSON MXNet symbol graphs under misleading filenames.
+
+    Large graph-like JSON files are preserved for the MXNet scanner, which
+    already fails closed when its bounded parser cannot complete analysis.
+    """
+    file_path = Path(path)
+    if not file_path.is_file():
+        return False
+
+    try:
+        file_size = file_path.stat().st_size
+        if file_size < 4:
+            return False
+
+        read_size = min(file_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
+        with file_path.open("rb") as handle:
+            prefix = handle.read(min(read_size, _TAR_BLOCK_SIZE))
+            if not prefix.lstrip().startswith(b"{"):
+                return False
+            if len(prefix) < read_size:
+                prefix += handle.read(read_size - len(prefix))
+    except OSError:
+        return False
+
+    if file_size > MXNET_SYMBOL_SIGNATURE_READ_BYTES:
+        return all(marker in prefix for marker in _MXNET_SYMBOL_PREFIX_NODE_MARKERS)
+    if not all(marker in prefix for marker in _MXNET_SYMBOL_REQUIRED_MARKERS):
+        return False
+
+    try:
+        payload = json.loads(prefix)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return _has_mxnet_symbol_graph_structure(payload)
+
+
+def _could_be_renamed_mxnet_symbol(file_path: Path, prefix: bytes) -> bool:
+    """Return whether content-based MXNet routing is needed for this path."""
+    return file_path.suffix.lower() != ".json" and prefix.lstrip().startswith(b"{")
 
 
 _MIN_BINARY_PICKLE_PROTOCOL = 1
@@ -1242,6 +1306,12 @@ def detect_format_from_magic_bytes(
 
     if file_path is not None and _looks_like_onnx_model_candidate_file(file_path, file_size, magic4):
         return "onnx"
+    if (
+        file_path is not None
+        and _could_be_renamed_mxnet_symbol(file_path, magic16)
+        and is_mxnet_symbol_graph_file(file_path)
+    ):
+        return "mxnet"
 
     # Check longer magic sequences
     match magic8:
@@ -1315,6 +1385,8 @@ def detect_file_format_from_magic(path: str) -> str:
                 return "torchserve_mar"
             if format_result != "unknown":
                 return format_result
+            if _could_be_renamed_mxnet_symbol(file_path, header) and is_mxnet_symbol_graph_file(file_path):
+                return "mxnet"
 
             # CNTKv2 has protobuf-style serialization without a fixed first-8-byte magic.
             # Use bounded signature markers for deterministic identification.
@@ -1368,6 +1440,8 @@ def detect_file_format_from_magic(path: str) -> str:
 
     if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
         return "onnx"
+    if _could_be_renamed_mxnet_symbol(file_path, magic8) and is_mxnet_symbol_graph_file(file_path):
+        return "mxnet"
 
     return "unknown"
 
@@ -1425,6 +1499,8 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             return format_result
         if format_result != "unknown":
             return format_result
+        if _could_be_renamed_mxnet_symbol(file_path, prefix) and is_mxnet_symbol_graph_file(file_path):
+            return "mxnet"
 
         lightgbm_probe_size = min(size, _LIGHTGBM_SIGNATURE_READ_BYTES)
         if len(prefix) < lightgbm_probe_size:
@@ -1492,6 +1568,8 @@ def detect_file_format(path: str) -> str:
         return "numpy"
     if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
         return "onnx"
+    if _could_be_renamed_mxnet_symbol(file_path, header) and is_mxnet_symbol_graph_file(file_path):
+        return "mxnet"
 
     # Check first 8 bytes for HDF5 magic
     hdf5_magic = b"\x89HDF\r\n\x1a\n"

@@ -70,6 +70,24 @@ def test_mxnet_scanner_can_handle_symbol_and_params(tmp_path: Path) -> None:
     assert MXNetScanner.can_handle(str(params_path))
 
 
+def test_mxnet_scanner_handles_renamed_structural_symbol_graph(tmp_path: Path) -> None:
+    symbol_path = tmp_path / "unsafe.jpg"
+    _write_symbol_file(
+        symbol_path,
+        custom_node={
+            "op": "Custom",
+            "name": "custom_loader",
+            "attrs": {"library": "../../tmp/libevil.so", "op_type": "unsafe_loader"},
+            "inputs": [[1, 0, 0]],
+        },
+    )
+
+    assert MXNetScanner.can_handle(str(symbol_path))
+    result = MXNetScanner().scan(str(symbol_path))
+
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
 def test_mxnet_scanner_rejects_non_mxnet_files(tmp_path: Path) -> None:
     fake_symbol = tmp_path / "fake.json"
     fake_symbol.write_text('{"not": "mxnet"}', encoding="utf-8")

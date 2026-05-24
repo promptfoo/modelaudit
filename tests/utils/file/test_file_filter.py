@@ -13,7 +13,7 @@ from modelaudit.utils.file.filtering import (
     _ZIP_MEMBER_SNIFF_LIMIT,
     should_skip_file,
 )
-from tests.helpers.file_creators import create_v7_tar_archive
+from tests.helpers.file_creators import create_mock_mxnet_symbol, create_v7_tar_archive
 
 
 def _build_lightgbm_text() -> str:
@@ -260,6 +260,22 @@ class TestFileFilter:
 
         assert detect_file_format_for_skip_filter(str(disguised_lightgbm)) == "lightgbm"
         assert not should_skip_file(str(disguised_lightgbm))
+
+    def test_disguised_mxnet_symbol_bypasses_default_skip_without_promoting_json_near_match(
+        self, tmp_path: Path
+    ) -> None:
+        """Structurally valid MXNet symbol JSON should survive skipped media suffixes."""
+        disguised_symbol = create_mock_mxnet_symbol(tmp_path / "model.jpg")
+        near_match = tmp_path / "graph.jpg"
+        near_match.write_text(
+            '{"nodes":[{"op":"Custom"}],"arg_nodes":[],"heads":[[0,0,0]]}',
+            encoding="utf-8",
+        )
+
+        assert detect_file_format_for_skip_filter(str(disguised_symbol)) == "mxnet"
+        assert not should_skip_file(str(disguised_symbol))
+        assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+        assert should_skip_file(str(near_match))
 
     def test_disguised_xml_models_with_long_prologs_bypass_default_skip(self, tmp_path: Path) -> None:
         """Skipped suffixes must not hide XML model roots after long benign prologs."""

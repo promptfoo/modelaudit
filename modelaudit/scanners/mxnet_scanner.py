@@ -9,10 +9,14 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import EXECUTABLE_SIGNATURES
+from modelaudit.utils.file.detection import (
+    MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+    is_mxnet_symbol_graph_file,
+)
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
-MAX_SYMBOL_READ_BYTES = 10 * 1024 * 1024
+MAX_SYMBOL_READ_BYTES = MXNET_SYMBOL_SIGNATURE_READ_BYTES
 MAX_PARAMS_READ_BYTES = 10 * 1024 * 1024
 MIN_PARAMS_SIZE_BYTES = 16
 MAX_PREVIEW_SIGNATURE_OFFSET = 4096
@@ -149,9 +153,11 @@ class MXNetScanner(BaseScanner):
         if suffix == ".params":
             return cls._is_mxnet_params_filename(path_obj.name)
 
-        # Route MXNet symbol artifacts by their framework filename convention so
-        # malformed graphs reach scan() and fail closed as inconclusive.
-        return suffix == ".json" and path_obj.name.lower().endswith("-symbol.json")
+        # Preserve canonical malformed symbols for fail-closed parsing, while
+        # routing renamed symbols only when their bounded structure identifies them.
+        return (suffix == ".json" and path_obj.name.lower().endswith("-symbol.json")) or (
+            suffix != ".json" and is_mxnet_symbol_graph_file(path_obj)
+        )
 
     @classmethod
     def _is_mxnet_params_filename(cls, filename: str) -> bool:
@@ -192,10 +198,10 @@ class MXNetScanner(BaseScanner):
         suffix = Path(path).suffix.lower()
         analysis_complete = True
 
-        if suffix == ".json":
-            analysis_complete = self._scan_symbol_graph(path, result)
-        elif suffix == ".params":
+        if suffix == ".params":
             analysis_complete = self._scan_params_blob(path, result)
+        elif suffix == ".json" or is_mxnet_symbol_graph_file(path):
+            analysis_complete = self._scan_symbol_graph(path, result)
         else:
             result.add_check(
                 name="MXNet Format Dispatch",

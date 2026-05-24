@@ -75,7 +75,7 @@ ModelAudit includes 44 registered scanners covering model, archive, and configur
 | **Keras**               | `.h5`, `.hdf5`, `.keras`                                                  | MEDIUM |
 | **ONNX**                | `.onnx`                                                                   | MEDIUM |
 | **CoreML**              | `.mlmodel`                                                                | LOW    |
-| **MXNet**               | `*-symbol.json`, `*-NNNN.params`                                          | LOW    |
+| **MXNet**               | `*-symbol.json`, `*-NNNN.params`, structurally valid renamed symbol JSON  | LOW    |
 | **NeMo**                | `.nemo`                                                                   | MEDIUM |
 | **CNTK**                | `.dnn`, `.cmf`                                                            | MEDIUM |
 | **RKNN**                | `.rknn`                                                                   | MEDIUM |
