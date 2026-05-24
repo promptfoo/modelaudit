@@ -75,6 +75,7 @@ def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
     header_len = 100 * 1024 * 1024
     with path.open("wb") as handle:
         handle.write(struct.pack("<Q", header_len))
+        handle.write(b"{")
         handle.truncate(8 + header_len + 1)
 
 
@@ -247,11 +248,19 @@ def test_detect_file_format_from_magic_malformed_safetensors_header_len_rejected
 
 def test_detect_oversized_renamed_safetensors_candidate_for_bounded_scan(tmp_path: Path) -> None:
     candidate_path = tmp_path / "oversized.jpg"
+    malformed_path = tmp_path / "framing-only.jpg"
     _write_sparse_oversized_safetensors_candidate(candidate_path)
+    with malformed_path.open("wb") as handle:
+        handle.write(struct.pack("<Q", 100 * 1024 * 1024))
+        handle.write(b"\x00")
+        handle.truncate(8 + (100 * 1024 * 1024) + 1)
 
     assert detect_file_format_from_magic(str(candidate_path)) == "safetensors"
     assert detect_file_format_for_skip_filter(str(candidate_path)) == "safetensors"
     assert detect_file_format(str(candidate_path)) == "safetensors"
+    assert detect_file_format_from_magic(str(malformed_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(malformed_path)) == "unknown"
+    assert detect_file_format(str(malformed_path)) == "unknown"
 
 
 def test_detect_file_format_from_magic_invalid_safetensors_json_rejected(tmp_path: Path) -> None:

@@ -71,6 +71,7 @@ def _build_malicious_tf_savedmodel() -> bytes:
 def _write_sparse_oversized_safetensors_candidate(path: Path, header_len: int = 100 * 1024 * 1024) -> None:
     with path.open("wb") as handle:
         handle.write(struct.pack("<Q", header_len))
+        handle.write(b"{")
         handle.truncate(8 + header_len + 1)
 
 

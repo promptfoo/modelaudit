@@ -595,9 +595,14 @@ def _is_safetensors_routing_candidate(path: Path | None, magic8: bytes, file_siz
         return False
 
     # The scanner fails closed on headers above this bounded parse budget.
-    # Retain such files by framing alone so renamed payloads cannot bypass that outcome.
+    # Retain plausible object headers without parsing attacker-sized metadata.
     if header_len > SAFETENSORS_ROUTING_HEADER_PARSE_BYTES:
-        return True
+        try:
+            with path.open("rb") as handle:
+                handle.seek(8)
+                return handle.read(1) == b"{"
+        except OSError:
+            return False
 
     try:
         with path.open("rb") as handle:

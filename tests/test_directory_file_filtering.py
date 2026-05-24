@@ -49,6 +49,7 @@ def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
     header_len = 100 * 1024 * 1024
     with path.open("wb") as handle:
         handle.write(struct.pack("<Q", header_len))
+        handle.write(b"{")
         handle.truncate(8 + header_len + 1)
 
 

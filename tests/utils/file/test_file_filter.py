@@ -47,6 +47,7 @@ def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
     header_len = 100 * 1024 * 1024
     with path.open("wb") as handle:
         handle.write(struct.pack("<Q", header_len))
+        handle.write(b"{")
         handle.truncate(8 + header_len + 1)
 
 
@@ -345,10 +346,17 @@ class TestFileFilter:
     def test_oversized_disguised_safetensors_candidate_bypasses_default_skip(self, tmp_path: Path) -> None:
         """Oversized framing must survive filtering for scanner-level bounded handling."""
         disguised_safetensors = tmp_path / "weights.jpg"
+        malformed_near_match = tmp_path / "framing-only.jpg"
         _write_sparse_oversized_safetensors_candidate(disguised_safetensors)
+        with malformed_near_match.open("wb") as handle:
+            handle.write(struct.pack("<Q", 100 * 1024 * 1024))
+            handle.write(b"\x00")
+            handle.truncate(8 + (100 * 1024 * 1024) + 1)
 
         assert detect_file_format_for_skip_filter(str(disguised_safetensors)) == "safetensors"
         assert not should_skip_file(str(disguised_safetensors))
+        assert detect_file_format_for_skip_filter(str(malformed_near_match)) == "unknown"
+        assert should_skip_file(str(malformed_near_match))
 
     def test_disguised_pmml_with_oversized_doctype_subset_fails_closed(self, tmp_path: Path) -> None:
         """Incomplete oversized XML prologs should survive filtering for fail-closed handling."""
