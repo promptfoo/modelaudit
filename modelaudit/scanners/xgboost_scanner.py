@@ -19,6 +19,7 @@ Security Focus:
 """
 
 import importlib.util
+import io
 import json
 import logging
 import os
@@ -28,7 +29,7 @@ import subprocess
 import sys
 import tempfile
 from contextlib import suppress
-from typing import Any, ClassVar, cast
+from typing import Any, BinaryIO, ClassVar, cast
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
@@ -208,6 +209,50 @@ def _json_file_has_xgboost_markers(path: str, max_bytes: int) -> bool:
                     expecting_key = True
 
     return False
+
+
+class _XGBoostUBJSONReadAdapter:
+    """Supply the lookahead py-ubjson expects after valid empty counted containers."""
+
+    _COUNT_WIDTHS: ClassVar[dict[bytes, int]] = {
+        b"U": 1,
+        b"i": 1,
+        b"I": 2,
+        b"l": 4,
+        b"L": 8,
+    }
+    _VIRTUAL_CONTAINER_END: ClassVar[dict[bytes, bytes]] = {b"[": b"]", b"{": b"}"}
+
+    def __init__(self, stream: BinaryIO) -> None:
+        self._stream = stream
+        self._recent_single_byte_reads = b""
+        self._virtual_container_end: bytes | None = None
+
+    def read(self, size: int = -1) -> bytes:
+        if self._virtual_container_end is not None:
+            if size != 1:
+                raise ValueError("Unexpected UBJSON decoder read after an empty counted container")
+            virtual_end = self._virtual_container_end
+            self._virtual_container_end = None
+            self._recent_single_byte_reads = b""
+            return virtual_end
+
+        data = self._stream.read(size)
+        prefix = self._recent_single_byte_reads
+        if len(prefix) == 3 and prefix[:2] in (b"[#", b"{#") and self._COUNT_WIDTHS.get(prefix[2:]) == size:
+            self._recent_single_byte_reads = b""
+            if data == b"\0" * size:
+                self._virtual_container_end = self._VIRTUAL_CONTAINER_END[prefix[:1]]
+            return data
+
+        if size == 1 and len(data) == 1:
+            self._recent_single_byte_reads = (self._recent_single_byte_reads + data)[-3:]
+        else:
+            self._recent_single_byte_reads = b""
+        return data
+
+    def tell(self) -> int:
+        return self._stream.tell()
 
 
 class XGBoostScanner(BaseScanner):
@@ -464,8 +509,11 @@ class XGBoostScanner(BaseScanner):
         try:
             import ubjson
 
-            with open(path, "rb") as f:
-                model_data = ubjson.loadb(f.read())
+            payload = self._read_file_safely(path)
+            try:
+                model_data = ubjson.loadb(payload)
+            except ubjson.DecoderException:
+                model_data = ubjson.load(_XGBoostUBJSONReadAdapter(io.BytesIO(payload)))
 
             result.add_check(
                 name="UBJ Decoding",

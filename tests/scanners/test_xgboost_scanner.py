@@ -164,6 +164,16 @@ def _xgboost_ubjson_probe() -> bytes:
     return b"{L" + (b"\0" * 8) + b"learner" + b"learner_model_param" + b"version"
 
 
+def _use_xgboost_counted_empty_arrays(payload: bytes) -> bytes:
+    counted_empty_array = b"[#L" + (b"\0" * 8)
+    adapted = payload.replace(b"feature_names[]", b"feature_names" + counted_empty_array).replace(
+        b"feature_types[]", b"feature_types" + counted_empty_array
+    )
+    assert counted_empty_array in adapted
+    assert adapted != payload
+    return adapted
+
+
 class TestXGBoostScannerBasic:
     """Test basic XGBoost scanner functionality."""
 
@@ -722,6 +732,35 @@ class TestXGBoostUBJScanning:
             result = xgboost_scanner.scan(str(ubj_file))
 
         assert any("Error analyzing XGBoost UBJ model" in str(issue.message) for issue in result.issues)
+
+    def test_count_optimized_empty_arrays_are_decoded(self, temp_dir: Path, valid_xgboost_json: dict[str, Any]) -> None:
+        ubjson = pytest.importorskip("ubjson", reason="ubjson not installed")
+        valid_xgboost_json["learner"]["feature_names"] = []
+        valid_xgboost_json["learner"]["feature_types"] = []
+        model_file = temp_dir / "empty_features.ubj"
+        model_file.write_bytes(_use_xgboost_counted_empty_arrays(ubjson.dumpb(valid_xgboost_json)))
+
+        result = XGBoostScanner().scan(str(model_file))
+
+        assert result.success is True
+        assert any(check.name == "UBJ Decoding" and check.status == CheckStatus.PASSED for check in result.checks)
+
+    def test_count_optimized_empty_arrays_still_report_malicious_content(
+        self, temp_dir: Path, valid_xgboost_json: dict[str, Any]
+    ) -> None:
+        ubjson = pytest.importorskip("ubjson", reason="ubjson not installed")
+        valid_xgboost_json["learner"]["feature_names"] = []
+        valid_xgboost_json["learner"]["feature_types"] = []
+        valid_xgboost_json["learner"]["malicious_code"] = "os.system('touch pwned')"
+        model_file = temp_dir / "malicious_empty_features.ubj"
+        model_file.write_bytes(_use_xgboost_counted_empty_arrays(ubjson.dumpb(valid_xgboost_json)))
+
+        result = XGBoostScanner().scan(str(model_file))
+
+        assert result.success is False
+        assert any(
+            check.name == "JSON Content Analysis" and check.status == CheckStatus.FAILED for check in result.checks
+        )
 
 
 class TestXGBoostBinaryScanning:
