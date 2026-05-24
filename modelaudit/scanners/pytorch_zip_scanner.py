@@ -237,6 +237,8 @@ class PyTorchZipScanner(BaseScanner):
     MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE: ClassVar[int] = 1024 * 1024
     MAX_ARCHIVE_ENTRIES: ClassVar[int] = 10000  # Maximum number of entries in archive
     DEFAULT_MAX_NESTED_ZIP_DEPTH: ClassVar[int] = 5
+    DEFAULT_MAX_BLACKLIST_SCAN_BYTES: ClassVar[int] = 100 * 1024 * 1024
+    BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_blacklist_member_size_limit"
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -1731,7 +1733,10 @@ class PyTorchZipScanner(BaseScanner):
         result: ScanResult,
     ) -> None:
         """Scan files for blacklisted patterns"""
-        max_blacklist_scan_size = self.config.get("max_blacklist_scan_size", 100 * 1024 * 1024)  # 100MB default
+        max_blacklist_scan_size = self._normalize_positive_int_config(
+            self.config.get("max_blacklist_scan_size"),
+            self.DEFAULT_MAX_BLACKLIST_SCAN_BYTES,
+        )
 
         for entry in safe_entries:
             name = self._get_zip_member_name(entry)
@@ -1740,11 +1745,12 @@ class PyTorchZipScanner(BaseScanner):
 
                 # Skip files that are too large
                 if info.file_size > max_blacklist_scan_size:
+                    mark_inconclusive_scan_result(result, self.BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON)
                     result.add_check(
                         name="Blacklist Pattern Check",
-                        passed=True,
+                        passed=False,
                         message=(
-                            f"File {name} too large for blacklist scanning "
+                            f"Skipped configured blacklist scanning for oversized file {name} "
                             f"(size: {info.file_size}, limit: {max_blacklist_scan_size})"
                         ),
                         severity=IssueSeverity.INFO,
@@ -1754,6 +1760,8 @@ class PyTorchZipScanner(BaseScanner):
                             "scan_limit": max_blacklist_scan_size,
                             "zip_entry": name,
                             "reason": "size_limit_exceeded",
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": self.BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON,
                         },
                     )
                     continue

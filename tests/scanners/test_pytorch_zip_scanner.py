@@ -484,6 +484,91 @@ def test_pytorch_zip_scanner_with_blacklist(tmp_path):
     assert len(blacklist_issues) > 0
 
 
+def test_pytorch_zip_oversized_blacklist_member_is_inconclusive(tmp_path: Path) -> None:
+    """Configured blacklist coverage must not pass when a matching member is skipped."""
+    zip_path = create_mock_pytorch_zip(tmp_path / "blocked_oversized.pt", data={})
+    with zipfile.ZipFile(zip_path, "a") as zip_file:
+        zip_file.writestr("notes.txt", b"A" * 48 + b"BLOCKED_PATTERN")
+
+    config = {"blacklist_patterns": ["BLOCKED_PATTERN"], "max_blacklist_scan_size": 32}
+    result = PyTorchZipScanner(config=config).scan(str(zip_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == [
+        PyTorchZipScanner.BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON,
+    ]
+    limit_checks = [
+        check
+        for check in result.checks
+        if check.name == "Blacklist Pattern Check" and check.details.get("zip_entry") == "notes.txt"
+    ]
+    assert len(limit_checks) == 1
+    assert limit_checks[0].status == CheckStatus.FAILED
+    assert limit_checks[0].severity == IssueSeverity.INFO
+    assert limit_checks[0].details["analysis_incomplete"] is True
+    assert not any("BLOCKED_PATTERN" in issue.message for issue in result.issues)
+
+    aggregate = scan_model_directory_or_file(
+        str(zip_path),
+        blacklist_patterns=["BLOCKED_PATTERN"],
+        max_blacklist_scan_size=32,
+        cache_scan_results=False,
+    )
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_pytorch_zip_oversized_benign_blacklist_member_is_inconclusive_without_finding(tmp_path: Path) -> None:
+    """A benign skipped member is incomplete coverage, not a claimed blacklist match."""
+    zip_path = create_mock_pytorch_zip(tmp_path / "benign_oversized.pt", data={})
+    with zipfile.ZipFile(zip_path, "a") as zip_file:
+        zip_file.writestr("notes.txt", b"A" * 48 + b"ordinary")
+
+    result = PyTorchZipScanner(
+        config={"blacklist_patterns": ["BLOCKED_PATTERN"], "max_blacklist_scan_size": 32},
+    ).scan(str(zip_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == [
+        PyTorchZipScanner.BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON,
+    ]
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    aggregate = scan_model_directory_or_file(
+        str(zip_path),
+        blacklist_patterns=["BLOCKED_PATTERN"],
+        max_blacklist_scan_size=32,
+        cache_scan_results=False,
+    )
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_pytorch_zip_blacklist_pattern_at_size_limit_is_detected(tmp_path: Path) -> None:
+    """A member within the configured blacklist window must remain actively inspected."""
+    zip_path = create_mock_pytorch_zip(tmp_path / "bounded_pattern.pt", data={})
+    payload = b"A" * 48 + b"BLOCKED_PATTERN"
+    with zipfile.ZipFile(zip_path, "a") as zip_file:
+        zip_file.writestr("notes.txt", payload)
+
+    result = PyTorchZipScanner(
+        config={"blacklist_patterns": ["BLOCKED_PATTERN"], "max_blacklist_scan_size": len(payload)},
+    ).scan(str(zip_path))
+
+    assert "scan_outcome" not in result.metadata
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "BLOCKED_PATTERN" in issue.message for issue in result.issues
+    )
+
+    aggregate = scan_model_directory_or_file(
+        str(zip_path),
+        blacklist_patterns=["BLOCKED_PATTERN"],
+        max_blacklist_scan_size=len(payload),
+        cache_scan_results=False,
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
 def test_pytorch_pickle_file_unsupported(tmp_path):
     """Raw pickle files with .pt extension should be unsupported."""
     from tests.assets.generators.generate_evil_pickle import EvilClass
