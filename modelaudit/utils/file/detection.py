@@ -5,6 +5,7 @@ import struct
 import tarfile
 import zipfile
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
 from ...scanner_registry_metadata import get_extension_format_map
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
@@ -36,6 +37,7 @@ _CNTK_V2_STRUCTURE_MARKERS = (b"CompositeFunction", b"primitive_functions", b"Pr
 _CNTK_SIGNATURE_READ_BYTES = 4096
 _TF_METAGRAPH_MIN_BYTES = 8
 _TF_METAGRAPH_MAX_VALIDATE_BYTES = 20 * 1024 * 1024
+_TF_METAGRAPH_MAX_ROUTING_FIELDS = 4096
 _TORCH7_SIGNATURE_READ_BYTES = 4096
 _LIGHTGBM_SIGNATURE_READ_BYTES = 8192
 _ONNX_PROTO_SIGNATURE_READ_BYTES = 1024 * 1024
@@ -1097,6 +1099,78 @@ def _is_tensorflow_metagraph_file(path: str) -> bool:
         return False
 
 
+def _read_proto_varint_stream(stream: BinaryIO) -> int | None:
+    value = 0
+    shift = 0
+    for _ in range(10):
+        raw_byte = stream.read(1)
+        if not raw_byte:
+            return None
+        byte = raw_byte[0]
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value
+        shift += 7
+    return None
+
+
+def _skip_proto_stream_value(stream: BinaryIO, wire_type: int, file_size: int) -> bool:
+    if wire_type == 0:
+        return _read_proto_varint_stream(stream) is not None
+    if wire_type == 1:
+        length = 8
+    elif wire_type == 2:
+        length_result = _read_proto_varint_stream(stream)
+        if length_result is None:
+            return False
+        length = length_result
+    elif wire_type == 5:
+        length = 4
+    else:
+        return False
+
+    if stream.tell() + length > file_size:
+        return False
+    stream.seek(length, 1)
+    return True
+
+
+def _has_bounded_metagraph_graph_field(path: Path, file_size: int) -> bool:
+    """Seek past top-level protobuf values while looking for MetaGraph graph_def."""
+    try:
+        with path.open("rb") as stream:
+            for _ in range(_TF_METAGRAPH_MAX_ROUTING_FIELDS):
+                if stream.tell() >= file_size:
+                    return False
+                tag = _read_proto_varint_stream(stream)
+                if tag is None:
+                    return False
+                field_number = tag >> 3
+                wire_type = tag & 0x07
+                if field_number == 0:
+                    return False
+                if field_number == 2 and wire_type == 2:
+                    return True
+                if wire_type in {3, 4}:
+                    # Unknown group fields cannot be skipped without a recursive walk.
+                    return True
+                if not _skip_proto_stream_value(stream, wire_type, file_size):
+                    return False
+    except OSError:
+        return False
+    # Treat excessive unknown fields as unresolved rather than silently clean.
+    return True
+
+
+def _could_be_renamed_tensorflow_metagraph(file_path: Path, file_size: int) -> bool:
+    """Recognize renamed MetaGraphs by strict parsing after bounded field discovery."""
+    if file_path.suffix.lower() == ".meta" or not _has_bounded_metagraph_graph_field(file_path, file_size):
+        return False
+    if file_size > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+        return True
+    return _is_tensorflow_metagraph_file(str(file_path))
+
+
 def _has_torch7_ascii_object_signature(prefix: bytes) -> bool:
     """Return whether text contains a Torch7 ASCII serialized Torch object header."""
     fields = prefix.splitlines()
@@ -1353,6 +1427,9 @@ def detect_file_format_from_magic(path: str) -> str:
                 if xml_format != "unknown":
                     return xml_format
 
+            if _could_be_renamed_tensorflow_metagraph(file_path, size):
+                return "tf_metagraph"
+
     except OSError:
         return "unknown"
 
@@ -1452,6 +1529,9 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             )
             if xml_format != "unknown":
                 return xml_format
+
+    if _could_be_renamed_tensorflow_metagraph(file_path, size):
+        return "tf_metagraph"
 
     return "unknown"
 
@@ -1553,6 +1633,9 @@ def detect_file_format(path: str) -> str:
         )
         if xml_format != "unknown":
             return xml_format
+
+    if _could_be_renamed_tensorflow_metagraph(file_path, size):
+        return "tf_metagraph"
 
     # For .bin files, do more sophisticated detection
     if ext == ".bin":

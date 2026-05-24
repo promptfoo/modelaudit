@@ -17,6 +17,7 @@ from modelaudit.scanner_registry_metadata import get_extension_format_map
 from modelaudit.utils.file.detection import (
     PROTO0_1_MAX_PROBE_BYTES,
     detect_file_format,
+    detect_file_format_for_skip_filter,
     detect_file_format_from_magic,
     detect_format_from_extension,
     find_sharded_files,
@@ -339,6 +340,23 @@ def test_detect_tf_metagraph_by_strict_parse(tmp_path: Path) -> None:
     assert detect_file_format(str(metagraph_path)) == "tf_metagraph"
     assert detect_file_format_from_magic(str(metagraph_path)) == "tf_metagraph"
     assert validate_file_type(str(metagraph_path)) is True
+
+
+def test_detect_renamed_tf_metagraph_by_strict_parse_without_promoting_generic_protobuf(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    disguised_metagraph = tmp_path / "graph.jpg"
+    generic_protobuf = tmp_path / "generic.jpg"
+    disguised_metagraph.write_bytes(b"\xa2\x06\x80\x08" + (b"x" * 1024) + _build_tf_metagraph_bytes())
+    generic_protobuf.write_bytes(b"\x12\x02\x08\x01")
+
+    assert detect_file_format_from_magic(str(disguised_metagraph)) == "tf_metagraph"
+    assert detect_file_format_for_skip_filter(str(disguised_metagraph)) == "tf_metagraph"
+    assert detect_file_format(str(disguised_metagraph)) == "tf_metagraph"
+    assert detect_file_format_from_magic(str(generic_protobuf)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
+    assert detect_file_format(str(generic_protobuf)) == "unknown"
 
 
 def test_detect_tf_metagraph_rejects_renamed_non_protobuf(tmp_path: Path) -> None:

@@ -111,6 +111,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "class": "TensorFlowMetaGraphScanner",
         "description": "Scans TensorFlow MetaGraph .meta files",
         "extensions": [".meta"],
+        "header_formats": ["tf_metagraph"],
         "priority": 4,
         "dependencies": [],
         "numpy_sensitive": False,
