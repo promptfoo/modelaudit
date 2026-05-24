@@ -21,6 +21,11 @@ class TestPerformanceBenchmarks:
         """Get the path to test assets."""
         return Path(__file__).parent / "assets"
 
+    @pytest.fixture(autouse=True)
+    def suppress_expected_scanner_logs(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Avoid measuring capture of expected findings from malicious fixtures."""
+        caplog.set_level(logging.CRITICAL + 1, logger="modelaudit.scanners")
+
     @pytest.fixture
     def performance_thresholds(self):
         """Define performance thresholds for different operations."""
@@ -184,7 +189,7 @@ class TestPerformanceBenchmarks:
             assert degradation_ratio < 5.0, f"Performance degrades too much with scale (ratio: {degradation_ratio:.2f})"
 
     @pytest.mark.performance
-    def test_memory_usage_stability(self, assets_dir: Path, caplog: pytest.LogCaptureFixture) -> None:
+    def test_memory_usage_stability(self, assets_dir: Path) -> None:
         """Test that memory usage remains stable after scanner initialization."""
         if not assets_dir.exists():
             pytest.skip("Assets directory does not exist")
@@ -195,10 +200,6 @@ class TestPerformanceBenchmarks:
             import psutil  # type: ignore[import-untyped]
         except ImportError:
             pytest.skip("psutil not available for memory testing")
-
-        # Expected malicious fixtures emit many critical findings; retaining those
-        # records in pytest capture would measure the harness rather than scanning.
-        caplog.set_level(logging.CRITICAL + 1, logger="modelaudit.scanners")
 
         process = psutil.Process(os.getpid())
         scan_model_directory_or_file(str(assets_dir))
