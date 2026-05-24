@@ -102,8 +102,11 @@ class CompressedScanner(BaseScanner):
     DEFAULT_MAX_DEPTH: ClassVar[int] = 3
     DEFAULT_MAX_MEMBERS: ClassVar[int] = 1000
     DEFAULT_CHUNK_SIZE: ClassVar[int] = 64 * 1024
+    _DEPTH_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_depth_limit_exceeded"
     _MEMBER_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_member_limit_exceeded"
     _DECOMPRESSION_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_decompression_limit_exceeded"
+    _OPTIONAL_DEPENDENCY_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_optional_dependency_unavailable"
+    _STREAM_DECODE_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_stream_decode_failed"
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -709,13 +712,19 @@ class CompressedScanner(BaseScanner):
         archive_depth = get_archive_depth(self.config)
         depth = max(int(self.config.get("_compressed_depth", 0)), archive_depth)
         if depth >= self.max_depth:
+            mark_inconclusive_scan_result(result, self._DEPTH_LIMIT_INCONCLUSIVE_REASON)
             result.add_check(
                 name="Compressed Wrapper Depth Limit",
                 passed=False,
-                message=f"Maximum compressed-wrapper nesting depth ({self.max_depth}) exceeded",
+                message=f"Maximum compressed-wrapper nesting depth ({self.max_depth}) exceeded; analysis incomplete",
                 severity=IssueSeverity.WARNING,
                 location=path,
-                details={"depth": depth, "max_depth": self.max_depth},
+                details={
+                    "depth": depth,
+                    "max_depth": self.max_depth,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self._DEPTH_LIMIT_INCONCLUSIVE_REASON,
+                },
             )
             result.finish(success=False)
             return result
@@ -843,13 +852,19 @@ class CompressedScanner(BaseScanner):
                     result.merge(member_result)
             result.bytes_scanned += self.get_file_size(path)
         except _MissingOptionalDependencyError as exc:
+            mark_inconclusive_scan_result(result, self._OPTIONAL_DEPENDENCY_INCONCLUSIVE_REASON)
             result.add_check(
                 name="Compressed Wrapper Optional Dependency",
                 passed=False,
-                message=str(exc),
+                message=f"{exc}; analysis incomplete",
                 severity=IssueSeverity.INFO,
                 location=path,
-                details={"codec": expected_codec, "missing_dependency": "lz4"},
+                details={
+                    "codec": expected_codec,
+                    "missing_dependency": "lz4",
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self._OPTIONAL_DEPENDENCY_INCONCLUSIVE_REASON,
+                },
             )
             result.finish(success=False)
             return result
@@ -892,13 +907,18 @@ class CompressedScanner(BaseScanner):
             result.finish(success=False)
             return result
         except _CorruptStreamError as exc:
+            mark_inconclusive_scan_result(result, self._STREAM_DECODE_INCONCLUSIVE_REASON)
             result.add_check(
                 name="Compressed Wrapper Stream Decode",
                 passed=False,
-                message=str(exc),
+                message=f"{exc}; analysis incomplete",
                 severity=IssueSeverity.WARNING,
                 location=path,
-                details={"codec": expected_codec},
+                details={
+                    "codec": expected_codec,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self._STREAM_DECODE_INCONCLUSIVE_REASON,
+                },
             )
             result.finish(success=False)
             return result

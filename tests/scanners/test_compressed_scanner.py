@@ -296,6 +296,9 @@ def test_compressed_scanner_corrupt_stream_is_warning_not_critical(tmp_path: Pat
     decode_checks = [c for c in result.checks if c.name == "Compressed Wrapper Stream Decode"]
     assert decode_checks and decode_checks[0].status == CheckStatus.FAILED
     assert decode_checks[0].severity == IssueSeverity.WARNING
+    assert decode_checks[0].details["scan_outcome_reason"] == "compressed_stream_decode_failed"
+    assert result.metadata["scan_outcome_reasons"] == ["compressed_stream_decode_failed"]
+    assert result.success is False
 
 
 @pytest.mark.parametrize(
@@ -365,6 +368,19 @@ def test_compressed_scanner_false_positive_control_high_ratio_within_policy(tmp_
         if c.name == "Compressed Wrapper Decompression Limits" and c.status == CheckStatus.FAILED
     ]
     assert len(ratio_failures) == 0
+
+
+def test_compressed_scanner_depth_limit_marks_analysis_incomplete(tmp_path: Path) -> None:
+    path = tmp_path / "nested_payload.pkl.gz"
+    path.write_bytes(gzip.compress(pickle.dumps({"safe": True})))
+
+    result = CompressedScanner(config={"_compressed_depth": 1, "compressed_max_depth": 1}).scan(str(path))
+
+    depth_checks = [c for c in result.checks if c.name == "Compressed Wrapper Depth Limit"]
+    assert depth_checks and depth_checks[0].status == CheckStatus.FAILED
+    assert depth_checks[0].details["scan_outcome_reason"] == "compressed_depth_limit_exceeded"
+    assert result.metadata["scan_outcome_reasons"] == ["compressed_depth_limit_exceeded"]
+    assert result.success is False
 
 
 def test_read_zlib_stream_uses_bounded_decompression(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -751,6 +767,37 @@ def test_compressed_scanner_decompression_limit_preserves_exit1_and_is_not_cache
         reset_cache_manager()
 
 
+def test_compressed_scanner_corrupt_stream_preserves_exit1_and_is_not_cached(tmp_path: Path) -> None:
+    path = tmp_path / "corrupt_payload.pkl.gz"
+    path.write_bytes(b"\x1f\x8b\x08\x00\x00\x00\x00\x00")
+
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert aggregate.success is True
+            assert determine_exit_code(aggregate) == 1
+            assert metadata["scan_outcome"] == "inconclusive"
+            assert metadata["scan_outcome_reasons"] == ["compressed_stream_decode_failed"]
+            assert any("invalid gzip stream" in issue.message.lower() for issue in aggregate.issues)
+        assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 def test_compressed_scanner_keeps_split_pickle_members_clean(tmp_path: Path) -> None:
     payload = pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
     split_at = len(payload) // 2
@@ -914,3 +961,6 @@ def test_compressed_scanner_missing_lz4_dependency_path(tmp_path: Path, monkeypa
     dependency_checks = [c for c in result.checks if c.name == "Compressed Wrapper Optional Dependency"]
     assert dependency_checks and dependency_checks[0].status == CheckStatus.FAILED
     assert dependency_checks[0].severity == IssueSeverity.INFO
+    assert dependency_checks[0].details["scan_outcome_reason"] == "compressed_optional_dependency_unavailable"
+    assert result.metadata["scan_outcome_reasons"] == ["compressed_optional_dependency_unavailable"]
+    assert result.success is False
