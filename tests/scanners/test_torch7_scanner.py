@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from modelaudit import core
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.torch7_scanner import Torch7Scanner
@@ -183,6 +185,36 @@ def test_scan_bounded_torch7_window_is_inconclusive(tmp_path: Path) -> None:
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "torch7_bounded_read_incomplete" in result.metadata["scan_outcome_reasons"]
     assert result.success is False
+
+
+def test_scan_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_torch7_file(tmp_path, b"T7\x00\x00torch.FloatTensor nn.Sequential safe metadata")
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated Torch7 read failure")
+
+    monkeypatch.setattr(Torch7Scanner, "can_handle", classmethod(lambda _cls, _path: True))
+    monkeypatch.setattr("modelaudit.scanners.torch7_scanner.open", raise_os_error, raising=False)
+
+    direct = Torch7Scanner().scan(str(path))
+    aggregate = core.scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    read_checks = [check for check in direct.checks if check.name == "Torch7 File Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "torch7_read_failed"
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "torch7_read_failed" in direct.metadata["scan_outcome_reasons"]
+    metadata = aggregate.file_metadata[str(path)]
+    assert "torch7_read_failed" in metadata["scan_outcome_reasons"]
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert core.determine_exit_code(aggregate) == 2
 
 
 def test_scan_string_extraction_limit_marks_late_torch7_payload_inconclusive(tmp_path: Path) -> None:

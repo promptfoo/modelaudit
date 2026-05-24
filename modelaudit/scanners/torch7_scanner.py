@@ -101,13 +101,19 @@ class Torch7Scanner(BaseScanner):
             with open(path, "rb") as file_obj:
                 data = file_obj.read(self.max_scan_bytes + 1)
         except OSError as exc:
+            mark_inconclusive_scan_result(result, "torch7_read_failed")
             result.add_check(
                 name="Torch7 File Read",
                 passed=False,
                 message=f"Failed to read Torch7 file: {exc!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(exc), "exception_type": type(exc).__name__},
+                details={
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "torch7_read_failed",
+                },
             )
             result.finish(success=False)
             return result

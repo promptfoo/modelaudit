@@ -119,13 +119,19 @@ class RknnScanner(BaseScanner):
             with open(path, "rb") as file_obj:
                 data = file_obj.read(self.max_scan_bytes + 1)
         except OSError as exc:
+            mark_inconclusive_scan_result(result, "rknn_read_failed")
             result.add_check(
                 name="RKNN File Read",
                 passed=False,
                 message=f"Failed to read RKNN file: {exc!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(exc), "exception_type": type(exc).__name__},
+                details={
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "rknn_read_failed",
+                },
             )
             result.finish(success=False)
             return result

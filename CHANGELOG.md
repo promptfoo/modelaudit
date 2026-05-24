@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - detect Python operators declared in nested ONNX graphs and functions
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
-- mark RKNN and Torch7 string-extraction limits as inconclusive analysis
+- mark RKNN and Torch7 string-extraction limits and unavailable reads as inconclusive analysis
 
 ## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
 

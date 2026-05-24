@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from modelaudit import core
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.rknn_scanner import RknnScanner
@@ -117,6 +119,36 @@ def test_scan_bounded_rknn_window_is_inconclusive(tmp_path: Path) -> None:
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "rknn_bounded_read_incomplete" in result.metadata["scan_outcome_reasons"]
+
+
+def test_scan_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _write_rknn_file(tmp_path, b"RKNN\x01\x00\x00\x00model_name=demo runtime=rockchip")
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated RKNN read failure")
+
+    monkeypatch.setattr(RknnScanner, "can_handle", classmethod(lambda _cls, _path: True))
+    monkeypatch.setattr("modelaudit.scanners.rknn_scanner.open", raise_os_error, raising=False)
+
+    direct = RknnScanner().scan(str(path))
+    aggregate = core.scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    read_checks = [check for check in direct.checks if check.name == "RKNN File Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "rknn_read_failed"
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "rknn_read_failed" in direct.metadata["scan_outcome_reasons"]
+    metadata = aggregate.file_metadata[str(path)]
+    assert "rknn_read_failed" in metadata["scan_outcome_reasons"]
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert core.determine_exit_code(aggregate) == 2
 
 
 def test_scan_string_extraction_limit_marks_late_rknn_payload_inconclusive(tmp_path: Path) -> None:
