@@ -103,6 +103,7 @@ class CompressedScanner(BaseScanner):
     DEFAULT_MAX_MEMBERS: ClassVar[int] = 1000
     DEFAULT_CHUNK_SIZE: ClassVar[int] = 64 * 1024
     _MEMBER_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_member_limit_exceeded"
+    _DECOMPRESSION_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_decompression_limit_exceeded"
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -872,10 +873,11 @@ class CompressedScanner(BaseScanner):
             result.finish(success=False)
             return result
         except _DecompressionLimitExceeded as exc:
+            mark_inconclusive_scan_result(result, self._DECOMPRESSION_LIMIT_INCONCLUSIVE_REASON)
             result.add_check(
                 name="Compressed Wrapper Decompression Limits",
                 passed=False,
-                message=str(exc),
+                message=f"{exc}; analysis incomplete",
                 severity=IssueSeverity.WARNING,
                 location=path,
                 details={
@@ -883,6 +885,8 @@ class CompressedScanner(BaseScanner):
                     "max_decompressed_bytes": self.max_decompressed_bytes,
                     "max_decompression_ratio": self.max_decompression_ratio,
                     "max_compressed_members": self.max_members,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self._DECOMPRESSION_LIMIT_INCONCLUSIVE_REASON,
                 },
             )
             result.finish(success=False)

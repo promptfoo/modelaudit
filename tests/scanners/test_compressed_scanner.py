@@ -320,7 +320,12 @@ def test_compressed_scanner_enforces_decompression_size_limit(
 
     limit_checks = [c for c in result.checks if c.name == "Compressed Wrapper Decompression Limits"]
     assert limit_checks and limit_checks[0].status == CheckStatus.FAILED
+    assert "analysis incomplete" in limit_checks[0].message.lower()
     assert limit_checks[0].severity == IssueSeverity.WARNING
+    assert limit_checks[0].details["scan_outcome_reason"] == "compressed_decompression_limit_exceeded"
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["scan_outcome_reasons"] == ["compressed_decompression_limit_exceeded"]
+    assert result.success is False
 
 
 def test_compressed_scanner_enforces_decompression_ratio_limit(tmp_path: Path) -> None:
@@ -333,7 +338,12 @@ def test_compressed_scanner_enforces_decompression_ratio_limit(tmp_path: Path) -
 
     ratio_checks = [c for c in result.checks if c.name == "Compressed Wrapper Decompression Limits"]
     assert ratio_checks and ratio_checks[0].status == CheckStatus.FAILED
+    assert "analysis incomplete" in ratio_checks[0].message.lower()
     assert ratio_checks[0].severity == IssueSeverity.WARNING
+    assert ratio_checks[0].details["scan_outcome_reason"] == "compressed_decompression_limit_exceeded"
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["scan_outcome_reasons"] == ["compressed_decompression_limit_exceeded"]
+    assert result.success is False
 
 
 def test_compressed_scanner_false_positive_control_high_ratio_within_policy(tmp_path: Path) -> None:
@@ -703,6 +713,39 @@ def test_compressed_scanner_excess_members_are_exit2_and_not_cached(tmp_path: Pa
             assert aggregate.success is False
             assert determine_exit_code(aggregate) == 2
             assert any("member count exceeded limit (3 > 2)" in issue.message.lower() for issue in aggregate.issues)
+        assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_compressed_scanner_decompression_limit_preserves_exit1_and_is_not_cached(tmp_path: Path) -> None:
+    path = tmp_path / "size_limited_payload.pkl.gz"
+    path.write_bytes(gzip.compress(b"A" * 4096))
+
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+            compressed_max_decompressed_bytes=512,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(tmp_path / "cache"),
+            min_cache_file_size=0,
+            compressed_max_decompressed_bytes=512,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert aggregate.success is True
+            assert determine_exit_code(aggregate) == 1
+            assert metadata["scan_outcome"] == "inconclusive"
+            assert metadata["scan_outcome_reasons"] == ["compressed_decompression_limit_exceeded"]
+            assert any("decompressed size exceeded limit" in issue.message.lower() for issue in aggregate.issues)
         assert get_cache_manager(str(tmp_path / "cache"), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
