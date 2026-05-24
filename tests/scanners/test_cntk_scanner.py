@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.cntk_scanner import DISCOVERY_ASSUMPTIONS, CntkScanner
@@ -154,6 +155,55 @@ def test_cntk_scanner_marks_bounded_prefix_analysis_inconclusive(
     assert "cntk_bounded_read_incomplete" in result.metadata["scan_outcome_reasons"]
 
 
+def test_cntk_scanner_file_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable.jpg"
+    _write_cntkv2(path)
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> tuple[bytes, bool]:
+        raise OSError("simulated CNTK read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.cntk_scanner._read_bounded", raise_os_error)
+
+    direct = CntkScanner().scan(str(path))
+    read_checks = [check for check in direct.checks if check.name == "CNTK File Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "cntk_read_failed"
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "cntk_read_failed" in direct.metadata["scan_outcome_reasons"]
+
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert "cntk_read_failed" in metadata["scan_outcome_reasons"]
+            assert not [
+                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 def test_cntk_scanner_marks_late_string_payload_inconclusive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -173,11 +223,31 @@ def test_cntk_scanner_marks_late_string_payload_inconclusive(
     budget_checks = [check for check in result.checks if check.name == "CNTK Text Fragment Budget"]
     assert len(budget_checks) == 1
     assert budget_checks[0].status == CheckStatus.FAILED
+    assert "stopped at the configured extraction limit" in budget_checks[0].message
     assert budget_checks[0].details["analysis_incomplete"] is True
 
-    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
-    assert aggregate.file_metadata[str(path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert determine_exit_code(aggregate) == 2
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            assert aggregate.file_metadata[str(path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_cntk_scanner_exact_string_limit_preserves_clean_result(
