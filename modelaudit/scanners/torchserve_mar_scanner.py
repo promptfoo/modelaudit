@@ -196,13 +196,19 @@ class TorchServeMarScanner(BaseScanner):
             self._get_int_config("_archive_depth", 0, minimum=0),
         )
         if current_depth >= self.max_depth:
+            mark_inconclusive_scan_result(result, "torchserve_mar_depth_limit")
             result.add_check(
                 name="TorchServe MAR Depth Limit",
                 passed=False,
                 message=f"Maximum .mar recursion depth ({self.max_depth}) exceeded",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"depth": current_depth, "max_depth": self.max_depth},
+                details={
+                    "depth": current_depth,
+                    "max_depth": self.max_depth,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "torchserve_mar_depth_limit",
+                },
             )
             result.finish(success=False)
             return result
@@ -343,6 +349,7 @@ class TorchServeMarScanner(BaseScanner):
         manifest_infos = all_manifest_infos
         if len(all_manifest_infos) > self.max_entries:
             manifest_infos = all_manifest_infos[: self.max_entries]
+            mark_inconclusive_scan_result(result, "torchserve_manifest_entry_limit")
             result.add_check(
                 name="TorchServe Manifest Entry Limit",
                 passed=False,
@@ -352,12 +359,14 @@ class TorchServeMarScanner(BaseScanner):
                     f"({self.max_entries}); manifest declarations after the entry cap were skipped and "
                     "scan results are incomplete"
                 ),
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
                 details={
                     "manifest_entry_count": len(all_manifest_infos),
                     "max_entries": self.max_entries,
                     "dropped_manifest_count": len(all_manifest_infos) - self.max_entries,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "torchserve_manifest_entry_limit",
                 },
             )
 
@@ -381,6 +390,7 @@ class TorchServeMarScanner(BaseScanner):
 
             processed_manifest_uncompressed += max(manifest_info.file_size, 0)
             if processed_manifest_uncompressed > self.max_uncompressed_bytes:
+                mark_inconclusive_scan_result(result, "torchserve_manifest_uncompressed_budget")
                 result.add_check(
                     name="TorchServe Manifest Uncompressed Size Budget",
                     passed=False,
@@ -389,11 +399,13 @@ class TorchServeMarScanner(BaseScanner):
                         f"({processed_manifest_uncompressed} > {self.max_uncompressed_bytes}); "
                         "later manifest declarations were skipped and scan results are incomplete"
                     ),
-                    severity=IssueSeverity.CRITICAL,
+                    severity=IssueSeverity.INFO,
                     location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
                     details={
                         "processed_uncompressed": processed_manifest_uncompressed,
                         "max_uncompressed_bytes": self.max_uncompressed_bytes,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "torchserve_manifest_uncompressed_budget",
                     },
                 )
                 break
@@ -403,23 +415,34 @@ class TorchServeMarScanner(BaseScanner):
             try:
                 manifest_bytes = self._read_member_bounded(archive, manifest_info, self.MAX_MANIFEST_BYTES)
             except ValueError as exc:
+                mark_inconclusive_scan_result(result, "torchserve_manifest_size_limit")
                 result.add_check(
                     name="TorchServe Manifest Size Limit",
                     passed=False,
                     message=str(exc),
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
-                    details=manifest_details,
+                    details={
+                        **manifest_details,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "torchserve_manifest_size_limit",
+                    },
                 )
                 continue
             except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+                mark_inconclusive_scan_result(result, "torchserve_manifest_read_failed")
                 result.add_check(
                     name="TorchServe Manifest Read",
                     passed=False,
                     message=f"Unable to read TorchServe manifest entry: {exc}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=f"{archive_path}:{MANIFEST_ENTRY_PATH}",
-                    details={**manifest_details, "exception_type": type(exc).__name__},
+                    details={
+                        **manifest_details,
+                        "exception_type": type(exc).__name__,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "torchserve_manifest_read_failed",
+                    },
                 )
                 continue
 
@@ -782,6 +805,7 @@ class TorchServeMarScanner(BaseScanner):
 
                 for handler_info in handler_infos:
                     if processed_handler_entries >= self.max_entries:
+                        mark_inconclusive_scan_result(result, "torchserve_handler_entry_limit")
                         result.add_check(
                             name="TorchServe Handler Entry Limit",
                             passed=False,
@@ -790,12 +814,14 @@ class TorchServeMarScanner(BaseScanner):
                                 f"({self.max_entries}); later handler files were skipped and scan results "
                                 "are incomplete"
                             ),
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=f"{archive_path}:{normalized_handler}",
                             details={
                                 "processed_handler_entries": processed_handler_entries,
                                 "max_entries": self.max_entries,
                                 "skipped_handler": normalized_handler,
+                                "analysis_incomplete": True,
+                                "scan_outcome_reason": "torchserve_handler_entry_limit",
                             },
                         )
                         handler_budget_exceeded = True
@@ -804,6 +830,7 @@ class TorchServeMarScanner(BaseScanner):
                     processed_handler_entries += 1
                     processed_handler_uncompressed += max(handler_info.file_size, 0)
                     if processed_handler_uncompressed > self.max_uncompressed_bytes:
+                        mark_inconclusive_scan_result(result, "torchserve_handler_uncompressed_budget")
                         result.add_check(
                             name="TorchServe Handler Uncompressed Size Budget",
                             passed=False,
@@ -812,12 +839,14 @@ class TorchServeMarScanner(BaseScanner):
                                 f"({processed_handler_uncompressed} > {self.max_uncompressed_bytes}); "
                                 "later handler files were skipped and scan results are incomplete"
                             ),
-                            severity=IssueSeverity.CRITICAL,
+                            severity=IssueSeverity.INFO,
                             location=f"{archive_path}:{normalized_handler}",
                             details={
                                 "processed_uncompressed": processed_handler_uncompressed,
                                 "max_uncompressed_bytes": self.max_uncompressed_bytes,
                                 "handler": normalized_handler,
+                                "analysis_incomplete": True,
+                                "scan_outcome_reason": "torchserve_handler_uncompressed_budget",
                             },
                         )
                         handler_budget_exceeded = True
@@ -832,23 +861,35 @@ class TorchServeMarScanner(BaseScanner):
                     try:
                         handler_bytes = self._read_member_bounded(archive, handler_info, self.max_member_bytes)
                     except ValueError as exc:
+                        mark_inconclusive_scan_result(result, "torchserve_handler_size_limit")
                         result.add_check(
                             name="TorchServe Handler Static Analysis",
                             passed=False,
                             message=str(exc),
-                            severity=IssueSeverity.WARNING,
+                            severity=IssueSeverity.INFO,
                             location=f"{archive_path}:{normalized_handler}",
-                            details=handler_details,
+                            details={
+                                **handler_details,
+                                "analysis_incomplete": True,
+                                "scan_outcome_reason": "torchserve_handler_size_limit",
+                            },
                         )
                         continue
                     except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+                        mark_inconclusive_scan_result(result, "torchserve_handler_read_failed")
                         result.add_check(
                             name="TorchServe Handler Static Analysis",
                             passed=False,
                             message=f"Unable to read handler source for static analysis: {exc}",
-                            severity=IssueSeverity.WARNING,
+                            severity=IssueSeverity.INFO,
                             location=f"{archive_path}:{normalized_handler}",
-                            details={**handler_details, "analysis_kind": "read", "exception_type": type(exc).__name__},
+                            details={
+                                **handler_details,
+                                "analysis_kind": "read",
+                                "exception_type": type(exc).__name__,
+                                "analysis_incomplete": True,
+                                "scan_outcome_reason": "torchserve_handler_read_failed",
+                            },
                         )
                         continue
 
@@ -1084,25 +1125,35 @@ class TorchServeMarScanner(BaseScanner):
                 try:
                     source_bytes = self._read_member_bounded(archive, member_info, self.max_member_bytes)
                 except ValueError as exc:
-                    non_handler_findings += 1
+                    mark_inconclusive_scan_result(result, "torchserve_non_handler_python_size_limit")
                     result.add_check(
                         name="MAR Non-Handler Python Analysis",
                         passed=False,
                         message=str(exc),
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=f"{archive_path}:{member_name}",
-                        details={**member_details, "analysis_kind": "bounded_read"},
+                        details={
+                            **member_details,
+                            "analysis_kind": "bounded_read",
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": "torchserve_non_handler_python_size_limit",
+                        },
                     )
                     continue
                 except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
-                    non_handler_findings += 1
+                    mark_inconclusive_scan_result(result, "torchserve_non_handler_python_read_failed")
                     result.add_check(
                         name="MAR Non-Handler Python Analysis",
                         passed=False,
                         message=f"Unable to read non-handler Python source for static analysis: {exc}",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=f"{archive_path}:{member_name}",
-                        details={**member_details, "analysis_kind": "read"},
+                        details={
+                            **member_details,
+                            "analysis_kind": "read",
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": "torchserve_non_handler_python_read_failed",
+                        },
                     )
                     continue
 
@@ -1350,9 +1401,14 @@ class TorchServeMarScanner(BaseScanner):
                 message=(
                     f"Archive contains {total_entries} entries, exceeding max processed entries ({self.max_entries})"
                 ),
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=archive_path,
-                details={"entry_count": total_entries, "max_entries": self.max_entries, "analysis_incomplete": True},
+                details={
+                    "entry_count": total_entries,
+                    "max_entries": self.max_entries,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "torchserve_mar_entry_limit",
+                },
             )
             mark_inconclusive_scan_result(result, "torchserve_mar_entry_limit")
             entries_to_process = member_infos[: self.max_entries]
@@ -1397,12 +1453,13 @@ class TorchServeMarScanner(BaseScanner):
                         "Archive uncompressed byte budget exceeded "
                         f"({processed_uncompressed} > {self.max_uncompressed_bytes})"
                     ),
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=f"{archive_path}:{member_name}",
                     details={
                         "processed_uncompressed": processed_uncompressed,
                         "max_uncompressed_bytes": self.max_uncompressed_bytes,
                         "analysis_incomplete": True,
+                        "scan_outcome_reason": "torchserve_mar_uncompressed_budget",
                     },
                 )
                 mark_inconclusive_scan_result(result, "torchserve_mar_uncompressed_budget")
@@ -1482,12 +1539,13 @@ class TorchServeMarScanner(BaseScanner):
                     name="TorchServe MAR Member Size Limit",
                     passed=False,
                     message=str(exc),
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=f"{archive_path}:{member_name}",
                     details={
                         "entry": member_name,
                         "max_member_bytes": self.max_member_bytes,
                         "analysis_incomplete": True,
+                        "scan_outcome_reason": "torchserve_mar_member_size_limit",
                     },
                 )
                 mark_inconclusive_scan_result(result, "torchserve_mar_member_size_limit")
@@ -1497,12 +1555,13 @@ class TorchServeMarScanner(BaseScanner):
                     name="TorchServe MAR Member Extraction",
                     passed=False,
                     message=f"Failed to extract archive member for scanning: {exc!s}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=f"{archive_path}:{member_name}",
                     details={
                         "entry": member_name,
                         "exception_type": type(exc).__name__,
                         "analysis_incomplete": True,
+                        "scan_outcome_reason": "torchserve_mar_member_extraction_failed",
                     },
                 )
                 mark_inconclusive_scan_result(result, "torchserve_mar_member_extraction_failed")
@@ -1617,7 +1676,7 @@ class TorchServeMarScanner(BaseScanner):
             member_info=member_info,
             normalized_member=normalized_member,
         )
-        findings = self._collect_requirements_findings(
+        requirement_findings, incomplete_members = self._collect_requirements_findings(
             archive,
             members_by_normalized,
             member_info,
@@ -1625,10 +1684,10 @@ class TorchServeMarScanner(BaseScanner):
             visited=set(),
         )
 
-        if findings:
+        if requirement_findings:
             highest_severity = (
                 IssueSeverity.CRITICAL
-                if any(finding["severity"] == IssueSeverity.CRITICAL for finding in findings)
+                if any(finding["severity"] == IssueSeverity.CRITICAL for finding in requirement_findings)
                 else IssueSeverity.WARNING
             )
             result.add_check(
@@ -1637,8 +1696,26 @@ class TorchServeMarScanner(BaseScanner):
                 message="requirements.txt contains potential supply-chain attack patterns",
                 severity=highest_severity,
                 location=location,
-                details={**member_details, "findings": findings},
+                details={**member_details, "findings": requirement_findings},
             )
+
+        if incomplete_members:
+            mark_inconclusive_scan_result(result, "torchserve_requirements_size_limit")
+            result.add_check(
+                name="TorchServe Requirements Supply Chain Coverage",
+                passed=False,
+                message="requirements.txt analysis was incomplete because a referenced file exceeded the size limit",
+                severity=IssueSeverity.INFO,
+                location=location,
+                details={
+                    **member_details,
+                    "incomplete_requirements_members": incomplete_members,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "torchserve_requirements_size_limit",
+                },
+            )
+
+        if requirement_findings or incomplete_members:
             return
 
         result.add_check(
@@ -1771,25 +1848,16 @@ class TorchServeMarScanner(BaseScanner):
         normalized_member: str,
         *,
         visited: set[tuple[str, int]],
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
         visit_key = (member_info.filename, member_info.header_offset)
         if visit_key in visited:
-            return []
+            return [], []
         visited.add(visit_key)
 
         try:
             requirements_bytes = self._read_member_bounded(archive, member_info, self.MAX_REQUIREMENTS_TXT_BYTES)
         except ValueError as exc:
-            return [
-                self._build_requirements_finding(
-                    requirements_file=normalized_member,
-                    line_number=0,
-                    line_content="",
-                    severity=IssueSeverity.WARNING,
-                    reason="requirements_read_error",
-                    message=str(exc),
-                )
-            ]
+            return [], [{"requirements_file": normalized_member, "message": str(exc)}]
 
         try:
             requirements_text = requirements_bytes.decode("utf-8")
@@ -1797,6 +1865,7 @@ class TorchServeMarScanner(BaseScanner):
             requirements_text = requirements_bytes.decode("utf-8", errors="replace")
 
         findings: list[dict[str, Any]] = []
+        incomplete_members: list[dict[str, str]] = []
         for line_number, raw_line in enumerate(requirements_text.splitlines(), start=1):
             line = self._strip_inline_requirement_comment(raw_line)
             if not line:
@@ -1840,15 +1909,15 @@ class TorchServeMarScanner(BaseScanner):
                 resolved_include = self._resolve_local_requirements_reference(normalized_member, include_target)
                 if resolved_include:
                     for included_member_info in members_by_normalized.get(resolved_include, []):
-                        findings.extend(
-                            self._collect_requirements_findings(
-                                archive,
-                                members_by_normalized,
-                                included_member_info,
-                                self._normalize_member_name(included_member_info.filename),
-                                visited=visited,
-                            )
+                        included_findings, included_incomplete_members = self._collect_requirements_findings(
+                            archive,
+                            members_by_normalized,
+                            included_member_info,
+                            self._normalize_member_name(included_member_info.filename),
+                            visited=visited,
                         )
+                        findings.extend(included_findings)
+                        incomplete_members.extend(included_incomplete_members)
                 continue
 
             index_url = self._extract_pip_option_value(
@@ -1982,7 +2051,7 @@ class TorchServeMarScanner(BaseScanner):
                     )
                 )
 
-        return findings
+        return findings, incomplete_members
 
     def _extract_pip_option_value(
         self,
@@ -2048,8 +2117,21 @@ class TorchServeMarScanner(BaseScanner):
         try:
             raw_target = self._read_member_bounded(archive, member_info, 4096)
             target = raw_target.decode("utf-8", "replace")
-        except Exception:
-            target = ""
+        except Exception as exc:
+            mark_inconclusive_scan_result(result, "torchserve_mar_symlink_target_read_failed")
+            result.add_check(
+                name="TorchServe MAR Symlink Safety Validation",
+                passed=False,
+                message=f"Unable to read symlink target for safety validation: {exc!s}",
+                severity=IssueSeverity.INFO,
+                location=f"{archive_path}:{member_name}",
+                details={
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "torchserve_mar_symlink_target_read_failed",
+                },
+            )
+            return
 
         target_base = os.path.dirname(resolved_member_path)
         _resolved_target, target_is_safe = sanitize_archive_path(target, target_base)
