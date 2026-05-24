@@ -1143,7 +1143,42 @@ def _read_proto_varint_stream(stream: BinaryIO) -> int | None:
     return None
 
 
-def _skip_proto_stream_value(stream: BinaryIO, wire_type: int, file_size: int) -> bool:
+def _is_tensorflow_graph_field_payload(payload: bytes) -> bool:
+    """Validate a bounded protobuf field as TensorFlow graph-bearing content."""
+    try:
+        import modelaudit.protos  # noqa: F401, I001
+
+        from tensorflow.core.framework.graph_pb2 import GraphDef
+        from tensorflow.core.protobuf.meta_graph_pb2 import MetaGraphDef
+    except Exception:
+        return False
+    try:
+        graph_def = GraphDef()
+        graph_def.ParseFromString(payload)
+        if len(graph_def.node) > 0 or any(function.node_def for function in graph_def.library.function):
+            return True
+    except Exception:
+        pass
+    try:
+        metagraph = MetaGraphDef()
+        metagraph.ParseFromString(payload)
+        return metagraph.HasField("graph_def") and (
+            len(metagraph.graph_def.node) > 0
+            or any(function.node_def for function in metagraph.graph_def.library.function)
+            or len(metagraph.collection_def) > 0
+        )
+    except Exception:
+        return False
+
+
+def _skip_proto_stream_value(
+    stream: BinaryIO,
+    wire_type: int,
+    file_size: int,
+    *,
+    field_number: int | None = None,
+    remaining_fields: list[int] | None = None,
+) -> bool:
     if wire_type == 0:
         return _read_proto_varint_stream(stream) is not None
     if wire_type == 1:
@@ -1155,6 +1190,27 @@ def _skip_proto_stream_value(stream: BinaryIO, wire_type: int, file_size: int) -
         length = length_result
     elif wire_type == 5:
         length = 4
+    elif wire_type == 3:
+        if field_number is None or remaining_fields is None:
+            return False
+        while remaining_fields[0] > 0 and stream.tell() < file_size:
+            remaining_fields[0] -= 1
+            nested_tag = _read_proto_varint_stream(stream)
+            if nested_tag is None:
+                return False
+            nested_field_number = nested_tag >> 3
+            nested_wire_type = nested_tag & 0x07
+            if nested_wire_type == 4:
+                return nested_field_number == field_number
+            if nested_field_number == 0 or not _skip_proto_stream_value(
+                stream,
+                nested_wire_type,
+                file_size,
+                field_number=nested_field_number,
+                remaining_fields=remaining_fields,
+            ):
+                return False
+        return False
     else:
         return False
 
@@ -1167,8 +1223,10 @@ def _skip_proto_stream_value(stream: BinaryIO, wire_type: int, file_size: int) -
 def _has_bounded_tensorflow_graph_field(path: Path, file_size: int) -> bool:
     """Seek past top-level protobuf values while looking for TensorFlow graph content."""
     try:
+        remaining_fields = [_TF_METAGRAPH_MAX_ROUTING_FIELDS]
         with path.open("rb") as stream:
-            for _ in range(_TF_METAGRAPH_MAX_ROUTING_FIELDS):
+            while remaining_fields[0] > 0:
+                remaining_fields[0] -= 1
                 if stream.tell() >= file_size:
                     return False
                 tag = _read_proto_varint_stream(stream)
@@ -1179,11 +1237,22 @@ def _has_bounded_tensorflow_graph_field(path: Path, file_size: int) -> bool:
                 if field_number == 0:
                     return False
                 if field_number == 2 and wire_type == 2:
-                    return True
-                if wire_type in {3, 4}:
-                    # Unknown group fields cannot be skipped without a recursive walk.
-                    return True
-                if not _skip_proto_stream_value(stream, wire_type, file_size):
+                    length = _read_proto_varint_stream(stream)
+                    if length is None or stream.tell() + length > file_size:
+                        return False
+                    if file_size <= _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+                        return True
+                    if length > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+                        # Preserve an uninspectably large structural graph field for fail-closed scanning.
+                        return True
+                    return _is_tensorflow_graph_field_payload(stream.read(length))
+                if not _skip_proto_stream_value(
+                    stream,
+                    wire_type,
+                    file_size,
+                    field_number=field_number,
+                    remaining_fields=remaining_fields,
+                ):
                     return False
     except OSError:
         return False
