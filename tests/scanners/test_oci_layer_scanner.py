@@ -4,13 +4,51 @@ import shutil
 import tarfile
 import tempfile
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import IssueSeverity, ScanResult
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
 from modelaudit.scanners.oci_layer_scanner import OciLayerScanner
+
+
+def _assert_inconclusive_aggregate_not_cached(
+    path: Path,
+    expected_reason: str,
+    cache_dir: Path,
+    **scan_kwargs: Any,
+) -> None:
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert expected_reason in metadata["scan_outcome_reasons"]
+            assert not [
+                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 class TestOciLayerScanner:
@@ -128,10 +166,10 @@ class TestOciLayerScanner:
 
         assert result.success is True
 
-    def test_scan_invalid_json_manifest(self, tmp_path):
+    def test_scan_invalid_json_manifest(self, tmp_path: Path) -> None:
         """Test scanning an invalid JSON manifest."""
         manifest_path = tmp_path / "invalid.manifest"
-        manifest_path.write_text("{ invalid json content")
+        manifest_path.write_text("{ invalid json content layer.tar.gz")
 
         scanner = OciLayerScanner()
         result = scanner.scan(str(manifest_path))
@@ -141,6 +179,11 @@ class TestOciLayerScanner:
         assert "oci_manifest_parse_failed" in result.metadata["scan_outcome_reasons"]
         assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
         assert any("Error parsing manifest" in issue.message for issue in result.issues)
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_manifest_parse_failed",
+            tmp_path / "parse-cache",
+        )
 
     def test_scan_empty_manifest(self, tmp_path):
         """Test scanning an empty manifest."""
@@ -167,6 +210,11 @@ class TestOciLayerScanner:
         assert "oci_layer_missing" in result.metadata["scan_outcome_reasons"]
         assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
         assert any("Layer not found: nonexistent.tar.gz" in issue.message for issue in result.issues)
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_layer_missing",
+            tmp_path / "missing-cache",
+        )
 
     def test_scan_manifest_with_multiple_layers(self, tmp_path):
         """Test scanning manifest with multiple layers."""
@@ -375,6 +423,11 @@ class TestOciLayerScanner:
             and "Remote layer was not scanned" in issue.message
             and remote_layer_ref in issue.message
             for issue in result.issues
+        )
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_remote_layer_unavailable",
+            tmp_path / "remote-cache",
         )
 
     def test_scan_manifest_scans_url_like_layer_ref_when_local_path_exists(self, tmp_path: Path) -> None:
@@ -723,8 +776,12 @@ class TestOciLayerScanner:
         assert len(checks) == 1
         assert checks[0].severity == IssueSeverity.INFO
 
-        aggregate = scan_model_directory_or_file(str(manifest_path), max_file_size=64, use_cache=False)
-        assert determine_exit_code(aggregate) == 2
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_layer_size_limit_exceeded",
+            tmp_path / "layer-size-cache",
+            max_file_size=64,
+        )
 
     def test_scan_layer_skips_oversized_member_before_copying(self, tmp_path: Path) -> None:
         """Oversized members should be rejected before they are copied to temp storage."""
@@ -782,8 +839,12 @@ class TestOciLayerScanner:
         assert "oci_member_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
-        aggregate = scan_model_directory_or_file(str(manifest_path), max_file_size=4096, use_cache=False)
-        assert determine_exit_code(aggregate) == 2
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_member_size_limit_exceeded",
+            tmp_path / "member-size-cache",
+            max_file_size=4096,
+        )
 
     def test_scan_member_at_size_limit_remains_clean(self, tmp_path: Path) -> None:
         """Content at the configured member limit is inspected rather than failed closed."""
@@ -893,6 +954,31 @@ class TestOciLayerScanner:
         assert all(not Path(path).exists() for path in created_paths)
         assert any("Error processing layer" in issue.message for issue in result.issues)
 
+    def test_scan_member_extraction_failure_is_inconclusive(self, tmp_path: Path) -> None:
+        """A member that cannot be extracted represents incomplete coverage, not malicious content."""
+        safe_file = tmp_path / "safe.txt"
+        safe_file.write_text("safe content")
+
+        layer_path = tmp_path / "layer.tar.gz"
+        with tarfile.open(layer_path, "w:gz") as tar:
+            tar.add(safe_file, arcname="safe.txt")
+
+        manifest_path = tmp_path / "extraction-failure.manifest"
+        manifest_path.write_text(json.dumps({"layers": ["layer.tar.gz"]}))
+
+        with patch("modelaudit.scanners.oci_layer_scanner.tarfile.TarFile.extractfile", return_value=None):
+            result = OciLayerScanner().scan(str(manifest_path))
+
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert "oci_member_extraction_failed" in result.metadata["scan_outcome_reasons"]
+            assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+            _assert_inconclusive_aggregate_not_cached(
+                manifest_path,
+                "oci_member_extraction_failed",
+                tmp_path / "extraction-cache",
+            )
+
     def test_scan_layer_with_directory_entries(self, tmp_path):
         """Test scanning layer with directory entries (should be skipped)."""
         safe_file = tmp_path / "safe.txt"
@@ -933,6 +1019,11 @@ class TestOciLayerScanner:
         assert "oci_layer_processing_failed" in result.metadata["scan_outcome_reasons"]
         assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
         assert any("Error processing layer" in issue.message for issue in result.issues)
+        _assert_inconclusive_aggregate_not_cached(
+            manifest_path,
+            "oci_layer_processing_failed",
+            tmp_path / "processing-cache",
+        )
 
     def test_scan_nonexistent_file(self):
         """Test scanning non-existent manifest file."""
