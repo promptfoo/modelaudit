@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pmml_scanner import PmmlScanner
 
@@ -62,6 +64,10 @@ def test_pmml_scanner_suspicious_extension_content(tmp_path: Path) -> None:
     suspicious_issues = [i for i in result.issues if "suspicious content" in i.message.lower()]
     assert len(suspicious_issues) >= 1
     assert all(i.severity == IssueSeverity.WARNING for i in suspicious_issues)
+    assert "scan_outcome" not in result.metadata
+
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+    assert determine_exit_code(aggregate) == 1
 
 
 def test_pmml_scanner_benign_ecosystem_call_is_not_flagged(tmp_path: Path) -> None:
@@ -577,6 +583,11 @@ def test_pmml_scanner_malformed_xml(tmp_path: Path) -> None:
     assert any("malformed xml" in i.message.lower() for i in result.issues)
     # Malformed XML is INFO severity (not a security threat, just parsing issue)
     assert any(i.severity == IssueSeverity.INFO for i in result.issues)
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == [PmmlScanner.XML_PARSE_INCOMPLETE_REASON]
+
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_pmml_scanner_invalid_root_element(tmp_path: Path) -> None:
@@ -707,11 +718,11 @@ def test_pmml_scanner_deep_extension_tree_does_not_recurse_forever(tmp_path: Pat
     assert result.bytes_scanned > 0
 
 
-def test_pmml_scanner_extension_text_truncation_fails_closed(tmp_path: Path) -> None:
+def test_pmml_scanner_extension_text_truncation_with_hidden_payload_is_inconclusive(tmp_path: Path) -> None:
     pmml = f"""<?xml version='1.0'?>
 <PMML version='4.4'>
   <Header>
-    <Extension>{"<node/>" * (PmmlScanner.MAX_EXTENSION_TEXT_NODES + 8)}<script>eval('x')</script></Extension>
+    <Extension>{"<node/>" * (PmmlScanner.MAX_EXTENSION_TEXT_NODES + 8)}<payload>eval('x')</payload></Extension>
   </Header>
 </PMML>"""
     path = tmp_path / "truncated_extension.pmml"
@@ -721,7 +732,33 @@ def test_pmml_scanner_extension_text_truncation_fails_closed(tmp_path: Path) -> 
 
     assert result.success is False
     assert any("exceeds the safe inspection node limit" in issue.message for issue in result.issues)
-    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == [PmmlScanner.EXTENSION_TRAVERSAL_INCOMPLETE_REASON]
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_pmml_scanner_benign_extension_truncation_is_not_a_security_finding(tmp_path: Path) -> None:
+    pmml = f"""<?xml version='1.0'?>
+<PMML version='4.4'>
+  <Header>
+    <Extension>{"<node/>" * (PmmlScanner.MAX_EXTENSION_TEXT_NODES + 8)}</Extension>
+  </Header>
+</PMML>"""
+    path = tmp_path / "benign_padded_extension.pmml"
+    path.write_text(pmml, encoding="utf-8")
+
+    result = PmmlScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == [PmmlScanner.EXTENSION_TRAVERSAL_INCOMPLETE_REASON]
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_pmml_scanner_can_handle_detection(tmp_path: Path) -> None:
