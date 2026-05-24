@@ -64,38 +64,38 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 
 ModelAudit includes 44 registered scanners covering model, archive, and configuration formats:
 
-| Format                  | Extensions                                                                | Risk   |
-| ----------------------- | ------------------------------------------------------------------------- | ------ |
-| **Pickle**              | `.pkl`, `.pickle`, `.dill`                                                | HIGH   |
-| **PyTorch**             | `.pt`, `.pth`, `.ckpt`, `.bin`                                            | HIGH   |
-| **Joblib**              | `.joblib`                                                                 | HIGH   |
-| **NumPy**               | `.npy`, `.npz`                                                            | HIGH   |
-| **R Serialized**        | `.rds`, `.rda`, `.rdata`                                                  | HIGH   |
-| **TensorFlow**          | `.pb`, `.meta`, SavedModel dirs                                           | MEDIUM |
-| **Keras**               | `.h5`, `.hdf5`, `.keras`                                                  | MEDIUM |
-| **ONNX**                | `.onnx`                                                                   | MEDIUM |
-| **CoreML**              | `.mlmodel`                                                                | LOW    |
-| **MXNet**               | `*-symbol.json`, `*-NNNN.params`                                          | LOW    |
-| **NeMo**                | `.nemo`                                                                   | MEDIUM |
-| **CNTK**                | `.dnn`, `.cmf`                                                            | MEDIUM |
-| **RKNN**                | `.rknn`                                                                   | MEDIUM |
-| **Torch7**              | `.t7`, `.th`, `.net`                                                      | HIGH   |
-| **CatBoost**            | `.cbm`                                                                    | MEDIUM |
-| **XGBoost**             | `.bst`, `.model`, `.json`, `.ubj`                                         | MEDIUM |
-| **LightGBM**            | `.lgb`, `.lightgbm`, `.model`                                             | MEDIUM |
-| **Llamafile**           | `.llamafile`, extensionless, `.exe`                                       | MEDIUM |
-| **TorchServe**          | `.mar`                                                                    | HIGH   |
-| **SafeTensors**         | `.safetensors`                                                            | LOW    |
-| **GGUF/GGML**           | `.gguf`, `.ggml`, `.ggmf`, `.ggjt`, `.ggla`, `.ggsa`                      | LOW    |
-| **JAX/Flax**            | `.msgpack`, `.flax`, `.orbax`, `.jax`, `.checkpoint`, `.orbax-checkpoint` | LOW    |
-| **TFLite**              | `.tflite`                                                                 | LOW    |
-| **ExecuTorch**          | `.ptl`, `.pte`                                                            | LOW    |
-| **TensorRT**            | `.engine`, `.plan`, `.trt`                                                | LOW    |
-| **PaddlePaddle**        | `.pdmodel`, `.pdiparams`                                                  | LOW    |
-| **OpenVINO**            | `.xml`                                                                    | LOW    |
-| **Skops**               | `.skops`                                                                  | HIGH   |
-| **PMML**                | `.pmml`                                                                   | LOW    |
-| **Compressed Wrappers** | `.gz`, `.bz2`, `.xz`, `.lz4`, `.zlib`                                     | MEDIUM |
+| Format                  | Extensions                                                                              | Risk   |
+| ----------------------- | --------------------------------------------------------------------------------------- | ------ |
+| **Pickle**              | `.pkl`, `.pickle`, `.dill`                                                              | HIGH   |
+| **PyTorch**             | `.pt`, `.pth`, `.ckpt`, `.bin`                                                          | HIGH   |
+| **Joblib**              | `.joblib`                                                                               | HIGH   |
+| **NumPy**               | `.npy`, `.npz`                                                                          | HIGH   |
+| **R Serialized**        | `.rds`, `.rda`, `.rdata`                                                                | HIGH   |
+| **TensorFlow**          | `.pb`, `.meta`, SavedModel dirs                                                         | MEDIUM |
+| **Keras**               | `.h5`, `.hdf5`, `.keras`                                                                | MEDIUM |
+| **ONNX**                | `.onnx`                                                                                 | MEDIUM |
+| **CoreML**              | `.mlmodel`                                                                              | LOW    |
+| **MXNet**               | `*-symbol.json`, `*-NNNN.params`                                                        | LOW    |
+| **NeMo**                | `.nemo`                                                                                 | MEDIUM |
+| **CNTK**                | `.dnn`, `.cmf`                                                                          | MEDIUM |
+| **RKNN**                | `.rknn`                                                                                 | MEDIUM |
+| **Torch7**              | `.t7`, `.th`, `.net`                                                                    | HIGH   |
+| **CatBoost**            | `.cbm`                                                                                  | MEDIUM |
+| **XGBoost**             | `.bst`, `.model`, `.json`, `.ubj`                                                       | MEDIUM |
+| **LightGBM**            | `.lgb`, `.lightgbm`, `.model`                                                           | MEDIUM |
+| **Llamafile**           | `.llamafile`, extensionless, `.exe`                                                     | MEDIUM |
+| **TorchServe**          | `.mar`                                                                                  | HIGH   |
+| **SafeTensors**         | `.safetensors`                                                                          | LOW    |
+| **GGUF/GGML**           | `.gguf`, `.ggml`, `.ggmf`, `.ggjt`, `.ggla`, `.ggsa`, signature-valid renamed artifacts | LOW    |
+| **JAX/Flax**            | `.msgpack`, `.flax`, `.orbax`, `.jax`, `.checkpoint`, `.orbax-checkpoint`               | LOW    |
+| **TFLite**              | `.tflite`                                                                               | LOW    |
+| **ExecuTorch**          | `.ptl`, `.pte`                                                                          | LOW    |
+| **TensorRT**            | `.engine`, `.plan`, `.trt`                                                              | LOW    |
+| **PaddlePaddle**        | `.pdmodel`, `.pdiparams`                                                                | LOW    |
+| **OpenVINO**            | `.xml`                                                                                  | LOW    |
+| **Skops**               | `.skops`                                                                                | HIGH   |
+| **PMML**                | `.pmml`                                                                                 | LOW    |
+| **Compressed Wrappers** | `.gz`, `.bz2`, `.xz`, `.lz4`, `.zlib`                                                   | MEDIUM |
 
 Plus scanners for ZIP, TAR, 7-Zip, OCI layers, Jinja2 templates, JSON/YAML metadata, manifests, model cards, text files, and RAR recognition. RAR archives are reported as unsupported/fail-closed instead of being skipped.
 

@@ -1639,6 +1639,17 @@ def test_scan_file_routes_misnamed_gguf_by_header(tmp_path: Path) -> None:
     assert result.metadata["format"] == "gguf"
 
 
+def test_scan_file_routes_misnamed_ggml_by_header(tmp_path: Path) -> None:
+    disguised_ggml = tmp_path / "model.payload"
+    disguised_ggml.write_bytes(b"GGML" + (1).to_bytes(4, "little") + b"\x00" * 24)
+
+    result = scan_file(str(disguised_ggml))
+
+    assert result.scanner_name == "gguf"
+    assert result.metadata["format"] == "ggml"
+    assert result.metadata["version"] == 1
+
+
 def test_scan_file_routes_gguf_chat_templates_through_jinja_analysis(tmp_path: Path) -> None:
     gguf_path = create_mock_gguf(
         tmp_path / "model.gguf",
