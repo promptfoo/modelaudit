@@ -3,6 +3,7 @@
 import importlib
 import json
 import pickle
+import struct
 import zipfile
 from pathlib import Path
 from typing import cast
@@ -40,6 +41,13 @@ def _build_tf_savedmodel_bytes() -> bytes:
     node.name = "const_node"
     node.op = "Const"
     return cast(bytes, saved_model.SerializeToString())
+
+
+def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
+    header_len = 100 * 1024 * 1024
+    with path.open("wb") as handle:
+        handle.write(struct.pack("<Q", header_len))
+        handle.truncate(8 + header_len + 1)
 
 
 def _build_lightgbm_text() -> str:
@@ -333,6 +341,14 @@ class TestFileFilter:
         assert not should_skip_file(str(disguised_openvino))
         assert not should_skip_file(str(disguised_pmml))
         assert should_skip_file(str(benign_xml))
+
+    def test_oversized_disguised_safetensors_candidate_bypasses_default_skip(self, tmp_path: Path) -> None:
+        """Oversized framing must survive filtering for scanner-level bounded handling."""
+        disguised_safetensors = tmp_path / "weights.jpg"
+        _write_sparse_oversized_safetensors_candidate(disguised_safetensors)
+
+        assert detect_file_format_for_skip_filter(str(disguised_safetensors)) == "safetensors"
+        assert not should_skip_file(str(disguised_safetensors))
 
     def test_disguised_pmml_with_oversized_doctype_subset_fails_closed(self, tmp_path: Path) -> None:
         """Incomplete oversized XML prologs should survive filtering for fail-closed handling."""

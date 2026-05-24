@@ -6,6 +6,7 @@ import importlib
 import json
 import lzma
 import pickle
+import struct
 import tarfile
 import tempfile
 import zipfile
@@ -42,6 +43,13 @@ def _build_malicious_tf_savedmodel() -> bytes:
     node.name = "pyfunc_node"
     node.op = "PyFunc"
     return cast(bytes, saved_model.SerializeToString())
+
+
+def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
+    header_len = 100 * 1024 * 1024
+    with path.open("wb") as handle:
+        handle.write(struct.pack("<Q", header_len))
+        handle.truncate(8 + header_len + 1)
 
 
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
@@ -267,6 +275,29 @@ class TestDirectoryFileFiltering:
         assert "tf_savedmodel" in results.scanner_names
         assert determine_exit_code(results) == 1
         assert any("PyFunc operation detected" in issue.message for issue in results.issues)
+
+    def test_disguised_oversized_safetensors_with_skipped_extension_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        disguised_payload = tmp_path / "weights.jpg"
+        _write_sparse_oversized_safetensors_candidate(disguised_payload)
+        from modelaudit.scanners.safetensors_scanner import SafeTensorsScanner
+
+        monkeypatch.setattr(
+            SafeTensorsScanner,
+            "calculate_file_hashes",
+            lambda _self, _path: {"md5": "0", "sha256": "0", "sha512": "0"},
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "safetensors" in results.scanner_names
+        assert results["success"] is False
+        assert determine_exit_code(results) == 2
+        assert any(check.name == "Header Size Limit" for check in results.checks)
 
     @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
     def test_disguised_pickle_with_default_hidden_or_basename_skip_is_scanned(

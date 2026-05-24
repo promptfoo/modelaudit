@@ -70,6 +70,14 @@ def _build_tf_savedmodel_bytes() -> bytes:
     return cast(bytes, saved_model.SerializeToString())
 
 
+def _write_sparse_oversized_safetensors_candidate(path: Path) -> None:
+    """Write framing that exceeds the historic strict routing limit without allocating its header."""
+    header_len = 100 * 1024 * 1024
+    with path.open("wb") as handle:
+        handle.write(struct.pack("<Q", header_len))
+        handle.truncate(8 + header_len + 1)
+
+
 def test_detect_file_format_directory(tmp_path):
     """Test detecting a directory format."""
     # Create a regular directory
@@ -235,6 +243,15 @@ def test_detect_file_format_from_magic_malformed_safetensors_header_len_rejected
     malformed_path.write_bytes(struct.pack("<Q", 100 * 1024 * 1024) + b'{"x":1}' + b"\x00" * 16)
 
     assert detect_file_format_from_magic(str(malformed_path)) == "unknown"
+
+
+def test_detect_oversized_renamed_safetensors_candidate_for_bounded_scan(tmp_path: Path) -> None:
+    candidate_path = tmp_path / "oversized.jpg"
+    _write_sparse_oversized_safetensors_candidate(candidate_path)
+
+    assert detect_file_format_from_magic(str(candidate_path)) == "safetensors"
+    assert detect_file_format_for_skip_filter(str(candidate_path)) == "safetensors"
+    assert detect_file_format(str(candidate_path)) == "safetensors"
 
 
 def test_detect_file_format_from_magic_invalid_safetensors_json_rejected(tmp_path: Path) -> None:

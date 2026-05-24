@@ -7,6 +7,7 @@ import gzip
 import importlib
 import json
 import pickle
+import struct
 import zipfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -18,7 +19,7 @@ from modelaudit import core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import normalize_material_scan_config
 from modelaudit.core import scan_file, scan_model_directory_or_file
-from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner
+from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner, safetensors_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.tf_metagraph_scanner import _MAX_PARSE_BYTES
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
@@ -65,6 +66,12 @@ def _build_malicious_tf_savedmodel() -> bytes:
     node.name = "pyfunc_node"
     node.op = "PyFunc"
     return cast(bytes, saved_model.SerializeToString())
+
+
+def _write_sparse_oversized_safetensors_candidate(path: Path, header_len: int = 100 * 1024 * 1024) -> None:
+    with path.open("wb") as handle:
+        handle.write(struct.pack("<Q", header_len))
+        handle.truncate(8 + header_len + 1)
 
 
 def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
@@ -1658,6 +1665,29 @@ def test_scan_file_routes_misnamed_keras_hdf5_by_header(tmp_path: Path) -> None:
     assert any("CVE-2025-9905" in issue.message for issue in result.issues)
 
 
+def test_scan_file_routes_oversized_renamed_safetensors_to_inconclusive_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disguised_safetensors = tmp_path / "weights.jpg"
+    _write_sparse_oversized_safetensors_candidate(disguised_safetensors)
+    monkeypatch.setattr(
+        safetensors_scanner.SafeTensorsScanner,
+        "calculate_file_hashes",
+        lambda _self, _path: {"md5": "0", "sha256": "0", "sha512": "0"},
+    )
+
+    result = scan_file(str(disguised_safetensors), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "safetensors"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "safetensors_header_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    limit_check = next(check for check in result.checks if check.name == "Header Size Limit")
+    assert limit_check.status == CheckStatus.FAILED
+    assert limit_check.severity == IssueSeverity.INFO
+
+
 def test_scan_file_routes_misnamed_gguf_by_header(tmp_path: Path) -> None:
     disguised_gguf = create_mock_gguf(tmp_path / "model.payload")
 
@@ -2004,6 +2034,31 @@ def test_scan_file_incomplete_xml_routing_result_is_not_cached(tmp_path: Path) -
     try:
         first = scan_file(str(ambiguous_xml), config=config)
         second = scan_file(str(ambiguous_xml), config=config)
+
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert second.metadata["scan_outcome"] == "inconclusive"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_inconclusive_safetensors_header_limit_result_is_not_cached(tmp_path: Path) -> None:
+    payload = tmp_path / "oversized.safetensors"
+    _write_sparse_oversized_safetensors_candidate(payload, header_len=(1024 * 1024) + 1)
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+        "max_safetensors_header_bytes": 1024 * 1024,
+    }
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(payload), config=config)
+        second = scan_file(str(payload), config=config)
 
         assert first.success is False
         assert second.success is False

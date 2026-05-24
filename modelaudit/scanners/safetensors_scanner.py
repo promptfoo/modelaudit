@@ -146,7 +146,7 @@ class SafeTensorsScanner(BaseScanner):
                         message=(
                             f"SafeTensors header exceeds maximum allowed size ({header_len} > {max_header_bytes})"
                         ),
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=path,
                         details={"header_len": header_len, "max_allowed": max_header_bytes},
                         why=(
@@ -157,7 +157,7 @@ class SafeTensorsScanner(BaseScanner):
                     result.metadata["analysis_incomplete"] = True
                     self._mark_inconclusive(result, SAFETENSORS_HEADER_LIMIT_INCONCLUSIVE_REASON)
                     result.bytes_scanned = file_size
-                    result.finish(success=True)
+                    result.finish(success=False)
                     return result
 
                 result.add_check(
