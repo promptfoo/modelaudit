@@ -6,11 +6,19 @@ import logging
 import os
 import time
 from collections.abc import Iterator
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 from typing import Any
 
-from modelaudit_picklescan import shared_source_sensitive_caches
+try:
+    from modelaudit_picklescan import shared_source_sensitive_caches
+except ImportError:
+
+    @contextmanager
+    def shared_source_sensitive_caches() -> Iterator[None]:
+        """Preserve compatibility with older independently versioned picklescan installs."""
+        yield
+
 
 import modelaudit.core_results as core_results
 from modelaudit.integrations.license_checker import (
