@@ -462,51 +462,54 @@ class OnnxScanner(BaseScanner):
         custom_domains = set()
         python_ops_found = False
         safe_nodes = 0
+        nodes_checked = 0
 
-        for node in model.graph.node:
-            # Check for interrupts periodically during node processing
-            self.check_interrupted()
-            is_python_operator = _is_python_operator(node.op_type or "")
-            if node.domain and node.domain not in STANDARD_ONNX_DOMAINS:
-                custom_domains.add(node.domain)
+        for graph in _iter_model_graphs(model):
+            for node in _iter_graph_nodes(graph):
+                nodes_checked += 1
+                # Check for interrupts periodically during node processing.
+                self.check_interrupted()
+                is_python_operator = _is_python_operator(node.op_type or "")
+                if node.domain and node.domain not in STANDARD_ONNX_DOMAINS:
+                    custom_domains.add(node.domain)
 
-                # All custom domains are INFO - they're metadata, not executable code
-                # Security risk is in runtime environment (installing malicious operators)
-                # not in the ONNX file itself
-                result.add_check(
-                    name="Custom Operator Domain Check",
-                    passed=False,
-                    message=(
-                        f"Model references custom operator domain '{node.domain}'. "
-                        f"This is metadata only - ensure operators are from trusted sources before installation."
-                    ),
-                    severity=IssueSeverity.INFO,
-                    location=f"{path} (node: {node.name})",
-                    rule_code="S302",
-                    details={
-                        "op_type": node.op_type,
-                        "domain": node.domain,
-                        "security_note": (
-                            "Custom domains indicate dependencies on external operator implementations. "
-                            "ONNX files cannot execute code - risk is in runtime environment if malicious "
-                            "operators are installed. Verify operator packages before installation."
+                    # All custom domains are INFO - they're metadata, not executable code
+                    # Security risk is in runtime environment (installing malicious operators)
+                    # not in the ONNX file itself
+                    result.add_check(
+                        name="Custom Operator Domain Check",
+                        passed=False,
+                        message=(
+                            f"Model references custom operator domain '{node.domain}'. "
+                            f"This is metadata only - ensure operators are from trusted sources before installation."
                         ),
-                    },
-                )
+                        severity=IssueSeverity.INFO,
+                        location=f"{path} (node: {node.name})",
+                        rule_code="S302",
+                        details={
+                            "op_type": node.op_type,
+                            "domain": node.domain,
+                            "security_note": (
+                                "Custom domains indicate dependencies on external operator implementations. "
+                                "ONNX files cannot execute code - risk is in runtime environment if malicious "
+                                "operators are installed. Verify operator packages before installation."
+                            ),
+                        },
+                    )
 
-            if is_python_operator:
-                python_ops_found = True
-                result.add_check(
-                    name="Python Operator Detection",
-                    passed=False,
-                    message=f"Model uses Python operator '{node.op_type}'",
-                    severity=IssueSeverity.CRITICAL,
-                    location=f"{path} (node: {node.name})",
-                    rule_code="S902",
-                    details={"op_type": node.op_type, "domain": node.domain},
-                )
-            elif not node.domain or node.domain in STANDARD_ONNX_DOMAINS:
-                safe_nodes += 1
+                if is_python_operator:
+                    python_ops_found = True
+                    result.add_check(
+                        name="Python Operator Detection",
+                        passed=False,
+                        message=f"Model uses Python operator '{node.op_type}'",
+                        severity=IssueSeverity.CRITICAL,
+                        location=f"{path} (node: {node.name})",
+                        rule_code="S902",
+                        details={"op_type": node.op_type, "domain": node.domain},
+                    )
+                elif not node.domain or node.domain in STANDARD_ONNX_DOMAINS:
+                    safe_nodes += 1
 
         # Record successful checks for safe operators
         if safe_nodes > 0 and not custom_domains:
@@ -525,7 +528,7 @@ class OnnxScanner(BaseScanner):
                 passed=True,
                 message="No Python operators detected",
                 location=path,
-                details={"nodes_checked": len(model.graph.node)},
+                details={"nodes_checked": nodes_checked},
             )
 
         if custom_domains:
