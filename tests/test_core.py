@@ -869,6 +869,56 @@ def test_scan_file_missing_yaml_parser_result_is_not_cached(
         reset_cache_manager()
 
 
+def test_scan_file_oversized_standalone_jinja_result_is_not_cached(tmp_path: Path) -> None:
+    template_file = tmp_path / "large.jinja"
+    template_file.write_text("{{ content }}" * 10000, encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(template_file), config=config)
+        second = scan_file(str(template_file), config=config)
+
+        assert first.scanner_name == "jinja2_template"
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert second.metadata["scan_outcome"] == "inconclusive"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_unreadable_standalone_jinja_result_is_not_cached(tmp_path: Path) -> None:
+    template_file = tmp_path / "invalid.jinja"
+    template_file.write_bytes(b"{{ cycler.__init__.__globals__ }}\xff")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(template_file), config=config)
+        second = scan_file(str(template_file), config=config)
+
+        assert first.scanner_name == "jinja2_template"
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert second.metadata["scan_outcome"] == "inconclusive"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 def test_scan_file_still_routes_malicious_zip_with_local_header(tmp_path: Path) -> None:
     disguised_zip = tmp_path / "payload.bin"
     _create_misnamed_zip(disguised_zip, {"payload.pkl": _build_malicious_pickle()})
