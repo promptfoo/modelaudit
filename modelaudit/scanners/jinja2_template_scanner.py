@@ -210,10 +210,17 @@ class Jinja2TemplateScanner(BaseScanner):
 
             if not templates:
                 if extraction_failures:
+                    size_limited = any(
+                        failure["reason"] == "jinja2_template_size_limit_exceeded" for failure in extraction_failures
+                    )
                     result.add_check(
                         name="Template Extraction",
                         passed=False,
-                        message="Template extraction incomplete due to malformed structured config",
+                        message=(
+                            "Template analysis incomplete because standalone template exceeds the size limit"
+                            if size_limited
+                            else "Template extraction incomplete due to malformed structured config"
+                        ),
                         severity=IssueSeverity.INFO,
                         location=path,
                         details={
@@ -380,6 +387,17 @@ class Jinja2TemplateScanner(BaseScanner):
 
         result.metadata[_INCONCLUSIVE_METADATA_KEY] = INCONCLUSIVE_SCAN_OUTCOME
         result.metadata[_INCONCLUSIVE_REASONS_METADATA_KEY] = reasons
+        if reason == "jinja2_template_size_limit_exceeded":
+            result.add_check(
+                name="Template Size Limit",
+                passed=False,
+                message="Template analysis incomplete because one or more extracted templates exceed the size limit",
+                severity=IssueSeverity.INFO,
+                location=location,
+                details=failure,
+            )
+            return
+
         result.add_check(
             name="Template Config Parsing",
             passed=False,
@@ -455,7 +473,9 @@ class Jinja2TemplateScanner(BaseScanner):
                 templates.update(extracted)
                 extraction_failures.extend(failures)
             elif context.file_type == "template":
-                templates.update(self._extract_template_file(path))
+                extracted, failures = self._extract_template_file(path)
+                templates.update(extracted)
+                extraction_failures.extend(failures)
         except Exception as e:
             logger.warning(f"Failed to extract templates from {path}: {e}")
 
@@ -728,21 +748,31 @@ class Jinja2TemplateScanner(BaseScanner):
         windows.append(Jinja2TemplateScanner._fallback_window_for_marker(marker_offset, content_size, window_size))
         return True
 
-    def _extract_template_file(self, path: str) -> dict[str, str]:
-        """Extract content from standalone template files"""
-        templates = {}
+    def _extract_template_file(self, path: str) -> tuple[dict[str, str], list[dict[str, Any]]]:
+        """Extract bounded content from a standalone template file."""
+        templates: dict[str, str] = {}
+        extraction_failures: list[dict[str, Any]] = []
 
         try:
             with open(path, encoding="utf-8") as f:
-                content = f.read()
+                content = f.read(self.max_template_size + 1)
 
-            if content and len(content) <= self.max_template_size:
+            if len(content) > self.max_template_size:
+                extraction_failures.append(
+                    {
+                        "format": "template",
+                        "reason": "jinja2_template_size_limit_exceeded",
+                        "max_template_size": self.max_template_size,
+                        "skipped_template_locations": ["template_content"],
+                    }
+                )
+            elif content:
                 templates["template_content"] = content
 
         except Exception as e:
             logger.debug(f"Error reading template file: {e}")
 
-        return templates
+        return templates, extraction_failures
 
     def _looks_like_template(self, text: str) -> bool:
         """Check if text looks like a Jinja2 template"""

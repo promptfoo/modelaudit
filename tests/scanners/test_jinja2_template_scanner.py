@@ -631,7 +631,7 @@ class TestJinja2TemplateScannerEdgeCases:
         assert len(passed_checks) > 0
 
     def test_handles_large_template(self, tmp_path: Path) -> None:
-        """Test handling of templates exceeding size limit."""
+        """Standalone templates exceeding the size limit must fail closed."""
         # Create template larger than max_template_size (default 50000)
         large_content = "{{ content }}" * 10000  # > 50000 chars
 
@@ -641,8 +641,22 @@ class TestJinja2TemplateScannerEdgeCases:
         scanner = Jinja2TemplateScanner()
         result = scanner.scan(str(template_file))
 
-        # Should complete without error
-        assert result.success is True
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_template_size_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Template Size Limit"
+            and check.status == CheckStatus.FAILED
+            and check.details["max_template_size"] == scanner.max_template_size
+            for check in result.checks
+        )
+
+        aggregate_result = scan_model_directory_or_file(
+            str(template_file),
+            config={"cache_scan_results": False},
+        )
+        assert aggregate_result.success is False
+        assert determine_exit_code(aggregate_result) == 2
 
     def test_handles_unicode_content(self, tmp_path: Path) -> None:
         """Test handling of unicode characters in templates."""
