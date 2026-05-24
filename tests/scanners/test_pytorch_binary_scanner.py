@@ -3,7 +3,9 @@ from pathlib import Path
 
 import pytest
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.detectors.suspicious_symbols import BINARY_CODE_PATTERNS
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.pytorch_binary_scanner import PyTorchBinaryScanner
 from tests.helpers import create_mock_onnx
 
@@ -58,6 +60,37 @@ def test_pytorch_binary_scanner_basic_scan(tmp_path):
     # Should have no file type validation warnings (.bin files with unknown headers are valid)
     validation_issues = [i for i in result.issues if "file type validation failed" in i.message.lower()]
     assert len(validation_issues) == 0
+
+
+def test_pytorch_binary_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable.bin"
+    path.write_bytes(b"benign binary tensor weights" * 10)
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated PyTorch binary read failure")
+
+    monkeypatch.setattr(PyTorchBinaryScanner, "can_handle", classmethod(lambda _cls, _path: True))
+    monkeypatch.setattr("modelaudit.scanners.pytorch_binary_scanner.open", raise_os_error, raising=False)
+
+    direct = PyTorchBinaryScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    read_checks = [check for check in direct.checks if check.name == "Binary File Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "pytorch_binary_read_failed"
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_binary_read_failed" in direct.metadata["scan_outcome_reasons"]
+    metadata = aggregate.file_metadata[str(path)]
+    assert "pytorch_binary_read_failed" in metadata["scan_outcome_reasons"]
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_pytorch_binary_scanner_reports_tiny_top_level_bin_files(tmp_path: Path) -> None:

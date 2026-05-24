@@ -10,6 +10,7 @@ from modelaudit.detectors.suspicious_symbols import (
     EXECUTABLE_SIGNATURES,
 )
 
+from ..scanner_results import mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
 
 
@@ -154,6 +155,23 @@ class PyTorchBinaryScanner(BaseScanner):
             # Check if file appears to be a valid tensor file
             self._validate_tensor_structure(path, result)
 
+        except OSError as e:
+            mark_inconclusive_scan_result(result, "pytorch_binary_read_failed")
+            result.add_check(
+                name="Binary File Read",
+                passed=False,
+                message=f"Unable to read binary file: {e!s}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "pytorch_binary_read_failed",
+                },
+            )
+            result.finish(success=False)
+            return result
         except Exception as e:
             result.add_check(
                 name="Binary File Scan",

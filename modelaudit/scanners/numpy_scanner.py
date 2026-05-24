@@ -567,6 +567,29 @@ class NumPyScanner(BaseScanner):
                     result.metadata.update(
                         {"shape": shape, "dtype": str(dtype), "fortran_order": fortran},
                     )
+        except OSError as e:
+            result.metadata["operational_error"] = True
+            result.metadata["operational_error_reason"] = "numpy_read_failed"
+            _mark_inconclusive_scan_result(result, "numpy_read_failed")
+            result.add_check(
+                name="NumPy File Read",
+                passed=False,
+                message=f"Unable to read NumPy file: {e}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                rule_code="S902",
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "numpy_version": NUMPY_VERSION,
+                    "analysis_incomplete": True,
+                    "operational_error": True,
+                    "operational_error_reason": "numpy_read_failed",
+                    "scan_outcome_reason": "numpy_read_failed",
+                },
+            )
+            _finish_with_inconclusive_contract(result, default_success=False)
+            return result
         except Exception as e:  # pragma: no cover - unexpected errors
             result.add_check(
                 name="NumPy File Scan",

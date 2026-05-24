@@ -275,6 +275,23 @@ class TensorFlowSavedModelScanner(BaseScanner):
 
                 self._analyze_saved_model(saved_model, result)
 
+        except OSError as e:
+            mark_inconclusive_scan_result(result, "savedmodel_read_failed")
+            result.add_check(
+                name="SavedModel File Read",
+                passed=False,
+                message=f"Unable to read TF SavedModel file: {e!s}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "savedmodel_read_failed",
+                },
+            )
+            result.finish(success=False)
+            return result
         except Exception as e:
             result.add_check(
                 name="SavedModel Parsing",

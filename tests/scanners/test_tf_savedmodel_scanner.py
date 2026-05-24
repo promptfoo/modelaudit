@@ -7,7 +7,7 @@ from typing import Any, Protocol, TypedDict
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.tf_savedmodel_scanner import _ASSET_PROBE_BYTES, TensorFlowSavedModelScanner
 from modelaudit.utils.file.detection import PROTO0_1_MAX_PROBE_BYTES
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as has_tf_protos
@@ -64,6 +64,37 @@ def test_tf_savedmodel_scanner_can_handle(tmp_path: Path) -> None:
         assert TensorFlowSavedModelScanner.can_handle(str(tf_dir)) is False
         assert TensorFlowSavedModelScanner.can_handle(str(regular_dir)) is False
         assert TensorFlowSavedModelScanner.can_handle(str(test_file)) is False
+
+
+@pytest.mark.skipif(not has_tf_protos(), reason="TensorFlow protobuf stubs unavailable")
+def test_tf_savedmodel_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = _create_test_savedmodel_with_op(tmp_path, "Const", "unreadable_model")
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated SavedModel read failure")
+
+    monkeypatch.setattr(TensorFlowSavedModelScanner, "can_handle", classmethod(lambda _cls, _path: True))
+    monkeypatch.setattr("modelaudit.scanners.tf_savedmodel_scanner.open", raise_os_error, raising=False)
+
+    direct = TensorFlowSavedModelScanner().scan(path)
+    aggregate = scan_model_directory_or_file(path, cache_scan_results=False)
+
+    read_checks = [check for check in direct.checks if check.name == "SavedModel File Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "savedmodel_read_failed"
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "savedmodel_read_failed" in direct.metadata["scan_outcome_reasons"]
+    metadata = aggregate.file_metadata[str(Path(path) / "saved_model.pb")].model_dump()
+    assert "savedmodel_read_failed" in metadata["scan_outcome_reasons"]
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_suspicious_function_name_reuses_precompiled_patterns(monkeypatch: pytest.MonkeyPatch) -> None:

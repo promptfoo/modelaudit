@@ -144,6 +144,23 @@ class PaddleScanner(BaseScanner):
                         )
                     previous_chunk_tail = chunk[-chunk_overlap:] if chunk_overlap else b""
             result.bytes_scanned = bytes_scanned
+        except OSError as e:
+            mark_inconclusive_scan_result(result, "paddle_read_failed")
+            result.add_check(
+                name="Paddle File Read",
+                passed=False,
+                message=f"Error reading file: {e}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "paddle_read_failed",
+                },
+            )
+            result.finish(success=False)
+            return result
         except Exception as e:  # pragma: no cover - unexpected I/O errors
             result.add_check(
                 name="Paddle File Read",

@@ -65,6 +65,36 @@ def test_numpy_format_module_unavailable_is_operational_not_critical(
     assert all(issue.severity != IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_numpy_read_failure_is_operational_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable.npy"
+    np.save(path, np.arange(3))
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated NumPy read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.numpy_scanner.open", raise_os_error, raising=False)
+
+    direct = NumPyScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    read_checks = [check for check in direct.checks if check.name == "NumPy File Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["operational_error"] is True
+    assert read_checks[0].details["operational_error_reason"] == "numpy_read_failed"
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["operational_error_reason"] == "numpy_read_failed"
+    assert "numpy_read_failed" in direct.metadata["scan_outcome_reasons"]
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
+
+
 class TestCVE20196446ObjectDtype:
     """Tests for CVE-2019-6446: NumPy allow_pickle RCE via object dtype."""
 

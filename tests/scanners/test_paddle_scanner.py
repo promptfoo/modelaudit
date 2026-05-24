@@ -2,8 +2,10 @@ import struct
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.paddle_scanner import PaddleScanner
 from modelaudit.utils.file.detection import validate_file_type
 
@@ -102,6 +104,37 @@ def test_paddle_scanner_fails_closed_for_unbounded_regex_prefix_at_chunk_boundar
     assert result.metadata["scan_outcome"] == "inconclusive"
     assert result.metadata["scan_outcome_reasons"] == ["paddle_unbounded_regex_boundary"]
     assert any(check.name == "Paddle Boundary Coverage" for check in result.checks)
+
+
+def test_paddle_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable.pdmodel"
+    path.write_bytes(b"safe paddle model metadata")
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated Paddle read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.paddle_scanner.open", raise_os_error, raising=False)
+
+    with patch("modelaudit.scanners.paddle_scanner.HAS_PADDLE", True):
+        direct = PaddleScanner().scan(str(path))
+        aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    read_checks = [check for check in direct.checks if check.name == "Paddle File Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "paddle_read_failed"
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "paddle_read_failed" in direct.metadata["scan_outcome_reasons"]
+    metadata = aggregate.file_metadata[str(path)]
+    assert "paddle_read_failed" in metadata["scan_outcome_reasons"]
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_paddle_scanner_deduplicates_variable_width_regex_across_chunk_boundary(tmp_path: Path) -> None:
