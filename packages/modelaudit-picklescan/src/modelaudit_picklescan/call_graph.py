@@ -554,7 +554,7 @@ def find_unanalyzed_callable_call_graph_references(
 
 @contextmanager
 def shared_source_sensitive_caches() -> Iterator[None]:
-    """Share one fresh cache generation across related enrichment passes."""
+    """Share one fresh installed-source snapshot across related scan work."""
     with _SHARED_SOURCE_SENSITIVE_CACHE_LOCK:
         depth = _SHARED_SOURCE_SENSITIVE_CACHE_DEPTH.get()
         if depth == 0:

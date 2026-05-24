@@ -6,9 +6,11 @@ import logging
 import os
 import time
 from collections.abc import Iterator
-from contextlib import suppress
+from contextlib import ExitStack, suppress
 from pathlib import Path
 from typing import Any
+
+from modelaudit_picklescan import shared_source_sensitive_caches
 
 import modelaudit.core_results as core_results
 from modelaudit.integrations.license_checker import (
@@ -472,6 +474,7 @@ def scan_model_directory_or_file(
     # Track file hashes for aggregate hash computation
     file_hashes: list[str] = []
     nearby_license_cache: dict[str, list[str]] = {}
+    pickle_source_snapshot_stack = ExitStack()
 
     phase_timings: dict[str, float] | None = {} if bool(kwargs.get("profile_timings")) else None
 
@@ -777,6 +780,9 @@ def scan_model_directory_or_file(
                         duplicate_paths_by_hash.setdefault(content_hash, []).append(file_path)
                 recorded_content_hashes: set[str] = set()
 
+                if len(scan_entries) > 1:
+                    pickle_source_snapshot_stack.enter_context(shared_source_sensitive_caches())
+
                 for representative_file, scanned_file_paths, shard_family_key in scan_entries:
                     # Check for interrupts
                     check_interrupted()
@@ -1075,6 +1081,8 @@ def scan_model_directory_or_file(
             details={"exception_type": type(e).__name__},
         )
         _add_error_asset_to_results(results, path)
+    finally:
+        pickle_source_snapshot_stack.close()
 
     # Final timing is handled by finalize_statistics()
 

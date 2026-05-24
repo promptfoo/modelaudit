@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect Python operators declared in nested ONNX graphs and functions
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
 
+### Performance Improvements
+
+- share fresh pickle call-graph source analysis across files in one directory scan
+
 ## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
 
 ### Bug Fixes

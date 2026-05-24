@@ -120,6 +120,40 @@ def test_shared_source_sensitive_caches_clears_once_per_scope(monkeypatch: pytes
     assert clear_count == 2
 
 
+def test_shared_source_sensitive_caches_refreshes_between_outer_scopes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_scoped_rewritten_call_graph_source"
+    module_path = module_dir / f"{module_name}.py"
+    module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+    payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo rewritten"))
+
+    try:
+        with call_graph.shared_source_sensitive_caches():
+            safe_report = scan_bytes(payload, source="scoped-source-safe.pkl")
+
+        module_path.write_text(
+            "import os\n\ndef invoke(command):\n    return os.system(command)\n",
+            encoding="utf-8",
+        )
+        importlib.invalidate_caches()
+
+        with call_graph.shared_source_sensitive_caches():
+            dangerous_report = scan_bytes(payload, source="scoped-source-dangerous.pkl")
+    finally:
+        _clear_call_graph_caches()
+
+    assert safe_report.verdict == SafetyVerdict.CLEAN
+    assert dangerous_report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(dangerous_report, module_name, "invoke", "os.system")
+
+
 def _env_without_pythonpath() -> dict[str, str]:
     return {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
 

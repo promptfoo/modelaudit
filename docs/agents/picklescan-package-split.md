@@ -41,7 +41,9 @@ modelaudit/
 - `modelaudit.scanners.pickle_scanner.PickleScanner` is a thin ModelAudit
   adapter around the Rust-backed standalone package.
 - Wrapper scanners in `modelaudit` pass embedded pickle streams into
-  `modelaudit-picklescan`; archive parsing stays in `modelaudit`.
+  `modelaudit-picklescan`; the root package owns rich archive/container
+  orchestration, while standalone `scan_file()` also recognizes PyTorch ZIP
+  checkpoints for standalone callers.
 - The root `modelaudit` wheel depends on the `modelaudit-picklescan`
   distribution instead of bundling its pure Python package files. This keeps
   wheel installs aligned with the native extension that the scanner requires.
@@ -53,13 +55,23 @@ modelaudit/
 The standalone package exposes a small native surface:
 
 ```python
-from modelaudit_picklescan import PickleScanner, ScanOptions, scan_bytes, scan_file, scan_stream
+from modelaudit_picklescan import (
+    PickleScanner,
+    ScanOptions,
+    scan_bytes,
+    scan_file,
+    scan_stream,
+    shared_source_sensitive_caches,
+)
 
 report = scan_file("weights.pkl")
 report = scan_bytes(payload, source="weights.pkl")
 
 scanner = PickleScanner(options=ScanOptions(timeout_s=30.0, max_opcodes=1_000_000))
 report = scanner.scan_stream(stream, source="archive.pt:data.pkl", size=pickle_size)
+
+with shared_source_sensitive_caches():
+    reports = [scan_file(path) for path in related_paths]
 ```
 
 Resource controls include opcode and wall-clock limits, post-budget tail bytes,
@@ -86,6 +98,10 @@ Report semantics keep these concepts separate:
 - Embedded-pickle wrapper scanners (`pytorch_zip`, `joblib`, `numpy`, and
   `executorch`) call the public `scan_stream(..., source=...)` API and preserve
   archive-member context in result locations/details.
+- A multi-file root scan enters one `shared_source_sensitive_caches()` scope
+  while dispatching artifacts, reusing an installed-source snapshot for
+  call-graph enrichment. A later scan operation starts with fresh source
+  analysis so rewritten dangerous code is not hidden by stale cache state.
 - CI lints, type-checks, tests, builds, and smoke-installs both the root
   `modelaudit` distribution and the standalone `modelaudit-picklescan`
   distribution. Root wheel smoke tests install the local standalone wheel via
@@ -129,5 +145,5 @@ uvx twine check /tmp/modelaudit-picklescan-dist/*
   safety decision and scan-completeness contract must stay aligned.
 - Inconclusive analysis is represented as first-class status/metadata, not as a
   hidden success boolean.
-- Per-scan state stays isolated so one scan cannot leak source/location context
-  into the next.
+- Per-scan state stays isolated: related artifacts may reuse one installed-source
+  snapshot inside an explicit scope, while the next outer scope starts fresh.
