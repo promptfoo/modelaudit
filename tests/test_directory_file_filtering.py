@@ -218,6 +218,21 @@ class TestDirectoryFileFiltering:
         assert results["files_scanned"] == 1
         assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
 
+    def test_disguised_malicious_flax_msgpack_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should preserve renamed MessagePack checkpoints for Flax analysis."""
+        msgpack = pytest.importorskip("msgpack")
+        disguised_payload = tmp_path / "payload.jpg"
+        disguised_payload.write_bytes(
+            msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
+
     @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
     def test_disguised_pickle_with_default_hidden_or_basename_skip_is_scanned(
         self,

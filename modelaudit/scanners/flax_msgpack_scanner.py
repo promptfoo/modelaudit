@@ -7,6 +7,8 @@ import re
 from contextlib import suppress
 from typing import Any, ClassVar
 
+from ..utils.file.detection import is_flax_msgpack_checkpoint_file
+
 try:
     import msgpack
 
@@ -239,7 +241,7 @@ class FlaxMsgpackScanner(BaseScanner):
                 ]:
                     return True
 
-        return False
+        return is_flax_msgpack_checkpoint_file(path)
 
     def _extract_jax_metadata(
         self,

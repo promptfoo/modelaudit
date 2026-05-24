@@ -595,6 +595,16 @@ def test_flax_msgpack_can_handle_extensions(tmp_path):
         assert FlaxMsgpackScanner.can_handle(str(test_file))
 
 
+def test_flax_msgpack_can_handle_renamed_checkpoint_structure_without_promoting_generic_map(tmp_path: Path) -> None:
+    disguised_checkpoint = tmp_path / "checkpoint.jpg"
+    generic_map = tmp_path / "metadata.jpg"
+    create_msgpack_file(disguised_checkpoint, {"params": {"w": [1, 2, 3]}})
+    create_msgpack_file(generic_map, {"state": {"selected": True}, "__reduce__": "os.system"})
+
+    assert FlaxMsgpackScanner.can_handle(str(disguised_checkpoint)) is True
+    assert FlaxMsgpackScanner.can_handle(str(generic_map)) is False
+
+
 @pytest.mark.slow
 def test_flax_msgpack_ml_context_confidence(tmp_path):
     """Test ML context confidence scoring.

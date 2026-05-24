@@ -227,6 +227,22 @@ class TestFileFilter:
         assert not should_skip_file(str(disguised_legacy_tar))
         assert should_skip_file(str(real_image))
 
+    def test_disguised_flax_checkpoint_bypasses_skip_without_promoting_generic_msgpack_map(
+        self, tmp_path: Path
+    ) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        disguised_checkpoint = tmp_path / "checkpoint.jpg"
+        generic_map = tmp_path / "metadata.jpg"
+        disguised_checkpoint.write_bytes(msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True))
+        generic_map.write_bytes(
+            msgpack.packb({"state": {"selected": True}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        assert detect_file_format_for_skip_filter(str(disguised_checkpoint)) == "flax_msgpack"
+        assert not should_skip_file(str(disguised_checkpoint))
+        assert detect_file_format_for_skip_filter(str(generic_map)) == "unknown"
+        assert should_skip_file(str(generic_map))
+
     def test_pk_prefix_near_match_stays_skipped(self, tmp_path: Path) -> None:
         near_match = tmp_path / "pknope.jpg"
         near_match.write_bytes(b"PKNO harmless text")

@@ -785,7 +785,21 @@ def test_scan_file_fails_closed_for_msgpack_extensions_when_dependency_is_missin
     assert core_module.determine_exit_code(aggregate) == 1
 
 
-def test_scan_file_does_not_route_msgpack_suffix_near_match_without_dependency(
+def test_scan_file_does_not_route_generic_msgpack_suffix_near_match_without_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoint = tmp_path / "model.flaxy"
+    checkpoint.write_bytes(b"\x81\xa5state\x81\xa8selected\xc3")
+    monkeypatch.setattr(flax_msgpack_scanner, "HAS_MSGPACK", False)
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+
+
+def test_scan_file_fails_closed_for_renamed_structural_msgpack_without_dependency(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -795,8 +809,9 @@ def test_scan_file_does_not_route_msgpack_suffix_near_match_without_dependency(
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
 
-    assert result.scanner_name == "unknown"
-    assert result.success is True
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(check.name == "msgpack Library Check" for check in result.checks)
 
 
 def test_scan_file_routes_malicious_explicit_flax_suffix_to_flax_scanner(tmp_path: Path) -> None:
@@ -804,6 +819,22 @@ def test_scan_file_routes_malicious_explicit_flax_suffix_to_flax_scanner(tmp_pat
         pytest.skip("msgpack unavailable")
 
     checkpoint = tmp_path / "malicious.flax"
+    checkpoint.write_bytes(
+        flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+def test_scan_file_routes_malicious_renamed_flax_msgpack_to_flax_scanner(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "malicious.jpg"
     checkpoint.write_bytes(
         flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
     )

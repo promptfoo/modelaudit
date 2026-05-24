@@ -322,6 +322,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "class": "FlaxMsgpackScanner",
         "description": "Scans Flax/JAX msgpack checkpoint files with enhanced security analysis",
         "extensions": [".msgpack", ".flax", ".orbax", ".jax"],
+        "header_formats": ["flax_msgpack"],
         "priority": 15,
         "dependencies": ["msgpack"],
         "numpy_sensitive": False,

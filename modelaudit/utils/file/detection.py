@@ -122,6 +122,14 @@ _XML_MODEL_ROOT_FORMATS = {
     "pmml": "pmml",
 }
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
+FLAX_MSGPACK_STRUCTURE_READ_BYTES = 1024 * 1024
+_FLAX_MSGPACK_ROUTING_KEYS = frozenset({"params", "opt_state", "model_state"})
+_FLAX_MSGPACK_ROUTING_KEY_TOKENS = tuple(
+    bytes([0xA0 + len(key)]) + key.encode("ascii") for key in _FLAX_MSGPACK_ROUTING_KEYS
+)
+_FLAX_MSGPACK_NATIVE_SUFFIXES = frozenset(
+    {".msgpack", ".flax", ".orbax", ".jax", ".ckpt", ".checkpoint", ".orbax-checkpoint"}
+)
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -1215,6 +1223,75 @@ def _detect_compression_format(prefix: bytes) -> str | None:
     return None
 
 
+def _msgpack_map_key_offset(prefix: bytes) -> int | None:
+    """Return the first-key offset for a MessagePack map, if its header is complete."""
+    if not prefix:
+        return None
+    if 0x80 <= prefix[0] <= 0x8F:
+        return 1
+    if prefix[0] == 0xDE and len(prefix) >= 3:
+        return 3
+    if prefix[0] == 0xDF and len(prefix) >= 5:
+        return 5
+    return None
+
+
+def _has_flax_msgpack_checkpoint_structure(payload: object) -> bool:
+    """Return whether a decoded MessagePack map exposes checkpoint-state roots."""
+    if not isinstance(payload, dict):
+        return False
+
+    normalized_keys: set[str] = set()
+    for key in payload:
+        if isinstance(key, str):
+            normalized_keys.add(key)
+        elif isinstance(key, bytes):
+            try:
+                normalized_keys.add(key.decode("utf-8"))
+            except UnicodeDecodeError:
+                continue
+
+    return bool(normalized_keys & _FLAX_MSGPACK_ROUTING_KEYS)
+
+
+def is_flax_msgpack_checkpoint_file(path: str | Path) -> bool:
+    """Recognize plausible Flax/JAX MessagePack checkpoints with bounded reads."""
+    file_path = Path(path)
+    try:
+        if not file_path.is_file() or file_path.stat().st_size < 2:
+            return False
+        with file_path.open("rb") as f:
+            sample = f.read(FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1)
+    except OSError:
+        return False
+
+    key_offset = _msgpack_map_key_offset(sample)
+    if key_offset is None:
+        return False
+
+    if len(sample) > FLAX_MSGPACK_STRUCTURE_READ_BYTES:
+        # Large checkpoints commonly start at `params`; route only that
+        # strongest bounded prefix shape so the scanner can apply its size cap.
+        return any(sample[key_offset:].startswith(token) for token in _FLAX_MSGPACK_ROUTING_KEY_TOKENS)
+
+    try:
+        import msgpack
+
+        payload = msgpack.unpackb(sample, raw=False, strict_map_key=False)
+    except Exception:
+        return False
+    return _has_flax_msgpack_checkpoint_structure(payload)
+
+
+def _could_be_renamed_flax_msgpack(file_path: Path, prefix: bytes) -> bool:
+    """Limit structure probing to files outside native checkpoint suffixes."""
+    return (
+        file_path.suffix.lower() not in _FLAX_MSGPACK_NATIVE_SUFFIXES
+        and _msgpack_map_key_offset(prefix) is not None
+        and is_flax_msgpack_checkpoint_file(file_path)
+    )
+
+
 def detect_format_from_magic_bytes(
     magic4: MagicBytes, magic8: MagicBytes, magic16: MagicBytes, file_size: int, file_path: Path | None = None
 ) -> FileFormat:
@@ -1270,6 +1347,9 @@ def detect_format_from_magic_bytes(
 
     if b'"__metadata__"' in magic16 and _looks_like_safetensors_structure(file_path, magic8, file_size):
         return "safetensors"
+
+    if file_path is not None and _could_be_renamed_flax_msgpack(file_path, magic16):
+        return "flax_msgpack"
 
     return "unknown"
 
@@ -1553,6 +1633,9 @@ def detect_file_format(path: str) -> str:
         )
         if xml_format != "unknown":
             return xml_format
+
+    if _could_be_renamed_flax_msgpack(file_path, header):
+        return "flax_msgpack"
 
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
