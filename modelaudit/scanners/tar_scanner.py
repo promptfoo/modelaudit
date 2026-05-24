@@ -42,6 +42,10 @@ _BZIP2_MAGIC = b"BZh"
 _XZ_MAGIC = b"\xfd7zXZ\x00"
 
 
+class _TarEntryExtractionIncomplete(ValueError):
+    """Raised when a TAR member cannot be inspected within extraction policy."""
+
+
 class TarScanner(BaseScanner):
     """Scanner for TAR archive files."""
 
@@ -227,10 +231,12 @@ class TarScanner(BaseScanner):
         """Stream a TAR member to disk while enforcing the configured size limit."""
         max_entry_size = self._get_max_entry_size()
         if member.size > max_entry_size:
-            raise ValueError(f"TAR entry {member.name} exceeds maximum size of {max_entry_size} bytes")
+            raise _TarEntryExtractionIncomplete(
+                f"TAR entry {member.name} exceeds maximum size of {max_entry_size} bytes"
+            )
         fileobj = tar.extractfile(member)
         if fileobj is None:
-            raise ValueError(f"Unable to extract TAR entry: {member.name}")
+            raise _TarEntryExtractionIncomplete(f"Unable to extract TAR entry: {member.name}")
 
         total_size = 0
         tmp_path: str | None = None
@@ -243,7 +249,9 @@ class TarScanner(BaseScanner):
                         break
                     total_size += len(chunk)
                     if total_size > max_entry_size:
-                        raise ValueError(f"TAR entry {member.name} exceeds maximum size of {max_entry_size} bytes")
+                        raise _TarEntryExtractionIncomplete(
+                            f"TAR entry {member.name} exceeds maximum size of {max_entry_size} bytes"
+                        )
                     tmp.write(chunk)
         except Exception:
             if tmp_path and os.path.exists(tmp_path):
@@ -616,20 +624,39 @@ class TarScanner(BaseScanner):
                         contents.append(asset_entry)
                     finally:
                         os.unlink(tmp_path)
-                except Exception as exc:
+                except _TarEntryExtractionIncomplete as exc:
                     scan_complete = False
+                    mark_archive_scan_incomplete(result, "tar_entry_extraction_incomplete")
                     result.add_check(
                         name="TAR Entry Scan",
                         passed=False,
-                        message=f"Error scanning TAR entry {name}: {exc!s}",
-                        severity=IssueSeverity.WARNING,
+                        message=f"Unable to fully inspect TAR entry {name}: {exc!s}",
+                        severity=IssueSeverity.INFO,
                         location=f"{path}:{name}",
                         details={
                             "entry": name,
                             "exception": str(exc),
                             "exception_type": type(exc).__name__,
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": "tar_entry_extraction_incomplete",
                         },
-                        rule_code="S902",
+                    )
+                except Exception as exc:
+                    scan_complete = False
+                    mark_archive_scan_incomplete(result, "tar_entry_scan_incomplete")
+                    result.add_check(
+                        name="TAR Entry Scan",
+                        passed=False,
+                        message=f"Error scanning TAR entry {name}: {exc!s}",
+                        severity=IssueSeverity.INFO,
+                        location=f"{path}:{name}",
+                        details={
+                            "entry": name,
+                            "exception": str(exc),
+                            "exception_type": type(exc).__name__,
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": "tar_entry_scan_incomplete",
+                        },
                     )
 
         result.metadata["contents"] = contents
