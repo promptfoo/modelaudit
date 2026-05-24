@@ -7,7 +7,7 @@ import re
 from contextlib import suppress
 from typing import Any, ClassVar
 
-from ..utils.file.detection import is_flax_msgpack_checkpoint_file
+from ..utils.file.detection import has_inconclusive_renamed_flax_msgpack_routing, is_flax_msgpack_checkpoint_file
 
 try:
     import msgpack
@@ -27,7 +27,7 @@ except Exception:  # pragma: no cover - optional dependency missing
     HAS_MSGPACK_EXCEPTIONS = False
     msgpack_exceptions = None  # type: ignore[assignment]
 
-from .base import BaseScanner, IssueSeverity, ScanResult
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 _DANGEROUS_JAX_TRANSFORMS = ("jit_compile", "eval_jit", "exec_transform", "dynamic_eval", "runtime_eval")
 
@@ -1055,6 +1055,26 @@ class FlaxMsgpackScanner(BaseScanner):
         self.add_file_integrity_check(path, result)
 
         self.current_file_path = path
+
+        if has_inconclusive_renamed_flax_msgpack_routing(path):
+            result.metadata["analysis_incomplete"] = True
+            result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+            result.metadata["scan_outcome_reasons"] = ["flax_msgpack_routing_probe_limit_exceeded"]
+            result.add_check(
+                name="MessagePack Routing Analysis Limit",
+                passed=False,
+                message="Flax MessagePack analysis incomplete because bounded routing inspection was exhausted",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "flax_msgpack_routing_probe_limit_exceeded",
+                },
+                rule_code="S902",
+            )
+            result.bytes_scanned = file_size
+            result.finish(success=False)
+            return result
 
         if not HAS_MSGPACK:
             result.add_check(

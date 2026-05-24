@@ -611,6 +611,30 @@ def test_flax_msgpack_can_handle_large_renamed_checkpoint_root_after_metadata_wi
     assert FlaxMsgpackScanner.can_handle(str(generic_map)) is False
 
 
+def test_flax_msgpack_ambiguous_renamed_probe_limit_fails_closed_without_unpacking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ambiguous_map = tmp_path / "metadata.jpg"
+    large_metadata: dict[str, object] = {f"field{i}": i for i in range(2100)}
+    large_metadata["blob"] = "x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100)
+    create_msgpack_file(ambiguous_map, {"metadata": large_metadata, "state": {"selected": True}})
+
+    def fail_unpack(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("ambiguous renamed maps must not be fully unpacked")
+
+    monkeypatch.setattr(msgpack, "unpackb", fail_unpack)
+
+    result = FlaxMsgpackScanner().scan(str(ambiguous_map))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["analysis_incomplete"] is True
+    check = next(check for check in result.checks if check.name == "MessagePack Routing Analysis Limit")
+    assert check.status == CheckStatus.FAILED
+    assert check.details["scan_outcome_reason"] == "flax_msgpack_routing_probe_limit_exceeded"
+
+
 @pytest.mark.slow
 def test_flax_msgpack_ml_context_confidence(tmp_path):
     """Test ML context confidence scoring.
