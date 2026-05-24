@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import re
-from pathlib import Path
 from typing import Any, ClassVar
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
@@ -68,8 +67,6 @@ class Torch7Scanner(BaseScanner):
     @classmethod
     def can_handle(cls, path: str) -> bool:
         if not os.path.isfile(path):
-            return False
-        if Path(path).suffix.lower() not in cls.supported_extensions:
             return False
 
         try:

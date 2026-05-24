@@ -576,6 +576,20 @@ def test_get_scanner_for_path_routes_extensionless_readme_to_metadata_scanner(tm
     _assert_scanner_for_path(readme_path, "metadata")
 
 
+def test_get_scanner_for_path_routes_misnamed_torch7_by_content(tmp_path: Path) -> None:
+    torch7_path = tmp_path / "payload.jpg"
+    torch7_path.write_bytes(b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n")
+
+    _assert_scanner_for_path(torch7_path, "torch7")
+
+
+def test_get_scanner_for_path_does_not_route_misnamed_torch_source_text(tmp_path: Path) -> None:
+    source_path = tmp_path / "source.jpg"
+    source_path.write_text("import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    pass\n")
+
+    assert ScannerRegistry().get_scanner_for_path(str(source_path)) is None
+
+
 def test_get_scanner_for_path_routes_extensionless_llamafile(tmp_path: Path) -> None:
     llamafile_path = tmp_path / "llama"
     llamafile_path.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime")

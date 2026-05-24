@@ -1426,6 +1426,12 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if format_result != "unknown":
             return format_result
 
+        torch7_probe_size = min(size, _TORCH7_SIGNATURE_READ_BYTES)
+        if len(prefix) < torch7_probe_size:
+            prefix += f.read(torch7_probe_size - len(prefix))
+        if _is_torch7_signature(prefix):
+            return "torch7"
+
         lightgbm_probe_size = min(size, _LIGHTGBM_SIGNATURE_READ_BYTES)
         if len(prefix) < lightgbm_probe_size:
             prefix += f.read(lightgbm_probe_size - len(prefix))
@@ -1553,6 +1559,10 @@ def detect_file_format(path: str) -> str:
         )
         if xml_format != "unknown":
             return xml_format
+
+    torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
+    if _is_torch7_signature(torch7_prefix):
+        return "torch7"
 
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
