@@ -19,6 +19,7 @@ from modelaudit.cache.optimized_config import normalize_material_scan_config
 from modelaudit.core import scan_file, scan_model_directory_or_file
 from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
+from modelaudit.utils.file.detection import JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from tests.helpers import create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
 
@@ -1543,6 +1544,49 @@ def test_scan_file_routes_malicious_renamed_jax_json_without_routing_ajax_near_m
     )
     assert near_match_result.scanner_name == "unknown"
     assert near_match_result.success is True
+
+
+def test_scan_file_fails_closed_for_oversized_renamed_jax_json_and_does_not_cache_result(tmp_path: Path) -> None:
+    model_path = tmp_path / "large-state.jpg"
+    near_match_path = tmp_path / "large-ajax.jpg"
+    padding = "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)
+    model_path.write_text(
+        json.dumps(
+            {
+                "padding": padding,
+                "framework": "jax",
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+            }
+        ),
+        encoding="utf-8",
+    )
+    near_match_path.write_text(json.dumps({"padding": padding, "framework": "ajax"}), encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(model_path), config=config)
+        second = scan_file(str(model_path), config=config)
+        near_match_result = scan_file(str(near_match_path), config={"cache_scan_results": False})
+
+        assert first.scanner_name == "jax_checkpoint"
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert "jax_json_checkpoint_analysis_size_limit" in first.metadata["scan_outcome_reasons"]
+        assert near_match_result.scanner_name == "unknown"
+        assert near_match_result.success is True
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    assert core_module.determine_exit_code(aggregate) == 2
 
 
 def test_scan_file_routes_raw_bin_without_zip_structure_to_pytorch_binary(tmp_path: Path) -> None:

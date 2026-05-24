@@ -51,6 +51,6 @@ This page shows which model formats work in base install and which require optio
 - CNTK scanner scope in v1 is `.dnn`/`.cmf`; `.model` remains owned by XGBoost overlap handling.
 - Llamafile wrappers are executable by design: executable presence is reported at `INFO`, and severity escalates only when suspicious runtime indicators or malformed embedded payloads are found.
 - RAR archives are recognized so they do not disappear from directory scans; ModelAudit reports them as unsupported coverage with a non-clean result.
-- JAX content routing recognizes renamed bounded JSON metadata only when structured identity fields explicitly name JAX, Flax, Haiku, or Orbax; `ajax` and arbitrary JSON remain outside this route.
+- JAX content routing recognizes renamed JSON metadata only when top-level identity fields explicitly name JAX, Flax, Haiku, or Orbax; oversized identified JSON is routed with bounded-memory streaming and reported as incomplete coverage rather than parsed without bounds, while `ajax` and arbitrary JSON remain outside this route.
 - `modelaudit doctor --show-failed` shows unavailable scanners and missing dependencies in your environment.
 - If you need predictable CI behavior across many formats, prefer `modelaudit[all]`; ONNX is included on Python 3.10-3.12, and TensorFlow runtime-dependent paths require adding `modelaudit[tensorflow]` on Python 3.11-3.12.
