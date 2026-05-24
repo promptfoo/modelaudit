@@ -465,7 +465,7 @@ class JaxCheckpointScanner(BaseScanner):
         if os.path.isfile(path):
             ext = os.path.splitext(path)[1].lower()
             if ext in cls.supported_extensions:
-                return cls._is_likely_jax_file(path)
+                return cls._is_likely_jax_file(path) or is_jax_json_checkpoint_file(path)
             return is_jax_json_checkpoint_file(path)
 
         return False
@@ -673,7 +673,7 @@ class JaxCheckpointScanner(BaseScanner):
                 self._scan_pickle_checkpoint(path, result)
             elif header.startswith(b"\x93NUMPY"):  # NumPy format
                 self._scan_numpy_checkpoint(path, result)
-            elif self._header_looks_like_json(header):  # JSON format
+            elif self._header_looks_like_json(header) or is_jax_json_checkpoint_file(path):  # JSON format
                 self._scan_json_checkpoint(path, result)
             else:
                 result.add_check(

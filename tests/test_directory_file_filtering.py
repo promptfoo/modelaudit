@@ -222,7 +222,7 @@ class TestDirectoryFileFiltering:
         """Directory scans should preserve JAX metadata content but not `ajax` lookalikes."""
         payload = "jax.experimental.host_callback.call(os.system, 'id')"
         (tmp_path / "payload.jpg").write_text(
-            json.dumps({"framework": "jax", "payload": payload}),
+            (" " * 1024) + json.dumps({"framework": "jax", "payload": payload}),
             encoding="utf-8",
         )
         (tmp_path / "ajax.jpg").write_text(

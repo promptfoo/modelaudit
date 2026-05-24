@@ -99,7 +99,10 @@ def test_detect_file_format_zip(tmp_path):
 def test_detect_renamed_jax_json_checkpoint_without_routing_ajax_near_match(tmp_path: Path) -> None:
     checkpoint_path = tmp_path / "checkpoint.jpg"
     near_match_path = tmp_path / "ajax.jpg"
-    checkpoint_path.write_text(json.dumps({"framework": "jax", "orbax_version": "0.1.0"}), encoding="utf-8")
+    checkpoint_path.write_text(
+        (" " * 1024) + json.dumps({"framework": "jax", "orbax_version": "0.1.0"}),
+        encoding="utf-8",
+    )
     near_match_path.write_text(json.dumps({"framework": "ajax", "format": "checkpoint"}), encoding="utf-8")
 
     assert detect_file_format_from_magic(str(checkpoint_path)) == "jax_checkpoint"

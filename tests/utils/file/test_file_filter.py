@@ -230,7 +230,10 @@ class TestFileFilter:
     def test_disguised_jax_json_checkpoint_bypasses_skip_without_routing_ajax_near_match(self, tmp_path: Path) -> None:
         checkpoint_path = tmp_path / "checkpoint.jpg"
         near_match_path = tmp_path / "ajax.jpg"
-        checkpoint_path.write_text(json.dumps({"framework": "jax", "orbax_version": "0.1.0"}), encoding="utf-8")
+        checkpoint_path.write_text(
+            (" " * 1024) + json.dumps({"framework": "jax", "orbax_version": "0.1.0"}),
+            encoding="utf-8",
+        )
         near_match_path.write_text(json.dumps({"framework": "ajax", "format": "checkpoint"}), encoding="utf-8")
 
         assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"

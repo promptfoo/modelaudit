@@ -1513,27 +1513,33 @@ def test_scan_file_routes_jax_pickles_through_jax_specific_analysis(tmp_path: Pa
 
 def test_scan_file_routes_malicious_renamed_jax_json_without_routing_ajax_near_match(tmp_path: Path) -> None:
     model_path = tmp_path / "state.jpg"
+    native_model_path = tmp_path / "state.checkpoint"
     near_match_path = tmp_path / "ajax.jpg"
-    model_path.write_text(
-        json.dumps(
-            {
-                "framework": "jax",
-                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
-            }
-        ),
-        encoding="utf-8",
+    malicious_payload = (" " * 1024) + json.dumps(
+        {
+            "framework": "jax",
+            "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+        }
     )
+    model_path.write_text(malicious_payload, encoding="utf-8")
+    native_model_path.write_text(malicious_payload, encoding="utf-8")
     near_match_path.write_text(
         json.dumps({"framework": "ajax", "payload": "jax.experimental.host_callback.call(os.system, 'id')"}),
         encoding="utf-8",
     )
 
     result = scan_file(str(model_path), config={"cache_scan_results": False})
+    native_result = scan_file(str(native_model_path), config={"cache_scan_results": False})
     near_match_result = scan_file(str(near_match_path), config={"cache_scan_results": False})
 
     assert result.scanner_name == "jax_checkpoint"
+    assert native_result.scanner_name == "jax_checkpoint"
     assert any(
         check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED
+        for check in native_result.checks
     )
     assert near_match_result.scanner_name == "unknown"
     assert near_match_result.success is True

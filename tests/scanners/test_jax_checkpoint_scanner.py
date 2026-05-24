@@ -672,11 +672,15 @@ def test_can_handle_json_checkpoint_with_jax_metadata(tmp_path: Path) -> None:
 
 def test_can_handle_renamed_jax_json_checkpoint_without_routing_ajax_near_match(tmp_path: Path) -> None:
     checkpoint_path = tmp_path / "model.jpg"
+    native_checkpoint_path = tmp_path / "model.checkpoint"
     near_match_path = tmp_path / "ajax.jpg"
-    checkpoint_path.write_text(json.dumps({"framework": "jax", "orbax_version": "0.1.0"}), encoding="utf-8")
+    payload = (" " * 1024) + json.dumps({"framework": "jax", "orbax_version": "0.1.0"})
+    checkpoint_path.write_text(payload, encoding="utf-8")
+    native_checkpoint_path.write_text(payload, encoding="utf-8")
     near_match_path.write_text(json.dumps({"framework": "ajax", "format": "checkpoint"}), encoding="utf-8")
 
     assert JaxCheckpointScanner.can_handle(str(checkpoint_path)) is True
+    assert JaxCheckpointScanner.can_handle(str(native_checkpoint_path)) is True
     assert JaxCheckpointScanner.can_handle(str(near_match_path)) is False
 
 

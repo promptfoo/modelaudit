@@ -1271,12 +1271,10 @@ def is_jax_json_checkpoint_file(path: str | Path) -> bool:
     return _has_jax_json_checkpoint_structure(payload)
 
 
-def _could_be_renamed_jax_json_checkpoint(file_path: Path, prefix: bytes) -> bool:
+def _could_be_renamed_jax_json_checkpoint(file_path: Path) -> bool:
     """Route only non-native suffixes whose bounded JSON identifies a JAX checkpoint."""
-    return (
-        file_path.suffix.lower() not in _JAX_JSON_CHECKPOINT_NATIVE_SUFFIXES
-        and _could_start_json_object(prefix)
-        and is_jax_json_checkpoint_file(file_path)
+    return file_path.suffix.lower() not in _JAX_JSON_CHECKPOINT_NATIVE_SUFFIXES and is_jax_json_checkpoint_file(
+        file_path
     )
 
 
@@ -1381,7 +1379,7 @@ def detect_file_format_from_magic(path: str) -> str:
             if format_result != "unknown":
                 return format_result
 
-            if _could_be_renamed_jax_json_checkpoint(file_path, header):
+            if _could_be_renamed_jax_json_checkpoint(file_path):
                 return "jax_checkpoint"
 
             # CNTKv2 has protobuf-style serialization without a fixed first-8-byte magic.
@@ -1494,7 +1492,7 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if format_result != "unknown":
             return format_result
 
-        if _could_be_renamed_jax_json_checkpoint(file_path, prefix):
+        if _could_be_renamed_jax_json_checkpoint(file_path):
             return "jax_checkpoint"
 
         lightgbm_probe_size = min(size, _LIGHTGBM_SIGNATURE_READ_BYTES)
@@ -1625,7 +1623,7 @@ def detect_file_format(path: str) -> str:
         if xml_format != "unknown":
             return xml_format
 
-    if _could_be_renamed_jax_json_checkpoint(file_path, header):
+    if _could_be_renamed_jax_json_checkpoint(file_path):
         return "jax_checkpoint"
 
     # For .bin files, do more sophisticated detection
