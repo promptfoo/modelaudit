@@ -5,10 +5,12 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
+import pytest
+
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import get_scanner_for_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.catboost_scanner import CatBoostScanner
 from modelaudit.utils.file.detection import detect_file_format, detect_file_format_from_magic
 
@@ -102,6 +104,41 @@ def test_scan_corrupt_cbm_aggregate_exit_code_is_inconclusive(tmp_path: Path) ->
     assert "catboost_structure_parse_failed" in metadata["scan_outcome_reasons"]
     assert result.success is False
     assert determine_exit_code(result) == 2
+
+
+def test_scan_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "unreadable.cbm"
+    model_path.write_bytes(_build_cbm(["feature_names", "safe_metadata"]))
+
+    def raise_os_error(
+        _self: CatBoostScanner,
+        _path: str,
+        _file_size: int,
+        _result: ScanResult,
+    ) -> tuple[bytes, bytes, int, int]:
+        raise OSError("simulated storage read failure")
+
+    monkeypatch.setattr(CatBoostScanner, "_parse_sections", raise_os_error)
+
+    direct = CatBoostScanner().scan(str(model_path))
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    read_checks = [check for check in direct.checks if check.name == "CatBoost File Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "catboost_read_failed"
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "catboost_read_failed" in direct.metadata["scan_outcome_reasons"]
+    metadata = aggregate.file_metadata[str(model_path)]
+    assert "catboost_read_failed" in metadata["scan_outcome_reasons"]
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_scan_bounded_parse_marks_uninspected_catboost_bytes_inconclusive(tmp_path: Path) -> None:

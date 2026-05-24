@@ -184,9 +184,14 @@ class CatBoostScanner(BaseScanner):
                 name="CatBoost File Read",
                 passed=False,
                 message=f"Unable to read CatBoost file: {error}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"error": str(error), "error_type": type(error).__name__},
+                details={
+                    "error": str(error),
+                    "error_type": type(error).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "catboost_read_failed",
+                },
             )
             self._mark_inconclusive_scan_result(result, "catboost_read_failed")
             result.finish(success=False)
