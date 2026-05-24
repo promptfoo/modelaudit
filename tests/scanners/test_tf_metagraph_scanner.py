@@ -129,6 +129,35 @@ def test_tf_metagraph_scanner_can_handle_oversized_meta_for_fail_closed_scan(tmp
     assert determine_exit_code(audit_result) == 2
 
 
+def test_tf_metagraph_scanner_read_failure_is_operational_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unreadable_meta = tmp_path / "unreadable.meta"
+    unreadable_meta.write_bytes(_build_metagraph(graph_nodes=[{"name": "input", "op": "Placeholder"}]))
+
+    def raise_os_error(_path: str, _limit: int) -> tuple[bytes, bool]:
+        raise OSError("simulated MetaGraph read failure")
+
+    monkeypatch.setattr(TensorFlowMetaGraphScanner, "can_handle", classmethod(lambda _cls, _path: True))
+    monkeypatch.setattr("modelaudit.scanners.tf_metagraph_scanner._read_bounded", raise_os_error)
+
+    result = TensorFlowMetaGraphScanner().scan(str(unreadable_meta))
+    audit_result = scan_model_directory_or_file(str(unreadable_meta), cache_scan_results=False)
+
+    read_checks = [check for check in result.checks if check.name == "MetaGraph File Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["operational_error_reason"] == "metagraph_read_failed"
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "metagraph_read_failed"
+    assert not [
+        issue for issue in audit_result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(audit_result) == 2
+
+
 def test_tf_metagraph_scanner_benign_graph_has_no_security_findings(tmp_path: Path) -> None:
     benign_meta = tmp_path / "benign.meta"
     benign_meta.write_bytes(

@@ -300,13 +300,20 @@ class TensorFlowMetaGraphScanner(BaseScanner):
         try:
             content, truncated = _read_bounded(path, _MAX_PARSE_BYTES)
         except OSError as e:
+            result.metadata["operational_error"] = True
+            result.metadata["operational_error_reason"] = "metagraph_read_failed"
             result.add_check(
                 name="MetaGraph File Read",
                 passed=False,
                 message=f"Unable to read .meta file: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "operational_error_reason": "metagraph_read_failed",
+                },
             )
             result.finish(success=False)
             return result
