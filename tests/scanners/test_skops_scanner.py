@@ -521,7 +521,10 @@ class TestSkopsScannerEdgeCases:
         parse_checks = [check for check in result.checks if check.name == "Skops Structured JSON Parse Check"]
         assert len(parse_checks) == 1
         assert parse_checks[0].status == CheckStatus.FAILED
+        assert parse_checks[0].severity == IssueSeverity.INFO
         assert parse_checks[0].details["entry"] == entry_name
+        aggregate = scan_model_directory_or_file(str(skops_file), cache_scan_results=False)
+        assert determine_exit_code(aggregate) == 2
 
     @pytest.mark.parametrize(
         ("loader_name", "payload"),
@@ -583,6 +586,7 @@ class TestSkopsScannerEdgeCases:
         _assert_inconclusive_reason(result.metadata, "skops_zip_entry_size_limited")
         oversized_checks = [c for c in result.checks if c.name == "Skops Oversized ZIP Entry"]
         assert len(oversized_checks) == 1
+        assert oversized_checks[0].severity == IssueSeverity.INFO
         assert oversized_checks[0].details["entry"] == "README.md"
         cve_checks = [c for c in result.checks if "CVE-2025-54886" in c.name and c.status == CheckStatus.FAILED]
         assert len(cve_checks) == 0
@@ -602,8 +606,30 @@ class TestSkopsScannerEdgeCases:
         oversized_checks = [c for c in result.checks if c.name == "Skops Oversized ZIP Entry"]
         assert len(oversized_checks) == 0
 
-    def test_oversized_entry_warning_is_emitted_once(self, tmp_path: Path) -> None:
-        """Repeated detector passes over one oversized member should emit one incomplete warning."""
+    def test_detected_cve_before_oversized_entry_preserves_security_exit_code(self, tmp_path: Path) -> None:
+        """Observed CVE payloads remain findings even when later coverage is bounded."""
+        skops_file = tmp_path / "detected_before_oversized_entry.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(
+                "schema.json",
+                '{"__loader__":"OperatorFuncNode","__module__":"builtins","__class__":"eval"}',
+            )
+            zf.writestr("README.md", "ordinary documentation " * 512)
+
+        result = scan_model_directory_or_file(
+            str(skops_file),
+            cache_scan_results=False,
+            max_zip_entry_read_size=128,
+            max_skops_file_size=10 * 1024 * 1024,
+        )
+
+        metadata = result.file_metadata[str(skops_file)]
+        _assert_inconclusive_reason(metadata, "skops_zip_entry_size_limited")
+        assert any("CVE-2025-54412" in str(issue.message) for issue in result.issues)
+        assert determine_exit_code(result) == 1
+
+    def test_oversized_entry_diagnostic_is_emitted_once(self, tmp_path: Path) -> None:
+        """Repeated detector passes over one oversized member should emit one incomplete diagnostic."""
         skops_file = tmp_path / "oversized_methodnode.skops"
         with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("payload.bin", "MethodNode __getattr__" * 512)
@@ -614,15 +640,16 @@ class TestSkopsScannerEdgeCases:
 
         oversized_checks = [c for c in result.checks if c.name == "Skops Oversized ZIP Entry"]
         assert len(oversized_checks) == 1
+        assert oversized_checks[0].severity == IssueSeverity.INFO
         assert oversized_checks[0].details["entry"] == "payload.bin"
         assert result.success is False
         assert result.metadata["oversized_zip_entries"] == ["payload.bin"]
 
-    def test_oversized_entry_core_exits_one_and_avoids_cache_reuse(self, tmp_path: Path) -> None:
+    def test_oversized_entry_core_exits_two_and_avoids_cache_reuse(self, tmp_path: Path) -> None:
         """Aggregate scans should preserve fail-closed exit and avoid reusing incomplete outer results."""
         skops_file = tmp_path / "oversized_readme.skops"
         with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("README.md", "get_model via joblib.load" * 512)
+            zf.writestr("README.md", "ordinary model documentation " * 512)
             zf.writestr("schema.json", '{"version": "1.0"}')
 
         cache_dir = tmp_path / "cache"
@@ -636,8 +663,8 @@ class TestSkopsScannerEdgeCases:
             )
 
             for result in (first, second):
-                assert result.success is True
-                assert determine_exit_code(result) == 1
+                assert result.success is False
+                assert determine_exit_code(result) == 2
                 assert "skops" in result.scanner_names
                 metadata = result.file_metadata[str(skops_file)]
                 _assert_inconclusive_reason(metadata, "skops_zip_entry_size_limited")

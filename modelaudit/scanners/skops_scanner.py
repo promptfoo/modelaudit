@@ -68,12 +68,14 @@ class SkopsScanner(BaseScanner):
                 f"Skipped oversized ZIP entry {file_info.filename} "
                 f"({file_info.file_size} bytes > {self.max_zip_entry_read_size} byte read limit)"
             ),
-            severity=IssueSeverity.WARNING,
+            severity=IssueSeverity.INFO,
             location=f"{zip_path}:{file_info.filename}",
             details={
                 "entry": file_info.filename,
                 "entry_size": file_info.file_size,
                 "max_zip_entry_read_size": self.max_zip_entry_read_size,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": self._OVERSIZED_ENTRY_REASON,
             },
             why=(
                 "The scanner did not inspect this archive member because reading it would exceed the configured "
@@ -352,9 +354,13 @@ class SkopsScanner(BaseScanner):
                         name="Skops Structured JSON Parse Check",
                         passed=False,
                         message=f"Unable to parse Skops JSON entry {file_info.filename}: {exc}",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=f"{zip_path}:{file_info.filename}",
-                        details={"entry": file_info.filename},
+                        details={
+                            "entry": file_info.filename,
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": self._STRUCTURED_JSON_PARSE_REASON,
+                        },
                         why="Structured Skops loader inspection was incomplete for this archive member.",
                     )
                 mark_archive_scan_incomplete(result, self._STRUCTURED_JSON_PARSE_REASON)
