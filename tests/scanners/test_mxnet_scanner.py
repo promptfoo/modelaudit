@@ -326,6 +326,29 @@ def test_mxnet_symbol_read_failure_scan_is_inconclusive(
     result = MXNetScanner().scan(str(symbol_path))
 
     _assert_inconclusive_result(result, "mxnet_symbol_read_failed")
+    read_checks = [check for check in result.checks if check.name == "MXNet Symbol Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "mxnet_symbol_read_failed"
+
+
+def test_mxnet_symbol_read_failure_aggregate_exit_code_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    symbol_path = tmp_path / "unreadable-symbol.json"
+    _write_symbol_file(symbol_path)
+
+    def raise_os_error(path: Path, max_bytes: int) -> tuple[bytes, bool]:
+        raise OSError("symbol read failed")
+
+    monkeypatch.setattr(MXNetScanner, "_read_bounded_bytes", staticmethod(raise_os_error))
+
+    result = scan_model_directory_or_file(str(symbol_path), cache_scan_results=False)
+
+    _assert_aggregate_inconclusive(result, symbol_path, "mxnet_symbol_read_failed")
+    assert not [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}]
 
 
 def test_mxnet_params_read_failure_scan_is_inconclusive(
@@ -343,6 +366,29 @@ def test_mxnet_params_read_failure_scan_is_inconclusive(
     result = MXNetScanner().scan(str(params_path))
 
     _assert_inconclusive_result(result, "mxnet_params_read_failed")
+    read_checks = [check for check in result.checks if check.name == "MXNet Params Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "mxnet_params_read_failed"
+
+
+def test_mxnet_params_read_failure_aggregate_exit_code_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    params_path = tmp_path / "unreadable-0000.params"
+    _write_params_file(params_path)
+
+    def raise_os_error(path: Path, max_bytes: int) -> tuple[bytes, bool]:
+        raise OSError("params read failed")
+
+    monkeypatch.setattr(MXNetScanner, "_read_bounded_bytes", staticmethod(raise_os_error))
+
+    result = scan_model_directory_or_file(str(params_path), cache_scan_results=False)
+
+    _assert_aggregate_inconclusive(result, params_path, "mxnet_params_read_failed")
+    assert not [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}]
 
 
 def test_mxnet_truncated_symbol_scan_is_inconclusive(
