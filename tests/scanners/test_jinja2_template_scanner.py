@@ -658,6 +658,28 @@ class TestJinja2TemplateScannerEdgeCases:
         assert aggregate_result.success is False
         assert determine_exit_code(aggregate_result) == 2
 
+    def test_invalid_utf8_standalone_template_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
+        """Unreadable standalone templates must not look clean."""
+        template_file = tmp_path / "invalid.jinja"
+        template_file.write_bytes(b"{{ cycler.__init__.__globals__ }}\xff")
+
+        scanner = Jinja2TemplateScanner()
+        result = scanner.scan(str(template_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_template_read_failed" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Template Read"
+            and check.status == CheckStatus.FAILED
+            and check.details["exception_type"] == "UnicodeDecodeError"
+            for check in result.checks
+        )
+
+        aggregate_result = scan_model_directory_or_file(str(template_file), cache_enabled=False)
+        assert aggregate_result.success is False
+        assert determine_exit_code(aggregate_result) == 2
+
     def test_handles_unicode_content(self, tmp_path: Path) -> None:
         """Test handling of unicode characters in templates."""
         config = {

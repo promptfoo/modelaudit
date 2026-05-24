@@ -213,13 +213,20 @@ class Jinja2TemplateScanner(BaseScanner):
                     size_limited = any(
                         failure["reason"] == "jinja2_template_size_limit_exceeded" for failure in extraction_failures
                     )
+                    read_failed = any(
+                        failure["reason"] == "jinja2_template_read_failed" for failure in extraction_failures
+                    )
                     result.add_check(
                         name="Template Extraction",
                         passed=False,
                         message=(
                             "Template analysis incomplete because standalone template exceeds the size limit"
                             if size_limited
-                            else "Template extraction incomplete due to malformed structured config"
+                            else (
+                                "Template analysis incomplete because standalone template could not be read"
+                                if read_failed
+                                else "Template extraction incomplete due to malformed structured config"
+                            )
                         ),
                         severity=IssueSeverity.INFO,
                         location=path,
@@ -392,6 +399,17 @@ class Jinja2TemplateScanner(BaseScanner):
                 name="Template Size Limit",
                 passed=False,
                 message="Template analysis incomplete because one or more extracted templates exceed the size limit",
+                severity=IssueSeverity.INFO,
+                location=location,
+                details=failure,
+            )
+            return
+
+        if reason == "jinja2_template_read_failed":
+            result.add_check(
+                name="Template Read",
+                passed=False,
+                message="Template analysis incomplete because the standalone template could not be read as UTF-8 text",
                 severity=IssueSeverity.INFO,
                 location=location,
                 details=failure,
@@ -771,6 +789,7 @@ class Jinja2TemplateScanner(BaseScanner):
 
         except Exception as e:
             logger.debug(f"Error reading template file: {e}")
+            extraction_failures.append(self._template_extraction_failure("template", "jinja2_template_read_failed", e))
 
         return templates, extraction_failures
 

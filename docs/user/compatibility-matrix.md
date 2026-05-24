@@ -51,6 +51,6 @@ This page shows which model formats work in base install and which require optio
 - CNTK scanner scope in v1 is `.dnn`/`.cmf`; `.model` remains owned by XGBoost overlap handling.
 - Llamafile wrappers are executable by design: executable presence is reported at `INFO`, and severity escalates only when suspicious runtime indicators or malformed embedded payloads are found.
 - RAR archives are recognized so they do not disappear from directory scans; ModelAudit reports them as unsupported coverage with a non-clean result.
-- Standalone Jinja2 templates exceeding the configured template-analysis size limit are reported as incomplete coverage instead of clean results.
+- Standalone Jinja2 templates exceeding the configured template-analysis size limit or failing UTF-8 text decoding are reported as incomplete coverage instead of clean results.
 - `modelaudit doctor --show-failed` shows unavailable scanners and missing dependencies in your environment.
 - If you need predictable CI behavior across many formats, prefer `modelaudit[all]`; ONNX is included on Python 3.10-3.12, and TensorFlow runtime-dependent paths require adding `modelaudit[tensorflow]` on Python 3.11-3.12.
