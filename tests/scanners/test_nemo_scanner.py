@@ -330,6 +330,44 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
 
+    def test_embedded_python_member_retains_generic_tar_security_analysis(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "handler-rce.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "handler.py", b"import os\nos.system('echo hidden')\n")
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(checks) == 1
+        assert checks[0].status == CheckStatus.FAILED
+        assert checks[0].rule_code == "S101"
+        assert checks[0].details["entry"] == "handler.py"
+
+    def test_renamed_nemo_embedded_executable_retains_archive_member_analysis(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "embedded-executable.jpg"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "assets/payload.jpg", b"\x7fELF\x02\x01\x01\x00")
+
+        result = scan_file(str(nemo_path), config={"cache_scan_results": False})
+
+        assert result.scanner_name == "nemo"
+        checks = [check for check in result.checks if check.name == "Executable Archive Member Detection"]
+        assert len(checks) == 1
+        assert checks[0].status == CheckStatus.FAILED
+        assert checks[0].details["entry"] == "assets/payload.jpg"
+
+    def test_benign_embedded_python_member_does_not_create_security_finding(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "benign-handler.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "handler.py", b"def build_model():\n    return 'safe'\n")
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert not [check for check in result.checks if check.name == "Python Archive Member Security"]
+
     def test_metadata_referenced_misnamed_payload_detects_nemo_deserialization_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "referenced-misnamed-payload.nemo"
         config = {
@@ -548,6 +586,58 @@ class TestCVE202523304HydraTarget:
             and check.details["target"] == "os.system"
             for check in result.checks
         )
+
+    def test_core_routes_renamed_nemo_archive_and_detects_dangerous_target(self, tmp_path: Path) -> None:
+        config = {"model": {"_target_": "os.system", "command": "echo pwned"}}
+        path = _create_nemo_file(tmp_path, config, filename="model.jpg")
+
+        assert NemoScanner.can_handle(str(path))
+
+        result = scan_file(str(path), config={"cache_scan_results": False})
+
+        assert result.scanner_name == "nemo"
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.details["target"] == "os.system"
+            for check in result.checks
+        )
+
+        directory = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+        assert directory.files_scanned == 1
+        assert "nemo" in directory.scanner_names
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in directory.issues)
+
+    def test_core_routes_gzip_wrapped_renamed_nemo_archive(self, tmp_path: Path) -> None:
+        path = tmp_path / "compressed.jpg"
+        with tarfile.open(path, "w:gz") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n")
+
+        result = scan_file(str(path), config={"cache_scan_results": False})
+
+        assert result.scanner_name == "nemo"
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.details["target"] == "os.system"
+            for check in result.checks
+        )
+
+    def test_renamed_generic_tar_yaml_is_not_promoted_to_nemo(self, tmp_path: Path) -> None:
+        path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": "os.system", "command": "echo pwned"}},
+            filename="generic.jpg",
+            config_name="config.yaml",
+        )
+
+        assert not NemoScanner.can_handle(str(path))
+
+        result = scan_file(str(path), config={"cache_scan_results": False})
+
+        assert result.scanner_name == "tar"
+        assert not any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
 
     def test_dangerous_subprocess_detected(self, tmp_path):
         """subprocess.Popen _target_ should trigger CVE-2025-23304."""

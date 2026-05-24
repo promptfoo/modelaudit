@@ -112,6 +112,7 @@ _KERAS_CONFIG_PREFIX_CONFIG_OBJECT_RE = re.compile(r'"config"\s*:\s*\{')
 _KERAS_CONFIG_PREFIX_HINT_RE = re.compile(
     r'"(?:layers|input_layers|output_layers|build_config|compile_config|module|registered_name)"\s*:'
 )
+_NEMO_CONFIG_ENTRY_BASENAMES = frozenset({"model_config.yaml", "model_config.yml"})
 _PYTORCH_ZIP_METADATA_MAX_BYTES = 64
 _SKOPS_SCHEMA_ENTRIES = frozenset({"schema", "schema.json"})
 _SKOPS_SCHEMA_MAX_BYTES = 4 * 1024 * 1024
@@ -975,6 +976,26 @@ def is_skops_archive(path: str) -> bool:
     return False
 
 
+def is_nemo_archive(path: str) -> bool:
+    """Return whether a TAR-backed artifact has the canonical NeMo config member."""
+    file_path = Path(path)
+    if not file_path.is_file():
+        return False
+
+    try:
+        with tarfile.open(file_path, "r:*") as archive:
+            for member in archive:
+                if not member.isfile():
+                    continue
+                member_name = _normalize_archive_member_name(member.name)
+                if PurePosixPath(member_name).name.lower() in _NEMO_CONFIG_ENTRY_BASENAMES:
+                    return True
+    except (OSError, tarfile.TarError):
+        return False
+
+    return False
+
+
 def _is_tar_archive(path: str) -> bool:
     """Return whether a path is a TAR archive, including compressed wrappers."""
     try:
@@ -1297,7 +1318,7 @@ def detect_file_format_from_magic(path: str) -> str:
             header = f.read(min(size, _TAR_BLOCK_SIZE))
 
             if _looks_like_uncompressed_tar_header(header):
-                return "tar"
+                return "nemo" if is_nemo_archive(path) else "tar"
 
             magic4 = header[:4]
             magic8 = header[:8]
@@ -1313,6 +1334,8 @@ def detect_file_format_from_magic(path: str) -> str:
             format_result = detect_format_from_magic_bytes(magic4, magic8, magic16, size, file_path)
             if format_result == "zip" and file_path.suffix.lower() == ".mar" and is_torchserve_mar_archive(path):
                 return "torchserve_mar"
+            if format_result in {"gzip", "bzip2", "xz"} and is_nemo_archive(path):
+                return "nemo"
             if format_result != "unknown":
                 return format_result
 
@@ -1409,7 +1432,7 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         magic16 = header[:16]
 
         if _looks_like_uncompressed_tar_header(prefix):
-            return "tar"
+            return "nemo" if is_nemo_archive(path) else "tar"
 
         if _looks_like_tflite_header(magic8):
             return "tflite"
@@ -1421,7 +1444,7 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             return "zip"
         if format_result in {"gzip", "bzip2", "xz", "lz4", "zlib"}:
             if _is_tar_archive(path):
-                return "tar"
+                return "nemo" if is_nemo_archive(path) else "tar"
             return format_result
         if format_result != "unknown":
             return format_result
@@ -1511,12 +1534,12 @@ def detect_file_format(path: str) -> str:
 
     # Compound tar wrappers should route to TAR scanner semantics.
     if filename_lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
-        return "tar"
+        return "nemo" if is_nemo_archive(path) else "tar"
 
     compression_format = _detect_compression_format(header)
     if ext in _COMPRESSED_EXTENSION_CODECS:
         if _is_tar_archive(path):
-            return "tar"
+            return "nemo" if is_nemo_archive(path) else "tar"
         expected_codec = _COMPRESSED_EXTENSION_CODECS[ext]
         if compression_format == expected_codec:
             return "compressed"
@@ -1526,10 +1549,10 @@ def detect_file_format(path: str) -> str:
     if _has_rar_magic(magic8):
         return "rar"
     if _looks_like_uncompressed_tar_header(header):
-        return "tar"
+        return "nemo" if is_nemo_archive(path) else "tar"
     if compression_format:
         if _is_tar_archive(path):
-            return "tar"
+            return "nemo" if is_nemo_archive(path) else "tar"
         return compression_format
     # Check ZIP magic first (for .pt/.pth files that are actually zips)
     if _has_zip_magic(magic4):
@@ -1788,16 +1811,16 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
         }:
             return True
 
-        # TAR files must match
+        # TAR-backed NeMo artifacts remain valid under either declared container suffix.
         if ext_format == "tar":
             filename_lower = Path(path).name.lower()
             if filename_lower.endswith((".tar.gz", ".tgz")):
-                return header_format in {"tar", "gzip"}
+                return header_format in {"tar", "gzip", "nemo"}
             if filename_lower.endswith((".tar.bz2", ".tbz2")):
-                return header_format in {"tar", "bzip2"}
+                return header_format in {"tar", "bzip2", "nemo"}
             if filename_lower.endswith((".tar.xz", ".txz")):
-                return header_format in {"tar", "xz"}
-            return header_format == "tar"
+                return header_format in {"tar", "xz", "nemo"}
+            return header_format in {"tar", "nemo"}
 
         # Standalone compressed wrappers must match their declared codecs.
         if ext_format == "compressed":
@@ -1807,8 +1830,8 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
                 return False
             return header_format == expected_codec
 
-        # NeMo files are TAR archives with a dedicated extension
-        if ext_format == "nemo" and header_format == "tar":
+        # NeMo files are TAR archives with a dedicated or structurally recognized route.
+        if ext_format == "nemo" and header_format in {"tar", "nemo"}:
             return True
 
         # ExecuTorch files may be ZIP archives or valid FlatBuffers binaries.

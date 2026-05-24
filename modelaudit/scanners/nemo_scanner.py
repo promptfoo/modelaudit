@@ -13,6 +13,12 @@ import tempfile
 from typing import Any, ClassVar
 
 from ..utils import is_absolute_archive_path, sanitize_archive_path
+from ..utils.file.detection import is_nemo_archive
+from .archive_member_security import (
+    is_executable_archive_member_name,
+    is_python_archive_member_name,
+    scan_archive_member_for_known_risks,
+)
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 try:
@@ -128,6 +134,7 @@ CVE_2025_23304_REMEDIATION = (
 )
 NEMO_CHECKPOINT_MEMBER_EXTENSIONS = frozenset({".ckpt", ".pt", ".pth", ".pkl", ".pickle"})
 NEMO_MAX_CHECKPOINT_SCAN_BYTES = 50 * 1024 * 1024
+NEMO_MAX_PYTHON_ANALYSIS_BYTES = 10 * 1024 * 1024
 
 _INCONCLUSIVE_METADATA_KEY = "scan_outcome"
 _INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
@@ -192,10 +199,10 @@ class NemoScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
         ext = os.path.splitext(path)[1].lower()
-        if ext not in cls.supported_extensions:
-            return False
-        # Verify it's actually a tar archive
-        return tarfile.is_tarfile(path)
+        if ext in cls.supported_extensions:
+            # Preserve legacy coverage for `.nemo` archives whose config is malformed or missing.
+            return tarfile.is_tarfile(path)
+        return is_nemo_archive(path)
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
@@ -350,6 +357,8 @@ class NemoScanner(BaseScanner):
                 if not member.isfile():
                     continue
 
+                self._scan_embedded_member_for_known_risks(tar, member, path, result)
+
                 # Check for suspicious files in the archive
                 if name_lower.endswith((".py", ".sh", ".bat", ".cmd", ".ps1")):
                     result.add_check(
@@ -480,6 +489,53 @@ class NemoScanner(BaseScanner):
                 message=f"Found {yaml_configs_found} YAML config(s)",
                 location=path,
             )
+
+    def _scan_embedded_member_for_known_risks(
+        self,
+        tar: tarfile.TarFile,
+        member: tarfile.TarInfo,
+        archive_path: str,
+        result: ScanResult,
+    ) -> None:
+        """Apply bounded generic archive-member security checks inside NeMo files."""
+        member_name_lower = member.name.lower()
+        if member.size > NEMO_MAX_PYTHON_ANALYSIS_BYTES:
+            if not (
+                is_python_archive_member_name(member_name_lower) or is_executable_archive_member_name(member_name_lower)
+            ):
+                return
+            scan_archive_member_for_known_risks(
+                archive_kind="NeMo",
+                archive_path=archive_path,
+                member_name=member.name,
+                tmp_path=archive_path,
+                total_size=member.size,
+                result=result,
+                max_python_analysis_bytes=NEMO_MAX_PYTHON_ANALYSIS_BYTES,
+                python_analysis_incomplete_reason="nemo_python_member_analysis_incomplete",
+            )
+            return
+
+        extracted_path = self._extract_member_to_tempfile(tar, member)
+        if extracted_path is None:
+            return
+
+        try:
+            scan_archive_member_for_known_risks(
+                archive_kind="NeMo",
+                archive_path=archive_path,
+                member_name=member.name,
+                tmp_path=extracted_path,
+                total_size=member.size,
+                result=result,
+                max_python_analysis_bytes=NEMO_MAX_PYTHON_ANALYSIS_BYTES,
+                python_analysis_incomplete_reason="nemo_python_member_analysis_incomplete",
+            )
+        finally:
+            try:
+                os.unlink(extracted_path)
+            except OSError:
+                logger.debug("Failed to remove temporary NeMo member security file: %s", extracted_path)
 
     @staticmethod
     def _resolve_archive_link_member_name(member: tarfile.TarInfo) -> str | None:
