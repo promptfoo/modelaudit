@@ -82,7 +82,7 @@ ModelAudit includes 44 registered scanners covering model, archive, and configur
 | **Torch7**              | `.t7`, `.th`, `.net`                                                      | HIGH   |
 | **CatBoost**            | `.cbm`                                                                    | MEDIUM |
 | **XGBoost**             | `.bst`, `.model`, `.json`, `.ubj`                                         | MEDIUM |
-| **LightGBM**            | `.lgb`, `.lightgbm`, `.model`, signature-valid renamed artifacts           | MEDIUM |
+| **LightGBM**            | `.lgb`, `.lightgbm`, `.model`, signature-valid renamed artifacts          | MEDIUM |
 | **Llamafile**           | `.llamafile`, extensionless, `.exe`                                       | MEDIUM |
 | **TorchServe**          | `.mar`                                                                    | HIGH   |
 | **SafeTensors**         | `.safetensors`                                                            | LOW    |
