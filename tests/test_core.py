@@ -1960,7 +1960,10 @@ def test_scan_file_rejects_malformed_protobuf_near_match_without_finding(tmp_pat
         assert result.success is True
         assert repeated_result.success is True
         assert result.issues == []
-        assert result.metadata["tentative_protobuf_candidate_rejected"] is True
+        assert (
+            result.metadata.get("tentative_protobuf_candidate_rejected") is True
+            or result.metadata.get("tentative_protobuf_candidate_unanalyzed") == "onnx_dependency_unavailable"
+        )
         assert "scan_outcome" not in result.metadata
     finally:
         reset_cache_manager()

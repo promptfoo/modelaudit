@@ -20,7 +20,7 @@
 - Keep scanner routing metadata descriptor-owned in `scanner_registry_metadata.py`; header-format aliases, content-routed extensions, extension-only format policy, and lazy class exports should come from that descriptor module, with `can_handle()` as the final content gate.
 - Source discovery filters should consume the registry-backed scannable extension set instead of carrying local allowlists.
 - For routing, prefiltering, or archive-recursion changes, add one malicious positive regression and one benign near-match negative regression.
-- If bounded routing cannot distinguish formats safely, preserve the candidate for tentative analysis; reject disproven candidates cleanly and report an inconclusive outcome only when that analysis cannot run or complete.
+- If bounded routing cannot distinguish formats safely, preserve the candidate for tentative analysis; reject disproven or optional-analyzer-unsupported candidates cleanly, and report an inconclusive outcome once an established analysis path cannot complete.
 - If a scanner aborts to avoid partial coverage, make the result operationally explicit (`success=False` with a clear error message) and preserve consistent exit-code and cache behavior.
 
 ## Scanner System

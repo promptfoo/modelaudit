@@ -949,10 +949,14 @@ def test_scan_nested_file_rejects_ambiguous_protobuf_without_findings(tmp_path: 
     assert result.scanner_name == "unknown"
     assert result.success is True
     assert result.issues == []
-    assert result.metadata["tentative_protobuf_candidate_rejected"] is True
+    assert (
+        result.metadata.get("tentative_protobuf_candidate_rejected") is True
+        or result.metadata.get("tentative_protobuf_candidate_unanalyzed") == "onnx_dependency_unavailable"
+    )
 
 
 def test_scan_nested_file_keeps_claimed_onnx_candidate_fail_closed(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
     extracted_member = tmp_path / "ambiguous.onnx"
     extracted_member.write_bytes(b"\x4a\x00" * 4097)
 

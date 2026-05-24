@@ -305,6 +305,11 @@ class OnnxScanner(BaseScanner):
         self.current_file_path = path
 
         if not _check_onnx():
+            if self._is_tentative_protobuf_route():
+                result.scanner_name = "unknown"
+                result.metadata["tentative_protobuf_candidate_unanalyzed"] = "onnx_dependency_unavailable"
+                result.finish(success=True)
+                return result
             result.add_check(
                 name="ONNX Library Check",
                 passed=False,
