@@ -19,6 +19,7 @@ from modelaudit.cache.optimized_config import normalize_material_scan_config
 from modelaudit.core import scan_file, scan_model_directory_or_file
 from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
+from modelaudit.utils.file.detection import FLAX_MSGPACK_STRUCTURE_READ_BYTES
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from tests.helpers import create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
 
@@ -830,13 +831,20 @@ def test_scan_file_routes_malicious_explicit_flax_suffix_to_flax_scanner(tmp_pat
     assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
 
 
-def test_scan_file_routes_malicious_renamed_flax_msgpack_to_flax_scanner(tmp_path: Path) -> None:
+def test_scan_file_routes_large_malicious_renamed_flax_msgpack_with_later_root_to_flax_scanner(tmp_path: Path) -> None:
     if not flax_msgpack_scanner.HAS_MSGPACK:
         pytest.skip("msgpack unavailable")
 
     checkpoint = tmp_path / "malicious.jpg"
     checkpoint.write_bytes(
-        flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        flax_msgpack_scanner.msgpack.packb(
+            {
+                "metadata": "x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100),
+                "params": {"w": [1, 2, 3]},
+                "__reduce__": "os.system",
+            },
+            use_bin_type=True,
+        )
     )
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})

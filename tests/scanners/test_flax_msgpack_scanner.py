@@ -11,6 +11,7 @@ import msgpack
 
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.flax_msgpack_scanner import FlaxMsgpackScanner, _matching_jax_transforms
+from modelaudit.utils.file.detection import FLAX_MSGPACK_STRUCTURE_READ_BYTES
 
 
 def create_msgpack_file(path: Path, data: Any) -> None:
@@ -595,11 +596,16 @@ def test_flax_msgpack_can_handle_extensions(tmp_path):
         assert FlaxMsgpackScanner.can_handle(str(test_file))
 
 
-def test_flax_msgpack_can_handle_renamed_checkpoint_structure_without_promoting_generic_map(tmp_path: Path) -> None:
+def test_flax_msgpack_can_handle_large_renamed_checkpoint_root_after_metadata_without_promoting_generic_map(
+    tmp_path: Path,
+) -> None:
     disguised_checkpoint = tmp_path / "checkpoint.jpg"
     generic_map = tmp_path / "metadata.jpg"
-    create_msgpack_file(disguised_checkpoint, {"params": {"w": [1, 2, 3]}})
-    create_msgpack_file(generic_map, {"state": {"selected": True}, "__reduce__": "os.system"})
+    large_metadata = "x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100)
+    create_msgpack_file(disguised_checkpoint, {"metadata": large_metadata, "params": {"w": [1, 2, 3]}})
+    create_msgpack_file(
+        generic_map, {"metadata": large_metadata, "state": {"selected": True}, "__reduce__": "os.system"}
+    )
 
     assert FlaxMsgpackScanner.can_handle(str(disguised_checkpoint)) is True
     assert FlaxMsgpackScanner.can_handle(str(generic_map)) is False

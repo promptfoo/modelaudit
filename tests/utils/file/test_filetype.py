@@ -15,6 +15,7 @@ import pytest
 
 from modelaudit.scanner_registry_metadata import get_extension_format_map
 from modelaudit.utils.file.detection import (
+    FLAX_MSGPACK_STRUCTURE_READ_BYTES,
     PROTO0_1_MAX_PROBE_BYTES,
     detect_file_format,
     detect_file_format_for_skip_filter,
@@ -95,12 +96,19 @@ def test_detect_file_format_zip(tmp_path):
     assert detect_file_format(str(zip_path)) == "zip"
 
 
-def test_detect_renamed_flax_msgpack_by_structure_without_promoting_generic_map(tmp_path: Path) -> None:
+def test_detect_large_renamed_flax_msgpack_by_later_root_without_promoting_generic_map(tmp_path: Path) -> None:
     msgpack = pytest.importorskip("msgpack")
     disguised_checkpoint = tmp_path / "checkpoint.jpg"
     generic_map = tmp_path / "metadata.jpg"
-    disguised_checkpoint.write_bytes(msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True))
-    generic_map.write_bytes(msgpack.packb({"state": {"selected": True}, "__reduce__": "os.system"}, use_bin_type=True))
+    large_metadata = "x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100)
+    disguised_checkpoint.write_bytes(
+        msgpack.packb({"metadata": large_metadata, "params": {"w": [1, 2, 3]}}, use_bin_type=True)
+    )
+    generic_map.write_bytes(
+        msgpack.packb(
+            {"metadata": large_metadata, "state": {"selected": True}, "__reduce__": "os.system"}, use_bin_type=True
+        )
+    )
 
     assert detect_file_format_from_magic(str(disguised_checkpoint)) == "flax_msgpack"
     assert detect_file_format_for_skip_filter(str(disguised_checkpoint)) == "flax_msgpack"

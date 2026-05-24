@@ -5,6 +5,7 @@ import struct
 import tarfile
 import zipfile
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
 from ...scanner_registry_metadata import get_extension_format_map
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
@@ -124,12 +125,40 @@ _XML_MODEL_ROOT_FORMATS = {
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
 FLAX_MSGPACK_STRUCTURE_READ_BYTES = 1024 * 1024
 _FLAX_MSGPACK_ROUTING_KEYS = frozenset({"params", "opt_state", "model_state"})
-_FLAX_MSGPACK_ROUTING_KEY_TOKENS = tuple(
-    bytes([0xA0 + len(key)]) + key.encode("ascii") for key in _FLAX_MSGPACK_ROUTING_KEYS
-)
 _FLAX_MSGPACK_NATIVE_SUFFIXES = frozenset(
     {".msgpack", ".flax", ".orbax", ".jax", ".ckpt", ".checkpoint", ".orbax-checkpoint"}
 )
+_FLAX_MSGPACK_PROBE_MAX_NODES = 4096
+_FLAX_MSGPACK_PROBE_MAX_DEPTH = 32
+_FLAX_MSGPACK_PROBE_MAX_KEY_BYTES = 64
+_FLAX_MSGPACK_PROBE_SCALAR_SIZES = {
+    0xCA: 4,
+    0xCB: 8,
+    0xCC: 1,
+    0xCD: 2,
+    0xCE: 4,
+    0xCF: 8,
+    0xD0: 1,
+    0xD1: 2,
+    0xD2: 4,
+    0xD3: 8,
+    0xD4: 2,
+    0xD5: 3,
+    0xD6: 5,
+    0xD7: 9,
+    0xD8: 17,
+}
+_FLAX_MSGPACK_PROBE_LENGTH_SIZES = {
+    0xC4: (1, 0),
+    0xC5: (2, 0),
+    0xC6: (4, 0),
+    0xC7: (1, 1),
+    0xC8: (2, 1),
+    0xC9: (4, 1),
+    0xD9: (1, 0),
+    0xDA: (2, 0),
+    0xDB: (4, 0),
+}
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -1236,6 +1265,152 @@ def _msgpack_map_key_offset(prefix: bytes) -> int | None:
     return None
 
 
+class _MsgpackProbeInvalid(ValueError):
+    """Raised when bounded MessagePack structure probing sees invalid data."""
+
+
+class _MsgpackProbeLimit(ValueError):
+    """Raised when bounded MessagePack structure probing cannot finish safely."""
+
+
+def _read_msgpack_probe_bytes(stream: BinaryIO, size: int) -> bytes:
+    data = stream.read(size)
+    if len(data) != size:
+        raise _MsgpackProbeInvalid
+    return data
+
+
+def _read_msgpack_probe_uint(stream: BinaryIO, size: int) -> int:
+    return int.from_bytes(_read_msgpack_probe_bytes(stream, size), "big")
+
+
+def _skip_msgpack_probe_bytes(stream: BinaryIO, size: int, file_size: int) -> None:
+    if size < 0 or stream.tell() + size > file_size:
+        raise _MsgpackProbeInvalid
+    stream.seek(size, 1)
+
+
+def _consume_msgpack_probe_node(remaining_nodes: list[int]) -> None:
+    remaining_nodes[0] -= 1
+    if remaining_nodes[0] < 0:
+        raise _MsgpackProbeLimit
+
+
+def _skip_msgpack_probe_value(
+    stream: BinaryIO,
+    file_size: int,
+    remaining_nodes: list[int],
+    depth: int,
+) -> None:
+    marker = _read_msgpack_probe_bytes(stream, 1)[0]
+    _consume_msgpack_probe_node(remaining_nodes)
+    _skip_msgpack_probe_value_after_marker(stream, marker, file_size, remaining_nodes, depth)
+
+
+def _skip_msgpack_probe_value_after_marker(
+    stream: BinaryIO,
+    marker: int,
+    file_size: int,
+    remaining_nodes: list[int],
+    depth: int,
+) -> None:
+    if marker <= 0x7F or marker >= 0xE0 or marker in {0xC0, 0xC2, 0xC3}:
+        return
+    if 0xA0 <= marker <= 0xBF:
+        _skip_msgpack_probe_bytes(stream, marker & 0x1F, file_size)
+        return
+
+    if marker in _FLAX_MSGPACK_PROBE_SCALAR_SIZES:
+        _skip_msgpack_probe_bytes(stream, _FLAX_MSGPACK_PROBE_SCALAR_SIZES[marker], file_size)
+        return
+
+    if marker in _FLAX_MSGPACK_PROBE_LENGTH_SIZES:
+        length_size, type_size = _FLAX_MSGPACK_PROBE_LENGTH_SIZES[marker]
+        _skip_msgpack_probe_bytes(stream, _read_msgpack_probe_uint(stream, length_size) + type_size, file_size)
+        return
+
+    if depth >= _FLAX_MSGPACK_PROBE_MAX_DEPTH:
+        raise _MsgpackProbeLimit
+
+    if 0x90 <= marker <= 0x9F:
+        child_count = marker & 0x0F
+    elif marker == 0xDC:
+        child_count = _read_msgpack_probe_uint(stream, 2)
+    elif marker == 0xDD:
+        child_count = _read_msgpack_probe_uint(stream, 4)
+    elif 0x80 <= marker <= 0x8F:
+        child_count = (marker & 0x0F) * 2
+    elif marker == 0xDE:
+        child_count = _read_msgpack_probe_uint(stream, 2) * 2
+    elif marker == 0xDF:
+        child_count = _read_msgpack_probe_uint(stream, 4) * 2
+    else:
+        raise _MsgpackProbeInvalid
+
+    for _ in range(child_count):
+        _skip_msgpack_probe_value(stream, file_size, remaining_nodes, depth + 1)
+
+
+def _read_msgpack_probe_map_count(stream: BinaryIO, remaining_nodes: list[int]) -> int | None:
+    marker = _read_msgpack_probe_bytes(stream, 1)[0]
+    _consume_msgpack_probe_node(remaining_nodes)
+    if 0x80 <= marker <= 0x8F:
+        return marker & 0x0F
+    if marker == 0xDE:
+        return _read_msgpack_probe_uint(stream, 2)
+    if marker == 0xDF:
+        return _read_msgpack_probe_uint(stream, 4)
+    return None
+
+
+def _read_msgpack_probe_key(
+    stream: BinaryIO,
+    file_size: int,
+    remaining_nodes: list[int],
+) -> str | None:
+    marker = _read_msgpack_probe_bytes(stream, 1)[0]
+    _consume_msgpack_probe_node(remaining_nodes)
+    if 0xA0 <= marker <= 0xBF:
+        length = marker & 0x1F
+    elif marker in {0xD9, 0xC4}:
+        length = _read_msgpack_probe_uint(stream, 1)
+    elif marker in {0xDA, 0xC5}:
+        length = _read_msgpack_probe_uint(stream, 2)
+    elif marker in {0xDB, 0xC6}:
+        length = _read_msgpack_probe_uint(stream, 4)
+    else:
+        _skip_msgpack_probe_value_after_marker(stream, marker, file_size, remaining_nodes, 1)
+        return None
+
+    if length > _FLAX_MSGPACK_PROBE_MAX_KEY_BYTES:
+        _skip_msgpack_probe_bytes(stream, length, file_size)
+        return None
+    try:
+        return _read_msgpack_probe_bytes(stream, length).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool:
+    """Inspect large maps without materializing tensor or metadata payload values."""
+    remaining_nodes = [_FLAX_MSGPACK_PROBE_MAX_NODES]
+    try:
+        with path.open("rb") as stream:
+            map_count = _read_msgpack_probe_map_count(stream, remaining_nodes)
+            if map_count is None:
+                return False
+            for _ in range(map_count):
+                if _read_msgpack_probe_key(stream, file_size, remaining_nodes) in _FLAX_MSGPACK_ROUTING_KEYS:
+                    return True
+                _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
+    except _MsgpackProbeLimit:
+        # A valid map might expose checkpoint roots beyond the bounded walk.
+        return True
+    except (OSError, _MsgpackProbeInvalid):
+        return False
+    return False
+
+
 def _has_flax_msgpack_checkpoint_structure(payload: object) -> bool:
     """Return whether a decoded MessagePack map exposes checkpoint-state roots."""
     if not isinstance(payload, dict):
@@ -1258,8 +1433,13 @@ def is_flax_msgpack_checkpoint_file(path: str | Path) -> bool:
     """Recognize plausible Flax/JAX MessagePack checkpoints with bounded reads."""
     file_path = Path(path)
     try:
-        if not file_path.is_file() or file_path.stat().st_size < 2:
+        if not file_path.is_file():
             return False
+        file_size = file_path.stat().st_size
+        if file_size < 2:
+            return False
+        if file_size > FLAX_MSGPACK_STRUCTURE_READ_BYTES:
+            return _has_bounded_flax_msgpack_routing_key(file_path, file_size)
         with file_path.open("rb") as f:
             sample = f.read(FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1)
     except OSError:
@@ -1268,11 +1448,6 @@ def is_flax_msgpack_checkpoint_file(path: str | Path) -> bool:
     key_offset = _msgpack_map_key_offset(sample)
     if key_offset is None:
         return False
-
-    if len(sample) > FLAX_MSGPACK_STRUCTURE_READ_BYTES:
-        # Large checkpoints commonly start at `params`; route only that
-        # strongest bounded prefix shape so the scanner can apply its size cap.
-        return any(sample[key_offset:].startswith(token) for token in _FLAX_MSGPACK_ROUTING_KEY_TOKENS)
 
     try:
         import msgpack

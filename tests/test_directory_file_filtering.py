@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.utils.file.detection import FLAX_MSGPACK_STRUCTURE_READ_BYTES
 from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
 
 
@@ -218,12 +219,19 @@ class TestDirectoryFileFiltering:
         assert results["files_scanned"] == 1
         assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
 
-    def test_disguised_malicious_flax_msgpack_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+    def test_large_disguised_malicious_flax_msgpack_with_later_root_is_scanned(self, tmp_path: Path) -> None:
         """Directory scans should preserve renamed MessagePack checkpoints for Flax analysis."""
         msgpack = pytest.importorskip("msgpack")
         disguised_payload = tmp_path / "payload.jpg"
         disguised_payload.write_bytes(
-            msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+            msgpack.packb(
+                {
+                    "metadata": "x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100),
+                    "params": {"w": [1, 2, 3]},
+                    "__reduce__": "os.system",
+                },
+                use_bin_type=True,
+            )
         )
 
         results = scan_model_directory_or_file(str(tmp_path))

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from modelaudit.utils.file import filtering
-from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
+from modelaudit.utils.file.detection import FLAX_MSGPACK_STRUCTURE_READ_BYTES, detect_file_format_for_skip_filter
 from modelaudit.utils.file.filtering import (
     _ZIP_MEMBER_SNIFF_LIMIT,
     should_skip_file,
@@ -227,15 +227,21 @@ class TestFileFilter:
         assert not should_skip_file(str(disguised_legacy_tar))
         assert should_skip_file(str(real_image))
 
-    def test_disguised_flax_checkpoint_bypasses_skip_without_promoting_generic_msgpack_map(
+    def test_large_disguised_flax_checkpoint_bypasses_skip_without_promoting_generic_msgpack_map(
         self, tmp_path: Path
     ) -> None:
         msgpack = pytest.importorskip("msgpack")
         disguised_checkpoint = tmp_path / "checkpoint.jpg"
         generic_map = tmp_path / "metadata.jpg"
-        disguised_checkpoint.write_bytes(msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True))
+        large_metadata = "x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100)
+        disguised_checkpoint.write_bytes(
+            msgpack.packb({"metadata": large_metadata, "params": {"w": [1, 2, 3]}}, use_bin_type=True)
+        )
         generic_map.write_bytes(
-            msgpack.packb({"state": {"selected": True}, "__reduce__": "os.system"}, use_bin_type=True)
+            msgpack.packb(
+                {"metadata": large_metadata, "state": {"selected": True}, "__reduce__": "os.system"},
+                use_bin_type=True,
+            )
         )
 
         assert detect_file_format_for_skip_filter(str(disguised_checkpoint)) == "flax_msgpack"
