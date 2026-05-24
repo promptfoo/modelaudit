@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.sevenzip_scanner import HAS_PY7ZR, SevenZipScanner, _RecursiveScanBudget
@@ -1379,6 +1380,67 @@ class TestSevenZipScannerHardening:
             limit_checks = [c for c in result.checks if "Probe Limit" in c.name]
             assert len(limit_checks) == 1
             assert limit_checks[0].status == CheckStatus.FAILED
+            assert limit_checks[0].severity == IssueSeverity.INFO
+            assert limit_checks[0].details["analysis_incomplete"] is True
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_extensionless_probe_limit_benign_archive_exits_inconclusive(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A bounded probe window is incomplete coverage, not a security finding."""
+        import py7zr  # type: ignore[import-untyped]
+
+        archive_path = tmp_path / "benign_probe_limit.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.writestr(b"ordinary notes", "first_payload")
+            archive.writestr(b"more ordinary notes", "second_payload")
+
+        config = {"max_7z_extensionless_probes": 1}
+        result = SevenZipScanner(config=config).scan(str(archive_path))
+        aggregate = scan_model_directory_or_file(
+            str(archive_path),
+            cache_scan_results=False,
+            max_7z_extensionless_probes=1,
+        )
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "sevenzip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+        assert determine_exit_code(aggregate) == 2
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_extensionless_probe_limit_hidden_payload_exits_inconclusive(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """An uninspected payload after the probe cap must not produce a clean or invented finding."""
+        import py7zr  # type: ignore[import-untyped]
+
+        class DangerousPayload:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                return (os.system, ("echo hidden_after_probe_cap",))
+
+        archive_path = tmp_path / "hidden_probe_limit.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.writestr(b"ordinary notes", "first_payload")
+            archive.writestr(pickle.dumps(DangerousPayload(), protocol=0), "second_payload")
+
+        config = {"max_7z_extensionless_probes": 1}
+        result = SevenZipScanner(config=config).scan(str(archive_path))
+        aggregate = scan_model_directory_or_file(
+            str(archive_path),
+            cache_scan_results=False,
+            max_7z_extensionless_probes=1,
+        )
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["scannable_files"] == 0
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+        assert determine_exit_code(aggregate) == 2
 
     def test_disguised_nested_zip_member_is_routed_for_scan(
         self,

@@ -525,9 +525,13 @@ class SevenZipScanner(BaseScanner):
                     f"Nested member probe limit ({self.max_extensionless_probes}) "
                     f"reached; remaining unsupported members were not inspected"
                 ),
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=archive_path,
-                details={"limit": self.max_extensionless_probes},
+                details={
+                    "limit": self.max_extensionless_probes,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "sevenzip_analysis_incomplete",
+                },
             )
 
         probe_candidates.sort(key=lambda item: (-item[0], item[1]))
