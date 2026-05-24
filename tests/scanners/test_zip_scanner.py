@@ -1836,6 +1836,29 @@ class TestZipScanner:
         assert audit_result.success is False
         assert core.determine_exit_code(audit_result) == 2
 
+    def test_core_zip_nested_scan_exception_without_findings_returns_exit_code_2(self, tmp_path: Path) -> None:
+        """An unavailable nested member scan is incomplete coverage, not a finding."""
+        archive_path = tmp_path / "nested_scan_exception.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("member.bin", b"ordinary member")
+
+        def nested_scan(_path: str, _config: dict[str, Any]) -> ScanResult:
+            raise RuntimeError("nested scanner unavailable")
+
+        scan_kwargs: dict[str, Any] = {NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan}
+        audit_result = core.scan_model_directory_or_file(
+            str(archive_path),
+            cache_enabled=False,
+            **scan_kwargs,
+        )
+
+        metadata = audit_result.file_metadata[str(archive_path)]
+        assert "zip_entry_scan_incomplete" in metadata["scan_outcome_reasons"]
+        entry_issues = [issue for issue in audit_result.issues if issue.message.startswith("Error scanning ZIP entry")]
+        assert len(entry_issues) == 1
+        assert entry_issues[0].severity == IssueSeverity.INFO
+        assert core.determine_exit_code(audit_result) == 2
+
     def test_zip_nested_critical_finding_does_not_mark_archive_incomplete(self, tmp_path: Path) -> None:
         """Real nested findings should fail the archive without claiming partial traversal."""
         archive_path = tmp_path / "nested_critical.zip"
@@ -1897,13 +1920,18 @@ class TestZipScanner:
         result = self.scanner.scan(str(archive_path))
 
         assert result.success is False
-        assert any(
-            check.name == "Symlink Safety Validation"
-            and check.status == CheckStatus.FAILED
-            and "symlink target exceeds maximum size" in check.message.lower()
-            and check.details.get("entry") == "link.txt"
+        symlink_checks = [
+            check
             for check in result.checks
-        )
+            if check.name == "Symlink Safety Validation" and check.status == CheckStatus.FAILED
+        ]
+        assert len(symlink_checks) == 1
+        assert "symlink target exceeds maximum size" in symlink_checks[0].message.lower()
+        assert symlink_checks[0].details.get("entry") == "link.txt"
+        assert symlink_checks[0].severity == IssueSeverity.INFO
+        assert "zip_symlink_target_read_incomplete" in result.metadata["scan_outcome_reasons"]
+        aggregate = core.scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
+        assert core.determine_exit_code(aggregate) == 2
 
     def test_oversized_entry_cleanup_removes_partial_temp_file(
         self,
@@ -1929,7 +1957,71 @@ class TestZipScanner:
             and check.details.get("entry") == "big.bin"
             for check in result.checks
         )
+        entry_checks = [check for check in result.checks if check.name == "ZIP Entry Scan"]
+        assert len(entry_checks) == 1
+        assert entry_checks[0].severity == IssueSeverity.INFO
+        assert "zip_entry_scan_incomplete" in result.metadata["scan_outcome_reasons"]
         assert list(scratch_dir.iterdir()) == []
+
+    def test_oversized_benign_zip_member_returns_inconclusive_exit_code(self, tmp_path: Path) -> None:
+        """Skipped ordinary member content is incomplete coverage, not a security finding."""
+        archive_path = tmp_path / "oversized_benign.zip"
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+            archive.writestr("notes.txt", b"ordinary metadata " * 10)
+
+        result = core.scan_model_directory_or_file(
+            str(archive_path),
+            cache_scan_results=False,
+            max_entry_size=64,
+        )
+
+        metadata = result.file_metadata[str(archive_path)]
+        assert "zip_entry_scan_incomplete" in metadata["scan_outcome_reasons"]
+        assert not [
+            issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        ]
+        assert core.determine_exit_code(result) == 2
+
+    def test_oversized_hidden_zip_payload_returns_inconclusive_without_detected_finding(self, tmp_path: Path) -> None:
+        """A payload hidden above the extraction cap must not be reported as observed."""
+        archive_path = tmp_path / "oversized_hidden_payload.zip"
+        payload = b'cos\nsystem\n(S"echo pwned"\ntR.' + (b"A" * 128)
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+            archive.writestr("payload.txt", payload)
+
+        result = core.scan_model_directory_or_file(
+            str(archive_path),
+            cache_scan_results=False,
+            max_entry_size=64,
+        )
+
+        metadata = result.file_metadata[str(archive_path)]
+        assert "zip_entry_scan_incomplete" in metadata["scan_outcome_reasons"]
+        assert not [
+            issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        ]
+        assert core.determine_exit_code(result) == 2
+
+    def test_detected_zip_payload_after_skipped_member_preserves_security_exit_code(self, tmp_path: Path) -> None:
+        """Observed malicious content still wins over an informational coverage gap."""
+        archive_path = tmp_path / "detected_after_skipped_member.zip"
+        payload = b'cos\nsystem\n(S"echo pwned"\ntR.'
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+            archive.writestr("large.txt", b"A" * 128)
+            archive.writestr("payload.txt", payload)
+
+        result = core.scan_model_directory_or_file(
+            str(archive_path),
+            cache_scan_results=False,
+            max_entry_size=64,
+        )
+
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and any(symbol in issue.message.lower() for symbol in ("os.system", "posix.system"))
+            for issue in result.issues
+        )
+        assert core.determine_exit_code(result) == 1
 
     def test_scan_zip_with_dangerous_pickle(self):
         """Test scanning a ZIP file containing a dangerous pickle"""

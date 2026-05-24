@@ -749,8 +749,13 @@ class TestKerasZipScanner:
         assert len(recursive_size_checks) == 1
         assert recursive_size_checks[0].status == CheckStatus.FAILED
         assert "exceeds maximum size of 1024 bytes" in recursive_size_checks[0].message
+        assert recursive_size_checks[0].severity == IssueSeverity.INFO
+        assert "zip_entry_scan_incomplete" in result.metadata["scan_outcome_reasons"]
         assert result.success is False
-        assert result.has_warnings is True
+        assert result.has_warnings is False
+
+        aggregate_result = scan_model_directory_or_file(str(keras_path), max_embedded_weights_bytes=1024)
+        assert determine_exit_code(aggregate_result) == 2
 
     def test_scan_fails_closed_on_oversized_config_json_and_recurses_payloads(self, tmp_path: Path) -> None:
         """Oversized config.json members should be bounded before parsing and still recurse other entries."""

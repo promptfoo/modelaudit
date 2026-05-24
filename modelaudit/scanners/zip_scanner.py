@@ -292,17 +292,19 @@ class ZipScanner(BaseScanner):
             try:
                 target = self._read_symlink_target(archive, info)
             except Exception as exc:
+                mark_archive_scan_incomplete(result, "zip_symlink_target_read_incomplete")
                 result.add_check(
                     name="Symlink Safety Validation",
                     passed=False,
                     message=f"Unable to read symlink target for {name}: {exc!s}",
-                    severity=IssueSeverity.WARNING,
-                    rule_code="S902",
+                    severity=IssueSeverity.INFO,
                     location=f"{archive_path}:{name}",
                     details={
                         "entry": name,
                         "exception": str(exc),
                         "exception_type": type(exc).__name__,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "zip_symlink_target_read_incomplete",
                     },
                 )
                 return False, False
@@ -617,14 +619,20 @@ class ZipScanner(BaseScanner):
 
                 except Exception as e:
                     scan_complete = False
+                    mark_archive_scan_incomplete(result, "zip_entry_scan_incomplete")
                     result.add_check(
                         name="ZIP Entry Scan",
                         passed=False,
                         message=f"Error scanning ZIP entry {name}: {e!s}",
-                        severity=IssueSeverity.WARNING,
-                        rule_code="S902",  # Scan error
+                        severity=IssueSeverity.INFO,
                         location=f"{path}:{name}",
-                        details={"entry": name, "exception": str(e), "exception_type": type(e).__name__},
+                        details={
+                            "entry": name,
+                            "exception": str(e),
+                            "exception_type": type(e).__name__,
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": "zip_entry_scan_incomplete",
+                        },
                     )
 
         result.metadata["contents"] = contents
