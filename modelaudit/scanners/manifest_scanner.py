@@ -798,6 +798,22 @@ class ManifestScanner(BaseScanner):
                 )
         except TimeoutError:
             raise
+        except OSError as e:
+            self._mark_inconclusive_scan_result(result, "manifest_blacklist_read_failed")
+            result.add_check(
+                name="Blacklist Pattern Check",
+                passed=False,
+                message=f"Unable to read manifest for blacklist analysis: {e!s}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "manifest_blacklist_read_failed",
+                },
+                rule_code="S902",
+            )
         except Exception as e:
             result.add_check(
                 name="Blacklist Pattern Check",

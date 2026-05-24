@@ -3,6 +3,7 @@
 import os
 from typing import Any, ClassVar
 
+from modelaudit.scanner_results import mark_inconclusive_scan_result
 from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
 
 
@@ -43,6 +44,11 @@ class TextScanner(BaseScanner):
 
         return filename in ml_text_files or any(filename.startswith(prefix) for prefix in ["vocab", "token", "label"])
 
+    @staticmethod
+    def _get_file_size(path: str) -> int:
+        """Return file size for bounded text classification."""
+        return os.path.getsize(path)
+
     def scan(self, path: str) -> ScanResult:
         """Scan a text file for security issues."""
         result = self._create_scan_result_after_preflight(path, check_size_limit=False)
@@ -51,7 +57,7 @@ class TextScanner(BaseScanner):
 
         try:
             # Get file size
-            file_size = os.path.getsize(path)
+            file_size = self._get_file_size(path)
             result.metadata["file_size"] = file_size
 
             # Check if file exceeds expected size for text files
@@ -137,6 +143,23 @@ class TextScanner(BaseScanner):
             result.bytes_scanned = file_size
             result.finish(success=True)
 
+        except OSError as e:
+            mark_inconclusive_scan_result(result, "text_metadata_read_failed")
+            result.add_check(
+                name="Text File Metadata Read",
+                passed=False,
+                message=f"Unable to inspect text file metadata: {e!s}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "text_metadata_read_failed",
+                },
+                rule_code="S902",
+            )
+            result.finish(success=False)
         except Exception as e:
             result.add_check(
                 name="Text File Scan",

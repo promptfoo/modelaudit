@@ -96,6 +96,39 @@ def test_manifest_scanner_clears_manifest_text_after_scan(tmp_path: Path) -> Non
     assert scanner._manifest_text_cache == {}
 
 
+def test_manifest_blacklist_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    test_file = tmp_path / "config.json"
+    test_file.write_text(json.dumps({"model_type": "bert"}), encoding="utf-8")
+
+    def raise_os_error(_self: ManifestScanner, _path: str) -> str:
+        raise OSError("simulated manifest read failure")
+
+    monkeypatch.setattr(ManifestScanner, "_read_manifest_text", raise_os_error)
+
+    direct = ManifestScanner(config={"blacklist_patterns": ["blocked"]}).scan(str(test_file))
+    aggregate = scan_model_directory_or_file(
+        str(test_file),
+        blacklist_patterns=["blocked"],
+        cache_scan_results=False,
+    )
+
+    assert direct.success is False
+    assert direct.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert "manifest_blacklist_read_failed" in direct.metadata.get("scan_outcome_reasons", [])
+    assert any(
+        check.name == "Blacklist Pattern Check"
+        and check.severity == IssueSeverity.INFO
+        and check.details.get("scan_outcome_reason") == "manifest_blacklist_read_failed"
+        for check in direct.checks
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+    assert aggregate.file_metadata[str(test_file)].get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert determine_exit_code(aggregate) == 2
+
+
 def test_manifest_scanner_case_insensitive_blacklist(tmp_path):
     """Test that blacklist matching is case-insensitive."""
     test_file = tmp_path / "inference_config.json"
