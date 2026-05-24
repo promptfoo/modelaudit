@@ -16,6 +16,7 @@ import pytest
 
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
+from tests.helpers import create_mock_onnx, prefix_mock_onnx_with_unknown_field
 
 
 def _build_malicious_tf_metagraph() -> bytes:
@@ -267,6 +268,18 @@ class TestDirectoryFileFiltering:
         assert "tf_savedmodel" in results.scanner_names
         assert determine_exit_code(results) == 1
         assert any("PyFunc operation detected" in issue.message for issue in results.issues)
+
+    def test_prefixed_disguised_malicious_onnx_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        pytest.importorskip("onnx")
+        disguised_payload = create_mock_onnx(tmp_path / "payload.jpg", op_type="PythonOp")
+        prefix_mock_onnx_with_unknown_field(disguised_payload, value_size=(1024 * 1024) + 32)
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "onnx" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.details.get("op_type") == "PythonOp" for issue in results.issues)
 
     @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
     def test_disguised_pickle_with_default_hidden_or_basename_skip_is_scanned(

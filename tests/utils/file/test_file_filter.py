@@ -15,7 +15,11 @@ from modelaudit.utils.file.filtering import (
     _ZIP_MEMBER_SNIFF_LIMIT,
     should_skip_file,
 )
-from tests.helpers.file_creators import create_v7_tar_archive
+from tests.helpers.file_creators import (
+    create_mock_onnx,
+    create_v7_tar_archive,
+    prefix_mock_onnx_with_unknown_field,
+)
 
 
 def _build_tf_metagraph_bytes() -> bytes:
@@ -278,6 +282,18 @@ class TestFileFilter:
 
         assert detect_file_format_for_skip_filter(str(disguised_savedmodel)) == "tf_savedmodel"
         assert not should_skip_file(str(disguised_savedmodel))
+        assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
+        assert should_skip_file(str(generic_protobuf))
+
+    def test_prefixed_disguised_onnx_bypasses_skip_without_promoting_generic_protobuf(self, tmp_path: Path) -> None:
+        pytest.importorskip("onnx")
+        disguised_onnx = create_mock_onnx(tmp_path / "model.jpg")
+        prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=(1024 * 1024) + 32)
+        generic_protobuf = tmp_path / "generic.jpg"
+        generic_protobuf.write_bytes(b"\xa2\x06\x04xxxx\x12\x02\x08\x01")
+
+        assert detect_file_format_for_skip_filter(str(disguised_onnx)) == "onnx"
+        assert not should_skip_file(str(disguised_onnx))
         assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
         assert should_skip_file(str(generic_protobuf))
 

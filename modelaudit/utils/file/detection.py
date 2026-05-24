@@ -40,20 +40,12 @@ _TF_METAGRAPH_MAX_VALIDATE_BYTES = 20 * 1024 * 1024
 _TF_METAGRAPH_MAX_ROUTING_FIELDS = 4096
 _TORCH7_SIGNATURE_READ_BYTES = 4096
 _LIGHTGBM_SIGNATURE_READ_BYTES = 8192
-_ONNX_PROTO_SIGNATURE_READ_BYTES = 1024 * 1024
-_ONNX_MODEL_TOP_LEVEL_TAG_START_BYTES = frozenset(
-    {
-        0x08,  # ir_version
-        0x12,  # producer_name
-        0x1A,  # producer_version
-        0x22,  # domain
-        0x28,  # model_version
-        0x32,  # doc_string
-        0x3A,  # graph
-        0x42,  # opset_import
-        0x72,  # metadata_props
-    }
-)
+_ONNX_MODEL_MAX_ROUTING_FIELDS = 4096
+_ONNX_GRAPH_MAX_ROUTING_FIELDS = 4096
+_ONNX_NODE_MAX_ROUTING_FIELDS = 512
+_ONNX_MAX_ROUTING_TEXT_BYTES = 1024
+_PROTO_GROUP_MAX_ROUTING_FIELDS = 512
+_PROTO_GROUP_MAX_ROUTING_DEPTH = 8
 _LIGHTGBM_HEADER_MARKERS = (
     "version=",
     "num_class=",
@@ -282,97 +274,49 @@ PROTO0_1_TRIVIAL_LEADING_OPCODES: frozenset[str] = frozenset(
 )
 
 
-def _read_proto_varint(data: bytes, offset: int, end: int | None = None) -> tuple[int, int] | None:
-    """Read a protobuf varint from bounded data."""
-    limit = len(data) if end is None else min(end, len(data))
-    value = 0
-    shift = 0
-    cursor = offset
-    while cursor < limit and cursor - offset < 10:
-        byte = data[cursor]
-        cursor += 1
-        value |= (byte & 0x7F) << shift
-        if byte < 0x80:
-            return value, cursor
-        shift += 7
-    return None
-
-
-def _has_onnx_model_tag_start(data: bytes) -> bool:
-    """Return True when data starts with a plausible ONNX ModelProto field tag."""
-    return bool(data) and data[0] in _ONNX_MODEL_TOP_LEVEL_TAG_START_BYTES
-
-
-def _read_length_delimited_proto_value(
-    data: bytes,
-    offset: int,
-    end: int | None = None,
-) -> tuple[int, int, int, int] | None:
-    """Return protobuf length-delimited value bounds within the sampled prefix."""
-    limit = len(data) if end is None else min(end, len(data))
-    length_result = _read_proto_varint(data, offset, limit)
-    if length_result is None:
+def _read_proto_length_delimited_bounds_stream(
+    stream: BinaryIO,
+    end_offset: int,
+) -> tuple[int, int, int] | None:
+    """Return bounds for a length-delimited value without reading its payload."""
+    length = _read_proto_varint_stream(stream, end_offset)
+    if length is None:
         return None
-    length, value_start = length_result
+    value_start = stream.tell()
     value_end = value_start + length
-    if value_start > limit:
+    if value_end > end_offset:
         return None
-    return length, value_start, min(value_end, limit), value_end
+    return length, value_start, value_end
 
 
-def _skip_proto_value(data: bytes, offset: int, wire_type: int, end: int | None = None) -> int | None:
-    """Skip one protobuf value, returning the next offset when the sample contains it."""
-    limit = len(data) if end is None else min(end, len(data))
-    if wire_type == 0:
-        value_result = _read_proto_varint(data, offset, limit)
-        return None if value_result is None else value_result[1]
-    if wire_type == 1:
-        next_offset = offset + 8
-        return next_offset if next_offset <= limit else None
-    if wire_type == 2:
-        bounds = _read_length_delimited_proto_value(data, offset, limit)
-        if bounds is None:
-            return None
-        _length, _value_start, _sampled_value_end, value_end = bounds
-        return value_end if value_end <= limit else None
-    if wire_type == 5:
-        next_offset = offset + 4
-        return next_offset if next_offset <= limit else None
-    return None
-
-
-def _looks_like_onnx_node_proto_prefix(data: bytes) -> bool:
-    """Return True when a bounded prefix resembles an ONNX NodeProto."""
-    offset = 0
+def _looks_like_onnx_node_proto_stream(stream: BinaryIO, end_offset: int) -> bool:
+    """Return True when a bounded message resembles an ONNX NodeProto."""
     fields_seen = 0
     has_input_or_output = False
     has_op_type = False
-    while offset < len(data) and fields_seen < 128:
-        tag_result = _read_proto_varint(data, offset)
-        if tag_result is None:
-            break
-        tag, value_offset = tag_result
+    while stream.tell() < end_offset and fields_seen < _ONNX_NODE_MAX_ROUTING_FIELDS:
+        tag = _read_proto_varint_stream(stream, end_offset)
+        if tag is None:
+            return False
         field_number = tag >> 3
         wire_type = tag & 0x07
         if field_number == 0:
             return False
 
         if wire_type == 2 and field_number in {1, 2, 4}:
-            bounds = _read_length_delimited_proto_value(data, value_offset)
+            bounds = _read_proto_length_delimited_bounds_stream(stream, end_offset)
             if bounds is None:
-                break
-            length, value_start, value_end, actual_value_end = bounds
-            if field_number in {1, 2} and 0 < length <= 1024:
+                return False
+            length, _value_start, value_end = bounds
+            if field_number in {1, 2} and 0 < length <= _ONNX_MAX_ROUTING_TEXT_BYTES:
                 has_input_or_output = True
-            elif field_number == 4 and 0 < length <= 1024:
-                op_type = data[value_start:value_end]
+            elif field_number == 4 and 0 < length <= _ONNX_MAX_ROUTING_TEXT_BYTES:
+                op_type = stream.read(length)
                 has_op_type = bool(op_type) and all(32 <= byte < 127 for byte in op_type)
-            offset = actual_value_end
+            stream.seek(value_end)
         else:
-            next_offset = _skip_proto_value(data, value_offset, wire_type)
-            if next_offset is None:
-                break
-            offset = next_offset
+            if not _skip_proto_stream_value(stream, wire_type, end_offset, field_number=field_number):
+                return False
 
         fields_seen += 1
         if has_input_or_output and has_op_type:
@@ -381,41 +325,37 @@ def _looks_like_onnx_node_proto_prefix(data: bytes) -> bool:
     return False
 
 
-def _looks_like_onnx_graph_proto_prefix(data: bytes) -> bool:
-    """Return True when a bounded prefix resembles an ONNX GraphProto."""
-    offset = 0
+def _looks_like_onnx_graph_proto_stream(stream: BinaryIO, end_offset: int) -> bool:
+    """Return True when a bounded message resembles an ONNX GraphProto."""
     fields_seen = 0
     has_node = False
     has_initializer = False
     value_info_fields: set[int] = set()
 
-    while offset < len(data) and fields_seen < 512:
-        tag_result = _read_proto_varint(data, offset)
-        if tag_result is None:
-            break
-        tag, value_offset = tag_result
+    while stream.tell() < end_offset and fields_seen < _ONNX_GRAPH_MAX_ROUTING_FIELDS:
+        tag = _read_proto_varint_stream(stream, end_offset)
+        if tag is None:
+            return False
         field_number = tag >> 3
         wire_type = tag & 0x07
         if field_number == 0:
             return False
 
         if wire_type == 2:
-            bounds = _read_length_delimited_proto_value(data, value_offset)
+            bounds = _read_proto_length_delimited_bounds_stream(stream, end_offset)
             if bounds is None:
-                break
-            _length, value_start, value_end, actual_value_end = bounds
-            if field_number == 1 and _looks_like_onnx_node_proto_prefix(data[value_start:value_end]):
+                return False
+            length, _value_start, value_end = bounds
+            if field_number == 1 and length > 0 and _looks_like_onnx_node_proto_stream(stream, value_end):
                 has_node = True
             elif field_number == 5:
                 has_initializer = True
             elif field_number in {11, 12, 13}:
                 value_info_fields.add(field_number)
-            offset = actual_value_end
+            stream.seek(value_end)
         else:
-            next_offset = _skip_proto_value(data, value_offset, wire_type)
-            if next_offset is None:
-                break
-            offset = next_offset
+            if not _skip_proto_stream_value(stream, wire_type, end_offset, field_number=field_number):
+                return False
 
         fields_seen += 1
         if (has_node and value_info_fields) or len(value_info_fields) >= 2:
@@ -424,45 +364,37 @@ def _looks_like_onnx_graph_proto_prefix(data: bytes) -> bool:
     return has_initializer and bool(value_info_fields)
 
 
-def _looks_like_onnx_model_proto_prefix(data: bytes) -> bool:
-    """Return True when a bounded prefix resembles an ONNX ModelProto."""
-    if not _has_onnx_model_tag_start(data):
-        return False
-
-    offset = 0
+def _looks_like_onnx_model_proto_stream(stream: BinaryIO, end_offset: int) -> bool:
+    """Return True when a bounded message resembles an ONNX ModelProto."""
     fields_seen = 0
     has_plausible_ir_version = False
     has_graph = False
 
-    while offset < len(data) and fields_seen < 512:
-        tag_result = _read_proto_varint(data, offset)
-        if tag_result is None:
-            break
-        tag, value_offset = tag_result
+    while stream.tell() < end_offset and fields_seen < _ONNX_MODEL_MAX_ROUTING_FIELDS:
+        tag = _read_proto_varint_stream(stream, end_offset)
+        if tag is None:
+            return False
         field_number = tag >> 3
         wire_type = tag & 0x07
         if field_number == 0:
             return False
 
         if field_number == 1 and wire_type == 0:
-            value_result = _read_proto_varint(data, value_offset)
-            if value_result is None:
-                break
-            ir_version, offset = value_result
+            ir_version = _read_proto_varint_stream(stream, end_offset)
+            if ir_version is None:
+                return False
             has_plausible_ir_version = 0 < ir_version <= 1000
         elif field_number == 7 and wire_type == 2:
-            bounds = _read_length_delimited_proto_value(data, value_offset)
+            bounds = _read_proto_length_delimited_bounds_stream(stream, end_offset)
             if bounds is None:
-                break
-            length, value_start, value_end, actual_value_end = bounds
-            if length > 0 and _looks_like_onnx_graph_proto_prefix(data[value_start:value_end]):
+                return False
+            length, _value_start, value_end = bounds
+            if length > 0 and _looks_like_onnx_graph_proto_stream(stream, value_end):
                 has_graph = True
-            offset = actual_value_end
+            stream.seek(value_end)
         else:
-            next_offset = _skip_proto_value(data, value_offset, wire_type)
-            if next_offset is None:
-                break
-            offset = next_offset
+            if not _skip_proto_stream_value(stream, wire_type, end_offset, field_number=field_number):
+                return False
 
         fields_seen += 1
         if has_plausible_ir_version and has_graph:
@@ -472,20 +404,19 @@ def _looks_like_onnx_model_proto_prefix(data: bytes) -> bool:
 
 
 def _looks_like_onnx_model_file(path: Path, size: int) -> bool:
-    """Detect real ONNX ModelProto structure with a bounded prefix read."""
+    """Detect real ONNX ModelProto structure while seeking over large values."""
     if size < 4:
         return False
     try:
-        with path.open("rb") as handle:
-            prefix = handle.read(min(size, _ONNX_PROTO_SIGNATURE_READ_BYTES))
+        with path.open("rb") as stream:
+            return _looks_like_onnx_model_proto_stream(stream, size)
     except OSError:
         return False
-    return _looks_like_onnx_model_proto_prefix(prefix)
 
 
-def _looks_like_onnx_model_candidate_file(path: Path, size: int, header: bytes) -> bool:
-    """Run the bounded ONNX parser only for plausible protobuf tag starts."""
-    return _has_onnx_model_tag_start(header) and _looks_like_onnx_model_file(path, size)
+def _looks_like_onnx_model_candidate_file(path: Path, size: int) -> bool:
+    """Run bounded structural ONNX routing without assuming its first field."""
+    return _looks_like_onnx_model_file(path, size)
 
 
 def _looks_like_binary_pickle_protocol(header: bytes) -> bool:
@@ -1128,10 +1059,12 @@ def _is_tensorflow_saved_model_file(path: str) -> bool:
         return False
 
 
-def _read_proto_varint_stream(stream: BinaryIO) -> int | None:
+def _read_proto_varint_stream(stream: BinaryIO, end_offset: int | None = None) -> int | None:
     value = 0
     shift = 0
     for _ in range(10):
+        if end_offset is not None and stream.tell() >= end_offset:
+            return None
         raw_byte = stream.read(1)
         if not raw_byte:
             return None
@@ -1143,22 +1076,51 @@ def _read_proto_varint_stream(stream: BinaryIO) -> int | None:
     return None
 
 
-def _skip_proto_stream_value(stream: BinaryIO, wire_type: int, file_size: int) -> bool:
+def _skip_proto_stream_value(
+    stream: BinaryIO,
+    wire_type: int,
+    end_offset: int,
+    *,
+    field_number: int | None = None,
+    group_depth: int = 0,
+) -> bool:
     if wire_type == 0:
-        return _read_proto_varint_stream(stream) is not None
+        return _read_proto_varint_stream(stream, end_offset) is not None
     if wire_type == 1:
         length = 8
     elif wire_type == 2:
-        length_result = _read_proto_varint_stream(stream)
+        length_result = _read_proto_varint_stream(stream, end_offset)
         if length_result is None:
             return False
         length = length_result
     elif wire_type == 5:
         length = 4
+    elif wire_type == 3:
+        if field_number is None or group_depth >= _PROTO_GROUP_MAX_ROUTING_DEPTH:
+            return False
+        for _ in range(_PROTO_GROUP_MAX_ROUTING_FIELDS):
+            nested_tag = _read_proto_varint_stream(stream, end_offset)
+            if nested_tag is None:
+                return False
+            nested_field_number = nested_tag >> 3
+            nested_wire_type = nested_tag & 0x07
+            if nested_field_number == 0:
+                return False
+            if nested_wire_type == 4:
+                return nested_field_number == field_number
+            if not _skip_proto_stream_value(
+                stream,
+                nested_wire_type,
+                end_offset,
+                field_number=nested_field_number,
+                group_depth=group_depth + 1,
+            ):
+                return False
+        return False
     else:
         return False
 
-    if stream.tell() + length > file_size:
+    if stream.tell() + length > end_offset:
         return False
     stream.seek(length, 1)
     return True
@@ -1348,7 +1310,7 @@ def detect_format_from_magic_bytes(
         case _:
             pass
 
-    if file_path is not None and _looks_like_onnx_model_candidate_file(file_path, file_size, magic4):
+    if file_path is not None and _looks_like_onnx_model_candidate_file(file_path, file_size):
         return "onnx"
 
     # Check longer magic sequences
@@ -1478,7 +1440,7 @@ def detect_file_format_from_magic(path: str) -> str:
     if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
 
-    if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
+    if _looks_like_onnx_model_candidate_file(file_path, size):
         return "onnx"
 
     return "unknown"
@@ -1606,7 +1568,7 @@ def detect_file_format(path: str) -> str:
 
     if magic8.startswith(b"\x93NUMPY"):
         return "numpy"
-    if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
+    if _looks_like_onnx_model_candidate_file(file_path, size):
         return "onnx"
 
     # Check first 8 bytes for HDF5 magic
@@ -1700,7 +1662,7 @@ def detect_file_format(path: str) -> str:
             return "safetensors"
 
         # Check for ONNX format (protobuf)
-        if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
+        if _looks_like_onnx_model_candidate_file(file_path, size):
             return "onnx"
 
         # Otherwise, assume raw binary format (PyTorch weights)

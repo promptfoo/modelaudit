@@ -22,7 +22,12 @@ from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.tf_metagraph_scanner import _MAX_PARSE_BYTES
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
-from tests.helpers import create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
+from tests.helpers import (
+    create_mock_gguf,
+    create_mock_onnx,
+    create_mock_pytorch_zip,
+    prefix_mock_onnx_with_unknown_field,
+)
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
 
@@ -1809,6 +1814,21 @@ def test_scan_file_detects_malicious_onnx_pb_by_content(tmp_path: Path) -> None:
 
     assert result.scanner_name == "onnx"
     assert not any(check.name == "Format Validation" for check in result.checks)
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
+
+
+def test_scan_file_detects_malicious_prefixed_renamed_onnx_by_content(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    disguised_onnx = create_mock_onnx(tmp_path / "malicious.jpg", op_type="PythonOp")
+    prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=(1024 * 1024) + 32)
+
+    result = scan_file(str(disguised_onnx), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "onnx"
+    assert result.success is False
     assert any(
         issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
         for issue in result.issues
