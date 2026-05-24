@@ -16,6 +16,7 @@ import pytest
 
 from modelaudit.scanner_registry_metadata import get_extension_format_map
 from modelaudit.utils.file.detection import (
+    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     PROTO0_1_MAX_PROBE_BYTES,
     detect_file_format,
     detect_file_format_for_skip_filter,
@@ -108,6 +109,26 @@ def test_detect_renamed_jax_json_checkpoint_without_routing_ajax_near_match(tmp_
     assert detect_file_format_from_magic(str(checkpoint_path)) == "jax_checkpoint"
     assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
     assert detect_file_format(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format_from_magic(str(near_match_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(near_match_path)) == "unknown"
+    assert detect_file_format(str(near_match_path)) == "unknown"
+
+
+def test_detect_oversized_renamed_jax_json_checkpoint_with_streamed_identity(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "checkpoint-large.jpg"
+    marker_path = tmp_path / "orbax-large.jpg"
+    near_match_path = tmp_path / "ajax-large.jpg"
+    padding = "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)
+    checkpoint_path.write_text(json.dumps({"padding": padding, "framework": "jax"}), encoding="utf-8")
+    marker_path.write_text(json.dumps({"padding": padding, "__orbax_metadata__": "x" * 512}), encoding="utf-8")
+    near_match_path.write_text(json.dumps({"padding": padding, "framework": "ajax"}), encoding="utf-8")
+
+    assert detect_file_format_from_magic(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format_from_magic(str(marker_path)) == "jax_checkpoint"
+    assert detect_file_format_for_skip_filter(str(marker_path)) == "jax_checkpoint"
+    assert detect_file_format(str(marker_path)) == "jax_checkpoint"
     assert detect_file_format_from_magic(str(near_match_path)) == "unknown"
     assert detect_file_format_for_skip_filter(str(near_match_path)) == "unknown"
     assert detect_file_format(str(near_match_path)) == "unknown"

@@ -1248,8 +1248,137 @@ def _has_jax_json_checkpoint_structure(payload: object) -> bool:
     return False
 
 
+def _has_streamed_jax_json_checkpoint_identity(path: Path) -> bool:
+    """Find a top-level JAX identity while retaining bounded memory use for large JSON."""
+    max_captured_string_chars = 256
+    depth = 0
+    found_root = False
+    in_string = False
+    escaped = False
+    expecting_key = False
+    expecting_value = False
+    pending_key: str | None = None
+    capture_kind: str | None = None
+    captured_chars: list[str] = []
+    capture_exceeded = False
+
+    try:
+        with path.open(encoding="utf-8-sig") as stream:
+            while chunk := stream.read(8192):
+                for character in chunk:
+                    if in_string:
+                        if escaped:
+                            if capture_kind is not None:
+                                if len(captured_chars) < max_captured_string_chars:
+                                    captured_chars.append(character)
+                                else:
+                                    capture_exceeded = True
+                            escaped = False
+                            continue
+                        if character == "\\":
+                            if capture_kind is not None:
+                                if len(captured_chars) < max_captured_string_chars:
+                                    captured_chars.append(character)
+                                else:
+                                    capture_exceeded = True
+                            escaped = True
+                            continue
+                        if character != '"':
+                            if capture_kind is not None:
+                                if len(captured_chars) < max_captured_string_chars:
+                                    captured_chars.append(character)
+                                else:
+                                    capture_exceeded = True
+                            continue
+
+                        in_string = False
+                        decoded_value: object = None
+                        if capture_kind is not None and not capture_exceeded:
+                            try:
+                                decoded_value = json.loads('"' + "".join(captured_chars) + '"')
+                            except json.JSONDecodeError:
+                                return False
+                        if capture_kind == "key":
+                            pending_key = decoded_value if isinstance(decoded_value, str) else None
+                            expecting_key = False
+                        elif capture_kind == "value":
+                            if pending_key in _JAX_JSON_CHECKPOINT_MARKER_KEYS:
+                                return True
+                            if (
+                                pending_key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS
+                                and isinstance(decoded_value, str)
+                                and _JAX_JSON_CHECKPOINT_IDENTITY_RE.search(decoded_value)
+                            ):
+                                return True
+                            expecting_value = False
+                            pending_key = None
+                        capture_kind = None
+                        captured_chars = []
+                        capture_exceeded = False
+                        continue
+
+                    if not found_root:
+                        if character.isspace():
+                            continue
+                        if character != "{":
+                            return False
+                        found_root = True
+                        depth = 1
+                        expecting_key = True
+                        continue
+
+                    if character.isspace():
+                        continue
+                    if character == '"':
+                        in_string = True
+                        escaped = False
+                        captured_chars = []
+                        capture_exceeded = False
+                        if depth == 1 and expecting_key:
+                            capture_kind = "key"
+                        elif depth == 1 and expecting_value and pending_key in _JAX_JSON_CHECKPOINT_MARKER_KEYS:
+                            return True
+                        elif depth == 1 and expecting_value and pending_key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS:
+                            capture_kind = "value"
+                        else:
+                            capture_kind = None
+                        continue
+                    if character in "{[":
+                        depth += 1
+                        if depth == 2 and expecting_value:
+                            if pending_key in _JAX_JSON_CHECKPOINT_MARKER_KEYS:
+                                return True
+                            pending_key = None
+                            expecting_value = False
+                        continue
+                    if character in "}]":
+                        depth -= 1
+                        if depth <= 0:
+                            return False
+                        continue
+                    if depth != 1:
+                        continue
+                    if character == ":" and pending_key is not None:
+                        expecting_value = True
+                        continue
+                    if character == ",":
+                        expecting_key = True
+                        expecting_value = False
+                        pending_key = None
+                        continue
+                    if expecting_value:
+                        if pending_key in _JAX_JSON_CHECKPOINT_MARKER_KEYS:
+                            return True
+                        expecting_value = False
+                        pending_key = None
+    except (OSError, UnicodeDecodeError):
+        return False
+
+    return False
+
+
 def is_jax_json_checkpoint_file(path: str | Path) -> bool:
-    """Recognize bounded, structured JSON metadata for JAX-family checkpoints."""
+    """Recognize bounded JSON metadata or a streamed explicit JAX identity."""
     file_path = Path(path)
     try:
         if not file_path.is_file():
@@ -1258,14 +1387,16 @@ def is_jax_json_checkpoint_file(path: str | Path) -> bool:
             sample = f.read(JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 1)
     except OSError:
         return False
-    if len(sample) > JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
+    prefix = sample[:JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES]
+
+    if not _could_start_json_object(prefix):
         return False
 
-    if not _could_start_json_object(sample):
-        return False
+    if len(sample) > JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
+        return _has_streamed_jax_json_checkpoint_identity(file_path)
 
     try:
-        payload = json.loads(sample.decode("utf-8-sig"))
+        payload = json.loads(prefix.decode("utf-8-sig"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return False
     return _has_jax_json_checkpoint_structure(payload)

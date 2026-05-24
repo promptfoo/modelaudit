@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from modelaudit.utils.file import filtering
-from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
+from modelaudit.utils.file.detection import JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES, detect_file_format_for_skip_filter
 from modelaudit.utils.file.filtering import (
     _ZIP_MEMBER_SNIFF_LIMIT,
     should_skip_file,
@@ -235,6 +235,18 @@ class TestFileFilter:
             encoding="utf-8",
         )
         near_match_path.write_text(json.dumps({"framework": "ajax", "format": "checkpoint"}), encoding="utf-8")
+
+        assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
+        assert not should_skip_file(str(checkpoint_path))
+        assert detect_file_format_for_skip_filter(str(near_match_path)) == "unknown"
+        assert should_skip_file(str(near_match_path))
+
+    def test_oversized_disguised_jax_json_checkpoint_bypasses_skip_after_late_identity(self, tmp_path: Path) -> None:
+        checkpoint_path = tmp_path / "large-checkpoint.jpg"
+        near_match_path = tmp_path / "large-ajax.jpg"
+        padding = "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)
+        checkpoint_path.write_text(json.dumps({"padding": padding, "framework": "jax"}), encoding="utf-8")
+        near_match_path.write_text(json.dumps({"padding": padding, "framework": "ajax"}), encoding="utf-8")
 
         assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
         assert not should_skip_file(str(checkpoint_path))

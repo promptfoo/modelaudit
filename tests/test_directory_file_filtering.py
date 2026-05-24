@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.utils.file.detection import JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES
 from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
 
 
@@ -236,6 +237,19 @@ class TestDirectoryFileFiltering:
         assert "jax_checkpoint" in results.scanner_names
         assert determine_exit_code(results) == 1
         assert any(issue.message.startswith("Suspicious pattern in JSON checkpoint") for issue in results.issues)
+
+    def test_oversized_disguised_jax_json_checkpoint_fails_closed_after_late_identity(self, tmp_path: Path) -> None:
+        """Directory filtering should preserve streamed JAX identity routing for large JSON."""
+        padding = "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)
+        (tmp_path / "payload.jpg").write_text(json.dumps({"padding": padding, "framework": "jax"}), encoding="utf-8")
+        (tmp_path / "ajax.jpg").write_text(json.dumps({"padding": padding, "framework": "ajax"}), encoding="utf-8")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "jax_checkpoint" in results.scanner_names
+        assert results.success is False
+        assert determine_exit_code(results) == 2
 
     @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
     def test_disguised_pickle_with_default_hidden_or_basename_skip_is_scanned(

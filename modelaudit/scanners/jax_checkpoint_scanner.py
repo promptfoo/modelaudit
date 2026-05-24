@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
-from ..utils.file.detection import is_jax_json_checkpoint_file
+from ..utils.file.detection import JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES, is_jax_json_checkpoint_file
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 try:
@@ -210,6 +210,7 @@ class JaxCheckpointScanner(BaseScanner):
         re.IGNORECASE,
     )
     DEFAULT_MAX_PICKLE_SCAN_BYTES: ClassVar[int] = 16 * 1024 * 1024
+    _JSON_ANALYSIS_SIZE_LIMIT_REASON: ClassVar[str] = "jax_json_checkpoint_analysis_size_limit"
     _METADATA_TRAVERSAL_LIMIT_REASON: ClassVar[str] = "jax_metadata_traversal_depth_limit"
     _PICKLE_SCAN_LIMIT_REASON: ClassVar[str] = "jax_pickle_scan_limit_exceeded"
 
@@ -707,13 +708,19 @@ class JaxCheckpointScanner(BaseScanner):
                 )
 
         except Exception as e:
+            mark_inconclusive_scan_result(result, "jax_checkpoint_file_scan_failed")
             result.add_check(
                 name="Checkpoint File Scan",
                 passed=False,
                 message=f"Error scanning checkpoint file: {e}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"error": str(e), "error_type": type(e).__name__},
+                details={
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "jax_checkpoint_file_scan_failed",
+                },
                 rule_code="S902",
             )
 
@@ -1049,6 +1056,25 @@ class JaxCheckpointScanner(BaseScanner):
 
     def _scan_json_checkpoint(self, path: str, result: ScanResult) -> None:
         """Scan JSON-based checkpoint metadata."""
+        file_size = os.path.getsize(path)
+        if file_size > JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
+            mark_inconclusive_scan_result(result, self._JSON_ANALYSIS_SIZE_LIMIT_REASON)
+            result.add_check(
+                name="JSON Checkpoint Analysis Limit",
+                passed=False,
+                message="JSON checkpoint analysis incomplete because the file exceeds the bounded parsing limit",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "file_size": file_size,
+                    "max_json_analysis_bytes": JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self._JSON_ANALYSIS_SIZE_LIMIT_REASON,
+                },
+                rule_code="S902",
+            )
+            return
+
         try:
             with open(path, encoding="utf-8-sig") as f:
                 data = json.load(f)
@@ -1147,13 +1173,19 @@ class JaxCheckpointScanner(BaseScanner):
                 self._scan_checkpoint_file(path, result)
 
         except Exception as e:
+            mark_inconclusive_scan_result(result, "jax_checkpoint_scan_failed")
             result.add_check(
                 name="JAX Checkpoint Scan",
                 passed=False,
                 message=f"Unexpected error scanning JAX checkpoint: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"error": str(e), "error_type": type(e).__name__},
+                details={
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "jax_checkpoint_scan_failed",
+                },
                 rule_code="S902",
             )
             result.finish(success=False)
