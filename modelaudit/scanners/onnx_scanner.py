@@ -359,6 +359,23 @@ class OnnxScanner(BaseScanner):
             result.finish(success=False)
             return result
 
+        has_graph = model.HasField("graph")
+        if model.ir_version <= 0 or not has_graph:
+            _mark_inconclusive_scan_result(result, ONNX_STRUCTURE_INCONCLUSIVE_REASON)
+            result.add_check(
+                name="ONNX Structure Validation",
+                passed=False,
+                message="Parsed ONNX payload is missing required model structure; analysis incomplete",
+                severity=IssueSeverity.INFO,
+                location=path,
+                rule_code="S902",
+                details={
+                    "scan_outcome_reason": ONNX_STRUCTURE_INCONCLUSIVE_REASON,
+                    "ir_version": model.ir_version,
+                    "has_graph": has_graph,
+                },
+            )
+
         result.metadata.update(
             {
                 "ir_version": model.ir_version,

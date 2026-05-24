@@ -277,6 +277,17 @@ def test_detect_file_format_routes_prefixed_renamed_onnx_by_bounded_structure(tm
     assert detect_file_format_for_skip_filter(str(model_path)) == "onnx"
 
 
+def test_detect_file_format_keeps_budget_exhausted_prefixed_renamed_onnx_scannable(tmp_path: Path) -> None:
+    """A long legal prefix must stay scannable after bounded routing is exhausted."""
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "many-prefixes.jpg")
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097)
+
+    assert detect_file_format(str(model_path)) == "onnx"
+    assert detect_file_format_from_magic(str(model_path)) == "onnx"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "onnx"
+
+
 def test_detect_file_format_routes_group_prefixed_renamed_onnx_by_bounded_structure(tmp_path: Path) -> None:
     """Deprecated but legal unknown protobuf groups must not hide ONNX content."""
     pytest.importorskip("onnx")
@@ -430,6 +441,40 @@ def test_detect_renamed_tf_savedmodel_by_strict_parse_without_promoting_generic_
     assert detect_file_format_from_magic(str(generic_protobuf)) == "unknown"
     assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
     assert detect_file_format(str(generic_protobuf)) == "unknown"
+
+
+def test_detect_oversized_renamed_tf_protobuf_rejects_malformed_field_two_payload(tmp_path: Path) -> None:
+    malformed_payload = tmp_path / "malformed-large.jpg"
+    malformed_payload.write_bytes(b"\x12" + (b"x" * (20 * 1024 * 1024)))
+
+    assert detect_file_format_from_magic(str(malformed_payload)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(malformed_payload)) == "unknown"
+    assert detect_file_format(str(malformed_payload)) == "unknown"
+
+
+def test_detect_oversized_renamed_tf_savedmodel_routes_to_bounded_scan(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    oversized_savedmodel = tmp_path / "saved-large.jpg"
+    seed = _build_tf_savedmodel_bytes()
+    oversized_savedmodel.write_bytes(seed + (b"x" * (20 * 1024 * 1024 + 1 - len(seed))))
+
+    assert detect_file_format_from_magic(str(oversized_savedmodel)) == "tf_metagraph"
+    assert detect_file_format_for_skip_filter(str(oversized_savedmodel)) == "tf_metagraph"
+    assert detect_file_format(str(oversized_savedmodel)) == "tf_metagraph"
+
+
+def test_detect_renamed_tf_metagraph_after_unknown_group_prefix(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    prefixed_metagraph = tmp_path / "group-prefixed.jpg"
+    prefixed_metagraph.write_bytes(b"\xa3\x06\x08\x01\xa4\x06" + _build_tf_metagraph_bytes())
+
+    assert detect_file_format_from_magic(str(prefixed_metagraph)) == "tf_metagraph"
+    assert detect_file_format_for_skip_filter(str(prefixed_metagraph)) == "tf_metagraph"
+    assert detect_file_format(str(prefixed_metagraph)) == "tf_metagraph"
 
 
 def test_detect_tf_metagraph_rejects_renamed_non_protobuf(tmp_path: Path) -> None:

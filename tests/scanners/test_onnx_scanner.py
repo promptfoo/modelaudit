@@ -17,7 +17,11 @@ from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.detectors.jit_script import JITScriptDetector
 from modelaudit.detectors.network_comm import NetworkCommDetector
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.onnx_scanner import OnnxScanner, _confirmed_python_operator_findings
+from modelaudit.scanners.onnx_scanner import (
+    ONNX_STRUCTURE_INCONCLUSIVE_REASON,
+    OnnxScanner,
+    _confirmed_python_operator_findings,
+)
 
 
 def create_onnx_model(
@@ -119,6 +123,23 @@ def test_onnx_scanner_basic_model(tmp_path):
     assert result.success
     assert result.bytes_scanned > 0
     assert not any(i.severity in (IssueSeverity.INFO, IssueSeverity.WARNING) for i in result.issues)
+
+
+def test_onnx_scanner_unknown_only_payload_is_inconclusive(tmp_path: Path) -> None:
+    model_path = tmp_path / "unknown-only.onnx"
+    model_path.write_bytes(b"\xa2\x06\x00" * 4097)
+
+    result = OnnxScanner({"check_jit_script": False, "check_network_comm": False}).scan(str(model_path))
+
+    assert result.success is False
+    assert result.has_errors is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert ONNX_STRUCTURE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    check = next(check for check in result.checks if check.name == "ONNX Structure Validation")
+    assert check.status == CheckStatus.FAILED
+    assert check.severity == IssueSeverity.INFO
+    assert check.details["has_graph"] is False
+    assert check.details["ir_version"] == 0
 
 
 def test_onnx_scanner_reuses_raw_bytes_for_model_parse(

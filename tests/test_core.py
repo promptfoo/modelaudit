@@ -1835,6 +1835,54 @@ def test_scan_file_detects_malicious_prefixed_renamed_onnx_by_content(tmp_path: 
     )
 
 
+def test_scan_file_detects_malicious_budget_exhausted_prefixed_renamed_onnx(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    disguised_onnx = create_mock_onnx(tmp_path / "many-prefixes.jpg", op_type="PythonOp")
+    prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=0, count=4097)
+
+    result = scan_file(str(disguised_onnx), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(disguised_onnx), cache_scan_results=False)
+
+    assert result.scanner_name == "onnx"
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
+    assert core_module.determine_exit_code(aggregate) == 1
+
+
+def test_scan_file_fails_closed_on_budget_exhausted_renamed_onnx_without_structure(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    ambiguous_onnx = tmp_path / "ambiguous.jpg"
+    ambiguous_onnx.write_bytes(b"\xa2\x06\x00" * 4097)
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        result = scan_file(str(ambiguous_onnx), config=config)
+        repeated_result = scan_file(str(ambiguous_onnx), config=config)
+
+        assert result.scanner_name == "onnx"
+        assert result.success is False
+        assert repeated_result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert "onnx_structure_validation_failed" in result.metadata["scan_outcome_reasons"]
+        check = next(check for check in result.checks if check.name == "ONNX Structure Validation")
+        assert "missing required model structure" in check.message
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    aggregate = scan_model_directory_or_file(str(ambiguous_onnx), cache_scan_results=False)
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
 def test_scan_file_detects_malicious_renamed_tf_metagraph_by_content(tmp_path: Path) -> None:
     disguised_metagraph = tmp_path / "malicious.jpg"
     disguised_metagraph.write_bytes(b"\xa2\x06\x80\x08" + (b"x" * 1024) + _build_malicious_tf_metagraph())
@@ -1892,6 +1940,19 @@ def test_scan_file_routes_oversized_renamed_tf_metagraph_to_fail_closed_scan(tmp
 
     aggregate = scan_model_directory_or_file(str(disguised_metagraph), cache_scan_results=False)
     assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_does_not_route_oversized_malformed_tf_protobuf_near_match(tmp_path: Path) -> None:
+    malformed_payload = tmp_path / "malformed-large.jpg"
+    malformed_payload.write_bytes(b"\x12" + (b"x" * _MAX_PARSE_BYTES))
+
+    result = scan_file(str(malformed_payload), config={"cache_enabled": False})
+    aggregate = scan_model_directory_or_file(str(malformed_payload), cache_enabled=False)
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+    assert aggregate.success is True
+    assert core_module.determine_exit_code(aggregate) == 0
 
 
 def test_scan_file_does_not_route_incidental_onnx_pb_string(tmp_path: Path) -> None:

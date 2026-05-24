@@ -44,6 +44,7 @@ _ONNX_MODEL_MAX_ROUTING_FIELDS = 4096
 _ONNX_GRAPH_MAX_ROUTING_FIELDS = 4096
 _ONNX_NODE_MAX_ROUTING_FIELDS = 512
 _ONNX_MAX_ROUTING_TEXT_BYTES = 1024
+_ONNX_UNKNOWN_PREFIX_MIN_FIELD_NUMBER = 64
 _PROTO_GROUP_MAX_ROUTING_FIELDS = 512
 _PROTO_GROUP_MAX_ROUTING_DEPTH = 8
 _LIGHTGBM_HEADER_MARKERS = (
@@ -289,8 +290,8 @@ def _read_proto_length_delimited_bounds_stream(
     return length, value_start, value_end
 
 
-def _looks_like_onnx_node_proto_stream(stream: BinaryIO, end_offset: int) -> bool:
-    """Return True when a bounded message resembles an ONNX NodeProto."""
+def _looks_like_onnx_node_proto_stream(stream: BinaryIO, end_offset: int) -> bool | None:
+    """Return whether a bounded message resembles an ONNX NodeProto, or is unresolved."""
     fields_seen = 0
     has_input_or_output = False
     has_op_type = False
@@ -322,11 +323,13 @@ def _looks_like_onnx_node_proto_stream(stream: BinaryIO, end_offset: int) -> boo
         if has_input_or_output and has_op_type:
             return True
 
+    if stream.tell() < end_offset:
+        return None
     return False
 
 
-def _looks_like_onnx_graph_proto_stream(stream: BinaryIO, end_offset: int) -> bool:
-    """Return True when a bounded message resembles an ONNX GraphProto."""
+def _looks_like_onnx_graph_proto_stream(stream: BinaryIO, end_offset: int) -> bool | None:
+    """Return whether a bounded message resembles an ONNX GraphProto, or is unresolved."""
     fields_seen = 0
     has_node = False
     has_initializer = False
@@ -346,8 +349,11 @@ def _looks_like_onnx_graph_proto_stream(stream: BinaryIO, end_offset: int) -> bo
             if bounds is None:
                 return False
             length, _value_start, value_end = bounds
-            if field_number == 1 and length > 0 and _looks_like_onnx_node_proto_stream(stream, value_end):
-                has_node = True
+            if field_number == 1 and length > 0:
+                node_status = _looks_like_onnx_node_proto_stream(stream, value_end)
+                if node_status is None:
+                    return None
+                has_node = has_node or node_status
             elif field_number == 5:
                 has_initializer = True
             elif field_number in {11, 12, 13}:
@@ -361,14 +367,19 @@ def _looks_like_onnx_graph_proto_stream(stream: BinaryIO, end_offset: int) -> bo
         if (has_node and value_info_fields) or len(value_info_fields) >= 2:
             return True
 
-    return has_initializer and bool(value_info_fields)
+    if has_initializer and value_info_fields:
+        return True
+    if stream.tell() < end_offset:
+        return None
+    return False
 
 
-def _looks_like_onnx_model_proto_stream(stream: BinaryIO, end_offset: int) -> bool:
-    """Return True when a bounded message resembles an ONNX ModelProto."""
+def _looks_like_onnx_model_proto_stream(stream: BinaryIO, end_offset: int) -> bool | None:
+    """Return whether a bounded message resembles an ONNX ModelProto, or is unresolved."""
     fields_seen = 0
     has_plausible_ir_version = False
     has_graph = False
+    has_only_unknown_prefix_fields = True
 
     while stream.tell() < end_offset and fields_seen < _ONNX_MODEL_MAX_ROUTING_FIELDS:
         tag = _read_proto_varint_stream(stream, end_offset)
@@ -380,19 +391,26 @@ def _looks_like_onnx_model_proto_stream(stream: BinaryIO, end_offset: int) -> bo
             return False
 
         if field_number == 1 and wire_type == 0:
+            has_only_unknown_prefix_fields = False
             ir_version = _read_proto_varint_stream(stream, end_offset)
             if ir_version is None:
                 return False
             has_plausible_ir_version = 0 < ir_version <= 1000
         elif field_number == 7 and wire_type == 2:
+            has_only_unknown_prefix_fields = False
             bounds = _read_proto_length_delimited_bounds_stream(stream, end_offset)
             if bounds is None:
                 return False
             length, _value_start, value_end = bounds
-            if length > 0 and _looks_like_onnx_graph_proto_stream(stream, value_end):
-                has_graph = True
+            if length > 0:
+                graph_status = _looks_like_onnx_graph_proto_stream(stream, value_end)
+                if graph_status is None:
+                    return None
+                has_graph = has_graph or graph_status
             stream.seek(value_end)
         else:
+            if field_number < _ONNX_UNKNOWN_PREFIX_MIN_FIELD_NUMBER or wire_type not in {2, 3}:
+                has_only_unknown_prefix_fields = False
             if not _skip_proto_stream_value(stream, wire_type, end_offset, field_number=field_number):
                 return False
 
@@ -400,11 +418,13 @@ def _looks_like_onnx_model_proto_stream(stream: BinaryIO, end_offset: int) -> bo
         if has_plausible_ir_version and has_graph:
             return True
 
+    if stream.tell() < end_offset and (has_plausible_ir_version or has_graph or has_only_unknown_prefix_fields):
+        return None
     return False
 
 
-def _looks_like_onnx_model_file(path: Path, size: int) -> bool:
-    """Detect real ONNX ModelProto structure while seeking over large values."""
+def _looks_like_onnx_model_file(path: Path, size: int) -> bool | None:
+    """Detect ONNX ModelProto structure while preserving unresolved bounded scans."""
     if size < 4:
         return False
     try:
@@ -415,8 +435,13 @@ def _looks_like_onnx_model_file(path: Path, size: int) -> bool:
 
 
 def _looks_like_onnx_model_candidate_file(path: Path, size: int) -> bool:
-    """Run bounded structural ONNX routing without assuming its first field."""
-    return _looks_like_onnx_model_file(path, size)
+    """Return True only when bounded routing establishes ONNX structure."""
+    return _looks_like_onnx_model_file(path, size) is True
+
+
+def _has_inconclusive_onnx_model_routing(path: Path, size: int) -> bool:
+    """Return True when bounded ONNX routing exhausts its field budget."""
+    return _looks_like_onnx_model_file(path, size) is None
 
 
 def _looks_like_binary_pickle_protocol(header: bytes) -> bool:
@@ -1076,12 +1101,41 @@ def _read_proto_varint_stream(stream: BinaryIO, end_offset: int | None = None) -
     return None
 
 
+def _is_tensorflow_graph_field_payload(payload: bytes) -> bool:
+    """Validate a bounded protobuf field as TensorFlow graph-bearing content."""
+    try:
+        import modelaudit.protos  # noqa: F401, I001
+
+        from tensorflow.core.framework.graph_pb2 import GraphDef
+        from tensorflow.core.protobuf.meta_graph_pb2 import MetaGraphDef
+    except Exception:
+        return False
+    try:
+        graph_def = GraphDef()
+        graph_def.ParseFromString(payload)
+        if len(graph_def.node) > 0 or any(function.node_def for function in graph_def.library.function):
+            return True
+    except Exception:
+        pass
+    try:
+        metagraph = MetaGraphDef()
+        metagraph.ParseFromString(payload)
+        return metagraph.HasField("graph_def") and (
+            len(metagraph.graph_def.node) > 0
+            or any(function.node_def for function in metagraph.graph_def.library.function)
+            or len(metagraph.collection_def) > 0
+        )
+    except Exception:
+        return False
+
+
 def _skip_proto_stream_value(
     stream: BinaryIO,
     wire_type: int,
     end_offset: int,
     *,
     field_number: int | None = None,
+    remaining_fields: list[int] | None = None,
     group_depth: int = 0,
 ) -> bool:
     if wire_type == 0:
@@ -1099,6 +1153,10 @@ def _skip_proto_stream_value(
         if field_number is None or group_depth >= _PROTO_GROUP_MAX_ROUTING_DEPTH:
             return False
         for _ in range(_PROTO_GROUP_MAX_ROUTING_FIELDS):
+            if remaining_fields is not None:
+                if remaining_fields[0] <= 0:
+                    return False
+                remaining_fields[0] -= 1
             nested_tag = _read_proto_varint_stream(stream, end_offset)
             if nested_tag is None:
                 return False
@@ -1113,6 +1171,7 @@ def _skip_proto_stream_value(
                 nested_wire_type,
                 end_offset,
                 field_number=nested_field_number,
+                remaining_fields=remaining_fields,
                 group_depth=group_depth + 1,
             ):
                 return False
@@ -1129,8 +1188,10 @@ def _skip_proto_stream_value(
 def _has_bounded_tensorflow_graph_field(path: Path, file_size: int) -> bool:
     """Seek past top-level protobuf values while looking for TensorFlow graph content."""
     try:
+        remaining_fields = [_TF_METAGRAPH_MAX_ROUTING_FIELDS]
         with path.open("rb") as stream:
-            for _ in range(_TF_METAGRAPH_MAX_ROUTING_FIELDS):
+            while remaining_fields[0] > 0:
+                remaining_fields[0] -= 1
                 if stream.tell() >= file_size:
                     return False
                 tag = _read_proto_varint_stream(stream)
@@ -1141,11 +1202,22 @@ def _has_bounded_tensorflow_graph_field(path: Path, file_size: int) -> bool:
                 if field_number == 0:
                     return False
                 if field_number == 2 and wire_type == 2:
-                    return True
-                if wire_type in {3, 4}:
-                    # Unknown group fields cannot be skipped without a recursive walk.
-                    return True
-                if not _skip_proto_stream_value(stream, wire_type, file_size):
+                    length = _read_proto_varint_stream(stream)
+                    if length is None or stream.tell() + length > file_size:
+                        return False
+                    if file_size <= _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+                        return True
+                    if length > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+                        # Preserve an uninspectably large structural graph field for fail-closed scanning.
+                        return True
+                    return _is_tensorflow_graph_field_payload(stream.read(length))
+                if not _skip_proto_stream_value(
+                    stream,
+                    wire_type,
+                    file_size,
+                    field_number=field_number,
+                    remaining_fields=remaining_fields,
+                ):
                     return False
     except OSError:
         return False
@@ -1442,6 +1514,8 @@ def detect_file_format_from_magic(path: str) -> str:
 
     if _looks_like_onnx_model_candidate_file(file_path, size):
         return "onnx"
+    if _has_inconclusive_onnx_model_routing(file_path, size):
+        return "onnx"
 
     return "unknown"
 
@@ -1530,6 +1604,8 @@ def detect_file_format_for_skip_filter(path: str) -> str:
     renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
     if renamed_tensorflow_format != "unknown":
         return renamed_tensorflow_format
+    if _has_inconclusive_onnx_model_routing(file_path, size):
+        return "onnx"
 
     return "unknown"
 
@@ -1635,6 +1711,8 @@ def detect_file_format(path: str) -> str:
     renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
     if renamed_tensorflow_format != "unknown":
         return renamed_tensorflow_format
+    if _has_inconclusive_onnx_model_routing(file_path, size):
+        return "onnx"
 
     # For .bin files, do more sophisticated detection
     if ext == ".bin":

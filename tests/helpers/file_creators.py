@@ -200,18 +200,19 @@ def prefix_mock_onnx_with_unknown_field(
     *,
     value_size: int = 4,
     field_number: int = 100,
+    count: int = 1,
 ) -> Path:
-    """Prefix a serialized ONNX model with a legal unknown protobuf field."""
+    """Prefix a serialized ONNX model with legal unknown protobuf fields."""
     if field_number <= 0:
         raise ValueError("field_number must be positive")
     if value_size < 0:
         raise ValueError("value_size cannot be negative")
+    if count <= 0:
+        raise ValueError("count must be positive")
 
     payload = path.read_bytes()
-    prefix = (
-        _encode_protobuf_varint((field_number << 3) | 2) + _encode_protobuf_varint(value_size) + (b"x" * value_size)
-    )
-    path.write_bytes(prefix + payload)
+    field = _encode_protobuf_varint((field_number << 3) | 2) + _encode_protobuf_varint(value_size) + (b"x" * value_size)
+    path.write_bytes((field * count) + payload)
     return path
 
 
