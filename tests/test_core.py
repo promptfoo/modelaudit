@@ -21,6 +21,7 @@ from modelaudit.core import scan_file, scan_model_directory_or_file
 from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.tf_metagraph_scanner import _MAX_PARSE_BYTES
+from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from tests.helpers import (
     create_mock_gguf,
@@ -1838,7 +1839,7 @@ def test_scan_file_detects_malicious_prefixed_renamed_onnx_by_content(tmp_path: 
 def test_scan_file_detects_malicious_budget_exhausted_prefixed_renamed_onnx(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     disguised_onnx = create_mock_onnx(tmp_path / "many-prefixes.jpg", op_type="PythonOp")
-    prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=0, count=4097, field_number=9)
+    prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=0, count=4097, field_number=8)
 
     result = scan_file(str(disguised_onnx), config={"cache_scan_results": False})
     aggregate = scan_model_directory_or_file(str(disguised_onnx), cache_scan_results=False)
@@ -1852,7 +1853,7 @@ def test_scan_file_detects_malicious_budget_exhausted_prefixed_renamed_onnx(tmp_
     assert core_module.determine_exit_code(aggregate) == 1
 
 
-def test_scan_file_fails_closed_on_budget_exhausted_renamed_onnx_without_structure(tmp_path: Path) -> None:
+def test_scan_file_rejects_budget_exhausted_protobuf_without_onnx_structure_cleanly(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     ambiguous_onnx = tmp_path / "ambiguous.jpg"
     ambiguous_onnx.write_bytes(b"\x4a\x00" * 4097)
@@ -1868,19 +1869,17 @@ def test_scan_file_fails_closed_on_budget_exhausted_renamed_onnx_without_structu
         result = scan_file(str(ambiguous_onnx), config=config)
         repeated_result = scan_file(str(ambiguous_onnx), config=config)
 
-        assert result.scanner_name == "onnx"
-        assert result.success is False
-        assert repeated_result.success is False
-        assert result.metadata["scan_outcome"] == "inconclusive"
-        assert "onnx_structure_validation_failed" in result.metadata["scan_outcome_reasons"]
-        check = next(check for check in result.checks if check.name == "ONNX Structure Validation")
-        assert "missing required model structure" in check.message
-        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        assert result.scanner_name == "unknown"
+        assert result.success is True
+        assert repeated_result.success is True
+        assert result.issues == []
+        assert result.metadata["tentative_protobuf_candidate_rejected"] is True
+        assert "scan_outcome" not in result.metadata
     finally:
         reset_cache_manager()
 
     aggregate = scan_model_directory_or_file(str(ambiguous_onnx), cache_scan_results=False)
-    assert core_module.determine_exit_code(aggregate) == 2
+    assert core_module.determine_exit_code(aggregate) == 0
 
 
 def test_scan_file_detects_malicious_renamed_tf_metagraph_by_content(tmp_path: Path) -> None:
@@ -1942,15 +1941,31 @@ def test_scan_file_routes_oversized_renamed_tf_metagraph_to_fail_closed_scan(tmp
     assert core_module.determine_exit_code(aggregate) == 2
 
 
-def test_scan_file_does_not_route_oversized_malformed_tf_protobuf_near_match(tmp_path: Path) -> None:
+def test_scan_file_rejects_malformed_protobuf_near_match_without_finding(tmp_path: Path) -> None:
     malformed_payload = tmp_path / "malformed-large.jpg"
     malformed_payload.write_bytes(b"\x12" + (b"x" * _MAX_PARSE_BYTES))
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
 
-    result = scan_file(str(malformed_payload), config={"cache_enabled": False})
-    aggregate = scan_model_directory_or_file(str(malformed_payload), cache_enabled=False)
+    reset_cache_manager()
+    try:
+        result = scan_file(str(malformed_payload), config=config)
+        repeated_result = scan_file(str(malformed_payload), config=config)
 
-    assert result.scanner_name == "unknown"
-    assert result.success is True
+        assert result.scanner_name == "unknown"
+        assert result.success is True
+        assert repeated_result.success is True
+        assert result.issues == []
+        assert result.metadata["tentative_protobuf_candidate_rejected"] is True
+        assert "scan_outcome" not in result.metadata
+    finally:
+        reset_cache_manager()
+
+    aggregate = scan_model_directory_or_file(str(malformed_payload), cache_scan_results=False)
     assert aggregate.success is True
     assert core_module.determine_exit_code(aggregate) == 0
 
@@ -2049,6 +2064,61 @@ def test_scan_file_unavailable_recognized_format_result_is_not_cached(
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
+
+
+def test_scan_file_unavailable_protobuf_candidate_analyzer_fails_closed_and_is_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = tmp_path / "candidate.jpg"
+    candidate.write_bytes(b"bounded-probe candidate")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    monkeypatch.setattr(core_module, "detect_file_format", lambda _path: PROTOBUF_MODEL_CANDIDATE_FORMAT)
+    monkeypatch.setattr(core_module, "detect_file_format_from_magic", lambda _path: PROTOBUF_MODEL_CANDIDATE_FORMAT)
+    monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(core_module._registry, "get_scanner_for_path", lambda *_args, **_kwargs: None)
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(candidate), config=config)
+        second = scan_file(str(candidate), config=config)
+
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["operational_error_reason"] == "protobuf_model_routing_incomplete"
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        check = next(check for check in first.checks if check.name == "Protobuf Model Routing")
+        assert "tentative ONNX analysis was unavailable" in check.message
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_scan_file_keeps_budget_exhausted_coreml_candidate_owned_by_extension(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coreml_candidate = tmp_path / "model.mlmodel"
+    coreml_candidate.write_bytes(b"\x42\x00" * 4097)
+
+    monkeypatch.setattr(core_module._registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(core_module._registry, "get_scanner_for_path", lambda *_args, **_kwargs: None)
+
+    result = scan_file(str(coreml_candidate))
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+    check = next(check for check in result.checks if check.name == "Format Detection")
+    assert check.details["format"] == "coreml"
+    assert check.details["preferred_scanner_id"] == "coreml"
+    assert not any(check.name == "Protobuf Model Routing" for check in result.checks)
 
 
 def test_scan_file_fails_closed_when_xml_root_is_beyond_bounded_probe(tmp_path: Path) -> None:

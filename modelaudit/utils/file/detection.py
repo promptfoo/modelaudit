@@ -44,8 +44,6 @@ _ONNX_MODEL_MAX_ROUTING_FIELDS = 4096
 _ONNX_GRAPH_MAX_ROUTING_FIELDS = 4096
 _ONNX_NODE_MAX_ROUTING_FIELDS = 512
 _ONNX_MAX_ROUTING_TEXT_BYTES = 1024
-# Keep aligned with top-level onnx.ModelProto fields; other valid tags are unknown prefix padding.
-_ONNX_MODEL_KNOWN_FIELD_NUMBERS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 14, 20, 25, 26})
 _PROTO_GROUP_MAX_ROUTING_FIELDS = 512
 _PROTO_GROUP_MAX_ROUTING_DEPTH = 8
 _LIGHTGBM_HEADER_MARKERS = (
@@ -118,6 +116,7 @@ _XML_MODEL_ROOT_FORMATS = {
     "pmml": "pmml",
 }
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
+PROTOBUF_MODEL_CANDIDATE_FORMAT = "protobuf_model_candidate"
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -380,7 +379,6 @@ def _looks_like_onnx_model_proto_stream(stream: BinaryIO, end_offset: int) -> bo
     fields_seen = 0
     has_plausible_ir_version = False
     has_graph = False
-    has_only_unknown_prefix_fields = True
 
     while stream.tell() < end_offset and fields_seen < _ONNX_MODEL_MAX_ROUTING_FIELDS:
         tag = _read_proto_varint_stream(stream, end_offset)
@@ -392,13 +390,11 @@ def _looks_like_onnx_model_proto_stream(stream: BinaryIO, end_offset: int) -> bo
             return False
 
         if field_number == 1 and wire_type == 0:
-            has_only_unknown_prefix_fields = False
             ir_version = _read_proto_varint_stream(stream, end_offset)
             if ir_version is None:
                 return False
             has_plausible_ir_version = 0 < ir_version <= 1000
         elif field_number == 7 and wire_type == 2:
-            has_only_unknown_prefix_fields = False
             bounds = _read_proto_length_delimited_bounds_stream(stream, end_offset)
             if bounds is None:
                 return False
@@ -410,8 +406,6 @@ def _looks_like_onnx_model_proto_stream(stream: BinaryIO, end_offset: int) -> bo
                 has_graph = has_graph or graph_status
             stream.seek(value_end)
         else:
-            if field_number in _ONNX_MODEL_KNOWN_FIELD_NUMBERS or wire_type not in {0, 1, 2, 3, 5}:
-                has_only_unknown_prefix_fields = False
             if not _skip_proto_stream_value(stream, wire_type, end_offset, field_number=field_number):
                 return False
 
@@ -419,7 +413,7 @@ def _looks_like_onnx_model_proto_stream(stream: BinaryIO, end_offset: int) -> bo
         if has_plausible_ir_version and has_graph:
             return True
 
-    if stream.tell() < end_offset and (has_plausible_ir_version or has_graph or has_only_unknown_prefix_fields):
+    if stream.tell() < end_offset:
         return None
     return False
 
@@ -440,8 +434,8 @@ def _looks_like_onnx_model_candidate_file(path: Path, size: int) -> bool:
     return _looks_like_onnx_model_file(path, size) is True
 
 
-def _has_inconclusive_onnx_model_routing(path: Path, size: int) -> bool:
-    """Return True when bounded ONNX routing exhausts its field budget."""
+def _has_budget_exhausted_protobuf_model_candidate(path: Path, size: int) -> bool:
+    """Return True when a bounded probe leaves a protobuf model candidate."""
     return _looks_like_onnx_model_file(path, size) is None
 
 
@@ -1515,8 +1509,8 @@ def detect_file_format_from_magic(path: str) -> str:
 
     if _looks_like_onnx_model_candidate_file(file_path, size):
         return "onnx"
-    if _has_inconclusive_onnx_model_routing(file_path, size):
-        return "onnx"
+    if _has_budget_exhausted_protobuf_model_candidate(file_path, size):
+        return PROTOBUF_MODEL_CANDIDATE_FORMAT
 
     return "unknown"
 
@@ -1605,8 +1599,8 @@ def detect_file_format_for_skip_filter(path: str) -> str:
     renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
     if renamed_tensorflow_format != "unknown":
         return renamed_tensorflow_format
-    if _has_inconclusive_onnx_model_routing(file_path, size):
-        return "onnx"
+    if _has_budget_exhausted_protobuf_model_candidate(file_path, size):
+        return PROTOBUF_MODEL_CANDIDATE_FORMAT
 
     return "unknown"
 
@@ -1712,8 +1706,11 @@ def detect_file_format(path: str) -> str:
     renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
     if renamed_tensorflow_format != "unknown":
         return renamed_tensorflow_format
-    if _has_inconclusive_onnx_model_routing(file_path, size):
-        return "onnx"
+    if (
+        _has_budget_exhausted_protobuf_model_candidate(file_path, size)
+        and detect_format_from_extension(path) == "unknown"
+    ):
+        return PROTOBUF_MODEL_CANDIDATE_FORMAT
 
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
@@ -1921,7 +1918,12 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
             return True
 
         # TensorFlow protobuf files (.pb extension)
-        if ext_format == "protobuf" and header_format in {"protobuf", "unknown", "onnx"}:
+        if ext_format == "protobuf" and header_format in {
+            "protobuf",
+            "unknown",
+            "onnx",
+            PROTOBUF_MODEL_CANDIDATE_FORMAT,
+        }:
             return True
 
         # TensorFlow MetaGraph files (.meta extension) require strict protobuf validation.
@@ -1996,7 +1998,7 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
 
         # ONNX files (Protocol Buffer format - difficult to detect reliably)
         if ext_format == "onnx":
-            return header_format in {"onnx", "unknown"}
+            return header_format in {"onnx", "unknown", PROTOBUF_MODEL_CANDIDATE_FORMAT}
 
         # NumPy files (.npy should match, .npz is ZIP by design)
         if ext_format == "numpy":
@@ -2068,7 +2070,7 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
         # CoreML .mlmodel files are protobuf-encoded with no stable magic bytes.
         # Structural validation is performed by the dedicated scanner.
         if ext_format == "coreml":
-            return header_format in {"coreml", "unknown"}
+            return header_format in {"coreml", "unknown", PROTOBUF_MODEL_CANDIDATE_FORMAT}
 
         # R serialized workspace/data files may be uncompressed or wrapped;
         # extension-based intent is authoritative for static scanning.

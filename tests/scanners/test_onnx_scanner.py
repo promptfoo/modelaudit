@@ -16,12 +16,13 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.detectors.jit_script import JITScriptDetector
 from modelaudit.detectors.network_comm import NetworkCommDetector
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.onnx_scanner import (
     ONNX_STRUCTURE_INCONCLUSIVE_REASON,
     OnnxScanner,
     _confirmed_python_operator_findings,
 )
+from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
 
 
 def create_onnx_model(
@@ -140,6 +141,26 @@ def test_onnx_scanner_unknown_only_payload_is_inconclusive(tmp_path: Path) -> No
     assert check.severity == IssueSeverity.INFO
     assert check.details["has_graph"] is False
     assert check.details["ir_version"] == 0
+
+
+def test_onnx_scanner_tentative_protobuf_parse_failure_is_rejected_cleanly(tmp_path: Path) -> None:
+    model_path = tmp_path / "ambiguous.jpg"
+    model_path.write_bytes(b"\x12\x05oops")
+    scanner = OnnxScanner(
+        {
+            FORMAT_VALIDATION_CONFIG_KEY: {"routed_format": PROTOBUF_MODEL_CANDIDATE_FORMAT},
+            "check_jit_script": False,
+            "check_network_comm": False,
+        }
+    )
+
+    result = scanner.scan(str(model_path))
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+    assert result.issues == []
+    assert result.metadata["tentative_protobuf_candidate_rejected"] is True
+    assert "scan_outcome" not in result.metadata
 
 
 def test_onnx_scanner_reuses_raw_bytes_for_model_parse(

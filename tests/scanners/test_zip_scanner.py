@@ -24,6 +24,7 @@ from modelaudit.scanners.archive_dispatch import (
 )
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.zip_scanner import ZipScanner
+from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
 from tests.helpers import create_mock_onnx, prefix_mock_onnx_with_unknown_field
 
 
@@ -925,6 +926,90 @@ def test_scan_nested_file_fails_closed_when_xml_root_is_beyond_bounded_probe(tmp
     assert result.metadata["operational_error_reason"] == "xml_model_routing_incomplete"
     check = next(check for check in result.checks if check.name == "XML Model Routing")
     assert "bounded probe ended before the first structural root element" in check.message
+
+
+def test_scan_nested_file_recovers_findings_from_budget_exhausted_onnx_candidate(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    extracted_member = create_mock_onnx(tmp_path / "payload.jpg", op_type="PythonOp")
+    prefix_mock_onnx_with_unknown_field(extracted_member, value_size=0, count=4097, field_number=8)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "onnx"
+    assert result.success is False
+    assert any(issue.details.get("op_type") == "PythonOp" for issue in result.issues)
+
+
+def test_scan_nested_file_rejects_ambiguous_protobuf_without_findings(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "ambiguous.jpg"
+    extracted_member.write_bytes(b"\x12" + (b"x" * (20 * 1024 * 1024)))
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+    assert result.issues == []
+    assert result.metadata["tentative_protobuf_candidate_rejected"] is True
+
+
+def test_scan_nested_file_keeps_claimed_onnx_candidate_fail_closed(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "ambiguous.onnx"
+    extracted_member.write_bytes(b"\x4a\x00" * 4097)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "onnx"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    check = next(check for check in result.checks if check.name == "ONNX Structure Validation")
+    assert "missing required model structure" in check.message
+
+
+def test_scan_nested_file_fails_closed_when_protobuf_candidate_analyzer_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted_member = tmp_path / "candidate.jpg"
+    extracted_member.write_bytes(b"bounded-probe candidate")
+
+    monkeypatch.setattr(archive_dispatch, "detect_file_format", lambda _path: PROTOBUF_MODEL_CANDIDATE_FORMAT)
+    monkeypatch.setattr(
+        archive_dispatch,
+        "detect_file_format_from_magic",
+        lambda _path: PROTOBUF_MODEL_CANDIDATE_FORMAT,
+    )
+    monkeypatch.setattr(_registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(_registry, "get_scanner_for_path", lambda _path: None)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "protobuf_model_routing_incomplete"
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    check = next(check for check in result.checks if check.name == "Protobuf Model Routing")
+    assert "tentative ONNX analysis was unavailable" in check.message
+
+
+def test_scan_nested_file_keeps_budget_exhausted_coreml_candidate_owned_by_extension(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted_member = tmp_path / "model.mlmodel"
+    extracted_member.write_bytes(b"\x42\x00" * 4097)
+
+    monkeypatch.setattr(_registry, "load_scanner_by_id", lambda _scanner_id: None)
+    monkeypatch.setattr(_registry, "get_scanner_for_path", lambda _path: None)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "recognized_format_scanner_unavailable"
+    check = next(check for check in result.checks if check.name == "Format Detection")
+    assert check.details["format"] == "coreml"
+    assert check.details["preferred_scanner_id"] == "coreml"
+    assert not any(check.name == "Protobuf Model Routing" for check in result.checks)
 
 
 def test_scan_zip_fails_closed_when_nested_recognized_header_scanner_is_unavailable(

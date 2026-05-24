@@ -10,7 +10,7 @@ from typing import cast
 import pytest
 
 from modelaudit.utils.file import filtering
-from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
+from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT, detect_file_format_for_skip_filter
 from modelaudit.utils.file.filtering import (
     _ZIP_MEMBER_SNIFF_LIMIT,
     should_skip_file,
@@ -288,14 +288,21 @@ class TestFileFilter:
     def test_prefixed_disguised_onnx_bypasses_skip_without_promoting_generic_protobuf(self, tmp_path: Path) -> None:
         pytest.importorskip("onnx")
         disguised_onnx = create_mock_onnx(tmp_path / "model.jpg")
-        prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=0, count=4097, field_number=9)
+        prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=0, count=4097, field_number=8)
         generic_protobuf = tmp_path / "generic.jpg"
         generic_protobuf.write_bytes(b"\xa2\x06\x04xxxx\x12\x02\x08\x01")
 
-        assert detect_file_format_for_skip_filter(str(disguised_onnx)) == "onnx"
+        assert detect_file_format_for_skip_filter(str(disguised_onnx)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
         assert not should_skip_file(str(disguised_onnx))
         assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
         assert should_skip_file(str(generic_protobuf))
+
+    def test_budget_exhausted_protobuf_near_match_survives_filter_for_tentative_scan(self, tmp_path: Path) -> None:
+        near_match = tmp_path / "ambiguous.jpg"
+        near_match.write_bytes(b"\x12" + (b"x" * (20 * 1024 * 1024)))
+
+        assert detect_file_format_for_skip_filter(str(near_match)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+        assert not should_skip_file(str(near_match))
 
     def test_prefixed_zip_with_central_directory_stub_stays_scannable(self, tmp_path: Path) -> None:
         disguised_zip = tmp_path / "archive.jpg"

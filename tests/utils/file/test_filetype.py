@@ -16,6 +16,7 @@ import pytest
 from modelaudit.scanner_registry_metadata import get_extension_format_map
 from modelaudit.utils.file.detection import (
     PROTO0_1_MAX_PROBE_BYTES,
+    PROTOBUF_MODEL_CANDIDATE_FORMAT,
     detect_file_format,
     detect_file_format_for_skip_filter,
     detect_file_format_from_magic,
@@ -277,19 +278,38 @@ def test_detect_file_format_routes_prefixed_renamed_onnx_by_bounded_structure(tm
     assert detect_file_format_for_skip_filter(str(model_path)) == "onnx"
 
 
-@pytest.mark.parametrize("unknown_field_number", [9, 63, 100])
-def test_detect_file_format_keeps_budget_exhausted_prefixed_renamed_onnx_scannable(
+@pytest.mark.parametrize("prefix_field_number", [8, 9, 63, 100])
+def test_detect_file_format_marks_budget_exhausted_prefixed_renamed_onnx_as_candidate(
     tmp_path: Path,
-    unknown_field_number: int,
+    prefix_field_number: int,
 ) -> None:
-    """A long legal unknown prefix must stay scannable after bounded routing is exhausted."""
+    """A long valid prefix must survive filtering without a premature format guess."""
     pytest.importorskip("onnx")
-    model_path = create_mock_onnx(tmp_path / f"many-prefixes-{unknown_field_number}.jpg")
-    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=unknown_field_number)
+    model_path = create_mock_onnx(tmp_path / f"many-prefixes-{prefix_field_number}.jpg")
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=prefix_field_number)
 
+    assert detect_file_format(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+
+def test_validate_file_type_accepts_budget_exhausted_onnx_candidate_with_onnx_suffix(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "many-prefixes.onnx")
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=8)
+
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
     assert detect_file_format(str(model_path)) == "onnx"
-    assert detect_file_format_from_magic(str(model_path)) == "onnx"
-    assert detect_file_format_for_skip_filter(str(model_path)) == "onnx"
+    assert validate_file_type(str(model_path)) is True
+
+
+def test_budget_exhausted_protobuf_probe_does_not_steal_coreml_extension_route(tmp_path: Path) -> None:
+    model_path = tmp_path / "ambiguous.mlmodel"
+    model_path.write_bytes(b"\x42\x00" * 4097)
+
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format(str(model_path)) == "coreml"
+    assert validate_file_type(str(model_path)) is True
 
 
 def test_detect_file_format_routes_group_prefixed_renamed_onnx_by_bounded_structure(tmp_path: Path) -> None:
@@ -447,13 +467,13 @@ def test_detect_renamed_tf_savedmodel_by_strict_parse_without_promoting_generic_
     assert detect_file_format(str(generic_protobuf)) == "unknown"
 
 
-def test_detect_oversized_renamed_tf_protobuf_rejects_malformed_field_two_payload(tmp_path: Path) -> None:
+def test_detect_oversized_renamed_tf_protobuf_retains_ambiguous_field_two_payload(tmp_path: Path) -> None:
     malformed_payload = tmp_path / "malformed-large.jpg"
     malformed_payload.write_bytes(b"\x12" + (b"x" * (20 * 1024 * 1024)))
 
-    assert detect_file_format_from_magic(str(malformed_payload)) == "unknown"
-    assert detect_file_format_for_skip_filter(str(malformed_payload)) == "unknown"
-    assert detect_file_format(str(malformed_payload)) == "unknown"
+    assert detect_file_format_from_magic(str(malformed_payload)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(malformed_payload)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format(str(malformed_payload)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
 
 
 def test_detect_oversized_renamed_tf_savedmodel_routes_to_bounded_scan(tmp_path: Path) -> None:
