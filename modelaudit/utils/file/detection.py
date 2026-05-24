@@ -1159,7 +1159,7 @@ def _is_executorch_binary_signature(prefix: bytes) -> bool:
     return len(prefix) >= 8 and prefix[4:6] == b"ET" and prefix[6:8].isdigit()
 
 
-def _is_valid_executorch_binary(path: str | Path) -> bool:
+def _is_valid_executorch_binary(path: str | Path, *, propagate_io_errors: bool = False) -> bool:
     """Validate the minimal FlatBuffers structure for ExecuTorch binaries."""
     file_path = Path(path)
     if not file_path.is_file():
@@ -1204,7 +1204,11 @@ def _is_valid_executorch_binary(path: str | Path) -> bool:
                 return False
             if root_table_offset + object_size > file_size:
                 return False
-    except (OSError, struct.error):
+    except OSError:
+        if propagate_io_errors:
+            raise
+        return False
+    except struct.error:
         return False
 
     return True

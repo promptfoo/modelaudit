@@ -18,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect Python operators declared in nested ONNX graphs and functions
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
 - detect and scan signature-valid CNTK and LightGBM payloads even when renamed with misleading suffixes
-- detect and scan signature-valid R workspace, RKNN, TFLite, and ExecuTorch payloads when renamed with misleading suffixes
+- detect and scan signature-valid R workspace, RKNN, TFLite, and ExecuTorch payloads when renamed with misleading suffixes, and classify unavailable ExecuTorch reads as inconclusive
 
 ## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
 

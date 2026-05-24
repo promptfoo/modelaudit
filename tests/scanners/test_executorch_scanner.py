@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from modelaudit import core
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.executorch_scanner import ExecuTorchScanner
 from modelaudit.utils.file.detection import detect_file_format
 
@@ -88,6 +88,55 @@ def test_executorch_scanner_accepts_versioned_binary_program_header(tmp_path: Pa
     assert result.success is True
     assert result.bytes_scanned == file_path.stat().st_size
     assert not result.issues
+
+
+def test_executorch_header_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = create_executorch_binary(tmp_path)
+
+    def raise_os_error(_path: str, length: int = 4) -> bytes:
+        raise OSError(f"simulated ExecuTorch header read failure at {length} bytes")
+
+    monkeypatch.setattr(ExecuTorchScanner, "_read_header", staticmethod(raise_os_error))
+
+    direct = ExecuTorchScanner().scan(str(file_path))
+    monkeypatch.setattr(ExecuTorchScanner, "can_handle", classmethod(lambda _cls, _path: True))
+    aggregate = core.scan_model_directory_or_file(str(file_path), cache_scan_results=False)
+
+    assert direct.success is False
+    assert direct.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert "executorch_read_failed" in direct.metadata.get("scan_outcome_reasons", [])
+    assert any(
+        check.name == "ExecuTorch File Read"
+        and check.severity == IssueSeverity.INFO
+        and check.details.get("scan_outcome_reason") == "executorch_read_failed"
+        for check in direct.checks
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+    assert aggregate.file_metadata[str(file_path)].get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert core.determine_exit_code(aggregate) == 2
+
+
+def test_executorch_structure_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = create_executorch_binary(tmp_path)
+
+    def raise_os_error(_path: str, *, propagate_io_errors: bool = False) -> bool:
+        assert propagate_io_errors is True
+        raise OSError("simulated ExecuTorch structure read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.executorch_scanner._is_valid_executorch_binary", raise_os_error)
+
+    result = ExecuTorchScanner().scan(str(file_path))
+
+    assert result.success is False
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert "executorch_read_failed" in result.metadata.get("scan_outcome_reasons", [])
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_renamed_executorch_binary_routes_through_directory_scan(tmp_path: Path) -> None:
