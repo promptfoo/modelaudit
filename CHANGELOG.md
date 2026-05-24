@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- classify Flax MessagePack recursion-limit analysis gaps as inconclusive coverage
 - route renamed structurally valid Flax/JAX MessagePack checkpoints through existing security analysis
 - avoid repeatedly scanning sharded model families during directory scans
 - keep shard sibling discovery within the requested scan root
