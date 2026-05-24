@@ -15,6 +15,7 @@ import pickle
 import struct
 import subprocess as real_subprocess
 import tempfile
+import zipfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, cast
@@ -1147,6 +1148,25 @@ class TestXGBoostFailClosedEndToEnd:
         assert result.scanner_name == "unknown"
         assert result.success is True
         assert result.issues == []
+
+    def test_extensionless_ubjson_nested_zip_detects_malicious_content(
+        self, tmp_path: Path, valid_xgboost_json: dict[str, Any]
+    ) -> None:
+        ubjson = pytest.importorskip("ubjson", reason="ubjson not installed")
+        valid_xgboost_json["learner"]["malicious_code"] = "os.system('touch pwned')"
+        archive_file = tmp_path / "bundle.zip"
+        with zipfile.ZipFile(archive_file, "w") as archive:
+            archive.writestr("models/model", ubjson.dumpb(valid_xgboost_json))
+
+        result = scan_model_directory_or_file(str(archive_file), cache_enabled=False)
+
+        assert determine_exit_code(result) == 1
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.location == f"{archive_file}:models/model"
+            and "System call in JSON" in str(issue.message)
+            for issue in result.issues
+        )
 
     def test_malformed_nested_xgboost_json_core_fails_closed_and_is_uncached(
         self, tmp_path: Path, valid_xgboost_json: dict[str, Any]
