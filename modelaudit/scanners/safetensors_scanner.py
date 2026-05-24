@@ -34,6 +34,7 @@ MAX_HEADER_BYTES = 16 * 1024 * 1024
 SAFETENSORS_HEADER_INCONCLUSIVE_REASON = "safetensors_header_validation_failed"
 SAFETENSORS_STRUCTURE_INCONCLUSIVE_REASON = "safetensors_structure_validation_failed"
 SAFETENSORS_HEADER_LIMIT_INCONCLUSIVE_REASON = "safetensors_header_size_limit_exceeded"
+SAFETENSORS_READ_INCONCLUSIVE_REASON = "safetensors_read_failed"
 
 
 class SafeTensorsScanner(BaseScanner):
@@ -489,6 +490,23 @@ class SafeTensorsScanner(BaseScanner):
                 # Bytes scanned = file size
                 result.bytes_scanned = file_size
 
+        except OSError as e:
+            self._mark_inconclusive(result, SAFETENSORS_READ_INCONCLUSIVE_REASON)
+            result.add_check(
+                name="SafeTensors File Read",
+                passed=False,
+                message=f"Unable to read SafeTensors file: {e!s}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": SAFETENSORS_READ_INCONCLUSIVE_REASON,
+                },
+            )
+            result.finish(success=False)
+            return result
         except Exception as e:
             result.add_check(
                 name="SafeTensors File Scan",

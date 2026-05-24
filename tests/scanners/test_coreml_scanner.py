@@ -3,7 +3,10 @@ from __future__ import annotations
 import base64
 from pathlib import Path
 
-from modelaudit.scanners.base import IssueSeverity
+import pytest
+
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.coreml_scanner import CoreMLScanner
 from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension
 
@@ -150,6 +153,39 @@ def test_coreml_scanner_benign_model(tmp_path: Path) -> None:
     assert result.metadata.get("specification_version") == 8
     assert detect_file_format(str(safe_model_path)) == "coreml"
     assert detect_format_from_extension(str(safe_model_path)) == "coreml"
+
+
+def test_coreml_unavailable_read_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = _write_model(
+        tmp_path / "unreadable.mlmodel",
+        _build_model(description=_build_description(metadata=_build_metadata())),
+    )
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated CoreML read failure")
+
+    monkeypatch.setattr(CoreMLScanner, "can_handle", classmethod(lambda _cls, _path: True))
+    monkeypatch.setattr("modelaudit.scanners.coreml_scanner.open", raise_os_error, raising=False)
+
+    direct = CoreMLScanner().scan(str(model_path))
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    read_checks = [check for check in direct.checks if check.name == "CoreML File Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "coreml_read_failed"
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "coreml_read_failed" in direct.metadata["scan_outcome_reasons"]
+    metadata = aggregate.file_metadata[str(model_path)]
+    assert "coreml_read_failed" in metadata["scan_outcome_reasons"]
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_coreml_scanner_preserves_metadata_for_root_and_nested_models(tmp_path: Path) -> None:

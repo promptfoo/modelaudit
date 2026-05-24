@@ -352,6 +352,23 @@ class CoreMLScanner(BaseScanner):
             with open(path, "rb") as handle:
                 data = handle.read(read_limit)
             result.bytes_scanned = len(data)
+        except OSError as exc:
+            mark_inconclusive_scan_result(result, "coreml_read_failed")
+            result.add_check(
+                name="CoreML File Read",
+                passed=False,
+                message=f"Failed to read CoreML file: {exc}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "coreml_read_failed",
+                },
+            )
+            result.finish(success=False)
+            return result
         except Exception as exc:
             result.add_check(
                 name="CoreML File Read",

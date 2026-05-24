@@ -7,6 +7,7 @@ import re
 from collections.abc import Iterator
 from typing import ClassVar, Literal
 
+from ..scanner_results import mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 SUSPICIOUS_PATTERN_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -140,6 +141,23 @@ class TensorRTScanner(BaseScanner):
         try:
             data = self._read_file_safely(path)
             result.bytes_scanned = len(data)
+        except OSError as e:
+            mark_inconclusive_scan_result(result, "tensorrt_read_failed")
+            result.add_check(
+                name="TensorRT Engine Read",
+                passed=False,
+                message=f"Error reading TensorRT engine: {e}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "tensorrt_read_failed",
+                },
+            )
+            result.finish(success=False)
+            return result
         except Exception as e:  # pragma: no cover - unexpected read errors
             result.add_check(
                 name="TensorRT Engine Read",
