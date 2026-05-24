@@ -498,6 +498,16 @@ def test_get_scanner_for_file_rejects_rar_suffix_without_magic(tmp_path: Path) -
     assert scanner is None
 
 
+def test_get_scanner_for_file_routes_hdf5_header_alias_under_misleading_suffix(tmp_path: Path) -> None:
+    path = tmp_path / "model.jpg"
+    path.write_bytes(b"\x89HDF\r\n\x1a\n" + b"\x00" * 32)
+
+    scanner = get_scanner_for_file(str(path))
+
+    assert scanner is not None
+    assert scanner.name == "keras_h5"
+
+
 def test_get_scanner_for_path_routes_valid_mar_archive_to_torchserve_mar(tmp_path: Path) -> None:
     mar_path = _write_zip_archive(
         tmp_path / "model.mar",
