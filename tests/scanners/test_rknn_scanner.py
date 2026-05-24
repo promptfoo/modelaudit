@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from modelaudit import core
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.rknn_scanner import RknnScanner
 
@@ -134,8 +135,6 @@ def test_scan_read_failure_is_inconclusive_not_security_finding(
     monkeypatch.setattr("modelaudit.scanners.rknn_scanner.open", raise_os_error, raising=False)
 
     direct = RknnScanner().scan(str(path))
-    aggregate = core.scan_model_directory_or_file(str(path), cache_scan_results=False)
-
     read_checks = [check for check in direct.checks if check.name == "RKNN File Read"]
     assert len(read_checks) == 1
     assert read_checks[0].severity == IssueSeverity.INFO
@@ -143,12 +142,33 @@ def test_scan_read_failure_is_inconclusive_not_security_finding(
     assert read_checks[0].details["scan_outcome_reason"] == "rknn_read_failed"
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "rknn_read_failed" in direct.metadata["scan_outcome_reasons"]
-    metadata = aggregate.file_metadata[str(path)]
-    assert "rknn_read_failed" in metadata["scan_outcome_reasons"]
-    assert not [
-        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-    ]
-    assert core.determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        first = core.scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = core.scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert "rknn_read_failed" in metadata["scan_outcome_reasons"]
+            assert not [
+                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+            assert core.determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_scan_string_extraction_limit_marks_late_rknn_payload_inconclusive(tmp_path: Path) -> None:
@@ -167,15 +187,33 @@ def test_scan_string_extraction_limit_marks_late_rknn_payload_inconclusive(tmp_p
     budget_checks = [check for check in result.checks if check.name == "RKNN Text Fragment Budget"]
     assert len(budget_checks) == 1
     assert budget_checks[0].status == CheckStatus.FAILED
+    assert "stopped at the configured extraction limit" in budget_checks[0].message
     assert budget_checks[0].details["analysis_incomplete"] is True
 
-    aggregate = core.scan_model_directory_or_file(
-        str(path),
-        rknn_max_extracted_strings=2,
-        cache_scan_results=False,
-    )
-    assert aggregate.file_metadata[str(path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-    assert core.determine_exit_code(aggregate) == 2
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        first = core.scan_model_directory_or_file(
+            str(path),
+            rknn_max_extracted_strings=2,
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = core.scan_model_directory_or_file(
+            str(path),
+            rknn_max_extracted_strings=2,
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            assert aggregate.file_metadata[str(path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert core.determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_scan_string_extraction_exact_limit_preserves_clean_rknn_result(tmp_path: Path) -> None:
