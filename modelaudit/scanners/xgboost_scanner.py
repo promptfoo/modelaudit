@@ -215,7 +215,7 @@ class XGBoostScanner(BaseScanner):
 
     name: ClassVar[str] = "xgboost"
     description: ClassVar[str] = "Scans XGBoost models for security vulnerabilities"
-    supported_extensions: ClassVar[list[str]] = [".bst", ".model", ".json", ".ubj"]
+    supported_extensions: ClassVar[list[str]] = [".bst", ".model", ".json", ".ubj", ""]
     default_max_file_read_size: ClassVar[int] = XGBOOST_DEFAULT_MAX_FILE_READ_SIZE
     _JSON_PROBE_READ_BYTES: ClassVar[int] = 256 * 1024
     _JSON_REQUIRED_MARKERS: ClassVar[tuple[bytes, ...]] = (b'"learner"', b'"version"')

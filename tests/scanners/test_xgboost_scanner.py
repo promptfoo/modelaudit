@@ -1117,6 +1117,37 @@ class TestXGBoostBinaryScanning:
 class TestXGBoostFailClosedEndToEnd:
     """Test CLI/core-visible XGBoost fail-closed semantics."""
 
+    def test_extensionless_ubjson_core_detects_malicious_content(
+        self, tmp_path: Path, valid_xgboost_json: dict[str, Any]
+    ) -> None:
+        ubjson = pytest.importorskip("ubjson", reason="ubjson not installed")
+        valid_xgboost_json["learner"]["malicious_code"] = "os.system('touch pwned')"
+        model_file = tmp_path / "model"
+        model_file.write_bytes(ubjson.dumpb(valid_xgboost_json))
+
+        direct = scan_file(str(model_file), config={"cache_enabled": False})
+        directory = scan_model_directory_or_file(str(tmp_path), cache_enabled=False)
+
+        assert direct.scanner_name == "xgboost"
+        assert direct.success is False
+        assert any(
+            check.name == "JSON Content Analysis" and check.status == CheckStatus.FAILED for check in direct.checks
+        )
+        assert directory.success is True
+        assert determine_exit_code(directory) == 1
+        assert "xgboost" in directory.scanner_names
+        assert any("System call in JSON" in str(issue.message) for issue in directory.issues)
+
+    def test_extensionless_ubjson_near_match_remains_unclaimed(self, tmp_path: Path) -> None:
+        model_file = tmp_path / "model"
+        model_file.write_bytes(b"{L" + (b"\0" * 8) + b"learner")
+
+        result = scan_file(str(model_file), config={"cache_enabled": False})
+
+        assert result.scanner_name == "unknown"
+        assert result.success is True
+        assert result.issues == []
+
     def test_malformed_nested_xgboost_json_core_fails_closed_and_is_uncached(
         self, tmp_path: Path, valid_xgboost_json: dict[str, Any]
     ) -> None:
@@ -1180,8 +1211,11 @@ class TestXGBoostFailClosedEndToEnd:
         finally:
             reset_cache_manager()
 
-    def test_missing_ubjson_for_bst_header_core_fails_closed_and_is_uncached(self, tmp_path: Path) -> None:
-        bst_file = tmp_path / "model.bst"
+    @pytest.mark.parametrize("filename", ["model.bst", "model"])
+    def test_missing_ubjson_for_content_routed_header_core_fails_closed_and_is_uncached(
+        self, tmp_path: Path, filename: str
+    ) -> None:
+        bst_file = tmp_path / filename
         bst_file.write_bytes(_xgboost_ubjson_probe())
         cache_dir = tmp_path / "cache"
 

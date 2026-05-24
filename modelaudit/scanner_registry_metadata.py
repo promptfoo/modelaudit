@@ -449,7 +449,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "module": "modelaudit.scanners.xgboost_scanner",
         "class": "XGBoostScanner",
         "description": "Scans XGBoost model files for security vulnerabilities",
-        "extensions": [".bst", ".model", ".json", ".ubj"],
+        "extensions": [".bst", ".model", ".json", ".ubj", ""],
         "priority": 7,
         "dependencies": ["xgboost", "ubjson"],
         "numpy_sensitive": True,
