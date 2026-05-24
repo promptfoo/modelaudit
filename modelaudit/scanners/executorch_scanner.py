@@ -37,7 +37,10 @@ class ExecuTorchScanner(BaseScanner):
         ext = os.path.splitext(path)[1].lower()
         if ext in cls.supported_extensions:
             return True
-        return is_executorch_archive(path)
+        header = cls._read_header(path, length=8)
+        return (_is_executorch_binary_signature(header) and _is_valid_executorch_binary(path)) or is_executorch_archive(
+            path
+        )
 
     @staticmethod
     def _read_header(path: str, length: int = 4) -> bytes:

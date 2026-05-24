@@ -70,7 +70,7 @@ ModelAudit includes 44 registered scanners covering model, archive, and configur
 | **PyTorch**             | `.pt`, `.pth`, `.ckpt`, `.bin`                                            | HIGH   |
 | **Joblib**              | `.joblib`                                                                 | HIGH   |
 | **NumPy**               | `.npy`, `.npz`                                                            | HIGH   |
-| **R Serialized**        | `.rds`, `.rda`, `.rdata`                                                  | HIGH   |
+| **R Serialized**        | `.rds`, `.rda`, `.rdata`, signature-valid renamed workspace artifacts     | HIGH   |
 | **TensorFlow**          | `.pb`, `.meta`, SavedModel dirs                                           | MEDIUM |
 | **Keras**               | `.h5`, `.hdf5`, `.keras`                                                  | MEDIUM |
 | **ONNX**                | `.onnx`                                                                   | MEDIUM |
@@ -78,7 +78,7 @@ ModelAudit includes 44 registered scanners covering model, archive, and configur
 | **MXNet**               | `*-symbol.json`, `*-NNNN.params`                                          | LOW    |
 | **NeMo**                | `.nemo`                                                                   | MEDIUM |
 | **CNTK**                | `.dnn`, `.cmf`, signature-valid renamed artifacts                         | MEDIUM |
-| **RKNN**                | `.rknn`                                                                   | MEDIUM |
+| **RKNN**                | `.rknn`, signature-valid renamed artifacts                                | MEDIUM |
 | **Torch7**              | `.t7`, `.th`, `.net`                                                      | HIGH   |
 | **CatBoost**            | `.cbm`                                                                    | MEDIUM |
 | **XGBoost**             | `.bst`, `.model`, `.json`, `.ubj`                                         | MEDIUM |
@@ -88,8 +88,8 @@ ModelAudit includes 44 registered scanners covering model, archive, and configur
 | **SafeTensors**         | `.safetensors`                                                            | LOW    |
 | **GGUF/GGML**           | `.gguf`, `.ggml`, `.ggmf`, `.ggjt`, `.ggla`, `.ggsa`                      | LOW    |
 | **JAX/Flax**            | `.msgpack`, `.flax`, `.orbax`, `.jax`, `.checkpoint`, `.orbax-checkpoint` | LOW    |
-| **TFLite**              | `.tflite`                                                                 | LOW    |
-| **ExecuTorch**          | `.ptl`, `.pte`                                                            | LOW    |
+| **TFLite**              | `.tflite`, signature-valid renamed artifacts                              | LOW    |
+| **ExecuTorch**          | `.ptl`, `.pte`, signature-valid standalone renamed artifacts              | LOW    |
 | **TensorRT**            | `.engine`, `.plan`, `.trt`                                                | LOW    |
 | **PaddlePaddle**        | `.pdmodel`, `.pdiparams`                                                  | LOW    |
 | **OpenVINO**            | `.xml`                                                                    | LOW    |

@@ -1423,6 +1423,14 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             if _is_tar_archive(path):
                 return "tar"
             return format_result
+        if format_result == "r_serialized":
+            if any(
+                magic16.startswith(workspace_header + marker)
+                for workspace_header in R_WORKSPACE_HEADERS
+                for marker in R_SERIALIZATION_MARKERS
+            ):
+                return format_result
+            return "unknown"
         if format_result != "unknown":
             return format_result
 
@@ -1511,6 +1519,18 @@ def detect_file_format(path: str) -> str:
         return "gguf"
     if magic4 in GGML_MAGIC_VARIANTS:
         return "ggml"
+    if _looks_like_tflite_header(magic8):
+        return "tflite"
+    if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
+        return "executorch"
+    if magic4 == b"RKNN":
+        return "rknn"
+    if any(
+        magic16.startswith(workspace_header + marker)
+        for workspace_header in R_WORKSPACE_HEADERS
+        for marker in R_SERIALIZATION_MARKERS
+    ):
+        return "r_serialized"
 
     ext = file_path.suffix.lower()
     filename_lower = file_path.name.lower()
@@ -1569,8 +1589,6 @@ def detect_file_format(path: str) -> str:
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
         magic64 = read_magic_bytes(path, 64)
-        if _looks_like_tflite_header(magic8):
-            return "tflite"
         # IMPORTANT: Check ZIP format first (PyTorch models saved with torch.save())
         if _has_zip_magic(magic4):
             return "zip"

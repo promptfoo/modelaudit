@@ -11,6 +11,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.scanners import _registry
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.tflite_scanner import _MAX_COUNT, TFLiteScanner
+from modelaudit.utils.file.detection import detect_file_format
 
 HAS_TFLITE = importlib.util.find_spec("tflite") is not None
 
@@ -74,6 +75,30 @@ def test_core_scan_file_routes_renamed_tflite_bin_to_tflite_scanner(tmp_path: Pa
     result = core.scan_file(str(path))
 
     assert result.scanner_name == "tflite"
+
+
+def test_renamed_tflite_with_skipped_suffix_routes_through_directory_scan(tmp_path: Path) -> None:
+    path = tmp_path / "model.jpg"
+    path.write_bytes(b"\x0c\x00\x00\x00TFL3" + b"\x00" * 100)
+
+    assert TFLiteScanner.can_handle(str(path))
+    assert detect_file_format(str(path)) == "tflite"
+    assert core.scan_file(str(path)).scanner_name == "tflite"
+
+    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+    assert directory.files_scanned == 1
+    assert "tflite" in directory.scanner_names
+
+
+def test_renamed_tflite_near_match_with_skipped_suffix_remains_skipped(tmp_path: Path) -> None:
+    path = tmp_path / "notes.jpg"
+    path.write_bytes(b"\x0c\x00\x00\x00XTFL3" + b"\x00" * 100)
+
+    assert not TFLiteScanner.can_handle(str(path))
+    assert detect_file_format(str(path)) == "unknown"
+
+    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+    assert directory.files_scanned == 0
 
 
 def test_tflite_scanner_can_handle_magic_near_match_requires_exact_offset(tmp_path: Path) -> None:

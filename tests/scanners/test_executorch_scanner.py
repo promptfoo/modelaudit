@@ -4,14 +4,16 @@ from pathlib import Path
 
 import pytest
 
+from modelaudit import core
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.executorch_scanner import ExecuTorchScanner
+from modelaudit.utils.file.detection import detect_file_format
 
 _ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
 
 
-def create_executorch_binary(tmp_path: Path, *, identifier: bytes = b"ET12") -> Path:
-    binary_path = tmp_path / "program.pte"
+def create_executorch_binary(tmp_path: Path, *, identifier: bytes = b"ET12", filename: str = "program.pte") -> Path:
+    binary_path = tmp_path / filename
     # Minimal valid FlatBuffer with the ExecuTorch file identifier.
     binary_path.write_bytes(b"\x0c\x00\x00\x00" + identifier + b"\x04\x00\x04\x00\x04\x00\x00\x00")
     return binary_path
@@ -86,6 +88,28 @@ def test_executorch_scanner_accepts_versioned_binary_program_header(tmp_path: Pa
     assert result.success is True
     assert result.bytes_scanned == file_path.stat().st_size
     assert not result.issues
+
+
+def test_renamed_executorch_binary_routes_through_directory_scan(tmp_path: Path) -> None:
+    file_path = create_executorch_binary(tmp_path, filename="program.jpg")
+
+    assert ExecuTorchScanner.can_handle(str(file_path))
+    assert detect_file_format(str(file_path)) == "executorch"
+    assert core.scan_file(str(file_path)).scanner_name == "executorch"
+
+    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+    assert directory.files_scanned == 1
+    assert "executorch" in directory.scanner_names
+
+
+def test_renamed_executorch_near_match_remains_skipped(tmp_path: Path) -> None:
+    file_path = create_executorch_binary(tmp_path, identifier=b"ETXX", filename="program.jpg")
+
+    assert not ExecuTorchScanner.can_handle(str(file_path))
+    assert detect_file_format(str(file_path)) == "unknown"
+
+    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+    assert directory.files_scanned == 0
 
 
 def test_executorch_scanner_rejects_invalid_binary_signature_match(tmp_path: Path) -> None:
