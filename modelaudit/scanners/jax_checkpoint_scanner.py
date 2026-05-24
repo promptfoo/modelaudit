@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from ..utils.file.detection import is_jax_json_checkpoint_file
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 try:
@@ -465,6 +466,7 @@ class JaxCheckpointScanner(BaseScanner):
             ext = os.path.splitext(path)[1].lower()
             if ext in cls.supported_extensions:
                 return cls._is_likely_jax_file(path)
+            return is_jax_json_checkpoint_file(path)
 
         return False
 

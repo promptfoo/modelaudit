@@ -122,6 +122,16 @@ _XML_MODEL_ROOT_FORMATS = {
     "pmml": "pmml",
 }
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
+JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES = 1024 * 1024
+_JAX_JSON_CHECKPOINT_IDENTITY_KEYS = frozenset(
+    {"framework", "library", "backend", "serialization", "format", "type", "checkpoint_type"}
+)
+_JAX_JSON_CHECKPOINT_MARKER_KEYS = frozenset({"orbax_version", "__orbax_metadata__"})
+_JAX_JSON_CHECKPOINT_NATIVE_SUFFIXES = frozenset({".json", ".ckpt", ".checkpoint", ".orbax-checkpoint", ".pickle"})
+_JAX_JSON_CHECKPOINT_IDENTITY_RE = re.compile(
+    r"(?<![a-z0-9])(?:jax|flax|haiku|orbax|jaxlib|arrayimpl|device_array)(?![a-z0-9])",
+    re.IGNORECASE,
+)
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -1215,6 +1225,61 @@ def _detect_compression_format(prefix: bytes) -> str | None:
     return None
 
 
+def _could_start_json_object(prefix: bytes) -> bool:
+    """Return True when a bounded prefix begins a JSON object after whitespace/BOM."""
+    normalized_prefix = prefix.lstrip()
+    if normalized_prefix.startswith(b"\xef\xbb\xbf"):
+        normalized_prefix = normalized_prefix[3:].lstrip()
+    return normalized_prefix.startswith(b"{")
+
+
+def _has_jax_json_checkpoint_structure(payload: object) -> bool:
+    """Return whether parsed metadata explicitly identifies a JAX-family checkpoint."""
+    if not isinstance(payload, dict):
+        return False
+
+    if _JAX_JSON_CHECKPOINT_MARKER_KEYS & payload.keys():
+        return True
+
+    for key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and _JAX_JSON_CHECKPOINT_IDENTITY_RE.search(value):
+            return True
+    return False
+
+
+def is_jax_json_checkpoint_file(path: str | Path) -> bool:
+    """Recognize bounded, structured JSON metadata for JAX-family checkpoints."""
+    file_path = Path(path)
+    try:
+        if not file_path.is_file():
+            return False
+        with file_path.open("rb") as f:
+            sample = f.read(JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 1)
+    except OSError:
+        return False
+    if len(sample) > JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES:
+        return False
+
+    if not _could_start_json_object(sample):
+        return False
+
+    try:
+        payload = json.loads(sample.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return _has_jax_json_checkpoint_structure(payload)
+
+
+def _could_be_renamed_jax_json_checkpoint(file_path: Path, prefix: bytes) -> bool:
+    """Route only non-native suffixes whose bounded JSON identifies a JAX checkpoint."""
+    return (
+        file_path.suffix.lower() not in _JAX_JSON_CHECKPOINT_NATIVE_SUFFIXES
+        and _could_start_json_object(prefix)
+        and is_jax_json_checkpoint_file(file_path)
+    )
+
+
 def detect_format_from_magic_bytes(
     magic4: MagicBytes, magic8: MagicBytes, magic16: MagicBytes, file_size: int, file_path: Path | None = None
 ) -> FileFormat:
@@ -1315,6 +1380,9 @@ def detect_file_format_from_magic(path: str) -> str:
                 return "torchserve_mar"
             if format_result != "unknown":
                 return format_result
+
+            if _could_be_renamed_jax_json_checkpoint(file_path, header):
+                return "jax_checkpoint"
 
             # CNTKv2 has protobuf-style serialization without a fixed first-8-byte magic.
             # Use bounded signature markers for deterministic identification.
@@ -1425,6 +1493,9 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             return format_result
         if format_result != "unknown":
             return format_result
+
+        if _could_be_renamed_jax_json_checkpoint(file_path, prefix):
+            return "jax_checkpoint"
 
         lightgbm_probe_size = min(size, _LIGHTGBM_SIGNATURE_READ_BYTES)
         if len(prefix) < lightgbm_probe_size:
@@ -1553,6 +1624,9 @@ def detect_file_format(path: str) -> str:
         )
         if xml_format != "unknown":
             return xml_format
+
+    if _could_be_renamed_jax_json_checkpoint(file_path, header):
+        return "jax_checkpoint"
 
     # For .bin files, do more sophisticated detection
     if ext == ".bin":

@@ -99,6 +99,8 @@ ModelAudit includes 44 registered scanners covering model, archive, and configur
 
 Plus scanners for ZIP, TAR, 7-Zip, OCI layers, Jinja2 templates, JSON/YAML metadata, manifests, model cards, text files, and RAR recognition. RAR archives are reported as unsupported/fail-closed instead of being skipped.
 
+Structured JAX/Orbax JSON checkpoint metadata is also recognized when renamed to non-model suffixes.
+
 [View complete format documentation](https://www.promptfoo.dev/docs/model-audit/scanners/)
 
 ## Remote Sources

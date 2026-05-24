@@ -2,6 +2,7 @@ import bz2
 import gzip
 import importlib
 import io
+import json
 import lzma
 import pickle
 import struct
@@ -17,6 +18,7 @@ from modelaudit.scanner_registry_metadata import get_extension_format_map
 from modelaudit.utils.file.detection import (
     PROTO0_1_MAX_PROBE_BYTES,
     detect_file_format,
+    detect_file_format_for_skip_filter,
     detect_file_format_from_magic,
     detect_format_from_extension,
     find_sharded_files,
@@ -92,6 +94,20 @@ def test_detect_file_format_zip(tmp_path):
         zipf.writestr("test.txt", "test content")
 
     assert detect_file_format(str(zip_path)) == "zip"
+
+
+def test_detect_renamed_jax_json_checkpoint_without_routing_ajax_near_match(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "checkpoint.jpg"
+    near_match_path = tmp_path / "ajax.jpg"
+    checkpoint_path.write_text(json.dumps({"framework": "jax", "orbax_version": "0.1.0"}), encoding="utf-8")
+    near_match_path.write_text(json.dumps({"framework": "ajax", "format": "checkpoint"}), encoding="utf-8")
+
+    assert detect_file_format_from_magic(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format(str(checkpoint_path)) == "jax_checkpoint"
+    assert detect_file_format_from_magic(str(near_match_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(near_match_path)) == "unknown"
+    assert detect_file_format(str(near_match_path)) == "unknown"
 
 
 def test_detect_file_format_rejects_pk_prefix_near_match(tmp_path: Path) -> None:

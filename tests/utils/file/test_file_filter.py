@@ -227,6 +227,17 @@ class TestFileFilter:
         assert not should_skip_file(str(disguised_legacy_tar))
         assert should_skip_file(str(real_image))
 
+    def test_disguised_jax_json_checkpoint_bypasses_skip_without_routing_ajax_near_match(self, tmp_path: Path) -> None:
+        checkpoint_path = tmp_path / "checkpoint.jpg"
+        near_match_path = tmp_path / "ajax.jpg"
+        checkpoint_path.write_text(json.dumps({"framework": "jax", "orbax_version": "0.1.0"}), encoding="utf-8")
+        near_match_path.write_text(json.dumps({"framework": "ajax", "format": "checkpoint"}), encoding="utf-8")
+
+        assert detect_file_format_for_skip_filter(str(checkpoint_path)) == "jax_checkpoint"
+        assert not should_skip_file(str(checkpoint_path))
+        assert detect_file_format_for_skip_filter(str(near_match_path)) == "unknown"
+        assert should_skip_file(str(near_match_path))
+
     def test_pk_prefix_near_match_stays_skipped(self, tmp_path: Path) -> None:
         near_match = tmp_path / "pknope.jpg"
         near_match.write_bytes(b"PKNO harmless text")

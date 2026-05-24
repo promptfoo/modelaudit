@@ -1511,6 +1511,34 @@ def test_scan_file_routes_jax_pickles_through_jax_specific_analysis(tmp_path: Pa
     )
 
 
+def test_scan_file_routes_malicious_renamed_jax_json_without_routing_ajax_near_match(tmp_path: Path) -> None:
+    model_path = tmp_path / "state.jpg"
+    near_match_path = tmp_path / "ajax.jpg"
+    model_path.write_text(
+        json.dumps(
+            {
+                "framework": "jax",
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+            }
+        ),
+        encoding="utf-8",
+    )
+    near_match_path.write_text(
+        json.dumps({"framework": "ajax", "payload": "jax.experimental.host_callback.call(os.system, 'id')"}),
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+    near_match_result = scan_file(str(near_match_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jax_checkpoint"
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert near_match_result.scanner_name == "unknown"
+    assert near_match_result.success is True
+
+
 def test_scan_file_routes_raw_bin_without_zip_structure_to_pytorch_binary(tmp_path: Path) -> None:
     model_path = tmp_path / "weights.bin"
     model_path.write_bytes(b"\x00" * 128)
