@@ -1904,6 +1904,19 @@ def test_scan_file_routes_oversized_renamed_tf_metagraph_to_fail_closed_scan(tmp
     assert core_module.determine_exit_code(aggregate) == 2
 
 
+def test_scan_file_does_not_route_oversized_malformed_tf_protobuf_near_match(tmp_path: Path) -> None:
+    malformed_payload = tmp_path / "malformed-large.jpg"
+    malformed_payload.write_bytes(b"\x12" + (b"x" * _MAX_PARSE_BYTES))
+
+    result = scan_file(str(malformed_payload), config={"cache_enabled": False})
+    aggregate = scan_model_directory_or_file(str(malformed_payload), cache_enabled=False)
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+    assert aggregate.success is True
+    assert core_module.determine_exit_code(aggregate) == 0
+
+
 def test_scan_file_does_not_route_incidental_onnx_pb_string(tmp_path: Path) -> None:
     near_match = tmp_path / "metadata.pb"
     near_match.write_bytes(bytes([0x0A, 0x04]) + b"onnx" + b"\x00" * 16)
