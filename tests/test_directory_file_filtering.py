@@ -236,6 +236,25 @@ class TestDirectoryFileFiltering:
         assert determine_exit_code(results) == 1
         assert any(issue.message.startswith("Potential SSTI vulnerability") for issue in results.issues)
 
+    def test_oversized_disguised_ssti_template_fails_closed_after_late_marker(self, tmp_path: Path) -> None:
+        """Directory filtering should preserve oversized high-signal template coverage."""
+        padding = "x" * 50_001
+        (tmp_path / "payload.jpg").write_text(
+            padding + "{{ cycler.__init__.__globals__.os.popen('id').read() }}",
+            encoding="utf-8",
+        )
+        (tmp_path / "chat.jpg").write_text(
+            padding + "{% for message in messages %}{{ message['content'] }}{% endfor %}",
+            encoding="utf-8",
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "jinja2_template" in results.scanner_names
+        assert results.success is False
+        assert determine_exit_code(results) == 2
+
     @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
     def test_disguised_pickle_with_default_hidden_or_basename_skip_is_scanned(
         self,

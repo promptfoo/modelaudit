@@ -122,7 +122,7 @@ _XML_MODEL_ROOT_FORMATS = {
     "pmml": "pmml",
 }
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
-_JINJA2_SUSPICIOUS_TEMPLATE_READ_BYTES = 50_000
+_JINJA2_SUSPICIOUS_TEMPLATE_CHUNK_BYTES = 8192
 _JINJA2_TEMPLATE_SYNTAX_MARKERS = (b"{{", b"{%", b"{#")
 _JINJA2_SUSPICIOUS_TEMPLATE_MARKERS = (
     b"__globals__",
@@ -1230,26 +1230,37 @@ def _detect_compression_format(prefix: bytes) -> str | None:
 
 
 def is_suspicious_jinja2_template_file(path: str | Path) -> bool:
-    """Recognize a small standalone template carrying high-signal SSTI content."""
+    """Recognize high-signal SSTI content with bounded-memory streaming."""
     file_path = Path(path)
+    max_marker_length = max(
+        *(len(marker) for marker in _JINJA2_TEMPLATE_SYNTAX_MARKERS),
+        *(len(marker) for marker in _JINJA2_SUSPICIOUS_TEMPLATE_MARKERS),
+    )
+    overlap = b""
+    syntax_found = False
+    suspicious_marker_found = False
     try:
         if not file_path.is_file():
             return False
         with file_path.open("rb") as f:
-            sample = f.read(_JINJA2_SUSPICIOUS_TEMPLATE_READ_BYTES + 1)
+            while chunk := f.read(_JINJA2_SUSPICIOUS_TEMPLATE_CHUNK_BYTES):
+                sample = overlap + chunk
+                lowered_sample = sample.lower()
+                syntax_found = syntax_found or any(marker in sample for marker in _JINJA2_TEMPLATE_SYNTAX_MARKERS)
+                suspicious_marker_found = suspicious_marker_found or any(
+                    marker in lowered_sample for marker in _JINJA2_SUSPICIOUS_TEMPLATE_MARKERS
+                )
+                if syntax_found and suspicious_marker_found:
+                    return True
+                overlap = sample[-(max_marker_length - 1) :]
     except OSError:
         return False
-    if len(sample) > _JINJA2_SUSPICIOUS_TEMPLATE_READ_BYTES:
-        return False
 
-    lowered_sample = sample.lower()
-    return any(marker in sample for marker in _JINJA2_TEMPLATE_SYNTAX_MARKERS) and any(
-        marker in lowered_sample for marker in _JINJA2_SUSPICIOUS_TEMPLATE_MARKERS
-    )
+    return False
 
 
 def _could_be_renamed_suspicious_jinja2_template(file_path: Path) -> bool:
-    """Route non-native suffixes only after bounded high-signal SSTI inspection."""
+    """Route non-native suffixes only after streamed high-signal SSTI inspection."""
     return file_path.suffix.lower() not in _JINJA2_NATIVE_SUFFIXES and is_suspicious_jinja2_template_file(file_path)
 
 

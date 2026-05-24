@@ -2188,3 +2188,43 @@ def test_scan_file_routes_renamed_ssti_template_without_routing_benign_chat_temp
     )
     assert benign_result.scanner_name == "unknown"
     assert benign_result.success is True
+
+
+def test_scan_file_fails_closed_for_oversized_renamed_ssti_template_without_caching(tmp_path: Path) -> None:
+    malicious_file = tmp_path / "large-payload.jpg"
+    benign_file = tmp_path / "large-chat.jpg"
+    padding = "x" * 50_001
+    malicious_file.write_text(
+        padding + "{{ cycler.__init__.__globals__.os.popen('id').read() }}",
+        encoding="utf-8",
+    )
+    benign_file.write_text(
+        padding + "{% for message in messages %}{{ message['content'] }}{% endfor %}",
+        encoding="utf-8",
+    )
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(malicious_file), config=config)
+        second = scan_file(str(malicious_file), config=config)
+        benign_result = scan_file(str(benign_file), config={"cache_scan_results": False})
+
+        assert first.scanner_name == "jinja2_template"
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert "jinja2_template_size_limit_exceeded" in first.metadata["scan_outcome_reasons"]
+        assert benign_result.scanner_name == "unknown"
+        assert benign_result.success is True
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    aggregate = scan_model_directory_or_file(str(malicious_file), cache_scan_results=False)
+    assert core_module.determine_exit_code(aggregate) == 2

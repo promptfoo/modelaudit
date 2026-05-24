@@ -111,6 +111,26 @@ def test_detect_renamed_ssti_template_without_routing_benign_template(tmp_path: 
     assert detect_file_format(str(benign_file)) == "unknown"
 
 
+def test_detect_oversized_renamed_ssti_template_after_late_marker(tmp_path: Path) -> None:
+    malicious_file = tmp_path / "large-payload.jpg"
+    benign_file = tmp_path / "large-chat.jpg"
+    padding = "x" * 50_001
+    malicious_file.write_text(
+        padding + "{{ cycler.__init__.__globals__.os.popen('id').read() }}",
+        encoding="utf-8",
+    )
+    benign_file.write_text(
+        padding + "{% for message in messages %}{{ message['content'] }}{% endfor %}", encoding="utf-8"
+    )
+
+    assert detect_file_format_from_magic(str(malicious_file)) == "jinja2_template"
+    assert detect_file_format_for_skip_filter(str(malicious_file)) == "jinja2_template"
+    assert detect_file_format(str(malicious_file)) == "jinja2_template"
+    assert detect_file_format_from_magic(str(benign_file)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(benign_file)) == "unknown"
+    assert detect_file_format(str(benign_file)) == "unknown"
+
+
 def test_detect_file_format_rejects_pk_prefix_near_match(tmp_path: Path) -> None:
     near_match = tmp_path / "not-a-zip.dat"
     near_match.write_bytes(b"PKNOPE harmless text")
