@@ -8,7 +8,11 @@ from modelaudit import core
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.r_serialized_scanner import RSerializedScanner
-from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension
+from modelaudit.utils.file.detection import (
+    detect_file_format,
+    detect_file_format_from_magic,
+    detect_format_from_extension,
+)
 
 
 def _write_raw_r_serialized(path: Path, body: str, *, workspace_header: bool = False) -> None:
@@ -334,6 +338,7 @@ def test_renamed_r_workspace_routes_and_detects_malicious_expression(tmp_path: P
 
     assert RSerializedScanner.can_handle(str(path))
     assert detect_file_format(str(path)) == "r_serialized"
+    assert detect_file_format_from_magic(str(path)) == "r_serialized"
 
     direct = core.scan_file(str(path))
     assert direct.scanner_name == "r_serialized"
@@ -350,6 +355,7 @@ def test_renamed_r_workspace_near_match_remains_skipped(tmp_path: Path) -> None:
 
     assert not RSerializedScanner.can_handle(str(path))
     assert detect_file_format(str(path)) == "unknown"
+    assert detect_file_format_from_magic(str(path)) == "unknown"
 
     directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
     assert directory.files_scanned == 0
