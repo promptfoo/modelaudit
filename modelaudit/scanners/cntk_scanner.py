@@ -326,13 +326,19 @@ class CntkScanner(BaseScanner):
         try:
             data, truncated = _read_bounded(path, _MAX_SCAN_BYTES)
         except OSError as e:
+            mark_inconclusive_scan_result(result, "cntk_read_failed")
             result.add_check(
                 name="CNTK File Read",
                 passed=False,
                 message=f"Error reading CNTK file: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "cntk_read_failed",
+                },
             )
             result.finish(success=False)
             return result

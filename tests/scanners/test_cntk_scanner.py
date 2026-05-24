@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.cntk_scanner import DISCOVERY_ASSUMPTIONS, CntkScanner
 
@@ -139,6 +140,36 @@ def test_cntk_scanner_marks_bounded_prefix_analysis_inconclusive(
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "cntk_bounded_read_incomplete" in result.metadata["scan_outcome_reasons"]
+
+
+def test_cntk_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable.cmf"
+    _write_cntkv2(path, payload=b" safe metadata ")
+
+    def raise_os_error(_path: str, _max_bytes: int) -> tuple[bytes, bool]:
+        raise OSError("simulated CNTK read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.cntk_scanner._read_bounded", raise_os_error)
+
+    direct = CntkScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    read_checks = [check for check in direct.checks if check.name == "CNTK File Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "cntk_read_failed"
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "cntk_read_failed" in direct.metadata["scan_outcome_reasons"]
+    metadata = aggregate.file_metadata[str(path)]
+    assert "cntk_read_failed" in metadata["scan_outcome_reasons"]
+    assert not [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_cntk_scanner_records_scope_assumptions(tmp_path: Path) -> None:

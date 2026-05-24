@@ -374,13 +374,19 @@ class LightGBMScanner(BaseScanner):
             with open(path, "rb") as file_obj:
                 payload = file_obj.read(self.scan_budget + 1)
         except OSError as error:
+            mark_inconclusive_scan_result(result, "lightgbm_read_failed")
             result.add_check(
                 name="LightGBM File Read",
                 passed=False,
                 message=f"Unable to read LightGBM file: {error}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"error": str(error), "error_type": type(error).__name__},
+                details={
+                    "error": str(error),
+                    "error_type": type(error).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "lightgbm_read_failed",
+                },
             )
             result.finish(success=False)
             return result
