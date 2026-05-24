@@ -288,7 +288,7 @@ class TestFileFilter:
     def test_prefixed_disguised_onnx_bypasses_skip_without_promoting_generic_protobuf(self, tmp_path: Path) -> None:
         pytest.importorskip("onnx")
         disguised_onnx = create_mock_onnx(tmp_path / "model.jpg")
-        prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=0, count=4097)
+        prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=0, count=4097, field_number=9)
         generic_protobuf = tmp_path / "generic.jpg"
         generic_protobuf.write_bytes(b"\xa2\x06\x04xxxx\x12\x02\x08\x01")
 

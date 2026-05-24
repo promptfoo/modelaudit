@@ -44,7 +44,8 @@ _ONNX_MODEL_MAX_ROUTING_FIELDS = 4096
 _ONNX_GRAPH_MAX_ROUTING_FIELDS = 4096
 _ONNX_NODE_MAX_ROUTING_FIELDS = 512
 _ONNX_MAX_ROUTING_TEXT_BYTES = 1024
-_ONNX_UNKNOWN_PREFIX_MIN_FIELD_NUMBER = 64
+# Keep aligned with top-level onnx.ModelProto fields; other valid tags are unknown prefix padding.
+_ONNX_MODEL_KNOWN_FIELD_NUMBERS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 14, 20, 25, 26})
 _PROTO_GROUP_MAX_ROUTING_FIELDS = 512
 _PROTO_GROUP_MAX_ROUTING_DEPTH = 8
 _LIGHTGBM_HEADER_MARKERS = (
@@ -409,7 +410,7 @@ def _looks_like_onnx_model_proto_stream(stream: BinaryIO, end_offset: int) -> bo
                 has_graph = has_graph or graph_status
             stream.seek(value_end)
         else:
-            if field_number < _ONNX_UNKNOWN_PREFIX_MIN_FIELD_NUMBER or wire_type not in {2, 3}:
+            if field_number in _ONNX_MODEL_KNOWN_FIELD_NUMBERS or wire_type not in {0, 1, 2, 3, 5}:
                 has_only_unknown_prefix_fields = False
             if not _skip_proto_stream_value(stream, wire_type, end_offset, field_number=field_number):
                 return False

@@ -127,7 +127,7 @@ def test_onnx_scanner_basic_model(tmp_path):
 
 def test_onnx_scanner_unknown_only_payload_is_inconclusive(tmp_path: Path) -> None:
     model_path = tmp_path / "unknown-only.onnx"
-    model_path.write_bytes(b"\xa2\x06\x00" * 4097)
+    model_path.write_bytes(b"\x4a\x00" * 4097)
 
     result = OnnxScanner({"check_jit_script": False, "check_network_comm": False}).scan(str(model_path))
 

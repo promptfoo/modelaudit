@@ -277,11 +277,15 @@ def test_detect_file_format_routes_prefixed_renamed_onnx_by_bounded_structure(tm
     assert detect_file_format_for_skip_filter(str(model_path)) == "onnx"
 
 
-def test_detect_file_format_keeps_budget_exhausted_prefixed_renamed_onnx_scannable(tmp_path: Path) -> None:
-    """A long legal prefix must stay scannable after bounded routing is exhausted."""
+@pytest.mark.parametrize("unknown_field_number", [9, 63, 100])
+def test_detect_file_format_keeps_budget_exhausted_prefixed_renamed_onnx_scannable(
+    tmp_path: Path,
+    unknown_field_number: int,
+) -> None:
+    """A long legal unknown prefix must stay scannable after bounded routing is exhausted."""
     pytest.importorskip("onnx")
-    model_path = create_mock_onnx(tmp_path / "many-prefixes.jpg")
-    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097)
+    model_path = create_mock_onnx(tmp_path / f"many-prefixes-{unknown_field_number}.jpg")
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=unknown_field_number)
 
     assert detect_file_format(str(model_path)) == "onnx"
     assert detect_file_format_from_magic(str(model_path)) == "onnx"

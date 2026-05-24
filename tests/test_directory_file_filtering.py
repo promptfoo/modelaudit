@@ -272,7 +272,7 @@ class TestDirectoryFileFiltering:
     def test_prefixed_disguised_malicious_onnx_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         pytest.importorskip("onnx")
         disguised_payload = create_mock_onnx(tmp_path / "payload.jpg", op_type="PythonOp")
-        prefix_mock_onnx_with_unknown_field(disguised_payload, value_size=0, count=4097)
+        prefix_mock_onnx_with_unknown_field(disguised_payload, value_size=0, count=4097, field_number=9)
 
         results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
 

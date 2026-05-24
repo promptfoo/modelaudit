@@ -1838,7 +1838,7 @@ def test_scan_file_detects_malicious_prefixed_renamed_onnx_by_content(tmp_path: 
 def test_scan_file_detects_malicious_budget_exhausted_prefixed_renamed_onnx(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     disguised_onnx = create_mock_onnx(tmp_path / "many-prefixes.jpg", op_type="PythonOp")
-    prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=0, count=4097)
+    prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=0, count=4097, field_number=9)
 
     result = scan_file(str(disguised_onnx), config={"cache_scan_results": False})
     aggregate = scan_model_directory_or_file(str(disguised_onnx), cache_scan_results=False)
@@ -1855,7 +1855,7 @@ def test_scan_file_detects_malicious_budget_exhausted_prefixed_renamed_onnx(tmp_
 def test_scan_file_fails_closed_on_budget_exhausted_renamed_onnx_without_structure(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     ambiguous_onnx = tmp_path / "ambiguous.jpg"
-    ambiguous_onnx.write_bytes(b"\xa2\x06\x00" * 4097)
+    ambiguous_onnx.write_bytes(b"\x4a\x00" * 4097)
     cache_dir = tmp_path / "cache"
     config = {
         "cache_enabled": True,
