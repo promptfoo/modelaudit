@@ -97,6 +97,15 @@ class TestJinja2TemplateScannerCanHandle:
 
         assert Jinja2TemplateScanner.can_handle(str(template_file)) is True
 
+    def test_can_handle_renamed_ssti_template_without_routing_benign_chat_template(self, tmp_path: Path) -> None:
+        malicious_file = tmp_path / "payload.jpg"
+        benign_file = tmp_path / "chat.jpg"
+        malicious_file.write_text("{{ cycler.__init__.__globals__.os.popen('id').read() }}")
+        benign_file.write_text("{% for message in messages %}{{ message['content'] }}{% endfor %}")
+
+        assert Jinja2TemplateScanner.can_handle(str(malicious_file)) is True
+        assert Jinja2TemplateScanner.can_handle(str(benign_file)) is False
+
     def test_can_handle_tokenizer_config_json(self, tmp_path: Path) -> None:
         """Test that scanner handles tokenizer_config.json."""
         tokenizer_file = tmp_path / "tokenizer_config.json"

@@ -404,6 +404,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "class": "Jinja2TemplateScanner",
         "description": "Scans for Jinja2 template injection vulnerabilities in ML models",
         "extensions": [".gguf", ".json", ".yaml", ".yml", ".jinja", ".j2", ".template"],
+        "header_formats": ["jinja2_template"],
         "priority": 14,
         "dependencies": ["jinja2", "gguf"],
         "numpy_sensitive": False,

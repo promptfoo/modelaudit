@@ -122,6 +122,20 @@ _XML_MODEL_ROOT_FORMATS = {
     "pmml": "pmml",
 }
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
+_JINJA2_SUSPICIOUS_TEMPLATE_READ_BYTES = 50_000
+_JINJA2_TEMPLATE_SYNTAX_MARKERS = (b"{{", b"{%", b"{#")
+_JINJA2_SUSPICIOUS_TEMPLATE_MARKERS = (
+    b"__globals__",
+    b"__builtins__",
+    b"__subclasses__",
+    b"__mro__",
+    b"__import__",
+    b"os.system",
+    b"os.popen",
+    b"subprocess.",
+    b"pty.spawn",
+)
+_JINJA2_NATIVE_SUFFIXES = frozenset({".gguf", ".json", ".yaml", ".yml", ".jinja", ".j2", ".template"})
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -1215,6 +1229,34 @@ def _detect_compression_format(prefix: bytes) -> str | None:
     return None
 
 
+def is_suspicious_jinja2_template_file(path: str | Path) -> bool:
+    """Recognize a small standalone template carrying high-signal SSTI content."""
+    file_path = Path(path)
+    try:
+        if not file_path.is_file():
+            return False
+        with file_path.open("rb") as f:
+            sample = f.read(_JINJA2_SUSPICIOUS_TEMPLATE_READ_BYTES + 1)
+    except OSError:
+        return False
+    if len(sample) > _JINJA2_SUSPICIOUS_TEMPLATE_READ_BYTES:
+        return False
+
+    lowered_sample = sample.lower()
+    return any(marker in sample for marker in _JINJA2_TEMPLATE_SYNTAX_MARKERS) and any(
+        marker in lowered_sample for marker in _JINJA2_SUSPICIOUS_TEMPLATE_MARKERS
+    )
+
+
+def _could_be_renamed_suspicious_jinja2_template(file_path: Path, prefix: bytes) -> bool:
+    """Limit content routing to non-native suffixes with an early Jinja delimiter."""
+    return (
+        file_path.suffix.lower() not in _JINJA2_NATIVE_SUFFIXES
+        and any(marker in prefix for marker in _JINJA2_TEMPLATE_SYNTAX_MARKERS)
+        and is_suspicious_jinja2_template_file(file_path)
+    )
+
+
 def detect_format_from_magic_bytes(
     magic4: MagicBytes, magic8: MagicBytes, magic16: MagicBytes, file_size: int, file_path: Path | None = None
 ) -> FileFormat:
@@ -1315,6 +1357,9 @@ def detect_file_format_from_magic(path: str) -> str:
                 return "torchserve_mar"
             if format_result != "unknown":
                 return format_result
+
+            if _could_be_renamed_suspicious_jinja2_template(file_path, header):
+                return "jinja2_template"
 
             # CNTKv2 has protobuf-style serialization without a fixed first-8-byte magic.
             # Use bounded signature markers for deterministic identification.
@@ -1425,6 +1470,9 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             return format_result
         if format_result != "unknown":
             return format_result
+
+        if _could_be_renamed_suspicious_jinja2_template(file_path, prefix):
+            return "jinja2_template"
 
         lightgbm_probe_size = min(size, _LIGHTGBM_SIGNATURE_READ_BYTES)
         if len(prefix) < lightgbm_probe_size:
@@ -1553,6 +1601,9 @@ def detect_file_format(path: str) -> str:
         )
         if xml_format != "unknown":
             return xml_format
+
+    if _could_be_renamed_suspicious_jinja2_template(file_path, header):
+        return "jinja2_template"
 
     # For .bin files, do more sophisticated detection
     if ext == ".bin":

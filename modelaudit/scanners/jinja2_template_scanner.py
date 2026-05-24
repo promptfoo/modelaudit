@@ -26,6 +26,7 @@ from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import JINJA2_SSTI_PATTERNS
 
+from ..utils.file.detection import is_suspicious_jinja2_template_file
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
 
 # Optional GGUF support with graceful fallback
@@ -176,7 +177,10 @@ class Jinja2TemplateScanner(BaseScanner):
             ):
                 return True
 
-        return False
+        if ext in [".json", ".yaml", ".yml"]:
+            return False
+
+        return is_suspicious_jinja2_template_file(path)
 
     def scan(self, path: str) -> ScanResult:
         """Scan a file for Jinja2 template injection vulnerabilities"""
@@ -419,7 +423,7 @@ class Jinja2TemplateScanner(BaseScanner):
         elif ext in [".yaml", ".yml"]:
             context.file_type = "yaml"
             context.confidence += 1
-        elif ext in [".jinja", ".j2", ".template"]:
+        elif ext in [".jinja", ".j2", ".template"] or is_suspicious_jinja2_template_file(path):
             context.file_type = "template"
             context.is_chat_template = True
             context.confidence += 1

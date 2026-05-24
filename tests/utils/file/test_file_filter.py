@@ -227,6 +227,17 @@ class TestFileFilter:
         assert not should_skip_file(str(disguised_legacy_tar))
         assert should_skip_file(str(real_image))
 
+    def test_disguised_ssti_template_bypasses_skip_without_routing_benign_template(self, tmp_path: Path) -> None:
+        malicious_file = tmp_path / "payload.jpg"
+        benign_file = tmp_path / "chat.jpg"
+        malicious_file.write_text("{{ cycler.__init__.__globals__.os.popen('id').read() }}", encoding="utf-8")
+        benign_file.write_text("{% for message in messages %}{{ message['content'] }}{% endfor %}", encoding="utf-8")
+
+        assert detect_file_format_for_skip_filter(str(malicious_file)) == "jinja2_template"
+        assert not should_skip_file(str(malicious_file))
+        assert detect_file_format_for_skip_filter(str(benign_file)) == "unknown"
+        assert should_skip_file(str(benign_file))
+
     def test_pk_prefix_near_match_stays_skipped(self, tmp_path: Path) -> None:
         near_match = tmp_path / "pknope.jpg"
         near_match.write_bytes(b"PKNO harmless text")

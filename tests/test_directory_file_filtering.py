@@ -218,6 +218,24 @@ class TestDirectoryFileFiltering:
         assert results["files_scanned"] == 1
         assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
 
+    def test_disguised_ssti_template_is_scanned_without_benign_chat_template_noise(self, tmp_path: Path) -> None:
+        """Directory scans should retain suspicious templates without promoting benign markup."""
+        (tmp_path / "payload.jpg").write_text(
+            "{{ cycler.__init__.__globals__.os.popen('id').read() }}",
+            encoding="utf-8",
+        )
+        (tmp_path / "chat.jpg").write_text(
+            "{% for message in messages %}{{ message['content'] }}{% endfor %}",
+            encoding="utf-8",
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "jinja2_template" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message.startswith("Potential SSTI vulnerability") for issue in results.issues)
+
     @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
     def test_disguised_pickle_with_default_hidden_or_basename_skip_is_scanned(
         self,
