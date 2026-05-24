@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.jax_checkpoint_scanner import JaxCheckpointScanner
 
@@ -579,11 +580,13 @@ def test_truncated_large_pickle_prefix_keeps_dangerous_global_without_scan_error
 
     result = scanner.scan(str(pickle_path))
 
-    assert result.success
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_pickle_scan_limit_exceeded" in result.metadata["scan_outcome_reasons"]
     assert any(
         check.name == "Pickle Checkpoint Prefix Scan Limit"
         and check.status == CheckStatus.FAILED
-        and check.severity == IssueSeverity.WARNING
+        and check.severity == IssueSeverity.INFO
         for check in result.checks
     )
     assert any(
@@ -605,10 +608,45 @@ def test_truncated_benign_large_pickle_prefix_does_not_emit_scan_error(tmp_path:
 
     result = scanner.scan(str(pickle_path))
 
-    assert result.success
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_pickle_scan_limit_exceeded" in result.metadata["scan_outcome_reasons"]
     assert all(check.name != "Pickle Checkpoint Scan" for check in result.checks)
+    assert any(
+        check.name == "Pickle Checkpoint Prefix Scan Limit"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
     assert all(
         check.name != "Pickle Opcode Security Check" or check.status != CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_late_dangerous_pickle_opcode_beyond_prefix_is_inconclusive(tmp_path: Path) -> None:
+    pickle_path = tmp_path / "late_dangerous_prefix.pickle"
+    payload = (
+        b"\x80\x04"
+        + _proto4_short_unicode("jax")
+        + b"0"
+        + _proto4_binunicode("safe" * 1024)
+        + b"0"
+        + _proto4_short_unicode("os")
+        + _proto4_short_unicode("system")
+        + b"\x93."
+    )
+    pickle_path.write_bytes(payload)
+
+    scanner = JaxCheckpointScanner(config={"jax_pickle_max_scan_bytes": 1024})
+    assert scanner.can_handle(str(pickle_path))
+
+    result = scanner.scan(str(pickle_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_pickle_scan_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert not any(
+        check.name == "Pickle Opcode Security Check" and check.status == CheckStatus.FAILED for check in result.checks
     )
 
 
@@ -932,11 +970,13 @@ def test_deep_orbax_metadata_reports_depth_limit_without_silent_truncation(tmp_p
 
     result = JaxCheckpointScanner().scan(str(checkpoint_dir))
 
-    assert result.success
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_metadata_traversal_depth_limit" in result.metadata["scan_outcome_reasons"]
     assert any(
         check.name == "Orbax Metadata Traversal Depth Limit"
         and check.status == CheckStatus.FAILED
-        and check.severity == IssueSeverity.WARNING
+        and check.severity == IssueSeverity.INFO
         and check.details["traversal_depth_cap_reached"] is True
         and check.details["max_metadata_traversal_depth"] == JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH
         and check.details["context"].startswith("orbax_metadata.payload")
@@ -945,7 +985,7 @@ def test_deep_orbax_metadata_reports_depth_limit_without_silent_truncation(tmp_p
 
 
 def test_deep_json_checkpoint_reports_depth_limit_without_silent_truncation(tmp_path: Path) -> None:
-    checkpoint_path = tmp_path / "deep_model.checkpoint"
+    checkpoint_path = tmp_path / "deep_model.jpg"
     nested_metadata: object = "jax.experimental.host_callback.call(os.system, 'id')"
     for _ in range(2 * JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH):
         nested_metadata = {"nested": nested_metadata}
@@ -958,13 +998,91 @@ def test_deep_json_checkpoint_reports_depth_limit_without_silent_truncation(tmp_
 
     result = JaxCheckpointScanner().scan(str(checkpoint_path))
 
-    assert result.success
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_metadata_traversal_depth_limit" in result.metadata["scan_outcome_reasons"]
     assert any(
         check.name == "JSON Metadata Traversal Depth Limit"
         and check.status == CheckStatus.FAILED
-        and check.severity == IssueSeverity.WARNING
+        and check.severity == IssueSeverity.INFO
         and check.details["traversal_depth_cap_reached"] is True
         and check.details["max_metadata_traversal_depth"] == JaxCheckpointScanner._MAX_METADATA_TRAVERSAL_DEPTH
         and check.details["context"].startswith("json_checkpoint.payload")
         for check in result.checks
     )
+
+    aggregate = scan_model_directory_or_file(str(checkpoint_path), use_cache=False)
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_malformed_jax_json_checkpoint_is_inconclusive(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "malformed.checkpoint"
+    checkpoint_path.write_text('{"framework": "jax", "payload": ', encoding="utf-8")
+
+    assert JaxCheckpointScanner.can_handle(str(checkpoint_path))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_json_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "JSON Checkpoint Validation"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+
+    aggregate = scan_model_directory_or_file(str(checkpoint_path), use_cache=False)
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_malformed_orbax_metadata_is_inconclusive(tmp_path: Path) -> None:
+    checkpoint_dir = tmp_path / "malformed_orbax"
+    checkpoint_dir.mkdir()
+    (checkpoint_dir / "metadata.json").write_text('{"type": "orbax_checkpoint"', encoding="utf-8")
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_orbax_metadata_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Orbax Metadata JSON Validation"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+
+
+def test_orbax_object_numpy_checkpoint_is_inconclusive(tmp_path: Path) -> None:
+    np = pytest.importorskip("numpy")
+    checkpoint_dir = tmp_path / "orbax_object_numpy"
+    _write_orbax_metadata(checkpoint_dir, {"type": "orbax_checkpoint"})
+    with (checkpoint_dir / "checkpoint_0").open("wb") as checkpoint_file:
+        np.save(checkpoint_file, np.array([{"payload": "unsafe"}], dtype=object), allow_pickle=True)
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_numpy_load_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "NumPy Checkpoint Load"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+
+
+def test_orbax_numeric_numpy_checkpoint_remains_clean(tmp_path: Path) -> None:
+    np = pytest.importorskip("numpy")
+    checkpoint_dir = tmp_path / "orbax_numeric_numpy"
+    _write_orbax_metadata(checkpoint_dir, {"type": "orbax_checkpoint"})
+    with (checkpoint_dir / "checkpoint_0").open("wb") as checkpoint_file:
+        np.save(checkpoint_file, np.array([1.0, 2.0, 3.0]))
+
+    result = JaxCheckpointScanner().scan(str(checkpoint_dir))
+
+    assert result.success is True
+    assert result.metadata.get("scan_outcome") != "inconclusive"
