@@ -100,7 +100,7 @@ class TestJinja2TemplateScannerCanHandle:
     def test_can_handle_renamed_ssti_template_without_routing_benign_chat_template(self, tmp_path: Path) -> None:
         malicious_file = tmp_path / "payload.jpg"
         benign_file = tmp_path / "chat.jpg"
-        malicious_file.write_text("{{ cycler.__init__.__globals__.os.popen('id').read() }}")
+        malicious_file.write_text(("x" * 1024) + "{{ cycler.__init__.__globals__.os.popen('id').read() }}")
         benign_file.write_text("{% for message in messages %}{{ message['content'] }}{% endfor %}")
 
         assert Jinja2TemplateScanner.can_handle(str(malicious_file)) is True

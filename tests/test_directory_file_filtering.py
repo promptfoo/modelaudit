@@ -221,7 +221,7 @@ class TestDirectoryFileFiltering:
     def test_disguised_ssti_template_is_scanned_without_benign_chat_template_noise(self, tmp_path: Path) -> None:
         """Directory scans should retain suspicious templates without promoting benign markup."""
         (tmp_path / "payload.jpg").write_text(
-            "{{ cycler.__init__.__globals__.os.popen('id').read() }}",
+            ("x" * 1024) + "{{ cycler.__init__.__globals__.os.popen('id').read() }}",
             encoding="utf-8",
         )
         (tmp_path / "chat.jpg").write_text(

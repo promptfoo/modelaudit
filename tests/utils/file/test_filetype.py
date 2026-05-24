@@ -98,7 +98,9 @@ def test_detect_file_format_zip(tmp_path):
 def test_detect_renamed_ssti_template_without_routing_benign_template(tmp_path: Path) -> None:
     malicious_file = tmp_path / "payload.jpg"
     benign_file = tmp_path / "chat.jpg"
-    malicious_file.write_text("{{ cycler.__init__.__globals__.os.popen('id').read() }}", encoding="utf-8")
+    malicious_file.write_text(
+        ("x" * 1024) + "{{ cycler.__init__.__globals__.os.popen('id').read() }}", encoding="utf-8"
+    )
     benign_file.write_text("{% for message in messages %}{{ message['content'] }}{% endfor %}", encoding="utf-8")
 
     assert detect_file_format_from_magic(str(malicious_file)) == "jinja2_template"

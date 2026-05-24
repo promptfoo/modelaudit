@@ -1248,13 +1248,9 @@ def is_suspicious_jinja2_template_file(path: str | Path) -> bool:
     )
 
 
-def _could_be_renamed_suspicious_jinja2_template(file_path: Path, prefix: bytes) -> bool:
-    """Limit content routing to non-native suffixes with an early Jinja delimiter."""
-    return (
-        file_path.suffix.lower() not in _JINJA2_NATIVE_SUFFIXES
-        and any(marker in prefix for marker in _JINJA2_TEMPLATE_SYNTAX_MARKERS)
-        and is_suspicious_jinja2_template_file(file_path)
-    )
+def _could_be_renamed_suspicious_jinja2_template(file_path: Path) -> bool:
+    """Route non-native suffixes only after bounded high-signal SSTI inspection."""
+    return file_path.suffix.lower() not in _JINJA2_NATIVE_SUFFIXES and is_suspicious_jinja2_template_file(file_path)
 
 
 def detect_format_from_magic_bytes(
@@ -1358,7 +1354,7 @@ def detect_file_format_from_magic(path: str) -> str:
             if format_result != "unknown":
                 return format_result
 
-            if _could_be_renamed_suspicious_jinja2_template(file_path, header):
+            if _could_be_renamed_suspicious_jinja2_template(file_path):
                 return "jinja2_template"
 
             # CNTKv2 has protobuf-style serialization without a fixed first-8-byte magic.
@@ -1471,7 +1467,7 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if format_result != "unknown":
             return format_result
 
-        if _could_be_renamed_suspicious_jinja2_template(file_path, prefix):
+        if _could_be_renamed_suspicious_jinja2_template(file_path):
             return "jinja2_template"
 
         lightgbm_probe_size = min(size, _LIGHTGBM_SIGNATURE_READ_BYTES)
@@ -1602,7 +1598,7 @@ def detect_file_format(path: str) -> str:
         if xml_format != "unknown":
             return xml_format
 
-    if _could_be_renamed_suspicious_jinja2_template(file_path, header):
+    if _could_be_renamed_suspicious_jinja2_template(file_path):
         return "jinja2_template"
 
     # For .bin files, do more sophisticated detection

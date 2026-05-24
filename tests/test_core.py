@@ -2123,7 +2123,9 @@ def test_scan_file_routes_manifest_owned_chat_templates_through_jinja_analysis(t
 def test_scan_file_routes_renamed_ssti_template_without_routing_benign_chat_template(tmp_path: Path) -> None:
     malicious_file = tmp_path / "payload.jpg"
     benign_file = tmp_path / "chat.jpg"
-    malicious_file.write_text("{{ cycler.__init__.__globals__.os.popen('id').read() }}", encoding="utf-8")
+    malicious_file.write_text(
+        ("x" * 1024) + "{{ cycler.__init__.__globals__.os.popen('id').read() }}", encoding="utf-8"
+    )
     benign_file.write_text("{% for message in messages %}{{ message['content'] }}{% endfor %}", encoding="utf-8")
 
     result = scan_file(str(malicious_file), config={"cache_scan_results": False})
