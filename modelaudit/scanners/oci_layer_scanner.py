@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import urlparse
 
+from ..scanner_results import mark_inconclusive_scan_result
 from ..utils import is_within_directory, sanitize_archive_path
 from ..utils.file.detection import (
     MARKED_PROTOCOL0_GLOBAL_RE,
@@ -50,6 +51,11 @@ class OciLayerScanner(BaseScanner):
     _MEMBER_HEADER_PROBE_BYTES: ClassVar[int] = 64
     _DEFAULT_MAX_LAYER_FILE_SIZE: ClassVar[int] = 10 * 1024 * 1024 * 1024
     _REMOTE_LAYER_REF_SCHEMES: ClassVar[frozenset[str]] = frozenset({"http", "https", "s3", "gs", "oci"})
+
+    @staticmethod
+    def _mark_incomplete_coverage(result: ScanResult, reason: str) -> None:
+        """Record OCI content that could not be inspected without reporting a security finding."""
+        mark_inconclusive_scan_result(result, reason)
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -263,13 +269,18 @@ class OciLayerScanner(BaseScanner):
                 else:
                     raise
         except Exception as e:
+            self._mark_incomplete_coverage(result, "oci_manifest_parse_failed")
             result.add_check(
                 name="OCI Manifest Parse",
                 passed=False,
                 message=f"Error parsing manifest: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception_type": type(e).__name__},
+                details={
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "oci_manifest_parse_failed",
+                },
                 rule_code="S902",
             )
             result.finish(success=False)
@@ -300,26 +311,35 @@ class OciLayerScanner(BaseScanner):
             if not os.path.exists(layer_path):
                 if self._is_remote_layer_ref(layer_ref):
                     scan_complete = False
+                    self._mark_incomplete_coverage(result, "oci_remote_layer_unavailable")
                     result.add_check(
                         name="Remote Layer Resolution Check",
                         passed=False,
                         message=f"Remote layer was not scanned because it is not available locally: {layer_ref}",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=f"{path}:{layer_ref}",
                         details={
                             "layer": layer_ref,
                             "resolved_path": layer_path,
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": "oci_remote_layer_unavailable",
                         },
                         rule_code="S902",
                     )
                     continue
                 scan_complete = False
+                self._mark_incomplete_coverage(result, "oci_layer_missing")
                 result.add_check(
                     name="Layer File Existence Check",
                     passed=False,
                     message=f"Layer not found: {layer_ref}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=f"{path}:{layer_ref}",
+                    details={
+                        "layer": layer_ref,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "oci_layer_missing",
+                    },
                     rule_code="S902",
                 )
                 continue
@@ -327,6 +347,7 @@ class OciLayerScanner(BaseScanner):
                 layer_size = os.path.getsize(layer_path)
                 if self.max_layer_file_size > 0 and layer_size > self.max_layer_file_size:
                     scan_complete = False
+                    self._mark_incomplete_coverage(result, "oci_layer_size_limit_exceeded")
                     result.add_check(
                         name="Layer File Size Check",
                         passed=False,
@@ -334,13 +355,15 @@ class OciLayerScanner(BaseScanner):
                             f"Layer {normalized_layer_ref} is too large to scan: "
                             f"{layer_size} bytes (max: {self.max_layer_file_size})"
                         ),
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=f"{path}:{layer_ref}",
                         details={
                             "layer": layer_ref,
                             "normalized_layer": normalized_layer_ref,
                             "size": layer_size,
                             "max_file_size": self.max_layer_file_size,
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": "oci_layer_size_limit_exceeded",
                         },
                         rule_code="S902",
                     )
@@ -354,6 +377,7 @@ class OciLayerScanner(BaseScanner):
                         matched_ext = self._get_scannable_extension(name)
                         if self.max_layer_file_size > 0 and member.size > self.max_layer_file_size:
                             scan_complete = False
+                            self._mark_incomplete_coverage(result, "oci_member_size_limit_exceeded")
                             result.add_check(
                                 name="Layer Member Size Check",
                                 passed=False,
@@ -361,13 +385,15 @@ class OciLayerScanner(BaseScanner):
                                     f"Layer member {name} is too large to scan: "
                                     f"{member.size} bytes (max: {self.max_layer_file_size})"
                                 ),
-                                severity=IssueSeverity.WARNING,
+                                severity=IssueSeverity.INFO,
                                 location=f"{path}:{layer_ref}:{name}",
                                 details={
                                     "layer": layer_ref,
                                     "member": name,
                                     "size": member.size,
                                     "max_file_size": self.max_layer_file_size,
+                                    "analysis_incomplete": True,
+                                    "scan_outcome_reason": "oci_member_size_limit_exceeded",
                                 },
                                 rule_code="S902",
                             )
@@ -376,13 +402,19 @@ class OciLayerScanner(BaseScanner):
                         fileobj = tar.extractfile(member)
                         if fileobj is None:
                             scan_complete = False
+                            self._mark_incomplete_coverage(result, "oci_member_extraction_failed")
                             result.add_check(
                                 name="Layer Member Extraction",
                                 passed=False,
                                 message=f"Layer member {name} was not extracted from {layer_ref}",
-                                severity=IssueSeverity.WARNING,
+                                severity=IssueSeverity.INFO,
                                 location=f"{path}:{layer_ref}:{name}",
-                                details={"layer": layer_ref, "member": name},
+                                details={
+                                    "layer": layer_ref,
+                                    "member": name,
+                                    "analysis_incomplete": True,
+                                    "scan_outcome_reason": "oci_member_extraction_failed",
+                                },
                                 rule_code="S902",
                             )
                             continue
@@ -449,13 +481,18 @@ class OciLayerScanner(BaseScanner):
                                 os.unlink(tmp_path)
             except Exception as e:
                 scan_complete = False
+                self._mark_incomplete_coverage(result, "oci_layer_processing_failed")
                 result.add_check(
                     name="Layer Processing",
                     passed=False,
                     message=f"Error processing layer {layer_ref}: {e}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=f"{path}:{layer_ref}",
-                    details={"exception_type": type(e).__name__},
+                    details={
+                        "exception_type": type(e).__name__,
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "oci_layer_processing_failed",
+                    },
                     rule_code="S902",
                 )
 
