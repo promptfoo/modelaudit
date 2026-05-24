@@ -166,8 +166,27 @@ class Torch7Scanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        extracted_strings = self._extract_strings(payload)
+        extracted_strings, strings_truncated = self._extract_strings(payload)
         result.metadata["extracted_string_count"] = len(extracted_strings)
+        result.metadata["string_extraction_truncated"] = strings_truncated
+
+        if strings_truncated:
+            mark_inconclusive_scan_result(result, "torch7_string_extraction_limit_exceeded")
+        result.add_check(
+            name="Torch7 Text Fragment Budget",
+            passed=not strings_truncated,
+            message=(
+                "Torch7 text fragment analysis stopped at the configured extraction limit"
+                if strings_truncated
+                else "Torch7 text fragment analysis completed within the configured extraction limit"
+            ),
+            severity=IssueSeverity.INFO if strings_truncated else None,
+            location=path,
+            details={
+                "max_extracted_strings": self.max_extracted_strings,
+                "analysis_incomplete": strings_truncated,
+            },
+        )
 
         self._analyze_execution_primitives(path, extracted_strings, result)
         self._analyze_dynamic_loads(path, extracted_strings, result)
@@ -178,7 +197,7 @@ class Torch7Scanner(BaseScanner):
         )
         return result
 
-    def _extract_strings(self, payload: bytes) -> list[str]:
+    def _extract_strings(self, payload: bytes) -> tuple[list[str], bool]:
         return extract_bounded_printable_strings(
             payload,
             PRINTABLE_TEXT_PATTERN,

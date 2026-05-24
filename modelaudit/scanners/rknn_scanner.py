@@ -203,8 +203,27 @@ class RknnScanner(BaseScanner):
                 location=path,
             )
 
-        extracted_strings = self._extract_strings(payload)
+        extracted_strings, strings_truncated = self._extract_strings(payload)
         result.metadata["extracted_string_count"] = len(extracted_strings)
+        result.metadata["string_extraction_truncated"] = strings_truncated
+
+        if strings_truncated:
+            mark_inconclusive_scan_result(result, "rknn_string_extraction_limit_exceeded")
+        result.add_check(
+            name="RKNN Text Fragment Budget",
+            passed=not strings_truncated,
+            message=(
+                "RKNN text fragment analysis stopped at the configured extraction limit"
+                if strings_truncated
+                else "RKNN text fragment analysis completed within the configured extraction limit"
+            ),
+            severity=IssueSeverity.INFO if strings_truncated else None,
+            location=path,
+            details={
+                "max_extracted_strings": self.max_extracted_strings,
+                "analysis_incomplete": strings_truncated,
+            },
+        )
 
         self._check_path_references(path, extracted_strings, result)
         self._check_command_and_network_indicators(path, extracted_strings, result)
@@ -249,7 +268,7 @@ class RknnScanner(BaseScanner):
             idx = pos + 4
         return count
 
-    def _extract_strings(self, payload: bytes) -> list[str]:
+    def _extract_strings(self, payload: bytes) -> tuple[list[str], bool]:
         return extract_bounded_printable_strings(
             payload,
             PRINTABLE_TEXT_PATTERN,

