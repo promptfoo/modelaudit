@@ -202,11 +202,35 @@ class CatBoostScanner(BaseScanner):
         )
         result.bytes_scanned = header_size + len(core_blob) + len(trailing_blob)
 
-        extracted_strings = self._extract_text_fragments(core_blob, "core") + self._extract_text_fragments(
-            trailing_blob,
-            "trailing",
-        )
+        core_strings, core_strings_truncated = self._extract_text_fragments(core_blob, "core")
+        trailing_strings, trailing_strings_truncated = self._extract_text_fragments(trailing_blob, "trailing")
+        extracted_strings = core_strings + trailing_strings
         result.metadata["extracted_string_count"] = len(extracted_strings)
+
+        truncated_sections = [
+            section
+            for section, truncated in (("core", core_strings_truncated), ("trailing", trailing_strings_truncated))
+            if truncated
+        ]
+        string_analysis_incomplete = bool(truncated_sections)
+        if string_analysis_incomplete:
+            self._mark_inconclusive_scan_result(result, "catboost_string_extraction_limit_exceeded")
+        result.add_check(
+            name="CatBoost Text Fragment Budget",
+            passed=not string_analysis_incomplete,
+            message=(
+                "CatBoost text fragment analysis stopped at the configured extraction limit"
+                if string_analysis_incomplete
+                else "CatBoost text fragment analysis completed within the configured extraction limit"
+            ),
+            severity=IssueSeverity.INFO if string_analysis_incomplete else None,
+            location=path,
+            details={
+                "max_extracted_strings_per_section": self.max_extracted_strings,
+                "truncated_sections": truncated_sections,
+                "analysis_incomplete": string_analysis_incomplete,
+            },
+        )
 
         self._analyze_text_fragments(extracted_strings, result, path)
 
@@ -318,20 +342,20 @@ class CatBoostScanner(BaseScanner):
 
             return core_blob, trailing_blob, header_size, declared_core_size
 
-    def _extract_text_fragments(self, blob: bytes, section: str) -> list[dict[str, str]]:
+    def _extract_text_fragments(self, blob: bytes, section: str) -> tuple[list[dict[str, str]], bool]:
         fragments: list[dict[str, str]] = []
         if not blob:
-            return fragments
+            return fragments, False
 
         for match in _PRINTABLE_TEXT_PATTERN.finditer(blob):
             value = match.group(0).decode("utf-8", errors="ignore").strip()
             if not value:
                 continue
-            fragments.append({"text": value, "section": section})
             if len(fragments) >= self.max_extracted_strings:
-                break
+                return fragments, True
+            fragments.append({"text": value, "section": section})
 
-        return fragments
+        return fragments, False
 
     @staticmethod
     def _summarize_matches(matches: list[dict[str, str]], limit: int = 5) -> list[dict[str, str]]:
