@@ -624,7 +624,8 @@ class NemoScanner(BaseScanner):
             critical_issues = [
                 issue
                 for issue in nested_result.issues
-                if issue.severity == IssueSeverity.CRITICAL and self._is_nested_checkpoint_deserialization_issue(issue)
+                if issue.severity == IssueSeverity.CRITICAL
+                and self._is_nested_checkpoint_deserialization_issue(issue, nested_result.scanner_name)
             ]
             if critical_issues:
                 self._add_checkpoint_deserialization_check(
@@ -733,7 +734,8 @@ class NemoScanner(BaseScanner):
             critical_issues = [
                 issue
                 for issue in nested_result.issues
-                if issue.severity == IssueSeverity.CRITICAL and self._is_nested_checkpoint_deserialization_issue(issue)
+                if issue.severity == IssueSeverity.CRITICAL
+                and self._is_nested_checkpoint_deserialization_issue(issue, nested_result.scanner_name)
             ]
             if critical_issues:
                 self._add_checkpoint_deserialization_check(
@@ -812,8 +814,11 @@ class NemoScanner(BaseScanner):
         return normalized_member.lstrip("./")
 
     @staticmethod
-    def _is_nested_checkpoint_deserialization_issue(issue: Any) -> bool:
+    def _is_nested_checkpoint_deserialization_issue(issue: Any, nested_scanner: str | None = None) -> bool:
         details = issue.details if isinstance(issue.details, dict) else {}
+        if nested_scanner == "torch7" and details.get("signal") == "exec_with_network_shell_context":
+            return True
+
         text = " ".join(
             str(part).lower()
             for part in (
