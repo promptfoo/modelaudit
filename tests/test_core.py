@@ -1901,6 +1901,25 @@ def test_scan_file_does_not_route_gguf_magic_near_match_to_gguf(tmp_path: Path) 
     assert result.issues == []
 
 
+def test_scan_file_keeps_torch_marker_safetensors_on_safetensors_scanner(tmp_path: Path) -> None:
+    file_path = tmp_path / "torch-marker-metadata.safetensors"
+    header = {
+        "__metadata__": {
+            "framework": "torch",
+            "kind": "tensor nn.Sequential",
+            "description": "<script>alert('xss')</script>",
+        },
+        "t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+    }
+    header_bytes = json.dumps(header, separators=(",", ":")).encode()
+    file_path.write_bytes(len(header_bytes).to_bytes(8, "little") + header_bytes + b"\x00" * 4)
+
+    result = scan_file(str(file_path))
+
+    assert result.scanner_name == "safetensors"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
 def test_scan_file_detects_malicious_torch7_with_misleading_suffix(tmp_path: Path) -> None:
     disguised_torch7 = tmp_path / "payload.jpg"
     disguised_torch7.write_bytes(

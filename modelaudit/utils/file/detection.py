@@ -1221,13 +1221,19 @@ def _is_torch7_signature(prefix: bytes) -> bool:
     return has_torch_marker and has_structure_marker
 
 
-def is_strict_torch7_serialized_file(path: str) -> bool:
-    """Return whether an unambiguous bounded probe verifies a Torch7 artifact."""
+def is_torch7_suffix_override_candidate(path: str) -> bool:
+    """Return whether suffix dispatch may be safely overridden by Torch7."""
     try:
         prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
     except OSError:
         return False
-    return prefix.startswith(b"T7\x00\x00") or _has_torch7_ascii_object_signature(prefix)
+    if not _is_torch7_signature(prefix):
+        return False
+
+    content_format = detect_file_format_from_magic(path)
+    if content_format == "torch7":
+        return True
+    return content_format == "onnx" and (prefix.startswith(b"T7\x00\x00") or _has_torch7_ascii_object_signature(prefix))
 
 
 def _is_lightgbm_signature(prefix: bytes) -> bool:
@@ -1421,6 +1427,15 @@ def detect_file_format_from_magic(path: str) -> str:
             if _is_cntk_signature(cntk_prefix):
                 return "cntk"
 
+            # Protocol 0/1 pickle payloads can evade short magic-byte checks.
+            # Probe a bounded prefix and require a valid opcode stream.
+            pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
+            if _looks_like_proto0_or_1_pickle(
+                pickle_probe_sample,
+                sample_is_prefix=size > len(pickle_probe_sample),
+            ):
+                return "pickle"
+
             f.seek(0)
             torch7_prefix = f.read(_TORCH7_SIGNATURE_READ_BYTES)
             if _is_torch7_signature(torch7_prefix):
@@ -1430,14 +1445,6 @@ def detect_file_format_from_magic(path: str) -> str:
             lightgbm_prefix = f.read(_LIGHTGBM_SIGNATURE_READ_BYTES)
             if _is_lightgbm_signature(lightgbm_prefix):
                 return "lightgbm"
-            # Protocol 0/1 pickle payloads can evade short magic-byte checks.
-            # Probe a bounded prefix and require a valid opcode stream.
-            pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
-            if _looks_like_proto0_or_1_pickle(
-                pickle_probe_sample,
-                sample_is_prefix=size > len(pickle_probe_sample),
-            ):
-                return "pickle"
 
             # Check for XML-based formats (OpenVINO and PMML) using the first
             # structural root tag rather than a short raw-byte substring.
@@ -1669,6 +1676,9 @@ def detect_file_format(path: str) -> str:
         )
         if xml_format != "unknown":
             return xml_format
+
+    if _looks_like_safetensors_structure(file_path, magic8, size):
+        return "safetensors"
 
     torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
     if _is_torch7_signature(torch7_prefix):
