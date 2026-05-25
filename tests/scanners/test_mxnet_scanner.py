@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners import get_scanner_for_file
@@ -58,6 +59,33 @@ def _assert_aggregate_inconclusive(result: ModelAuditResultModel, path: Path, re
     assert metadata["analysis_incomplete"] is True
     assert result.success is False
     assert determine_exit_code(result) == 2
+
+
+def _assert_aggregate_inconclusive_not_cached(path: Path, reason: str, cache_dir: Path) -> None:
+    reset_cache_manager()
+    try:
+        first_result = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second_result = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for result in (first_result, second_result):
+            _assert_aggregate_inconclusive(result, path, reason)
+            assert not [
+                issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_mxnet_scanner_can_handle_symbol_and_params(tmp_path: Path) -> None:
@@ -339,16 +367,18 @@ def test_mxnet_symbol_read_failure_aggregate_exit_code_is_inconclusive(
 ) -> None:
     symbol_path = tmp_path / "unreadable-symbol.json"
     _write_symbol_file(symbol_path)
+    symbol_path.write_text(symbol_path.read_text(encoding="utf-8") + (" " * (10 * 1024)), encoding="utf-8")
 
     def raise_os_error(path: Path, max_bytes: int) -> tuple[bytes, bool]:
         raise OSError("symbol read failed")
 
     monkeypatch.setattr(MXNetScanner, "_read_bounded_bytes", staticmethod(raise_os_error))
 
-    result = scan_model_directory_or_file(str(symbol_path), cache_scan_results=False)
-
-    _assert_aggregate_inconclusive(result, symbol_path, "mxnet_symbol_read_failed")
-    assert not [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}]
+    _assert_aggregate_inconclusive_not_cached(
+        symbol_path,
+        "mxnet_symbol_read_failed",
+        tmp_path / "symbol-read-cache",
+    )
 
 
 def test_mxnet_params_read_failure_scan_is_inconclusive(
@@ -385,10 +415,11 @@ def test_mxnet_params_read_failure_aggregate_exit_code_is_inconclusive(
 
     monkeypatch.setattr(MXNetScanner, "_read_bounded_bytes", staticmethod(raise_os_error))
 
-    result = scan_model_directory_or_file(str(params_path), cache_scan_results=False)
-
-    _assert_aggregate_inconclusive(result, params_path, "mxnet_params_read_failed")
-    assert not [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}]
+    _assert_aggregate_inconclusive_not_cached(
+        params_path,
+        "mxnet_params_read_failed",
+        tmp_path / "params-read-cache",
+    )
 
 
 def test_mxnet_truncated_symbol_scan_is_inconclusive(
