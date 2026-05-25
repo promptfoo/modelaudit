@@ -332,7 +332,7 @@ class TestFileFilter:
 
     def test_disguised_lightgbm_binary_prelude_bypasses_default_skip(self, tmp_path: Path) -> None:
         disguised_lightgbm = tmp_path / "binary-model.jpg"
-        disguised_lightgbm.write_bytes(b"\x01opaque prelude\x00" + _build_lightgbm_text().encode("utf-8"))
+        disguised_lightgbm.write_bytes(b"\x01opaque tree prelude\x00" + _build_lightgbm_text().encode("utf-8"))
         prose_prefixed = tmp_path / "notes.jpg"
         prose_prefixed.write_text("notes about a model\n" + _build_lightgbm_text(), encoding="utf-8")
 

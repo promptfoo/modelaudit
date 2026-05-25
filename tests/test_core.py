@@ -920,7 +920,7 @@ def test_scan_file_routes_malicious_lightgbm_with_misleading_extension(tmp_path:
 def test_scan_file_routes_malicious_lightgbm_with_binary_prelude(tmp_path: Path) -> None:
     disguised_lightgbm = tmp_path / "binary-payload.jpg"
     _write_malicious_lightgbm(disguised_lightgbm)
-    disguised_lightgbm.write_bytes(b"\x01opaque prelude\x00" + disguised_lightgbm.read_bytes())
+    disguised_lightgbm.write_bytes(b"\x01opaque tree prelude\x00" + disguised_lightgbm.read_bytes())
 
     result = scan_file(str(disguised_lightgbm))
 

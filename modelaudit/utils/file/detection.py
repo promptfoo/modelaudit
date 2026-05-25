@@ -1254,10 +1254,17 @@ def _is_content_routed_lightgbm_signature(prefix: bytes) -> bool:
     if not native_lines:
         return False
 
-    tree_offset = prefix.lower().find(b"tree")
-    has_binary_prelude = tree_offset > 0 and b"\x00" in prefix[:tree_offset]
-    has_tree_record = native_lines[0].startswith("tree") or (
-        has_binary_prelude and any(line.startswith("tree") for line in native_lines)
+    nul_offset = prefix.find(b"\x00")
+    binary_payload_lines: list[str] = []
+    if nul_offset >= 0:
+        binary_payload_preview = prefix[nul_offset + 1 :].decode("utf-8", errors="ignore").replace("\x00", "\n").lower()
+        binary_payload_lines = [
+            line.lstrip()
+            for line in binary_payload_preview.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    has_tree_record = native_lines[0].startswith("tree") or any(
+        line.startswith("tree") for line in binary_payload_lines
     )
     return has_tree_record and _is_lightgbm_signature(prefix)
 
