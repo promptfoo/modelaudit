@@ -172,6 +172,25 @@ def test_cntk_read_failure_is_inconclusive_not_security_finding(
     assert determine_exit_code(aggregate) == 2
 
 
+def test_cntk_signature_read_failure_still_routes_to_inconclusive_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "signature-unreadable.cmf"
+    _write_cntkv2(path, payload=b" safe metadata ")
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> bytes:
+        raise OSError("simulated CNTK signature read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.cntk_scanner._read_prefix", raise_os_error)
+
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    metadata = aggregate.file_metadata[str(path)]
+    assert "cntk_read_failed" in metadata["scan_outcome_reasons"]
+    assert determine_exit_code(aggregate) == 2
+
+
 def test_cntk_scanner_records_scope_assumptions(tmp_path: Path) -> None:
     path = tmp_path / "safe.cmf"
     _write_cntkv2(path, payload=b" version uid inputs outputs ")

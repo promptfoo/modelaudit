@@ -160,7 +160,7 @@ class LightGBMScanner(BaseScanner):
             with open(path, "rb") as file_obj:
                 preview = file_obj.read(cls._SIGNATURE_READ_BYTES)
         except OSError:
-            return False
+            return True
 
         signature = cls._evaluate_signature(cls._normalize_preview(preview))
         return bool(signature["looks_like"])
