@@ -38,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect embedded Python `os.exec*`, `os.spawn*`, `os.posix_spawn*`, and `os.startfile` process-launch calls
 - detect JIT-scanned embedded Python `os.posix_spawn*` and `os.startfile` process-launch calls while suppressing certain safe replacements
 - detect JIT-scanned embedded Python `subprocess.check_call`, `getoutput`, and `getstatusoutput` calls while suppressing certain safe replacements
+- detect embedded Python `asyncio.create_subprocess_exec` and `asyncio.create_subprocess_shell` process-launch calls
 - preserve embedded Python execution findings when a replacement receiver is conditional, aliased, or a runtime argument
 - fail closed when nested NeMo checkpoint or referenced-artifact analysis is explicitly incomplete
 - preserve concrete nested security findings from checkpoint and referenced artifacts inside NeMo archives

@@ -178,6 +178,7 @@ CODE_EXECUTION_PATTERNS = [
         rb"subprocess\.(call|run|Popen|check_call|check_output|getoutput|getstatusoutput)",
         _SUBPROCESS_CODE_EXECUTION_DESCRIPTION,
     ),
+    (rb"asyncio\.create_subprocess_(?:exec|shell)", _SUBPROCESS_CODE_EXECUTION_DESCRIPTION),
     (rb"os\.(system|popen|exec\w*|spawn\w*|posix_spawnp?|startfile)", _OS_CODE_EXECUTION_DESCRIPTION),
     # Network patterns
     (rb"socket\.(socket|create_connection)", "Socket creation detected"),

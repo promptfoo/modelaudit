@@ -333,6 +333,49 @@ class TestJITScriptDetector:
     @pytest.mark.parametrize(
         "source",
         [
+            b"async def payload():\n    return await asyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
+            b"async def payload():\n    return await asyncio.create_subprocess_shell('id')\n",
+        ],
+    )
+    def test_scan_model_detects_unmarked_asyncio_process_launch(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_certain_replaced_asyncio_process_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"async def payload():\n"
+            b"    asyncio.create_subprocess_shell = len\n"
+            b"    return asyncio.create_subprocess_shell([])\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
+    def test_scan_model_preserves_possible_asyncio_process_launch_after_conditional_replacement(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"async def payload():\n"
+            b"    if replace:\n"
+            b"        asyncio.create_subprocess_exec = len\n"
+            b"    return await asyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
             b"getattr(__builtins__, 'eval')('1 + 1')\n",
             b"__builtins__['eval']('1 + 1')\n",
             b"getattr(__builtins__, 'ev' + 'al')('1 + 1')\n",

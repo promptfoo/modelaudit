@@ -167,6 +167,36 @@ class TestTarScanner:
         assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
 
     @pytest.mark.parametrize(
+        ("payload", "dangerous_name"),
+        [
+            (
+                b"import asyncio\nasyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
+                "asyncio.create_subprocess_exec",
+            ),
+            (
+                b"from asyncio import create_subprocess_shell as run\nrun('id')\n",
+                "asyncio.create_subprocess_shell",
+            ),
+        ],
+    )
+    def test_scan_tar_flags_asyncio_process_launch_python_member(
+        self, tmp_path: Path, payload: bytes, dangerous_name: str
+    ) -> None:
+        archive_path = tmp_path / "model_bundle.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].rule_code == "S103"
+        assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+    @pytest.mark.parametrize(
         "payload",
         [
             b"import os\nos.system.__call__('echo hidden')\n",
@@ -267,6 +297,7 @@ class TestTarScanner:
             b"import os\nos.execvpe = len\nos.execvpe([])\n",
             b"import os\nos.__dict__.update({'spawnv': len})\nos.spawnv([])\n",
             b"import os\nsetattr(os, 'posix_spawn', len)\nos.posix_spawn([])\n",
+            b"import asyncio\nasyncio.create_subprocess_shell = len\nasyncio.create_subprocess_shell([])\n",
         ],
     )
     def test_scan_tar_allows_callable_captured_after_safe_overwrite(self, tmp_path: Path, payload: bytes) -> None:
@@ -309,6 +340,10 @@ class TestTarScanner:
             ),
             b"import os\nimport subprocess\ndict.update(os.__dict__, {'system': subprocess.run})\nos.system(['id'])\n",
             b"import os\nimport subprocess\nos.execvpe = subprocess.run\nos.execvpe(['id'])\n",
+            (
+                b"import asyncio\nimport subprocess\nasyncio.create_subprocess_exec = subprocess.run\n"
+                b"asyncio.create_subprocess_exec(['id'])\n"
+            ),
         ],
     )
     def test_scan_tar_reports_dangerous_setattr_replacement(self, tmp_path: Path, payload: bytes) -> None:

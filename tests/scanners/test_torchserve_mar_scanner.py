@@ -302,6 +302,59 @@ def test_scan_allows_replaced_os_process_launch_handler_api(tmp_path: Path, hand
 
 
 @pytest.mark.parametrize(
+    ("handler_source", "dangerous_name"),
+    [
+        (
+            b"import asyncio\nasync def handle(data, context):\n"
+            b"    return await asyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
+            "asyncio.create_subprocess_exec",
+        ),
+        (
+            b"from asyncio import create_subprocess_shell as run\nasync def handle(data, context):\n"
+            b"    return await run('id')\n",
+            "asyncio.create_subprocess_shell",
+        ),
+    ],
+)
+def test_scan_detects_asyncio_process_launch_handler_execution_primitive(
+    tmp_path: Path, handler_source: bytes, dangerous_name: str
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={"handler.py": handler_source, "weights.bin": b"weights"},
+        filename="asyncio_process_launch_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(handler_failures) == 1
+    assert handler_failures[0].severity == IssueSeverity.CRITICAL
+    assert dangerous_name in handler_failures[0].message
+
+
+def test_scan_allows_replaced_asyncio_process_launch_handler_api(tmp_path: Path) -> None:
+    handler_source = (
+        b"import asyncio\nasync def handle(data, context):\n"
+        b"    asyncio.create_subprocess_shell = len\n"
+        b"    return asyncio.create_subprocess_shell([])\n"
+    )
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={"handler.py": handler_source, "weights.bin": b"weights"},
+        filename="safe_replaced_asyncio_process_launch_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
+
+
+@pytest.mark.parametrize(
     "handler_source",
     [
         b"def handle(data, context):\n    return __builtins__['ev' + 'al']('1 + 1')\n",

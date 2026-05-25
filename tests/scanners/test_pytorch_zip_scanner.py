@@ -1143,6 +1143,65 @@ def test_pytorch_zip_ignores_nonexecuting_or_replaced_subprocess_launch_in_archi
 @pytest.mark.parametrize(
     "payload",
     [
+        b"async def payload():\n    return await asyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
+        b"async def payload():\n    return await asyncio.create_subprocess_shell('id')\n",
+    ],
+)
+def test_pytorch_zip_scans_unmarked_asyncio_process_launch_in_archive_data(tmp_path: Path, payload: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    jit_failures = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert any(
+        check.location == f"{zip_path}:archive/data/payload.bin" and "Subprocess execution detected" in check.message
+        for check in jit_failures
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        (
+            b"async def payload():\n"
+            b"    asyncio.create_subprocess_exec = len\n"
+            b"    return asyncio.create_subprocess_exec([])\n"
+        ),
+        (
+            b"async def payload():\n"
+            b"    asyncio.create_subprocess_shell = len\n"
+            b"    return asyncio.create_subprocess_shell([])\n"
+        ),
+    ],
+)
+def test_pytorch_zip_ignores_certain_replaced_asyncio_process_launch_in_archive_data(
+    tmp_path: Path, payload: bytes
+) -> None:
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
         b"getattr(__builtins__, 'eval')('1 + 1')\n",
         b"__builtins__['ev' + 'al']('1 + 1')\n",
         b"__builtins__.__dict__.get('eval')('1 + 1')\n",

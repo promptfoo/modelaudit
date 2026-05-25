@@ -218,6 +218,57 @@ def test_scan_zip_flags_aliased_os_process_launch_python_member(tmp_path: Path) 
 
 
 @pytest.mark.parametrize(
+    ("source", "dangerous_name"),
+    [
+        (
+            "import asyncio\nasyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
+            "asyncio.create_subprocess_exec",
+        ),
+        (
+            "from asyncio import create_subprocess_shell as run\nrun('id')\n",
+            "asyncio.create_subprocess_shell",
+        ),
+    ],
+)
+def test_scan_zip_flags_asyncio_process_launch_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S103"
+    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+
+def test_scan_zip_preserves_possible_asyncio_launch_after_conditional_overwrite(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "import asyncio\nif replace:\n    asyncio.create_subprocess_shell = len\n"
+        "asyncio.create_subprocess_shell('id')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S103"
+    assert python_checks[0].details["reason"] == "high-risk calls: asyncio.create_subprocess_shell"
+
+
+@pytest.mark.parametrize(
     "source",
     [
         "import os\nos.system.__call__('echo hidden')\n",
@@ -364,6 +415,7 @@ def test_scan_zip_preserves_captured_dangerous_callable_before_overwrite(tmp_pat
         "import os\nos.execvpe = len\nos.execvpe([])\n",
         "import os\nos.__dict__.update({'spawnv': len})\nos.spawnv([])\n",
         "import os\nsetattr(os, 'posix_spawn', len)\nos.posix_spawn([])\n",
+        "import asyncio\nasyncio.create_subprocess_shell = len\nasyncio.create_subprocess_shell([])\n",
     ],
 )
 def test_scan_zip_allows_callable_captured_after_safe_overwrite(tmp_path: Path, source: str) -> None:
@@ -415,6 +467,10 @@ def test_scan_zip_flags_from_import_dangerous_python_member(tmp_path: Path) -> N
             "os.__dict__.update({'system': subprocess.run})\nos.system(['id'])\n"
         ),
         "import os\nimport subprocess\nos.execvpe = subprocess.run\nos.execvpe(['id'])\n",
+        (
+            "import asyncio\nimport subprocess\nasyncio.create_subprocess_exec = subprocess.run\n"
+            "asyncio.create_subprocess_exec(['id'])\n"
+        ),
     ],
 )
 def test_scan_zip_reports_dangerous_setattr_replacement(tmp_path: Path, source: str) -> None:
