@@ -245,6 +245,34 @@ class TestTarScanner:
         assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
 
     @pytest.mark.parametrize(
+        ("payload", "dangerous_name"),
+        [
+            (b"import webbrowser\nwebbrowser.open('https://evil.example')\n", "webbrowser.open"),
+            (
+                b"from webbrowser import open_new as launch\nlaunch('https://evil.example')\n",
+                "webbrowser.open_new",
+            ),
+            (b"import webbrowser\nwebbrowser.open_new_tab('https://evil.example')\n", "webbrowser.open_new_tab"),
+        ],
+    )
+    def test_scan_tar_flags_webbrowser_launch_python_member(
+        self, tmp_path: Path, payload: bytes, dangerous_name: str
+    ) -> None:
+        archive_path = tmp_path / "model_bundle.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].rule_code == "S109"
+        assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+    @pytest.mark.parametrize(
         "payload",
         [
             b"import os\nos.system.__call__('echo hidden')\n",
@@ -348,6 +376,7 @@ class TestTarScanner:
             b"import asyncio\nasyncio.create_subprocess_shell = len\nasyncio.create_subprocess_shell([])\n",
             b"import pty\npty.spawn = len\npty.spawn([])\n",
             b"import runpy\nrunpy.run_path = len\nrunpy.run_path([])\n",
+            b"import webbrowser\nwebbrowser.open = len\nwebbrowser.open([])\n",
         ],
     )
     def test_scan_tar_allows_callable_captured_after_safe_overwrite(self, tmp_path: Path, payload: bytes) -> None:
@@ -1054,6 +1083,11 @@ class TestTarScanner:
             ),
             (b"import pty\npty.spawn('/bin/sh')\n", "S111", "pty.spawn"),
             (b"import runpy\nrunpy.run_path('payload.py')\n", "S108", "runpy.run_path"),
+            (
+                b"import webbrowser\nwebbrowser.open_new_tab('https://evil.example')\n",
+                "S109",
+                "webbrowser.open_new_tab",
+            ),
             (b"import importlib\nimportlib.import_module('os')\n", "S107", "importlib.import_module"),
             (b"eval('1 + 1')\n", "S104", "eval"),
             (b"import pickle\npickle.loads(b'\\x80\\x04N.')\n", "S213", "pickle.loads"),

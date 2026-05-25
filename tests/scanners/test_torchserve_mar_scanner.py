@@ -442,6 +442,61 @@ def test_scan_allows_replaced_runpy_handler_api(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("handler_source", "dangerous_name"),
+    [
+        (
+            b"import webbrowser\ndef handle(data, context):\n    return webbrowser.open('https://evil.example')\n",
+            "webbrowser.open",
+        ),
+        (
+            b"from webbrowser import open_new as launch\ndef handle(data, context):\n"
+            b"    return launch('https://evil.example')\n",
+            "webbrowser.open_new",
+        ),
+        (
+            b"import webbrowser\ndef handle(data, context):\n"
+            b"    return webbrowser.open_new_tab('https://evil.example')\n",
+            "webbrowser.open_new_tab",
+        ),
+    ],
+)
+def test_scan_detects_webbrowser_handler_launch_primitive(
+    tmp_path: Path, handler_source: bytes, dangerous_name: str
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={"handler.py": handler_source, "weights.bin": b"weights"},
+        filename="webbrowser_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(handler_failures) == 1
+    assert handler_failures[0].severity == IssueSeverity.CRITICAL
+    assert dangerous_name in handler_failures[0].message
+
+
+def test_scan_allows_replaced_webbrowser_handler_api(tmp_path: Path) -> None:
+    handler_source = (
+        b"import webbrowser\ndef handle(data, context):\n    webbrowser.open = len\n    return webbrowser.open([])\n"
+    )
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={"handler.py": handler_source, "weights.bin": b"weights"},
+        filename="safe_replaced_webbrowser_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
+
+
+@pytest.mark.parametrize(
     "handler_source",
     [
         b"def handle(data, context):\n    return __builtins__['ev' + 'al']('1 + 1')\n",

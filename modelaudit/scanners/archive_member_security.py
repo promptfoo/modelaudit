@@ -95,6 +95,13 @@ _RUNPY_CODE_EXECUTION_CALLS = frozenset(
         "runpy.run_path",
     }
 )
+_WEBBROWSER_LAUNCH_CALLS = frozenset(
+    {
+        "webbrowser.open",
+        "webbrowser.open_new",
+        "webbrowser.open_new_tab",
+    }
+)
 _HIGH_RISK_PYTHON_CALLS = {
     "__import__",
     "__builtin__.__import__",
@@ -120,6 +127,7 @@ _HIGH_RISK_PYTHON_CALLS = {
     *_ASYNCIO_PROCESS_EXECUTION_CALLS,
     *_PTY_PROCESS_EXECUTION_CALLS,
     *_RUNPY_CODE_EXECUTION_CALLS,
+    *_WEBBROWSER_LAUNCH_CALLS,
 }
 # Retain broad subprocess coverage while excluding public APIs that only construct data.
 _KNOWN_NON_EXECUTING_SUBPROCESS_CALLS = {
@@ -154,6 +162,7 @@ _HIGH_RISK_PYTHON_CALL_RULE_CODES: dict[str, str] = {
     **dict.fromkeys(_ASYNCIO_PROCESS_EXECUTION_CALLS, "S103"),
     **dict.fromkeys(_PTY_PROCESS_EXECUTION_CALLS, "S111"),
     **dict.fromkeys(_RUNPY_CODE_EXECUTION_CALLS, "S108"),
+    **dict.fromkeys(_WEBBROWSER_LAUNCH_CALLS, "S109"),
 }
 _HIGH_RISK_PYTHON_CALL_PREFIX_RULE_CODES: tuple[tuple[str, str], ...] = (("subprocess.", "S103"),)
 _FALLBACK_HIGH_RISK_RULE_CODE = "S104"

@@ -491,6 +491,42 @@ class TestJITScriptDetector:
     @pytest.mark.parametrize(
         "source",
         [
+            b"def payload():\n    return webbrowser.open('https://evil.example')\n",
+            b"def payload():\n    from webbrowser import open_new as launch\n    return launch('https://evil.example')\n",
+            b"def payload():\n    return webbrowser.open_new_tab('https://evil.example')\n",
+        ],
+    )
+    def test_scan_model_detects_unmarked_webbrowser_launch(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(f.type == "code_execution_pattern" and f.pattern == "Web browser launch detected" for f in findings)
+
+    def test_scan_model_ignores_certain_replaced_webbrowser_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = b"def payload():\n    webbrowser.open = len\n    return webbrowser.open([])\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
+    def test_scan_model_preserves_possible_webbrowser_launch_after_conditional_replacement(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def payload():\n"
+            b"    if replace:\n"
+            b"        webbrowser.open = len\n"
+            b"    return webbrowser.open('https://evil.example')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(f.type == "code_execution_pattern" and f.pattern == "Web browser launch detected" for f in findings)
+
+    @pytest.mark.parametrize(
+        "source",
+        [
             b"getattr(__builtins__, 'eval')('1 + 1')\n",
             b"__builtins__['eval']('1 + 1')\n",
             b"getattr(__builtins__, 'ev' + 'al')('1 + 1')\n",

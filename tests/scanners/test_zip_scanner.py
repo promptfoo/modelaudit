@@ -353,6 +353,49 @@ def test_scan_zip_preserves_possible_runpy_execution_after_conditional_overwrite
 
 
 @pytest.mark.parametrize(
+    ("source", "dangerous_name"),
+    [
+        ("import webbrowser\nwebbrowser.open('https://evil.example')\n", "webbrowser.open"),
+        ("from webbrowser import open_new as launch\nlaunch('https://evil.example')\n", "webbrowser.open_new"),
+        ("import webbrowser\nwebbrowser.open_new_tab('https://evil.example')\n", "webbrowser.open_new_tab"),
+    ],
+)
+def test_scan_zip_flags_webbrowser_launch_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S109"
+    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+
+def test_scan_zip_preserves_possible_webbrowser_launch_after_conditional_overwrite(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import webbrowser\nif replace:\n    webbrowser.open = len\nwebbrowser.open('https://evil.example')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S109"
+    assert python_checks[0].details["reason"] == "high-risk calls: webbrowser.open"
+
+
+@pytest.mark.parametrize(
     "source",
     [
         "import os\nos.system.__call__('echo hidden')\n",
@@ -502,6 +545,7 @@ def test_scan_zip_preserves_captured_dangerous_callable_before_overwrite(tmp_pat
         "import asyncio\nasyncio.create_subprocess_shell = len\nasyncio.create_subprocess_shell([])\n",
         "import pty\npty.spawn = len\npty.spawn([])\n",
         "import runpy\nrunpy.run_path = len\nrunpy.run_path([])\n",
+        "import webbrowser\nwebbrowser.open = len\nwebbrowser.open([])\n",
     ],
 )
 def test_scan_zip_allows_callable_captured_after_safe_overwrite(tmp_path: Path, source: str) -> None:
@@ -1373,6 +1417,7 @@ def test_scan_zip_ignores_benign_python_file_operations(tmp_path: Path) -> None:
         ("import subprocess\nsubprocess.getstatusoutput('echo hidden')\n", "S103", "subprocess.getstatusoutput"),
         ("import pty\npty.spawn('/bin/sh')\n", "S111", "pty.spawn"),
         ("import runpy\nrunpy.run_path('payload.py')\n", "S108", "runpy.run_path"),
+        ("import webbrowser\nwebbrowser.open_new_tab('https://evil.example')\n", "S109", "webbrowser.open_new_tab"),
         ("import importlib\nimportlib.import_module('os')\n", "S107", "importlib.import_module"),
         ("eval('1 + 1')\n", "S104", "eval"),
         ("import pickle\npickle.loads(b'\\x80\\x04N.')\n", "S213", "pickle.loads"),
