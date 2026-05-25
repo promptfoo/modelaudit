@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.utils.file.detection import LLAMAFILE_ROUTE_SCAN_BYTES, LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
 from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
 
 
@@ -275,6 +276,114 @@ class TestDirectoryFileFiltering:
         results = scan_model_directory_or_file(str(tmp_path))
 
         assert results["files_scanned"] == 0
+
+    def test_disguised_llamafile_probe_failure_is_not_skipped(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An unreadable content probe must not turn a candidate into a clean skip."""
+        payload = tmp_path / "payload.jpg"
+        payload.write_bytes(b"\x7fELF" + b"\x00" * 60 + b"llamafile runtime")
+
+        def raise_os_error(_path: Path, _marker: bytes, _limit: int) -> bool:
+            raise OSError("synthetic marker probe failure")
+
+        monkeypatch.setattr("modelaudit.utils.file.detection._contains_casefolded_marker_in_prefix", raise_os_error)
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert results.file_metadata[str(payload)]["scan_outcome"] == "inconclusive"
+        assert determine_exit_code(results) == 2
+
+    def test_disguised_llamafile_zip_polyglot_preserves_nested_findings(self, tmp_path: Path) -> None:
+        """A renamed executable ZIP wrapper must retain recursive member scanning."""
+
+        class DangerousPayload:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo directory-llamafile-zip-test",))
+
+        payload = tmp_path / "payload.jpg"
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("payload.pkl", pickle.dumps(DangerousPayload()))
+        payload.write_bytes(b"\x7fELF" + b"\x00" * 60 + b"llamafile runtime\n" + payload.read_bytes())
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "llamafile" in results.scanner_names
+        assert any(issue.severity.name == "CRITICAL" for issue in results.issues)
+
+    def test_disguised_llamafile_skops_polyglot_preserves_cve_findings(self, tmp_path: Path) -> None:
+        """Subtype-owned CVE checks must survive executable wrapper routing."""
+        payload = tmp_path / "skops-cve.jpg"
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr(
+                "schema.json",
+                '{"__loader__": "OperatorFuncNode", "__module__": "builtins", "__class__": "eval", '
+                '"_skops_version": "0.11.0", "content": {}}',
+            )
+        payload.write_bytes(b"\x7fELF" + b"\x00" * 60 + b"llamafile runtime\n" + payload.read_bytes())
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "llamafile" in results.scanner_names
+        assert any(issue.rule_code == "CVE-2025-54412" or "CVE-2025-54412" in issue.message for issue in results.issues)
+
+    def test_executable_zip_with_out_of_window_llamafile_marker_preserves_nested_findings(self, tmp_path: Path) -> None:
+        """ZIP structure must preserve coverage independently of bounded marker routing."""
+
+        class DangerousPayload:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo directory-late-marker-zip-test",))
+
+        payload = tmp_path / "payload.jpg"
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("payload.pkl", pickle.dumps(DangerousPayload()))
+        payload.write_bytes(
+            b"\x7fELF"
+            + b"\x00" * 60
+            + b"A" * LLAMAFILE_ROUTE_SCAN_BYTES
+            + b"llamafile runtime"
+            + b"B" * LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
+            + payload.read_bytes()
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "zip" in results.scanner_names
+        assert any(issue.severity.name == "CRITICAL" for issue in results.issues)
+
+    def test_out_of_window_executable_skops_zip_preserves_cve_findings(self, tmp_path: Path) -> None:
+        """Late-marker executable ZIPs still require subtype-owned checks."""
+        payload = tmp_path / "skops-late-marker.jpg"
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr(
+                "schema.json",
+                '{"__loader__": "OperatorFuncNode", "__module__": "builtins", "__class__": "eval", '
+                '"_skops_version": "0.11.0", "content": {}}',
+            )
+        payload.write_bytes(
+            b"\x7fELF"
+            + b"\x00" * 60
+            + b"A" * LLAMAFILE_ROUTE_SCAN_BYTES
+            + b"llamafile runtime"
+            + b"B" * LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
+            + payload.read_bytes()
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "zip" in results.scanner_names
+        assert any("CVE-2025-54412" in issue.message for issue in results.issues)
 
     def test_disguised_executorch_zip_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         """Directory scans should preserve disguised ZIPs that contain supported ExecuTorch payloads."""

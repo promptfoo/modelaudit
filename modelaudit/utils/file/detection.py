@@ -136,6 +136,8 @@ _XML_MODEL_ROOT_FORMATS = {
     "pmml": "pmml",
 }
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
+LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT = "llamafile_routing_inconclusive"
+EXECUTABLE_ZIP_POLYGLOT_FORMAT = "executable_zip_polyglot"
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -170,7 +172,12 @@ def _contains_casefolded_marker_in_prefix(path: Path, marker: bytes, max_scan_by
     return False
 
 
-def is_llamafile_executable(path: str | Path, header: bytes | None = None) -> bool:
+def is_llamafile_executable(
+    path: str | Path,
+    header: bytes | None = None,
+    *,
+    raise_on_error: bool = False,
+) -> bool:
     """Recognize an executable Llamafile using bounded content inspection."""
     file_path = Path(path)
     try:
@@ -184,13 +191,29 @@ def is_llamafile_executable(path: str | Path, header: bytes | None = None) -> bo
         if _contains_casefolded_marker_in_prefix(file_path, LLAMAFILE_MARKER, LLAMAFILE_ROUTE_SCAN_BYTES):
             return True
         size = file_path.stat().st_size
-        if size <= LLAMAFILE_ROUTE_TAIL_SCAN_BYTES:
+        if size <= LLAMAFILE_ROUTE_SCAN_BYTES:
             return False
         with file_path.open("rb") as handle:
             handle.seek(size - LLAMAFILE_ROUTE_TAIL_SCAN_BYTES)
             return LLAMAFILE_MARKER in handle.read(LLAMAFILE_ROUTE_TAIL_SCAN_BYTES).lower()
     except OSError:
+        if raise_on_error:
+            raise
         return False
+
+
+def _detect_llamafile_route_format(path: Path, header: bytes) -> str | None:
+    """Return a Llamafile route or an explicit incomplete-routing outcome."""
+    if not _is_supported_llamafile_executable_header(header):
+        return None
+    try:
+        if is_llamafile_executable(path, header, raise_on_error=True):
+            return "llamafile"
+    except OSError:
+        return LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT
+    if zipfile.is_zipfile(path):
+        return EXECUTABLE_ZIP_POLYGLOT_FORMAT
+    return None
 
 
 def _has_rar_magic(data: bytes) -> bool:
@@ -1371,8 +1394,9 @@ def detect_file_format_from_magic(path: str) -> str:
             if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
                 return "executorch"
 
-            if is_llamafile_executable(file_path, magic4):
-                return "llamafile"
+            llamafile_format = _detect_llamafile_route_format(file_path, magic4)
+            if llamafile_format is not None:
+                return llamafile_format
 
             # Try the new pattern matching approach first
             format_result = detect_format_from_magic_bytes(magic4, magic8, magic16, size, file_path)
@@ -1481,9 +1505,9 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             return "tflite"
         if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
             return "executorch"
-        if is_llamafile_executable(file_path, magic4):
-            return "llamafile"
-
+        llamafile_format = _detect_llamafile_route_format(file_path, magic4)
+        if llamafile_format is not None:
+            return llamafile_format
         format_result = detect_format_from_magic_bytes(magic4, magic8, magic16, size, file_path)
         if format_result == "zip":
             return "zip"
@@ -1573,8 +1597,9 @@ def detect_file_format(path: str) -> str:
         return "gguf"
     if magic4 in GGML_MAGIC_VARIANTS:
         return "ggml"
-    if is_llamafile_executable(file_path, magic4):
-        return "llamafile"
+    llamafile_format = _detect_llamafile_route_format(file_path, magic4)
+    if llamafile_format is not None:
+        return llamafile_format
 
     ext = file_path.suffix.lower()
     filename_lower = file_path.name.lower()

@@ -214,7 +214,7 @@ modelaudit scan ./archive.zip --scanners zip,pickle
 
 `--scanners` starts from an explicit allowlist. `--exclude-scanner` subtracts scanners from either that allowlist or the default scanner set. Scanner selection is reflected in JSON output under `scanner_selection`.
 
-For remote folders, ModelAudit narrows downloads by selected scanner extensions when safe, and keeps filtering conservative for container or header-routed scanners to avoid dropping extension-spoofed artifacts before scanning.
+For remote folders, ModelAudit narrows downloads by selected scanner extensions when safe. Content-based renamed-wrapper routing applies after acquisition; scan a direct file URL when repository filenames may be intentionally misleading.
 
 ## Metadata Extraction
 

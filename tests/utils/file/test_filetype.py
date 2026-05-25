@@ -951,7 +951,7 @@ def test_validate_file_type(tmp_path):
     assert detect_file_format_from_magic(str(invalid_executorch_path)) == "unknown"
     assert validate_file_type(str(invalid_executorch_path)) is False
 
-    # Llamafile wrappers validate through bounded executable and runtime-marker checks.
+    # Llamafile extensions remain eligible for scanner-level executable and marker checks.
     llamafile_path = tmp_path / "model.llamafile"
     llamafile_path.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile")
     assert validate_file_type(str(llamafile_path)) is True

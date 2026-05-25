@@ -49,7 +49,7 @@ This page shows which model formats work in base install and which require optio
 - Compressed wrappers enforce limits via `compressed_max_decompressed_bytes`, `compressed_max_decompression_ratio`, and `compressed_max_depth`.
 - R serialized (`.rds/.rda/.rdata`) support is static-only: ModelAudit does not execute R code or evaluate objects in an R runtime.
 - CNTK scanner scope in v1 is `.dnn`/`.cmf`; `.model` remains owned by XGBoost overlap handling.
-- Llamafile wrappers are executable by design and are identified from executable content plus the runtime marker even when renamed: executable presence is reported at `INFO`, and severity escalates only when suspicious runtime indicators or malformed embedded payloads are found.
+- Acquired Llamafile wrappers are executable by design; renamed wrappers are identified through bounded executable-content and runtime-marker probes. Executable presence is reported at `INFO`; suspicious runtime indicators or malformed embedded payloads may escalate Llamafile-specific findings, while conflicting recognized suffixes may also trigger a format-mismatch `WARNING`. Selective remote folder acquisition remains filename-filtered.
 - RAR archives are recognized so they do not disappear from directory scans; ModelAudit reports them as unsupported coverage with a non-clean result.
 - `modelaudit doctor --show-failed` shows unavailable scanners and missing dependencies in your environment.
 - If you need predictable CI behavior across many formats, prefer `modelaudit[all]`; ONNX is included on Python 3.10-3.12, and TensorFlow runtime-dependent paths require adding `modelaudit[tensorflow]` on Python 3.11-3.12.

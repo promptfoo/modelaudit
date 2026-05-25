@@ -37,11 +37,16 @@ from modelaudit.scanner_selection import (
     selected_scanner_extensions,
 )
 from modelaudit.scanners import _registry
-from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
+from modelaudit.scanners.archive_dispatch import (
+    NESTED_SCAN_CALLBACK_CONFIG_KEY,
+    merge_executable_zip_container_findings,
+)
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.file.detection import (
+    EXECUTABLE_ZIP_POLYGLOT_FORMAT,
+    LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
     detect_file_format,
     detect_file_format_from_magic,
@@ -115,6 +120,7 @@ _XGBOOST_BINARY_EXTENSIONS = frozenset({".bst"})
 _XGBOOST_PICKLE_SPOOF_REASON = "xgboost_binary_pickle_spoof"
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
+_LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
 _ShardFamilyKey = tuple[str, str, int | None]
 _ScanEntry = tuple[str, list[str], _ShardFamilyKey | None]
 _SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY = "shard_family_cache_fingerprint"
@@ -316,6 +322,44 @@ def _make_incomplete_xml_model_result(path: str) -> ScanResult:
     _mark_inconclusive_scan_outcome(result, _XML_MODEL_ROUTING_INCOMPLETE_REASON)
     _mark_operational_scan_error(result, _XML_MODEL_ROUTING_INCOMPLETE_REASON)
     result.finish(success=False)
+    return result
+
+
+def _make_incomplete_llamafile_routing_result(path: str, config: dict[str, Any]) -> ScanResult:
+    """Fail closed when an executable Llamafile marker probe cannot complete."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="Llamafile Routing",
+        passed=False,
+        message="Llamafile routing was inconclusive because bounded marker bytes could not be read",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _LLAMAFILE_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _LLAMAFILE_ROUTING_INCOMPLETE_REASON)
+
+    merge_executable_zip_container_findings(
+        path,
+        result,
+        config,
+        context="inconclusive executable ZIP polyglot",
+    )
+
+    result.finish(success=False)
+    return result
+
+
+def _scan_executable_zip_polyglot(path: str, config: dict[str, Any]) -> ScanResult:
+    """Preserve container and subtype analysis for executable-prefixed ZIPs."""
+    result = ScanResult(scanner_name="zip")
+    merge_executable_zip_container_findings(
+        path,
+        result,
+        config,
+        context="executable ZIP polyglot",
+    )
+    result.finish(success=not result.has_errors)
     return result
 
 
@@ -1392,6 +1436,17 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     # Validate file type consistency as a security check
     magic_format = detect_file_format_from_magic(path)
+    if header_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT or magic_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
+        sr = _make_incomplete_llamafile_routing_result(path, config)
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
+    if header_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT or magic_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT:
+        sr = _scan_executable_zip_polyglot(path, config)
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
+
     file_type_valid = validate_file_type_with_formats(path, magic_format, ext_format)
     discrepancy_msg = None
 
@@ -1558,6 +1613,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
             if magic_format == XML_MODEL_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_xml_model_result(path)
+            elif magic_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_llamafile_routing_result(path, config)
             elif magic_format == "unknown":
                 # Not a recognized model format — skip silently
                 sr = ScanResult(scanner_name="unknown")
