@@ -12,8 +12,8 @@ pytest.importorskip("h5py")
 import h5py
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.keras_h5_scanner import KerasH5Scanner
 
 ASSETS_DIR = Path(__file__).parent.parent / "assets" / "samples" / "keras"
@@ -405,6 +405,50 @@ def test_keras_h5_malformed_model_config_json_returns_inconclusive_exit2(tmp_pat
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_keras_h5_corrupt_magic_confirmed_file_is_inconclusive_and_uncached(tmp_path: Path) -> None:
+    """A routed but unreadable HDF5 container is incomplete coverage, not malicious evidence."""
+    model_path = tmp_path / "corrupt_magic_confirmed.h5"
+    model_path.write_bytes(b"\x89HDF\r\n\x1a\n" + b"truncated")
+    cache_dir = tmp_path / "cache"
+
+    direct_result = KerasH5Scanner().scan(str(model_path))
+    routed_result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert routed_result.scanner_name == "keras_h5"
+    assert direct_result.success is False
+    assert direct_result.has_errors is False
+    assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "keras_h5_read_failed" in direct_result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "Keras H5 Read" and check.status == CheckStatus.FAILED for check in direct_result.checks)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in direct_result.issues)
+
+    reset_cache_manager()
+    try:
+        first_result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second_result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for result in (first_result, second_result):
+            metadata = result.file_metadata[str(model_path)]
+            assert determine_exit_code(result) == 2
+            assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            assert "keras_h5_read_failed" in metadata.get("scan_outcome_reasons")
+            assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 @pytest.mark.parametrize(
     ("training_config", "reason", "expected_check_name", "expected_message_substring"),
     [
@@ -489,6 +533,46 @@ def test_keras_h5_inconclusive_training_config_preserves_security_exit1(tmp_path
     assert determine_exit_code(audit_result) == 1
 
 
+def test_keras_h5_read_failure_preserves_prior_security_finding_exit1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later HDF5 read failure must not discard an already identified malicious layer."""
+    model_path = create_raw_config_h5_file(
+        tmp_path,
+        model_config_attr=json.dumps(
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [
+                        {
+                            "class_name": "Lambda",
+                            "config": {"function": "lambda x: eval('1')"},
+                        }
+                    ]
+                },
+            }
+        ),
+        training_config_attr=json.dumps({}),
+        keras_version="3.11.2",
+        file_name="lambda_with_hdf5_read_failure.h5",
+    )
+
+    def fail_training_config(self: KerasH5Scanner, training_config: Any, result: ScanResult) -> None:
+        raise OSError("damaged training metadata")
+
+    monkeypatch.setattr(KerasH5Scanner, "_scan_training_config", fail_training_config)
+
+    result = KerasH5Scanner().scan(str(model_path))
+    audit_result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "keras_h5_read_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "Keras H5 Read" and check.status == CheckStatus.FAILED for check in result.checks)
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert determine_exit_code(audit_result) == 1
+
+
 def test_keras_h5_inconclusive_scan_outcome_uncached_rerun_preserves_exit2(tmp_path: Path) -> None:
     """Uncached Keras H5 inconclusive results must still produce exit 2 on subsequent scans."""
     model_path = create_custom_h5_file(
@@ -549,8 +633,8 @@ def test_keras_h5_scanner_malicious_model(tmp_path):
     )
 
 
-def test_keras_h5_scanner_invalid_h5(tmp_path):
-    """Test scanning an invalid H5 file."""
+def test_keras_h5_scanner_invalid_h5(tmp_path: Path) -> None:
+    """A directly scanned invalid H5 file should report incomplete coverage."""
     # Create an invalid H5 file (without magic bytes)
     invalid_path = tmp_path / "invalid.h5"
     invalid_path.write_bytes(b"This is not a valid HDF5 file")
@@ -558,12 +642,11 @@ def test_keras_h5_scanner_invalid_h5(tmp_path):
     scanner = KerasH5Scanner()
     result = scanner.scan(str(invalid_path))
 
-    # Should have an error about invalid H5
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "keras_h5_read_failed" in result.metadata["scan_outcome_reasons"]
     assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
-    assert any(
-        "invalid" in issue.message.lower() or "not an hdf5" in issue.message.lower() or "error" in issue.message.lower()
-        for issue in result.issues
-    )
+    assert any(check.name == "Keras H5 Read" and check.status == CheckStatus.FAILED for check in result.checks)
 
 
 def test_keras_h5_scanner_with_blacklist(tmp_path):
