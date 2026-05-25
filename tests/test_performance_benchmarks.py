@@ -1,3 +1,4 @@
+import gc
 import json
 import os
 import statistics
@@ -182,7 +183,7 @@ class TestPerformanceBenchmarks:
             assert degradation_ratio < 5.0, f"Performance degrades too much with scale (ratio: {degradation_ratio:.2f})"
 
     @pytest.mark.performance
-    def test_memory_usage_stability(self, assets_dir):
+    def test_memory_usage_stability(self, assets_dir: Path) -> None:
         """Test that memory usage remains stable during scanning."""
         if not assets_dir.exists():
             pytest.skip("Assets directory does not exist")
@@ -195,13 +196,21 @@ class TestPerformanceBenchmarks:
             pytest.skip("psutil not available for memory testing")
 
         process = psutil.Process(os.getpid())
+
+        # Exclude lazy imports and process-scoped caches from retained-growth measurement.
+        warmup_results = scan_model_directory_or_file(str(assets_dir))
+        assert warmup_results.success, "Warm-up scan should succeed"
+        del warmup_results
+        gc.collect()
         initial_memory = process.memory_info().rss / 1024 / 1024  # MB
 
-        # Perform multiple scans
-        for _ in range(5):
+        # Keep five total scans while measuring repeat-scan stability after warm-up.
+        for _ in range(4):
             results = scan_model_directory_or_file(str(assets_dir))
             assert results.success, "Scan should succeed"
 
+        del results
+        gc.collect()
         final_memory = process.memory_info().rss / 1024 / 1024  # MB
         memory_growth = final_memory - initial_memory
 
