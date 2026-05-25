@@ -10,6 +10,9 @@ from typing import Any
 
 import pytest
 
+from modelaudit import core
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.weight_distribution_scanner import WeightDistributionScanner
 from modelaudit.utils.tensorflow_compat import DataType, tensor_proto_to_ndarray
 
@@ -180,6 +183,74 @@ def _has_h5py_cached():
 @lru_cache(maxsize=1)
 def _has_tensorflow_cached():
     return has_tensorflow()
+
+
+@pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
+def test_non_numeric_hdf5_weight_metadata_is_not_a_security_finding(tmp_path: Path) -> None:
+    import h5py
+    import numpy as np
+
+    path = tmp_path / "metadata_weight.h5"
+    with h5py.File(path, "w") as hdf5_file:
+        hdf5_file.create_dataset("metadata/weight_names", data=np.array([[b"a", b"b"], [b"c", b"d"]]))
+
+    result = core.scan_model_directory_or_file(str(path), scanners=["weight_distribution"], cache_enabled=False)
+
+    assert result.scanner_names == ["weight_distribution"]
+    assert core.determine_exit_code(result) == 0
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+@pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
+def test_analysis_failure_is_inconclusive_and_not_cached(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import h5py
+    import numpy as np
+
+    path = tmp_path / "numeric_weights.h5"
+    with h5py.File(path, "w") as hdf5_file:
+        hdf5_file.create_dataset("model_weights/dense/kernel:0", data=np.zeros((2, 2)))
+
+    def fail_analysis(_self: WeightDistributionScanner, _weights_info: dict[str, Any]) -> list[dict[str, Any]]:
+        raise RuntimeError("simulated weight analysis failure")
+
+    monkeypatch.setattr(WeightDistributionScanner, "_analyze_weight_distributions", fail_analysis)
+
+    direct = WeightDistributionScanner().scan(str(path))
+    assert direct.success is False
+    assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.metadata["scan_outcome_reasons"] == ["weight_distribution_analysis_incomplete"]
+    assert all(check.severity not in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in direct.checks)
+
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        first = core.scan_model_directory_or_file(
+            str(path),
+            scanners=["weight_distribution"],
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = core.scan_model_directory_or_file(
+            str(path),
+            scanners=["weight_distribution"],
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert aggregate.success is False
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert metadata["scan_outcome_reasons"] == ["weight_distribution_analysis_incomplete"]
+            assert core.determine_exit_code(aggregate) == 2
+            assert not any(
+                issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues
+            )
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 @pytest.mark.skipif(not HAS_NUMPY, reason="numpy not available")

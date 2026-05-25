@@ -7,7 +7,10 @@ import zipfile
 from contextlib import suppress
 from typing import Any, ClassVar
 
+from ..scanner_results import mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult, logger
+
+_ANALYSIS_INCONCLUSIVE_REASON = "weight_distribution_analysis_incomplete"
 
 
 class WeightDistributionScanner(BaseScanner):
@@ -185,11 +188,12 @@ class WeightDistributionScanner(BaseScanner):
             result.bytes_scanned = file_size
 
         except Exception as e:
+            mark_inconclusive_scan_result(result, _ANALYSIS_INCONCLUSIVE_REASON)
             result.add_check(
                 name="Weight Distribution Analysis",
                 passed=False,
                 message=f"Error analyzing weight distributions: {e!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"exception": str(e), "exception_type": type(e).__name__},
             )
@@ -379,7 +383,9 @@ class WeightDistributionScanner(BaseScanner):
                 # Navigate through the HDF5 structure to find weights
                 def extract_weights(name, obj):
                     if isinstance(obj, h5py.Dataset) and ("kernel" in name or "weight" in name):
-                        weights_info[name] = np.array(obj)
+                        array = np.array(obj)
+                        if np.issubdtype(array.dtype, np.number):
+                            weights_info[name] = array
 
                 f.visititems(extract_weights)
 
