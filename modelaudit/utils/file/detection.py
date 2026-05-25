@@ -2020,6 +2020,8 @@ def detect_file_format(path: str) -> str:
     # Check for GGUF/GGML magic bytes
     if magic4 == b"CBM1":
         return "catboost"
+    if magic4 == b"RKNN":
+        return "rknn"
     if magic4 == b"GGUF":
         return "gguf"
     if magic4 in GGML_MAGIC_VARIANTS:

