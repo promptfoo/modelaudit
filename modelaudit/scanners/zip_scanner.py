@@ -364,16 +364,20 @@ class ZipScanner(BaseScanner):
 
         # Check depth to prevent zip bomb attacks
         if depth >= self.max_depth:
+            mark_archive_scan_incomplete(result, "zip_depth_limit")
             result.add_check(
                 name="ZIP Depth Bomb Protection",
                 passed=False,
                 message=f"Maximum ZIP nesting depth ({self.max_depth}) exceeded",
-                severity=IssueSeverity.WARNING,
-                rule_code="S410",  # Archive bomb
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"depth": depth, "max_depth": self.max_depth},
+                details={
+                    "depth": depth,
+                    "max_depth": self.max_depth,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "zip_depth_limit",
+                },
             )
-            mark_archive_scan_incomplete(result, "zip_analysis_incomplete")
             result.finish(success=False)
             return result
         else:
@@ -661,6 +665,7 @@ class ZipScanner(BaseScanner):
 
         if entry_size > max_analysis_bytes:
             result = ScanResult(scanner_name=self.name)
+            mark_archive_scan_incomplete(result, "torchserve_handler_size_limit")
             result.add_check(
                 name="TorchServe Handler Static Analysis",
                 passed=False,
@@ -668,9 +673,15 @@ class ZipScanner(BaseScanner):
                     f"Skipped Python handler static analysis for oversized entry ({entry_size} bytes); "
                     f"limit is {max_analysis_bytes} bytes"
                 ),
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=f"{archive_path}:{entry_name}",
-                details={"entry": entry_name, "entry_size": entry_size, "size_limit": max_analysis_bytes},
+                details={
+                    "entry": entry_name,
+                    "entry_size": entry_size,
+                    "size_limit": max_analysis_bytes,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "torchserve_handler_size_limit",
+                },
             )
             result.finish(success=False)
             return result
@@ -680,13 +691,19 @@ class ZipScanner(BaseScanner):
                 source_bytes = source_file.read()
         except OSError as exc:
             result = ScanResult(scanner_name=self.name)
+            mark_archive_scan_incomplete(result, "torchserve_handler_read_failed")
             result.add_check(
                 name="TorchServe Handler Static Analysis",
                 passed=False,
                 message=f"Unable to read Python entry for static analysis: {exc}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=f"{archive_path}:{entry_name}",
-                details={"entry": entry_name, "exception_type": type(exc).__name__},
+                details={
+                    "entry": entry_name,
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "torchserve_handler_read_failed",
+                },
             )
             result.finish(success=False)
             return result
@@ -700,13 +717,20 @@ class ZipScanner(BaseScanner):
 
         result = ScanResult(scanner_name=self.name)
         if parse_error is not None:
+            mark_archive_scan_incomplete(result, "torchserve_handler_parse_failed")
             result.add_check(
                 name="TorchServe Handler Static Analysis",
                 passed=False,
                 message=f"Unable to parse Python entry for static analysis: {parse_error}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=f"{archive_path}:{entry_name}",
-                details={"entry": entry_name, "analysis_kind": "syntax", "parse_error": parse_error},
+                details={
+                    "entry": entry_name,
+                    "analysis_kind": "syntax",
+                    "parse_error": parse_error,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "torchserve_handler_parse_failed",
+                },
             )
         else:
             result.add_check(

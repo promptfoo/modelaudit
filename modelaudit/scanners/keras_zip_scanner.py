@@ -523,15 +523,21 @@ class KerasZipScanner(BaseScanner):
             self._finish_scan_result(result)
             return result
         except Exception as e:
+            self._mark_inconclusive_scan_result(result, "keras_zip_scan_failed")
             result.add_check(
                 name="Keras ZIP File Scan",
                 passed=False,
                 message=f"Error scanning Keras ZIP file: {e!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "keras_zip_scan_failed",
+                },
             )
-            result.finish(success=False)
+            self._finish_scan_result(result)
             return result
 
         self._finish_scan_result(result)

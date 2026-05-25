@@ -15,7 +15,11 @@ from typing import Any, ClassVar
 import pytest
 
 from modelaudit import core
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cache.optimized_config import build_cache_version_context
+from modelaudit.scanner_selection import normalize_scanner_selection_config
 from modelaudit.scanners import _registry, archive_dispatch
+from modelaudit.scanners import zip_scanner as zip_scanner_module
 from modelaudit.scanners._archive_locations import rewrite_extracted_member_location
 from modelaudit.scanners.archive_dispatch import (
     NESTED_SCAN_CALLBACK_CONFIG_KEY,
@@ -33,6 +37,95 @@ def _npy_payload() -> bytes:
     payload = io.BytesIO()
     np.save(payload, np.arange(3))
     return payload.getvalue()
+
+
+def _assert_inconclusive_zip_aggregate_not_cached(
+    path: Path,
+    expected_reason: str,
+    cache_dir: Path,
+    **scan_kwargs: Any,
+) -> None:
+    reset_cache_manager()
+    try:
+        first = core.scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+        second = core.scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert expected_reason in metadata["scan_outcome_reasons"]
+            assert not [
+                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+            assert core.determine_exit_code(aggregate) == 2
+
+        top_level_config = normalize_scanner_selection_config(
+            {
+                "blacklist_patterns": None,
+                "max_file_size": 0,
+                "max_total_size": 0,
+                "timeout": 3600,
+                "skip_file_types": True,
+                "strict_license": False,
+                "cache_enabled": True,
+                "cache_dir": str(cache_dir),
+                "min_cache_file_size": 0,
+                **scan_kwargs,
+            }
+        )
+        cached_parent = get_cache_manager(str(cache_dir), enabled=True).get_cached_result(
+            str(path),
+            version_context=build_cache_version_context(top_level_config),
+        )
+        assert cached_parent is None
+    finally:
+        reset_cache_manager()
+
+
+def _assert_inconclusive_zip_scan_not_cached(
+    path: Path,
+    expected_reason: str,
+    cache_dir: Path,
+    **scan_kwargs: Any,
+) -> None:
+    scan_config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+        **scan_kwargs,
+    }
+    reset_cache_manager()
+    try:
+        first = ZipScanner(config=scan_config).scan_with_cache(str(path))
+        second = ZipScanner(config=scan_config).scan_with_cache(str(path))
+
+        for result in (first, second):
+            assert result.success is False
+            assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert expected_reason in result.metadata["scan_outcome_reasons"]
+            assert not [
+                issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+
+        cached_parent = get_cache_manager(str(cache_dir), enabled=True).get_cached_result(
+            str(path),
+            version_context=build_cache_version_context(scan_config),
+        )
+        assert cached_parent is None
+    finally:
+        reset_cache_manager()
 
 
 def test_rewrite_extracted_member_location_preserves_scanner_specific_suffix_policy() -> None:
@@ -1160,6 +1253,8 @@ class TestZipScanner:
         assert len(depth_checks) == 1
         assert "maximum zip nesting depth (2) exceeded" in depth_checks[0].message.lower()
         assert depth_checks[0].location == f"{outer_zip}:middle.tar:inner.zip"
+        assert depth_checks[0].severity == IssueSeverity.INFO
+        assert "zip_depth_limit" in result.metadata["scan_outcome_reasons"]
 
     def test_scan_nested_mar_enforces_shared_depth_limit(self, tmp_path: Path) -> None:
         """Archive depth should not reset when ZIP recursion enters TorchServe MAR files."""
@@ -1229,12 +1324,19 @@ class TestZipScanner:
             if check.name == "TorchServe Handler Static Analysis" and check.status == CheckStatus.FAILED
         ]
         assert len(handler_failures) == 1
-        assert handler_failures[0].severity == IssueSeverity.WARNING
+        assert handler_failures[0].severity == IssueSeverity.INFO
         assert "oversized entry" in handler_failures[0].message.lower()
         assert "limit is 16 bytes" in handler_failures[0].message.lower()
         assert handler_failures[0].details.get("entry") == "handler.py"
         assert handler_failures[0].details.get("size_limit") == 16
         assert handler_failures[0].location == f"{mar_path}:handler.py"
+        assert "torchserve_handler_size_limit" in result.metadata["scan_outcome_reasons"]
+        _assert_inconclusive_zip_scan_not_cached(
+            mar_path,
+            "torchserve_handler_size_limit",
+            tmp_path / "oversized-handler-cache",
+            max_mar_python_analysis_bytes=16,
+        )
 
     def test_scan_manifestless_mar_reports_malformed_python_handler(self, tmp_path: Path) -> None:
         """Manifest-less .mar handlers with invalid syntax should emit parse-error analysis checks."""
@@ -1244,7 +1346,7 @@ class TestZipScanner:
 
         result = self.scanner.scan(str(mar_path))
         assert result.success is False
-        assert result.has_warnings is True
+        assert result.has_warnings is False
         assert result.has_errors is False
 
         handler_failures = [
@@ -1253,12 +1355,52 @@ class TestZipScanner:
             if check.name == "TorchServe Handler Static Analysis" and check.status == CheckStatus.FAILED
         ]
         assert len(handler_failures) == 1
-        assert handler_failures[0].severity == IssueSeverity.WARNING
+        assert handler_failures[0].severity == IssueSeverity.INFO
         assert "unable to parse python entry for static analysis" in handler_failures[0].message.lower()
         assert handler_failures[0].details.get("entry") == "handler.py"
         assert handler_failures[0].details.get("analysis_kind") == "syntax"
         assert "expected ':'" in str(handler_failures[0].details.get("parse_error")).lower()
         assert handler_failures[0].location == f"{mar_path}:handler.py"
+        assert "torchserve_handler_parse_failed" in result.metadata["scan_outcome_reasons"]
+        _assert_inconclusive_zip_scan_not_cached(
+            mar_path,
+            "torchserve_handler_parse_failed",
+            tmp_path / "malformed-handler-cache",
+        )
+
+    def test_scan_manifestless_mar_unreadable_python_handler_is_inconclusive(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Unavailable fallback handler bytes should not be reported as malicious content."""
+        mar_path = tmp_path / "unreadable_handler.mar"
+        with zipfile.ZipFile(mar_path, "w") as archive:
+            archive.writestr("handler.py", "def handle(data, context):\n    return data\n")
+
+        real_open = open
+
+        def fail_handler_read(path: str, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+            if mode == "rb" and path.endswith("_handler.py"):
+                raise OSError("simulated fallback handler read failure")
+            return real_open(path, mode, *args, **kwargs)
+
+        monkeypatch.setattr(zip_scanner_module, "open", fail_handler_read, raising=False)
+
+        result = self.scanner.scan(str(mar_path))
+        handler_failures = [
+            check
+            for check in result.checks
+            if check.name == "TorchServe Handler Static Analysis" and check.status == CheckStatus.FAILED
+        ]
+        assert len(handler_failures) == 1
+        assert handler_failures[0].severity == IssueSeverity.INFO
+        assert "torchserve_handler_read_failed" in result.metadata["scan_outcome_reasons"]
+        _assert_inconclusive_zip_scan_not_cached(
+            mar_path,
+            "torchserve_handler_read_failed",
+            tmp_path / "unreadable-handler-cache",
+        )
 
     def test_scan_extensionless_nested_zip_recurses(self, tmp_path: Path) -> None:
         """Extensionless ZIP members should be recursively scanned by content."""
@@ -1399,6 +1541,7 @@ class TestZipScanner:
         assert result.success is False
         assert any(
             issue.message == "Maximum ZIP nesting depth (2) exceeded"
+            and issue.severity == IssueSeverity.INFO
             and issue.location == f"{archive_path}:level0:level1"
             and issue.details.get("zip_entry") == "level0:level1"
             and issue.details.get("depth") == 2
@@ -1410,6 +1553,13 @@ class TestZipScanner:
             and ("os.system" in issue.message.lower() or "posix.system" in issue.message.lower())
             for issue in result.issues
         ), f"Depth limit should stop payload scan, got: {[(i.location, i.message) for i in result.issues]}"
+        assert "zip_depth_limit" in result.metadata["scan_outcome_reasons"]
+        _assert_inconclusive_zip_aggregate_not_cached(
+            archive_path,
+            "zip_depth_limit",
+            tmp_path / "depth-limit-cache",
+            max_zip_depth=2,
+        )
 
     def test_directory_traversal_detection(self):
         """Test detection of directory traversal attempts in ZIP files"""
@@ -1579,9 +1729,10 @@ class TestZipScanner:
             result = scanner.scan(current_path)
 
             assert result.success is False
-            # Should have a warning about max depth
             depth_issues = [i for i in result.issues if "depth" in i.message.lower()]
             assert len(depth_issues) >= 1
+            assert depth_issues[0].severity == IssueSeverity.INFO
+            assert "zip_depth_limit" in result.metadata["scan_outcome_reasons"]
         finally:
             for path in paths_to_delete:
                 if os.path.exists(path):
@@ -1930,8 +2081,11 @@ class TestZipScanner:
         assert symlink_checks[0].details.get("entry") == "link.txt"
         assert symlink_checks[0].severity == IssueSeverity.INFO
         assert "zip_symlink_target_read_incomplete" in result.metadata["scan_outcome_reasons"]
-        aggregate = core.scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
-        assert core.determine_exit_code(aggregate) == 2
+        _assert_inconclusive_zip_aggregate_not_cached(
+            archive_path,
+            "zip_symlink_target_read_incomplete",
+            tmp_path / "symlink-cache",
+        )
 
     def test_oversized_entry_cleanup_removes_partial_temp_file(
         self,
@@ -1981,6 +2135,12 @@ class TestZipScanner:
             issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         ]
         assert core.determine_exit_code(result) == 2
+        _assert_inconclusive_zip_aggregate_not_cached(
+            archive_path,
+            "zip_entry_scan_incomplete",
+            tmp_path / "oversized-benign-cache",
+            max_entry_size=64,
+        )
 
     def test_oversized_hidden_zip_payload_returns_inconclusive_without_detected_finding(self, tmp_path: Path) -> None:
         """A payload hidden above the extraction cap must not be reported as observed."""
@@ -2001,6 +2161,12 @@ class TestZipScanner:
             issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
         ]
         assert core.determine_exit_code(result) == 2
+        _assert_inconclusive_zip_aggregate_not_cached(
+            archive_path,
+            "zip_entry_scan_incomplete",
+            tmp_path / "oversized-hidden-cache",
+            max_entry_size=64,
+        )
 
     def test_detected_zip_payload_after_skipped_member_preserves_security_exit_code(self, tmp_path: Path) -> None:
         """Observed malicious content still wins over an informational coverage gap."""

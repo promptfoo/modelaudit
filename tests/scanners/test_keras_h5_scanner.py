@@ -321,6 +321,36 @@ def _assert_inconclusive_keras_h5_scan(
     assert determine_exit_code(audit_result) == 2
 
 
+def _assert_inconclusive_keras_h5_scan_not_cached(model_path: Path, reason: str, cache_dir: Path) -> None:
+    reset_cache_manager()
+    try:
+        first_result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second_result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for audit_result in (first_result, second_result):
+            metadata = audit_result.file_metadata[str(model_path)]
+            assert determine_exit_code(audit_result) == 2
+            assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            assert reason in metadata.get("scan_outcome_reasons")
+            assert not any(
+                issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in audit_result.issues
+            )
+
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 @pytest.mark.parametrize(
     ("model_config", "reason", "expected_check_name", "expected_message_substring"),
     [
@@ -429,6 +459,40 @@ def test_keras_h5_read_failure_returns_inconclusive_exit2(
     )
     result = KerasH5Scanner().scan(str(model_path))
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+    _assert_inconclusive_keras_h5_scan_not_cached(
+        model_path,
+        "keras_h5_read_failed",
+        tmp_path / "read-failure-cache",
+    )
+
+
+def test_keras_h5_unexpected_scan_failure_returns_inconclusive_exit2_without_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unexpected unavailable H5 analysis is incomplete, not a critical model finding."""
+    model_path = create_custom_h5_file(
+        tmp_path,
+        {"class_name": "Sequential", "config": {"layers": []}},
+        file_name="unexpected_scan_failure.h5",
+    )
+
+    def fail_config_scan(_self: KerasH5Scanner, _model_config: dict[str, Any], _result: Any) -> None:
+        raise RuntimeError("simulated unexpected Keras H5 scan failure")
+
+    monkeypatch.setattr(KerasH5Scanner, "_scan_model_config", fail_config_scan)
+
+    _assert_inconclusive_keras_h5_scan(
+        model_path,
+        "keras_h5_scan_failed",
+        "Keras H5 File Scan",
+        "Error scanning Keras H5 file",
+    )
+    _assert_inconclusive_keras_h5_scan_not_cached(
+        model_path,
+        "keras_h5_scan_failed",
+        tmp_path / "scan-failure-cache",
+    )
 
 
 @pytest.mark.parametrize(

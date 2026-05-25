@@ -262,16 +262,22 @@ class KerasH5Scanner(BaseScanner):
             self._finish_scan_result(result)
             return result
         except Exception as e:
+            self._mark_inconclusive_scan_result(result, "keras_h5_scan_failed")
             result.add_check(
                 name="Keras H5 File Scan",
                 passed=False,
                 message=f"Error scanning Keras H5 file: {e!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
-                rule_code="S1005",  # Invalid signature/corrupted file
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "keras_h5_scan_failed",
+                },
+                rule_code="S902",
             )
-            result.finish(success=False)
+            self._finish_scan_result(result)
             return result
 
         self._finish_scan_result(result)

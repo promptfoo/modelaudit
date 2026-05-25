@@ -76,6 +76,36 @@ def _assert_inconclusive_keras_zip_scan(model_path: Path, reason: str, expected_
     assert determine_exit_code(audit_result) == 2
 
 
+def _assert_inconclusive_keras_zip_scan_not_cached(model_path: Path, reason: str, cache_dir: Path) -> None:
+    reset_cache_manager()
+    try:
+        first_result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second_result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for audit_result in (first_result, second_result):
+            metadata = audit_result.file_metadata[str(model_path)]
+            assert determine_exit_code(audit_result) == 2
+            assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            assert reason in metadata.get("scan_outcome_reasons")
+            assert not any(
+                issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in audit_result.issues
+            )
+
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 def create_external_link_weights_h5(tmp_path: Path) -> Path:
     """Create a weights H5 file containing an ExternalLink to a local fixture."""
     if h5py is None:
@@ -341,6 +371,37 @@ class TestKerasZipScanner:
         _assert_inconclusive_keras_zip_scan(keras_path, "keras_zip_read_failed", "Keras ZIP File Read")
         result = KerasZipScanner().scan(str(keras_path))
         assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+        _assert_inconclusive_keras_zip_scan_not_cached(
+            keras_path,
+            "keras_zip_read_failed",
+            tmp_path / "read-failure-cache",
+        )
+
+    def test_unexpected_scan_failure_returns_inconclusive_exit2_without_cache(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Unexpected unavailable ZIP analysis is incomplete, not a critical model finding."""
+        keras_path = create_configured_keras_zip(
+            tmp_path,
+            {"class_name": "Sequential", "config": {"layers": []}},
+            file_name="unexpected_scan_failure.keras",
+        )
+
+        def fail_config_scan(_self: KerasZipScanner, _model_config: dict[str, Any], _result: Any) -> None:
+            raise RuntimeError("simulated unexpected Keras ZIP scan failure")
+
+        monkeypatch.setattr(KerasZipScanner, "_scan_model_config", fail_config_scan)
+
+        _assert_inconclusive_keras_zip_scan(keras_path, "keras_zip_scan_failed", "Keras ZIP File Scan")
+        result = KerasZipScanner().scan(str(keras_path))
+        assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+        _assert_inconclusive_keras_zip_scan_not_cached(
+            keras_path,
+            "keras_zip_scan_failed",
+            tmp_path / "scan-failure-cache",
+        )
 
     def test_malformed_config_json_returns_inconclusive_exit2(self, tmp_path: Path) -> None:
         """Malformed config.json without security evidence should exit 2, not 1."""
