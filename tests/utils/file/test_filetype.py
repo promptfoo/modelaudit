@@ -2,6 +2,7 @@ import bz2
 import gzip
 import importlib
 import io
+import json
 import lzma
 import pickle
 import struct
@@ -346,9 +347,15 @@ def test_detect_cntk_model_extension_remains_excluded_for_xgboost_overlap(tmp_pa
     deferred.write_bytes(
         b"\x0a\x07version\x12\x031.0\x12\x09\x0a\x03uid\x12\x02ab CompositeFunction primitive_functions"
     )
+    legacy_deferred = tmp_path / "legacy.model"
+    legacy_deferred.write_bytes(
+        b"B\x00C\x00N\x00\x00\x00" + b"B\x00V\x00e\x00r\x00s\x00i\x00o\x00n\x00\x00\x00" + b"inputs outputs"
+    )
 
     assert detect_file_format(str(deferred)) != "cntk"
     assert detect_file_format_from_magic(str(deferred)) != "cntk"
+    assert detect_file_format(str(legacy_deferred)) != "cntk"
+    assert detect_file_format_from_magic(str(legacy_deferred)) != "cntk"
 
 
 def test_detect_renamed_lightgbm_by_strict_signature_only(tmp_path: Path) -> None:
@@ -365,6 +372,21 @@ def test_detect_renamed_lightgbm_by_strict_signature_only(tmp_path: Path) -> Non
     assert detect_file_format_from_magic(str(renamed)) == "lightgbm"
     assert detect_file_format(str(near_match)) == "unknown"
     assert detect_file_format_from_magic(str(near_match)) == "unknown"
+
+
+def test_detect_renamed_lightgbm_does_not_promote_embedded_model_text(tmp_path: Path) -> None:
+    model_text = (
+        "tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
+        "tree_sizes=12\nTree=0\nnum_leaves=2\nsplit_feature=0\nleaf_value=0.1 0.2\n"
+    )
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"example": model_text}), encoding="utf-8")
+    safetensors_path = tmp_path / "model.safetensors"
+    header = json.dumps({"__metadata__": {"example": model_text}}).encode()
+    safetensors_path.write_bytes(struct.pack("<Q", len(header)) + header)
+
+    assert detect_file_format(str(config_path)) == "unknown"
+    assert detect_file_format(str(safetensors_path)) == "safetensors"
 
 
 def test_detect_tf_metagraph_by_strict_parse(tmp_path: Path) -> None:
