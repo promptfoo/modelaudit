@@ -22,7 +22,7 @@ from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTE
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
-from .archive_member_security import is_executable_archive_member_name
+from .archive_member_security import executable_archive_member_rule_code, is_executable_archive_member_name
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 from .picklescan_adapter import apply_pickle_member_context
@@ -1658,6 +1658,7 @@ class PyTorchZipScanner(BaseScanner):
                     passed=False,
                     message=f"Executable file found in PyTorch model: {name}",
                     severity=IssueSeverity.CRITICAL,
+                    rule_code=executable_archive_member_rule_code(name),
                     location=f"{path}:{name}",
                     details={"file": name},
                 )

@@ -27,18 +27,23 @@ _EXECUTABLE_ARCHIVE_MEMBER_SUFFIXES = (
     ".bat",
     ".ps1",
 )
+_EXECUTABLE_ARCHIVE_MEMBER_SUFFIX_RULE_CODES = (
+    ((".exe", ".dll", ".scr", ".com"), "S501"),
+    ((".so",), "S502"),
+    ((".dylib",), "S503"),
+    ((".sh", ".bash"), "S504"),
+    ((".cmd", ".bat"), "S505"),
+    ((".ps1",), "S506"),
+)
 _EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES = 1024
 _PORTABLE_EXECUTABLE_POINTER_OFFSET = 0x3C
 _PORTABLE_EXECUTABLE_MIN_HEADER_OFFSET = 0x40
 _PORTABLE_EXECUTABLE_MAX_HEADER_OFFSET = 1024 * 1024
 _PORTABLE_EXECUTABLE_SIGNATURE = b"PE\x00\x00"
-_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_PREFIXES = (
-    b"\x7fELF",
-    b"\xfe\xed\xfa\xce",
-    b"\xfe\xed\xfa\xcf",
-    b"\xcf\xfa\xed\xfe",
-    b"\xce\xfa\xed\xfe",
-    b"#!",
+_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_RULE_CODES = (
+    ((b"\x7fELF",), "S502"),
+    ((b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe"), "S503"),
+    ((b"#!",), "S504"),
 )
 _MACHO_FAT_MAGIC_32_BE = b"\xca\xfe\xba\xbe"
 _MACHO_FAT_MAGIC_32_LE = b"\xbe\xba\xfe\xca"
@@ -129,6 +134,19 @@ def is_executable_archive_member_name(member_name: str) -> bool:
     )
 
 
+def executable_archive_member_rule_code(member_name: str, *, path: str | None = None) -> str | None:
+    """Return the rule code for an executable archive member name or content probe."""
+    normalized_name = member_name.lower()
+    for suffixes, rule_code in _EXECUTABLE_ARCHIVE_MEMBER_SUFFIX_RULE_CODES:
+        if normalized_name.endswith(suffixes):
+            return rule_code
+    if _VERSIONED_SHARED_OBJECT_SUFFIX_RE.search(normalized_name):
+        return "S502"
+    if path is not None:
+        return _executable_archive_member_content_rule_code(path)
+    return None
+
+
 def _looks_like_portable_executable(prefix: bytes, *, path: str) -> bool:
     if not prefix.startswith(b"MZ"):
         return False
@@ -172,19 +190,27 @@ def _looks_like_macho_fat_binary(prefix: bytes) -> bool:
     return len(prefix) >= 8 + (arch_count * arch_entry_size)
 
 
-def is_executable_archive_member_content(path: str) -> bool:
-    """Return True when a member begins with a strong executable signature."""
+def _executable_archive_member_content_rule_code(path: str) -> str | None:
+    """Return the rule code for a bounded executable-content signature probe."""
     try:
         with open(path, "rb") as member_file:
             prefix = member_file.read(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_READ_BYTES)
     except OSError:
-        return False
+        return None
 
-    if prefix.startswith(_EXECUTABLE_ARCHIVE_MEMBER_MAGIC_PREFIXES):
-        return True
+    for prefixes, rule_code in _EXECUTABLE_ARCHIVE_MEMBER_MAGIC_RULE_CODES:
+        if prefix.startswith(prefixes):
+            return rule_code
     if _looks_like_macho_fat_binary(prefix):
-        return True
-    return _looks_like_portable_executable(prefix, path=path)
+        return "S503"
+    if _looks_like_portable_executable(prefix, path=path):
+        return "S501"
+    return None
+
+
+def is_executable_archive_member_content(path: str) -> bool:
+    """Return True when a member begins with a strong executable signature."""
+    return _executable_archive_member_content_rule_code(path) is not None
 
 
 def is_python_archive_member_name(member_name: str) -> bool:
@@ -753,7 +779,8 @@ def scan_archive_member_for_known_risks(
             )
         return
 
-    if is_executable_archive_member_name(normalized_lower) or is_executable_archive_member_content(tmp_path):
+    executable_rule_code = executable_archive_member_rule_code(normalized_lower, path=tmp_path)
+    if executable_rule_code is not None:
         result.add_check(
             name=_EXECUTABLE_MEMBER_CHECK_NAME,
             passed=False,
@@ -761,4 +788,5 @@ def scan_archive_member_for_known_risks(
             severity=IssueSeverity.WARNING,
             location=location,
             details={"entry": member_name},
+            rule_code=executable_rule_code,
         )

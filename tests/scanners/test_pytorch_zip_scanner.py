@@ -393,6 +393,24 @@ def test_pytorch_zip_scanner_path_traversal_named_pickle_keeps_archive_rule(tmp_
     assert not [check for check in result.checks if check.rule_code == "S213"]
 
 
+def test_pytorch_zip_scanner_executable_named_pickle_keeps_executable_rule(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "executable.pt")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/data/pickle_payload.exe", b"not executed")
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    executable_checks = [
+        check
+        for check in result.checks
+        if check.name == "Executable File Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert len(executable_checks) == 1
+    assert executable_checks[0].severity == IssueSeverity.CRITICAL
+    assert executable_checks[0].rule_code == "S501"
+    assert not [check for check in result.checks if check.rule_code == "S213"]
+
+
 def test_pytorch_zip_scanner_scans_shadowed_duplicate_data_pkl(tmp_path: Path) -> None:
     """A benign last-write duplicate must not hide a malicious earlier data.pkl entry."""
     model_path = tmp_path / "duplicate_data_pkl.pt"

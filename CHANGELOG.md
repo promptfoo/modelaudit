@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - fail closed when nested NeMo checkpoint or referenced-artifact analysis is explicitly incomplete
 - preserve concrete nested security findings from checkpoint and referenced artifacts inside NeMo archives
 - keep PyTorch ZIP path traversal findings attributed to archive safety rules regardless of member names
+- classify executable archive members by their hazard type rather than attacker-controlled name fragments
 
 ## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
 
