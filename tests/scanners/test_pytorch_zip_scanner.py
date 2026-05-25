@@ -5,7 +5,7 @@ import time
 import warnings
 import zipfile
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 import pytest
 
@@ -484,6 +484,42 @@ def test_pytorch_zip_scanner_with_blacklist(tmp_path):
     assert len(blacklist_issues) > 0
 
 
+def _assert_blacklist_inconclusive_not_cached(
+    path: Path,
+    cache_dir: Path,
+    reason: str,
+    **scan_kwargs: Any,
+) -> None:
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert reason in metadata["scan_outcome_reasons"]
+            assert not [
+                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 def test_pytorch_zip_oversized_blacklist_member_is_inconclusive(tmp_path: Path) -> None:
     """Configured blacklist coverage must not pass when a matching member is skipped."""
     zip_path = create_mock_pytorch_zip(tmp_path / "blocked_oversized.pt", data={})
@@ -509,13 +545,13 @@ def test_pytorch_zip_oversized_blacklist_member_is_inconclusive(tmp_path: Path) 
     assert limit_checks[0].details["analysis_incomplete"] is True
     assert not any("BLOCKED_PATTERN" in issue.message for issue in result.issues)
 
-    aggregate = scan_model_directory_or_file(
-        str(zip_path),
+    _assert_blacklist_inconclusive_not_cached(
+        zip_path,
+        tmp_path / "oversized-hidden-cache",
+        PyTorchZipScanner.BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON,
         blacklist_patterns=["BLOCKED_PATTERN"],
         max_blacklist_scan_size=32,
-        cache_scan_results=False,
     )
-    assert determine_exit_code(aggregate) == 2
 
 
 def test_pytorch_zip_oversized_benign_blacklist_member_is_inconclusive_without_finding(tmp_path: Path) -> None:
@@ -535,13 +571,63 @@ def test_pytorch_zip_oversized_benign_blacklist_member_is_inconclusive_without_f
     ]
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
-    aggregate = scan_model_directory_or_file(
-        str(zip_path),
+    _assert_blacklist_inconclusive_not_cached(
+        zip_path,
+        tmp_path / "oversized-benign-cache",
+        PyTorchZipScanner.BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON,
         blacklist_patterns=["BLOCKED_PATTERN"],
         max_blacklist_scan_size=32,
-        cache_scan_results=False,
     )
-    assert determine_exit_code(aggregate) == 2
+
+
+def test_pytorch_zip_blacklist_member_read_failure_is_inconclusive_and_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    zip_path = create_mock_pytorch_zip(tmp_path / "unreadable_blacklist.pt", data={})
+    with zipfile.ZipFile(zip_path, "a") as zip_file:
+        zip_file.writestr("notes.txt", b"ordinary")
+
+    original_read_member_bytes = PyTorchZipScanner._read_member_bytes
+
+    def fail_blacklist_member_read(
+        self: PyTorchZipScanner,
+        zip_file: zipfile.ZipFile,
+        name: str | zipfile.ZipInfo,
+        *,
+        phase: str,
+        result: ScanResult,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        if phase == "blacklist_check" and self._get_zip_member_name(name) == "notes.txt":
+            raise OSError("member read failed")
+        return original_read_member_bytes(self, zip_file, name, phase=phase, result=result, max_bytes=max_bytes)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_read_member_bytes", fail_blacklist_member_read)
+
+    result = PyTorchZipScanner(config={"blacklist_patterns": ["BLOCKED_PATTERN"]}).scan(str(zip_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == [
+        PyTorchZipScanner.BLACKLIST_READ_INCONCLUSIVE_REASON,
+    ]
+    read_checks = [
+        check
+        for check in result.checks
+        if check.name == "ZIP Entry Read" and check.details.get("zip_entry") == "notes.txt"
+    ]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == PyTorchZipScanner.BLACKLIST_READ_INCONCLUSIVE_REASON
+
+    _assert_blacklist_inconclusive_not_cached(
+        zip_path,
+        tmp_path / "blacklist-read-failure-cache",
+        PyTorchZipScanner.BLACKLIST_READ_INCONCLUSIVE_REASON,
+        blacklist_patterns=["BLOCKED_PATTERN"],
+    )
 
 
 def test_pytorch_zip_blacklist_pattern_at_size_limit_is_detected(tmp_path: Path) -> None:
@@ -564,7 +650,7 @@ def test_pytorch_zip_blacklist_pattern_at_size_limit_is_detected(tmp_path: Path)
         str(zip_path),
         blacklist_patterns=["BLOCKED_PATTERN"],
         max_blacklist_scan_size=len(payload),
-        cache_scan_results=False,
+        cache_enabled=False,
     )
     assert determine_exit_code(aggregate) == 1
 

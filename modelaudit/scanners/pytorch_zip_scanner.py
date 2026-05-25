@@ -239,6 +239,7 @@ class PyTorchZipScanner(BaseScanner):
     DEFAULT_MAX_NESTED_ZIP_DEPTH: ClassVar[int] = 5
     DEFAULT_MAX_BLACKLIST_SCAN_BYTES: ClassVar[int] = 100 * 1024 * 1024
     BLACKLIST_SIZE_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_blacklist_member_size_limit"
+    BLACKLIST_READ_INCONCLUSIVE_REASON: ClassVar[str] = "pytorch_zip_blacklist_member_read_failed"
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -1918,27 +1919,21 @@ class PyTorchZipScanner(BaseScanner):
 
     def _handle_blacklist_scan_error(self, name: str, error: Exception, result: ScanResult) -> None:
         """Handle errors during blacklist pattern scanning"""
-        if isinstance(error, zipfile.BadZipFile):
-            severity = IssueSeverity.WARNING
-            error_type = "BadZipFile"
-        elif isinstance(error, MemoryError):
-            severity = IssueSeverity.WARNING
-            error_type = "MemoryError"
-        else:
-            severity = IssueSeverity.DEBUG
-            error_type = type(error).__name__
+        mark_inconclusive_scan_result(result, self.BLACKLIST_READ_INCONCLUSIVE_REASON)
 
         result.add_check(
             name="ZIP Entry Read",
             passed=False,
             message=f"Error reading file {name}: {error!s}",
-            severity=severity,
+            severity=IssueSeverity.INFO,
             location=f"{self.current_file_path} ({name})",
             details={
                 "zip_entry": name,
                 "exception": str(error),
-                "exception_type": error_type,
+                "exception_type": type(error).__name__,
                 "scan_phase": "blacklist_check",
+                "analysis_incomplete": True,
+                "scan_outcome_reason": self.BLACKLIST_READ_INCONCLUSIVE_REASON,
             },
         )
 
