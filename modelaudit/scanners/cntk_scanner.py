@@ -103,11 +103,8 @@ _KNOWN_SAFE_METADATA_KEYS = frozenset(
 
 
 def _read_prefix(path: str, limit: int = _MAX_SIGNATURE_BYTES) -> bytes:
-    try:
-        with open(path, "rb") as f:
-            return f.read(limit)
-    except OSError:
-        return b""
+    with open(path, "rb") as f:
+        return f.read(limit)
 
 
 def _read_bounded(path: str, limit: int) -> tuple[bytes, bool]:
@@ -277,7 +274,10 @@ class CntkScanner(BaseScanner):
         if extension in _CNTK_EXCLUDED_EXTENSIONS:
             return False
 
-        prefix = _read_prefix(path)
+        try:
+            prefix = _read_prefix(path)
+        except OSError:
+            return False
         variant, _reason = _detect_cntk_variant(prefix, extension)
         return variant in {"legacy_v1", "cntk_v2"}
 
@@ -296,7 +296,25 @@ class CntkScanner(BaseScanner):
         result.metadata["discovery_assumptions"] = DISCOVERY_ASSUMPTIONS
 
         extension = os.path.splitext(path)[1].lower()
-        signature_prefix = _read_prefix(path)
+        try:
+            signature_prefix = _read_prefix(path)
+        except OSError as e:
+            mark_inconclusive_scan_result(result, "cntk_read_failed")
+            result.add_check(
+                name="CNTK File Read",
+                passed=False,
+                message=f"Error reading CNTK file: {e}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "cntk_read_failed",
+                },
+            )
+            result.finish(success=False)
+            return result
         variant, variant_reason = _detect_cntk_variant(signature_prefix, extension)
         result.metadata["cntk_variant"] = variant
         result.metadata["variant_reason"] = variant_reason
@@ -429,5 +447,7 @@ class CntkScanner(BaseScanner):
                 },
             )
 
-        result.finish(success=not result.has_errors)
+        result.finish(
+            success=not result.has_errors and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+        )
         return result
