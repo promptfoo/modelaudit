@@ -1150,6 +1150,12 @@ def _is_lightgbm_signature(prefix: bytes) -> bool:
     return (starts_with_tree or "tree=" in preview) and header_hits >= 3 and tree_hits >= 2 and not xgboost_like
 
 
+def _is_content_routed_lightgbm_signature(prefix: bytes) -> bool:
+    """Require the native text header before routing a misleading suffix as LightGBM."""
+    preview = prefix.decode("utf-8", errors="ignore").lstrip().lower()
+    return preview.startswith("tree") and _is_lightgbm_signature(prefix)
+
+
 def _is_executorch_binary_signature(prefix: bytes) -> bool:
     """Recognize versioned ExecuTorch FlatBuffers binaries by their file identifier."""
     return len(prefix) >= 8 and prefix[4:6] == b"ET" and prefix[6:8].isdigit()
@@ -1258,7 +1264,7 @@ def detect_format_from_magic_bytes(
             return "sevenzip"
         case magic if _has_rar_magic(magic):
             return "rar"
-        case magic if magic == _CNTK_LEGACY_MAGIC:
+        case magic if magic == _CNTK_LEGACY_MAGIC and (file_path is None or file_path.suffix.lower() != ".model"):
             return "cntk"
         case b"\x89HDF\r\n\x1a\n":  # HDF5 magic
             return "hdf5"
@@ -1336,7 +1342,7 @@ def detect_file_format_from_magic(path: str) -> str:
 
             f.seek(0)
             lightgbm_prefix = f.read(_LIGHTGBM_SIGNATURE_READ_BYTES)
-            if _is_lightgbm_signature(lightgbm_prefix):
+            if _is_content_routed_lightgbm_signature(lightgbm_prefix):
                 return "lightgbm"
             # Protocol 0/1 pickle payloads can evade short magic-byte checks.
             # Probe a bounded prefix and require a valid opcode stream.
@@ -1444,7 +1450,7 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         lightgbm_probe_size = min(size, _LIGHTGBM_SIGNATURE_READ_BYTES)
         if len(prefix) < lightgbm_probe_size:
             prefix += f.read(lightgbm_probe_size - len(prefix))
-        if _is_lightgbm_signature(prefix[:lightgbm_probe_size]):
+        if _is_content_routed_lightgbm_signature(prefix[:lightgbm_probe_size]):
             return "lightgbm"
 
         if _could_start_proto0_or_1_pickle(prefix):
@@ -1573,10 +1579,13 @@ def detect_file_format(path: str) -> str:
         if xml_format != "unknown":
             return xml_format
 
+    if _looks_like_safetensors_structure(file_path, magic8, size):
+        return "safetensors"
+
     signature_prefix = read_magic_bytes(path, max(_CNTK_SIGNATURE_READ_BYTES, _LIGHTGBM_SIGNATURE_READ_BYTES))
     if ext != ".model" and _is_cntk_signature(signature_prefix[:_CNTK_SIGNATURE_READ_BYTES]):
         return "cntk"
-    if _is_lightgbm_signature(signature_prefix[:_LIGHTGBM_SIGNATURE_READ_BYTES]):
+    if _is_content_routed_lightgbm_signature(signature_prefix[:_LIGHTGBM_SIGNATURE_READ_BYTES]):
         return "lightgbm"
 
     if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
