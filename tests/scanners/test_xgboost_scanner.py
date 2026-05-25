@@ -209,6 +209,12 @@ class TestXGBoostScannerBasic:
 
         assert not XGBoostScanner.can_handle(str(model_file))
 
+    def test_rejects_extensionless_binary_signature_at_nonzero_offset(self, temp_dir: Path) -> None:
+        model_file = temp_dir / "model"
+        model_file.write_bytes(b"not-binf-in-prefix")
+
+        assert not XGBoostScanner.can_handle(str(model_file))
+
     def test_rejects_extensionless_ubjson_when_strong_marker_past_probe_window(self, temp_dir: Path) -> None:
         """Extensionless files require a strong marker *within* the probe window.
 

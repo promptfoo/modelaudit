@@ -27,7 +27,6 @@ import struct
 import subprocess
 import sys
 import tempfile
-from contextlib import suppress
 from typing import Any, ClassVar, cast
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
@@ -334,13 +333,7 @@ class XGBoostScanner(BaseScanner):
 
         # Check for XGBoost files without extension
         if file_ext == "":
-            if cls._is_ubjson_file(path):
-                return True
-            with suppress(OSError), open(path, "rb") as f:
-                header = f.read(16)
-                # Check for XGBoost binary signature patterns
-                if b"binf" in header or b"gblinear" in header[:100]:
-                    return True
+            return cls._is_ubjson_file(path)
 
         return False
 
@@ -990,21 +983,26 @@ class XGBoostScanner(BaseScanner):
         except Exception:
             return False
 
-    @staticmethod
-    def _is_ubjson_file(path: str, *, require_strong_marker: bool = True) -> bool:
+    @classmethod
+    def _is_ubjson_probe(cls, probe: bytes, *, require_strong_marker: bool = True) -> bool:
+        """Check if a bounded prefix is probably an XGBoost UBJSON model."""
+        is_ubjson_with_required_markers = (
+            len(probe) >= 2
+            and probe[0] == cls._UBJSON_OBJECT_START
+            and probe[1] in cls._UBJSON_NEXT_VALID
+            and all(marker in probe for marker in cls._UBJSON_REQUIRED_MARKERS)
+        )
+        if not is_ubjson_with_required_markers:
+            return False
+        return not require_strong_marker or any(marker in probe for marker in cls._UBJSON_STRONG_MARKERS)
+
+    @classmethod
+    def _is_ubjson_file(cls, path: str, *, require_strong_marker: bool = True) -> bool:
         """Check if a file is probably an XGBoost UBJSON model."""
         try:
             with open(path, "rb") as f:
-                probe = f.read(XGBoostScanner._UBJSON_PROBE_READ_BYTES)
-            is_ubjson_with_required_markers = (
-                len(probe) >= 2
-                and probe[0] == XGBoostScanner._UBJSON_OBJECT_START
-                and probe[1] in XGBoostScanner._UBJSON_NEXT_VALID
-                and all(marker in probe for marker in XGBoostScanner._UBJSON_REQUIRED_MARKERS)
-            )
-            if not is_ubjson_with_required_markers:
-                return False
-            return not require_strong_marker or any(marker in probe for marker in XGBoostScanner._UBJSON_STRONG_MARKERS)
+                probe = f.read(cls._UBJSON_PROBE_READ_BYTES)
+            return cls._is_ubjson_probe(probe, require_strong_marker=require_strong_marker)
         except OSError:
             return False
 

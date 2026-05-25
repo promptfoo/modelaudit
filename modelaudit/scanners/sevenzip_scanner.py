@@ -20,6 +20,7 @@ from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from .base import BaseScanner, IssueSeverity, ScanResult
+from .xgboost_scanner import XGBoostScanner
 
 # Try to import py7zr with graceful fallback
 try:
@@ -623,6 +624,9 @@ class SevenZipScanner(BaseScanner):
         prefix = probe.read(self._NESTED_MEMBER_PROBE_BYTES)
         if len(prefix) < 4:
             return None
+
+        if XGBoostScanner._is_ubjson_probe(prefix):
+            return "xgboost"
 
         if _looks_like_proto0_or_1_pickle(prefix, sample_is_prefix=len(prefix) == self._NESTED_MEMBER_PROBE_BYTES):
             return "pickle"

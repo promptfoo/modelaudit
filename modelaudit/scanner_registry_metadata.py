@@ -449,6 +449,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "module": "modelaudit.scanners.xgboost_scanner",
         "class": "XGBoostScanner",
         "description": "Scans XGBoost model files for security vulnerabilities",
+        # Keep extensionless candidates for selected remote scans: filenames alone cannot identify UBJSON safely.
         "extensions": [".bst", ".model", ".json", ".ubj", ""],
         "priority": 7,
         "dependencies": ["xgboost", "ubjson"],

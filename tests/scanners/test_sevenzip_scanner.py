@@ -1665,6 +1665,13 @@ class TestSevenZipScannerHardening:
 
         assert scanner._probe_detected_format(probe) == "pickle"
 
+    def test_probe_detected_format_recognizes_extensionless_xgboost_ubjson(self) -> None:
+        """7z nested probes should retain extensionless XGBoost UBJSON members."""
+        scanner = SevenZipScanner()
+        probe = io.BytesIO(b"{L" + (b"\0" * 8) + b"learner" + b"learner_model_param" + b"version")
+
+        assert scanner._probe_detected_format(probe) == "xgboost"
+
     def test_probe_detected_format_ignores_benign_proto0_near_match_text(self) -> None:
         """Plain text that starts with proto0-looking bytes should not route as pickle."""
         scanner = SevenZipScanner()
