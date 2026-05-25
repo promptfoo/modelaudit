@@ -783,6 +783,15 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+def high_risk_python_calls_in_tree(tree: ast.AST) -> set[HighRiskPythonCall]:
+    """Return the set of high-risk Python calls resolvable from an AST."""
+    visitor = _HighRiskPythonCallVisitor()
+    visitor.visit(tree)
+    return {
+        HighRiskPythonCall(name=name, rule_code=_rule_code_for_high_risk_call(name)) for name in visitor.risky_calls
+    }
+
+
 def high_risk_python_calls_in_source(source_bytes: bytes) -> set[HighRiskPythonCall]:
     """Return the set of high-risk Python calls resolvable from ``source_bytes``.
 
@@ -798,11 +807,7 @@ def high_risk_python_calls_in_source(source_bytes: bytes) -> set[HighRiskPythonC
     except (SyntaxError, ValueError) as exc:
         raise PythonArchiveMemberParseError(str(exc)) from exc
 
-    visitor = _HighRiskPythonCallVisitor()
-    visitor.visit(tree)
-    return {
-        HighRiskPythonCall(name=name, rule_code=_rule_code_for_high_risk_call(name)) for name in visitor.risky_calls
-    }
+    return high_risk_python_calls_in_tree(tree)
 
 
 _PYTHON_MEMBER_CHECK_NAME = "Python Archive Member Security"
