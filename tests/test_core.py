@@ -2467,10 +2467,11 @@ def test_scan_file_routes_readme_documentation_to_metadata_scanner(tmp_path: Pat
     assert result.success is True
 
 
-def test_scan_file_keeps_tree_prefixed_readme_on_metadata_scanner(tmp_path: Path) -> None:
+@pytest.mark.parametrize("leading_line", ["tree model notes", "tree=implementation notes"])
+def test_scan_file_keeps_tree_prefixed_readme_on_metadata_scanner(tmp_path: Path, leading_line: str) -> None:
     readme_path = tmp_path / "README.md"
     readme_path.write_text(
-        "tree model notes\n"
+        f"{leading_line}\n"
         "tree=0\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
         "tree_sizes=12\nnum_leaves=2\nsplit_feature=0\nleaf_value=0.1 0.2\n"
         f"API Key: sk-{'A' * 48}\n",

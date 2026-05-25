@@ -356,13 +356,17 @@ class TestFileFilter:
         prose_prefixed.write_text("notes about a model\n" + _build_lightgbm_text(), encoding="utf-8")
         tree_prefixed_prose = tmp_path / "tree-notes.jpg"
         tree_prefixed_prose.write_text("tree model notes\n" + _build_lightgbm_text(), encoding="utf-8")
+        tree_equals_prose = tmp_path / "tree-equals-notes.jpg"
+        tree_equals_prose.write_text("tree=implementation notes\n" + _build_lightgbm_text(), encoding="utf-8")
 
         assert detect_file_format_for_skip_filter(str(disguised_lightgbm)) == "lightgbm"
         assert detect_file_format_for_skip_filter(str(prose_prefixed)) == "unknown"
         assert detect_file_format_for_skip_filter(str(tree_prefixed_prose)) == "unknown"
+        assert detect_file_format_for_skip_filter(str(tree_equals_prose)) == "unknown"
         assert not should_skip_file(str(disguised_lightgbm))
         assert should_skip_file(str(prose_prefixed))
         assert should_skip_file(str(tree_prefixed_prose))
+        assert should_skip_file(str(tree_equals_prose))
 
     def test_disguised_cntk_model_bypasses_default_skip(self, tmp_path: Path) -> None:
         """Default skip filtering must preserve strict CNTK signatures under skipped suffixes."""

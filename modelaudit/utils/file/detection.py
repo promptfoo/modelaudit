@@ -1246,7 +1246,11 @@ def _is_lightgbm_signature(prefix: bytes) -> bool:
 
 
 def _is_lightgbm_native_tree_record(line: str) -> bool:
-    return line == "tree" or line.startswith("tree=")
+    if line == "tree":
+        return True
+    if not line.startswith("tree="):
+        return False
+    return line.removeprefix("tree=").strip().isdigit()
 
 
 def _is_content_routed_lightgbm_signature(prefix: bytes) -> bool:
