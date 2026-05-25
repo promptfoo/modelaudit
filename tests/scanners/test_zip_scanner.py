@@ -691,8 +691,9 @@ def test_scan_zip_python_member_emits_separate_check_per_rule_code(tmp_path: Pat
     assert python_checks[1].details["reason"] == "high-risk calls: subprocess.run"
 
 
-def test_scan_zip_honors_max_mar_python_analysis_bytes_config(tmp_path: Path) -> None:
-    """Generic ZIP Python scanning must honor the same config knob the MAR path reads."""
+def test_scan_zip_honors_max_mar_python_analysis_bytes_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Generic ZIP Python analysis reasons survive nested inconclusive routing."""
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
     archive_path = tmp_path / "source_bundle.zip"
     # ~60 KB payload; a 1 KB configured cap must cause the scanner to mark this
     # member analysis incomplete instead of silently reading the whole thing.
@@ -712,7 +713,9 @@ def test_scan_zip_honors_max_mar_python_analysis_bytes_config(tmp_path: Path) ->
     assert details["analysis_incomplete"] is True
     assert details["max_scan_bytes"] == 1024
     assert details["file_size"] >= 60_000
-    assert "zip_python_member_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    reasons = result.metadata["scan_outcome_reasons"]
+    assert "zip_python_member_analysis_incomplete" in reasons
+    assert "onnx_tentative_candidate_analysis_unavailable" in reasons
 
 
 def test_scan_zip_python_member_honors_pep263_encoding_declaration(tmp_path: Path) -> None:
