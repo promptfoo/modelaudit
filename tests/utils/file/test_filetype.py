@@ -243,12 +243,18 @@ def test_detect_file_format_coreml_validation_passthrough(tmp_path: Path) -> Non
 
 def test_detect_file_format_routes_renamed_coreml_structure_and_rejects_near_match(tmp_path: Path) -> None:
     model_path = create_mock_coreml(tmp_path / "model.jpg")
+    prefixed_model_path = create_mock_coreml(tmp_path / "prefixed-model.jpg")
     near_match = tmp_path / "near-match.jpg"
-    near_match.write_bytes(b"\x08\x08\x12\x03\xa2\x06\x00")
+    unknown_field_prefix = b"\x9a\x06\x03pad"
+    prefixed_model_path.write_bytes(unknown_field_prefix + prefixed_model_path.read_bytes())
+    near_match.write_bytes(unknown_field_prefix + b"\x08\x08\x12\x03\xa2\x06\x00")
 
     assert detect_file_format(str(model_path)) == "coreml"
     assert detect_file_format_from_magic(str(model_path)) == "coreml"
     assert detect_file_format_for_skip_filter(str(model_path)) == "coreml"
+    assert detect_file_format(str(prefixed_model_path)) == "coreml"
+    assert detect_file_format_from_magic(str(prefixed_model_path)) == "coreml"
+    assert detect_file_format_for_skip_filter(str(prefixed_model_path)) == "coreml"
     assert detect_file_format(str(near_match)) == "unknown"
     assert detect_file_format_from_magic(str(near_match)) == "unknown"
     assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
