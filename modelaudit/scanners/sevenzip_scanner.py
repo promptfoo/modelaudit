@@ -451,14 +451,16 @@ class SevenZipScanner(BaseScanner):
 
             # Filter for scannable model files from safe entries only
             scannable_files = self._identify_scannable_files(safe_file_names)
-            member_security_files = self._identify_named_member_security_files(safe_file_names)
+            named_security_files = self._identify_named_member_security_files(safe_file_names)
+            # Nested model targets still need generic executable-content inspection.
+            member_security_files = list(dict.fromkeys([*scannable_files, *named_security_files]))
             nested_archive_files, probed_security_files, probes_complete = (
                 self._identify_probed_nested_and_security_files(
                     archive,
                     safe_file_names,
                     path,
                     result,
-                    named_security_files=frozenset(member_security_files),
+                    named_security_files=frozenset(named_security_files),
                 )
             )
             member_security_files.extend(probed_security_files)
@@ -540,7 +542,7 @@ class SevenZipScanner(BaseScanner):
             candidate_extensions = self._candidate_archive_extensions(file_name)
             if (
                 any(extension in supported_extensions for extension in candidate_extensions)
-                or file_name in named_security_files
+                and file_name not in named_security_files
             ):
                 continue
 
@@ -566,7 +568,7 @@ class SevenZipScanner(BaseScanner):
                     f"Nested member probe limit ({self.max_extensionless_probes}) "
                     f"reached; remaining unsupported members were not inspected"
                 ),
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=archive_path,
                 details={"limit": self.max_extensionless_probes},
             )
@@ -605,7 +607,7 @@ class SevenZipScanner(BaseScanner):
                     name=f"Nested 7z Probe: {file_name}",
                     passed=False,
                     message=f"Failed to inspect nested archive candidate {file_name}: {e}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=f"{archive_path}:{file_name}",
                     details={"error": str(e)},
                 )

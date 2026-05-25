@@ -1385,6 +1385,7 @@ class TestSevenZipScannerHardening:
             limit_checks = [c for c in result.checks if "Probe Limit" in c.name]
             assert len(limit_checks) == 1
             assert limit_checks[0].status == CheckStatus.FAILED
+            assert limit_checks[0].severity == IssueSeverity.INFO
 
     def test_disguised_nested_zip_member_is_routed_for_scan(
         self,
@@ -1578,6 +1579,34 @@ class TestSevenZipScannerHardening:
         assert determine_exit_code(aggregate) == 1
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_python_named_pickle_still_reaches_nested_pickle_scanning(self, tmp_path: Path) -> None:
+        """A pickle disguised as Python source must not stop at AST inspection."""
+        import py7zr  # type: ignore[import-untyped]
+
+        class MaliciousClass:
+            def __reduce__(self) -> tuple[Any, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo disguised_python_pickle",))
+
+        payload_path = tmp_path / "payload.pkl"
+        archive_path = tmp_path / "python_named_pickle.7z"
+        self._write_pickle(payload_path, MaliciousClass())
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, "assets/payload.py")
+
+        result = SevenZipScanner().scan(str(archive_path))
+
+        assert any(
+            issue.location
+            and f"{archive_path}:assets/payload.py" in issue.location
+            and "system" in issue.message.lower()
+            for issue in result.issues
+        )
+        aggregate = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
+        assert determine_exit_code(aggregate) == 1
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_benign_python_and_ordinary_members_stay_clean(self, tmp_path: Path) -> None:
         """Scanning generic member types must not turn inert sidecars into findings."""
         import py7zr  # type: ignore[import-untyped]
@@ -1634,11 +1663,14 @@ class TestSevenZipScannerHardening:
         archive_path = tmp_path / "executable_sidecars.7z"
         elf_path = tmp_path / "payload.dat"
         pe_path = tmp_path / "loader.txt"
+        supported_path = tmp_path / "declared.pkl"
         elf_path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
         pe_path.write_bytes(bytes(distant_pe_header))
+        supported_path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
         with py7zr.SevenZipFile(archive_path, "w") as archive:
             archive.write(elf_path, "assets/payload.dat")
             archive.write(pe_path, "assets/loader.txt")
+            archive.write(supported_path, "assets/declared.pkl")
 
         result = SevenZipScanner().scan(str(archive_path))
         security_messages = {
@@ -1649,6 +1681,7 @@ class TestSevenZipScannerHardening:
 
         assert "Executable file found in 7z archive: assets/payload.dat" in security_messages
         assert "Executable file found in 7z archive: assets/loader.txt" in security_messages
+        assert "Executable file found in 7z archive: assets/declared.pkl" in security_messages
         aggregate = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
         assert determine_exit_code(aggregate) == 1
 
