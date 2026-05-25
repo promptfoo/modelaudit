@@ -301,6 +301,8 @@ class CoreMLScanner(BaseScanner):
                 return False
 
             return cls._has_coreml_structure(top_fields)
+        except OSError:
+            return True
         except Exception:
             return False
 

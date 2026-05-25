@@ -167,7 +167,6 @@ def test_coreml_unavailable_read_is_inconclusive_not_security_finding(
     def raise_os_error(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated CoreML read failure")
 
-    monkeypatch.setattr(CoreMLScanner, "can_handle", classmethod(lambda _cls, _path: True))
     monkeypatch.setattr("modelaudit.scanners.coreml_scanner.open", raise_os_error, raising=False)
 
     direct = CoreMLScanner().scan(str(model_path))
