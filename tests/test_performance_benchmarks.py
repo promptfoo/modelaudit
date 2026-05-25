@@ -202,13 +202,13 @@ class TestPerformanceBenchmarks:
             pytest.skip("psutil not available for memory testing")
 
         process = psutil.Process(os.getpid())
-        scan_model_directory_or_file(str(assets_dir))
+        scan_model_directory_or_file(str(assets_dir), cache_scan_results=False)
         gc.collect()
         initial_memory = process.memory_info().rss / 1024 / 1024  # MB
 
         # Measure repeated scans after lazy scanner imports and caches are warm.
         for _ in range(5):
-            results = scan_model_directory_or_file(str(assets_dir))
+            results = scan_model_directory_or_file(str(assets_dir), cache_scan_results=False)
             assert results.success, "Scan should succeed"
 
         gc.collect()
