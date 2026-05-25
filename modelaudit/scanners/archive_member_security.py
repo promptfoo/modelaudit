@@ -89,6 +89,12 @@ _ASYNCIO_PROCESS_EXECUTION_CALLS = frozenset(
     }
 )
 _PTY_PROCESS_EXECUTION_CALLS = frozenset({"pty.spawn"})
+_RUNPY_CODE_EXECUTION_CALLS = frozenset(
+    {
+        "runpy.run_module",
+        "runpy.run_path",
+    }
+)
 _HIGH_RISK_PYTHON_CALLS = {
     "__import__",
     "__builtin__.__import__",
@@ -113,6 +119,7 @@ _HIGH_RISK_PYTHON_CALLS = {
     *_OS_PROCESS_EXECUTION_CALLS,
     *_ASYNCIO_PROCESS_EXECUTION_CALLS,
     *_PTY_PROCESS_EXECUTION_CALLS,
+    *_RUNPY_CODE_EXECUTION_CALLS,
 }
 # Retain broad subprocess coverage while excluding public APIs that only construct data.
 _KNOWN_NON_EXECUTING_SUBPROCESS_CALLS = {
@@ -146,6 +153,7 @@ _HIGH_RISK_PYTHON_CALL_RULE_CODES: dict[str, str] = {
     **dict.fromkeys(_OS_PROCESS_EXECUTION_CALLS, "S101"),
     **dict.fromkeys(_ASYNCIO_PROCESS_EXECUTION_CALLS, "S103"),
     **dict.fromkeys(_PTY_PROCESS_EXECUTION_CALLS, "S111"),
+    **dict.fromkeys(_RUNPY_CODE_EXECUTION_CALLS, "S108"),
 }
 _HIGH_RISK_PYTHON_CALL_PREFIX_RULE_CODES: tuple[tuple[str, str], ...] = (("subprocess.", "S103"),)
 _FALLBACK_HIGH_RISK_RULE_CODE = "S104"

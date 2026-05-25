@@ -396,6 +396,52 @@ def test_scan_allows_replaced_pty_process_launch_handler_api(tmp_path: Path) -> 
 
 
 @pytest.mark.parametrize(
+    ("handler_source", "dangerous_name"),
+    [
+        (b"import runpy\ndef handle(data, context):\n    return runpy.run_module('payload')\n", "runpy.run_module"),
+        (
+            b"from runpy import run_path as run\ndef handle(data, context):\n    return run('payload.py')\n",
+            "runpy.run_path",
+        ),
+    ],
+)
+def test_scan_detects_runpy_handler_execution_primitive(
+    tmp_path: Path, handler_source: bytes, dangerous_name: str
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={"handler.py": handler_source, "weights.bin": b"weights"},
+        filename="runpy_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(handler_failures) == 1
+    assert handler_failures[0].severity == IssueSeverity.CRITICAL
+    assert dangerous_name in handler_failures[0].message
+
+
+def test_scan_allows_replaced_runpy_handler_api(tmp_path: Path) -> None:
+    handler_source = (
+        b"import runpy\ndef handle(data, context):\n    runpy.run_path = len\n    return runpy.run_path([])\n"
+    )
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={"handler.py": handler_source, "weights.bin": b"weights"},
+        filename="safe_replaced_runpy_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
+
+
+@pytest.mark.parametrize(
     "handler_source",
     [
         b"def handle(data, context):\n    return __builtins__['ev' + 'al']('1 + 1')\n",

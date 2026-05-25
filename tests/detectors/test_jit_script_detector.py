@@ -455,6 +455,42 @@ class TestJITScriptDetector:
     @pytest.mark.parametrize(
         "source",
         [
+            b"def payload():\n    return runpy.run_module('payload')\n",
+            b"def payload():\n    from runpy import run_path as run\n    return run('payload.py')\n",
+        ],
+    )
+    def test_scan_model_detects_unmarked_runpy_execution(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    def test_scan_model_ignores_certain_replaced_runpy_execution(self) -> None:
+        detector = JITScriptDetector()
+        source = b"def payload():\n    runpy.run_path = len\n    return runpy.run_path([])\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
+    def test_scan_model_preserves_possible_runpy_execution_after_conditional_replacement(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def payload():\n    if replace:\n        runpy.run_path = len\n    return runpy.run_path('payload.py')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Dynamic module execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
             b"getattr(__builtins__, 'eval')('1 + 1')\n",
             b"__builtins__['eval']('1 + 1')\n",
             b"getattr(__builtins__, 'ev' + 'al')('1 + 1')\n",

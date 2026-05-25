@@ -40,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect JIT-scanned embedded Python `subprocess.check_call`, `getoutput`, and `getstatusoutput` calls while suppressing certain safe replacements
 - detect embedded Python `asyncio.create_subprocess_exec` and `asyncio.create_subprocess_shell` process-launch calls
 - detect embedded Python `pty.spawn` launches and report statically resolved JIT process-launch aliases
+- detect embedded Python `runpy.run_module` and `runpy.run_path` dynamic-module execution calls
 - register emitted `S112`-`S114` dynamic-code rule identifiers so they can be listed and configured
 - avoid duplicate JIT findings when a complete embedded Python source payload is analyzed through multiple paths
 - preserve embedded Python execution findings when a replacement receiver is conditional, aliased, or a runtime argument

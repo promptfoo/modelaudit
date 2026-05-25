@@ -153,8 +153,8 @@ def _resolve_alias_aware_dangerous_builtins(tree: ast.AST) -> set[str]:
     return dangerous_builtins
 
 
-def _resolve_alias_aware_process_calls(tree: ast.AST) -> tuple[set[str], set[str], set[str]]:
-    """Return OS, subprocess, and pseudo-terminal launches reached through static resolution."""
+def _resolve_alias_aware_execution_calls(tree: ast.AST) -> tuple[set[str], set[str], set[str], set[str]]:
+    """Return modeled process and dynamic-module execution calls reached through static resolution."""
     from modelaudit.scanners.archive_member_security import high_risk_python_calls_in_tree
 
     calls = high_risk_python_calls_in_tree(tree)
@@ -162,6 +162,7 @@ def _resolve_alias_aware_process_calls(tree: ast.AST) -> tuple[set[str], set[str
         {call.name for call in calls if call.rule_code == "S101"},
         {call.name for call in calls if call.rule_code == "S103"},
         {call.name for call in calls if call.rule_code == "S111"},
+        {call.name for call in calls if call.rule_code == "S108"},
     )
 
 
@@ -169,6 +170,7 @@ def _resolve_alias_aware_process_calls(tree: ast.AST) -> tuple[set[str], set[str
 _SUBPROCESS_CODE_EXECUTION_DESCRIPTION = "Subprocess execution detected"
 _OS_CODE_EXECUTION_DESCRIPTION = "OS command execution detected"
 _PTY_CODE_EXECUTION_DESCRIPTION = "Pseudo-terminal process execution detected"
+_RUNPY_CODE_EXECUTION_DESCRIPTION = "Dynamic module execution detected"
 CODE_EXECUTION_PATTERNS = [
     # Direct execution patterns
     (rb"exec\s*\(", "exec() call detected"),
@@ -183,6 +185,7 @@ CODE_EXECUTION_PATTERNS = [
     (rb"asyncio\.create_subprocess_(?:exec|shell)", _SUBPROCESS_CODE_EXECUTION_DESCRIPTION),
     (rb"os\.(system|popen|exec\w*|spawn\w*|posix_spawnp?|startfile)", _OS_CODE_EXECUTION_DESCRIPTION),
     (rb"pty\.spawn", _PTY_CODE_EXECUTION_DESCRIPTION),
+    (rb"runpy\.(?:run_module|run_path)", _RUNPY_CODE_EXECUTION_DESCRIPTION),
     # Network patterns
     (rb"socket\.(socket|create_connection)", "Socket creation detected"),
     (rb"urllib\.(request|urlopen)", "URL request detected"),
@@ -246,8 +249,10 @@ class JITScriptDetector:
         """Return whether parsed Python contains modeled dangerous operations."""
         if _resolve_alias_aware_dangerous_builtins(tree):
             return True
-        os_process_calls, subprocess_calls, pty_process_calls = _resolve_alias_aware_process_calls(tree)
-        if os_process_calls or subprocess_calls or pty_process_calls:
+        os_process_calls, subprocess_calls, pty_process_calls, runpy_execution_calls = (
+            _resolve_alias_aware_execution_calls(tree)
+        )
+        if os_process_calls or subprocess_calls or pty_process_calls or runpy_execution_calls:
             return True
 
         def is_dangerous_import(module_name: str) -> bool:
@@ -578,12 +583,16 @@ class JITScriptDetector:
         bounded_os_process_calls: set[str] | None = None
         bounded_subprocess_calls: set[str] | None = None
         bounded_pty_process_calls: set[str] | None = None
+        bounded_runpy_execution_calls: set[str] | None = None
         try:
             bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
             bounded_dangerous_builtins = _resolve_alias_aware_dangerous_builtins(bounded_tree)
-            bounded_os_process_calls, bounded_subprocess_calls, bounded_pty_process_calls = (
-                _resolve_alias_aware_process_calls(bounded_tree)
-            )
+            (
+                bounded_os_process_calls,
+                bounded_subprocess_calls,
+                bounded_pty_process_calls,
+                bounded_runpy_execution_calls,
+            ) = _resolve_alias_aware_execution_calls(bounded_tree)
         except (SyntaxError, UnicodeDecodeError, ValueError):
             pass
 
@@ -692,6 +701,12 @@ class JITScriptDetector:
                 and not bounded_pty_process_calls
             ):
                 continue
+            if (
+                description == _RUNPY_CODE_EXECUTION_DESCRIPTION
+                and bounded_runpy_execution_calls is not None
+                and not bounded_runpy_execution_calls
+            ):
+                continue
             if re.search(pattern, bounded):  # Limit search size
                 add_code_execution_pattern_finding(description)
 
@@ -700,6 +715,7 @@ class JITScriptDetector:
             (bounded_os_process_calls, _OS_CODE_EXECUTION_DESCRIPTION),
             (bounded_subprocess_calls, _SUBPROCESS_CODE_EXECUTION_DESCRIPTION),
             (bounded_pty_process_calls, _PTY_CODE_EXECUTION_DESCRIPTION),
+            (bounded_runpy_execution_calls, _RUNPY_CODE_EXECUTION_DESCRIPTION),
         ):
             if calls and description not in reported_patterns:
                 add_code_execution_pattern_finding(description)
