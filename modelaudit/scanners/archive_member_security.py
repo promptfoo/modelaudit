@@ -319,11 +319,49 @@ def _resolve_getattr_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> fr
     return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
 
 
+def _resolve_namespace_dict_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+    """Resolve bounded calls dispatched through a statically known namespace mapping."""
+    if isinstance(node, ast.Attribute) and node.attr == "__call__":
+        return _resolve_namespace_dict_call_names(node.value, alias_scopes)
+
+    if not isinstance(node, ast.Subscript):
+        return None
+
+    attr_name = _resolve_static_string(node.slice)
+    if attr_name is None:
+        return None
+
+    target_root_node: ast.AST | None = None
+    namespace_node = node.value
+    if isinstance(namespace_node, ast.Attribute) and namespace_node.attr == "__dict__":
+        target_root_node = namespace_node.value
+    elif isinstance(namespace_node, ast.Call) and len(namespace_node.args) == 1 and not namespace_node.keywords:
+        helper_name = _resolve_call_name(namespace_node.func)
+        resolved_helper_names = _apply_aliases(helper_name, alias_scopes) if helper_name is not None else None
+        if resolved_helper_names is not None and resolved_helper_names & {"vars", "builtins.vars"}:
+            target_root_node = namespace_node.args[0]
+
+    if target_root_node is None:
+        return None
+
+    target_root = _resolve_call_name(target_root_node)
+    if target_root is None:
+        return None
+
+    resolved_target_roots = _apply_aliases(target_root, alias_scopes)
+    if resolved_target_roots is None:
+        return None
+    return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
+
+
 def _resolve_static_reference_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
     call_name = _resolve_call_name(node)
     if call_name is not None:
         return _apply_aliases(call_name, alias_scopes)
-    return _resolve_getattr_call_names(node, alias_scopes)
+    getattr_names = _resolve_getattr_call_names(node, alias_scopes)
+    if getattr_names is not None:
+        return getattr_names
+    return _resolve_namespace_dict_call_names(node, alias_scopes)
 
 
 def _is_high_risk_python_call_name(name: str) -> bool:

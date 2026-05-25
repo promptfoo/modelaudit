@@ -219,6 +219,32 @@ class TestTarScanner:
         assert python_checks[0].rule_code == "S101"
         assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            b"import os\nos.__dict__['sys' + 'tem']('echo hidden')\n",
+            b"import os as operating_system\nvars(operating_system)['system']('echo hidden')\n",
+        ],
+        ids=["module_dict", "vars_module"],
+    )
+    def test_scan_tar_flags_namespace_dict_dangerous_python_member(self, tmp_path: Path, payload: bytes) -> None:
+        """Static module namespace dispatch should still resolve risky calls."""
+        archive_path = tmp_path / "model_bundle.tar"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].severity == IssueSeverity.WARNING
+        assert python_checks[0].rule_code == "S101"
+        assert python_checks[0].details["reason"] == "high-risk calls: os.system"
+
     def test_scan_tar_flags_rebound_dangerous_python_member(self, tmp_path: Path) -> None:
         """Callable rebindings should not bypass generic TAR Python member scanning."""
         archive_path = tmp_path / "model_bundle.tar"
@@ -403,6 +429,27 @@ class TestTarScanner:
         """Benign Python source in generic TAR archives should not produce security findings."""
         archive_path = tmp_path / "model_bundle.tar"
         source = b"def preprocess(value: str) -> str:\n    return value.strip().lower()\n"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("preprocess.py")
+            info.size = len(source)
+            archive.addfile(info, tarfile.io.BytesIO(source))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    def test_scan_tar_ignores_benign_dictionary_dispatch_python_member(self, tmp_path: Path) -> None:
+        """Ordinary application dictionaries should not be treated as module namespaces."""
+        archive_path = tmp_path / "model_bundle.tar"
+        source = (
+            b"def normalize(value: float) -> float:\n"
+            b"    return value / 255.0\n"
+            b"handlers = {'system': normalize}\n"
+            b"handlers['system'](1.0)\n"
+        )
 
         with tarfile.open(archive_path, "w") as archive:
             info = tarfile.TarInfo("preprocess.py")

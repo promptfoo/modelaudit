@@ -246,6 +246,32 @@ def test_scan_zip_flags_concatenated_getattr_name_dangerous_python_member(tmp_pa
     assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import os\nos.__dict__['sys' + 'tem']('echo hidden')\n",
+        "import os as operating_system\nvars(operating_system)['system']('echo hidden')\n",
+    ],
+    ids=["module_dict", "vars_module"],
+)
+def test_scan_zip_flags_namespace_dict_dangerous_python_member(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].severity == IssueSeverity.WARNING
+    assert python_checks[0].rule_code == "S101"
+    assert python_checks[0].details["reason"] == "high-risk calls: os.system"
+
+
 def test_scan_zip_bounds_large_concatenated_getattr_names(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     padding = " + ".join(["''"] * 300)
@@ -473,6 +499,24 @@ def test_scan_zip_ignores_benign_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "source_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("preprocess.py", "def normalize(value: float) -> float:\n    return value / 255.0\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert result.success is True
+    assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_scan_zip_ignores_benign_dictionary_dispatch_python_member(tmp_path: Path) -> None:
+    archive_path = tmp_path / "source_bundle.zip"
+    source = (
+        "def normalize(value: float) -> float:\n"
+        "    return value / 255.0\n"
+        "handlers = {'system': normalize}\n"
+        "handlers['system'](1.0)\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("preprocess.py", source)
 
     result = ZipScanner().scan(str(archive_path))
 
