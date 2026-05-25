@@ -1450,7 +1450,8 @@ def detect_file_format_for_skip_filter(path: str) -> str:
 
     This intentionally recognizes only content-derived format signals. It avoids
     extension-based routing and uses one bounded prefix read for common skipped
-    files, while still preserving disguised model/archive payloads for full scans.
+    files. Executable-header candidates may receive bounded Llamafile marker
+    prefix/tail probes so disguised executable payloads reach full scans.
     """
     file_path = Path(path)
     if file_path.is_dir():
