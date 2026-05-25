@@ -112,7 +112,7 @@ _KERAS_CONFIG_PREFIX_CONFIG_OBJECT_RE = re.compile(r'"config"\s*:\s*\{')
 _KERAS_CONFIG_PREFIX_HINT_RE = re.compile(
     r'"(?:layers|input_layers|output_layers|build_config|compile_config|module|registered_name)"\s*:'
 )
-_NEMO_CONFIG_ENTRY_BASENAMES = frozenset({"model_config.yaml", "model_config.yml"})
+_NEMO_CONFIG_ENTRIES = frozenset({"model_config.yaml", "model_config.yml"})
 _PYTORCH_ZIP_METADATA_MAX_BYTES = 64
 _SKOPS_SCHEMA_ENTRIES = frozenset({"schema", "schema.json"})
 _SKOPS_SCHEMA_MAX_BYTES = 4 * 1024 * 1024
@@ -977,7 +977,7 @@ def is_skops_archive(path: str) -> bool:
 
 
 def is_nemo_archive(path: str) -> bool:
-    """Return whether a TAR-backed artifact has the canonical NeMo config member."""
+    """Return whether a TAR-backed artifact has an archive-root NeMo config."""
     file_path = Path(path)
     if not file_path.is_file():
         return False
@@ -988,7 +988,7 @@ def is_nemo_archive(path: str) -> bool:
                 if not member.isfile():
                     continue
                 member_name = _normalize_archive_member_name(member.name)
-                if PurePosixPath(member_name).name.lower() in _NEMO_CONFIG_ENTRY_BASENAMES:
+                if member_name.lower() in _NEMO_CONFIG_ENTRIES:
                     return True
     except (OSError, tarfile.TarError):
         return False

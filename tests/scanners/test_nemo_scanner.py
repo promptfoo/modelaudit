@@ -644,12 +644,12 @@ class TestCVE202523304HydraTarget:
             for check in result.checks
         )
 
-    def test_renamed_generic_tar_yaml_is_not_promoted_to_nemo(self, tmp_path: Path) -> None:
+    def test_renamed_nested_config_basename_tar_is_not_promoted_to_nemo(self, tmp_path: Path) -> None:
         path = _create_nemo_file(
             tmp_path,
             {"model": {"_target_": "os.system", "command": "echo pwned"}},
             filename="generic.jpg",
-            config_name="config.yaml",
+            config_name="docs/model_config.yaml",
         )
 
         assert not NemoScanner.can_handle(str(path))
@@ -659,12 +659,12 @@ class TestCVE202523304HydraTarget:
         assert result.scanner_name == "tar"
         assert not any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
 
-    def test_nested_renamed_generic_tar_yaml_is_not_promoted_to_nemo(self, tmp_path: Path) -> None:
+    def test_nested_renamed_nested_config_basename_tar_is_not_promoted_to_nemo(self, tmp_path: Path) -> None:
         member_path = _create_nemo_file(
             tmp_path,
             {"model": {"_target_": "os.system", "command": "echo pwned"}},
             filename="generic.jpg",
-            config_name="config.yaml",
+            config_name="docs/model_config.yaml",
         )
         archive_path = tmp_path / "bundle.zip"
         with zipfile.ZipFile(archive_path, "w") as archive:

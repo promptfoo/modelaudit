@@ -76,7 +76,7 @@ ModelAudit includes 44 registered scanners covering model, archive, and configur
 | **ONNX**                | `.onnx`                                                                   | MEDIUM |
 | **CoreML**              | `.mlmodel`                                                                | LOW    |
 | **MXNet**               | `*-symbol.json`, `*-NNNN.params`                                          | LOW    |
-| **NeMo**                | `.nemo`, signature-valid renamed archives                                 | MEDIUM |
+| **NeMo**                | `.nemo`, renamed archives with root config                                | MEDIUM |
 | **CNTK**                | `.dnn`, `.cmf`                                                            | MEDIUM |
 | **RKNN**                | `.rknn`                                                                   | MEDIUM |
 | **Torch7**              | `.t7`, `.th`, `.net`                                                      | HIGH   |
