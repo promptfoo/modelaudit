@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - avoid embedded Python execution findings after statically certain namespace-mapping replacement
 - model reflective and saved namespace-map replacements when their receiver remains certain
 - model deterministic mapping-helper replacements when their helper and receiver remain certain
+- avoid embedded Python execution findings after a certain discarded namespace-map removal
 - preserve embedded Python execution findings when a replacement receiver is conditional, aliased, or a runtime argument
 - fail closed when nested NeMo checkpoint or referenced-artifact analysis is explicitly incomplete
 - preserve concrete nested security findings from checkpoint and referenced artifacts inside NeMo archives

@@ -287,6 +287,8 @@ class TestJITScriptDetector:
                 b"globals()['__builtins__']['eval'] = __builtins__['exec']\n"
                 b"run('1 + 1')\n"
             ),
+            b"import builtins\nbuiltins.__dict__.pop('eval')('pass')\n",
+            b"import builtins\nrun = builtins.__dict__.pop('eval')\nrun('pass')\n",
         ],
     )
     def test_scan_model_detects_unmarked_static_builtin_indirection(self, source: bytes) -> None:
@@ -368,6 +370,8 @@ class TestJITScriptDetector:
             b"import builtins\nnamespace = builtins.__dict__\nnamespace.update({'eval': len})\nbuiltins.eval([])\n",
             b"import builtins\ndict.update(builtins.__dict__, {'eval': len})\nbuiltins.eval([])\n",
             b"import builtins\nimport operator\noperator.setitem(builtins.__dict__, 'eval', len)\nbuiltins.eval([])\n",
+            b"import builtins\nbuiltins.__dict__.pop('eval')\nbuiltins.eval([])\n",
+            b"import builtins\ndict.pop(builtins.__dict__, 'eval')\nbuiltins.eval([])\n",
             b"def payload():\n    eval = len\n    return eval([])\n",
             (
                 b"def payload():\n"

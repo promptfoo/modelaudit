@@ -310,6 +310,8 @@ def test_scan_detects_keyword_getattr_wrapped_handler_execution_primitive(
             b"    globals()['__builtins__']['eval'] = __builtins__['exec']\n"
             b"    return run('1 + 1')\n"
         ),
+        (b"def handle(data, context):\n    return globals()['__builtins__'].pop('eval')('1 + 1')\n"),
+        (b"def handle(data, context):\n    run = globals()['__builtins__'].pop('eval')\n    return run('1 + 1')\n"),
     ],
 )
 def test_scan_detects_implicit_builtins_handler_execution_primitive(
@@ -393,6 +395,18 @@ def test_scan_detects_implicit_builtins_handler_execution_primitive(
             b"import builtins\n"
             b"def handle(data, context):\n"
             b"    dict.update(builtins.__dict__, {'eval': len})\n"
+            b"    return builtins.eval([])\n"
+        ),
+        (
+            b"import builtins\n"
+            b"def handle(data, context):\n"
+            b"    builtins.__dict__.pop('eval')\n"
+            b"    return builtins.eval([])\n"
+        ),
+        (
+            b"import builtins\n"
+            b"def handle(data, context):\n"
+            b"    dict.pop(builtins.__dict__, 'eval')\n"
             b"    return builtins.eval([])\n"
         ),
         (

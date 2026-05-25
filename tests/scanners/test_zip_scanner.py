@@ -219,6 +219,8 @@ def test_scan_zip_flags_aliased_dangerous_python_member(tmp_path: Path) -> None:
             "    dict.update(namespace, {'system': len})\n"
             "    os.system('echo hidden')\n"
         ),
+        "import os\nrun = os.__dict__.pop('system')\nrun('echo hidden')\n",
+        "import os\nif remove:\n    os.__dict__.pop('system')\nos.system('echo hidden')\n",
         ("import os\ndef hide(target=os):\n    setattr(target, 'system', len)\n    os.system('echo hidden')\n"),
         ("import os\ndef hide(target=os):\n    target.system = len\n    os.system('echo hidden')\n"),
         (
@@ -276,6 +278,9 @@ def test_scan_zip_preserves_captured_dangerous_callable_before_overwrite(tmp_pat
         "import os\ndict.__setitem__(os.__dict__, 'system', len)\nos.system([])\n",
         "import os\nimport operator\noperator.setitem(os.__dict__, 'system', len)\nos.system([])\n",
         "import os\nfrom operator import setitem as replace\nreplace(os.__dict__, 'system', len)\nos.system([])\n",
+        "import os\nos.__dict__.pop('system')\nos.system([])\n",
+        "import os\nremove = os.__dict__.pop\nremove('system')\nos.system([])\n",
+        "import os\ndict.pop(os.__dict__, 'system')\nos.system([])\n",
     ],
 )
 def test_scan_zip_allows_callable_captured_after_safe_overwrite(tmp_path: Path, source: str) -> None:
@@ -406,6 +411,8 @@ def test_scan_zip_flags_builtins_getattr_keyword_call_dangerous_python_member(tm
             "globals()['__builtins__']['eval'] = __builtins__['exec']\n"
             "run('1 + 1')\n"
         ),
+        "globals()['__builtins__'].pop('eval')('1 + 1')\n",
+        "run = globals()['__builtins__'].pop('eval')\nrun('1 + 1')\n",
     ],
 )
 def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path, source: str) -> None:
@@ -456,6 +463,8 @@ def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path
             "run = globals()['__builtins__']['eval']\n"
             "run([])\n"
         ),
+        "globals()['__builtins__'].pop('eval')\nglobals()['__builtins__']['eval']([])\n",
+        "remove = globals()['__builtins__'].pop\nremove('eval')\nglobals()['__builtins__']['eval']([])\n",
     ],
 )
 def test_scan_zip_allows_benign_builtin_shaped_source(tmp_path: Path, source: str) -> None:

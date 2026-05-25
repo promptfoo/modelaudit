@@ -1070,6 +1070,8 @@ def test_pytorch_zip_scans_unmarked_python_blobs_in_archive_data(tmp_path: Path)
             b"globals()['__builtins__']['eval'] = __builtins__['exec']\n"
             b"run('1 + 1')\n"
         ),
+        b"import builtins\nbuiltins.__dict__.pop('eval')('pass')\n",
+        b"import builtins\nrun = builtins.__dict__.pop('eval')\nrun('pass')\n",
     ],
 )
 def test_pytorch_zip_scans_static_builtin_indirection_in_archive_data(tmp_path: Path, payload: bytes) -> None:
@@ -1147,6 +1149,8 @@ def test_pytorch_zip_scans_aliased_modeled_builtins_in_archive_data(
         b"import builtins\nbuiltins.__dict__.update({'eval': len})\nbuiltins.eval([])\n",
         b"import builtins\ngetattr(builtins, '__dict__').update({'eval': len})\nbuiltins.eval([])\n",
         b"import builtins\ndict.update(builtins.__dict__, {'eval': len})\nbuiltins.eval([])\n",
+        b"import builtins\nbuiltins.__dict__.pop('eval')\nbuiltins.eval([])\n",
+        b"import builtins\ndict.pop(builtins.__dict__, 'eval')\nbuiltins.eval([])\n",
         (
             b"replace = globals()['__builtins__'].__setitem__\n"
             b"replace('eval', len)\n"

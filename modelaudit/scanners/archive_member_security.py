@@ -297,7 +297,7 @@ _STATIC_MAPPING_MUTATION_ALIAS_PREFIX = "<static mapping mutation alias>:"
 _STATIC_UNCERTAIN_BINDING_PREFIX = "<uncertain static binding>:"
 _CAPTURED_CALLABLE_REFERENCE_PREFIX = "<captured callable>:"
 _BUILTIN_NAMESPACE_NAMES = {"__builtin__", "__builtins__"}
-_STATIC_MAPPING_MUTATORS = {"__setitem__", "update"}
+_STATIC_MAPPING_MUTATORS = {"__setitem__", "pop", "update"}
 _STATIC_ATTRIBUTE_MUTATION_HELPERS = {
     "setattr",
     "__builtin__.setattr",
@@ -309,6 +309,8 @@ _STATIC_MAPPING_FUNCTION_MUTATORS = {
     "builtins.dict.__setitem__": "__setitem__",
     "dict.update": "update",
     "builtins.dict.update": "update",
+    "dict.pop": "pop",
+    "builtins.dict.pop": "pop",
     "operator.setitem": "__setitem__",
 }
 
@@ -812,7 +814,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for target_name in target_names:
             self._bind_name(self._static_reference_override_key(target_name), resolved_value_names)
 
-    def _bind_static_mapping_mutation(self, node: ast.Call) -> None:
+    def _bind_static_mapping_mutation(self, node: ast.Call, *, model_discarded_removals: bool = False) -> None:
         """Model unconditional writes through one certain namespace mapping."""
         if node.keywords:
             return
@@ -841,7 +843,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             target_roots = resolved_target_roots
             mutation_args = node.args[1:]
 
-        mutations: list[tuple[frozenset[str], ast.AST]] = []
+        mutations: list[tuple[frozenset[str], ast.AST | None]] = []
         if method == "__setitem__":
             if len(mutation_args) != 2:
                 return
@@ -861,11 +863,22 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 if attr_name is None:
                     return
                 mutations.append((frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), value_node))
+        elif method == "pop":
+            if not model_discarded_removals or len(mutation_args) not in {1, 2}:
+                return
+            attr_name = _resolve_static_string(mutation_args[0])
+            if attr_name is None:
+                return
+            mutations.append((frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), None))
         else:
             return
 
         for target_names, value in mutations:
-            self._bind_static_reference_names_to_value(target_names, value)
+            if value is None:
+                for target_name in target_names:
+                    self._bind_name(self._static_reference_override_key(target_name), None)
+            else:
+                self._bind_static_reference_names_to_value(target_names, value)
 
     def _bind_static_setattr_mutation(self, node: ast.Call) -> None:
         """Model certain builtin ``setattr`` writes to one resolved reference."""
@@ -1129,7 +1142,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def visit_Expr(self, node: ast.Expr) -> None:
         self.visit(node.value)
         if isinstance(node.value, ast.Call):
-            self._bind_static_mapping_mutation(node.value)
+            self._bind_static_mapping_mutation(node.value, model_discarded_removals=True)
             self._bind_static_setattr_mutation(node.value)
 
     def _visit_loop(self, node: ast.For | ast.AsyncFor) -> None:
