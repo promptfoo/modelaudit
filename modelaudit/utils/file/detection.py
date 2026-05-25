@@ -123,6 +123,7 @@ _XML_MODEL_ROOT_FORMATS = {
 }
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
 _JINJA2_SUSPICIOUS_TEMPLATE_CHUNK_BYTES = 8192
+_JINJA2_SUSPICIOUS_TEMPLATE_PROBE_BYTES = 64 * 1024
 _JINJA2_TEMPLATE_SYNTAX_MARKERS = (b"{{", b"{%", b"{#")
 _JINJA2_SUSPICIOUS_TEMPLATE_MARKERS = (
     b"__globals__",
@@ -134,6 +135,19 @@ _JINJA2_SUSPICIOUS_TEMPLATE_MARKERS = (
     b"os.popen",
     b"subprocess.",
     b"pty.spawn",
+    b"eval(",
+    b"exec(",
+    b"compile(",
+    b"commands.",
+    b"os.spawn",
+    b"shutil.rmtree",
+    b"os.remove",
+    b"os.unlink",
+    b"socket.socket",
+    b"urllib.request.",
+    b"requests.",
+    b"importlib.",
+    b"runpy.",
 )
 _JINJA2_NATIVE_SUFFIXES = frozenset({".gguf", ".json", ".yaml", ".yml", ".jinja", ".j2", ".template"})
 _COMPRESSED_EXTENSION_CODECS = {
@@ -1243,7 +1257,9 @@ def is_suspicious_jinja2_template_file(path: str | Path) -> bool:
         if not file_path.is_file():
             return False
         with file_path.open("rb") as f:
-            while chunk := f.read(_JINJA2_SUSPICIOUS_TEMPLATE_CHUNK_BYTES):
+            remaining = _JINJA2_SUSPICIOUS_TEMPLATE_PROBE_BYTES
+            while remaining > 0 and (chunk := f.read(min(remaining, _JINJA2_SUSPICIOUS_TEMPLATE_CHUNK_BYTES))):
+                remaining -= len(chunk)
                 sample = overlap + chunk
                 lowered_sample = sample.lower()
                 syntax_found = syntax_found or any(marker in sample for marker in _JINJA2_TEMPLATE_SYNTAX_MARKERS)

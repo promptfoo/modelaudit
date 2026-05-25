@@ -131,6 +131,23 @@ def test_detect_oversized_renamed_ssti_template_after_late_marker(tmp_path: Path
     assert detect_file_format(str(benign_file)) == "unknown"
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "{{ eval('1+1') }}",
+        "{{ requests.get('https://example.invalid') }}",
+        "{{ importlib.import_module('os') }}",
+    ],
+)
+def test_detect_renamed_ssti_routes_critical_pattern_families(tmp_path: Path, payload: str) -> None:
+    malicious_file = tmp_path / "payload.jpg"
+    malicious_file.write_text(payload, encoding="utf-8")
+
+    assert detect_file_format_from_magic(str(malicious_file)) == "jinja2_template"
+    assert detect_file_format_for_skip_filter(str(malicious_file)) == "jinja2_template"
+    assert detect_file_format(str(malicious_file)) == "jinja2_template"
+
+
 def test_detect_file_format_rejects_pk_prefix_near_match(tmp_path: Path) -> None:
     near_match = tmp_path / "not-a-zip.dat"
     near_match.write_bytes(b"PKNOPE harmless text")
