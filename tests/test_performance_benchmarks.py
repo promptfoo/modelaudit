@@ -21,11 +21,6 @@ class TestPerformanceBenchmarks:
         """Get the path to test assets."""
         return Path(__file__).parent / "assets"
 
-    @pytest.fixture(autouse=True)
-    def suppress_expected_scanner_logs(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Avoid measuring capture of expected findings from malicious fixtures."""
-        caplog.set_level(logging.CRITICAL + 1, logger="modelaudit.scanners")
-
     @pytest.fixture
     def performance_thresholds(self):
         """Define performance thresholds for different operations."""
@@ -189,7 +184,7 @@ class TestPerformanceBenchmarks:
             assert degradation_ratio < 5.0, f"Performance degrades too much with scale (ratio: {degradation_ratio:.2f})"
 
     @pytest.mark.performance
-    def test_memory_usage_stability(self, assets_dir: Path) -> None:
+    def test_memory_usage_stability(self, assets_dir: Path, caplog: pytest.LogCaptureFixture) -> None:
         """Test that memory usage remains stable after scanner initialization."""
         if not assets_dir.exists():
             pytest.skip("Assets directory does not exist")
@@ -201,8 +196,11 @@ class TestPerformanceBenchmarks:
         except ImportError:
             pytest.skip("psutil not available for memory testing")
 
+        # Expected adversarial findings should not inflate the RSS measurement.
+        caplog.set_level(logging.CRITICAL + 1, logger="modelaudit.scanners")
         process = psutil.Process(os.getpid())
-        scan_model_directory_or_file(str(assets_dir), cache_scan_results=False)
+        warmup_results = scan_model_directory_or_file(str(assets_dir), cache_scan_results=False)
+        assert warmup_results.success, "Warm-up scan should succeed"
         gc.collect()
         initial_memory = process.memory_info().rss / 1024 / 1024  # MB
 
