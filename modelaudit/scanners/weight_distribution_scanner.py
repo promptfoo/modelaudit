@@ -391,6 +391,7 @@ class WeightDistributionScanner(BaseScanner):
 
         except Exception as e:
             logger.debug(f"Failed to extract weights from {path}: {e}")
+            raise RuntimeError(f"Failed to extract Keras weights from {path}") from e
 
         return weights_info
 
@@ -475,6 +476,7 @@ class WeightDistributionScanner(BaseScanner):
                         weights_info[node.name] = array
         except Exception as e:
             logger.warning(f"Weight analysis incomplete for {path}: {e}")
+            raise RuntimeError(f"Failed to extract TensorFlow weights from {path}") from e
 
         return weights_info
 
@@ -524,6 +526,7 @@ class WeightDistributionScanner(BaseScanner):
 
         except Exception as e:
             logger.warning(f"Failed to extract ONNX weights from {path}: {e}")
+            raise RuntimeError(f"Failed to extract ONNX weights from {path}") from e
 
         return weights_info
 
@@ -544,6 +547,7 @@ class WeightDistributionScanner(BaseScanner):
 
         except Exception as e:
             logger.debug(f"Failed to extract weights from {path}: {e}")
+            raise RuntimeError(f"Failed to extract SafeTensors weights from {path}") from e
 
         return weights_info
 

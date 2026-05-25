@@ -253,6 +253,28 @@ def test_analysis_failure_is_inconclusive_and_not_cached(tmp_path: Path, monkeyp
         reset_cache_manager()
 
 
+@pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
+def test_weight_extraction_failure_is_inconclusive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import h5py
+    import numpy as np
+
+    path = tmp_path / "unreadable_weights.h5"
+    with h5py.File(path, "w") as hdf5_file:
+        hdf5_file.create_dataset("model_weights/dense/kernel:0", data=np.zeros((2, 2)))
+
+    def fail_open(*_args: object, **_kwargs: object) -> object:
+        raise OSError("simulated HDF5 extraction read failure")
+
+    monkeypatch.setattr(h5py, "File", fail_open)
+
+    result = WeightDistributionScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["weight_distribution_analysis_incomplete"]
+    assert not any(check.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in result.checks)
+
+
 @pytest.mark.skipif(not HAS_NUMPY, reason="numpy not available")
 class TestWeightDistributionScanner:
     """Test suite for weight distribution anomaly detection"""
