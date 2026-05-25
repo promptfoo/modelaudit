@@ -293,11 +293,12 @@ _NAMESPACE_MAPPING_ACCESSORS = {"get", "__getitem__", "pop", "setdefault"}
 _GLOBAL_NAMESPACE_HELPERS = {"globals", "builtins.globals"}
 _GLOBAL_NAMESPACE_MAPPING_MARKER = "<globals mapping>"
 _STATIC_REFERENCE_OVERRIDE_PREFIX = "<static reference override>:"
+_STATIC_CLEARED_NAMESPACE_PREFIX = "<static cleared namespace>:"
 _STATIC_MAPPING_MUTATION_ALIAS_PREFIX = "<static mapping mutation alias>:"
 _STATIC_UNCERTAIN_BINDING_PREFIX = "<uncertain static binding>:"
 _CAPTURED_CALLABLE_REFERENCE_PREFIX = "<captured callable>:"
 _BUILTIN_NAMESPACE_NAMES = {"__builtin__", "__builtins__"}
-_STATIC_MAPPING_MUTATORS = {"__delitem__", "__setitem__", "pop", "update"}
+_STATIC_MAPPING_MUTATORS = {"__delitem__", "__setitem__", "clear", "pop", "update"}
 _STATIC_ATTRIBUTE_MUTATION_HELPERS = {
     "setattr",
     "__builtin__.setattr",
@@ -309,6 +310,8 @@ _STATIC_MAPPING_FUNCTION_MUTATORS = {
     "builtins.dict.__setitem__": "__setitem__",
     "dict.__delitem__": "__delitem__",
     "builtins.dict.__delitem__": "__delitem__",
+    "dict.clear": "clear",
+    "builtins.dict.clear": "clear",
     "dict.update": "update",
     "builtins.dict.update": "update",
     "dict.pop": "pop",
@@ -723,6 +726,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         return f"{_STATIC_REFERENCE_OVERRIDE_PREFIX}{reference_name}"
 
     @staticmethod
+    def _static_cleared_namespace_key(namespace_root: str) -> str:
+        return f"{_STATIC_CLEARED_NAMESPACE_PREFIX}{namespace_root}"
+
+    @staticmethod
     def _static_mapping_mutation_alias_key(name: str) -> str:
         return f"{_STATIC_MAPPING_MUTATION_ALIAS_PREFIX}{name}"
 
@@ -735,6 +742,13 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for aliases in reversed(self.alias_scopes):
             if override_key in aliases:
                 return aliases[override_key]
+            for key, value in aliases.items():
+                if (
+                    key.startswith(_STATIC_CLEARED_NAMESPACE_PREFIX)
+                    and value is None
+                    and reference_name.startswith(f"{key.removeprefix(_STATIC_CLEARED_NAMESPACE_PREFIX)}.")
+                ):
+                    return None
         return frozenset({reference_name})
 
     def _lookup_static_mapping_mutation_alias(self, name: str) -> _AliasValue:
@@ -821,6 +835,15 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for target_name in target_names:
             self._bind_name(self._static_reference_override_key(target_name), None)
 
+    def _bind_static_namespace_roots_as_cleared(self, namespace_roots: frozenset[str]) -> None:
+        current_scope = self.alias_scopes[-1]
+        for namespace_root in namespace_roots:
+            reference_prefix = f"{_STATIC_REFERENCE_OVERRIDE_PREFIX}{namespace_root}."
+            for key in list(current_scope):
+                if key.startswith(reference_prefix):
+                    del current_scope[key]
+            self._bind_name(self._static_cleared_namespace_key(namespace_root), None)
+
     def _bind_static_reference_target_as_removed(self, target: ast.AST) -> None:
         if _has_uncertain_static_binding(target, self.alias_scopes):
             return
@@ -874,6 +897,11 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             if attr_name is None:
                 return
             mutations.append((frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), None))
+        elif method == "clear":
+            if mutation_args:
+                return
+            self._bind_static_namespace_roots_as_cleared(target_roots)
+            return
         elif method == "update":
             if len(mutation_args) != 1 or not isinstance(mutation_args[0], ast.Dict):
                 return
@@ -1044,6 +1072,11 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     if isinstance(first_value, frozenset) and all(value == first_value for value in certainty_values)
                     else None
                 )
+                continue
+            if name.startswith(_STATIC_CLEARED_NAMESPACE_PREFIX):
+                cleared_base_value = current_scope.get(name, frozenset())
+                cleared_values = [scope.get(name, cleared_base_value) for scope in branch_scopes]
+                current_scope[name] = None if all(value is None for value in cleared_values) else frozenset()
                 continue
             base_value: _AliasValue | object
             if name.startswith(_STATIC_REFERENCE_OVERRIDE_PREFIX):
@@ -1277,7 +1310,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:
         resolved_names = self._resolve_invoked_reference_names(node.func)
-        if resolved_names is not None:
+        if resolved_names is not None and self._resolve_certain_static_mapping_mutator_names(node.func) is None:
             for resolved_name in resolved_names:
                 if self._is_tracked_call_name(resolved_name):
                     self.risky_calls.add(resolved_name)

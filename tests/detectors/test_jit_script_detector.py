@@ -290,6 +290,8 @@ class TestJITScriptDetector:
             b"import builtins\nbuiltins.__dict__.pop('eval')('pass')\n",
             b"import builtins\nrun = builtins.__dict__.pop('eval')\nrun('pass')\n",
             b"import builtins\nif remove:\n    del builtins.__dict__['eval']\nbuiltins.eval('pass')\n",
+            b"import builtins\nrun = builtins.eval\nbuiltins.__dict__.clear()\nrun('pass')\n",
+            b"import builtins\nif remove:\n    builtins.__dict__.clear()\nbuiltins.eval('pass')\n",
         ],
     )
     def test_scan_model_detects_unmarked_static_builtin_indirection(self, source: bytes) -> None:
@@ -376,6 +378,9 @@ class TestJITScriptDetector:
             b"import builtins\ndel builtins.__dict__['eval']\nbuiltins.eval([])\n",
             b"import builtins\nbuiltins.__dict__.__delitem__('eval')\nbuiltins.eval([])\n",
             b"import builtins\nimport operator\noperator.delitem(builtins.__dict__, 'eval')\nbuiltins.eval([])\n",
+            b"import builtins\nbuiltins.__dict__.clear()\nbuiltins.eval([])\n",
+            b"import builtins\nclear = builtins.__dict__.clear\nclear()\nbuiltins.eval([])\n",
+            b"import builtins\ndict.clear(builtins.__dict__)\nbuiltins.eval([])\n",
             b"def payload():\n    eval = len\n    return eval([])\n",
             (
                 b"def payload():\n"
@@ -434,6 +439,10 @@ class TestJITScriptDetector:
             (
                 b"import builtins\nimport operator\n"
                 b"operator.setitem(builtins.__dict__, 'eval', builtins.exec)\nbuiltins.eval('pass')\n"
+            ),
+            (
+                b"import builtins\nrun = builtins.exec\nbuiltins.__dict__.clear()\n"
+                b"builtins.__dict__.update({'eval': run})\nbuiltins.eval('pass')\n"
             ),
         ],
     )
