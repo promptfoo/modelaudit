@@ -362,6 +362,8 @@ class TestJITScriptDetector:
             b"import builtins\nsetattr(builtins, 'eval', len)\nbuiltins.eval([])\n",
             b"import builtins\nresult = setattr(builtins, 'eval', len)\nbuiltins.eval([])\n",
             (b"import builtins as bi\nfrom builtins import setattr as assign\nassign(bi, 'eval', len)\nbi.eval([])\n"),
+            b"import builtins\nbuiltins.__dict__.update({'eval': len})\nbuiltins.eval([])\n",
+            b"import builtins\nreplace = builtins.__dict__.update\nreplace({'eval': len})\nbuiltins.eval([])\n",
             b"def payload():\n    eval = len\n    return eval([])\n",
             (
                 b"def payload():\n"
@@ -410,6 +412,7 @@ class TestJITScriptDetector:
                 b"globals()['__builtins__']['eval']('pass')\n"
             ),
             b"import builtins\nsetattr(builtins, 'eval', builtins.exec)\nbuiltins.eval('pass')\n",
+            b"import builtins\nbuiltins.__dict__.update({'eval': builtins.exec})\nbuiltins.eval('pass')\n",
         ],
     )
     def test_scan_model_detects_dangerous_builtin_reassignment(self, source: bytes) -> None:
@@ -485,6 +488,66 @@ class TestJITScriptDetector:
                 b"except Exception:\n"
                 b"    pass\n"
                 b"builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"if replace_builtin:\n"
+                b"    builtins.__dict__.update({'eval': len})\n"
+                b"builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"replace = builtins.__dict__.update\n"
+                b"replace = lambda values: None\n"
+                b"replace({'eval': len})\n"
+                b"builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"if swap:\n"
+                b"    builtins = make_namespace()\n"
+                b"builtins.__dict__.update({'eval': len})\n"
+                b"builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"if swap:\n"
+                b"    builtins = make_namespace()\n"
+                b"setattr(builtins, 'eval', len)\n"
+                b"builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"if swap:\n"
+                b"    builtins = make_namespace()\n"
+                b"builtins.eval = len\n"
+                b"builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"if swap:\n"
+                b"    builtins = make_namespace()\n"
+                b"namespace = builtins\n"
+                b"namespace.__dict__.update({'eval': len})\n"
+                b"builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"def invoke(namespace=builtins):\n"
+                b"    namespace.__dict__.update({'eval': len})\n"
+                b"    return builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"def invoke(namespace=builtins):\n"
+                b"    setattr(namespace, 'eval', len)\n"
+                b"    return builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"def invoke(namespace=builtins):\n"
+                b"    namespace.eval = len\n"
+                b"    return builtins.eval('1 + 1')\n"
             ),
         ],
     )

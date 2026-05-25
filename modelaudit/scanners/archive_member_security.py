@@ -293,7 +293,8 @@ _NAMESPACE_MAPPING_ACCESSORS = {"get", "__getitem__", "pop", "setdefault"}
 _GLOBAL_NAMESPACE_HELPERS = {"globals", "builtins.globals"}
 _GLOBAL_NAMESPACE_MAPPING_MARKER = "<globals mapping>"
 _STATIC_REFERENCE_OVERRIDE_PREFIX = "<static reference override>:"
-_STATIC_DIRECT_MUTATION_ALIAS_PREFIX = "<static direct mutation alias>:"
+_STATIC_MAPPING_MUTATION_ALIAS_PREFIX = "<static mapping mutation alias>:"
+_STATIC_UNCERTAIN_BINDING_PREFIX = "<uncertain static binding>:"
 _CAPTURED_CALLABLE_REFERENCE_PREFIX = "<captured callable>:"
 _BUILTIN_NAMESPACE_NAMES = {"__builtin__", "__builtins__"}
 _STATIC_MAPPING_MUTATORS = {"__setitem__", "update"}
@@ -303,6 +304,20 @@ _STATIC_ATTRIBUTE_MUTATION_HELPERS = {
     "__builtins__.setattr",
     "builtins.setattr",
 }
+
+
+def _has_uncertain_static_binding(node: ast.AST, alias_scopes: _AliasScopes) -> bool:
+    """Return whether ``node`` uses a name whose identity diverged across branches."""
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Name):
+            continue
+        uncertainty_key = f"{_STATIC_UNCERTAIN_BINDING_PREFIX}{child.id}"
+        for aliases in reversed(alias_scopes):
+            if uncertainty_key in aliases:
+                if aliases[uncertainty_key] is None:
+                    return True
+                break
+    return False
 
 
 def _resolve_global_namespace_mappings(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
@@ -403,12 +418,32 @@ def _resolve_direct_global_builtin_namespace_roots(node: ast.AST, alias_scopes: 
     return frozenset({attr_name})
 
 
-def _resolve_direct_global_builtin_mutator_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    """Resolve mutator methods bound from a direct, unshadowed builtin mapping."""
+def _resolve_certain_namespace_mutation_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+    """Resolve namespace mappings whose mutation target is statically certain."""
+    direct_builtin_roots = _resolve_direct_global_builtin_namespace_roots(node, alias_scopes)
+    if direct_builtin_roots is not None:
+        return direct_builtin_roots
+
+    is_explicit_namespace_mapping = isinstance(node, ast.Attribute) and node.attr == "__dict__"
+    if isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords:
+        helper_name = _resolve_call_name(node.func)
+        helper_names = _apply_aliases(helper_name, alias_scopes) if helper_name is not None else None
+        is_explicit_namespace_mapping = helper_names is not None and helper_names.issubset({"vars", "builtins.vars"})
+    if not is_explicit_namespace_mapping:
+        return None
+    if _has_uncertain_static_binding(node, alias_scopes):
+        return None
+
+    target_roots = _resolve_namespace_dict_roots(node, alias_scopes)
+    return target_roots if target_roots is not None and len(target_roots) == 1 else None
+
+
+def _resolve_static_mapping_mutator_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+    """Resolve mutation methods bound from one certain namespace mapping."""
     if not isinstance(node, ast.Attribute) or node.attr not in _STATIC_MAPPING_MUTATORS:
         return None
 
-    target_roots = _resolve_direct_global_builtin_namespace_roots(node.value, alias_scopes)
+    target_roots = _resolve_certain_namespace_mutation_roots(node.value, alias_scopes)
     if target_roots is None:
         return None
     return frozenset(f"{target_root}.{node.attr}" for target_root in target_roots)
@@ -673,16 +708,22 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _bind_name(self, name: str, resolved_names: _AliasValue) -> None:
         self.alias_scopes[-1][name] = resolved_names
-        if not name.startswith("<") and self._lookup_static_direct_mutation_alias(name) is not None:
-            self.alias_scopes[-1][self._static_direct_mutation_alias_key(name)] = None
+        if not name.startswith("<"):
+            self.alias_scopes[-1][self._static_uncertain_binding_key(name)] = frozenset()
+            if self._lookup_static_mapping_mutation_alias(name) is not None:
+                self.alias_scopes[-1][self._static_mapping_mutation_alias_key(name)] = None
 
     @staticmethod
     def _static_reference_override_key(reference_name: str) -> str:
         return f"{_STATIC_REFERENCE_OVERRIDE_PREFIX}{reference_name}"
 
     @staticmethod
-    def _static_direct_mutation_alias_key(name: str) -> str:
-        return f"{_STATIC_DIRECT_MUTATION_ALIAS_PREFIX}{name}"
+    def _static_mapping_mutation_alias_key(name: str) -> str:
+        return f"{_STATIC_MAPPING_MUTATION_ALIAS_PREFIX}{name}"
+
+    @staticmethod
+    def _static_uncertain_binding_key(name: str) -> str:
+        return f"{_STATIC_UNCERTAIN_BINDING_PREFIX}{name}"
 
     def _lookup_static_reference_override(self, reference_name: str) -> _AliasValue:
         override_key = self._static_reference_override_key(reference_name)
@@ -691,19 +732,19 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 return aliases[override_key]
         return frozenset({reference_name})
 
-    def _lookup_static_direct_mutation_alias(self, name: str) -> _AliasValue:
-        alias_key = self._static_direct_mutation_alias_key(name)
+    def _lookup_static_mapping_mutation_alias(self, name: str) -> _AliasValue:
+        alias_key = self._static_mapping_mutation_alias_key(name)
         for aliases in reversed(self.alias_scopes):
             if alias_key in aliases:
                 return aliases[alias_key]
         return None
 
-    def _resolve_certain_direct_builtin_mutator_names(self, node: ast.AST) -> frozenset[str] | None:
-        direct_mutator_names = _resolve_direct_global_builtin_mutator_names(node, self.alias_scopes)
-        if direct_mutator_names is not None:
-            return direct_mutator_names
+    def _resolve_certain_static_mapping_mutator_names(self, node: ast.AST) -> frozenset[str] | None:
+        mutator_names = _resolve_static_mapping_mutator_names(node, self.alias_scopes)
+        if mutator_names is not None:
+            return mutator_names
         if isinstance(node, ast.Name):
-            return self._lookup_static_direct_mutation_alias(node.id)
+            return self._lookup_static_mapping_mutation_alias(node.id)
         return None
 
     def _is_tracked_call_name(self, name: str) -> bool:
@@ -758,6 +799,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         return self._capture_callable_names(self._resolve_invoked_reference_names(node))
 
     def _bind_static_reference_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
+        if _has_uncertain_static_binding(target, self.alias_scopes):
+            return
         target_names = _resolve_static_assignment_target_names(target, self.alias_scopes)
         if target_names is None:
             return
@@ -769,12 +812,12 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for target_name in target_names:
             self._bind_name(self._static_reference_override_key(target_name), resolved_value_names)
 
-    def _bind_direct_builtin_namespace_mutation(self, node: ast.Call) -> None:
-        """Model unconditional mutations of a directly addressed builtin mapping."""
+    def _bind_static_mapping_mutation(self, node: ast.Call) -> None:
+        """Model unconditional writes through one certain namespace mapping."""
         if node.keywords:
             return
 
-        mutator_names = self._resolve_certain_direct_builtin_mutator_names(node.func)
+        mutator_names = self._resolve_certain_static_mapping_mutator_names(node.func)
         if mutator_names is None:
             return
         methods = {mutator_name.rsplit(".", maxsplit=1)[1] for mutator_name in mutator_names}
@@ -811,6 +854,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         """Model certain builtin ``setattr`` writes to one resolved reference."""
         if len(node.args) != 3 or node.keywords:
             return
+        if _has_uncertain_static_binding(node.args[0], self.alias_scopes):
+            return
 
         helper_names = self._resolve_invoked_reference_names(node.func)
         if helper_names is None or not helper_names.issubset(_STATIC_ATTRIBUTE_MUTATION_HELPERS):
@@ -823,10 +868,13 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _bind_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
         if isinstance(target, ast.Name):
+            value_binding_is_uncertain = _has_uncertain_static_binding(value, self.alias_scopes)
             self._bind_name(target.id, self._resolve_bound_value_names(value))
-            direct_mutator_names = self._resolve_certain_direct_builtin_mutator_names(value)
-            if direct_mutator_names is not None:
-                self._bind_name(self._static_direct_mutation_alias_key(target.id), direct_mutator_names)
+            if value_binding_is_uncertain:
+                self.alias_scopes[-1][self._static_uncertain_binding_key(target.id)] = None
+            mutator_names = self._resolve_certain_static_mapping_mutator_names(value)
+            if mutator_names is not None:
+                self._bind_name(self._static_mapping_mutation_alias_key(target.id), mutator_names)
         elif isinstance(target, (ast.Attribute, ast.Subscript)):
             self._bind_static_reference_target_to_value(target, value)
         elif isinstance(target, ast.Starred):
@@ -857,15 +905,19 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 arg.arg,
                 self._resolve_bound_value_names(default) if default is not None else None,
             )
+            self.alias_scopes[-1][self._static_uncertain_binding_key(arg.arg)] = None
         for arg, default in zip(arguments.kwonlyargs, arguments.kw_defaults, strict=True):
             self._bind_name(
                 arg.arg,
                 self._resolve_bound_value_names(default) if default is not None else None,
             )
+            self.alias_scopes[-1][self._static_uncertain_binding_key(arg.arg)] = None
         if arguments.vararg is not None:
             self._bind_name(arguments.vararg.arg, None)
+            self.alias_scopes[-1][self._static_uncertain_binding_key(arguments.vararg.arg)] = None
         if arguments.kwarg is not None:
             self._bind_name(arguments.kwarg.arg, None)
+            self.alias_scopes[-1][self._static_uncertain_binding_key(arguments.kwarg.arg)] = None
 
     def visit_Import(self, node: ast.Import) -> None:
         for alias in node.names:
@@ -924,13 +976,22 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         current_scope = self.alias_scopes[-1]
         branch_names = {name for scope in branch_scopes for name in scope}
         for name in branch_names:
-            if name.startswith(_STATIC_DIRECT_MUTATION_ALIAS_PREFIX):
-                certainty_base_value = current_scope.get(name, _MISSING_ALIAS)
-                values = [scope.get(name, certainty_base_value) for scope in branch_scopes]
-                first_value = values[0]
+            if name.startswith(_STATIC_UNCERTAIN_BINDING_PREFIX):
+                uncertainty_base_value = current_scope.get(name, frozenset())
+                uncertainty_values = [scope.get(name, uncertainty_base_value) for scope in branch_scopes]
+                current_scope[name] = (
+                    None
+                    if current_scope.get(name) is None or any(value is None for value in uncertainty_values)
+                    else frozenset()
+                )
+                continue
+            if name.startswith(_STATIC_MAPPING_MUTATION_ALIAS_PREFIX):
+                certainty_base_value: _AliasValue | object = current_scope.get(name, _MISSING_ALIAS)
+                certainty_values = [scope.get(name, certainty_base_value) for scope in branch_scopes]
+                first_value = certainty_values[0]
                 current_scope[name] = (
                     first_value
-                    if isinstance(first_value, frozenset) and all(value == first_value for value in values)
+                    if isinstance(first_value, frozenset) and all(value == first_value for value in certainty_values)
                     else None
                 )
                 continue
@@ -941,11 +1002,15 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 )
             else:
                 base_value = current_scope.get(name, _MISSING_ALIAS)
-            values = [scope.get(name, base_value) for scope in branch_scopes]
-            concrete_aliases = frozenset(alias for value in values if isinstance(value, frozenset) for alias in value)
+            branch_values = [scope.get(name, base_value) for scope in branch_scopes]
+            if not name.startswith("<") and any(value != branch_values[0] for value in branch_values[1:]):
+                current_scope[self._static_uncertain_binding_key(name)] = None
+            concrete_aliases = frozenset(
+                alias for value in branch_values if isinstance(value, frozenset) for alias in value
+            )
             if concrete_aliases:
                 current_scope[name] = concrete_aliases
-            elif any(value is None for value in values):
+            elif any(value is None for value in branch_values):
                 current_scope[name] = None
 
     def _visit_child_scope_without_class_locals(self, body: list[ast.stmt]) -> None:
@@ -1015,6 +1080,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
         if isinstance(node.value, ast.Call):
+            self._bind_static_mapping_mutation(node.value)
             self._bind_static_setattr_mutation(node.value)
         for target in node.targets:
             self._bind_target_to_value(target, node.value)
@@ -1026,6 +1092,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if node.value is not None:
             self.visit(node.value)
             if isinstance(node.value, ast.Call):
+                self._bind_static_mapping_mutation(node.value)
                 self._bind_static_setattr_mutation(node.value)
             self._bind_target_to_value(node.target, node.value)
         else:
@@ -1045,7 +1112,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def visit_Expr(self, node: ast.Expr) -> None:
         self.visit(node.value)
         if isinstance(node.value, ast.Call):
-            self._bind_direct_builtin_namespace_mutation(node.value)
+            self._bind_static_mapping_mutation(node.value)
             self._bind_static_setattr_mutation(node.value)
 
     def _visit_loop(self, node: ast.For | ast.AsyncFor) -> None:
