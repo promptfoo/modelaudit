@@ -59,6 +59,7 @@ pub(crate) enum StackValue {
     },
     TrackedDict {
         entries: Vec<(String, StackValue)>,
+        unknown_key_values: Vec<StackValue>,
         memo_index: Option<i64>,
     },
     MappingWrapper {
@@ -116,10 +117,20 @@ pub(crate) fn operand_preview(value: Option<&StackValue>) -> String {
         Some(StackValue::DefaultDict { default_factory }) => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
-        Some(StackValue::TrackedDict { entries, .. }) if entries.is_empty() => {
-            "dict:{}".to_string()
-        }
-        Some(StackValue::TrackedDict { entries, .. }) => format!("dict(keys={})", entries.len()),
+        Some(StackValue::TrackedDict {
+            entries,
+            unknown_key_values,
+            ..
+        }) if entries.is_empty() && unknown_key_values.is_empty() => "dict:{}".to_string(),
+        Some(StackValue::TrackedDict {
+            entries,
+            unknown_key_values,
+            ..
+        }) => format!(
+            "dict(keys={}, dynamic_keys={})",
+            entries.len(),
+            unknown_key_values.len()
+        ),
         Some(StackValue::MappingWrapper {
             reference,
             mappings,
@@ -223,8 +234,20 @@ pub(crate) fn stack_value_preview(value: &StackValue, depth: usize) -> String {
         StackValue::DefaultDict { default_factory } => {
             format!("defaultdict(factory={})", default_factory.symbol())
         }
-        StackValue::TrackedDict { entries, .. } if entries.is_empty() => "dict:{}".to_string(),
-        StackValue::TrackedDict { entries, .. } => format!("dict(keys={})", entries.len()),
+        StackValue::TrackedDict {
+            entries,
+            unknown_key_values,
+            ..
+        } if entries.is_empty() && unknown_key_values.is_empty() => "dict:{}".to_string(),
+        StackValue::TrackedDict {
+            entries,
+            unknown_key_values,
+            ..
+        } => format!(
+            "dict(keys={}, dynamic_keys={})",
+            entries.len(),
+            unknown_key_values.len()
+        ),
         StackValue::MappingWrapper {
             reference,
             mappings,
