@@ -252,6 +252,7 @@ def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path
         "globals = lambda: {'__builtins__': {'eval': len}}\nglobals()['__builtins__']['eval']([])\n",
         "namespace = globals()\nnamespace['__builtins__']['len']([1])\n",
         ("namespace = globals()\nnamespace = {'__builtins__': {'eval': len}}\nnamespace['__builtins__']['eval']([])\n"),
+        ("namespace = globals()\nnamespace['__builtins__']['eval'] = len\nnamespace['__builtins__']['eval']([])\n"),
     ],
 )
 def test_scan_zip_allows_benign_builtin_shaped_source(tmp_path: Path, source: str) -> None:
@@ -262,6 +263,28 @@ def test_scan_zip_allows_benign_builtin_shaped_source(tmp_path: Path, source: st
     result = ZipScanner().scan(str(archive_path))
 
     assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+
+
+def test_scan_zip_reports_dangerous_builtin_reassignment(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "namespace = globals()\n"
+        "namespace['__builtins__']['eval'] = __builtins__['exec']\n"
+        "namespace['__builtins__']['eval']('pass')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S104"
+    assert python_checks[0].details["reason"] == "high-risk calls: __builtins__.exec"
 
 
 def test_scan_zip_flags_aliased_getattr_helper_dangerous_python_member(tmp_path: Path) -> None:

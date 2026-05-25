@@ -1117,6 +1117,14 @@ def test_pytorch_zip_scans_aliased_modeled_builtins_in_archive_data(
             b"namespace = {'__builtins__': {'eval': len}}\n"
             b"namespace['__builtins__']['eval']([])\n"
         ),
+        (b"namespace = globals()\nnamespace['__builtins__']['eval'] = len\nnamespace['__builtins__']['eval']([])\n"),
+        b"def payload():\n    eval = len\n    return eval([])\n",
+        (
+            b"def payload():\n"
+            b"    namespace = globals()\n"
+            b"    namespace['__builtins__']['eval'] = len\n"
+            b"    return namespace['__builtins__']['eval']([])\n"
+        ),
     ],
 )
 def test_pytorch_zip_ignores_benign_builtin_shaped_access_in_archive_data(tmp_path: Path, payload: bytes) -> None:
@@ -1133,6 +1141,28 @@ def test_pytorch_zip_ignores_benign_builtin_shaped_access_in_archive_data(tmp_pa
         check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
         for check in result.checks
     )
+
+
+def test_pytorch_zip_detects_dangerous_builtin_reassignment_in_archive_data(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    payload = (
+        b"namespace = globals()\n"
+        b"namespace['__builtins__']['eval'] = __builtins__['exec']\n"
+        b"namespace['__builtins__']['eval']('pass')\n"
+    )
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    jit_failures = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert any("Dangerous function call 'exec'" in check.message for check in jit_failures)
 
 
 def test_pytorch_zip_ignores_non_source_eval_text_in_archive_data(tmp_path: Path) -> None:

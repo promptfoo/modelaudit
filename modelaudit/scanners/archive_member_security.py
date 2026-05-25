@@ -292,6 +292,7 @@ def _resolve_static_string(node: ast.AST) -> str | None:
 _NAMESPACE_MAPPING_ACCESSORS = {"get", "__getitem__", "pop", "setdefault"}
 _GLOBAL_NAMESPACE_HELPERS = {"globals", "builtins.globals"}
 _GLOBAL_NAMESPACE_MAPPING_MARKER = "<globals mapping>"
+_STATIC_REFERENCE_OVERRIDE_PREFIX = "<static reference override>:"
 _BUILTIN_NAMESPACE_NAMES = {"__builtin__", "__builtins__"}
 
 
@@ -508,6 +509,15 @@ def _resolve_static_reference_names(node: ast.AST, alias_scopes: _AliasScopes) -
     return frozenset(f"{namespace_root}.__dict__" for namespace_root in namespace_roots) if namespace_roots else None
 
 
+def _resolve_static_assignment_target_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+    """Resolve member targets whose later static call identity can be overwritten."""
+    if isinstance(node, ast.Attribute):
+        return _resolve_static_attribute_names(node.value, ast.Constant(value=node.attr), alias_scopes)
+    if isinstance(node, ast.Subscript):
+        return _resolve_static_reference_names(node, alias_scopes)
+    return None
+
+
 def _is_high_risk_python_call_name(name: str) -> bool:
     return name in _HIGH_RISK_PYTHON_CALLS or name.startswith("subprocess.")
 
@@ -546,9 +556,43 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def _bind_name(self, name: str, resolved_names: _AliasValue) -> None:
         self.alias_scopes[-1][name] = resolved_names
 
+    @staticmethod
+    def _static_reference_override_key(reference_name: str) -> str:
+        return f"{_STATIC_REFERENCE_OVERRIDE_PREFIX}{reference_name}"
+
+    def _lookup_static_reference_override(self, reference_name: str) -> _AliasValue:
+        override_key = self._static_reference_override_key(reference_name)
+        for aliases in reversed(self.alias_scopes):
+            if override_key in aliases:
+                return aliases[override_key]
+        return frozenset({reference_name})
+
+    def _resolve_reference_names(self, node: ast.AST) -> frozenset[str] | None:
+        resolved_names = _resolve_static_reference_names(node, self.alias_scopes)
+        if resolved_names is None:
+            return None
+
+        effective_names: set[str] = set()
+        for resolved_name in resolved_names:
+            override_names = self._lookup_static_reference_override(resolved_name)
+            if override_names is not None:
+                effective_names.update(override_names)
+        return frozenset(effective_names) if effective_names else None
+
+    def _bind_static_reference_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
+        target_names = _resolve_static_assignment_target_names(target, self.alias_scopes)
+        if target_names is None:
+            return
+
+        resolved_value_names = self._resolve_reference_names(value)
+        for target_name in target_names:
+            self._bind_name(self._static_reference_override_key(target_name), resolved_value_names)
+
     def _bind_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
         if isinstance(target, ast.Name):
-            self._bind_name(target.id, _resolve_static_reference_names(value, self.alias_scopes))
+            self._bind_name(target.id, self._resolve_reference_names(value))
+        elif isinstance(target, (ast.Attribute, ast.Subscript)):
+            self._bind_static_reference_target_to_value(target, value)
         elif isinstance(target, ast.Starred):
             # Starred unpacking (``a, *b = seq``) binds ``b`` to a list slice,
             # which is not a single static reference; drop the binding so we
@@ -575,12 +619,12 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             )
             self._bind_name(
                 arg.arg,
-                _resolve_static_reference_names(default, self.alias_scopes) if default is not None else None,
+                self._resolve_reference_names(default) if default is not None else None,
             )
         for arg, default in zip(arguments.kwonlyargs, arguments.kw_defaults, strict=True):
             self._bind_name(
                 arg.arg,
-                _resolve_static_reference_names(default, self.alias_scopes) if default is not None else None,
+                self._resolve_reference_names(default) if default is not None else None,
             )
         if arguments.vararg is not None:
             self._bind_name(arguments.vararg.arg, None)
@@ -644,7 +688,13 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         current_scope = self.alias_scopes[-1]
         branch_names = {name for scope in branch_scopes for name in scope}
         for name in branch_names:
-            base_value = current_scope.get(name, _MISSING_ALIAS)
+            base_value: _AliasValue | object
+            if name.startswith(_STATIC_REFERENCE_OVERRIDE_PREFIX):
+                base_value = self._lookup_static_reference_override(
+                    name.removeprefix(_STATIC_REFERENCE_OVERRIDE_PREFIX)
+                )
+            else:
+                base_value = current_scope.get(name, _MISSING_ALIAS)
             values = [scope.get(name, base_value) for scope in branch_scopes]
             concrete_aliases = frozenset(alias for value in values if isinstance(value, frozenset) for alias in value)
             if concrete_aliases:
@@ -848,7 +898,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self.visit(statement)
 
     def visit_Call(self, node: ast.Call) -> None:
-        resolved_names = _resolve_static_reference_names(node.func, self.alias_scopes)
+        resolved_names = self._resolve_reference_names(node.func)
         if resolved_names is not None:
             for resolved_name in resolved_names:
                 if (
