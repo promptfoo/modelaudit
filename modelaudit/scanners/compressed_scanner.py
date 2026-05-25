@@ -17,6 +17,8 @@ from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_
 from ..utils.file._compression import is_zlib_header
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
+from ._archive_outcomes import member_scan_incomplete
+from .archive_member_security import is_executable_archive_member_content, scan_archive_member_for_known_risks
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 
@@ -102,11 +104,13 @@ class CompressedScanner(BaseScanner):
     DEFAULT_MAX_DEPTH: ClassVar[int] = 3
     DEFAULT_MAX_MEMBERS: ClassVar[int] = 1000
     DEFAULT_CHUNK_SIZE: ClassVar[int] = 64 * 1024
+    MAX_PYTHON_PAYLOAD_ANALYSIS_BYTES: ClassVar[int] = 10 * 1024 * 1024
     _DEPTH_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_depth_limit_exceeded"
     _MEMBER_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_member_limit_exceeded"
     _DECOMPRESSION_LIMIT_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_decompression_limit_exceeded"
     _OPTIONAL_DEPENDENCY_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_optional_dependency_unavailable"
     _STREAM_DECODE_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_stream_decode_failed"
+    _PYTHON_PAYLOAD_INCONCLUSIVE_REASON: ClassVar[str] = "compressed_python_payload_analysis_incomplete"
 
     def __init__(self, config: dict[str, Any] | None = None):
         super().__init__(config)
@@ -696,6 +700,71 @@ class CompressedScanner(BaseScanner):
             and not any(issue.severity == IssueSeverity.CRITICAL for issue in member_result.issues)
         )
 
+    @staticmethod
+    def _set_compressed_provenance(
+        result: ScanResult,
+        *,
+        first_issue: int,
+        first_check: int,
+        provenance: str,
+    ) -> None:
+        for issue in result.issues[first_issue:]:
+            issue.location = provenance
+            issue.details["compressed_wrapper"] = provenance
+        for check in result.checks[first_check:]:
+            check.location = provenance
+            check.details["compressed_wrapper"] = provenance
+
+    def _scan_decompressed_payload_security(
+        self,
+        *,
+        path: str,
+        inner_display: str,
+        provenance: str,
+        temp_path: str,
+        member_temp_paths: list[str],
+        decompressed_bytes: int,
+        result: ScanResult,
+    ) -> None:
+        first_issue = len(result.issues)
+        first_check = len(result.checks)
+        scan_archive_member_for_known_risks(
+            archive_kind="compressed",
+            archive_path=path,
+            member_name=inner_display,
+            tmp_path=temp_path,
+            total_size=decompressed_bytes,
+            result=result,
+            max_python_analysis_bytes=self.MAX_PYTHON_PAYLOAD_ANALYSIS_BYTES,
+            python_analysis_incomplete_reason=self._PYTHON_PAYLOAD_INCONCLUSIVE_REASON,
+        )
+        self._set_compressed_provenance(
+            result,
+            first_issue=first_issue,
+            first_check=first_check,
+            provenance=provenance,
+        )
+
+        if is_executable_archive_member_content(temp_path):
+            return
+        for member_index, member_temp_path in enumerate(member_temp_paths, start=1):
+            if not is_executable_archive_member_content(member_temp_path):
+                continue
+            member_provenance = f"{provenance}#member-{member_index}"
+            result.add_check(
+                name="Executable Archive Member Detection",
+                passed=False,
+                message=f"Executable file found in compressed payload member: {inner_display}#member-{member_index}",
+                severity=IssueSeverity.WARNING,
+                location=member_provenance,
+                details={
+                    "entry": inner_display,
+                    "member_index": member_index,
+                    "compressed_wrapper": member_provenance,
+                },
+            )
+            return
+
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
@@ -816,11 +885,22 @@ class CompressedScanner(BaseScanner):
             nested_config = dict(self.config)
             nested_config["_compressed_depth"] = depth + 1
             nested_config["_archive_depth"] = depth + 1
+            # Extracted temp paths are removed after this scan and cannot yield reusable cache entries.
+            nested_config["cache_enabled"] = False
             inner_result = core.scan_file(temp_path, nested_config)
 
             inner_display = self._derive_inner_display_name(path)
             provenance = f"{path} -> {inner_display}"
             self._rewrite_inner_locations(inner_result, temp_path, provenance)
+            self._scan_decompressed_payload_security(
+                path=path,
+                inner_display=inner_display,
+                provenance=provenance,
+                temp_path=temp_path,
+                member_temp_paths=member_temp_paths,
+                decompressed_bytes=decompressed_bytes,
+                result=result,
+            )
 
             result.add_check(
                 name="Compressed Wrapper Inner Scanner Routing",
@@ -938,5 +1018,5 @@ class CompressedScanner(BaseScanner):
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
 
-        result.finish(success=not result.has_errors)
+        result.finish(success=not member_scan_incomplete(result) and not result.has_errors)
         return result
