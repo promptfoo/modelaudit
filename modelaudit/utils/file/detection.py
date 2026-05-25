@@ -1216,6 +1216,15 @@ def _detect_compression_format(prefix: bytes) -> str | None:
     return None
 
 
+def _looks_like_renamed_r_serialized_header(prefix: bytes) -> bool:
+    """Require a complete R workspace serialization prefix for renamed artifacts."""
+    return any(
+        prefix.startswith(workspace_header + marker)
+        for workspace_header in R_WORKSPACE_HEADERS
+        for marker in R_SERIALIZATION_MARKERS
+    )
+
+
 def detect_format_from_magic_bytes(
     magic4: MagicBytes, magic8: MagicBytes, magic16: MagicBytes, file_size: int, file_path: Path | None = None
 ) -> FileFormat:
@@ -1259,7 +1268,7 @@ def detect_format_from_magic_bytes(
         case _:
             pass
 
-    if any(magic16.startswith(header) for header in R_WORKSPACE_HEADERS):
+    if _looks_like_renamed_r_serialized_header(magic16):
         return "r_serialized"
 
     if _looks_like_binary_pickle_protocol(magic4):
@@ -1304,8 +1313,9 @@ def detect_file_format_from_magic(path: str) -> str:
 
             if _looks_like_tflite_header(magic8):
                 return "tflite"
-            if file_path.suffix.lower() in _R_SERIALIZED_EXTENSIONS and any(
-                magic16.startswith(marker) for marker in R_SERIALIZATION_MARKERS
+            if file_path.suffix.lower() in _R_SERIALIZED_EXTENSIONS and (
+                any(magic16.startswith(marker) for marker in R_SERIALIZATION_MARKERS)
+                or any(magic16.startswith(header) for header in R_WORKSPACE_HEADERS)
             ):
                 return "r_serialized"
 
@@ -1508,7 +1518,7 @@ def detect_file_format(path: str) -> str:
         return "gguf"
     if magic4 in GGML_MAGIC_VARIANTS:
         return "ggml"
-    if any(magic16.startswith(header) for header in R_WORKSPACE_HEADERS):
+    if _looks_like_renamed_r_serialized_header(magic16):
         return "r_serialized"
 
     ext = file_path.suffix.lower()

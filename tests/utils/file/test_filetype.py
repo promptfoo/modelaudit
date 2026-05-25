@@ -322,11 +322,15 @@ def test_detect_r_raw_marker_requires_r_extension(tmp_path: Path) -> None:
     explicit_rds.write_bytes(b"X\nmodel\nweights")
     ambiguous_text = tmp_path / "notes.jpg"
     ambiguous_text.write_bytes(b"X\nordinary exported table\n")
+    incomplete_workspace = tmp_path / "workspace.jpg"
+    incomplete_workspace.write_bytes(b"RDX3\nQ\nordinary exported table\n")
 
     assert detect_file_format_from_magic(str(explicit_rds)) == "r_serialized"
     assert detect_file_format(str(explicit_rds)) == "r_serialized"
     assert detect_file_format_from_magic(str(ambiguous_text)) == "unknown"
     assert detect_file_format(str(ambiguous_text)) == "unknown"
+    assert detect_file_format_from_magic(str(incomplete_workspace)) == "unknown"
+    assert detect_file_format(str(incomplete_workspace)) == "unknown"
 
 
 def test_detect_cntk_formats_by_signature(tmp_path: Path) -> None:

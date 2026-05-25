@@ -1,4 +1,4 @@
-"""Scanner for R serialized model artifacts (.rds, .rda, .rdata)."""
+"""Scanner for R serialized model artifacts."""
 
 from __future__ import annotations
 
@@ -114,8 +114,7 @@ class RSerializedScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        if os.path.splitext(path)[1].lower() not in cls.supported_extensions:
-            return False
+        known_extension = os.path.splitext(path)[1].lower() in cls.supported_extensions
 
         try:
             with open(path, "rb") as file_obj:
@@ -125,7 +124,12 @@ class RSerializedScanner(BaseScanner):
 
         compression = cls._detect_compression(header)
         if compression is None:
-            return cls._looks_like_r_serialization(header)
+            if known_extension:
+                return cls._looks_like_r_serialization(header)
+            return cls._looks_like_renamed_r_serialization(header)
+
+        if not known_extension:
+            return False
 
         try:
             prefix = cls._read_decompressed_prefix(path, compression, cls._CAN_HANDLE_DECOMPRESSED_LIMIT)
@@ -134,6 +138,14 @@ class RSerializedScanner(BaseScanner):
             return True
 
         return cls._looks_like_r_serialization(prefix)
+
+    @classmethod
+    def _looks_like_renamed_r_serialization(cls, data: bytes) -> bool:
+        return any(
+            data.startswith(workspace_header + marker)
+            for workspace_header in cls._WORKSPACE_HEADERS
+            for marker in cls._SERIALIZATION_MARKERS
+        )
 
     @classmethod
     def _detect_compression(cls, header: bytes) -> str | None:

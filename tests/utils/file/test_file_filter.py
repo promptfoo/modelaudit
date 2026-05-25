@@ -266,11 +266,15 @@ class TestFileFilter:
         disguised_workspace.write_bytes(b"RDX3\nX\nworkspace\nmodel")
         ambiguous_text = tmp_path / "notes.jpg"
         ambiguous_text.write_bytes(b"X\nordinary exported table\n")
+        incomplete_workspace = tmp_path / "header-notes.jpg"
+        incomplete_workspace.write_bytes(b"RDX3\nQ\nordinary exported table\n")
 
         assert detect_file_format_for_skip_filter(str(disguised_workspace)) == "r_serialized"
         assert not should_skip_file(str(disguised_workspace))
         assert detect_file_format_for_skip_filter(str(ambiguous_text)) == "unknown"
         assert should_skip_file(str(ambiguous_text))
+        assert detect_file_format_for_skip_filter(str(incomplete_workspace)) == "unknown"
+        assert should_skip_file(str(incomplete_workspace))
 
     def test_disguised_xml_models_with_long_prologs_bypass_default_skip(self, tmp_path: Path) -> None:
         """Skipped suffixes must not hide XML model roots after long benign prologs."""

