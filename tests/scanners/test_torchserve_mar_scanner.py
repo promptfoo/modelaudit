@@ -262,15 +262,20 @@ def test_scan_detects_implicit_builtins_handler_execution_primitive(
     assert "__builtins__.eval" in handler_failures[0].message
 
 
-def test_scan_allows_ordinary_builtin_shaped_handler_mapping(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        b"def handle(data, context):\n    callbacks = {'eval': len}\n    return callbacks['eval']([])\n",
+        b"import builtins as bi\ndef handle(data, context):\n    return bi.open('labels.json', 'r')\n",
+    ],
+)
+def test_scan_allows_benign_builtin_shaped_handler_source(tmp_path: Path, handler_source: bytes) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
         tmp_path,
         manifest=manifest,
         entries={
-            "handler.py": (
-                b"def handle(data, context):\n    callbacks = {'eval': len}\n    return callbacks['eval']([])\n"
-            ),
+            "handler.py": handler_source,
             "weights.bin": b"weights",
         },
         filename="benign_builtin_mapping_handler.mar",

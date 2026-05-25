@@ -1066,6 +1066,39 @@ def test_pytorch_zip_scans_static_builtin_indirection_in_archive_data(tmp_path: 
 
 
 @pytest.mark.parametrize(
+    ("payload", "builtin"),
+    [
+        (b"import builtins as bi\nbi.open('result.txt', 'w')\n", "open"),
+        (b"import builtins as bi\ngetattr(bi, 'op' + 'en')('result.txt', 'w')\n", "open"),
+        (b"from builtins import compile as build\nbuild('x = 1', '<x>', 'exec')\n", "compile"),
+    ],
+)
+def test_pytorch_zip_scans_aliased_modeled_builtins_in_archive_data(
+    tmp_path: Path,
+    payload: bytes,
+    builtin: str,
+) -> None:
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    jit_failures = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert any(
+        check.location == f"{zip_path}:archive/data/payload.bin"
+        and f"Dangerous function call '{builtin}'" in check.message
+        for check in jit_failures
+    )
+
+
+@pytest.mark.parametrize(
     "payload",
     [
         b"callbacks = {'eval': len}\ncallbacks['eval']([])\n",

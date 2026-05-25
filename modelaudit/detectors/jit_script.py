@@ -89,6 +89,10 @@ DANGEROUS_BUILTINS = [
     "reload",
     "file",
 ]
+_BUILTIN_NAMESPACE_PREFIXES = ("__builtin__.", "__builtins__.", "builtins.")
+_JIT_DANGEROUS_BUILTIN_CALL_NAMES = frozenset(DANGEROUS_BUILTINS).union(
+    f"{prefix}{builtin}" for prefix in _BUILTIN_NAMESPACE_PREFIXES for builtin in DANGEROUS_BUILTINS
+)
 
 # Dangerous module imports
 DANGEROUS_IMPORTS = [
@@ -205,17 +209,16 @@ def _resolve_dangerous_builtin_reference(node: ast.AST) -> str | None:
 
 def _resolve_alias_aware_dangerous_builtins(tree: ast.AST) -> set[str]:
     """Return dangerous builtins reached through shared bounded source resolution."""
-    from modelaudit.scanners.archive_member_security import high_risk_python_calls_in_tree
+    from modelaudit.scanners.archive_member_security import statically_resolved_python_call_names_in_tree
 
-    builtin_prefixes = ("__builtin__.", "__builtins__.", "builtins.")
     dangerous_builtins: set[str] = set()
-    for call in high_risk_python_calls_in_tree(tree):
-        if call.name in DANGEROUS_BUILTINS:
-            dangerous_builtins.add(call.name)
+    for call_name in statically_resolved_python_call_names_in_tree(tree, _JIT_DANGEROUS_BUILTIN_CALL_NAMES):
+        if call_name in DANGEROUS_BUILTINS:
+            dangerous_builtins.add(call_name)
             continue
-        for prefix in builtin_prefixes:
-            if call.name.startswith(prefix):
-                builtin_name = call.name.removeprefix(prefix)
+        for prefix in _BUILTIN_NAMESPACE_PREFIXES:
+            if call_name.startswith(prefix):
+                builtin_name = call_name.removeprefix(prefix)
                 if builtin_name in DANGEROUS_BUILTINS:
                     dangerous_builtins.add(builtin_name)
                 break

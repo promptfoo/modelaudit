@@ -258,6 +258,21 @@ class TestJITScriptDetector:
         assert any(f.type == "ast_dangerous_call" and f.builtin == "eval" for f in findings)
 
     @pytest.mark.parametrize(
+        ("source", "builtin"),
+        [
+            (b"import builtins as bi\nbi.open('result.txt', 'w')\n", "open"),
+            (b"import builtins as bi\ngetattr(bi, 'op' + 'en')('result.txt', 'w')\n", "open"),
+            (b"from builtins import compile as build\nbuild('x = 1', '<x>', 'exec')\n", "compile"),
+        ],
+    )
+    def test_scan_model_detects_aliased_modeled_builtin_operations(self, source: bytes, builtin: str) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(f.type == "ast_dangerous_call" and f.builtin == builtin for f in findings)
+
+    @pytest.mark.parametrize(
         "source",
         [
             b"callbacks = {'eval': len}\ncallbacks['eval']([])\n",

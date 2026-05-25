@@ -229,10 +229,17 @@ def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path
     assert python_checks[0].details["reason"] == "high-risk calls: __builtins__.eval"
 
 
-def test_scan_zip_allows_ordinary_builtin_shaped_mapping(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "source",
+    [
+        "callbacks = {'eval': len}\ncallbacks['eval']([])\n",
+        "import builtins as bi\nbi.open('labels.json', 'r')\n",
+    ],
+)
+def test_scan_zip_allows_benign_builtin_shaped_source(tmp_path: Path, source: str) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", "callbacks = {'eval': len}\ncallbacks['eval']([])\n")
+        archive.writestr("handler.py", source)
 
     result = ZipScanner().scan(str(archive_path))
 

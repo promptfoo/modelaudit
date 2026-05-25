@@ -459,9 +459,11 @@ def _is_high_risk_python_call_name(name: str) -> bool:
     return name in _HIGH_RISK_PYTHON_CALLS or name.startswith("subprocess.")
 
 
-def _wildcard_import_aliases(module: str) -> Iterator[tuple[str, str]]:
+def _wildcard_import_aliases(
+    module: str, tracked_call_names: frozenset[str] | None = None
+) -> Iterator[tuple[str, str]]:
     prefix = f"{module}."
-    for call_name in sorted(_HIGH_RISK_PYTHON_CALLS):
+    for call_name in sorted(_HIGH_RISK_PYTHON_CALLS if tracked_call_names is None else tracked_call_names):
         if not call_name.startswith(prefix):
             continue
         exported_name = call_name.removeprefix(prefix).split(".", maxsplit=1)[0]
@@ -479,10 +481,11 @@ def _binding_names(target: ast.AST) -> Iterator[str]:
 
 
 class _HighRiskPythonCallVisitor(ast.NodeVisitor):
-    def __init__(self) -> None:
+    def __init__(self, tracked_call_names: frozenset[str] | None = None) -> None:
         self.alias_scopes: _AliasScopes = [{}]
         self._class_scope_ids: set[int] = set()
         self.risky_calls: set[str] = set()
+        self.tracked_call_names = tracked_call_names
 
     def _record_import(self, alias: ast.alias, import_name: str) -> None:
         self.alias_scopes[-1][alias.asname or alias.name] = frozenset({import_name})
@@ -540,7 +543,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             return
         for alias in node.names:
             if alias.name == "*":
-                for local_name, import_name in _wildcard_import_aliases(node.module):
+                for local_name, import_name in _wildcard_import_aliases(node.module, self.tracked_call_names):
                     self._bind_name(local_name, frozenset({import_name}))
                 continue
             self._record_import(alias, f"{node.module}.{alias.name}")
@@ -795,9 +798,20 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         resolved_names = _resolve_static_reference_names(node.func, self.alias_scopes)
         if resolved_names is not None:
             for resolved_name in resolved_names:
-                if _is_high_risk_python_call_name(resolved_name):
+                if (
+                    resolved_name in self.tracked_call_names
+                    if self.tracked_call_names is not None
+                    else _is_high_risk_python_call_name(resolved_name)
+                ):
                     self.risky_calls.add(resolved_name)
         self.generic_visit(node)
+
+
+def statically_resolved_python_call_names_in_tree(tree: ast.AST, tracked_call_names: frozenset[str]) -> set[str]:
+    """Return caller-selected static call targets resolved from an AST."""
+    visitor = _HighRiskPythonCallVisitor(tracked_call_names)
+    visitor.visit(tree)
+    return visitor.risky_calls
 
 
 def high_risk_python_calls_in_tree(tree: ast.AST) -> set[HighRiskPythonCall]:

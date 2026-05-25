@@ -200,9 +200,15 @@ class TestTarScanner:
         assert python_checks[0].rule_code == "S104"
         assert python_checks[0].details["reason"] == "high-risk calls: __builtins__.eval"
 
-    def test_scan_tar_allows_ordinary_builtin_shaped_mapping(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            b"callbacks = {'eval': len}\ncallbacks['eval']([])\n",
+            b"import builtins as bi\nbi.open('labels.json', 'r')\n",
+        ],
+    )
+    def test_scan_tar_allows_benign_builtin_shaped_source(self, tmp_path: Path, payload: bytes) -> None:
         archive_path = tmp_path / "model_bundle.tar"
-        payload = b"callbacks = {'eval': len}\ncallbacks['eval']([])\n"
         with tarfile.open(archive_path, "w") as archive:
             info = tarfile.TarInfo("handler.py")
             info.size = len(payload)
