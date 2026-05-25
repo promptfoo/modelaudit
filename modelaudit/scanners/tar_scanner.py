@@ -133,15 +133,20 @@ class TarScanner(BaseScanner):
             result.finish(success=False)
             return result
         except Exception as e:
+            mark_archive_scan_incomplete(result, "tar_scan_incomplete")
             result.add_check(
                 name="TAR File Scan",
                 passed=False,
                 message=f"Error scanning tar file: {e!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "tar_scan_incomplete",
+                },
             )
-            mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
             result.finish(success=False)
             return result
 
@@ -467,16 +472,20 @@ class TarScanner(BaseScanner):
         scan_complete = True
 
         if depth >= self.max_depth:
+            mark_archive_scan_incomplete(result, "tar_depth_limit")
             result.add_check(
                 name="TAR Depth Bomb Protection",
                 passed=False,
                 message=f"Maximum TAR nesting depth ({self.max_depth}) exceeded",
-                rule_code="S902",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"depth": depth, "max_depth": self.max_depth},
+                details={
+                    "depth": depth,
+                    "max_depth": self.max_depth,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "tar_depth_limit",
+                },
             )
-            mark_archive_scan_incomplete(result, "tar_analysis_incomplete")
             result.finish(success=False)
             return result
         else:

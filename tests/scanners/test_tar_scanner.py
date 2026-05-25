@@ -8,6 +8,7 @@ from typing import Any, Literal
 import pytest
 
 from modelaudit import core
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.tar_scanner import (
@@ -17,6 +18,43 @@ from modelaudit.scanners.tar_scanner import (
     DEFAULT_MAX_TAR_ENTRY_SIZE,
     TarScanner,
 )
+
+
+def _assert_inconclusive_aggregate_not_reused(
+    path: Path,
+    expected_reason: str,
+    cache_dir: Path,
+    **scan_kwargs: Any,
+) -> None:
+    reset_cache_manager()
+    try:
+        first = core.scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+        second = core.scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert expected_reason in metadata["scan_outcome_reasons"]
+            assert not [
+                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+            assert core.determine_exit_code(aggregate) == 2
+
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["cache_hits"] == 0
+    finally:
+        reset_cache_manager()
 
 
 class TestTarScanner:
@@ -592,7 +630,7 @@ class TestTarScanner:
             os.unlink(inner_path)
             os.unlink(outer_path)
 
-    def test_max_depth_limit(self):
+    def test_max_depth_limit(self, tmp_path: Path) -> None:
         """Test that maximum nesting depth is enforced"""
         # Create deeply nested tars
         tar_paths: list[str] = []
@@ -616,6 +654,13 @@ class TestTarScanner:
             assert result.success is False
             depth_issues = [i for i in result.issues if "maximum" in i.message.lower() and "depth" in i.message.lower()]
             assert len(depth_issues) > 0
+            assert depth_issues[0].severity == IssueSeverity.INFO
+            assert "tar_depth_limit" in result.metadata["scan_outcome_reasons"]
+            _assert_inconclusive_aggregate_not_reused(
+                Path(tar_paths[-1]),
+                "tar_depth_limit",
+                tmp_path / "depth-limit-cache",
+            )
         finally:
             for path in tar_paths:
                 if os.path.exists(path):
@@ -862,19 +907,12 @@ class TestTarScanner:
             info.size = len(payload)
             archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
 
-        result = core.scan_model_directory_or_file(
-            str(archive_path),
-            cache_scan_results=False,
+        _assert_inconclusive_aggregate_not_reused(
+            archive_path,
+            "tar_entry_extraction_incomplete",
+            tmp_path / "oversized-benign-cache",
             max_entry_size=64,
         )
-
-        metadata = result.file_metadata[str(archive_path)]
-        assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "tar_entry_extraction_incomplete" in metadata["scan_outcome_reasons"]
-        assert not [
-            issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        ]
-        assert core.determine_exit_code(result) == 2
 
     def test_oversized_hidden_payload_returns_inconclusive_without_detected_finding(self, tmp_path: Path) -> None:
         """A payload hidden above the extraction bound must not be reported as observed."""
@@ -886,18 +924,12 @@ class TestTarScanner:
             info.size = len(payload)
             archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
 
-        result = core.scan_model_directory_or_file(
-            str(archive_path),
-            cache_scan_results=False,
+        _assert_inconclusive_aggregate_not_reused(
+            archive_path,
+            "tar_entry_extraction_incomplete",
+            tmp_path / "oversized-hidden-cache",
             max_entry_size=64,
         )
-
-        metadata = result.file_metadata[str(archive_path)]
-        assert "tar_entry_extraction_incomplete" in metadata["scan_outcome_reasons"]
-        assert not [
-            issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        ]
-        assert core.determine_exit_code(result) == 2
 
     def test_scan_respects_max_file_size_over_entry_limit(self, tmp_path: Path) -> None:
         """A stricter top-level size limit should still fail TAR extraction before scan_file runs."""
@@ -951,7 +983,7 @@ class TestTarScanner:
         )
         aggregate = core.scan_model_directory_or_file(
             str(archive_path),
-            cache_scan_results=False,
+            cache_enabled=False,
             max_entry_size=64,
         )
         assert core.determine_exit_code(aggregate) == 1
@@ -969,18 +1001,46 @@ class TestTarScanner:
             raise RuntimeError("nested scanner unavailable")
 
         scan_kwargs: dict[str, Any] = {NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan}
-        result = core.scan_model_directory_or_file(
-            str(archive_path),
-            cache_scan_results=False,
+        direct = TarScanner(config=scan_kwargs).scan(str(archive_path))
+        assert "tar_entry_scan_incomplete" in direct.metadata["scan_outcome_reasons"]
+        entry_checks = [check for check in direct.issues if check.message.startswith("Error scanning TAR entry")]
+        assert len(entry_checks) == 1
+        assert entry_checks[0].severity == IssueSeverity.INFO
+        _assert_inconclusive_aggregate_not_reused(
+            archive_path,
+            "tar_entry_scan_incomplete",
+            tmp_path / "nested-failure-cache",
             **scan_kwargs,
         )
 
-        metadata = result.file_metadata[str(archive_path)]
-        assert "tar_entry_scan_incomplete" in metadata["scan_outcome_reasons"]
-        entry_checks = [check for check in result.issues if check.message.startswith("Error scanning TAR entry")]
-        assert len(entry_checks) == 1
-        assert entry_checks[0].severity == IssueSeverity.INFO
-        assert core.determine_exit_code(result) == 2
+    def test_unexpected_tar_scan_failure_returns_inconclusive_exit_code_without_cache_reuse(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A TAR scan abort is unavailable coverage unless a concrete hazard was observed."""
+        archive_path = tmp_path / "outer_scan_failure.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            payload = b"ordinary member"
+            info = tarfile.TarInfo("member.bin")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        def fail_tar_scan(_self: TarScanner, _path: str, depth: int = 0) -> ScanResult:
+            raise RuntimeError(f"unexpected TAR stream failure at depth {depth}")
+
+        monkeypatch.setattr(TarScanner, "_scan_tar_file", fail_tar_scan)
+
+        direct = TarScanner().scan(str(archive_path))
+        scan_checks = [check for check in direct.issues if check.message.startswith("Error scanning tar file")]
+        assert len(scan_checks) == 1
+        assert scan_checks[0].severity == IssueSeverity.INFO
+        assert "tar_scan_incomplete" in direct.metadata["scan_outcome_reasons"]
+        _assert_inconclusive_aggregate_not_reused(
+            archive_path,
+            "tar_scan_incomplete",
+            tmp_path / "outer-failure-cache",
+        )
 
     def test_scan_skips_non_regular_tar_members(self, tmp_path: Path) -> None:
         """Valid non-file TAR members should not abort scanning later regular files."""
