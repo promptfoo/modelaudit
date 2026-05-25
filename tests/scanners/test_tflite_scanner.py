@@ -101,6 +101,35 @@ def test_renamed_tflite_near_match_with_skipped_suffix_remains_skipped(tmp_path:
     assert directory.files_scanned == 0
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected_format"),
+    [
+        (b"PK\x03\x04TFL3" + b"\x00" * 32, "zip"),
+        (b"\x1f\x8b\x08\x00TFL3" + b"\x00" * 32, "gzip"),
+        (b"((S'TFL3'\ntt.", "pickle"),
+        (b"RKNNTFL3" + b"\x00" * 32, "rknn"),
+        (b"T7\x00\x00TFL3" + b"\x00" * 32, "torch7"),
+    ],
+)
+def test_tflite_identifier_does_not_override_stronger_content_routes(
+    tmp_path: Path,
+    payload: bytes,
+    expected_format: str,
+) -> None:
+    path = tmp_path / "payload.jpg"
+    path.write_bytes(payload)
+
+    assert detect_file_format(str(path)) == expected_format
+
+
+@pytest.mark.parametrize("suffix", [".dnn", ".rknn", ".t7", ".th", ".exe", ".llamafile"])
+def test_tflite_identifier_does_not_override_owned_format_extensions(tmp_path: Path, suffix: str) -> None:
+    path = tmp_path / f"payload{suffix}"
+    path.write_bytes(b"MZ\x00\x00TFL3llamafile runtime\n" if suffix in {".exe", ".llamafile"} else b"T7\x00\x00TFL3")
+
+    assert detect_file_format(str(path)) != "tflite"
+
+
 def test_tflite_scanner_can_handle_magic_near_match_requires_exact_offset(tmp_path: Path) -> None:
     """Near-match signatures in wrong offsets should not route non-TFLite files."""
     path = tmp_path / "model.bin"

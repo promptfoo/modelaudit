@@ -574,6 +574,11 @@ def _looks_like_tflite_header(header: bytes) -> bool:
     )
 
 
+_TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset(
+    {".cmf", ".dnn", ".exe", ".lgb", ".lightgbm", ".llamafile", ".model", ".net", ".rknn", ".t7", ".th"}
+)
+
+
 def _looks_like_safetensors_structure(path: Path | None, magic8: bytes, file_size: int) -> bool:
     """Validate safetensors framing: <u64 header_len><JSON header><tensor data>."""
     if file_size <= 8 or len(magic8) < 8:
@@ -1307,9 +1312,6 @@ def detect_file_format_from_magic(path: str) -> str:
             magic8 = header[:8]
             magic16 = header[:16]
 
-            if _looks_like_tflite_header(magic8):
-                return "tflite"
-
             if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
                 return "executorch"
 
@@ -1345,6 +1347,11 @@ def detect_file_format_from_magic(path: str) -> str:
             ):
                 return "pickle"
 
+            if file_path.suffix.lower() not in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS and _looks_like_tflite_header(
+                magic8
+            ):
+                return "tflite"
+
             # Check for XML-based formats (OpenVINO and PMML) using the first
             # structural root tag rather than a short raw-byte substring.
             if _could_be_xml_prefix(header):
@@ -1364,14 +1371,14 @@ def detect_file_format_from_magic(path: str) -> str:
     magic4 = header[:4]
     magic8 = header[:8]
 
-    if _looks_like_tflite_header(magic8):
-        return "tflite"
-
     if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
 
     if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
         return "onnx"
+
+    if file_path.suffix.lower() not in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS and _looks_like_tflite_header(magic8):
+        return "tflite"
 
     return "unknown"
 
@@ -1415,8 +1422,6 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if _looks_like_uncompressed_tar_header(prefix):
             return "tar"
 
-        if _looks_like_tflite_header(magic8):
-            return "tflite"
         if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
             return "executorch"
 
@@ -1451,6 +1456,11 @@ def detect_file_format_for_skip_filter(path: str) -> str:
                 sample_is_prefix=size > min(size, PROTO0_1_MAX_PROBE_BYTES),
             ):
                 return "pickle"
+
+        if file_path.suffix.lower() not in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS and _looks_like_tflite_header(
+            magic8
+        ):
+            return "tflite"
 
         if _could_be_xml_prefix(prefix):
             xml_probe_size = min(size, _XML_MODEL_SIGNATURE_READ_BYTES)
@@ -1515,13 +1525,6 @@ def detect_file_format(path: str) -> str:
         return "gguf"
     if magic4 in GGML_MAGIC_VARIANTS:
         return "ggml"
-    if _looks_like_tflite_header(magic8):
-        return "tflite"
-    if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
-        return "executorch"
-    if magic4 == b"RKNN":
-        return "rknn"
-
     ext = file_path.suffix.lower()
     filename_lower = file_path.name.lower()
 
@@ -1575,6 +1578,15 @@ def detect_file_format(path: str) -> str:
         return "cntk"
     if _is_lightgbm_signature(signature_prefix[:_LIGHTGBM_SIGNATURE_READ_BYTES]):
         return "lightgbm"
+
+    if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
+        return "executorch"
+    if magic4 == b"RKNN":
+        return "rknn"
+    if magic4 == b"T7\x00\x00":
+        return "torch7"
+    if ext not in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS and _looks_like_tflite_header(magic8):
+        return "tflite"
 
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
