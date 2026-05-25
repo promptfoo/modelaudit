@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - classify Keras ZIP archive-read failures as incomplete coverage while preserving earlier security findings
 - classify Keras H5 read failures as incomplete coverage while preserving earlier security findings
 - classify CoreML parser and traversal coverage gaps as incomplete analysis while preserving concrete findings
+- classify malformed recognized ONNX model parsing as incomplete coverage rather than a security finding
 
 ## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
 
