@@ -1147,8 +1147,12 @@ def _is_lightgbm_signature(prefix: bytes) -> bool:
 
 def _is_content_routed_lightgbm_signature(prefix: bytes) -> bool:
     """Require the native text header before routing a misleading suffix as LightGBM."""
-    preview = prefix.decode("utf-8", errors="ignore").lstrip().lower()
-    return preview.startswith("tree") and _is_lightgbm_signature(prefix)
+    preview = prefix.decode("utf-8", errors="ignore").replace("\x00", "\n").lower()
+    first_native_line = next(
+        (line.lstrip() for line in preview.splitlines() if line.strip() and not line.lstrip().startswith("#")),
+        "",
+    )
+    return first_native_line.startswith("tree") and _is_lightgbm_signature(prefix)
 
 
 def _is_executorch_binary_signature(prefix: bytes) -> bool:
