@@ -74,6 +74,10 @@ with shared_source_sensitive_caches():
     reports = [scan_file(path) for path in related_paths]
 ```
 
+Before returning each later report, the shared scope revalidates bounded
+analyzed source. A change observed at that validation point fails closed as
+inconclusive instead of returning an earlier clean result.
+
 Resource controls include opcode and wall-clock limits, post-budget tail bytes,
 string-literal scan characters, nested-pickle bytes, and nested scan depth.
 
@@ -98,10 +102,11 @@ Report semantics keep these concepts separate:
 - Embedded-pickle wrapper scanners (`pytorch_zip`, `joblib`, `numpy`, and
   `executorch`) call the public `scan_stream(..., source=...)` API and preserve
   archive-member context in result locations/details.
-- A multi-file root scan enters one `shared_source_sensitive_caches()` scope
-  while dispatching artifacts, reusing an installed-source snapshot for
-  call-graph enrichment. A later scan operation starts with fresh source
-  analysis so rewritten dangerous code is not hidden by stale cache state.
+- When a root scan has multiple dispatch entries and the installed standalone
+  package exposes `shared_source_sensitive_caches()`, it reuses source-validated
+  call-graph analysis across those entries. Changed sources are refreshed
+  before a later report, and changes observed by final validation fail closed;
+  older supported installs scan correctly without this optimization.
 - CI lints, type-checks, tests, builds, and smoke-installs both the root
   `modelaudit` distribution and the standalone `modelaudit-picklescan`
   distribution. Root wheel smoke tests install the local standalone wheel via
@@ -145,5 +150,5 @@ uvx twine check /tmp/modelaudit-picklescan-dist/*
   safety decision and scan-completeness contract must stay aligned.
 - Inconclusive analysis is represented as first-class status/metadata, not as a
   hidden success boolean.
-- Per-scan state stays isolated: related artifacts may reuse one installed-source
-  snapshot inside an explicit scope, while the next outer scope starts fresh.
+- Per-scan state stays isolated: scoped reuse revalidates analyzed source before
+  each later report, and the next outer scope starts fresh.

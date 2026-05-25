@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+import modelaudit_picklescan.api as api_module
 import modelaudit_picklescan.call_graph as call_graph
 from modelaudit_picklescan import PickleReport, SafetyVerdict, ScanOptions, ScanStatus, Severity, scan_bytes
 from modelaudit_picklescan.api import _RUST_EXTENSION_MODULE
@@ -134,6 +135,7 @@ def test_shared_source_sensitive_caches_allows_inherited_worker_scopes(
 
     def enter_worker_scope() -> None:
         with call_graph.shared_source_sensitive_caches():
+            call_graph._clear_source_sensitive_caches()
             worker_entered.set()
 
     monkeypatch.setattr(call_graph, "_clear_source_sensitive_caches_now", fake_clear)
@@ -151,6 +153,39 @@ def test_shared_source_sensitive_caches_allows_inherited_worker_scopes(
         pass
 
     assert clear_count == 2
+
+
+def test_shared_source_sensitive_caches_serializes_inherited_worker_work() -> None:
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+
+    def hold_first_scope() -> None:
+        with call_graph.shared_source_sensitive_caches():
+            first_entered.set()
+            release_first.wait(timeout=1)
+
+    def enter_second_scope() -> None:
+        with call_graph.shared_source_sensitive_caches():
+            second_entered.set()
+
+    with call_graph.shared_source_sensitive_caches():
+        first_context = copy_context()
+        second_context = copy_context()
+        first_worker = threading.Thread(target=first_context.run, args=(hold_first_scope,))
+        second_worker = threading.Thread(target=second_context.run, args=(enter_second_scope,))
+        first_worker.start()
+        assert first_entered.wait(timeout=1)
+        second_worker.start()
+        second_was_blocked = not second_entered.wait(timeout=0.05)
+        release_first.set()
+        assert second_entered.wait(timeout=1)
+        first_worker.join(timeout=1)
+        second_worker.join(timeout=1)
+
+    assert second_was_blocked
+    assert not first_worker.is_alive()
+    assert not second_worker.is_alive()
 
 
 def test_shared_source_sensitive_caches_serializes_independent_scopes(
@@ -215,6 +250,132 @@ def test_shared_source_sensitive_caches_refreshes_between_outer_scopes(
     assert safe_report.verdict == SafetyVerdict.CLEAN
     assert dangerous_report.verdict == SafetyVerdict.MALICIOUS
     assert _has_critical_call_graph_finding(dangerous_report, module_name, "invoke", "os.system")
+
+
+def test_shared_source_sensitive_caches_refreshes_changed_source_within_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_scoped_changed_call_graph_source"
+    module_path = module_dir / f"{module_name}.py"
+    module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+    payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo changed"))
+
+    try:
+        with call_graph.shared_source_sensitive_caches():
+            safe_report = scan_bytes(payload, source="scoped-changed-safe.pkl")
+            module_path.write_text(
+                "import os\n\ndef invoke(command):\n    return os.system(command)\n",
+                encoding="utf-8",
+            )
+            importlib.invalidate_caches()
+            dangerous_report = scan_bytes(payload, source="scoped-changed-dangerous.pkl")
+    finally:
+        _clear_call_graph_caches()
+
+    assert safe_report.verdict == SafetyVerdict.CLEAN
+    assert dangerous_report.verdict == SafetyVerdict.MALICIOUS
+    assert _has_critical_call_graph_finding(dangerous_report, module_name, "invoke", "os.system")
+
+
+def test_shared_source_sensitive_caches_fails_closed_when_final_validation_observes_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_scoped_inflight_call_graph_source"
+    module_path = module_dir / f"{module_name}.py"
+    module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+    payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo inflight"))
+
+    try:
+        with call_graph.shared_source_sensitive_caches():
+            safe_report = scan_bytes(payload, source="scoped-inflight-safe.pkl")
+            real_ensure_stable = api_module._ensure_shared_source_snapshot_stable
+            source_rewritten = False
+
+            def rewrite_before_completion_check(report_generation: int | None) -> None:
+                nonlocal source_rewritten
+                if not source_rewritten:
+                    module_path.write_text(
+                        "import os\n\ndef invoke(command):\n    return os.system(command)\n",
+                        encoding="utf-8",
+                    )
+                    importlib.invalidate_caches()
+                    source_rewritten = True
+                real_ensure_stable(report_generation)
+
+            monkeypatch.setattr(api_module, "_ensure_shared_source_snapshot_stable", rewrite_before_completion_check)
+            changed_report = scan_bytes(payload, source="scoped-inflight-changed.pkl")
+    finally:
+        _clear_call_graph_caches()
+
+    assert safe_report.verdict == SafetyVerdict.CLEAN
+    assert source_rewritten is True
+    assert changed_report.status == ScanStatus.INCONCLUSIVE
+    assert changed_report.verdict == SafetyVerdict.UNKNOWN
+    assert any(error.details.get("analysis") == "python_call_graph_source_stability" for error in changed_report.errors)
+
+
+def test_shared_source_sensitive_caches_fails_closed_after_mid_report_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_scoped_mid_report_call_graph_source"
+    module_path = module_dir / f"{module_name}.py"
+    module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    _clear_call_graph_caches()
+    payload = _global_call_payload(module_name, "invoke", _unicode_operand("echo mid-report"))
+
+    try:
+        with call_graph.shared_source_sensitive_caches():
+            safe_report = scan_bytes(payload, source="scoped-mid-report-safe.pkl")
+            real_startup_findings = api_module.find_startup_hook_write_call_graphs
+            source_rewritten = False
+
+            def rewrite_before_later_subpass(
+                import_references: object,
+                callable_invocations: object | None = None,
+                *,
+                callable_invocations_complete: bool = True,
+            ) -> tuple[call_graph.StartupHookWriteFinding, ...]:
+                nonlocal source_rewritten
+                if not source_rewritten:
+                    module_path.write_text(
+                        "import os\n\ndef invoke(command):\n    return os.system(command)\n",
+                        encoding="utf-8",
+                    )
+                    importlib.invalidate_caches()
+                    source_rewritten = True
+                return real_startup_findings(
+                    import_references,
+                    callable_invocations,
+                    callable_invocations_complete=callable_invocations_complete,
+                )
+
+            monkeypatch.setattr(api_module, "find_startup_hook_write_call_graphs", rewrite_before_later_subpass)
+            changed_report = scan_bytes(payload, source="scoped-mid-report-changed.pkl")
+    finally:
+        _clear_call_graph_caches()
+
+    assert safe_report.verdict == SafetyVerdict.CLEAN
+    assert source_rewritten is True
+    assert changed_report.status == ScanStatus.INCONCLUSIVE
+    assert changed_report.verdict == SafetyVerdict.UNKNOWN
+    assert any(error.details.get("analysis") == "python_call_graph_source_stability" for error in changed_report.errors)
 
 
 def _env_without_pythonpath() -> dict[str, str]:

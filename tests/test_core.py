@@ -75,6 +75,54 @@ def test_multi_file_directory_scan_shares_one_pickle_source_snapshot(
     assert any(issue.rule_code == "DANGEROUS_CALL_GRAPH" for issue in result.issues)
 
 
+def test_multi_file_directory_scan_refreshes_changed_pickle_source_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_directory_changed_call_graph_target"
+    module_path = module_dir / f"{module_name}.py"
+    module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    safe_module = importlib.import_module(module_name)
+    safe_invoke = safe_module.invoke
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+
+    class Payload:
+        def __reduce__(self) -> tuple[Any, tuple[str]]:
+            return (safe_invoke, ("echo changed-directory-scan",))
+
+    for index in range(2):
+        (model_dir / f"model-{index}.pkl").write_bytes(pickle.dumps(Payload()))
+
+    source_rewritten = False
+
+    def rewrite_before_second_scan(message: str, _percentage: float) -> None:
+        nonlocal source_rewritten
+        if "Scanning file 2/2" not in message or source_rewritten:
+            return
+        module_path.write_text(
+            "import os\n\ndef invoke(command):\n    return os.system(command)\n",
+            encoding="utf-8",
+        )
+        importlib.invalidate_caches()
+        source_rewritten = True
+
+    result = core_module.scan_model_directory_or_file(
+        str(model_dir),
+        cache_scan_results=False,
+        progress_callback=rewrite_before_second_scan,
+    )
+
+    assert source_rewritten is True
+    assert result.success is True
+    assert result.files_scanned == 2
+    assert any(issue.rule_code == "DANGEROUS_CALL_GRAPH" for issue in result.issues)
+
+
 def _build_malicious_pickle() -> bytes:
     """Build a tiny pickle payload that exercises nested dangerous-opcode scanning."""
     import os as os_module

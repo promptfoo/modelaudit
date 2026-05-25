@@ -106,8 +106,9 @@ Three convenience entry points, each returning a `PickleReport`:
 For long-running services, construct `PickleScanner(options=...)` once and reuse it across calls.
 
 When scanning a related batch of files, use `shared_source_sensitive_caches()` to
-reuse one installed-source snapshot for call-graph enrichment while keeping
-later scan batches isolated:
+reuse bounded call-graph source analysis. Analyzed source content is validated
+before each later report; changes observed at final validation fail closed as
+inconclusive, and later scan batches remain isolated:
 
 ```python
 from modelaudit_picklescan import scan_file, shared_source_sensitive_caches
