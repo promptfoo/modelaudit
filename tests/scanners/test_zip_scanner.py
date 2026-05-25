@@ -226,6 +226,61 @@ def test_scan_zip_flags_concatenated_getattr_name_dangerous_python_member(tmp_pa
     assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import os\nos.__dict__['sys' + 'tem']('echo hidden')\n",
+        "import os\nvars(os)['sys' + 'tem']('echo hidden')\n",
+        "import os\nos.__dict__.get('sys' + 'tem')('echo hidden')\n",
+        "import os\nos.__dict__.__getitem__('sys' + 'tem')('echo hidden')\n",
+        "import os\nos.__dict__.get('sys' + 'tem').__call__('echo hidden')\n",
+        "import os\nnamespace = os.__dict__\nnamespace['sys' + 'tem']('echo hidden')\n",
+        "import os\nnamespace = vars(os)\nnamespace.get('sys' + 'tem')('echo hidden')\n",
+    ],
+)
+def test_scan_zip_flags_namespace_mapping_dangerous_python_member(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].severity == IssueSeverity.WARNING
+    assert python_checks[0].rule_code == "S101"
+    assert python_checks[0].details["reason"] == "high-risk calls: os.system"
+
+
+def test_scan_zip_ignores_benign_namespace_mapping_call(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", "import os\nos.__dict__['getcwd']()\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_zip_ignores_shadowed_namespace_mapping_helper(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import os\nvars = lambda _: {'system': print}\nvars(os)['system']('safe')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
 def test_scan_zip_bounds_large_concatenated_getattr_names(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     padding = " + ".join(["''"] * 300)

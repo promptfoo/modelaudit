@@ -293,11 +293,81 @@ def _resolve_getattr_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> fr
     return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
 
 
+def _resolve_namespace_mapping_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+    """Resolve statically selected module namespace mappings."""
+    mapping_name = _resolve_call_name(node)
+    if mapping_name is not None:
+        resolved_mapping_names = _apply_aliases(mapping_name, alias_scopes)
+        if resolved_mapping_names is not None:
+            namespace_roots = frozenset(
+                name.removesuffix(".__dict__") for name in resolved_mapping_names if name.endswith(".__dict__")
+            )
+            if namespace_roots:
+                return namespace_roots
+
+    if not isinstance(node, ast.Call):
+        return None
+
+    helper_name = _resolve_call_name(node.func)
+    if helper_name is None:
+        return None
+    resolved_helper_names = _apply_aliases(helper_name, alias_scopes)
+    if resolved_helper_names is None or not (resolved_helper_names & {"vars", "builtins.vars"}):
+        return None
+    if len(node.args) != 1 or node.keywords:
+        return None
+
+    target_root = _resolve_call_name(node.args[0])
+    return _apply_aliases(target_root, alias_scopes) if target_root is not None else None
+
+
+def _resolve_namespace_mapping_lookup_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+    """Resolve bounded literal callable retrieval from a module namespace."""
+    if isinstance(node, ast.Attribute) and node.attr == "__call__":
+        return _resolve_namespace_mapping_lookup_names(node.value, alias_scopes)
+
+    mapping_node: ast.AST
+    key_node: ast.AST
+    if isinstance(node, ast.Subscript):
+        mapping_node = node.value
+        key_node = node.slice
+    elif (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"get", "__getitem__"}
+        and node.args
+        and not node.keywords
+    ):
+        if node.func.attr == "__getitem__" and len(node.args) != 1:
+            return None
+        if node.func.attr == "get" and len(node.args) not in {1, 2}:
+            return None
+        mapping_node = node.func.value
+        key_node = node.args[0]
+    else:
+        return None
+
+    resolved_roots = _resolve_namespace_mapping_roots(mapping_node, alias_scopes)
+    key = _resolve_static_string(key_node)
+    if resolved_roots is None or key is None:
+        return None
+    return frozenset(f"{resolved_root}.{key}" for resolved_root in resolved_roots)
+
+
 def _resolve_static_reference_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
     call_name = _resolve_call_name(node)
     if call_name is not None:
         return _apply_aliases(call_name, alias_scopes)
-    return _resolve_getattr_call_names(node, alias_scopes)
+    getattr_names = _resolve_getattr_call_names(node, alias_scopes)
+    if getattr_names is not None:
+        return getattr_names
+    mapping_lookup_names = _resolve_namespace_mapping_lookup_names(node, alias_scopes)
+    if mapping_lookup_names is not None:
+        return mapping_lookup_names
+    mapping_roots = _resolve_namespace_mapping_roots(node, alias_scopes)
+    if mapping_roots is not None:
+        return frozenset(f"{root}.__dict__" for root in mapping_roots)
+    return None
 
 
 def _is_high_risk_python_call_name(name: str) -> bool:
