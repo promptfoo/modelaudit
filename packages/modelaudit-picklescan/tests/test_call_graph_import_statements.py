@@ -10,7 +10,9 @@ import pickle
 import py_compile
 import subprocess
 import sys
+import threading
 import zipfile
+from contextvars import copy_context
 from importlib.machinery import ModuleSpec
 from importlib.util import find_spec
 from pathlib import Path
@@ -117,6 +119,67 @@ def test_shared_source_sensitive_caches_clears_once_per_scope(monkeypatch: pytes
 
     call_graph._clear_source_sensitive_caches()
 
+    assert clear_count == 2
+
+
+def test_shared_source_sensitive_caches_allows_inherited_worker_scopes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_count = 0
+    worker_entered = threading.Event()
+
+    def fake_clear() -> None:
+        nonlocal clear_count
+        clear_count += 1
+
+    def enter_worker_scope() -> None:
+        with call_graph.shared_source_sensitive_caches():
+            worker_entered.set()
+
+    monkeypatch.setattr(call_graph, "_clear_source_sensitive_caches_now", fake_clear)
+
+    with call_graph.shared_source_sensitive_caches():
+        worker_context = copy_context()
+        worker = threading.Thread(target=worker_context.run, args=(enter_worker_scope,))
+        worker.start()
+        assert worker_entered.wait(timeout=1)
+        worker.join(timeout=1)
+        assert not worker.is_alive()
+        assert clear_count == 1
+
+    with call_graph.shared_source_sensitive_caches():
+        pass
+
+    assert clear_count == 2
+
+
+def test_shared_source_sensitive_caches_serializes_independent_scopes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_count = 0
+    worker_started = threading.Event()
+    worker_entered = threading.Event()
+
+    def fake_clear() -> None:
+        nonlocal clear_count
+        clear_count += 1
+
+    def enter_worker_scope() -> None:
+        worker_started.set()
+        with call_graph.shared_source_sensitive_caches():
+            worker_entered.set()
+
+    monkeypatch.setattr(call_graph, "_clear_source_sensitive_caches_now", fake_clear)
+
+    with call_graph.shared_source_sensitive_caches():
+        worker = threading.Thread(target=enter_worker_scope)
+        worker.start()
+        assert worker_started.wait(timeout=1)
+        assert not worker_entered.wait(timeout=0.05)
+
+    assert worker_entered.wait(timeout=1)
+    worker.join(timeout=1)
+    assert not worker.is_alive()
     assert clear_count == 2
 
 
