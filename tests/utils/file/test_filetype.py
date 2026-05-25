@@ -569,6 +569,23 @@ def test_detect_renamed_tf_metagraph_by_strict_parse_without_promoting_generic_p
     assert detect_file_format(str(generic_protobuf)) == "unknown"
 
 
+def test_detect_renamed_malformed_tf_metagraph_with_recovered_graph_structure(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    malformed_metagraph = tmp_path / "graph-tail.jpg"
+    generic_protobuf = tmp_path / "generic-tail.jpg"
+    malformed_metagraph.write_bytes(_build_tf_metagraph_bytes() + b"\xff")
+    generic_protobuf.write_bytes(b"\x12\x02\x08\x01\xff")
+
+    assert detect_file_format_from_magic(str(malformed_metagraph)) == "tf_metagraph"
+    assert detect_file_format_for_skip_filter(str(malformed_metagraph)) == "tf_metagraph"
+    assert detect_file_format(str(malformed_metagraph)) == "tf_metagraph"
+    assert detect_file_format_from_magic(str(generic_protobuf)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
+    assert detect_file_format(str(generic_protobuf)) == "unknown"
+
+
 def test_detect_renamed_tf_savedmodel_by_strict_parse_without_promoting_generic_protobuf(tmp_path: Path) -> None:
     if not _has_tf_protos():
         pytest.skip("TensorFlow protobuf stubs unavailable")
