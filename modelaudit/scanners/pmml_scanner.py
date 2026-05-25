@@ -80,6 +80,7 @@ class PmmlScanner(BaseScanner):
     description = "Scans PMML files for XML security issues and suspicious content"
     supported_extensions: ClassVar[list[str]] = [".pmml"]
     MAX_EXTENSION_TEXT_NODES: ClassVar[int] = 20000
+    FILE_READ_INCOMPLETE_REASON: ClassVar[str] = "pmml_file_read_failed"
     EXTENSION_TRAVERSAL_INCOMPLETE_REASON: ClassVar[str] = "pmml_extension_traversal_limit_exceeded"
     XML_PARSE_INCOMPLETE_REASON: ClassVar[str] = "pmml_xml_parse_failed"
 
@@ -124,15 +125,20 @@ class PmmlScanner(BaseScanner):
             with open(path, "rb") as f:
                 data = f.read()
             result.bytes_scanned = len(data)
-        except Exception as e:  # pragma: no cover - unexpected read errors
-            mark_inconclusive_scan_result(result, "pmml_file_read_failed")
+        except Exception as e:
+            mark_inconclusive_scan_result(result, self.FILE_READ_INCOMPLETE_REASON)
             result.add_check(
                 name="PMML File Read",
                 passed=False,
                 message=f"Error reading file: {e}",
                 severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self.FILE_READ_INCOMPLETE_REASON,
+                },
             )
             result.finish(success=False)
             return result
@@ -192,7 +198,12 @@ class PmmlScanner(BaseScanner):
                 message=f"Malformed XML: {e}",
                 severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self.XML_PARSE_INCOMPLETE_REASON,
+                },
                 why=(
                     "The file contains malformed XML that cannot be parsed. This may indicate corruption "
                     "or malicious content."

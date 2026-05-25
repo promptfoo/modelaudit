@@ -1,9 +1,48 @@
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners.base import IssueSeverity
 from modelaudit.scanners.pmml_scanner import PmmlScanner
+
+
+def _assert_inconclusive_aggregate_not_cached(
+    path: Path,
+    expected_reason: str,
+    cache_dir: Path,
+    **scan_kwargs: Any,
+) -> None:
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert expected_reason in metadata["scan_outcome_reasons"]
+            assert not [
+                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_pmml_scanner_basic(tmp_path: Path) -> None:
@@ -66,7 +105,7 @@ def test_pmml_scanner_suspicious_extension_content(tmp_path: Path) -> None:
     assert all(i.severity == IssueSeverity.WARNING for i in suspicious_issues)
     assert "scan_outcome" not in result.metadata
 
-    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
     assert determine_exit_code(aggregate) == 1
 
 
@@ -585,9 +624,36 @@ def test_pmml_scanner_malformed_xml(tmp_path: Path) -> None:
     assert any(i.severity == IssueSeverity.INFO for i in result.issues)
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert result.metadata["scan_outcome_reasons"] == [PmmlScanner.XML_PARSE_INCOMPLETE_REASON]
+    parse_issue = next(issue for issue in result.issues if issue.message.lower().startswith("malformed xml"))
+    assert parse_issue.details["analysis_incomplete"] is True
+    assert parse_issue.details["scan_outcome_reason"] == PmmlScanner.XML_PARSE_INCOMPLETE_REASON
 
-    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
-    assert determine_exit_code(aggregate) == 2
+    _assert_inconclusive_aggregate_not_cached(
+        path,
+        PmmlScanner.XML_PARSE_INCOMPLETE_REASON,
+        tmp_path / "malformed-cache",
+    )
+
+
+def test_pmml_scanner_file_read_failure_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
+    path = tmp_path / "unreadable.pmml"
+    path.write_text("<PMML version='4.4'/>", encoding="utf-8")
+
+    with patch("modelaudit.scanners.pmml_scanner.open", side_effect=OSError("read failed")):
+        result = PmmlScanner().scan(str(path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["scan_outcome_reasons"] == [PmmlScanner.FILE_READ_INCOMPLETE_REASON]
+        read_issue = next(issue for issue in result.issues if issue.message.startswith("Error reading file:"))
+        assert read_issue.severity == IssueSeverity.INFO
+        assert read_issue.details["analysis_incomplete"] is True
+        assert read_issue.details["scan_outcome_reason"] == PmmlScanner.FILE_READ_INCOMPLETE_REASON
+        _assert_inconclusive_aggregate_not_cached(
+            path,
+            PmmlScanner.FILE_READ_INCOMPLETE_REASON,
+            tmp_path / "read-failure-cache",
+        )
 
 
 def test_pmml_scanner_invalid_root_element(tmp_path: Path) -> None:
@@ -736,8 +802,11 @@ def test_pmml_scanner_extension_text_truncation_with_hidden_payload_is_inconclus
     assert result.metadata["scan_outcome_reasons"] == [PmmlScanner.EXTENSION_TRAVERSAL_INCOMPLETE_REASON]
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
-    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
-    assert determine_exit_code(aggregate) == 2
+    _assert_inconclusive_aggregate_not_cached(
+        path,
+        PmmlScanner.EXTENSION_TRAVERSAL_INCOMPLETE_REASON,
+        tmp_path / "hidden-payload-cache",
+    )
 
 
 def test_pmml_scanner_benign_extension_truncation_is_not_a_security_finding(tmp_path: Path) -> None:
@@ -757,8 +826,11 @@ def test_pmml_scanner_benign_extension_truncation_is_not_a_security_finding(tmp_
     assert result.metadata["scan_outcome_reasons"] == [PmmlScanner.EXTENSION_TRAVERSAL_INCOMPLETE_REASON]
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
-    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
-    assert determine_exit_code(aggregate) == 2
+    _assert_inconclusive_aggregate_not_cached(
+        path,
+        PmmlScanner.EXTENSION_TRAVERSAL_INCOMPLETE_REASON,
+        tmp_path / "benign-truncation-cache",
+    )
 
 
 def test_pmml_scanner_can_handle_detection(tmp_path: Path) -> None:
