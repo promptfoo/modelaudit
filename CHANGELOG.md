@@ -48,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - share intrinsic builtin namespace execution detection across embedded Python entrypoints
 - route signature-confirmed RKNN artifacts with misleading filenames through security analysis
 - detect embedded Python builtin execution recovered through static global namespace lookups
+- detect embedded Python builtin execution reached through aliased global namespace mappings
 
 ## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
 
