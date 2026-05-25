@@ -574,15 +574,6 @@ def _looks_like_tflite_header(header: bytes) -> bool:
     )
 
 
-def _looks_like_renamed_r_serialized_header(header: bytes) -> bool:
-    """Require an R workspace header plus serialization marker for renamed payloads."""
-    return any(
-        header.startswith(workspace_header + marker)
-        for workspace_header in R_WORKSPACE_HEADERS
-        for marker in R_SERIALIZATION_MARKERS
-    )
-
-
 def _looks_like_safetensors_structure(path: Path | None, magic8: bytes, file_size: int) -> bool:
     """Validate safetensors framing: <u64 header_len><JSON header><tensor data>."""
     if file_size <= 8 or len(magic8) < 8:
@@ -1324,12 +1315,6 @@ def detect_file_format_from_magic(path: str) -> str:
 
             # Try the new pattern matching approach first
             format_result = detect_format_from_magic_bytes(magic4, magic8, magic16, size, file_path)
-            if (
-                format_result == "r_serialized"
-                and file_path.suffix.lower() not in {".rds", ".rda", ".rdata"}
-                and not _looks_like_renamed_r_serialized_header(magic16)
-            ):
-                format_result = "unknown"
             if format_result == "zip" and file_path.suffix.lower() == ".mar" and is_torchserve_mar_archive(path):
                 return "torchserve_mar"
             if format_result != "unknown":
@@ -1442,10 +1427,6 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             if _is_tar_archive(path):
                 return "tar"
             return format_result
-        if format_result == "r_serialized":
-            if _looks_like_renamed_r_serialized_header(magic16):
-                return format_result
-            return "unknown"
         if format_result != "unknown":
             return format_result
 
@@ -1540,8 +1521,6 @@ def detect_file_format(path: str) -> str:
         return "executorch"
     if magic4 == b"RKNN":
         return "rknn"
-    if _looks_like_renamed_r_serialized_header(magic16):
-        return "r_serialized"
 
     ext = file_path.suffix.lower()
     filename_lower = file_path.name.lower()
