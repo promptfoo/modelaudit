@@ -1345,6 +1345,61 @@ def test_pytorch_zip_ignores_certain_replaced_webbrowser_launch_in_archive_data(
 @pytest.mark.parametrize(
     "payload",
     [
+        b"def payload():\n    return ctypes.CDLL('./payload.so')\n",
+        b"def payload():\n    from ctypes import PyDLL as load\n    return load('./payload.so')\n",
+        b"def payload():\n    return ctypes.windll.LoadLibrary('payload.dll')\n",
+    ],
+)
+def test_pytorch_zip_scans_unmarked_ctypes_native_loading_in_archive_data(tmp_path: Path, payload: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    jit_failures = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+    ]
+    matching_failures = [
+        check
+        for check in jit_failures
+        if check.location == f"{zip_path}:archive/data/payload.bin"
+        and "Native library loading detected" in check.message
+    ]
+    assert len(matching_failures) == 1
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"def payload():\n    ctypes.CDLL = len\n    return ctypes.CDLL([])\n",
+        b"def payload():\n    ctypes.cdll.LoadLibrary = len\n    return ctypes.cdll.LoadLibrary([])\n",
+    ],
+)
+def test_pytorch_zip_ignores_certain_replaced_ctypes_native_loading_in_archive_data(
+    tmp_path: Path, payload: bytes
+) -> None:
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
         b"getattr(__builtins__, 'eval')('1 + 1')\n",
         b"__builtins__['ev' + 'al']('1 + 1')\n",
         b"__builtins__.__dict__.get('eval')('1 + 1')\n",

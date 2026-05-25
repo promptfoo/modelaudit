@@ -273,6 +273,31 @@ class TestTarScanner:
         assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
 
     @pytest.mark.parametrize(
+        ("payload", "dangerous_name"),
+        [
+            (b"import ctypes\nctypes.CDLL('./payload.so')\n", "ctypes.CDLL"),
+            (b"from ctypes import PyDLL as load\nload('./payload.so')\n", "ctypes.PyDLL"),
+            (b"import ctypes\nctypes.windll.LoadLibrary('payload.dll')\n", "ctypes.windll.LoadLibrary"),
+        ],
+    )
+    def test_scan_tar_flags_ctypes_native_loading_python_member(
+        self, tmp_path: Path, payload: bytes, dangerous_name: str
+    ) -> None:
+        archive_path = tmp_path / "model_bundle.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].rule_code == "S110"
+        assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+    @pytest.mark.parametrize(
         "payload",
         [
             b"import os\nos.system.__call__('echo hidden')\n",
@@ -377,6 +402,8 @@ class TestTarScanner:
             b"import pty\npty.spawn = len\npty.spawn([])\n",
             b"import runpy\nrunpy.run_path = len\nrunpy.run_path([])\n",
             b"import webbrowser\nwebbrowser.open = len\nwebbrowser.open([])\n",
+            b"import ctypes\nctypes.CDLL = len\nctypes.CDLL([])\n",
+            b"import ctypes\nctypes.cdll.LoadLibrary = len\nctypes.cdll.LoadLibrary([])\n",
         ],
     )
     def test_scan_tar_allows_callable_captured_after_safe_overwrite(self, tmp_path: Path, payload: bytes) -> None:
@@ -1088,6 +1115,7 @@ class TestTarScanner:
                 "S109",
                 "webbrowser.open_new_tab",
             ),
+            (b"import ctypes\nctypes.CDLL('./payload.so')\n", "S110", "ctypes.CDLL"),
             (b"import importlib\nimportlib.import_module('os')\n", "S107", "importlib.import_module"),
             (b"eval('1 + 1')\n", "S104", "eval"),
             (b"import pickle\npickle.loads(b'\\x80\\x04N.')\n", "S213", "pickle.loads"),

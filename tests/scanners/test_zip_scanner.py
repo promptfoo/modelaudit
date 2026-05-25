@@ -396,6 +396,55 @@ def test_scan_zip_preserves_possible_webbrowser_launch_after_conditional_overwri
 
 
 @pytest.mark.parametrize(
+    ("source", "dangerous_name"),
+    [
+        ("import ctypes\nctypes.CDLL('./payload.so')\n", "ctypes.CDLL"),
+        ("import ctypes\nctypes.OleDLL('payload.dll')\n", "ctypes.OleDLL"),
+        ("import ctypes\nctypes.PyDLL('./payload.so')\n", "ctypes.PyDLL"),
+        ("import ctypes\nctypes.WinDLL('payload.dll')\n", "ctypes.WinDLL"),
+        ("import ctypes\nctypes.cdll.LoadLibrary('./payload.so')\n", "ctypes.cdll.LoadLibrary"),
+        ("import ctypes\nctypes.oledll.LoadLibrary('payload.dll')\n", "ctypes.oledll.LoadLibrary"),
+        ("import ctypes\nctypes.pydll.LoadLibrary('./payload.so')\n", "ctypes.pydll.LoadLibrary"),
+        ("import ctypes\nctypes.windll.LoadLibrary('payload.dll')\n", "ctypes.windll.LoadLibrary"),
+        ("from ctypes import CDLL as load\nload('./payload.so')\n", "ctypes.CDLL"),
+    ],
+)
+def test_scan_zip_flags_ctypes_native_loading_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S110"
+    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+
+def test_scan_zip_preserves_possible_ctypes_native_loading_after_conditional_overwrite(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import ctypes\nif replace:\n    ctypes.CDLL = len\nctypes.CDLL('./payload.so')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S110"
+    assert python_checks[0].details["reason"] == "high-risk calls: ctypes.CDLL"
+
+
+@pytest.mark.parametrize(
     "source",
     [
         "import os\nos.system.__call__('echo hidden')\n",
@@ -546,6 +595,8 @@ def test_scan_zip_preserves_captured_dangerous_callable_before_overwrite(tmp_pat
         "import pty\npty.spawn = len\npty.spawn([])\n",
         "import runpy\nrunpy.run_path = len\nrunpy.run_path([])\n",
         "import webbrowser\nwebbrowser.open = len\nwebbrowser.open([])\n",
+        "import ctypes\nctypes.CDLL = len\nctypes.CDLL([])\n",
+        "import ctypes\nctypes.cdll.LoadLibrary = len\nctypes.cdll.LoadLibrary([])\n",
     ],
 )
 def test_scan_zip_allows_callable_captured_after_safe_overwrite(tmp_path: Path, source: str) -> None:
@@ -1418,6 +1469,7 @@ def test_scan_zip_ignores_benign_python_file_operations(tmp_path: Path) -> None:
         ("import pty\npty.spawn('/bin/sh')\n", "S111", "pty.spawn"),
         ("import runpy\nrunpy.run_path('payload.py')\n", "S108", "runpy.run_path"),
         ("import webbrowser\nwebbrowser.open_new_tab('https://evil.example')\n", "S109", "webbrowser.open_new_tab"),
+        ("import ctypes\nctypes.CDLL('./payload.so')\n", "S110", "ctypes.CDLL"),
         ("import importlib\nimportlib.import_module('os')\n", "S107", "importlib.import_module"),
         ("eval('1 + 1')\n", "S104", "eval"),
         ("import pickle\npickle.loads(b'\\x80\\x04N.')\n", "S213", "pickle.loads"),

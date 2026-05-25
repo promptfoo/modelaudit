@@ -102,6 +102,18 @@ _WEBBROWSER_LAUNCH_CALLS = frozenset(
         "webbrowser.open_new_tab",
     }
 )
+_CTYPES_NATIVE_LIBRARY_LOADING_CALLS = frozenset(
+    {
+        "ctypes.CDLL",
+        "ctypes.OleDLL",
+        "ctypes.PyDLL",
+        "ctypes.WinDLL",
+        "ctypes.cdll.LoadLibrary",
+        "ctypes.oledll.LoadLibrary",
+        "ctypes.pydll.LoadLibrary",
+        "ctypes.windll.LoadLibrary",
+    }
+)
 _HIGH_RISK_PYTHON_CALLS = {
     "__import__",
     "__builtin__.__import__",
@@ -128,6 +140,7 @@ _HIGH_RISK_PYTHON_CALLS = {
     *_PTY_PROCESS_EXECUTION_CALLS,
     *_RUNPY_CODE_EXECUTION_CALLS,
     *_WEBBROWSER_LAUNCH_CALLS,
+    *_CTYPES_NATIVE_LIBRARY_LOADING_CALLS,
 }
 # Retain broad subprocess coverage while excluding public APIs that only construct data.
 _KNOWN_NON_EXECUTING_SUBPROCESS_CALLS = {
@@ -163,6 +176,7 @@ _HIGH_RISK_PYTHON_CALL_RULE_CODES: dict[str, str] = {
     **dict.fromkeys(_PTY_PROCESS_EXECUTION_CALLS, "S111"),
     **dict.fromkeys(_RUNPY_CODE_EXECUTION_CALLS, "S108"),
     **dict.fromkeys(_WEBBROWSER_LAUNCH_CALLS, "S109"),
+    **dict.fromkeys(_CTYPES_NATIVE_LIBRARY_LOADING_CALLS, "S110"),
 }
 _HIGH_RISK_PYTHON_CALL_PREFIX_RULE_CODES: tuple[tuple[str, str], ...] = (("subprocess.", "S103"),)
 _FALLBACK_HIGH_RISK_RULE_CODE = "S104"
