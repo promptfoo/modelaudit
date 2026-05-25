@@ -1066,10 +1066,20 @@ def is_skops_archive(path: str) -> bool:
 
 def _is_nemo_root_config_member(member_name: str) -> bool:
     """Return whether a TAR member is a safe spelling of a root NeMo config."""
+    normalized_name = _normalize_safe_tar_member_name(member_name)
+    return normalized_name is not None and normalized_name.lower() in _NEMO_CONFIG_ENTRIES
+
+
+def _normalize_safe_tar_member_name(member_name: str) -> str | None:
+    """Normalize an in-archive TAR path without permitting extraction-root escape."""
     normalized_name = member_name.replace("\\", "/")
-    while normalized_name.startswith("./"):
-        normalized_name = normalized_name[2:]
-    return normalized_name.lower() in _NEMO_CONFIG_ENTRIES
+    if PurePosixPath(normalized_name).is_absolute() or re.match(r"^[A-Za-z]:/", normalized_name):
+        return None
+
+    normalized_name = posixpath.normpath(normalized_name)
+    if normalized_name in {"", ".", ".."} or normalized_name.startswith("../"):
+        return None
+    return normalized_name
 
 
 def _resolve_safe_tar_link_target_name(member: tarfile.TarInfo) -> str | None:
@@ -1080,29 +1090,7 @@ def _resolve_safe_tar_link_target_name(member: tarfile.TarInfo) -> str | None:
 
     member_dir = posixpath.dirname(member.name.replace("\\", "/"))
     target_name = posixpath.normpath(posixpath.join(member_dir, link_name))
-    if target_name in {"", ".", ".."} or target_name.startswith("../"):
-        return None
-    while target_name.startswith("./"):
-        target_name = target_name[2:]
-    return target_name
-
-
-def _is_nemo_root_config_tar_member(archive: tarfile.TarFile, member: tarfile.TarInfo) -> bool:
-    """Return whether a root config entry is a readable file or safe in-archive link."""
-    if not _is_nemo_root_config_member(member.name):
-        return False
-    if member.isfile():
-        return True
-    if not (member.issym() or member.islnk()):
-        return False
-
-    target_name = _resolve_safe_tar_link_target_name(member)
-    if target_name is None:
-        return False
-    try:
-        return archive.getmember(target_name).isfile()
-    except KeyError:
-        return False
+    return _normalize_safe_tar_member_name(target_name)
 
 
 def _detect_tar_route(path: str) -> str | None:
@@ -1115,11 +1103,27 @@ def _detect_tar_route(path: str) -> str | None:
         with tarfile.open(file_path, "r:*") as archive:
             if file_path.suffix.lower() == ".nemo":
                 return "tar"
+            regular_member_names: set[str] = set()
+            linked_root_config_targets: set[str] = set()
             for entry_count, member in enumerate(archive, start=1):
                 if entry_count > _NEMO_ROUTE_MAX_ENTRIES:
                     return NEMO_ROUTING_INCONCLUSIVE_FORMAT
-                if _is_nemo_root_config_tar_member(archive, member):
+                normalized_member_name = _normalize_safe_tar_member_name(member.name)
+                if member.isfile():
+                    if _is_nemo_root_config_member(member.name):
+                        return "nemo"
+                    if normalized_member_name in linked_root_config_targets:
+                        return "nemo"
+                    if normalized_member_name is not None:
+                        regular_member_names.add(normalized_member_name)
+                    continue
+                if not (member.issym() or member.islnk()) or not _is_nemo_root_config_member(member.name):
+                    continue
+                target_name = _resolve_safe_tar_link_target_name(member)
+                if target_name in regular_member_names:
                     return "nemo"
+                if target_name is not None:
+                    linked_root_config_targets.add(target_name)
     except (OSError, tarfile.TarError):
         return None
 

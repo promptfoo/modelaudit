@@ -7,6 +7,7 @@ Python callables, enabling RCE when loaded via hydra.utils.instantiate().
 
 import logging
 import os
+import posixpath
 import re
 import tarfile
 import tempfile
@@ -335,9 +336,16 @@ class NemoScanner(BaseScanner):
         yaml_configs_found = 0
         yaml_config_files_found = 0
         scanned_member_entries: set[str] = set()
-        scanned_yaml_sources: set[str] = set()
+        scanned_regular_checkpoint_sources: set[tuple[str, int]] = set()
+        scanned_yaml_sources: set[tuple[str, int]] = set()
 
         with tarfile.open(path, "r:*") as tar:
+            members_by_normalized_name: dict[str, list[tarfile.TarInfo]] = {}
+            for archive_member in tar.getmembers():
+                normalized_member_name = self._normalize_safe_archive_member_name(archive_member.name)
+                if normalized_member_name is not None:
+                    members_by_normalized_name.setdefault(normalized_member_name, []).append(archive_member)
+
             for member in tar:
                 self.check_interrupted()
 
@@ -365,6 +373,8 @@ class NemoScanner(BaseScanner):
                         )
                     elif name_lower.endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS)):
                         nemo_owned_entries.add(member.name)
+                        if member.name in scanned_member_entries:
+                            continue
                         link_target_name = self._resolve_archive_link_member_name(member)
                         if link_target_name is None:
                             self._mark_inconclusive_scan_result(
@@ -376,9 +386,11 @@ class NemoScanner(BaseScanner):
                                 details={"entry": member.name, "target": member.linkname},
                             )
                         else:
-                            try:
-                                target_member = tar.getmember(link_target_name)
-                            except KeyError:
+                            target_members = members_by_normalized_name.get(link_target_name, [])
+                            regular_target_members = [
+                                target_member for target_member in target_members if target_member.isfile()
+                            ]
+                            if not target_members:
                                 self._mark_inconclusive_scan_result(
                                     result,
                                     reason="nemo_checkpoint_link_target_missing",
@@ -387,8 +399,8 @@ class NemoScanner(BaseScanner):
                                     location=f"{path}:{member.name}",
                                     details={"entry": member.name, "target": member.linkname},
                                 )
-                            else:
-                                if target_member.isfile():
+                            elif regular_target_members:
+                                for target_member in regular_target_members:
                                     self._scan_checkpoint_member(
                                         tar,
                                         target_member,
@@ -396,28 +408,23 @@ class NemoScanner(BaseScanner):
                                         result,
                                         entry_name=member.name,
                                     )
-                                    scanned_member_entries.add(member.name)
-                                else:
-                                    self._mark_inconclusive_scan_result(
-                                        result,
-                                        reason="nemo_checkpoint_link_target_not_file",
-                                        check_name="NeMo Checkpoint Nested Scan",
-                                        message=f"Checkpoint link target is not a regular file: {member.name}",
-                                        location=f"{path}:{member.name}",
-                                        details={"entry": member.name, "target": member.linkname},
-                                    )
+                            else:
+                                self._mark_inconclusive_scan_result(
+                                    result,
+                                    reason="nemo_checkpoint_link_target_not_file",
+                                    check_name="NeMo Checkpoint Nested Scan",
+                                    message=f"Checkpoint link target is not a regular file: {member.name}",
+                                    location=f"{path}:{member.name}",
+                                    details={"entry": member.name, "target": member.linkname},
+                                )
                     elif self._is_root_config_member_name(member.name):
                         link_target_name = self._resolve_archive_link_member_name(member)
                         if link_target_name is not None:
-                            try:
-                                target_member = tar.getmember(link_target_name)
-                            except KeyError:
-                                target_member = None
-                            if (
-                                target_member is not None
-                                and target_member.isfile()
-                                and target_member.name not in scanned_yaml_sources
-                            ):
+                            target_members = members_by_normalized_name.get(link_target_name, [])
+                            for target_member in target_members:
+                                target_identity = self._tar_member_identity(target_member)
+                                if not target_member.isfile() or target_identity in scanned_yaml_sources:
+                                    continue
                                 yaml_config_files_found += 1
                                 if self._scan_yaml_config_member(
                                     tar,
@@ -427,9 +434,10 @@ class NemoScanner(BaseScanner):
                                     result,
                                     nemo_owned_entries,
                                     scanned_member_entries,
+                                    scanned_regular_checkpoint_sources,
                                 ):
                                     yaml_configs_found += 1
-                                scanned_yaml_sources.add(target_member.name)
+                                scanned_yaml_sources.add(target_identity)
                     continue
 
                 if not member.isfile():
@@ -451,7 +459,8 @@ class NemoScanner(BaseScanner):
 
                 # Parse YAML config files
                 if name_lower.endswith((".yaml", ".yml")):
-                    if member.name in scanned_yaml_sources:
+                    member_identity = self._tar_member_identity(member)
+                    if member_identity in scanned_yaml_sources:
                         continue
                     yaml_config_files_found += 1
                     if self._scan_yaml_config_member(
@@ -462,16 +471,18 @@ class NemoScanner(BaseScanner):
                         result,
                         nemo_owned_entries,
                         scanned_member_entries,
+                        scanned_regular_checkpoint_sources,
                     ):
                         yaml_configs_found += 1
-                    scanned_yaml_sources.add(member.name)
+                    scanned_yaml_sources.add(member_identity)
 
                 if name_lower.endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS)):
                     nemo_owned_entries.add(member.name)
-                    if member.name in scanned_member_entries:
+                    member_identity = self._tar_member_identity(member)
+                    if member.name in scanned_member_entries or member_identity in scanned_regular_checkpoint_sources:
                         continue
                     self._scan_checkpoint_member(tar, member, path, result)
-                    scanned_member_entries.add(member.name)
+                    scanned_regular_checkpoint_sources.add(member_identity)
 
         if yaml_configs_found == 0:
             message = (
@@ -584,6 +595,7 @@ class NemoScanner(BaseScanner):
         result: ScanResult,
         nemo_owned_entries: set[str],
         scanned_member_entries: set[str],
+        scanned_regular_checkpoint_sources: set[tuple[str, int]],
     ) -> bool:
         """Analyze one YAML config entry, including a safe root-config link target."""
         if member.size > self.MAX_CONFIG_SIZE:
@@ -663,6 +675,7 @@ class NemoScanner(BaseScanner):
                 result,
                 config_file=config_file,
                 config_path=config_path,
+                scanned_regular_checkpoint_sources=scanned_regular_checkpoint_sources,
             )
             if referenced_member_scanned:
                 scanned_member_entries.add(referenced_member_name)
@@ -670,10 +683,23 @@ class NemoScanner(BaseScanner):
 
     @staticmethod
     def _is_root_config_member_name(member_name: str) -> bool:
-        normalized_name = member_name.replace("\\", "/")
-        while normalized_name.startswith("./"):
-            normalized_name = normalized_name[2:]
-        return normalized_name.lower() in {"model_config.yaml", "model_config.yml"}
+        normalized_name = NemoScanner._normalize_safe_archive_member_name(member_name)
+        return normalized_name is not None and normalized_name.lower() in {"model_config.yaml", "model_config.yml"}
+
+    @staticmethod
+    def _tar_member_identity(member: tarfile.TarInfo) -> tuple[str, int]:
+        """Return an identity that distinguishes duplicate TAR entry headers."""
+        return member.name, member.offset
+
+    @staticmethod
+    def _normalize_safe_archive_member_name(member_name: str) -> str | None:
+        """Normalize an archive member path that cannot escape extraction root."""
+        normalized_name = posixpath.normpath(member_name.replace("\\", "/"))
+        if is_absolute_archive_path(normalized_name):
+            return None
+        if normalized_name in {"", ".", ".."} or normalized_name.startswith("../"):
+            return None
+        return normalized_name
 
     @staticmethod
     def _resolve_archive_link_member_name(member: tarfile.TarInfo) -> str | None:
@@ -682,11 +708,9 @@ class NemoScanner(BaseScanner):
         if is_absolute_archive_path(linkname):
             return None
 
-        member_dir = os.path.dirname(member.name.replace("\\", "/"))
-        candidate = os.path.normpath(os.path.join(member_dir, linkname)).replace("\\", "/")
-        if candidate in {"", "."} or candidate == ".." or candidate.startswith("../"):
-            return None
-        return candidate.lstrip("./")
+        member_dir = posixpath.dirname(member.name.replace("\\", "/"))
+        candidate = posixpath.join(member_dir, linkname)
+        return NemoScanner._normalize_safe_archive_member_name(candidate)
 
     def _add_archive_path_traversal_check(
         self,
@@ -845,12 +869,20 @@ class NemoScanner(BaseScanner):
         *,
         config_file: str,
         config_path: str,
+        scanned_regular_checkpoint_sources: set[tuple[str, int]],
     ) -> bool:
         """Scan `nemo:`-referenced archive members through content-based nested dispatch."""
         try:
             member = tar.getmember(referenced_member_name)
         except KeyError:
             return False
+
+        if (
+            member.isfile()
+            and referenced_member_name.lower().endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS))
+            and self._tar_member_identity(member) in scanned_regular_checkpoint_sources
+        ):
+            return True
 
         if member.issym() or member.islnk():
             resolved_name = self._resolve_archive_link_member_name(member)

@@ -855,7 +855,7 @@ def test_detect_file_format_disguised_compressed_tar_by_content(tmp_path: Path) 
     assert validate_file_type(str(archive_path)) is False
 
 
-@pytest.mark.parametrize("config_name", ["model_config.yaml", "./model_config.yaml"])
+@pytest.mark.parametrize("config_name", ["model_config.yaml", "./model_config.yaml", "configs/../model_config.yaml"])
 def test_detect_file_format_routes_renamed_nemo_archive_by_root_config(tmp_path: Path, config_name: str) -> None:
     archive_path = tmp_path / "model.jpg"
     with tarfile.open(archive_path, "w") as archive:
@@ -870,17 +870,23 @@ def test_detect_file_format_routes_renamed_nemo_archive_by_root_config(tmp_path:
 
 
 @pytest.mark.parametrize("link_type", [tarfile.SYMTYPE, tarfile.LNKTYPE])
+@pytest.mark.parametrize(
+    ("config_name", "payload_name"),
+    [("model_config.yaml", "payload.txt"), ("configs/../model_config.yaml", "configs/../payload.txt")],
+)
 def test_detect_file_format_routes_renamed_nemo_archive_by_linked_root_config(
     tmp_path: Path,
     link_type: bytes,
+    config_name: str,
+    payload_name: str,
 ) -> None:
     archive_path = tmp_path / "linked-model.jpg"
     with tarfile.open(archive_path, "w") as archive:
         payload = b"model:\n  _target_: os.system\n"
-        payload_info = tarfile.TarInfo("payload.txt")
+        payload_info = tarfile.TarInfo(payload_name)
         payload_info.size = len(payload)
         archive.addfile(payload_info, io.BytesIO(payload))
-        link_info = tarfile.TarInfo("model_config.yaml")
+        link_info = tarfile.TarInfo(config_name)
         link_info.type = link_type
         link_info.linkname = "payload.txt"
         archive.addfile(link_info)
@@ -924,6 +930,30 @@ def test_detect_file_format_keeps_unsafe_linked_root_config_on_tar_route(tmp_pat
     assert detect_file_format(str(archive_path)) == "tar"
     assert detect_file_format_from_magic(str(archive_path)) == "tar"
     assert detect_file_format_for_skip_filter(str(archive_path)) == "tar"
+
+
+def test_detect_file_format_bounds_late_linked_root_config_targets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.utils.file.detection._NEMO_ROUTE_MAX_ENTRIES", 2)
+    archive_path = tmp_path / "late-linked-model.jpg"
+    with tarfile.open(archive_path, "w") as archive:
+        link_info = tarfile.TarInfo("model_config.yaml")
+        link_info.type = tarfile.SYMTYPE
+        link_info.linkname = "payload.txt"
+        archive.addfile(link_info)
+        filler_info = tarfile.TarInfo("assets/filler.bin")
+        filler_info.size = 1
+        archive.addfile(filler_info, io.BytesIO(b"x"))
+        payload = b"model:\n  _target_: os.system\n"
+        payload_info = tarfile.TarInfo("payload.txt")
+        payload_info.size = len(payload)
+        archive.addfile(payload_info, io.BytesIO(payload))
+
+    assert detect_file_format(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
 
 
 def test_detect_file_format_fails_closed_when_nemo_route_probe_limit_is_reached(
