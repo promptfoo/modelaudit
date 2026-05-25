@@ -14,6 +14,9 @@ from typing import Any, cast
 import pytest
 
 from modelaudit import core
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.cache.optimized_config import build_cache_version_context
+from modelaudit.scanner_selection import normalize_scanner_selection_config
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.torchserve_mar_scanner import TorchServeMarScanner
 from modelaudit.scanners.zip_scanner import ZipScanner
@@ -65,6 +68,61 @@ def _checks_named(result: ScanResult, check_name: str) -> list[Any]:
     return [check for check in result.checks if check.name == check_name]
 
 
+def _assert_inconclusive_aggregate_not_cached(
+    path: Path,
+    expected_reason: str,
+    cache_dir: Path,
+    **scan_kwargs: Any,
+) -> None:
+    reset_cache_manager()
+    try:
+        first = core.scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+        second = core.scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert metadata["scan_outcome"] == "inconclusive"
+            assert expected_reason in metadata["scan_outcome_reasons"]
+            assert not [
+                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+            assert core.determine_exit_code(aggregate) == 2
+
+        top_level_config = normalize_scanner_selection_config(
+            {
+                "blacklist_patterns": None,
+                "max_file_size": 0,
+                "max_total_size": 0,
+                "timeout": 3600,
+                "skip_file_types": True,
+                "strict_license": False,
+                "cache_enabled": True,
+                "cache_dir": str(cache_dir),
+                "min_cache_file_size": 0,
+                **scan_kwargs,
+            }
+        )
+        cached_parent = get_cache_manager(str(cache_dir), enabled=True).get_cached_result(
+            str(path),
+            version_context=build_cache_version_context(top_level_config),
+        )
+        assert cached_parent is None
+    finally:
+        reset_cache_manager()
+
+
 def test_can_handle_valid_mar_archive(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(
@@ -111,9 +169,10 @@ def test_depth_limit_returns_inconclusive_exit_code_without_security_finding(tmp
     )
 
     direct = TorchServeMarScanner(config={"_mar_depth": 1, "max_mar_depth": 1}).scan(str(mar_path))
-    aggregate = core.scan_model_directory_or_file(
-        str(mar_path),
-        cache_scan_results=False,
+    _assert_inconclusive_aggregate_not_cached(
+        mar_path,
+        "torchserve_mar_depth_limit",
+        tmp_path / "depth-limit-cache",
         _mar_depth=1,
         max_mar_depth=1,
     )
@@ -123,7 +182,6 @@ def test_depth_limit_returns_inconclusive_exit_code_without_security_finding(tmp
     assert depth_checks[0].severity == IssueSeverity.INFO
     assert direct.metadata["scan_outcome"] == "inconclusive"
     assert "torchserve_mar_depth_limit" in direct.metadata["scan_outcome_reasons"]
-    assert core.determine_exit_code(aggregate) == 2
 
 
 def test_scan_benign_mar_with_safe_handler(tmp_path: Path) -> None:
@@ -212,6 +270,70 @@ def test_scan_analyzes_readable_duplicate_handler_when_later_duplicate_is_unread
         for failure in handler_failures
     )
     assert "torchserve_handler_read_failed" in result.metadata["scan_outcome_reasons"]
+
+
+def test_unreadable_handler_returns_inconclusive_exit_code_and_is_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return data\n",
+            "weights.bin": b"weights",
+        },
+        filename="unreadable_handler.mar",
+    )
+    original_read_member_bounded = TorchServeMarScanner._read_member_bounded
+
+    def read_with_failure(
+        self: TorchServeMarScanner,
+        archive: zipfile.ZipFile,
+        member_info: zipfile.ZipInfo,
+        max_bytes: int,
+    ) -> bytes:
+        if member_info.filename == "handler.py":
+            raise RuntimeError("CRC mismatch")
+        return original_read_member_bounded(self, archive, member_info, max_bytes)
+
+    monkeypatch.setattr(TorchServeMarScanner, "_read_member_bounded", read_with_failure)
+
+    direct = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(direct, "TorchServe Handler Static Analysis")
+    assert len(handler_failures) == 1
+    assert handler_failures[0].severity == IssueSeverity.INFO
+    assert "torchserve_handler_read_failed" in direct.metadata["scan_outcome_reasons"]
+    _assert_inconclusive_aggregate_not_cached(
+        mar_path,
+        "torchserve_handler_read_failed",
+        tmp_path / "handler-read-cache",
+    )
+
+
+def test_unparseable_handler_returns_inconclusive_exit_code_and_is_not_cached(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return (\n",
+            "weights.bin": b"weights",
+        },
+        filename="unparseable_handler.mar",
+    )
+
+    direct = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(direct, "TorchServe Handler Static Analysis")
+    assert len(handler_failures) == 1
+    assert handler_failures[0].severity == IssueSeverity.INFO
+    assert "torchserve_handler_parse_failed" in direct.metadata["scan_outcome_reasons"]
+    _assert_inconclusive_aggregate_not_cached(
+        mar_path,
+        "torchserve_handler_parse_failed",
+        tmp_path / "handler-parse-cache",
+    )
 
 
 def test_scan_detects_getattr_wrapped_handler_execution_primitive(tmp_path: Path) -> None:
@@ -648,9 +770,10 @@ def test_benign_mar_entry_limit_returns_inconclusive_exit_code(tmp_path: Path) -
     )
 
     direct = TorchServeMarScanner(config={"max_mar_entries": 3}).scan(str(mar_path))
-    aggregate = core.scan_model_directory_or_file(
-        str(mar_path),
-        cache_scan_results=False,
+    _assert_inconclusive_aggregate_not_cached(
+        mar_path,
+        "torchserve_mar_entry_limit",
+        tmp_path / "benign-entry-limit-cache",
         max_mar_entries=3,
     )
 
@@ -659,7 +782,6 @@ def test_benign_mar_entry_limit_returns_inconclusive_exit_code(tmp_path: Path) -
     assert entry_limit_failures[0].severity == IssueSeverity.INFO
     assert not [issue for issue in direct.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}]
     assert direct.metadata["scan_outcome"] == "inconclusive"
-    assert core.determine_exit_code(aggregate) == 2
 
 
 def test_non_handler_python_analysis_respects_uncompressed_budget(tmp_path: Path) -> None:
@@ -688,6 +810,12 @@ def test_non_handler_python_analysis_respects_uncompressed_budget(tmp_path: Path
     assert budget_failures[0].severity == IssueSeverity.INFO
     assert result.success is False
     assert result.metadata["analysis_incomplete"] is True
+    _assert_inconclusive_aggregate_not_cached(
+        mar_path,
+        "torchserve_mar_uncompressed_budget",
+        tmp_path / "non-handler-budget-cache",
+        max_mar_uncompressed_bytes=budget,
+    )
 
 
 def test_non_handler_python_analysis_handles_valueerror_from_ast_parse(
@@ -706,26 +834,36 @@ def test_non_handler_python_analysis_handles_valueerror_from_ast_parse(
         filename="valueerror_utils.mar",
     )
 
-    real_parse = ast.parse
+    real_parse_python_source = TorchServeMarScanner._parse_python_source
 
-    def parse_with_valueerror(source: str, *args: Any, **kwargs: Any) -> ast.AST:
-        if "def transform(data)" in source:
-            raise ValueError("source code string cannot contain null bytes")
-        return cast(ast.AST, real_parse(source, *args, **kwargs))
+    def parse_with_valueerror(
+        self: TorchServeMarScanner,
+        source_bytes: bytes,
+    ) -> tuple[ast.Module | None, str | None]:
+        if b"def transform(data)" in source_bytes:
+            return None, "source code string cannot contain null bytes"
+        return real_parse_python_source(self, source_bytes)
 
-    monkeypatch.setattr("modelaudit.scanners.torchserve_mar_scanner.ast.parse", parse_with_valueerror)
+    monkeypatch.setattr(TorchServeMarScanner, "_parse_python_source", parse_with_valueerror)
 
     result = TorchServeMarScanner().scan(str(mar_path))
 
     non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
     assert any(
         check.location == f"{mar_path}:utils.py"
+        and check.severity == IssueSeverity.INFO
         and "Unable to parse non-handler Python source for static analysis" in check.message
         and check.details.get("analysis_kind") == "syntax"
         for check in non_handler_failures
     )
     assert not _failed_checks(result, "TorchServe MAR Scan")
-    assert result.success
+    assert result.success is False
+    assert "torchserve_non_handler_python_parse_failed" in result.metadata["scan_outcome_reasons"]
+    _assert_inconclusive_aggregate_not_cached(
+        mar_path,
+        "torchserve_non_handler_python_parse_failed",
+        tmp_path / "non-handler-parse-cache",
+    )
 
 
 def test_non_handler_python_analysis_read_failure_is_reported_without_aborting(
@@ -744,17 +882,21 @@ def test_non_handler_python_analysis_read_failure_is_reported_without_aborting(
         filename="read_failure_utils.mar",
     )
 
-    scanner = TorchServeMarScanner()
-    original_read_member_bounded = scanner._read_member_bounded
+    original_read_member_bounded = TorchServeMarScanner._read_member_bounded
 
-    def read_with_failure(archive: zipfile.ZipFile, member_info: zipfile.ZipInfo, max_bytes: int) -> bytes:
+    def read_with_failure(
+        self: TorchServeMarScanner,
+        archive: zipfile.ZipFile,
+        member_info: zipfile.ZipInfo,
+        max_bytes: int,
+    ) -> bytes:
         if member_info.filename == "utils.py":
             raise RuntimeError("CRC mismatch")
-        return original_read_member_bounded(archive, member_info, max_bytes)
+        return original_read_member_bounded(self, archive, member_info, max_bytes)
 
-    monkeypatch.setattr(scanner, "_read_member_bounded", read_with_failure)
+    monkeypatch.setattr(TorchServeMarScanner, "_read_member_bounded", read_with_failure)
 
-    result = scanner.scan(str(mar_path))
+    result = TorchServeMarScanner().scan(str(mar_path))
 
     non_handler_failures = _failed_checks(result, "MAR Non-Handler Python Analysis")
     assert any(
@@ -767,6 +909,11 @@ def test_non_handler_python_analysis_read_failure_is_reported_without_aborting(
     assert not _failed_checks(result, "TorchServe MAR Scan")
     assert result.success is False
     assert "torchserve_non_handler_python_read_failed" in result.metadata["scan_outcome_reasons"]
+    _assert_inconclusive_aggregate_not_cached(
+        mar_path,
+        "torchserve_non_handler_python_read_failed",
+        tmp_path / "non-handler-read-cache",
+    )
 
 
 def test_scan_resolves_bare_module_handler_names(tmp_path: Path) -> None:
@@ -874,9 +1021,10 @@ def test_scan_fails_closed_when_manifest_payload_falls_after_entry_limit(tmp_pat
     )
 
     result = TorchServeMarScanner(config={"max_mar_entries": 3}).scan(str(mar_path))
-    aggregate = core.scan_model_directory_or_file(
-        str(mar_path),
-        cache_scan_results=False,
+    _assert_inconclusive_aggregate_not_cached(
+        mar_path,
+        "torchserve_mar_entry_limit",
+        tmp_path / "late-payload-entry-cache",
         max_mar_entries=3,
     )
 
@@ -889,7 +1037,6 @@ def test_scan_fails_closed_when_manifest_payload_falls_after_entry_limit(tmp_pat
     assert len(coverage_checks) == 1
     assert coverage_checks[0].details["unscanned_payload_members"] == ["late.pkl"]
     assert not _checks_named(result, "TorchServe Serialized Payload Security")
-    assert core.determine_exit_code(aggregate) == 2
 
 
 def test_scan_preserves_detected_payload_finding_when_a_later_entry_is_skipped(tmp_path: Path) -> None:
@@ -908,7 +1055,7 @@ def test_scan_preserves_detected_payload_finding_when_a_later_entry_is_skipped(t
     result = TorchServeMarScanner(config={"max_mar_entries": 3}).scan(str(mar_path))
     aggregate = core.scan_model_directory_or_file(
         str(mar_path),
-        cache_scan_results=False,
+        cache_enabled=False,
         max_mar_entries=3,
     )
 
@@ -933,9 +1080,10 @@ def test_scan_fails_closed_when_manifest_payload_exceeds_member_limit(tmp_path: 
     )
 
     result = TorchServeMarScanner(config={"max_mar_member_bytes": 128}).scan(str(mar_path))
-    aggregate = core.scan_model_directory_or_file(
-        str(mar_path),
-        cache_scan_results=False,
+    _assert_inconclusive_aggregate_not_cached(
+        mar_path,
+        "torchserve_mar_member_size_limit",
+        tmp_path / "payload-member-cache",
         max_mar_member_bytes=128,
     )
 
@@ -948,7 +1096,6 @@ def test_scan_fails_closed_when_manifest_payload_exceeds_member_limit(tmp_path: 
     assert len(coverage_checks) == 1
     assert coverage_checks[0].details["unscanned_payload_members"] == ["model.pkl"]
     assert not _checks_named(result, "TorchServe Serialized Payload Security")
-    assert core.determine_exit_code(aggregate) == 2
 
 
 def test_scan_fails_closed_when_manifest_payload_falls_after_uncompressed_budget(tmp_path: Path) -> None:
@@ -968,9 +1115,10 @@ def test_scan_fails_closed_when_manifest_payload_falls_after_uncompressed_budget
 
     budget = member_sizes["MAR-INF/MANIFEST.json"] + member_sizes["handler.py"]
     result = TorchServeMarScanner(config={"max_mar_uncompressed_bytes": budget}).scan(str(mar_path))
-    aggregate = core.scan_model_directory_or_file(
-        str(mar_path),
-        cache_scan_results=False,
+    _assert_inconclusive_aggregate_not_cached(
+        mar_path,
+        "torchserve_mar_uncompressed_budget",
+        tmp_path / "payload-budget-cache",
         max_mar_uncompressed_bytes=budget,
     )
 
@@ -983,7 +1131,6 @@ def test_scan_fails_closed_when_manifest_payload_falls_after_uncompressed_budget
     assert len(coverage_checks) == 1
     assert coverage_checks[0].details["unscanned_payload_members"] == ["late.pkl"]
     assert not _checks_named(result, "TorchServe Serialized Payload Security")
-    assert core.determine_exit_code(aggregate) == 2
 
 
 def test_scan_detects_path_traversal_member_names(tmp_path: Path) -> None:
@@ -1028,13 +1175,16 @@ def test_unreadable_symlink_target_returns_inconclusive_exit_code(tmp_path: Path
         archive.writestr(symlink_info, b"a" * 4097)
 
     direct = TorchServeMarScanner().scan(str(mar_path))
-    aggregate = core.scan_model_directory_or_file(str(mar_path), cache_scan_results=False)
+    _assert_inconclusive_aggregate_not_cached(
+        mar_path,
+        "torchserve_mar_symlink_target_read_failed",
+        tmp_path / "symlink-read-cache",
+    )
 
     symlink_failures = _failed_checks(direct, "TorchServe MAR Symlink Safety Validation")
     assert len(symlink_failures) == 1
     assert symlink_failures[0].severity == IssueSeverity.INFO
     assert "torchserve_mar_symlink_target_read_failed" in direct.metadata["scan_outcome_reasons"]
-    assert core.determine_exit_code(aggregate) == 2
 
 
 def test_scan_allows_normalized_safe_member_names(tmp_path: Path) -> None:
@@ -1432,6 +1582,38 @@ def test_scan_handles_corrupt_mar_gracefully(tmp_path: Path) -> None:
     archive_failures = _failed_checks(result, "TorchServe MAR Archive Validation")
     assert len(archive_failures) == 1
     assert result.success is False
+
+
+def test_unexpected_scan_failure_returns_inconclusive_exit_code_and_is_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return data\n",
+            "weights.bin": b"weights",
+        },
+        filename="scan_failure.mar",
+    )
+
+    def fail_archive_member_scan(self: TorchServeMarScanner, *args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("unexpected member scan failure")
+
+    monkeypatch.setattr(TorchServeMarScanner, "_scan_archive_members", fail_archive_member_scan)
+
+    direct = TorchServeMarScanner().scan(str(mar_path))
+    scan_failures = _failed_checks(direct, "TorchServe MAR Scan")
+    assert len(scan_failures) == 1
+    assert scan_failures[0].severity == IssueSeverity.INFO
+    assert "torchserve_mar_scan_failed" in direct.metadata["scan_outcome_reasons"]
+    _assert_inconclusive_aggregate_not_cached(
+        mar_path,
+        "torchserve_mar_scan_failed",
+        tmp_path / "scan-failure-cache",
+    )
 
 
 def test_scan_redacts_url_like_manifest_references(tmp_path: Path) -> None:
@@ -2312,6 +2494,12 @@ def test_scan_bounds_requirements_reads_to_dedicated_limit(
         for member in coverage_failures[0].details.get("incomplete_requirements_members", [])
     )
     assert "torchserve_requirements_size_limit" in result.metadata["scan_outcome_reasons"]
+    _assert_inconclusive_aggregate_not_cached(
+        mar_path,
+        "torchserve_requirements_size_limit",
+        tmp_path / "requirements-size-cache",
+        max_mar_member_bytes=1024 * 1024,
+    )
 
 
 def test_scan_without_requirements_txt_preserves_existing_behavior(tmp_path: Path) -> None:

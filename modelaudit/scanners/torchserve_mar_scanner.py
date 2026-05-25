@@ -247,13 +247,19 @@ class TorchServeMarScanner(BaseScanner):
             result.finish(success=False)
             return result
         except Exception as exc:
+            mark_inconclusive_scan_result(result, "torchserve_mar_scan_failed")
             result.add_check(
                 name="TorchServe MAR Scan",
                 passed=False,
                 message=f"Error scanning TorchServe .mar archive: {exc!s}",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(exc), "exception_type": type(exc).__name__},
+                details={
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "torchserve_mar_scan_failed",
+                },
             )
             result.finish(success=False)
             return result
@@ -895,13 +901,19 @@ class TorchServeMarScanner(BaseScanner):
 
                     tree, parse_error = self._parse_python_source(handler_bytes)
                     if parse_error is not None:
+                        mark_inconclusive_scan_result(result, "torchserve_handler_parse_failed")
                         result.add_check(
                             name="TorchServe Handler Static Analysis",
                             passed=False,
                             message=f"Unable to parse handler source for static analysis: {parse_error}",
-                            severity=IssueSeverity.WARNING,
+                            severity=IssueSeverity.INFO,
                             location=f"{archive_path}:{normalized_handler}",
-                            details=handler_details,
+                            details={
+                                **handler_details,
+                                "analysis_kind": "syntax",
+                                "analysis_incomplete": True,
+                                "scan_outcome_reason": "torchserve_handler_parse_failed",
+                            },
                         )
                         continue
                     assert tree is not None
@@ -1159,14 +1171,19 @@ class TorchServeMarScanner(BaseScanner):
 
                 tree, parse_error = self._parse_python_source(source_bytes)
                 if parse_error is not None:
-                    non_handler_findings += 1
+                    mark_inconclusive_scan_result(result, "torchserve_non_handler_python_parse_failed")
                     result.add_check(
                         name="MAR Non-Handler Python Analysis",
                         passed=False,
                         message=f"Unable to parse non-handler Python source for static analysis: {parse_error}",
-                        severity=IssueSeverity.WARNING,
+                        severity=IssueSeverity.INFO,
                         location=f"{archive_path}:{member_name}",
-                        details={**member_details, "analysis_kind": "syntax"},
+                        details={
+                            **member_details,
+                            "analysis_kind": "syntax",
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": "torchserve_non_handler_python_parse_failed",
+                        },
                     )
                     continue
 
