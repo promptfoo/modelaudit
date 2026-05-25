@@ -9,6 +9,7 @@ pytest.importorskip("msgpack")
 
 import msgpack
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
@@ -20,6 +21,42 @@ def create_msgpack_file(path: Path, data: Any) -> None:
     """Helper to create msgpack files with specific data."""
     with open(path, "wb") as f:
         f.write(msgpack.packb(data, use_bin_type=True))
+
+
+def _assert_inconclusive_aggregate_not_cached(
+    path: Path,
+    expected_reason: str,
+    cache_dir: Path,
+    **scan_kwargs: Any,
+) -> None:
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+        second = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+            **scan_kwargs,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(path)]
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert expected_reason in metadata["scan_outcome_reasons"]
+            assert not [
+                issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+            assert determine_exit_code(aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def create_malicious_msgpack_file(path):
@@ -409,8 +446,11 @@ def test_flax_msgpack_deep_nesting_is_inconclusive(tmp_path: Path) -> None:
     assert all(check.details["analysis_incomplete"] is True for check in depth_checks)
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
-    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
-    assert determine_exit_code(aggregate) == 2
+    _assert_inconclusive_aggregate_not_cached(
+        path,
+        FlaxMsgpackScanner.RECURSION_LIMIT_INCONCLUSIVE_REASON,
+        tmp_path / "benign-recursion-cache",
+    )
 
 
 def test_flax_msgpack_renamed_hidden_pattern_beyond_recursion_limit_is_inconclusive(tmp_path: Path) -> None:
@@ -426,12 +466,12 @@ def test_flax_msgpack_renamed_hidden_pattern_beyond_recursion_limit_is_inconclus
     assert result.metadata["scan_outcome_reasons"] == [FlaxMsgpackScanner.RECURSION_LIMIT_INCONCLUSIVE_REASON]
     assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
-    aggregate = scan_model_directory_or_file(
-        str(path),
+    _assert_inconclusive_aggregate_not_cached(
+        path,
+        FlaxMsgpackScanner.RECURSION_LIMIT_INCONCLUSIVE_REASON,
+        tmp_path / "hidden-payload-cache",
         max_recursion_depth=2,
-        cache_scan_results=False,
     )
-    assert determine_exit_code(aggregate) == 2
 
 
 def test_flax_msgpack_pattern_within_recursion_limit_remains_security_finding(tmp_path: Path) -> None:
@@ -448,7 +488,7 @@ def test_flax_msgpack_pattern_within_recursion_limit_remains_security_finding(tm
     aggregate = scan_model_directory_or_file(
         str(path),
         max_recursion_depth=2,
-        cache_scan_results=False,
+        cache_enabled=False,
     )
     assert determine_exit_code(aggregate) == 1
 
@@ -660,6 +700,30 @@ def test_flax_msgpack_can_handle_large_renamed_checkpoint_root_after_metadata_wi
 
     assert FlaxMsgpackScanner.can_handle(str(disguised_checkpoint)) is True
     assert FlaxMsgpackScanner.can_handle(str(generic_map)) is False
+
+
+def test_flax_msgpack_ambiguous_renamed_probe_limit_fails_closed_without_unpacking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ambiguous_map = tmp_path / "metadata.jpg"
+    large_metadata: dict[str, object] = {f"field{i}": i for i in range(2100)}
+    large_metadata["blob"] = "x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100)
+    create_msgpack_file(ambiguous_map, {"metadata": large_metadata, "state": {"selected": True}})
+
+    def fail_unpack(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("ambiguous renamed maps must not be fully unpacked")
+
+    monkeypatch.setattr(msgpack, "unpackb", fail_unpack)
+
+    result = FlaxMsgpackScanner().scan(str(ambiguous_map))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["analysis_incomplete"] is True
+    check = next(check for check in result.checks if check.name == "MessagePack Routing Analysis Limit")
+    assert check.status == CheckStatus.FAILED
+    assert check.details["scan_outcome_reason"] == "flax_msgpack_routing_probe_limit_exceeded"
 
 
 @pytest.mark.slow

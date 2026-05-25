@@ -1391,8 +1391,8 @@ def _read_msgpack_probe_key(
         return None
 
 
-def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool:
-    """Inspect large maps without materializing tensor or metadata payload values."""
+def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool | None:
+    """Inspect large maps, returning None when safe routing limits are exhausted."""
     remaining_nodes = [_FLAX_MSGPACK_PROBE_MAX_NODES]
     try:
         with path.open("rb") as stream:
@@ -1405,7 +1405,7 @@ def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool:
                 _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
     except _MsgpackProbeLimit:
         # A valid map might expose checkpoint roots beyond the bounded walk.
-        return True
+        return None
     except (OSError, _MsgpackProbeInvalid):
         return False
     return False
@@ -1439,7 +1439,7 @@ def is_flax_msgpack_checkpoint_file(path: str | Path) -> bool:
         if file_size < 2:
             return False
         if file_size > FLAX_MSGPACK_STRUCTURE_READ_BYTES:
-            return _has_bounded_flax_msgpack_routing_key(file_path, file_size)
+            return _has_bounded_flax_msgpack_routing_key(file_path, file_size) is not False
         with file_path.open("rb") as f:
             sample = f.read(FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1)
     except OSError:
@@ -1456,6 +1456,20 @@ def is_flax_msgpack_checkpoint_file(path: str | Path) -> bool:
     except Exception:
         return False
     return _has_flax_msgpack_checkpoint_structure(payload)
+
+
+def has_inconclusive_renamed_flax_msgpack_routing(path: str | Path) -> bool:
+    """Return whether a renamed MessagePack candidate exceeded bounded routing inspection."""
+    file_path = Path(path)
+    if file_path.suffix.lower() in _FLAX_MSGPACK_NATIVE_SUFFIXES:
+        return False
+    try:
+        file_size = file_path.stat().st_size
+    except OSError:
+        return False
+    if file_size <= FLAX_MSGPACK_STRUCTURE_READ_BYTES:
+        return False
+    return _has_bounded_flax_msgpack_routing_key(file_path, file_size) is None
 
 
 def _could_be_renamed_flax_msgpack(file_path: Path, prefix: bytes) -> bool:

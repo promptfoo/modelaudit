@@ -854,6 +854,66 @@ def test_scan_file_routes_large_malicious_renamed_flax_msgpack_with_later_root_t
     assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
 
 
+def test_scan_file_fails_closed_for_renamed_msgpack_routing_probe_limit(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "ambiguous.jpg"
+    large_metadata: dict[str, object] = {f"field{i}": i for i in range(2100)}
+    large_metadata["blob"] = "x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100)
+    checkpoint.write_bytes(
+        flax_msgpack_scanner.msgpack.packb(
+            {"metadata": large_metadata, "state": {"selected": True}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(checkpoint), cache_scan_results=False)
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "flax_msgpack_routing_probe_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+    limit_check = next(check for check in result.checks if check.name == "MessagePack Routing Analysis Limit")
+    assert (
+        limit_check.message == "Flax MessagePack analysis incomplete because bounded routing inspection was exhausted"
+    )
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_ambiguous_renamed_msgpack_result_is_not_cached(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "ambiguous.jpg"
+    large_metadata: dict[str, object] = {f"field{i}": i for i in range(2100)}
+    large_metadata["blob"] = "x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100)
+    checkpoint.write_bytes(
+        flax_msgpack_scanner.msgpack.packb(
+            {"metadata": large_metadata, "state": {"selected": True}},
+            use_bin_type=True,
+        )
+    )
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(checkpoint), config=config)
+        second = scan_file(str(checkpoint), config=config)
+
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert second.metadata["scan_outcome"] == "inconclusive"
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 def test_scan_file_missing_msgpack_result_is_not_cached(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     checkpoint = tmp_path / "model.flax"
     checkpoint.write_bytes(b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03")
