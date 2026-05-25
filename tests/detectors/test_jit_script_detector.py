@@ -258,6 +258,23 @@ class TestJITScriptDetector:
             (b"namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n"),
             b"lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
             b"lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
+            (b"run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun('1 + 1')\n"),
+            (
+                b"run = globals()['__builtins__']['eval']\n"
+                b"globals()['__builtins__'].__setitem__('eval', len)\n"
+                b"run('1 + 1')\n"
+            ),
+            (
+                b"run = globals()['__builtins__']['eval']\n"
+                b"replace = globals()['__builtins__'].__setitem__\n"
+                b"replace('eval', len)\n"
+                b"run('1 + 1')\n"
+            ),
+            (
+                b"run = globals()['__builtins__']['eval']\n"
+                b"globals()['__builtins__']['eval'] = __builtins__['exec']\n"
+                b"run('1 + 1')\n"
+            ),
         ],
     )
     def test_scan_model_detects_unmarked_static_builtin_indirection(self, source: bytes) -> None:
@@ -316,6 +333,14 @@ class TestJITScriptDetector:
                 b"replace({'eval': len})\n"
                 b"globals()['__builtins__']['eval']([])\n"
             ),
+            (b"globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
+            (b"globals()['__builtins__'].__setitem__('eval', len)\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
+            (
+                b"replace = globals()['__builtins__'].__setitem__\n"
+                b"replace('eval', len)\n"
+                b"run = globals()['__builtins__']['eval']\n"
+                b"run([])\n"
+            ),
             b"def payload():\n    eval = len\n    return eval([])\n",
             (
                 b"def payload():\n"
@@ -356,6 +381,11 @@ class TestJITScriptDetector:
             (
                 b"replace = globals()['__builtins__'].update\n"
                 b"replace({'eval': __builtins__['exec']})\n"
+                b"globals()['__builtins__']['eval']('pass')\n"
+            ),
+            (
+                b"globals()['__builtins__']['eval'] = __builtins__['exec']\n"
+                b"globals()['__builtins__']['exec'] = len\n"
                 b"globals()['__builtins__']['eval']('pass')\n"
             ),
         ],

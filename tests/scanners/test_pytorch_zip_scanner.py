@@ -1052,6 +1052,23 @@ def test_pytorch_zip_scans_unmarked_python_blobs_in_archive_data(tmp_path: Path)
         b"namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n",
         b"lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
         b"lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
+        (b"run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun('1 + 1')\n"),
+        (
+            b"run = globals()['__builtins__']['eval']\n"
+            b"globals()['__builtins__'].__setitem__('eval', len)\n"
+            b"run('1 + 1')\n"
+        ),
+        (
+            b"run = globals()['__builtins__']['eval']\n"
+            b"replace = globals()['__builtins__'].__setitem__\n"
+            b"replace('eval', len)\n"
+            b"run('1 + 1')\n"
+        ),
+        (
+            b"run = globals()['__builtins__']['eval']\n"
+            b"globals()['__builtins__']['eval'] = __builtins__['exec']\n"
+            b"run('1 + 1')\n"
+        ),
     ],
 )
 def test_pytorch_zip_scans_static_builtin_indirection_in_archive_data(tmp_path: Path, payload: bytes) -> None:
@@ -1135,6 +1152,14 @@ def test_pytorch_zip_scans_aliased_modeled_builtins_in_archive_data(
             b"replace = globals()['__builtins__'].update\n"
             b"replace({'eval': len})\n"
             b"globals()['__builtins__']['eval']([])\n"
+        ),
+        (b"globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
+        (b"globals()['__builtins__'].__setitem__('eval', len)\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
+        (
+            b"replace = globals()['__builtins__'].__setitem__\n"
+            b"replace('eval', len)\n"
+            b"run = globals()['__builtins__']['eval']\n"
+            b"run([])\n"
         ),
         b"def payload():\n    eval = len\n    return eval([])\n",
         (

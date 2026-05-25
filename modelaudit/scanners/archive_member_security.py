@@ -294,6 +294,7 @@ _GLOBAL_NAMESPACE_HELPERS = {"globals", "builtins.globals"}
 _GLOBAL_NAMESPACE_MAPPING_MARKER = "<globals mapping>"
 _STATIC_REFERENCE_OVERRIDE_PREFIX = "<static reference override>:"
 _STATIC_DIRECT_MUTATION_ALIAS_PREFIX = "<static direct mutation alias>:"
+_CAPTURED_CALLABLE_REFERENCE_PREFIX = "<captured callable>:"
 _BUILTIN_NAMESPACE_NAMES = {"__builtin__", "__builtins__"}
 _STATIC_MAPPING_MUTATORS = {"__setitem__", "update"}
 
@@ -657,8 +658,12 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self.risky_calls: set[str] = set()
         self.tracked_call_names = tracked_call_names
 
+    def _bind_import_name(self, local_name: str, import_name: str) -> None:
+        effective_names = self._effective_reference_names(frozenset({import_name}))
+        self._bind_name(local_name, self._capture_callable_names(effective_names))
+
     def _record_import(self, alias: ast.alias, import_name: str) -> None:
-        self._bind_name(alias.asname or alias.name, frozenset({import_name}))
+        self._bind_import_name(alias.asname or alias.name, import_name)
 
     def _bind_name(self, name: str, resolved_names: _AliasValue) -> None:
         self.alias_scopes[-1][name] = resolved_names
@@ -695,17 +700,47 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             return self._lookup_static_direct_mutation_alias(node.id)
         return None
 
-    def _resolve_reference_names(self, node: ast.AST) -> frozenset[str] | None:
-        resolved_names = _resolve_static_reference_names(node, self.alias_scopes)
+    def _is_tracked_call_name(self, name: str) -> bool:
+        return (
+            name in self.tracked_call_names
+            if self.tracked_call_names is not None
+            else _is_high_risk_python_call_name(name)
+        )
+
+    @staticmethod
+    def _captured_callable_reference_name(name: str) -> str:
+        return f"{_CAPTURED_CALLABLE_REFERENCE_PREFIX}{name}"
+
+    def _capture_callable_names(self, resolved_names: _AliasValue) -> _AliasValue:
         if resolved_names is None:
             return None
+        return frozenset(
+            self._captured_callable_reference_name(name) if self._is_tracked_call_name(name) else name
+            for name in resolved_names
+        )
 
+    def _effective_reference_names(self, resolved_names: frozenset[str]) -> frozenset[str] | None:
         effective_names: set[str] = set()
         for resolved_name in resolved_names:
+            if resolved_name.startswith(_CAPTURED_CALLABLE_REFERENCE_PREFIX):
+                effective_names.add(resolved_name.removeprefix(_CAPTURED_CALLABLE_REFERENCE_PREFIX))
+                continue
             override_names = self._lookup_static_reference_override(resolved_name)
             if override_names is not None:
-                effective_names.update(override_names)
+                effective_names.update(
+                    override_name.removeprefix(_CAPTURED_CALLABLE_REFERENCE_PREFIX)
+                    if override_name.startswith(_CAPTURED_CALLABLE_REFERENCE_PREFIX)
+                    else override_name
+                    for override_name in override_names
+                )
         return frozenset(effective_names) if effective_names else None
+
+    def _resolve_reference_names(self, node: ast.AST) -> frozenset[str] | None:
+        resolved_names = _resolve_static_reference_names(node, self.alias_scopes)
+        return self._effective_reference_names(resolved_names) if resolved_names is not None else None
+
+    def _resolve_bound_value_names(self, node: ast.AST) -> _AliasValue:
+        return self._capture_callable_names(self._resolve_reference_names(node))
 
     def _bind_static_reference_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
         target_names = _resolve_static_assignment_target_names(target, self.alias_scopes)
@@ -715,7 +750,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self._bind_static_reference_names_to_value(target_names, value)
 
     def _bind_static_reference_names_to_value(self, target_names: frozenset[str], value: ast.AST) -> None:
-        resolved_value_names = self._resolve_reference_names(value)
+        resolved_value_names = self._resolve_bound_value_names(value)
         for target_name in target_names:
             self._bind_name(self._static_reference_override_key(target_name), resolved_value_names)
 
@@ -759,7 +794,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _bind_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
         if isinstance(target, ast.Name):
-            self._bind_name(target.id, self._resolve_reference_names(value))
+            self._bind_name(target.id, self._resolve_bound_value_names(value))
             direct_mutator_names = self._resolve_certain_direct_builtin_mutator_names(value)
             if direct_mutator_names is not None:
                 self._bind_name(self._static_direct_mutation_alias_key(target.id), direct_mutator_names)
@@ -791,12 +826,12 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             )
             self._bind_name(
                 arg.arg,
-                self._resolve_reference_names(default) if default is not None else None,
+                self._resolve_bound_value_names(default) if default is not None else None,
             )
         for arg, default in zip(arguments.kwonlyargs, arguments.kw_defaults, strict=True):
             self._bind_name(
                 arg.arg,
-                self._resolve_reference_names(default) if default is not None else None,
+                self._resolve_bound_value_names(default) if default is not None else None,
             )
         if arguments.vararg is not None:
             self._bind_name(arguments.vararg.arg, None)
@@ -813,7 +848,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for alias in node.names:
             if alias.name == "*":
                 for local_name, import_name in _wildcard_import_aliases(node.module, self.tracked_call_names):
-                    self._bind_name(local_name, frozenset({import_name}))
+                    self._bind_import_name(local_name, import_name)
                 continue
             self._record_import(alias, f"{node.module}.{alias.name}")
 
@@ -1088,11 +1123,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         resolved_names = self._resolve_reference_names(node.func)
         if resolved_names is not None:
             for resolved_name in resolved_names:
-                if (
-                    resolved_name in self.tracked_call_names
-                    if self.tracked_call_names is not None
-                    else _is_high_risk_python_call_name(resolved_name)
-                ):
+                if self._is_tracked_call_name(resolved_name):
                     self.risky_calls.add(resolved_name)
         self.generic_visit(node)
 

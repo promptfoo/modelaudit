@@ -140,6 +140,47 @@ class TestTarScanner:
         assert python_checks[0].severity == IssueSeverity.WARNING
         assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            b"import os\nrun = os.system\nos.system = len\nrun('echo hidden')\n",
+            b"import os\nfrom os import system as run\nos.system = len\nrun('echo hidden')\n",
+        ],
+    )
+    def test_scan_tar_preserves_captured_dangerous_callable_before_overwrite(
+        self, tmp_path: Path, payload: bytes
+    ) -> None:
+        archive_path = tmp_path / "model_bundle.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].details["reason"] == "high-risk calls: os.system"
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            b"import os\nos.system = len\nrun = os.system\nrun([])\n",
+            b"import os\nos.system = len\nfrom os import system as run\nrun([])\n",
+        ],
+    )
+    def test_scan_tar_allows_callable_captured_after_safe_overwrite(self, tmp_path: Path, payload: bytes) -> None:
+        archive_path = tmp_path / "model_bundle.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+
     def test_scan_tar_flags_wildcard_import_dangerous_python_member(self, tmp_path: Path) -> None:
         """Wildcard imports should resolve known high-risk call names."""
         archive_path = tmp_path / "model_bundle.tar"
@@ -193,6 +234,23 @@ class TestTarScanner:
             (b"namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n"),
             b"lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
             b"lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
+            (b"run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun('1 + 1')\n"),
+            (
+                b"run = globals()['__builtins__']['eval']\n"
+                b"globals()['__builtins__'].__setitem__('eval', len)\n"
+                b"run('1 + 1')\n"
+            ),
+            (
+                b"run = globals()['__builtins__']['eval']\n"
+                b"replace = globals()['__builtins__'].__setitem__\n"
+                b"replace('eval', len)\n"
+                b"run('1 + 1')\n"
+            ),
+            (
+                b"run = globals()['__builtins__']['eval']\n"
+                b"globals()['__builtins__']['eval'] = __builtins__['exec']\n"
+                b"run('1 + 1')\n"
+            ),
         ],
     )
     def test_scan_tar_flags_implicit_builtins_dangerous_python_member(self, tmp_path: Path, payload: bytes) -> None:
@@ -241,6 +299,14 @@ class TestTarScanner:
                 b"replace = globals()['__builtins__'].update\n"
                 b"replace({'eval': len})\n"
                 b"globals()['__builtins__']['eval']([])\n"
+            ),
+            (b"globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
+            (b"globals()['__builtins__'].__setitem__('eval', len)\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
+            (
+                b"replace = globals()['__builtins__'].__setitem__\n"
+                b"replace('eval', len)\n"
+                b"run = globals()['__builtins__']['eval']\n"
+                b"run([])\n"
             ),
         ],
     )

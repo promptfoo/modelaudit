@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve ambiguous budget-exhausted protobuf candidates for tentative analysis without misclassifying non-ONNX payloads
 - route signature-confirmed CNTK and LightGBM artifacts with misleading filenames through security analysis
 - share trusted-content routing across direct, nested, and helper scans so renamed specialized archives retain their format-specific analysis
+- preserve dangerous callable findings when embedded source captures a callable before a later safe overwrite
 - fail closed when nested NeMo checkpoint or referenced-artifact analysis is explicitly incomplete
 - preserve concrete nested security findings from checkpoint and referenced artifacts inside NeMo archives
 - keep PyTorch ZIP path traversal findings attributed to archive safety rules regardless of member names

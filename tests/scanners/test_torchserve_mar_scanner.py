@@ -279,6 +279,31 @@ def test_scan_detects_keyword_getattr_wrapped_handler_execution_primitive(
             b"    lookup = globals()['__builtins__'].__getitem__\n"
             b"    return lookup('ev' + 'al')('1 + 1')\n"
         ),
+        (
+            b"def handle(data, context):\n"
+            b"    run = globals()['__builtins__']['eval']\n"
+            b"    globals()['__builtins__']['eval'] = len\n"
+            b"    return run('1 + 1')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    run = globals()['__builtins__']['eval']\n"
+            b"    globals()['__builtins__'].__setitem__('eval', len)\n"
+            b"    return run('1 + 1')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    run = globals()['__builtins__']['eval']\n"
+            b"    replace = globals()['__builtins__'].__setitem__\n"
+            b"    replace('eval', len)\n"
+            b"    return run('1 + 1')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    run = globals()['__builtins__']['eval']\n"
+            b"    globals()['__builtins__']['eval'] = __builtins__['exec']\n"
+            b"    return run('1 + 1')\n"
+        ),
     ],
 )
 def test_scan_detects_implicit_builtins_handler_execution_primitive(
@@ -357,6 +382,25 @@ def test_scan_detects_implicit_builtins_handler_execution_primitive(
             b"    replace = globals()['__builtins__'].update\n"
             b"    replace({'eval': len})\n"
             b"    return globals()['__builtins__']['eval']([])\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    globals()['__builtins__']['eval'] = len\n"
+            b"    run = globals()['__builtins__']['eval']\n"
+            b"    return run([])\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    globals()['__builtins__'].__setitem__('eval', len)\n"
+            b"    run = globals()['__builtins__']['eval']\n"
+            b"    return run([])\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    replace = globals()['__builtins__'].__setitem__\n"
+            b"    replace('eval', len)\n"
+            b"    run = globals()['__builtins__']['eval']\n"
+            b"    return run([])\n"
         ),
     ],
 )
