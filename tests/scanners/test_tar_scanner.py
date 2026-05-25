@@ -174,6 +174,10 @@ class TestTarScanner:
                 b"    os.system('echo hidden')\n"
             ),
             (
+                b"import os\nnamespace = os.__dict__\nif swap:\n    namespace = make_mapping()\n"
+                b"namespace.update({'system': len})\nos.system('echo hidden')\n"
+            ),
+            (
                 b"import os\n"
                 b"setattr = lambda target, key, value: None\n"
                 b"setattr(os, 'system', len)\n"
@@ -212,6 +216,8 @@ class TestTarScanner:
             b"import os\nvars(os).update({'system': len})\nos.system([])\n",
             b"import os\nreplace = os.__dict__.update\nreplace({'system': len})\nos.system([])\n",
             b"import os\nos.__dict__.update({'system': len})\nrun = os.system\nrun([])\n",
+            b"import os\ngetattr(os, '__dict__').update({'system': len})\nos.system([])\n",
+            b"import os\nnamespace = os.__dict__\nnamespace.update({'system': len})\nos.system([])\n",
         ],
     )
     def test_scan_tar_allows_callable_captured_after_safe_overwrite(self, tmp_path: Path, payload: bytes) -> None:
@@ -248,6 +254,10 @@ class TestTarScanner:
         [
             b"import os\nimport subprocess\nsetattr(os, 'system', subprocess.run)\nos.system(['id'])\n",
             b"import os\nimport subprocess\nos.__dict__.update({'system': subprocess.run})\nos.system(['id'])\n",
+            (
+                b"import os\nimport subprocess\n"
+                b"getattr(os, '__dict__').update({'system': subprocess.run})\nos.system(['id'])\n"
+            ),
         ],
     )
     def test_scan_tar_reports_dangerous_setattr_replacement(self, tmp_path: Path, payload: bytes) -> None:

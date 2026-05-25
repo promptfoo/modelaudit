@@ -197,6 +197,19 @@ def test_scan_zip_flags_aliased_dangerous_python_member(tmp_path: Path) -> None:
             "    target.__dict__.update({'system': len})\n"
             "    os.system('echo hidden')\n"
         ),
+        (
+            "import os\nresolve = getattr\nif swap:\n    resolve = make_resolver()\n"
+            "resolve(os, '__dict__').update({'system': len})\nos.system('echo hidden')\n"
+        ),
+        (
+            "import os\nnamespace = os.__dict__\nif swap:\n    namespace = make_mapping()\n"
+            "namespace.update({'system': len})\nos.system('echo hidden')\n"
+        ),
+        (
+            "import os\ndef hide(namespace=os.__dict__):\n"
+            "    namespace.update({'system': len})\n"
+            "    os.system('echo hidden')\n"
+        ),
         ("import os\ndef hide(target=os):\n    setattr(target, 'system', len)\n    os.system('echo hidden')\n"),
         ("import os\ndef hide(target=os):\n    target.system = len\n    os.system('echo hidden')\n"),
         (
@@ -244,6 +257,12 @@ def test_scan_zip_preserves_captured_dangerous_callable_before_overwrite(tmp_pat
         "import os\nreplace = os.__dict__.update\nreplace({'system': len})\nos.system([])\n",
         "import os\nresult = os.__dict__.update({'system': len})\nos.system([])\n",
         "import os\nos.__dict__.update({'system': len})\nrun = os.system\nrun([])\n",
+        "import os\ngetattr(os, '__dict__').update({'system': len})\nos.system([])\n",
+        "import os\nos.__getattribute__('__dict__').update({'system': len})\nos.system([])\n",
+        "import os\nobject.__getattribute__(os, '__dict__').update({'system': len})\nos.system([])\n",
+        "import os\nnamespace = os.__dict__\nnamespace.update({'system': len})\nos.system([])\n",
+        "import os\nnamespace = getattr(os, '__dict__')\nnamespace.update({'system': len})\nos.system([])\n",
+        "import os\nreplace = getattr(os, '__dict__').update\nreplace({'system': len})\nos.system([])\n",
     ],
 )
 def test_scan_zip_allows_callable_captured_after_safe_overwrite(tmp_path: Path, source: str) -> None:
@@ -280,6 +299,11 @@ def test_scan_zip_flags_from_import_dangerous_python_member(tmp_path: Path) -> N
         "import os\nimport subprocess\nresult = setattr(os, 'system', subprocess.run)\nos.system(['id'])\n",
         "import os\nimport subprocess\nos.__dict__.update({'system': subprocess.run})\nos.system(['id'])\n",
         "import os\nimport subprocess\nos.__dict__.__setitem__('system', subprocess.run)\nos.system(['id'])\n",
+        "import os\nimport subprocess\ngetattr(os, '__dict__').update({'system': subprocess.run})\nos.system(['id'])\n",
+        (
+            "import os\nimport subprocess\nnamespace = os.__dict__\n"
+            "namespace.update({'system': subprocess.run})\nos.system(['id'])\n"
+        ),
     ],
 )
 def test_scan_zip_reports_dangerous_setattr_replacement(tmp_path: Path, source: str) -> None:

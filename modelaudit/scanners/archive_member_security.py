@@ -424,13 +424,6 @@ def _resolve_certain_namespace_mutation_roots(node: ast.AST, alias_scopes: _Alia
     if direct_builtin_roots is not None:
         return direct_builtin_roots
 
-    is_explicit_namespace_mapping = isinstance(node, ast.Attribute) and node.attr == "__dict__"
-    if isinstance(node, ast.Call) and len(node.args) == 1 and not node.keywords:
-        helper_name = _resolve_call_name(node.func)
-        helper_names = _apply_aliases(helper_name, alias_scopes) if helper_name is not None else None
-        is_explicit_namespace_mapping = helper_names is not None and helper_names.issubset({"vars", "builtins.vars"})
-    if not is_explicit_namespace_mapping:
-        return None
     if _has_uncertain_static_binding(node, alias_scopes):
         return None
 

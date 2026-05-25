@@ -364,6 +364,8 @@ class TestJITScriptDetector:
             (b"import builtins as bi\nfrom builtins import setattr as assign\nassign(bi, 'eval', len)\nbi.eval([])\n"),
             b"import builtins\nbuiltins.__dict__.update({'eval': len})\nbuiltins.eval([])\n",
             b"import builtins\nreplace = builtins.__dict__.update\nreplace({'eval': len})\nbuiltins.eval([])\n",
+            b"import builtins\ngetattr(builtins, '__dict__').update({'eval': len})\nbuiltins.eval([])\n",
+            b"import builtins\nnamespace = builtins.__dict__\nnamespace.update({'eval': len})\nbuiltins.eval([])\n",
             b"def payload():\n    eval = len\n    return eval([])\n",
             (
                 b"def payload():\n"
@@ -413,6 +415,11 @@ class TestJITScriptDetector:
             ),
             b"import builtins\nsetattr(builtins, 'eval', builtins.exec)\nbuiltins.eval('pass')\n",
             b"import builtins\nbuiltins.__dict__.update({'eval': builtins.exec})\nbuiltins.eval('pass')\n",
+            b"import builtins\ngetattr(builtins, '__dict__').update({'eval': builtins.exec})\nbuiltins.eval('pass')\n",
+            (
+                b"import builtins\nnamespace = builtins.__dict__\n"
+                b"namespace.update({'eval': builtins.exec})\nbuiltins.eval('pass')\n"
+            ),
         ],
     )
     def test_scan_model_detects_dangerous_builtin_reassignment(self, source: bytes) -> None:
@@ -535,6 +542,20 @@ class TestJITScriptDetector:
                 b"import builtins\n"
                 b"def invoke(namespace=builtins):\n"
                 b"    namespace.__dict__.update({'eval': len})\n"
+                b"    return builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"namespace = builtins.__dict__\n"
+                b"if swap:\n"
+                b"    namespace = make_mapping()\n"
+                b"namespace.update({'eval': len})\n"
+                b"builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"def invoke(namespace=builtins.__dict__):\n"
+                b"    namespace.update({'eval': len})\n"
                 b"    return builtins.eval('1 + 1')\n"
             ),
             (
