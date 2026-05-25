@@ -541,6 +541,36 @@ def test_get_scanner_for_file_rejects_rar_suffix_without_magic(tmp_path: Path) -
     assert scanner is None
 
 
+def test_get_scanner_for_file_routes_hdf5_header_alias_under_misleading_suffix(tmp_path: Path) -> None:
+    path = tmp_path / "model.jpg"
+    path.write_bytes(b"\x89HDF\r\n\x1a\n" + b"\x00" * 32)
+
+    scanner = get_scanner_for_file(str(path))
+
+    assert scanner is not None
+    assert scanner.name == "keras_h5"
+
+
+def test_get_scanner_for_file_routes_ggml_header_alias_and_rejects_near_match(tmp_path: Path) -> None:
+    path = tmp_path / "model.jpg"
+    path.write_bytes(b"GGML" + (1).to_bytes(4, "little") + b"\x00" * 24)
+    near_match = tmp_path / "not-model.jpg"
+    near_match.write_bytes(b"GGMX" + (1).to_bytes(4, "little") + b"\x00" * 24)
+
+    scanner = get_scanner_for_file(str(path))
+
+    assert scanner is not None
+    assert scanner.name == "gguf"
+    assert get_scanner_for_file(str(near_match)) is None
+
+
+def test_get_scanner_for_file_does_not_override_r_serialized_suffix_with_compressed_alias(tmp_path: Path) -> None:
+    path = tmp_path / "not-r.rds"
+    path.write_bytes(gzip.compress(pickle.dumps({"weights": [1, 2, 3]}, protocol=4)))
+
+    assert get_scanner_for_file(str(path)) is None
+
+
 def test_get_scanner_for_path_routes_valid_mar_archive_to_torchserve_mar(tmp_path: Path) -> None:
     mar_path = _write_zip_archive(
         tmp_path / "model.mar",

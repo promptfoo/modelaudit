@@ -298,18 +298,26 @@ class ScannerRegistry:
                 return scanner_class
 
         try:
-            from modelaudit.utils.file.detection import detect_file_format
+            from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension
 
             header_format = detect_file_format(path)
+            extension_format = detect_format_from_extension(path)
         except Exception:
             header_format = "unknown"
+            extension_format = "unknown"
 
         header_scanner_id = self.get_scanner_id_for_header_format(header_format)
         header_scanner_info = self._scanners.get(header_scanner_id or "")
+        extension_scanner_id = self.get_scanner_id_for_header_format(extension_format)
+        compatible_header_route = (
+            header_format == header_scanner_id
+            or extension_format == "unknown"
+            or extension_scanner_id == header_scanner_id
+        )
         if (
             header_scanner_id
             and header_scanner_info
-            and header_format == header_scanner_id
+            and compatible_header_route
             and (scanner_selection is None or scanner_selection.allows(header_scanner_id))
         ):
             scanner_class = self._load_scanner(header_scanner_id)
