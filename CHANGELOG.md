@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve ambiguous budget-exhausted protobuf candidates for tentative analysis without misclassifying non-ONNX payloads
 - route signature-confirmed CNTK and LightGBM artifacts with misleading filenames through security analysis
 - share trusted-content routing across direct, nested, and helper scans so renamed specialized archives retain their format-specific analysis
+- fail closed when nested NeMo checkpoint or referenced-artifact analysis is explicitly incomplete
 
 ## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
 

@@ -13,6 +13,7 @@ import tempfile
 from typing import Any, ClassVar
 
 from ..utils import is_absolute_archive_path, sanitize_archive_path
+from ..utils.file.detection import detect_file_format_from_magic
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 try:
@@ -621,6 +622,16 @@ class NemoScanner(BaseScanner):
                 )
                 return
 
+            self._propagate_nested_incomplete_result(
+                result,
+                nested_result,
+                reason="nemo_checkpoint_nested_scan_incomplete",
+                message=f"Nested scan was incomplete for checkpoint member: {report_entry}",
+                archive_path=archive_path,
+                entry=report_entry,
+                source_entry=member.name,
+            )
+
             critical_issues = [
                 issue
                 for issue in nested_result.issues
@@ -730,6 +741,24 @@ class NemoScanner(BaseScanner):
                 )
                 return True
 
+            trusted_content_format = detect_file_format_from_magic(extracted_path)
+            is_declared_checkpoint = referenced_member_name.lower().endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS))
+            if trusted_content_format != "unknown" or is_declared_checkpoint:
+                self._propagate_nested_incomplete_result(
+                    result,
+                    nested_result,
+                    reason="nemo_referenced_nested_scan_incomplete",
+                    message=f"Nested scan was incomplete for referenced member: {referenced_member_name}",
+                    archive_path=archive_path,
+                    entry=referenced_member_name,
+                    source_entry=member.name,
+                    extra_details={
+                        "config_file": config_file,
+                        "config_path": config_path,
+                        "trusted_content_format": trusted_content_format,
+                    },
+                )
+
             critical_issues = [
                 issue
                 for issue in nested_result.issues
@@ -754,6 +783,42 @@ class NemoScanner(BaseScanner):
                 os.unlink(extracted_path)
             except OSError:
                 logger.debug("Failed to remove temporary NeMo referenced scan file: %s", extracted_path)
+
+    def _propagate_nested_incomplete_result(
+        self,
+        result: ScanResult,
+        nested_result: ScanResult,
+        *,
+        reason: str,
+        message: str,
+        archive_path: str,
+        entry: str,
+        source_entry: str,
+        extra_details: dict[str, Any] | None = None,
+    ) -> None:
+        """Preserve explicit incomplete coverage from a nested NeMo member scan."""
+        if (
+            nested_result.metadata.get("analysis_incomplete") is not True
+            and nested_result.metadata.get(_INCONCLUSIVE_METADATA_KEY) != INCONCLUSIVE_SCAN_OUTCOME
+        ):
+            return
+
+        nested_reasons = nested_result.metadata.get(_INCONCLUSIVE_REASONS_METADATA_KEY)
+        self._mark_inconclusive_scan_result(
+            result,
+            reason=reason,
+            check_name="NeMo Checkpoint Nested Scan",
+            message=message,
+            location=f"{archive_path}:{entry}",
+            details={
+                "entry": entry,
+                "source_entry": source_entry,
+                "nested_scanner": nested_result.scanner_name,
+                "nested_scan_outcome": nested_result.metadata.get(_INCONCLUSIVE_METADATA_KEY),
+                "nested_scan_outcome_reasons": list(nested_reasons) if isinstance(nested_reasons, list) else [],
+                **(extra_details or {}),
+            },
+        )
 
     @classmethod
     def _collect_nemo_member_references(

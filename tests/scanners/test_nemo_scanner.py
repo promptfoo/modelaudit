@@ -259,6 +259,26 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert skipped_checks[0].status == CheckStatus.FAILED
         assert skipped_checks[0].details["max_scan_bytes"] == 1
 
+    def test_incomplete_checkpoint_nested_scan_fails_closed(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "checkpoint-nested-incomplete.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "model_weights.ckpt", _build_malicious_pickle())
+
+        result = NemoScanner({"max_file_read_size": 1}).scan(str(nemo_path))
+
+        incomplete_checks = [
+            check
+            for check in result.checks
+            if check.details.get("scan_outcome_reason") == "nemo_checkpoint_nested_scan_incomplete"
+        ]
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert len(incomplete_checks) == 1
+        assert incomplete_checks[0].details["nested_scanner"] == "pickle"
+        assert incomplete_checks[0].details["nested_scan_outcome_reasons"] == ["max_file_read_size_exceeded"]
+        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+
     def test_nested_checkpoint_scanner_failure_fails_closed(
         self,
         tmp_path: Path,
@@ -475,6 +495,52 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert failed_checks[0].details["exception_type"] == "RuntimeError"
         assert failed_checks[0].details["exception_message"] == "referenced nested boom"
 
+    def test_incomplete_config_referenced_nested_scan_is_exit2_and_not_cached(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "referenced-nested-incomplete.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "tokenizer": {"model": "nemo:artifacts/payload.jpg"},
+        }
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "artifacts/payload.jpg", _build_malicious_pickle())
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            first = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                max_file_read_size=1,
+            )
+            second = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                max_file_read_size=1,
+            )
+
+            for aggregate in (first, second):
+                metadata = aggregate.file_metadata[str(nemo_path)]
+                assert aggregate.success is False
+                assert determine_exit_code(aggregate) == 2
+                assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+                assert "nemo_referenced_nested_scan_incomplete" in metadata["scan_outcome_reasons"]
+                incomplete_issues = [
+                    issue
+                    for issue in aggregate.issues
+                    if issue.details.get("scan_outcome_reason") == "nemo_referenced_nested_scan_incomplete"
+                ]
+                assert len(incomplete_issues) == 1
+                assert incomplete_issues[0].details["nested_scan_outcome_reasons"] == ["max_file_read_size_exceeded"]
+                assert incomplete_issues[0].details["trusted_content_format"] == "pickle"
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
     def test_metadata_referenced_benign_non_checkpoint_suffix_stays_clean(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "referenced-benign-artifact.nemo"
         config = {
@@ -484,6 +550,22 @@ class TestNemoArchiveVulnerabilityCoverage:
         with tarfile.open(nemo_path, "w") as tar:
             _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
             _add_tar_bytes(tar, "artifacts/tokenizer.model", b"plain tokenizer bytes")
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert result.success is True
+        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert "scan_outcome" not in result.metadata
+
+    def test_metadata_referenced_benign_pickle_completed_scan_stays_clean(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "referenced-benign-pickle.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "tokenizer": {"model": "nemo:artifacts/payload.jpg"},
+        }
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "artifacts/payload.jpg", pickle.dumps({"weights": [1, 2, 3]}))
 
         result = NemoScanner().scan(str(nemo_path))
 
