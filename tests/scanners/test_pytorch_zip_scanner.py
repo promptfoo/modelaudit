@@ -1146,6 +1146,7 @@ def test_pytorch_zip_scans_aliased_modeled_builtins_in_archive_data(
         b"globals()['__builtins__'].update({'eval': len})\nglobals()['__builtins__']['eval']([])\n",
         b"import builtins\nbuiltins.__dict__.update({'eval': len})\nbuiltins.eval([])\n",
         b"import builtins\ngetattr(builtins, '__dict__').update({'eval': len})\nbuiltins.eval([])\n",
+        b"import builtins\ndict.update(builtins.__dict__, {'eval': len})\nbuiltins.eval([])\n",
         (
             b"replace = globals()['__builtins__'].__setitem__\n"
             b"replace('eval', len)\n"
@@ -1223,6 +1224,7 @@ def test_pytorch_zip_ignores_benign_builtin_shaped_access_in_archive_data(tmp_pa
         ),
         b"import builtins\nbuiltins.__dict__.update({'eval': builtins.exec})\nbuiltins.eval('pass')\n",
         b"import builtins\ngetattr(builtins, '__dict__').update({'eval': builtins.exec})\nbuiltins.eval('pass')\n",
+        b"import builtins\ndict.update(builtins.__dict__, {'eval': builtins.exec})\nbuiltins.eval('pass')\n",
     ],
 )
 def test_pytorch_zip_detects_dangerous_builtin_reassignment_in_archive_data(tmp_path: Path, payload: bytes) -> None:

@@ -304,6 +304,13 @@ _STATIC_ATTRIBUTE_MUTATION_HELPERS = {
     "__builtins__.setattr",
     "builtins.setattr",
 }
+_STATIC_MAPPING_FUNCTION_MUTATORS = {
+    "dict.__setitem__": "__setitem__",
+    "builtins.dict.__setitem__": "__setitem__",
+    "dict.update": "update",
+    "builtins.dict.update": "update",
+    "operator.setitem": "__setitem__",
+}
 
 
 def _has_uncertain_static_binding(node: ast.AST, alias_scopes: _AliasScopes) -> bool:
@@ -811,26 +818,43 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             return
 
         mutator_names = self._resolve_certain_static_mapping_mutator_names(node.func)
-        if mutator_names is None:
-            return
-        methods = {mutator_name.rsplit(".", maxsplit=1)[1] for mutator_name in mutator_names}
-        if len(methods) != 1:
-            return
-        method = next(iter(methods))
-        target_roots = frozenset(mutator_name.rsplit(".", maxsplit=1)[0] for mutator_name in mutator_names)
+        mutation_args = node.args
+        if mutator_names is not None:
+            methods = {mutator_name.rsplit(".", maxsplit=1)[1] for mutator_name in mutator_names}
+            if len(methods) != 1:
+                return
+            method = next(iter(methods))
+            target_roots = frozenset(mutator_name.rsplit(".", maxsplit=1)[0] for mutator_name in mutator_names)
+        else:
+            if _has_uncertain_static_binding(node.func, self.alias_scopes) or not node.args:
+                return
+            helper_names = self._resolve_invoked_reference_names(node.func)
+            if helper_names is None:
+                return
+            helper_methods = {_STATIC_MAPPING_FUNCTION_MUTATORS.get(helper_name) for helper_name in helper_names}
+            if None in helper_methods or len(helper_methods) != 1:
+                return
+            method = next(helper_method for helper_method in helper_methods if helper_method is not None)
+            resolved_target_roots = _resolve_certain_namespace_mutation_roots(node.args[0], self.alias_scopes)
+            if resolved_target_roots is None:
+                return
+            target_roots = resolved_target_roots
+            mutation_args = node.args[1:]
 
         mutations: list[tuple[frozenset[str], ast.AST]] = []
         if method == "__setitem__":
-            if len(node.args) != 2:
+            if len(mutation_args) != 2:
                 return
-            attr_name = _resolve_static_string(node.args[0])
+            attr_name = _resolve_static_string(mutation_args[0])
             if attr_name is None:
                 return
-            mutations.append((frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), node.args[1]))
+            mutations.append(
+                (frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), mutation_args[1])
+            )
         elif method == "update":
-            if len(node.args) != 1 or not isinstance(node.args[0], ast.Dict):
+            if len(mutation_args) != 1 or not isinstance(mutation_args[0], ast.Dict):
                 return
-            for attr_name_node, value_node in zip(node.args[0].keys, node.args[0].values, strict=True):
+            for attr_name_node, value_node in zip(mutation_args[0].keys, mutation_args[0].values, strict=True):
                 if attr_name_node is None:
                     return
                 attr_name = _resolve_static_string(attr_name_node)
