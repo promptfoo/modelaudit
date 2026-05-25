@@ -5,6 +5,8 @@ from pathlib import Path
 from typing import ClassVar
 from urllib.parse import unquote, urlparse, urlunparse
 
+from modelaudit.scanner_results import mark_inconclusive_scan_result, scan_result_has_inconclusive_outcome
+
 from .base import BaseScanner, Issue, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
@@ -122,7 +124,7 @@ class MetadataScanner(BaseScanner):
             )
 
         result.bytes_scanned = file_size if p.exists() else 0
-        result.finish(success=True)
+        result.finish(success=not scan_result_has_inconclusive_outcome(result))
         return result
 
     def _add_issue_check(self, result: ScanResult, issue: Issue) -> None:
@@ -154,6 +156,22 @@ class MetadataScanner(BaseScanner):
 
         except TimeoutError:
             raise
+        except OSError as e:
+            mark_inconclusive_scan_result(result, "metadata_read_failed")
+            result.add_check(
+                name="Metadata File Read",
+                passed=False,
+                message=f"Unable to read metadata for analysis: {e!s}",
+                severity=IssueSeverity.INFO,
+                location=file_path,
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "metadata_read_failed",
+                },
+                rule_code="S902",
+            )
         except Exception as e:
             self._add_issue_check(
                 result,

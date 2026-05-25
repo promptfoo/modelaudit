@@ -6,6 +6,8 @@ from urllib.parse import ParseResult
 
 import pytest
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners import metadata_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.metadata_scanner import MetadataScanner
@@ -68,6 +70,36 @@ class TestMetadataScanner:
 
         assert result.scanner_name == "metadata"
         assert len(result.issues) == 0  # Clean README should have no issues
+
+    def test_metadata_read_failure_is_inconclusive_not_security_finding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Unreadable routed metadata should fail closed without a fabricated security issue."""
+        readme_path = tmp_path / "README.md"
+        readme_path.write_text("# Model Card\n\nThis README is benign.\n")
+
+        def fail_read(*_args: object, **_kwargs: object) -> object:
+            raise OSError("simulated metadata read failure")
+
+        monkeypatch.setattr(metadata_scanner, "open", fail_read, raising=False)
+
+        result = MetadataScanner().scan(str(readme_path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert result.metadata["scan_outcome_reasons"] == ["metadata_read_failed"]
+        read_checks = [check for check in result.checks if check.name == "Metadata File Read"]
+        assert len(read_checks) == 1
+        assert read_checks[0].severity == IssueSeverity.INFO
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+        aggregate = scan_model_directory_or_file(str(readme_path), cache_scan_results=False)
+
+        assert aggregate.success is False
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+        assert determine_exit_code(aggregate) == 2
 
     def test_scan_suspicious_urls_in_readme(self) -> None:
         """Test detection of suspicious URLs in README."""
