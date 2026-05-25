@@ -15,6 +15,9 @@ from urllib.parse import urlsplit, urlunsplit
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult
 
+_DECODE_INCONCLUSIVE_REASON = "r_serialized_decode_incomplete"
+_STRING_EXTRACTION_INCONCLUSIVE_REASON = "r_serialized_string_extraction_incomplete"
+
 
 def _redact_url_for_display(url: str) -> str:
     """Return a URL safe for scan output while preserving routing context."""
@@ -561,12 +564,7 @@ class RSerializedScanner(BaseScanner):
         strings_truncated: bool,
     ) -> None:
         printable_ratio = total_printable_bytes / payload_size if payload_size > 0 else 0.0
-        looks_stuffed = (
-            strings_truncated
-            or string_count >= self.max_extracted_strings
-            or longest_string > 8_192
-            or (payload_size >= 1_000_000 and printable_ratio > 0.80)
-        )
+        looks_stuffed = longest_string > 8_192 or (payload_size >= 1_000_000 and printable_ratio > 0.80)
 
         if looks_stuffed:
             result.add_check(
@@ -619,6 +617,7 @@ class RSerializedScanner(BaseScanner):
         try:
             payload, compression, truncated, decompressed_bytes = self._read_payload_for_analysis(path, file_size)
         except (EOFError, OSError, ValueError, MemoryError, gzip.BadGzipFile, lzma.LZMAError) as exc:
+            mark_inconclusive_scan_result(result, _DECODE_INCONCLUSIVE_REASON)
             result.add_check(
                 name="R Serialized Decompression",
                 passed=False,
@@ -702,6 +701,23 @@ class RSerializedScanner(BaseScanner):
         result.metadata["decompressed_bytes"] = decompressed_bytes
         result.metadata["extracted_string_count"] = len(extracted_strings)
         result.bytes_scanned = len(payload)
+
+        if strings_truncated:
+            mark_inconclusive_scan_result(result, _STRING_EXTRACTION_INCONCLUSIVE_REASON)
+            result.add_check(
+                name="String Extraction Ceiling",
+                passed=False,
+                message=(
+                    f"Analysis reached configured extracted-string ceiling ({self.max_extracted_strings} strings)"
+                ),
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={"max_extracted_strings": self.max_extracted_strings},
+                why=(
+                    "An extracted-string ceiling limits resource usage. Review with higher limits if deeper "
+                    "inspection is needed."
+                ),
+            )
 
         self._add_symbol_and_payload_checks(result, extracted_strings, path)
         self._add_payload_stuffing_check(
