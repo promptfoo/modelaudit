@@ -407,6 +407,18 @@ class TestJITScriptDetector:
                 b"replace({'eval': len})\n"
                 b"globals()['__builtins__']['eval']('1 + 1')\n"
             ),
+            (
+                b"replace = globals()['__builtins__'].__setitem__\n"
+                b"from helpers import replace\n"
+                b"replace('eval', len)\n"
+                b"globals()['__builtins__']['eval']('1 + 1')\n"
+            ),
+            (
+                b"replace = globals()['__builtins__'].update\n"
+                b"import helpers as replace\n"
+                b"replace({'eval': len})\n"
+                b"globals()['__builtins__']['eval']('1 + 1')\n"
+            ),
         ],
     )
     def test_scan_model_preserves_possible_builtin_execution_after_conditional_safe_overwrite(

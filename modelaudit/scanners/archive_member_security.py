@@ -658,7 +658,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self.tracked_call_names = tracked_call_names
 
     def _record_import(self, alias: ast.alias, import_name: str) -> None:
-        self.alias_scopes[-1][alias.asname or alias.name] = frozenset({import_name})
+        self._bind_name(alias.asname or alias.name, frozenset({import_name}))
 
     def _bind_name(self, name: str, resolved_names: _AliasValue) -> None:
         self.alias_scopes[-1][name] = resolved_names
