@@ -79,7 +79,7 @@ ModelAudit includes 44 registered scanners covering model, archive, and configur
 | **NeMo**                | `.nemo`                                                                   | MEDIUM |
 | **CNTK**                | `.dnn`, `.cmf`                                                            | MEDIUM |
 | **RKNN**                | `.rknn`                                                                   | MEDIUM |
-| **Torch7**              | `.t7`, `.th`, `.net`                                                      | HIGH   |
+| **Torch7**              | Serialized artifacts (`.t7`, `.th`, `.net` or renamed)                    | HIGH   |
 | **CatBoost**            | `.cbm`                                                                    | MEDIUM |
 | **XGBoost**             | `.bst`, `.model`, `.json`, `.ubj`                                         | MEDIUM |
 | **LightGBM**            | `.lgb`, `.lightgbm`, `.model`                                             | MEDIUM |

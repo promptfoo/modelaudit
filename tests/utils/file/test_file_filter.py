@@ -238,6 +238,17 @@ class TestFileFilter:
 
         assert should_skip_file(str(near_match))
 
+    def test_disguised_torch7_bypasses_default_skip(self, tmp_path: Path) -> None:
+        disguised_torch7 = tmp_path / "payload.jpg"
+        disguised_torch7.write_bytes(b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n")
+        near_match = tmp_path / "source.jpg"
+        near_match.write_text("import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    pass\n")
+
+        assert detect_file_format_for_skip_filter(str(disguised_torch7)) == "torch7"
+        assert not should_skip_file(str(disguised_torch7))
+        assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+        assert should_skip_file(str(near_match))
+
     def test_disguised_llamafile_bypasses_default_skip(self, tmp_path: Path) -> None:
         disguised_llamafile = tmp_path / "payload.jpg"
         disguised_llamafile.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile runtime")

