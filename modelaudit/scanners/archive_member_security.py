@@ -81,8 +81,14 @@ _HIGH_RISK_PYTHON_CALLS = {
     "subprocess.Popen",
     "subprocess.run",
 }
-# Retain broad subprocess coverage while excluding helpers that only transform data.
-_KNOWN_NON_EXECUTING_SUBPROCESS_CALLS = {"subprocess.list2cmdline"}
+# Retain broad subprocess coverage while excluding public APIs that only construct data.
+_KNOWN_NON_EXECUTING_SUBPROCESS_CALLS = {
+    "subprocess.CalledProcessError",
+    "subprocess.CompletedProcess",
+    "subprocess.SubprocessError",
+    "subprocess.TimeoutExpired",
+    "subprocess.list2cmdline",
+}
 
 # Map each high-risk call name to the rule code that best describes its risk
 # category. SARIF consumers, dashboards, and per-rule severity overrides rely

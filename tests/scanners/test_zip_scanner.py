@@ -388,6 +388,11 @@ def test_scan_zip_reports_dangerous_setattr_replacement(tmp_path: Path, source: 
             "subprocess.list2cmdline(['id'])\n",
             "os.system",
         ),
+        (
+            "import os\nimport subprocess\nsubprocess.__dict__.update({'CompletedProcess': os.system})\n"
+            "subprocess.CompletedProcess('id')\n",
+            "os.system",
+        ),
         ("import subprocess\nsubprocess.__dict__.pop('run')(['id'])\n", "subprocess.run"),
     ],
 )
@@ -931,10 +936,20 @@ def test_scan_zip_ignores_benign_python_member(tmp_path: Path) -> None:
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
-def test_scan_zip_ignores_nonexecuting_subprocess_helper(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import subprocess\nsubprocess.list2cmdline(['input file', '--quiet'])\n",
+        "import subprocess\nsubprocess.CompletedProcess([], 0)\n",
+        "import subprocess\nsubprocess.SubprocessError('failed')\n",
+        "import subprocess\nsubprocess.CalledProcessError(1, ['cmd'])\n",
+        "import subprocess\nsubprocess.TimeoutExpired(['cmd'], 1)\n",
+    ],
+)
+def test_scan_zip_ignores_nonexecuting_subprocess_api(tmp_path: Path, source: str) -> None:
     archive_path = tmp_path / "source_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("preprocess.py", "import subprocess\nsubprocess.list2cmdline(['input file', '--quiet'])\n")
+        archive.writestr("preprocess.py", source)
 
     result = ZipScanner().scan(str(archive_path))
 

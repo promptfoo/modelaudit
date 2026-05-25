@@ -312,6 +312,11 @@ class TestTarScanner:
                 b"subprocess.list2cmdline(['id'])\n",
                 "os.system",
             ),
+            (
+                b"import os\nimport subprocess\nsubprocess.__dict__.update({'CompletedProcess': os.system})\n"
+                b"subprocess.CompletedProcess('id')\n",
+                "os.system",
+            ),
         ],
     )
     def test_scan_tar_reports_dangerous_subprocess_mapping_replacement(
@@ -811,10 +816,19 @@ class TestTarScanner:
         assert not any(check.name == "Python Archive Member Security" for check in result.checks)
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
-    def test_scan_tar_ignores_nonexecuting_subprocess_helper(self, tmp_path: Path) -> None:
-        """subprocess.list2cmdline formats arguments without launching a process."""
+    @pytest.mark.parametrize(
+        "source",
+        [
+            b"import subprocess\nsubprocess.list2cmdline(['input file', '--quiet'])\n",
+            b"import subprocess\nsubprocess.CompletedProcess([], 0)\n",
+            b"import subprocess\nsubprocess.SubprocessError('failed')\n",
+            b"import subprocess\nsubprocess.CalledProcessError(1, ['cmd'])\n",
+            b"import subprocess\nsubprocess.TimeoutExpired(['cmd'], 1)\n",
+        ],
+    )
+    def test_scan_tar_ignores_nonexecuting_subprocess_api(self, tmp_path: Path, source: bytes) -> None:
+        """Known data/result/error helpers must not be reported as process launches."""
         archive_path = tmp_path / "model_bundle.tar"
-        source = b"import subprocess\nsubprocess.list2cmdline(['input file', '--quiet'])\n"
 
         with tarfile.open(archive_path, "w") as archive:
             info = tarfile.TarInfo("preprocess.py")
