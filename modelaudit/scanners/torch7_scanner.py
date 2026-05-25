@@ -53,7 +53,7 @@ SAFE_REQUIRE_MODULES = frozenset(
 
 
 class Torch7Scanner(BaseScanner):
-    """Static scanner for Torch7 `.t7` / `.th` / `.net` artifacts."""
+    """Static scanner for signature-valid Torch7 serialized artifacts."""
 
     name = "torch7"
     description = "Scans Torch7 serialized model files for Lua execution and dynamic loading indicators"
@@ -66,6 +66,7 @@ class Torch7Scanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
+        """Recognize Torch7 by bounded serialized-content markers, regardless of suffix."""
         if not os.path.isfile(path):
             return False
 

@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect Python operators declared in nested ONNX graphs and functions
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
 - detect signature-valid Torch7 payloads even when renamed with misleading suffixes
+- detect acquired executable Llamafile payloads with misleading suffixes, retain archive-polyglot coverage, and classify unavailable runtime previews as inconclusive
+
+### Performance Improvements
+
+- reuse source-validated pickle call-graph analysis across multiple directory dispatches when supported by installed picklescan
 
 ## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
 

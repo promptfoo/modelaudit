@@ -836,6 +836,7 @@ class NemoScanner(BaseScanner):
                 "global",
                 "reduce",
                 "torch.load",
+                "execution primitive",
                 "arbitrary code",
                 "cve-2020-13092",
                 "cve-2025-1716",

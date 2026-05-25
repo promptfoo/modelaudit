@@ -8,7 +8,12 @@ from pathlib import Path
 import pytest
 
 from modelaudit.utils.file import filtering
-from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
+from modelaudit.utils.file.detection import (
+    EXECUTABLE_ZIP_POLYGLOT_FORMAT,
+    LLAMAFILE_ROUTE_SCAN_BYTES,
+    LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    detect_file_format_for_skip_filter,
+)
 from modelaudit.utils.file.filtering import (
     _ZIP_MEMBER_SNIFF_LIMIT,
     should_skip_file,
@@ -243,6 +248,49 @@ class TestFileFilter:
         assert not should_skip_file(str(disguised_torch7))
         assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
         assert should_skip_file(str(near_match))
+
+    def test_disguised_llamafile_bypasses_default_skip(self, tmp_path: Path) -> None:
+        disguised_llamafile = tmp_path / "payload.jpg"
+        disguised_llamafile.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile runtime")
+        near_match = tmp_path / "tool.jpg"
+        near_match.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llama-file runtime")
+
+        assert detect_file_format_for_skip_filter(str(disguised_llamafile)) == "llamafile"
+        assert not should_skip_file(str(disguised_llamafile))
+        assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+        assert should_skip_file(str(near_match))
+
+    def test_disguised_llamafile_probe_failure_is_preserved_for_full_scan(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        payload = tmp_path / "payload.jpg"
+        payload.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile runtime")
+
+        def raise_os_error(_path: Path, _marker: bytes, _limit: int) -> bool:
+            raise OSError("synthetic marker probe failure")
+
+        monkeypatch.setattr("modelaudit.utils.file.detection._contains_casefolded_marker_in_prefix", raise_os_error)
+
+        assert detect_file_format_for_skip_filter(str(payload)) == "llamafile_routing_inconclusive"
+        assert not should_skip_file(str(payload))
+
+    def test_executable_zip_with_out_of_window_llamafile_marker_stays_scannable(self, tmp_path: Path) -> None:
+        payload = tmp_path / "payload.jpg"
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("payload.pkl", pickle.dumps({"safe": True}))
+        payload.write_bytes(
+            b"\x7fELF"
+            + b"\x00" * 60
+            + b"A" * LLAMAFILE_ROUTE_SCAN_BYTES
+            + b"llamafile runtime"
+            + b"B" * LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
+            + payload.read_bytes()
+        )
+
+        assert detect_file_format_for_skip_filter(str(payload)) == EXECUTABLE_ZIP_POLYGLOT_FORMAT
+        assert not should_skip_file(str(payload))
 
     def test_prefixed_zip_with_central_directory_stub_stays_scannable(self, tmp_path: Path) -> None:
         disguised_zip = tmp_path / "archive.jpg"

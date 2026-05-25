@@ -406,6 +406,15 @@ def test_torch7_content_routes_renamed_ascii_serialized_models(tmp_path: Path) -
     assert detect_file_format_from_magic(str(near_match)) == "unknown"
 
 
+@pytest.mark.parametrize("filename", ["payload.onnx", "payload.pt", "payload.gz", "payload.tar.gz"])
+def test_torch7_content_takes_priority_over_recognized_suffix(tmp_path: Path, filename: str) -> None:
+    torch7_path = tmp_path / filename
+    torch7_path.write_bytes(b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n")
+
+    assert detect_file_format(str(torch7_path)) == "torch7"
+    assert detect_file_format_from_magic(str(torch7_path)) == "torch7"
+
+
 def test_torch7_magic_rejects_malformed_ascii_version_header(tmp_path: Path) -> None:
     source_path = tmp_path / "malformed-header.py"
     source_path.write_bytes(b"4\n1\n9\nV payload\n13\nnn.Sequential\n")
@@ -740,6 +749,18 @@ def test_detect_file_format_disguised_compressed_tar_by_content(tmp_path: Path) 
     assert validate_file_type(str(archive_path)) is False
 
 
+def test_detect_file_format_disguised_llamafile_by_content(tmp_path: Path) -> None:
+    disguised_llamafile = tmp_path / "payload.jpg"
+    disguised_llamafile.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile runtime")
+    near_match = tmp_path / "tool.jpg"
+    near_match.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llama-file runtime")
+
+    assert detect_file_format(str(disguised_llamafile)) == "llamafile"
+    assert detect_file_format_from_magic(str(disguised_llamafile)) == "llamafile"
+    assert detect_file_format(str(near_match)) == "unknown"
+    assert detect_file_format_from_magic(str(near_match)) == "unknown"
+
+
 def test_zip_magic_variants(tmp_path):
     """Ensure alternate PK signatures are detected as ZIP."""
     for sig in (b"PK\x06\x06", b"PK\x06\x07"):
@@ -951,7 +972,7 @@ def test_validate_file_type(tmp_path):
     assert detect_file_format_from_magic(str(invalid_executorch_path)) == "unknown"
     assert validate_file_type(str(invalid_executorch_path)) is False
 
-    # Llamafile wrappers validate by extension with scanner-level marker checks.
+    # Llamafile extensions remain eligible for scanner-level executable and marker checks.
     llamafile_path = tmp_path / "model.llamafile"
     llamafile_path.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile")
     assert validate_file_type(str(llamafile_path)) is True
