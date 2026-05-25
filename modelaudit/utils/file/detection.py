@@ -1389,7 +1389,28 @@ def _is_tensorflow_saved_model_file(path: str) -> bool:
         from tensorflow.core.protobuf.saved_model_pb2 import SavedModel
 
         saved_model = SavedModel()
-        saved_model.ParseFromString(file_path.read_bytes())
+        parse_failed = False
+        try:
+            saved_model.ParseFromString(file_path.read_bytes())
+        except Exception:
+            # Preserve routing only when completed graph operations can still
+            # be inspected after malformed trailing protobuf content.
+            parse_failed = True
+
+        if parse_failed:
+            return any(
+                metagraph.HasField("graph_def")
+                and (
+                    any(node.name and node.op for node in metagraph.graph_def.node)
+                    or any(
+                        node.name and node.op
+                        for function in metagraph.graph_def.library.function
+                        for node in function.node_def
+                    )
+                )
+                for metagraph in saved_model.meta_graphs
+            )
+
         return any(
             metagraph.HasField("graph_def")
             and (

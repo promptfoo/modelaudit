@@ -603,6 +603,23 @@ def test_detect_renamed_tf_savedmodel_by_strict_parse_without_promoting_generic_
     assert detect_file_format(str(generic_protobuf)) == "unknown"
 
 
+def test_detect_renamed_malformed_tf_savedmodel_with_recovered_graph_structure(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    malformed_savedmodel = tmp_path / "saved-tail.jpg"
+    generic_protobuf = tmp_path / "generic-saved-tail.jpg"
+    malformed_savedmodel.write_bytes(_build_tf_savedmodel_bytes() + b"\xff")
+    generic_protobuf.write_bytes(b"\x08\x01\x12\x02\x08\x01\xff")
+
+    assert detect_file_format_from_magic(str(malformed_savedmodel)) == "tf_savedmodel"
+    assert detect_file_format_for_skip_filter(str(malformed_savedmodel)) == "tf_savedmodel"
+    assert detect_file_format(str(malformed_savedmodel)) == "tf_savedmodel"
+    assert detect_file_format_from_magic(str(generic_protobuf)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
+    assert detect_file_format(str(generic_protobuf)) == "unknown"
+
+
 def test_detect_oversized_renamed_tf_protobuf_retains_budget_exhausted_candidate_only(tmp_path: Path) -> None:
     budget_exhausted_payload = tmp_path / "many-unknown-fields-large.jpg"
     budget_exhausted_payload.write_bytes(b"\x12" + (b"x" * (20 * 1024 * 1024)))
