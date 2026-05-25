@@ -254,6 +254,22 @@ def test_detect_file_format_routes_renamed_coreml_structure_and_rejects_near_mat
     assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
 
 
+def test_detect_file_format_routes_renamed_coreml_with_reordered_fields(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(tmp_path / "reordered.jpg", model_type_first=True)
+
+    assert detect_file_format(str(model_path)) == "coreml"
+    assert detect_file_format_from_magic(str(model_path)) == "coreml"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "coreml"
+
+
+def test_detect_file_format_routes_renamed_coreml_with_large_model_payload(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(tmp_path / "large-model.jpg", model_type_padding=(1024 * 1024) + 1)
+
+    assert detect_file_format(str(model_path)) == "coreml"
+    assert detect_file_format_from_magic(str(model_path)) == "coreml"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "coreml"
+
+
 def test_detect_file_format_onnx_pb_content_hint_preempts_protobuf_extension(tmp_path: Path) -> None:
     """ONNX protobuf payloads renamed to .pb should route to ONNX, not TensorFlow protobuf."""
     pytest.importorskip("onnx")

@@ -557,7 +557,7 @@ def _looks_like_coreml_description_proto_prefix(data: bytes) -> bool:
 
 def _looks_like_coreml_model_proto_prefix(data: bytes) -> bool:
     """Return True when a bounded prefix resembles a CoreML Model protobuf."""
-    if not data or data[0] not in _COREML_MODEL_TOP_LEVEL_TAG_START_BYTES:
+    if not data:
         return False
 
     offset = 0
@@ -587,6 +587,8 @@ def _looks_like_coreml_model_proto_prefix(data: bytes) -> bool:
                 break
             _length, value_start, value_end, actual_value_end = bounds
             if actual_value_end > len(data):
+                if field_number in _COREML_MODEL_TYPE_FIELDS:
+                    has_model_type = True
                 break
             if field_number == 2 and _looks_like_coreml_description_proto_prefix(data[value_start:value_end]):
                 has_description = True
@@ -603,7 +605,7 @@ def _looks_like_coreml_model_proto_prefix(data: bytes) -> bool:
         if has_specification_version and has_description and has_model_type:
             return True
 
-    return False
+    return has_specification_version and has_description and has_model_type
 
 
 def _looks_like_coreml_model_file(path: Path, size: int) -> bool:
@@ -620,11 +622,7 @@ def _looks_like_coreml_model_file(path: Path, size: int) -> bool:
 
 def _looks_like_coreml_model_candidate_file(path: Path, size: int, header: bytes) -> bool:
     """Run bounded CoreML structure recognition only for plausible model starts."""
-    return (
-        bool(header)
-        and header[0] in _COREML_MODEL_TOP_LEVEL_TAG_START_BYTES
-        and _looks_like_coreml_model_file(path, size)
-    )
+    return bool(header) and _looks_like_coreml_model_file(path, size)
 
 
 def _looks_like_binary_pickle_protocol(header: bytes) -> bool:
