@@ -1607,6 +1607,25 @@ class TestSevenZipScannerHardening:
         assert determine_exit_code(aggregate) == 1
 
     @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_benign_python_named_pickle_does_not_mark_python_analysis_incomplete(self, tmp_path: Path) -> None:
+        """A nested pickle owned by content routing must not be parsed as Python source."""
+        import py7zr  # type: ignore[import-untyped]
+
+        payload_path = tmp_path / "payload.pkl"
+        archive_path = tmp_path / "benign_python_named_pickle.7z"
+        self._write_pickle(payload_path, {"safe": True})
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, "assets/payload.py")
+
+        result = SevenZipScanner().scan(str(archive_path))
+
+        assert result.success is True
+        assert result.metadata.get("analysis_incomplete") is not True
+        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+        aggregate = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
+        assert determine_exit_code(aggregate) == 0
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
     def test_benign_python_and_ordinary_members_stay_clean(self, tmp_path: Path) -> None:
         """Scanning generic member types must not turn inert sidecars into findings."""
         import py7zr  # type: ignore[import-untyped]

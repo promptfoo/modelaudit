@@ -892,6 +892,7 @@ class SevenZipScanner(BaseScanner):
                                     result=result,
                                     max_python_analysis_bytes=self._MAX_PYTHON_MEMBER_ANALYSIS_BYTES,
                                     python_analysis_incomplete_reason="sevenzip_python_member_analysis_incomplete",
+                                    analyze_python_source=file_name not in nested_scan_files,
                                 )
                                 if member_scan_incomplete(result):
                                     scan_complete = False

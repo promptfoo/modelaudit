@@ -701,20 +701,21 @@ def scan_archive_member_for_known_risks(
     result: ScanResult,
     max_python_analysis_bytes: int,
     python_analysis_incomplete_reason: str,
+    analyze_python_source: bool = True,
 ) -> None:
     """Inspect generic archive members that nested dispatch would otherwise ignore.
 
     ``archive_kind`` is a short label (``"ZIP"`` / ``"TAR"``) used only for the
     human-readable message text. The dispatcher (1) routes Python-looking
-    members through bounded AST analysis, (2) flags native/script executable-
-    suffix members, and (3) leaves everything else to the caller's normal
-    nested routing.
+    members through bounded AST analysis unless content routing already owns
+    the member, (2) flags native/script executable-suffix members, and (3)
+    leaves everything else to the caller's normal nested routing.
     """
     normalized_name = member_name.replace("\\", "/").lstrip("/")
     normalized_lower = normalized_name.lower()
     location = f"{archive_path}:{member_name}"
 
-    if is_python_archive_member_name(normalized_lower):
+    if is_python_archive_member_name(normalized_lower) and analyze_python_source:
         if total_size > max_python_analysis_bytes:
             mark_archive_scan_incomplete(result, python_analysis_incomplete_reason)
             result.add_check(
