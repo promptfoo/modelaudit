@@ -1430,6 +1430,49 @@ class PickleScanner(BaseScanner):
         )
         result.finish(success=False)
 
+    def _record_stream_coverage_failure(self, result: ScanResult, source: str, error: Exception) -> None:
+        reason = "stream_raw_read_failed"
+        mark_inconclusive_scan_result(result, reason)
+        result.add_check(
+            name="Pickle Stream Supplemental Analysis",
+            passed=False,
+            message=f"Unable to read pickle stream for supplemental analysis: {error!s}",
+            severity=IssueSeverity.INFO,
+            location=source,
+            details={
+                "category": reason,
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+            rule_code="S902",
+        )
+        result.finish(success=False)
+
+    def _stream_read_error_result(self, source: str, error: Exception) -> ScanResult:
+        result = self._create_result()
+        reason = "stream_read_failed"
+        self._mark_operational_incomplete(result, reason)
+        result.add_check(
+            name="Pickle Stream Read",
+            passed=False,
+            message=f"Unable to read pickle stream for analysis: {error!s}",
+            severity=IssueSeverity.INFO,
+            location=source,
+            details={
+                "category": reason,
+                "exception": str(error),
+                "exception_type": type(error).__name__,
+                "operational_error": True,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+            },
+            rule_code="S902",
+        )
+        result.finish(success=False)
+        return result
+
     def _root_raw_scan_limit(self) -> int:
         limit = self.config.get("pickle_root_raw_scan_limit_bytes", _ROOT_RAW_SCAN_LIMIT_BYTES)
         try:
@@ -1501,14 +1544,11 @@ class PickleScanner(BaseScanner):
         if read_size <= 0:
             return b""
 
-        try:
-            if not _stream_is_seekable(file_obj):
-                return b""
-            start_position = file_obj.tell()
-            data = self._read_stream_bytes(file_obj, read_size)
-            file_obj.seek(start_position)
-        except (AttributeError, OSError, ValueError):
+        if not _stream_is_seekable(file_obj):
             return b""
+        start_position = file_obj.tell()
+        data = self._read_stream_bytes(file_obj, read_size)
+        file_obj.seek(start_position)
         return data
 
     def _read_stream_bytes(self, file_obj: BinaryIO, read_size: int) -> bytes:
@@ -2360,6 +2400,8 @@ class PickleScanner(BaseScanner):
             except (AttributeError, OSError, ValueError) as error:
                 return self._stream_position_error_result(source, error)
             result = self._scan_standalone_stream(file_obj, standalone_size, source=source)
+            if result.metadata.get("operational_error"):
+                return result
             try:
                 file_obj.seek(start_position)
             except (AttributeError, OSError, ValueError) as error:
@@ -2383,11 +2425,18 @@ class PickleScanner(BaseScanner):
                 )
                 result.finish(success=False)
                 return result
-            raw_data = self._read_root_raw_scan_window_from_stream(file_obj, standalone_size)
+            try:
+                raw_data = self._read_root_raw_scan_window_from_stream(file_obj, standalone_size)
+            except (AttributeError, OSError, ValueError) as error:
+                self._record_stream_coverage_failure(result, source, error)
+                return result
             self._add_seekable_stream_integrity_check(file_obj, result, source, start_position, standalone_size)
             binary_tail_payload: bytes | None = None
         else:
-            stream_read = self._read_stream_payload_for_root(file_obj, standalone_size)
+            try:
+                stream_read = self._read_stream_payload_for_root(file_obj, standalone_size)
+            except (AttributeError, OSError, ValueError) as error:
+                return self._stream_read_error_result(source, error)
             payload = stream_read.payload
             rust_stream_size = len(payload) if stream_read.truncated else standalone_size
             result = self._scan_standalone_stream(io.BytesIO(payload), rust_stream_size, source=source)

@@ -68,6 +68,42 @@ class BrokenRewindStream(io.BytesIO):
         raise OSError("rewind failed")
 
 
+class BrokenSupplementalReadStream(io.BytesIO):
+    def __init__(self, initial_bytes: bytes) -> None:
+        super().__init__(initial_bytes)
+        self._native_scan_complete = False
+
+    def seekable(self) -> bool:
+        return True
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        position = super().seek(offset, whence)
+        if offset == 0 and whence == 0:
+            self._native_scan_complete = True
+        return position
+
+    def read(self, size: int | None = -1) -> bytes:
+        if self._native_scan_complete:
+            raise OSError("supplemental read failed")
+        return super().read(size)
+
+
+class BrokenNonSeekableReadStream(io.BytesIO):
+    def seekable(self) -> bool:
+        return False
+
+    def read(self, size: int | None = -1) -> bytes:
+        raise OSError("stream read failed")
+
+
+class BrokenNativeReadStream(io.BytesIO):
+    def seekable(self) -> bool:
+        return True
+
+    def read(self, size: int | None = -1) -> bytes:
+        raise OSError("native read failed")
+
+
 def _short_binunicode(data: bytes) -> bytes:
     if len(data) > 0xFF:
         raise ValueError("SHORT_BINUNICODE helper accepts at most 255 bytes")
@@ -1173,6 +1209,65 @@ def test_scan_stream_marks_rewind_failure_inconclusive_without_security_finding(
     assert any(
         issue.details.get("category") == "stream_rewind_failed" and issue.severity == IssueSeverity.INFO
         for issue in result.issues
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_scan_stream_fails_closed_when_supplemental_raw_analysis_cannot_read() -> None:
+    payload = pickle.dumps({"endpoint": "https://attacker.example.com/exfil"}, protocol=4)
+
+    readable_result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="readable.pkl")
+    result = PickleScanner().scan_stream(
+        BrokenSupplementalReadStream(payload),
+        len(payload),
+        source="unreadable-supplement.pkl",
+    )
+
+    assert any(
+        check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+        for check in readable_result.checks
+    )
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["stream_raw_read_failed"]
+    assert any(
+        issue.details.get("category") == "stream_raw_read_failed" and issue.severity == IssueSeverity.INFO
+        for issue in result.issues
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_scan_stream_marks_non_seekable_read_failure_inconclusive_without_security_finding() -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+
+    result = PickleScanner().scan_stream(
+        BrokenNonSeekableReadStream(payload),
+        len(payload),
+        source="unreadable-input.pkl",
+    )
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["stream_read_failed"]
+    assert result.metadata["operational_error_reason"] == "stream_read_failed"
+    assert any(
+        issue.details.get("category") == "stream_read_failed" and issue.severity == IssueSeverity.INFO
+        for issue in result.issues
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_scan_stream_maps_native_io_error_to_inconclusive_without_security_finding() -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+
+    result = PickleScanner().scan_stream(BrokenNativeReadStream(payload), len(payload), source="native-read.pkl")
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["io_error"]
+    assert result.metadata["operational_error_reason"] == "io_error"
+    assert any(
+        issue.details.get("category") == "io_error" and issue.severity == IssueSeverity.INFO for issue in result.issues
     )
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
