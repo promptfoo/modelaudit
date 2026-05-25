@@ -162,6 +162,10 @@ def test_scan_zip_flags_aliased_dangerous_python_member(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "source",
     [
+        "import os\nos.system.__call__('echo hidden')\n",
+        "import os\nrun = os.system\nrun.__call__('echo hidden')\n",
+        "import os\ngetattr(os.system, '__call__')('echo hidden')\n",
+        "import os\ninvoke = os.system.__call__\nos.system = len\ninvoke('echo hidden')\n",
         "import os\nrun = os.system\nos.system = len\nrun('echo hidden')\n",
         "import os\nfrom os import system as run\nos.system = len\nrun('echo hidden')\n",
         "import os\nfrom os import *\nos.system = len\nsystem('echo hidden')\n",
@@ -187,6 +191,9 @@ def test_scan_zip_preserves_captured_dangerous_callable_before_overwrite(tmp_pat
 @pytest.mark.parametrize(
     "source",
     [
+        "import os\nos.system = len\nos.system.__call__([])\n",
+        "import os\nos.system = len\ngetattr(os.system, '__call__')([])\n",
+        "import os\nos.system = len\ninvoke = os.system.__call__\ninvoke([])\n",
         "import os\nos.system = len\nrun = os.system\nrun([])\n",
         "import os\nos.system = len\nfrom os import system as run\nrun([])\n",
         "import os\nos.system = len\nfrom os import *\nsystem([])\n",
@@ -272,6 +279,7 @@ def test_scan_zip_flags_builtins_getattr_keyword_call_dangerous_python_member(tm
         "namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n",
         "lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
         "lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
+        ("run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun.__call__('1 + 1')\n"),
         "run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun('1 + 1')\n",
         ("run = globals()['__builtins__']['eval']\nglobals()['__builtins__'].__setitem__('eval', len)\nrun('1 + 1')\n"),
         (
@@ -325,6 +333,7 @@ def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path
         ),
         ("replace = globals()['__builtins__'].update\nreplace({'eval': len})\nglobals()['__builtins__']['eval']([])\n"),
         "globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun([])\n",
+        ("globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun.__call__([])\n"),
         ("globals()['__builtins__'].__setitem__('eval', len)\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
         (
             "replace = globals()['__builtins__'].__setitem__\n"

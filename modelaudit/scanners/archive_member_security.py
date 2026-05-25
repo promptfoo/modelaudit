@@ -735,12 +735,21 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 )
         return frozenset(effective_names) if effective_names else None
 
-    def _resolve_reference_names(self, node: ast.AST) -> frozenset[str] | None:
+    @staticmethod
+    def _invoked_callable_reference_name(name: str) -> str:
+        while name.endswith(".__call__"):
+            name = name.removesuffix(".__call__")
+        return name
+
+    def _resolve_invoked_reference_names(self, node: ast.AST) -> frozenset[str] | None:
         resolved_names = _resolve_static_reference_names(node, self.alias_scopes)
-        return self._effective_reference_names(resolved_names) if resolved_names is not None else None
+        if resolved_names is None:
+            return None
+        callable_names = frozenset(self._invoked_callable_reference_name(name) for name in resolved_names)
+        return self._effective_reference_names(callable_names)
 
     def _resolve_bound_value_names(self, node: ast.AST) -> _AliasValue:
-        return self._capture_callable_names(self._resolve_reference_names(node))
+        return self._capture_callable_names(self._resolve_invoked_reference_names(node))
 
     def _bind_static_reference_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
         target_names = _resolve_static_assignment_target_names(target, self.alias_scopes)
@@ -1120,7 +1129,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self.visit(statement)
 
     def visit_Call(self, node: ast.Call) -> None:
-        resolved_names = self._resolve_reference_names(node.func)
+        resolved_names = self._resolve_invoked_reference_names(node.func)
         if resolved_names is not None:
             for resolved_name in resolved_names:
                 if self._is_tracked_call_name(resolved_name):

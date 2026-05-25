@@ -288,6 +288,12 @@ def test_scan_detects_keyword_getattr_wrapped_handler_execution_primitive(
         (
             b"def handle(data, context):\n"
             b"    run = globals()['__builtins__']['eval']\n"
+            b"    globals()['__builtins__']['eval'] = len\n"
+            b"    return run.__call__('1 + 1')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    run = globals()['__builtins__']['eval']\n"
             b"    globals()['__builtins__'].__setitem__('eval', len)\n"
             b"    return run('1 + 1')\n"
         ),
@@ -388,6 +394,12 @@ def test_scan_detects_implicit_builtins_handler_execution_primitive(
             b"    globals()['__builtins__']['eval'] = len\n"
             b"    run = globals()['__builtins__']['eval']\n"
             b"    return run([])\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    globals()['__builtins__']['eval'] = len\n"
+            b"    run = globals()['__builtins__']['eval']\n"
+            b"    return run.__call__([])\n"
         ),
         (
             b"def handle(data, context):\n"

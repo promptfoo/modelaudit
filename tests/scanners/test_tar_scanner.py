@@ -143,6 +143,8 @@ class TestTarScanner:
     @pytest.mark.parametrize(
         "payload",
         [
+            b"import os\nos.system.__call__('echo hidden')\n",
+            b"import os\ninvoke = os.system.__call__\nos.system = len\ninvoke('echo hidden')\n",
             b"import os\nrun = os.system\nos.system = len\nrun('echo hidden')\n",
             b"import os\nfrom os import system as run\nos.system = len\nrun('echo hidden')\n",
         ],
@@ -166,6 +168,8 @@ class TestTarScanner:
     @pytest.mark.parametrize(
         "payload",
         [
+            b"import os\nos.system = len\nos.system.__call__([])\n",
+            b"import os\nos.system = len\ninvoke = os.system.__call__\ninvoke([])\n",
             b"import os\nos.system = len\nrun = os.system\nrun([])\n",
             b"import os\nos.system = len\nfrom os import system as run\nrun([])\n",
         ],
@@ -234,6 +238,11 @@ class TestTarScanner:
             (b"namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n"),
             b"lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
             b"lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
+            (
+                b"run = globals()['__builtins__']['eval']\n"
+                b"globals()['__builtins__']['eval'] = len\n"
+                b"run.__call__('1 + 1')\n"
+            ),
             (b"run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun('1 + 1')\n"),
             (
                 b"run = globals()['__builtins__']['eval']\n"
@@ -301,6 +310,7 @@ class TestTarScanner:
                 b"globals()['__builtins__']['eval']([])\n"
             ),
             (b"globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
+            (b"globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun.__call__([])\n"),
             (b"globals()['__builtins__'].__setitem__('eval', len)\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
             (
                 b"replace = globals()['__builtins__'].__setitem__\n"

@@ -1052,6 +1052,7 @@ def test_pytorch_zip_scans_unmarked_python_blobs_in_archive_data(tmp_path: Path)
         b"namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n",
         b"lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
         b"lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
+        (b"run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun.__call__('1 + 1')\n"),
         (b"run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun('1 + 1')\n"),
         (
             b"run = globals()['__builtins__']['eval']\n"
@@ -1154,6 +1155,7 @@ def test_pytorch_zip_scans_aliased_modeled_builtins_in_archive_data(
             b"globals()['__builtins__']['eval']([])\n"
         ),
         (b"globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
+        (b"globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun.__call__([])\n"),
         (b"globals()['__builtins__'].__setitem__('eval', len)\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
         (
             b"replace = globals()['__builtins__'].__setitem__\n"

@@ -258,7 +258,19 @@ class TestJITScriptDetector:
             (b"namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n"),
             b"lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
             b"lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
+            b"eval.__call__('1 + 1')\n",
+            b"run = globals()['__builtins__']['eval']\nrun.__call__('1 + 1')\n",
             (b"run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun('1 + 1')\n"),
+            (
+                b"run = globals()['__builtins__']['eval']\n"
+                b"globals()['__builtins__']['eval'] = len\n"
+                b"run.__call__('1 + 1')\n"
+            ),
+            (
+                b"invoke = globals()['__builtins__']['eval'].__call__\n"
+                b"globals()['__builtins__']['eval'] = len\n"
+                b"invoke('1 + 1')\n"
+            ),
             (
                 b"run = globals()['__builtins__']['eval']\n"
                 b"globals()['__builtins__'].__setitem__('eval', len)\n"
@@ -340,6 +352,12 @@ class TestJITScriptDetector:
                 b"replace('eval', len)\n"
                 b"run = globals()['__builtins__']['eval']\n"
                 b"run([])\n"
+            ),
+            (b"globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun.__call__([])\n"),
+            (
+                b"globals()['__builtins__']['eval'] = len\n"
+                b"invoke = globals()['__builtins__']['eval'].__call__\n"
+                b"invoke([])\n"
             ),
             b"def payload():\n    eval = len\n    return eval([])\n",
             (
