@@ -944,6 +944,7 @@ def test_scan_nested_file_recovers_findings_from_budget_exhausted_onnx_candidate
 
 
 def test_scan_nested_file_rejects_ambiguous_protobuf_without_findings(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
     extracted_member = tmp_path / "ambiguous.jpg"
     extracted_member.write_bytes(b"\x12" + (b"x" * (20 * 1024 * 1024)))
 
@@ -952,9 +953,26 @@ def test_scan_nested_file_rejects_ambiguous_protobuf_without_findings(tmp_path: 
     assert result.scanner_name == "unknown"
     assert result.success is True
     assert result.issues == []
-    assert (
-        result.metadata.get("tentative_protobuf_candidate_rejected") is True
-        or result.metadata.get("tentative_protobuf_candidate_unanalyzed") == "onnx_dependency_unavailable"
+    assert result.metadata.get("tentative_protobuf_candidate_rejected") is True
+
+
+def test_scan_nested_file_preserves_ambiguous_protobuf_without_onnx(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted_member = tmp_path / "ambiguous.jpg"
+    extracted_member.write_bytes(b"\x12" + (b"x" * (20 * 1024 * 1024)))
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "onnx_tentative_candidate_analysis_unavailable" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["tentative_protobuf_candidate_unanalyzed"] == "onnx_dependency_unavailable"
+    assert any(
+        issue.severity == IssueSeverity.INFO and "dependency is unavailable" in issue.message for issue in result.issues
     )
 
 
