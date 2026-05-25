@@ -523,8 +523,18 @@ class TestSkopsScannerEdgeCases:
         assert parse_checks[0].status == CheckStatus.FAILED
         assert parse_checks[0].severity == IssueSeverity.INFO
         assert parse_checks[0].details["entry"] == entry_name
-        aggregate = scan_model_directory_or_file(str(skops_file), cache_scan_results=False)
-        assert determine_exit_code(aggregate) == 2
+        cache_dir = tmp_path / "parse-cache"
+        reset_cache_manager()
+        try:
+            first, second = _scan_twice_with_cache(skops_file, cache_dir)
+            for aggregate in (first, second):
+                metadata = aggregate.file_metadata[str(skops_file)]
+                _assert_inconclusive_reason(metadata, "skops_structured_json_parse_failed")
+                assert determine_exit_code(aggregate) == 2
+            stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+            assert stats["cache_hits"] == 0
+        finally:
+            reset_cache_manager()
 
     @pytest.mark.parametrize(
         ("loader_name", "payload"),
@@ -618,7 +628,7 @@ class TestSkopsScannerEdgeCases:
 
         result = scan_model_directory_or_file(
             str(skops_file),
-            cache_scan_results=False,
+            cache_enabled=False,
             max_zip_entry_read_size=128,
             max_skops_file_size=10 * 1024 * 1024,
         )
@@ -644,6 +654,57 @@ class TestSkopsScannerEdgeCases:
         assert oversized_checks[0].details["entry"] == "payload.bin"
         assert result.success is False
         assert result.metadata["oversized_zip_entries"] == ["payload.bin"]
+
+    def test_unreadable_entry_core_exits_two_and_avoids_cache_reuse(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Member read failures are unavailable coverage, not observed vulnerabilities."""
+        skops_file = tmp_path / "unreadable_readme.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+            zf.writestr("README.md", "ordinary documentation")
+
+        original_open = zipfile.ZipFile.open
+
+        def open_with_failure(
+            archive: zipfile.ZipFile,
+            name: str | zipfile.ZipInfo,
+            mode: str = "r",
+            pwd: bytes | None = None,
+            *,
+            force_zip64: bool = False,
+        ) -> Any:
+            filename = name.filename if isinstance(name, zipfile.ZipInfo) else name
+            if filename == "README.md":
+                raise zipfile.BadZipFile("CRC mismatch")
+            return original_open(archive, name, mode, pwd, force_zip64=force_zip64)
+
+        def skip_nested_members(_self: SkopsScanner, _path: str, _result: ScanResult) -> None:
+            return None
+
+        monkeypatch.setattr(zipfile.ZipFile, "open", open_with_failure)
+        monkeypatch.setattr(SkopsScanner, "_scan_archive_members", skip_nested_members)
+
+        cache_dir = tmp_path / "unreadable-cache"
+        reset_cache_manager()
+        try:
+            first, second = _scan_twice_with_cache(skops_file, cache_dir)
+            for aggregate in (first, second):
+                metadata = aggregate.file_metadata[str(skops_file)]
+                _assert_inconclusive_reason(metadata, "skops_zip_entry_read_failed")
+                assert determine_exit_code(aggregate) == 2
+                read_issues = [
+                    issue for issue in aggregate.issues if "Unable to read ZIP entry README.md" in issue.message
+                ]
+                assert len(read_issues) == 1
+                assert read_issues[0].severity == IssueSeverity.INFO
+            stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+            assert stats["cache_hits"] == 0
+            assert stats["total_entries"] == 0
+        finally:
+            reset_cache_manager()
 
     def test_oversized_entry_core_exits_two_and_avoids_cache_reuse(self, tmp_path: Path) -> None:
         """Aggregate scans should preserve fail-closed exit and avoid reusing incomplete outer results."""
@@ -773,6 +834,37 @@ class TestSkopsScannerEdgeCases:
                 _assert_inconclusive_reason(metadata, "skops_bad_zip_file")
                 assert any("Invalid ZIP file" in str(issue.message) for issue in result.issues)
 
+            stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
+            assert stats["cache_hits"] == 0
+            assert stats["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
+    def test_unexpected_scan_failure_core_exits_two_and_avoids_cache_reuse(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Unexpected scanner failures stay fail closed without becoming findings."""
+        skops_file = tmp_path / "unexpected_scan_failure.skops"
+        with zipfile.ZipFile(skops_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("schema.json", '{"version": "1.0"}')
+
+        def fail_member_scan(_self: SkopsScanner, _path: str, _result: ScanResult) -> None:
+            raise RuntimeError("unexpected nested scan failure")
+
+        monkeypatch.setattr(SkopsScanner, "_scan_archive_members", fail_member_scan)
+        cache_dir = tmp_path / "unexpected-failure-cache"
+        reset_cache_manager()
+        try:
+            first, second = _scan_twice_with_cache(skops_file, cache_dir)
+            for aggregate in (first, second):
+                metadata = aggregate.file_metadata[str(skops_file)]
+                _assert_inconclusive_reason(metadata, "skops_scan_failed")
+                assert determine_exit_code(aggregate) == 2
+                scan_issues = [issue for issue in aggregate.issues if "Error scanning skops file" in issue.message]
+                assert len(scan_issues) == 1
+                assert scan_issues[0].severity == IssueSeverity.INFO
             stats = get_cache_manager(str(cache_dir), enabled=True).get_stats()
             assert stats["cache_hits"] == 0
             assert stats["total_entries"] == 0

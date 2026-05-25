@@ -26,8 +26,11 @@ class SkopsScanner(BaseScanner):
     supported_extensions: ClassVar[list[str]] = [".skops"]
     _OVERSIZED_ENTRY_REASON: ClassVar[str] = "skops_zip_entry_size_limited"
     _OVERSIZED_ENTRY_METADATA_KEY: ClassVar[str] = "oversized_zip_entries"
+    _UNREADABLE_ENTRY_REASON: ClassVar[str] = "skops_zip_entry_read_failed"
+    _UNREADABLE_ENTRY_METADATA_KEY: ClassVar[str] = "unreadable_zip_entries"
     _NOT_ZIP_REASON: ClassVar[str] = "skops_not_zip_archive"
     _BAD_ZIP_REASON: ClassVar[str] = "skops_bad_zip_file"
+    _SCAN_FAILURE_REASON: ClassVar[str] = "skops_scan_failed"
     _FILE_COUNT_LIMIT_REASON: ClassVar[str] = "skops_archive_file_count_limited"
     _UNCOMPRESSED_SIZE_LIMIT_REASON: ClassVar[str] = "skops_archive_uncompressed_size_limited"
     _STRUCTURED_JSON_PARSE_REASON: ClassVar[str] = "skops_structured_json_parse_failed"
@@ -84,6 +87,38 @@ class SkopsScanner(BaseScanner):
         )
         mark_archive_scan_incomplete(result, self._OVERSIZED_ENTRY_REASON)
 
+    def _record_unreadable_zip_entry(
+        self,
+        result: ScanResult,
+        zip_path: str,
+        file_info: zipfile.ZipInfo,
+        exc: Exception,
+    ) -> None:
+        unreadable_entries = result.metadata.setdefault(self._UNREADABLE_ENTRY_METADATA_KEY, [])
+        if not isinstance(unreadable_entries, list):
+            unreadable_entries = []
+            result.metadata[self._UNREADABLE_ENTRY_METADATA_KEY] = unreadable_entries
+
+        if file_info.filename in unreadable_entries:
+            return
+
+        unreadable_entries.append(file_info.filename)
+        result.add_check(
+            name="Skops ZIP Entry Read",
+            passed=False,
+            message=f"Unable to read ZIP entry {file_info.filename} for Skops analysis: {exc}",
+            severity=IssueSeverity.INFO,
+            location=f"{zip_path}:{file_info.filename}",
+            details={
+                "entry": file_info.filename,
+                "exception_type": type(exc).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": self._UNREADABLE_ENTRY_REASON,
+            },
+            why="Skops CVE coverage is incomplete because this archive member could not be read.",
+        )
+        mark_archive_scan_incomplete(result, self._UNREADABLE_ENTRY_REASON)
+
     def _read_zip_entry_safely(
         self,
         zip_file: zipfile.ZipFile,
@@ -98,8 +133,13 @@ class SkopsScanner(BaseScanner):
                 self._record_oversized_zip_entry(result, zip_path, file_info)
             return None
 
-        with zip_file.open(file_info, "r") as entry:
-            content = entry.read(self.max_zip_entry_read_size + 1)
+        try:
+            with zip_file.open(file_info, "r") as entry:
+                content = entry.read(self.max_zip_entry_read_size + 1)
+        except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+            if result is not None and zip_path is not None and not self._is_nested_array_payload(file_info.filename):
+                self._record_unreadable_zip_entry(result, zip_path, file_info, exc)
+            return None
 
         if len(content) > self.max_zip_entry_read_size:
             if result is not None and zip_path is not None and not self._is_nested_array_payload(file_info.filename):
@@ -547,13 +587,19 @@ class SkopsScanner(BaseScanner):
             result.finish(success=False)
             return result
         except Exception as e:
+            mark_archive_scan_incomplete(result, self._SCAN_FAILURE_REASON)
             result.add_check(
                 name="Skops File Scan",
                 passed=False,
                 message=f"Error scanning skops file: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self._SCAN_FAILURE_REASON,
+                },
             )
             result.finish(success=False)
             return result
