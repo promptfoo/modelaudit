@@ -312,6 +312,12 @@ def test_scan_detects_keyword_getattr_wrapped_handler_execution_primitive(
         ),
         (b"def handle(data, context):\n    return globals()['__builtins__'].pop('eval')('1 + 1')\n"),
         (b"def handle(data, context):\n    run = globals()['__builtins__'].pop('eval')\n    return run('1 + 1')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    if remove:\n"
+            b"        del globals()['__builtins__']['eval']\n"
+            b"    return globals()['__builtins__']['eval']('1 + 1')\n"
+        ),
     ],
 )
 def test_scan_detects_implicit_builtins_handler_execution_primitive(
@@ -407,6 +413,25 @@ def test_scan_detects_implicit_builtins_handler_execution_primitive(
             b"import builtins\n"
             b"def handle(data, context):\n"
             b"    dict.pop(builtins.__dict__, 'eval')\n"
+            b"    return builtins.eval([])\n"
+        ),
+        (
+            b"import builtins\n"
+            b"def handle(data, context):\n"
+            b"    del builtins.__dict__['eval']\n"
+            b"    return builtins.eval([])\n"
+        ),
+        (
+            b"import builtins\n"
+            b"def handle(data, context):\n"
+            b"    builtins.__dict__.__delitem__('eval')\n"
+            b"    return builtins.eval([])\n"
+        ),
+        (
+            b"import builtins\n"
+            b"def handle(data, context):\n"
+            b"    import operator\n"
+            b"    operator.delitem(builtins.__dict__, 'eval')\n"
             b"    return builtins.eval([])\n"
         ),
         (

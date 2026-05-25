@@ -183,6 +183,7 @@ class TestTarScanner:
             ),
             b"import os\nrun = os.__dict__.pop('system')\nrun('echo hidden')\n",
             b"import os\nif remove:\n    os.__dict__.pop('system')\nos.system('echo hidden')\n",
+            b"import os\nif remove:\n    del os.__dict__['system']\nos.system('echo hidden')\n",
             (
                 b"import os\n"
                 b"setattr = lambda target, key, value: None\n"
@@ -228,6 +229,9 @@ class TestTarScanner:
             b"import os\nimport operator\noperator.setitem(os.__dict__, 'system', len)\nos.system([])\n",
             b"import os\nos.__dict__.pop('system')\nos.system([])\n",
             b"import os\ndict.pop(os.__dict__, 'system')\nos.system([])\n",
+            b"import os\ndel os.__dict__['system']\nos.system([])\n",
+            b"import os\nos.__dict__.__delitem__('system')\nos.system([])\n",
+            b"import os\nimport operator\noperator.delitem(os.__dict__, 'system')\nos.system([])\n",
         ],
     )
     def test_scan_tar_allows_callable_captured_after_safe_overwrite(self, tmp_path: Path, payload: bytes) -> None:
@@ -344,6 +348,7 @@ class TestTarScanner:
             ),
             b"globals()['__builtins__'].pop('eval')('1 + 1')\n",
             b"run = globals()['__builtins__'].pop('eval')\nrun('1 + 1')\n",
+            b"if remove:\n    del globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval']('1 + 1')\n",
         ],
     )
     def test_scan_tar_flags_implicit_builtins_dangerous_python_member(self, tmp_path: Path, payload: bytes) -> None:
@@ -404,6 +409,7 @@ class TestTarScanner:
                 b"run([])\n"
             ),
             b"globals()['__builtins__'].pop('eval')\nglobals()['__builtins__']['eval']([])\n",
+            b"del globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval']([])\n",
         ],
     )
     def test_scan_tar_allows_benign_builtin_shaped_source(self, tmp_path: Path, payload: bytes) -> None:

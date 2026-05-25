@@ -297,7 +297,7 @@ _STATIC_MAPPING_MUTATION_ALIAS_PREFIX = "<static mapping mutation alias>:"
 _STATIC_UNCERTAIN_BINDING_PREFIX = "<uncertain static binding>:"
 _CAPTURED_CALLABLE_REFERENCE_PREFIX = "<captured callable>:"
 _BUILTIN_NAMESPACE_NAMES = {"__builtin__", "__builtins__"}
-_STATIC_MAPPING_MUTATORS = {"__setitem__", "pop", "update"}
+_STATIC_MAPPING_MUTATORS = {"__delitem__", "__setitem__", "pop", "update"}
 _STATIC_ATTRIBUTE_MUTATION_HELPERS = {
     "setattr",
     "__builtin__.setattr",
@@ -307,10 +307,13 @@ _STATIC_ATTRIBUTE_MUTATION_HELPERS = {
 _STATIC_MAPPING_FUNCTION_MUTATORS = {
     "dict.__setitem__": "__setitem__",
     "builtins.dict.__setitem__": "__setitem__",
+    "dict.__delitem__": "__delitem__",
+    "builtins.dict.__delitem__": "__delitem__",
     "dict.update": "update",
     "builtins.dict.update": "update",
     "dict.pop": "pop",
     "builtins.dict.pop": "pop",
+    "operator.delitem": "__delitem__",
     "operator.setitem": "__setitem__",
 }
 
@@ -814,6 +817,17 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for target_name in target_names:
             self._bind_name(self._static_reference_override_key(target_name), resolved_value_names)
 
+    def _bind_static_reference_names_as_removed(self, target_names: frozenset[str]) -> None:
+        for target_name in target_names:
+            self._bind_name(self._static_reference_override_key(target_name), None)
+
+    def _bind_static_reference_target_as_removed(self, target: ast.AST) -> None:
+        if _has_uncertain_static_binding(target, self.alias_scopes):
+            return
+        target_names = _resolve_static_assignment_target_names(target, self.alias_scopes)
+        if target_names is not None:
+            self._bind_static_reference_names_as_removed(target_names)
+
     def _bind_static_mapping_mutation(self, node: ast.Call, *, model_discarded_removals: bool = False) -> None:
         """Model unconditional writes through one certain namespace mapping."""
         if node.keywords:
@@ -853,6 +867,13 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             mutations.append(
                 (frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), mutation_args[1])
             )
+        elif method == "__delitem__":
+            if len(mutation_args) != 1:
+                return
+            attr_name = _resolve_static_string(mutation_args[0])
+            if attr_name is None:
+                return
+            mutations.append((frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), None))
         elif method == "update":
             if len(mutation_args) != 1 or not isinstance(mutation_args[0], ast.Dict):
                 return
@@ -875,8 +896,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
         for target_names, value in mutations:
             if value is None:
-                for target_name in target_names:
-                    self._bind_name(self._static_reference_override_key(target_name), None)
+                self._bind_static_reference_names_as_removed(target_names)
             else:
                 self._bind_static_reference_names_to_value(target_names, value)
 
@@ -1138,6 +1158,11 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self.visit(node.value)
         self._bind_target_to_value(node.target, node.value)
         self.visit(node.target)
+
+    def visit_Delete(self, node: ast.Delete) -> None:
+        for target in node.targets:
+            self._bind_static_reference_target_as_removed(target)
+            self.visit(target)
 
     def visit_Expr(self, node: ast.Expr) -> None:
         self.visit(node.value)
