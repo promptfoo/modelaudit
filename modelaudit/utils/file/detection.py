@@ -113,6 +113,7 @@ _KERAS_CONFIG_PREFIX_HINT_RE = re.compile(
     r'"(?:layers|input_layers|output_layers|build_config|compile_config|module|registered_name)"\s*:'
 )
 _NEMO_CONFIG_ENTRIES = frozenset({"model_config.yaml", "model_config.yml"})
+_NEMO_ROUTE_MAX_MEMBERS = 4096
 _PYTORCH_ZIP_METADATA_MAX_BYTES = 64
 _SKOPS_SCHEMA_ENTRIES = frozenset({"schema", "schema.json"})
 _SKOPS_SCHEMA_MAX_BYTES = 4 * 1024 * 1024
@@ -992,7 +993,9 @@ def is_nemo_archive(path: str) -> bool:
 
     try:
         with tarfile.open(file_path, "r:*") as archive:
-            for member in archive:
+            for index, member in enumerate(archive):
+                if index >= _NEMO_ROUTE_MAX_MEMBERS:
+                    return False
                 if not member.isfile():
                     continue
                 if _is_nemo_root_config_member(member.name):

@@ -135,6 +135,7 @@ CVE_2025_23304_REMEDIATION = (
 NEMO_CHECKPOINT_MEMBER_EXTENSIONS = frozenset({".ckpt", ".pt", ".pth", ".pkl", ".pickle"})
 NEMO_MAX_CHECKPOINT_SCAN_BYTES = 50 * 1024 * 1024
 NEMO_MAX_PYTHON_ANALYSIS_BYTES = 10 * 1024 * 1024
+NEMO_EXECUTABLE_PROBE_BYTES = 4096
 
 _INCONCLUSIVE_METADATA_KEY = "scan_outcome"
 _INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
@@ -499,11 +500,8 @@ class NemoScanner(BaseScanner):
     ) -> None:
         """Apply bounded generic archive-member security checks inside NeMo files."""
         member_name_lower = member.name.lower()
-        if member.size > NEMO_MAX_PYTHON_ANALYSIS_BYTES:
-            if not (
-                is_python_archive_member_name(member_name_lower) or is_executable_archive_member_name(member_name_lower)
-            ):
-                return
+        is_python_member = is_python_archive_member_name(member_name_lower)
+        if is_executable_archive_member_name(member_name_lower):
             scan_archive_member_for_known_risks(
                 archive_kind="NeMo",
                 archive_path=archive_path,
@@ -516,7 +514,24 @@ class NemoScanner(BaseScanner):
             )
             return
 
-        extracted_path = self._extract_member_to_tempfile(tar, member)
+        if is_python_member and member.size > NEMO_MAX_PYTHON_ANALYSIS_BYTES:
+            scan_archive_member_for_known_risks(
+                archive_kind="NeMo",
+                archive_path=archive_path,
+                member_name=member.name,
+                tmp_path=archive_path,
+                total_size=member.size,
+                result=result,
+                max_python_analysis_bytes=NEMO_MAX_PYTHON_ANALYSIS_BYTES,
+                python_analysis_incomplete_reason="nemo_python_member_analysis_incomplete",
+            )
+            return
+
+        extracted_path = self._extract_member_to_tempfile(
+            tar,
+            member,
+            max_bytes=None if is_python_member else NEMO_EXECUTABLE_PROBE_BYTES,
+        )
         if extracted_path is None:
             return
 
@@ -905,6 +920,7 @@ class NemoScanner(BaseScanner):
         member: tarfile.TarInfo,
         *,
         suffix_source: str | None = None,
+        max_bytes: int | None = None,
     ) -> str | None:
         member_file = tar.extractfile(member)
         if member_file is None:
@@ -912,11 +928,16 @@ class NemoScanner(BaseScanner):
 
         _root, suffix = os.path.splitext(suffix_source or member.name)
         with member_file, tempfile.NamedTemporaryFile(suffix=suffix or ".bin", delete=False) as temp_file:
+            remaining = max_bytes
             while True:
-                chunk = member_file.read(64 * 1024)
+                if remaining is not None and remaining <= 0:
+                    break
+                chunk = member_file.read(64 * 1024 if remaining is None else min(64 * 1024, remaining))
                 if not chunk:
                     break
                 temp_file.write(chunk)
+                if remaining is not None:
+                    remaining -= len(chunk)
             return temp_file.name
 
     def _add_checkpoint_deserialization_check(
