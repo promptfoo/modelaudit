@@ -119,16 +119,17 @@ These are the main measured areas that still deserve attention:
 
 ## Recent Wins Worth Preserving
 
-| Area                                   | Why it mattered                                               |
-| -------------------------------------- | ------------------------------------------------------------- |
-| scanner-selection reuse                | removed repeated registry and alias work in large directories |
-| Hugging Face bookkeeping short-circuit | avoided expensive non-HF path checks on ordinary folders      |
-| nearby-license reuse                   | cut repeated sibling-directory scans                          |
-| report-scoped call-graph cache sharing | reduced repeated AST work in pickle-heavy scans               |
-| bounded ordinary license-header reads  | removed long scans over huge non-license text files           |
-| cache-key hash reuse                   | avoided one duplicate full-file hash on cache miss            |
-| ONNX raw-buffer reuse                  | avoided rereading successful ONNX scans                       |
-| native-only pickle validation          | kept a validation path from doing full enrichment work        |
+| Area                                   | Why it mattered                                                               |
+| -------------------------------------- | ----------------------------------------------------------------------------- |
+| scanner-selection reuse                | removed repeated registry and alias work in large directories                 |
+| Hugging Face bookkeeping short-circuit | avoided expensive non-HF path checks on ordinary folders                      |
+| nearby-license reuse                   | cut repeated sibling-directory scans                                          |
+| report-scoped call-graph cache sharing | reduced repeated AST work in pickle-heavy scans                               |
+| scan-scoped call-graph cache sharing   | reuses source-validated installed-source analysis across directory dispatches |
+| bounded ordinary license-header reads  | removed long scans over huge non-license text files                           |
+| cache-key hash reuse                   | avoided one duplicate full-file hash on cache miss                            |
+| ONNX raw-buffer reuse                  | avoided rereading successful ONNX scans                                       |
+| native-only pickle validation          | kept a validation path from doing full enrichment work                        |
 
 ## Decision Checklist
 
@@ -146,7 +147,7 @@ Before landing a performance change, record:
 Priority 1:
 
 - unify or reuse remaining hashing passes
-- replace report-scoped call-graph sharing with safe source-aware invalidation
+- extend scan-scoped call-graph reuse only with source-refresh regression coverage
 - measure duplicate-aware reuse only for scanners proven path-independent
 
 Priority 2:

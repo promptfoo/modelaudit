@@ -139,6 +139,20 @@ def test_compressed_scanner_can_handle_header_routed_misnamed_wrapper(tmp_path: 
     assert CompressedScanner.can_handle(str(near_match_path)) is False
 
 
+def test_registry_routes_misnamed_compressed_malicious_payload_and_rejects_near_match(tmp_path: Path) -> None:
+    payload_path = tmp_path / "payload.jpg"
+    payload_path.write_bytes(gzip.compress(pickle.dumps({"payload": _MaliciousPayload()})))
+    near_match_path = tmp_path / "near-match.jpg"
+    near_match_path.write_bytes(b"\x1f\x00not-a-gzip-stream")
+
+    scanner = get_scanner_for_file(str(payload_path))
+
+    assert scanner is not None
+    assert scanner.name == "compressed"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in scanner.scan(str(payload_path)).issues)
+    assert get_scanner_for_file(str(near_match_path)) is None
+
+
 def test_compressed_scanner_can_handle_rejects_invalid_zlib_header_near_match(tmp_path: Path) -> None:
     zlib_path = tmp_path / "payload.bin.zlib"
     zlib_path.write_bytes(b"\x78\x00" + b"not-a-valid-zlib-stream")
