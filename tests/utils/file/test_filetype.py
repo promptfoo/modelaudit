@@ -418,10 +418,15 @@ def test_detect_renamed_tf_savedmodel_by_strict_parse_without_promoting_generic_
 def test_detect_oversized_renamed_tf_protobuf_rejects_malformed_field_two_payload(tmp_path: Path) -> None:
     malformed_payload = tmp_path / "malformed-large.jpg"
     malformed_payload.write_bytes(b"\x12" + (b"x" * (20 * 1024 * 1024)))
+    generic_payload = tmp_path / "generic-large.jpg"
+    generic_payload.write_bytes(b"\x12\x81\x80\x80\x0a" + (b"x" * (20 * 1024 * 1024 + 1)))
 
     assert detect_file_format_from_magic(str(malformed_payload)) == "unknown"
     assert detect_file_format_for_skip_filter(str(malformed_payload)) == "unknown"
     assert detect_file_format(str(malformed_payload)) == "unknown"
+    assert detect_file_format_from_magic(str(generic_payload)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(generic_payload)) == "unknown"
+    assert detect_file_format(str(generic_payload)) == "unknown"
 
 
 def test_detect_oversized_renamed_tf_savedmodel_routes_to_bounded_scan(tmp_path: Path) -> None:

@@ -1918,6 +1918,19 @@ def test_scan_file_does_not_route_oversized_malformed_tf_protobuf_near_match(tmp
     assert core_module.determine_exit_code(aggregate) == 0
 
 
+def test_scan_file_does_not_route_large_generic_field_two_protobuf_as_tensorflow(tmp_path: Path) -> None:
+    generic_payload = tmp_path / "generic-large.jpg"
+    generic_payload.write_bytes(b"\x12\x81\x80\x80\x0a" + (b"x" * (_MAX_PARSE_BYTES + 1)))
+
+    result = scan_file(str(generic_payload), config={"cache_enabled": False})
+    aggregate = scan_model_directory_or_file(str(generic_payload), cache_enabled=False)
+
+    assert result.scanner_name == "unknown"
+    assert result.success is True
+    assert aggregate.success is True
+    assert core_module.determine_exit_code(aggregate) == 0
+
+
 def test_scan_file_does_not_route_incidental_onnx_pb_string(tmp_path: Path) -> None:
     near_match = tmp_path / "metadata.pb"
     near_match.write_bytes(bytes([0x0A, 0x04]) + b"onnx" + b"\x00" * 16)
