@@ -9,6 +9,7 @@ on:
       - "tests/helpers/**"
       - "tests/conftest.py"
       - "tests/test_benchmark_report.py"
+      - "tests/test_performance_benchmarks.py"
       - "scripts/benchmark_report.py"
       - "pyproject.toml"
       - "uv.lock"
@@ -23,6 +24,7 @@ on:
       - "tests/helpers/**"
       - "tests/conftest.py"
       - "tests/test_benchmark_report.py"
+      - "tests/test_performance_benchmarks.py"
       - "scripts/benchmark_report.py"
       - "pyproject.toml"
       - "uv.lock"
@@ -152,6 +154,14 @@ jobs:
             --summary-file "$BENCHMARK_ARTIFACT_DIR/benchmark-current.md"
           cat "$BENCHMARK_ARTIFACT_DIR/benchmark-current.md" >> "$BENCHMARK_ARTIFACT_DIR/benchmark-summary.md"
           cat "$BENCHMARK_ARTIFACT_DIR/benchmark-summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run retained-memory stability guard
+        env:
+          PROMPTFOO_DISABLE_TELEMETRY: "1"
+        run: |
+          uv run --locked --with psutil pytest \
+            tests/test_performance_benchmarks.py::TestPerformanceBenchmarks::test_memory_usage_stability \
+            -q
 
       - name: Comment benchmark summary on PR
         if: >
