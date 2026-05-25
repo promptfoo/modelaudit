@@ -232,6 +232,16 @@ class TestTarScanner:
             b"mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
             b"globals()['__builtins__'].__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
             b"globals()['__builtins__'].update({'eval': len})\nglobals()['__builtins__']['eval']([])\n",
+            (
+                b"replace = globals()['__builtins__'].__setitem__\n"
+                b"replace('eval', len)\n"
+                b"globals()['__builtins__']['eval']([])\n"
+            ),
+            (
+                b"replace = globals()['__builtins__'].update\n"
+                b"replace({'eval': len})\n"
+                b"globals()['__builtins__']['eval']([])\n"
+            ),
         ],
     )
     def test_scan_tar_allows_benign_builtin_shaped_source(self, tmp_path: Path, payload: bytes) -> None:
@@ -259,6 +269,16 @@ class TestTarScanner:
             ),
             (
                 b"globals()['__builtins__'].update({'eval': __builtins__['exec']})\n"
+                b"globals()['__builtins__']['eval']('pass')\n"
+            ),
+            (
+                b"replace = globals()['__builtins__'].__setitem__\n"
+                b"replace('eval', __builtins__['exec'])\n"
+                b"globals()['__builtins__']['eval']('pass')\n"
+            ),
+            (
+                b"replace = globals()['__builtins__'].update\n"
+                b"replace({'eval': __builtins__['exec']})\n"
                 b"globals()['__builtins__']['eval']('pass')\n"
             ),
         ],
