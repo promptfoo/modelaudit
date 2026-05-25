@@ -1,4 +1,6 @@
+import gc
 import json
+import logging
 import os
 import statistics
 import time
@@ -182,8 +184,8 @@ class TestPerformanceBenchmarks:
             assert degradation_ratio < 5.0, f"Performance degrades too much with scale (ratio: {degradation_ratio:.2f})"
 
     @pytest.mark.performance
-    def test_memory_usage_stability(self, assets_dir):
-        """Test that memory usage remains stable during scanning."""
+    def test_memory_usage_stability(self, assets_dir: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """Test that memory usage remains stable after scanner initialization."""
         if not assets_dir.exists():
             pytest.skip("Assets directory does not exist")
 
@@ -194,14 +196,20 @@ class TestPerformanceBenchmarks:
         except ImportError:
             pytest.skip("psutil not available for memory testing")
 
+        # Expected adversarial findings should not inflate the RSS measurement.
+        caplog.set_level(logging.CRITICAL + 1, logger="modelaudit.scanners")
         process = psutil.Process(os.getpid())
+        warmup_results = scan_model_directory_or_file(str(assets_dir), cache_enabled=False)
+        assert warmup_results.success, "Warm-up scan should succeed"
+        gc.collect()
         initial_memory = process.memory_info().rss / 1024 / 1024  # MB
 
-        # Perform multiple scans
+        # Measure repeated scans after lazy scanner imports and caches are warm.
         for _ in range(5):
-            results = scan_model_directory_or_file(str(assets_dir))
+            results = scan_model_directory_or_file(str(assets_dir), cache_enabled=False)
             assert results.success, "Scan should succeed"
 
+        gc.collect()
         final_memory = process.memory_info().rss / 1024 / 1024  # MB
         memory_growth = final_memory - initial_memory
 

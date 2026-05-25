@@ -26,6 +26,8 @@ from modelaudit.scanner_selection import (
     selected_scanner_extensions,
 )
 from modelaudit.scanners.archive_dispatch import scan_nested_file
+from modelaudit.scanners.base import CheckStatus
+from modelaudit.utils.file.detection import LLAMAFILE_ROUTE_SCAN_BYTES, LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
 from modelaudit.utils.sources.cloud_storage import filter_scannable_files as filter_cloud_scannable_files
 from modelaudit.utils.sources.jfrog import filter_scannable_files as filter_jfrog_scannable_files
 from tests.helpers import create_mock_pytorch_zip
@@ -39,6 +41,13 @@ def _build_malicious_pickle() -> bytes:
             return (os.system, ("echo scanner-selection-test",))
 
     return pickle.dumps(DangerousPayload())
+
+
+def _build_malicious_skops_schema() -> bytes:
+    return (
+        b'{"__loader__": "OperatorFuncNode", "__module__": "builtins", "__class__": "eval", '
+        b'"_skops_version": "0.11.0", "content": {}}'
+    )
 
 
 def _has_pickle_execution_finding(result: Any) -> bool:
@@ -262,6 +271,165 @@ def test_nested_archive_dispatch_honors_selection_policy(tmp_path: Path) -> None
     )
     assert zip_and_pickle.scanner_name == "zip"
     assert _has_pickle_execution_finding(zip_and_pickle)
+
+
+def test_llamafile_zip_polyglot_honors_embedded_container_selection_policy(tmp_path: Path) -> None:
+    archive_path = tmp_path / "payload.jpg"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("payload.pkl", _build_malicious_pickle())
+    archive_path.write_bytes(b"\x7fELF" + b"\x00" * 60 + b"llamafile runtime\n" + archive_path.read_bytes())
+
+    llamafile_only = scan_file(str(archive_path), config={"scanners": ["llamafile"], "cache_enabled": False})
+    assert llamafile_only.scanner_name == "llamafile"
+    assert not _has_pickle_execution_finding(llamafile_only)
+    assert any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "zip"
+        for check in llamafile_only.checks
+    )
+
+    with_nested_scan = scan_file(
+        str(archive_path),
+        config={"scanners": ["llamafile", "zip", "pickle"], "cache_enabled": False},
+    )
+    assert with_nested_scan.scanner_name == "llamafile"
+    assert _has_pickle_execution_finding(with_nested_scan)
+
+
+def test_inconclusive_llamafile_zip_route_honors_container_selection_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "payload.jpg"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("payload.pkl", _build_malicious_pickle())
+    archive_path.write_bytes(b"\x7fELF" + b"\x00" * 60 + b"llamafile runtime\n" + archive_path.read_bytes())
+
+    def raise_os_error(_path: Path, _marker: bytes, _limit: int) -> bool:
+        raise OSError("synthetic marker probe failure")
+
+    monkeypatch.setattr("modelaudit.utils.file.detection._contains_casefolded_marker_in_prefix", raise_os_error)
+
+    llamafile_only = scan_file(str(archive_path), config={"scanners": ["llamafile"], "cache_enabled": False})
+    assert not _has_pickle_execution_finding(llamafile_only)
+    assert any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "zip"
+        for check in llamafile_only.checks
+    )
+
+    with_nested_scan = scan_file(
+        str(archive_path),
+        config={"scanners": ["llamafile", "zip", "pickle"], "cache_enabled": False},
+    )
+    assert _has_pickle_execution_finding(with_nested_scan)
+
+    nested_llamafile_only = scan_nested_file(
+        str(archive_path),
+        config={"scanners": ["llamafile"], "cache_enabled": False},
+    )
+    assert not _has_pickle_execution_finding(nested_llamafile_only)
+    assert any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "zip"
+        for check in nested_llamafile_only.checks
+    )
+
+    nested_with_container_scan = scan_nested_file(
+        str(archive_path),
+        config={"scanners": ["llamafile", "zip", "pickle"], "cache_enabled": False},
+    )
+    assert _has_pickle_execution_finding(nested_with_container_scan)
+
+
+def test_llamafile_skops_polyglot_honors_subtype_selection_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_path = tmp_path / "skops-cve.jpg"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("schema.json", _build_malicious_skops_schema())
+    archive_path.write_bytes(b"\x7fELF" + b"\x00" * 60 + b"llamafile runtime\n" + archive_path.read_bytes())
+
+    without_skops = scan_file(str(archive_path), config={"scanners": ["llamafile", "zip"], "cache_enabled": False})
+    assert not any(check.name == "CVE-2025-54412 Detection" for check in without_skops.checks)
+    assert any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "skops"
+        for check in without_skops.checks
+    )
+
+    with_skops = scan_file(
+        str(archive_path),
+        config={"scanners": ["llamafile", "zip", "skops"], "cache_enabled": False},
+    )
+    assert any(
+        check.name == "CVE-2025-54412 Detection" and check.status == CheckStatus.FAILED for check in with_skops.checks
+    )
+
+    nested_with_skops = scan_nested_file(
+        str(archive_path),
+        config={"scanners": ["llamafile", "zip", "skops"], "cache_enabled": False},
+    )
+    assert any(
+        check.name == "CVE-2025-54412 Detection" and check.status == CheckStatus.FAILED
+        for check in nested_with_skops.checks
+    )
+
+    def raise_os_error(_path: Path, _marker: bytes, _limit: int) -> bool:
+        raise OSError("synthetic marker probe failure")
+
+    monkeypatch.setattr("modelaudit.utils.file.detection._contains_casefolded_marker_in_prefix", raise_os_error)
+
+    inconclusive_with_skops = scan_file(
+        str(archive_path),
+        config={"scanners": ["llamafile", "zip", "skops"], "cache_enabled": False},
+    )
+    assert inconclusive_with_skops.metadata["scan_outcome"] == "inconclusive"
+    assert any(
+        check.name == "CVE-2025-54412 Detection" and check.status == CheckStatus.FAILED
+        for check in inconclusive_with_skops.checks
+    )
+
+    nested_inconclusive_with_skops = scan_nested_file(
+        str(archive_path),
+        config={"scanners": ["llamafile", "zip", "skops"], "cache_enabled": False},
+    )
+    assert any(
+        check.name == "CVE-2025-54412 Detection" and check.status == CheckStatus.FAILED
+        for check in nested_inconclusive_with_skops.checks
+    )
+
+
+def test_executable_zip_runs_all_matching_enabled_subtypes(tmp_path: Path) -> None:
+    archive_path = tmp_path / "multi-subtype.jpg"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("archive/data.pkl", pickle.dumps({"safe": True}))
+        archive.writestr("archive/version", b"1.6")
+        archive.writestr("schema.json", _build_malicious_skops_schema())
+    archive_path.write_bytes(
+        b"\x7fELF"
+        + b"\x00" * 60
+        + b"A" * LLAMAFILE_ROUTE_SCAN_BYTES
+        + b"llamafile runtime"
+        + b"B" * LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
+        + archive_path.read_bytes()
+    )
+
+    result = scan_file(
+        str(archive_path),
+        config={"scanners": ["zip", "pytorch_zip", "skops"], "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "zip"
+    assert any(
+        check.name == "CVE-2025-54412 Detection" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+    nested_result = scan_nested_file(
+        str(archive_path),
+        config={"scanners": ["zip", "pytorch_zip", "skops"], "cache_enabled": False},
+    )
+    assert any(
+        check.name == "CVE-2025-54412 Detection" and check.status == CheckStatus.FAILED
+        for check in nested_result.checks
+    )
 
 
 def test_selected_zip_scanner_handles_zip_backed_extension_fallback(tmp_path: Path) -> None:

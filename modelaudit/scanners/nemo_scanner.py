@@ -14,12 +14,12 @@ from typing import Any, ClassVar
 
 from ..utils import is_absolute_archive_path, sanitize_archive_path
 from ..utils.file.detection import is_nemo_archive
-from .archive_member_security import (
-    is_executable_archive_member_name,
-    is_python_archive_member_name,
-    scan_archive_member_for_known_risks,
-)
+from ._archive_outcomes import mark_archive_scan_incomplete
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
+from .tar_scanner import (
+    TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY,
+    TarScanner,
+)
 
 try:
     import yaml
@@ -134,7 +134,6 @@ CVE_2025_23304_REMEDIATION = (
 )
 NEMO_CHECKPOINT_MEMBER_EXTENSIONS = frozenset({".ckpt", ".pt", ".pth", ".pkl", ".pickle"})
 NEMO_MAX_CHECKPOINT_SCAN_BYTES = 50 * 1024 * 1024
-NEMO_MAX_PYTHON_ANALYSIS_BYTES = 10 * 1024 * 1024
 
 _INCONCLUSIVE_METADATA_KEY = "scan_outcome"
 _INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
@@ -213,6 +212,27 @@ class NemoScanner(BaseScanner):
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
 
+        tar_scanner = TarScanner(config=dict(self.config))
+        try:
+            archive_depth = max(int(self.config.get("_archive_depth", 0)), 0)
+        except (TypeError, ValueError):
+            archive_depth = 0
+        if archive_depth >= tar_scanner.max_depth:
+            result.merge(tar_scanner.scan(path))
+            result.bytes_scanned = file_size
+            self._finish_scan_result(result)
+            return result
+
+        preflight_result = ScanResult(scanner_name="tar")
+        if not tar_scanner._preflight_tar_archive(path, preflight_result):
+            mark_archive_scan_incomplete(preflight_result, "tar_analysis_incomplete")
+            preflight_result.finish(success=False)
+            result.merge(preflight_result)
+            result.bytes_scanned = file_size
+            self._finish_scan_result(result)
+            return result
+
+        nemo_owned_entries: set[str] = set()
         if not HAS_YAML:
             result.add_check(
                 name="YAML Parser Availability",
@@ -221,20 +241,25 @@ class NemoScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=path,
             )
-            result.bytes_scanned = file_size
-            return result
+        else:
+            try:
+                self._scan_nemo_archive(path, result, nemo_owned_entries)
+            except tarfile.TarError as e:
+                result.add_check(
+                    name="NeMo Archive Integrity",
+                    passed=False,
+                    message=f"Failed to open NeMo archive: {e}",
+                    severity=IssueSeverity.WARNING,
+                    location=path,
+                )
+                result.success = False
 
-        try:
-            self._scan_nemo_archive(path, result)
-        except tarfile.TarError as e:
-            result.add_check(
-                name="NeMo Archive Integrity",
-                passed=False,
-                message=f"Failed to open NeMo archive: {e}",
-                severity=IssueSeverity.WARNING,
-                location=path,
-            )
-            result.success = False
+        tar_config = dict(self.config)
+        tar_config[TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY] = nemo_owned_entries
+        # The enclosing NeMo result controls whether this artifact is complete
+        # enough to cache; nested TAR dispatch must not persist partial results.
+        tar_config["cache_enabled"] = False
+        result.merge(TarScanner(config=tar_config).scan(path))
 
         result.bytes_scanned = file_size
         self._finish_scan_result(result)
@@ -278,7 +303,7 @@ class NemoScanner(BaseScanner):
 
         result.finish(success=result.success and not result.has_errors)
 
-    def _scan_nemo_archive(self, path: str, result: ScanResult) -> None:
+    def _scan_nemo_archive(self, path: str, result: ScanResult, nemo_owned_entries: set[str]) -> None:
         """Extract and scan YAML configs from a NeMo tar archive."""
         yaml_configs_found = 0
         yaml_config_files_found = 0
@@ -311,6 +336,7 @@ class NemoScanner(BaseScanner):
                             target=member.linkname,
                         )
                     elif name_lower.endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS)):
+                        nemo_owned_entries.add(member.name)
                         link_target_name = self._resolve_archive_link_member_name(member)
                         if link_target_name is None:
                             self._mark_inconclusive_scan_result(
@@ -357,8 +383,6 @@ class NemoScanner(BaseScanner):
                 if not member.isfile():
                     continue
 
-                self._scan_embedded_member_for_known_risks(tar, member, path, result)
-
                 # Check for suspicious files in the archive
                 if name_lower.endswith((".py", ".sh", ".bat", ".cmd", ".ps1")):
                     result.add_check(
@@ -372,6 +396,7 @@ class NemoScanner(BaseScanner):
 
                 # Parse YAML config files
                 if name_lower.endswith((".yaml", ".yml")):
+                    nemo_owned_entries.add(member.name)
                     yaml_config_files_found += 1
                     if member.size > self.MAX_CONFIG_SIZE:
                         self._mark_inconclusive_scan_result(
@@ -415,6 +440,7 @@ class NemoScanner(BaseScanner):
                                 yaml_configs_found += 1
                                 self._check_hydra_targets(config, member.name, path, result)
                                 for config_path, referenced_member_name in self._collect_nemo_member_references(config):
+                                    nemo_owned_entries.add(referenced_member_name)
                                     if referenced_member_name in scanned_member_entries:
                                         continue
                                     referenced_member_scanned = self._scan_config_referenced_member(
@@ -455,6 +481,7 @@ class NemoScanner(BaseScanner):
                             )
 
                 if name_lower.endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS)):
+                    nemo_owned_entries.add(member.name)
                     if member.name in scanned_member_entries:
                         continue
                     self._scan_checkpoint_member(tar, member, path, result)
@@ -489,53 +516,6 @@ class NemoScanner(BaseScanner):
                 message=f"Found {yaml_configs_found} YAML config(s)",
                 location=path,
             )
-
-    def _scan_embedded_member_for_known_risks(
-        self,
-        tar: tarfile.TarFile,
-        member: tarfile.TarInfo,
-        archive_path: str,
-        result: ScanResult,
-    ) -> None:
-        """Apply bounded generic archive-member security checks inside NeMo files."""
-        member_name_lower = member.name.lower()
-        if member.size > NEMO_MAX_PYTHON_ANALYSIS_BYTES:
-            if not (
-                is_python_archive_member_name(member_name_lower) or is_executable_archive_member_name(member_name_lower)
-            ):
-                return
-            scan_archive_member_for_known_risks(
-                archive_kind="NeMo",
-                archive_path=archive_path,
-                member_name=member.name,
-                tmp_path=archive_path,
-                total_size=member.size,
-                result=result,
-                max_python_analysis_bytes=NEMO_MAX_PYTHON_ANALYSIS_BYTES,
-                python_analysis_incomplete_reason="nemo_python_member_analysis_incomplete",
-            )
-            return
-
-        extracted_path = self._extract_member_to_tempfile(tar, member)
-        if extracted_path is None:
-            return
-
-        try:
-            scan_archive_member_for_known_risks(
-                archive_kind="NeMo",
-                archive_path=archive_path,
-                member_name=member.name,
-                tmp_path=extracted_path,
-                total_size=member.size,
-                result=result,
-                max_python_analysis_bytes=NEMO_MAX_PYTHON_ANALYSIS_BYTES,
-                python_analysis_incomplete_reason="nemo_python_member_analysis_incomplete",
-            )
-        finally:
-            try:
-                os.unlink(extracted_path)
-            except OSError:
-                logger.debug("Failed to remove temporary NeMo member security file: %s", extracted_path)
 
     @staticmethod
     def _resolve_archive_link_member_name(member: tarfile.TarInfo) -> str | None:
@@ -680,7 +660,8 @@ class NemoScanner(BaseScanner):
             critical_issues = [
                 issue
                 for issue in nested_result.issues
-                if issue.severity == IssueSeverity.CRITICAL and self._is_nested_checkpoint_deserialization_issue(issue)
+                if issue.severity == IssueSeverity.CRITICAL
+                and self._is_nested_checkpoint_deserialization_issue(issue, nested_result.scanner_name)
             ]
             if critical_issues:
                 self._add_checkpoint_deserialization_check(
@@ -789,7 +770,8 @@ class NemoScanner(BaseScanner):
             critical_issues = [
                 issue
                 for issue in nested_result.issues
-                if issue.severity == IssueSeverity.CRITICAL and self._is_nested_checkpoint_deserialization_issue(issue)
+                if issue.severity == IssueSeverity.CRITICAL
+                and self._is_nested_checkpoint_deserialization_issue(issue, nested_result.scanner_name)
             ]
             if critical_issues:
                 self._add_checkpoint_deserialization_check(
@@ -868,8 +850,11 @@ class NemoScanner(BaseScanner):
         return normalized_member.lstrip("./")
 
     @staticmethod
-    def _is_nested_checkpoint_deserialization_issue(issue: Any) -> bool:
+    def _is_nested_checkpoint_deserialization_issue(issue: Any, nested_scanner: str | None = None) -> bool:
         details = issue.details if isinstance(issue.details, dict) else {}
+        if nested_scanner == "torch7" and details.get("signal") == "exec_with_network_shell_context":
+            return True
+
         text = " ".join(
             str(part).lower()
             for part in (

