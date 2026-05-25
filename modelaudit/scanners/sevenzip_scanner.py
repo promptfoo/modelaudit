@@ -560,9 +560,13 @@ class SevenZipScanner(BaseScanner):
                     name=f"Nested 7z Probe: {file_name}",
                     passed=False,
                     message=f"Failed to inspect nested archive candidate {file_name}: {e}",
-                    severity=IssueSeverity.WARNING,
+                    severity=IssueSeverity.INFO,
                     location=f"{archive_path}:{file_name}",
-                    details={"error": str(e)},
+                    details={
+                        "error": str(e),
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": "sevenzip_analysis_incomplete",
+                    },
                 )
 
         return nested_archives, probes_complete
