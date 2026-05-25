@@ -79,11 +79,11 @@ ModelAudit includes 44 registered scanners covering model, archive, and configur
 | **NeMo**                | `.nemo`                                                                   | MEDIUM |
 | **CNTK**                | `.dnn`, `.cmf`, signature-valid renamed artifacts                         | MEDIUM |
 | **RKNN**                | `.rknn`                                                                   | MEDIUM |
-| **Torch7**              | `.t7`, `.th`, `.net`                                                      | HIGH   |
+| **Torch7**              | Serialized artifacts (`.t7`, `.th`, `.net` or renamed)                    | HIGH   |
 | **CatBoost**            | `.cbm`                                                                    | MEDIUM |
 | **XGBoost**             | `.bst`, `.model`, `.json`, `.ubj`                                         | MEDIUM |
 | **LightGBM**            | `.lgb`, `.lightgbm`, `.model`, signature-valid renamed artifacts          | MEDIUM |
-| **Llamafile**           | `.llamafile`, extensionless, `.exe`                                       | MEDIUM |
+| **Llamafile**           | Executable wrappers (`.llamafile`, `.exe`, extensionless or renamed)      | MEDIUM |
 | **TorchServe**          | `.mar`                                                                    | HIGH   |
 | **SafeTensors**         | `.safetensors`                                                            | LOW    |
 | **GGUF/GGML**           | `.gguf`, `.ggml`, `.ggmf`, `.ggjt`, `.ggla`, `.ggsa`                      | LOW    |
@@ -214,7 +214,7 @@ modelaudit scan ./archive.zip --scanners zip,pickle
 
 `--scanners` starts from an explicit allowlist. `--exclude-scanner` subtracts scanners from either that allowlist or the default scanner set. Scanner selection is reflected in JSON output under `scanner_selection`.
 
-For remote folders, ModelAudit narrows downloads by selected scanner extensions when safe, and keeps filtering conservative for container or header-routed scanners to avoid dropping extension-spoofed artifacts before scanning.
+For remote folders, ModelAudit narrows downloads by selected scanner extensions when safe. Content-based renamed-wrapper routing applies after acquisition; scan a direct file URL when repository filenames may be intentionally misleading.
 
 ## Metadata Extraction
 
