@@ -251,10 +251,35 @@ def test_scan_zip_flags_concatenated_getattr_name_dangerous_python_member(tmp_pa
     [
         "import os\nos.__dict__['sys' + 'tem']('echo hidden')\n",
         "import os as operating_system\nvars(operating_system)['system']('echo hidden')\n",
+        "import os\nos.__dict__.get('sys' + 'tem')('echo hidden')\n",
+        "import os\nvars(os).get('system')('echo hidden')\n",
+        "import os\ngetattr(os, '__dict__')['system']('echo hidden')\n",
+        "import os\ngetattr(os, '__dict__').get('system')('echo hidden')\n",
+        "import os\nos.__dict__.pop('system')('echo hidden')\n",
+        "import os\nos.__dict__.setdefault('system', None)('echo hidden')\n",
+        "import os\nos.__getattribute__('system')('echo hidden')\n",
+        "import os\nobject.__getattribute__(os, 'system')('echo hidden')\n",
+        "import os\ncommands = os.__dict__\ncommands['system']('echo hidden')\n",
+        "import os\ncommands = vars(os)\ncommands.get('system')('echo hidden')\n",
+        "import os\ncommands = getattr(os, '__dict__')\ncommands['system']('echo hidden')\n",
     ],
-    ids=["module_dict", "vars_module"],
+    ids=[
+        "module_dict",
+        "vars_module",
+        "module_dict_get",
+        "vars_get",
+        "getattr_dict",
+        "getattr_dict_get",
+        "module_dict_pop",
+        "module_dict_setdefault",
+        "module_getattribute",
+        "object_getattribute",
+        "assigned_module_dict",
+        "assigned_vars",
+        "assigned_getattr_dict",
+    ],
 )
-def test_scan_zip_flags_namespace_dict_dangerous_python_member(tmp_path: Path, source: str) -> None:
+def test_scan_zip_flags_static_namespace_dangerous_python_member(tmp_path: Path, source: str) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
@@ -507,13 +532,14 @@ def test_scan_zip_ignores_benign_python_member(tmp_path: Path) -> None:
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
-def test_scan_zip_ignores_benign_dictionary_dispatch_python_member(tmp_path: Path) -> None:
+@pytest.mark.parametrize("dispatch", ["handlers['system'](1.0)", "handlers.get('system')(1.0)"])
+def test_scan_zip_ignores_benign_dictionary_dispatch_python_member(tmp_path: Path, dispatch: str) -> None:
     archive_path = tmp_path / "source_bundle.zip"
     source = (
         "def normalize(value: float) -> float:\n"
         "    return value / 255.0\n"
         "handlers = {'system': normalize}\n"
-        "handlers['system'](1.0)\n"
+        f"{dispatch}\n"
     )
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("preprocess.py", source)

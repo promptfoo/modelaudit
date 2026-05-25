@@ -224,10 +224,35 @@ class TestTarScanner:
         [
             b"import os\nos.__dict__['sys' + 'tem']('echo hidden')\n",
             b"import os as operating_system\nvars(operating_system)['system']('echo hidden')\n",
+            b"import os\nos.__dict__.get('sys' + 'tem')('echo hidden')\n",
+            b"import os\nvars(os).get('system')('echo hidden')\n",
+            b"import os\ngetattr(os, '__dict__')['system']('echo hidden')\n",
+            b"import os\ngetattr(os, '__dict__').get('system')('echo hidden')\n",
+            b"import os\nos.__dict__.pop('system')('echo hidden')\n",
+            b"import os\nos.__dict__.setdefault('system', None)('echo hidden')\n",
+            b"import os\nos.__getattribute__('system')('echo hidden')\n",
+            b"import os\nobject.__getattribute__(os, 'system')('echo hidden')\n",
+            b"import os\ncommands = os.__dict__\ncommands['system']('echo hidden')\n",
+            b"import os\ncommands = vars(os)\ncommands.get('system')('echo hidden')\n",
+            b"import os\ncommands = getattr(os, '__dict__')\ncommands['system']('echo hidden')\n",
         ],
-        ids=["module_dict", "vars_module"],
+        ids=[
+            "module_dict",
+            "vars_module",
+            "module_dict_get",
+            "vars_get",
+            "getattr_dict",
+            "getattr_dict_get",
+            "module_dict_pop",
+            "module_dict_setdefault",
+            "module_getattribute",
+            "object_getattribute",
+            "assigned_module_dict",
+            "assigned_vars",
+            "assigned_getattr_dict",
+        ],
     )
-    def test_scan_tar_flags_namespace_dict_dangerous_python_member(self, tmp_path: Path, payload: bytes) -> None:
+    def test_scan_tar_flags_static_namespace_dangerous_python_member(self, tmp_path: Path, payload: bytes) -> None:
         """Static module namespace dispatch should still resolve risky calls."""
         archive_path = tmp_path / "model_bundle.tar"
 
@@ -441,14 +466,14 @@ class TestTarScanner:
         assert not any(check.name == "Python Archive Member Security" for check in result.checks)
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
-    def test_scan_tar_ignores_benign_dictionary_dispatch_python_member(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("dispatch", [b"handlers['system'](1.0)\n", b"handlers.get('system')(1.0)\n"])
+    def test_scan_tar_ignores_benign_dictionary_dispatch_python_member(self, tmp_path: Path, dispatch: bytes) -> None:
         """Ordinary application dictionaries should not be treated as module namespaces."""
         archive_path = tmp_path / "model_bundle.tar"
         source = (
             b"def normalize(value: float) -> float:\n"
             b"    return value / 255.0\n"
-            b"handlers = {'system': normalize}\n"
-            b"handlers['system'](1.0)\n"
+            b"handlers = {'system': normalize}\n" + dispatch
         )
 
         with tarfile.open(archive_path, "w") as archive:
