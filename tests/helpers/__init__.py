@@ -15,6 +15,7 @@ from tests.helpers.file_creators import (
     create_mock_pytorch_zip,
     create_mock_safetensors,
     create_safe_pickle,
+    prefix_mock_onnx_with_unknown_field,
     write_mock_pytorch_zip_metadata,
 )
 from tests.helpers.frameworks import (
@@ -39,6 +40,7 @@ __all__ = [
     "create_mock_pytorch_zip",
     "create_mock_safetensors",
     "create_safe_pickle",
+    "prefix_mock_onnx_with_unknown_field",
     "requires_dill",
     "requires_h5py",
     "requires_joblib",

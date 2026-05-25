@@ -12,7 +12,8 @@ from pathlib import Path, PurePosixPath
 from typing import ClassVar, NamedTuple
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
-from .base import BaseScanner, IssueSeverity, ScanResult
+from ..utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
+from .base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner, IssueSeverity, ScanResult
 
 _MAX_VARINT_BYTES = 10
 
@@ -383,6 +384,28 @@ class CoreMLScanner(BaseScanner):
 
     SAFE_LINKED_PATH_PREFIXES: ClassVar[tuple[str, ...]] = ("$BUNDLE_MAIN", "$BUNDLE_IDENTIFIER(")
 
+    def _is_tentative_protobuf_route(self) -> bool:
+        format_validation = self.config.get(FORMAT_VALIDATION_CONFIG_KEY)
+        return isinstance(format_validation, dict) and (
+            format_validation.get("routed_format") == PROTOBUF_MODEL_CANDIDATE_FORMAT
+        )
+
+    @staticmethod
+    def _reject_tentative_candidate(result: ScanResult) -> ScanResult:
+        result.scanner_name = "unknown"
+        result.metadata["tentative_protobuf_candidate_rejected"] = True
+        for key in (
+            "analysis_incomplete",
+            "coreml_bounded_read_truncated",
+            "scan_outcome",
+            "scan_outcome_message",
+            "scan_outcome_reasons",
+        ):
+            result.metadata.pop(key, None)
+        result.checks = [check for check in result.checks if check.name != "CoreML Bounded Parse Window"]
+        result.finish(success=True)
+        return result
+
     @classmethod
     def can_handle(cls, path: str) -> bool:
         if not os.path.isfile(path):
@@ -495,6 +518,12 @@ class CoreMLScanner(BaseScanner):
             allow_truncated=file_size > self.MAX_PARSE_BYTES,
         )
         if parse_error:
+            if parse_error.startswith("field count exceeded limit"):
+                if self._is_tentative_protobuf_route():
+                    return self._reject_tentative_candidate(result)
+                mark_inconclusive_scan_result(result, "coreml_top_level_field_limit")
+            elif self._is_tentative_protobuf_route():
+                return self._reject_tentative_candidate(result)
             result.add_check(
                 name="CoreML Protobuf Parse",
                 passed=False,
@@ -507,6 +536,8 @@ class CoreMLScanner(BaseScanner):
             return result
 
         if not self._has_coreml_structure(top_fields):
+            if self._is_tentative_protobuf_route():
+                return self._reject_tentative_candidate(result)
             result.add_check(
                 name="CoreML Structural Validation",
                 passed=False,

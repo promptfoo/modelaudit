@@ -8,7 +8,8 @@ import re
 from pathlib import Path
 from typing import Any, ClassVar
 
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
+from ..utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
+from .base import FORMAT_VALIDATION_CONFIG_KEY, INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 logger = logging.getLogger("modelaudit.scanners")
 
@@ -280,6 +281,12 @@ class OnnxScanner(BaseScanner):
             return False
         return os.path.splitext(path)[1].lower() in cls.supported_extensions
 
+    def _is_tentative_protobuf_route(self) -> bool:
+        format_validation = self.config.get(FORMAT_VALIDATION_CONFIG_KEY)
+        return isinstance(format_validation, dict) and (
+            format_validation.get("routed_format") == PROTOBUF_MODEL_CANDIDATE_FORMAT
+        )
+
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
         if path_check_result:
@@ -298,6 +305,11 @@ class OnnxScanner(BaseScanner):
         self.current_file_path = path
 
         if not _check_onnx():
+            if self._is_tentative_protobuf_route():
+                result.scanner_name = "unknown"
+                result.metadata["tentative_protobuf_candidate_unanalyzed"] = "onnx_dependency_unavailable"
+                result.finish(success=True)
+                return result
             result.add_check(
                 name="ONNX Library Check",
                 passed=False,
@@ -348,6 +360,11 @@ class OnnxScanner(BaseScanner):
             # Re-raise keyboard interrupt for graceful shutdown
             raise
         except Exception as e:  # pragma: no cover - unexpected parse errors
+            if self._is_tentative_protobuf_route():
+                result.scanner_name = "unknown"
+                result.metadata["tentative_protobuf_candidate_rejected"] = True
+                result.finish(success=True)
+                return result
             result.add_check(
                 name="ONNX Model Parsing",
                 passed=False,
@@ -358,6 +375,28 @@ class OnnxScanner(BaseScanner):
             )
             result.finish(success=False)
             return result
+
+        has_graph = model.HasField("graph")
+        if model.ir_version <= 0 or not has_graph:
+            if self._is_tentative_protobuf_route():
+                result.scanner_name = "unknown"
+                result.metadata["tentative_protobuf_candidate_rejected"] = True
+                result.finish(success=True)
+                return result
+            _mark_inconclusive_scan_result(result, ONNX_STRUCTURE_INCONCLUSIVE_REASON)
+            result.add_check(
+                name="ONNX Structure Validation",
+                passed=False,
+                message="Parsed ONNX payload is missing required model structure; analysis incomplete",
+                severity=IssueSeverity.INFO,
+                location=path,
+                rule_code="S902",
+                details={
+                    "scan_outcome_reason": ONNX_STRUCTURE_INCONCLUSIVE_REASON,
+                    "ir_version": model.ir_version,
+                    "has_graph": has_graph,
+                },
+            )
 
         result.metadata.update(
             {

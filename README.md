@@ -62,7 +62,7 @@ Files scanned: 1 | Issues found: 2 critical, 1 warning
 
 ## Supported Formats
 
-ModelAudit includes 44 registered scanners covering model, archive, and configuration formats:
+ModelAudit includes 45 registered scanners covering model, archive, and configuration formats:
 
 | Format                  | Extensions                                                                | Risk   |
 | ----------------------- | ------------------------------------------------------------------------- | ------ |
@@ -98,6 +98,9 @@ ModelAudit includes 44 registered scanners covering model, archive, and configur
 | **Compressed Wrappers** | `.gz`, `.bz2`, `.xz`, `.lz4`, `.zlib`                                     | MEDIUM |
 
 Plus scanners for ZIP, TAR, 7-Zip, OCI layers, Jinja2 templates, JSON/YAML metadata, manifests, model cards, text files, and RAR recognition. RAR archives are reported as unsupported/fail-closed instead of being skipped.
+
+Structurally valid TensorFlow SavedModel and MetaGraph protobufs are also recognized when renamed to non-model suffixes.
+CoreML content routing preserves bounded ambiguous candidates for static custom-code and metadata analysis.
 
 [View complete format documentation](https://www.promptfoo.dev/docs/model-audit/scanners/)
 

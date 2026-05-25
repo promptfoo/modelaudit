@@ -1,19 +1,49 @@
 """Tests for file filtering functionality."""
 
+import importlib
 import json
 import pickle
 import zipfile
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from modelaudit.utils.file import filtering
-from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
+from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT, detect_file_format_for_skip_filter
 from modelaudit.utils.file.filtering import (
     _ZIP_MEMBER_SNIFF_LIMIT,
     should_skip_file,
 )
-from tests.helpers.file_creators import create_v7_tar_archive
+from tests.helpers.file_creators import (
+    create_mock_onnx,
+    create_v7_tar_archive,
+    prefix_mock_onnx_with_unknown_field,
+)
+
+
+def _build_tf_metagraph_bytes() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    node = metagraph.graph_def.node.add()
+    node.name = "const_node"
+    node.op = "Const"
+    return cast(bytes, metagraph.SerializeToString())
+
+
+def _build_tf_savedmodel_bytes() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
+    saved_model = saved_model_pb2.SavedModel()
+    saved_model.saved_model_schema_version = 1
+    metagraph = saved_model.meta_graphs.add()
+    node = metagraph.graph_def.node.add()
+    node.name = "const_node"
+    node.op = "Const"
+    return cast(bytes, saved_model.SerializeToString())
 
 
 def _build_lightgbm_text() -> str:
@@ -232,6 +262,47 @@ class TestFileFilter:
         near_match.write_bytes(b"PKNO harmless text")
 
         assert should_skip_file(str(near_match))
+
+    def test_disguised_tf_metagraph_bypasses_skip_without_promoting_generic_protobuf(self, tmp_path: Path) -> None:
+        disguised_metagraph = tmp_path / "graph.jpg"
+        generic_protobuf = tmp_path / "generic.jpg"
+        disguised_metagraph.write_bytes(b"\xa2\x06\x80\x08" + (b"x" * 1024) + _build_tf_metagraph_bytes())
+        generic_protobuf.write_bytes(b"\x12\x02\x08\x01")
+
+        assert detect_file_format_for_skip_filter(str(disguised_metagraph)) == "tf_metagraph"
+        assert not should_skip_file(str(disguised_metagraph))
+        assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
+        assert should_skip_file(str(generic_protobuf))
+
+    def test_disguised_tf_savedmodel_bypasses_skip_without_promoting_generic_protobuf(self, tmp_path: Path) -> None:
+        disguised_savedmodel = tmp_path / "saved.jpg"
+        generic_protobuf = tmp_path / "generic.jpg"
+        disguised_savedmodel.write_bytes(_build_tf_savedmodel_bytes())
+        generic_protobuf.write_bytes(b"\x12\x02\x08\x01")
+
+        assert detect_file_format_for_skip_filter(str(disguised_savedmodel)) == "tf_savedmodel"
+        assert not should_skip_file(str(disguised_savedmodel))
+        assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
+        assert should_skip_file(str(generic_protobuf))
+
+    def test_prefixed_disguised_onnx_bypasses_skip_without_promoting_generic_protobuf(self, tmp_path: Path) -> None:
+        pytest.importorskip("onnx")
+        disguised_onnx = create_mock_onnx(tmp_path / "model.jpg")
+        prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=0, count=4097, field_number=8)
+        generic_protobuf = tmp_path / "generic.jpg"
+        generic_protobuf.write_bytes(b"\xa2\x06\x04xxxx\x12\x02\x08\x01")
+
+        assert detect_file_format_for_skip_filter(str(disguised_onnx)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+        assert not should_skip_file(str(disguised_onnx))
+        assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
+        assert should_skip_file(str(generic_protobuf))
+
+    def test_budget_exhausted_protobuf_near_match_survives_filter_for_tentative_scan(self, tmp_path: Path) -> None:
+        near_match = tmp_path / "ambiguous.jpg"
+        near_match.write_bytes(b"\x12" + (b"x" * (20 * 1024 * 1024)))
+
+        assert detect_file_format_for_skip_filter(str(near_match)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+        assert not should_skip_file(str(near_match))
 
     def test_prefixed_zip_with_central_directory_stub_stays_scannable(self, tmp_path: Path) -> None:
         disguised_zip = tmp_path / "archive.jpg"

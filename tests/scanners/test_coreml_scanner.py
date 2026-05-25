@@ -278,6 +278,8 @@ def test_coreml_scanner_unknown_group_prefix_respects_field_limit(tmp_path: Path
     result = CoreMLScanner().scan(str(model_path))
 
     assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "coreml_top_level_field_limit" in result.metadata["scan_outcome_reasons"]
     assert any(
         check.name == "CoreML Protobuf Parse"
         and check.details.get("parse_error") == f"field count exceeded limit ({CoreMLScanner.MAX_TOP_LEVEL_FIELDS})"

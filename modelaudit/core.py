@@ -21,6 +21,7 @@ from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
 from modelaudit.scanner_selection import (
     SCANNER_SELECTION_PREFERRED_KIND,
     add_scanner_selection_skip_check,
+    allows_protobuf_model_candidate_analysis,
     make_scanner_selection_skip_result,
     normalize_scanner_selection_config,
     policy_from_config,
@@ -32,6 +33,7 @@ from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.file.detection import (
+    PROTOBUF_MODEL_CANDIDATE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
     detect_file_format,
     detect_file_format_from_magic,
@@ -105,6 +107,7 @@ _XGBOOST_BINARY_EXTENSIONS = frozenset({".bst"})
 _XGBOOST_PICKLE_SPOOF_REASON = "xgboost_binary_pickle_spoof"
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
+_PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON = "protobuf_model_routing_incomplete"
 _ShardFamilyKey = tuple[str, str, int | None]
 _ScanEntry = tuple[str, list[str], _ShardFamilyKey | None]
 _SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY = "shard_family_cache_fingerprint"
@@ -185,6 +188,9 @@ def _allowed_shard_paths_from_config(config: dict[str, Any]) -> list[str] | None
 
 def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
     """Select a scanner by trusted file structure, not just suffix."""
+    if header_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
+        return "protobuf_model_candidate"
+
     if header_format == "zip":
         if is_torchserve_mar_archive(path):
             return "torchserve_mar"
@@ -216,6 +222,8 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
 
 def _is_direct_header_route(scanner_id: str, header_format: str) -> bool:
     """Return whether the detected header directly maps to this scanner."""
+    if header_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
+        return scanner_id == "protobuf_model_candidate"
     return header_format != "unknown" and HEADER_FORMAT_TO_SCANNER_ID.get(header_format) == scanner_id
 
 
@@ -305,6 +313,26 @@ def _make_incomplete_xml_model_result(path: str) -> ScanResult:
     )
     _mark_inconclusive_scan_outcome(result, _XML_MODEL_ROUTING_INCOMPLETE_REASON)
     _mark_operational_scan_error(result, _XML_MODEL_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_protobuf_model_result(path: str) -> ScanResult:
+    """Fail closed when a protobuf candidate cannot receive tentative analysis."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="Protobuf Model Routing",
+        passed=False,
+        message=(
+            "Protobuf model routing was inconclusive because tentative protobuf "
+            "analysis was unavailable for a bounded-probe candidate"
+        ),
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": PROTOBUF_MODEL_CANDIDATE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _PROTOBUF_MODEL_ROUTING_INCOMPLETE_REASON)
     result.finish(success=False)
     return result
 
@@ -1402,7 +1430,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     preferred_scanner: type[BaseScanner] | None = None
     scanner_id = _select_preferred_scanner_id(path, header_format, ext)
     skipped_preferred_scanner_id: str | None = None
-    if scanner_id and scanner_selection.allows(scanner_id):
+    if scanner_id and (
+        scanner_selection.allows(scanner_id)
+        or (scanner_id == "protobuf_model_candidate" and allows_protobuf_model_candidate_analysis(scanner_selection))
+    ):
         preferred_scanner = _registry.load_scanner_by_id(scanner_id)
     elif scanner_id:
         skipped_preferred_scanner_id = scanner_id
@@ -1417,6 +1448,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     config[FORMAT_VALIDATION_CONFIG_KEY] = {
         "path": os.path.abspath(path),
         "header_format": magic_format,
+        "routed_format": header_format,
         "extension_format": ext_format,
         "file_type_valid": file_type_valid,
     }
@@ -1542,6 +1574,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
             if magic_format == XML_MODEL_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_xml_model_result(path)
+            elif header_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
+                sr = _make_incomplete_protobuf_model_result(path)
+            elif magic_format == PROTOBUF_MODEL_CANDIDATE_FORMAT and header_format != "unknown":
+                sr = _make_unavailable_recognized_format_result(path, header_format, scanner_id)
             elif magic_format == "unknown":
                 # Not a recognized model format — skip silently
                 sr = ScanResult(scanner_name="unknown")
