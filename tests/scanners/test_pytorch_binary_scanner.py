@@ -72,7 +72,6 @@ def test_pytorch_binary_read_failure_is_inconclusive_not_security_finding(
     def raise_os_error(*_args: object, **_kwargs: object) -> None:
         raise OSError("simulated PyTorch binary read failure")
 
-    monkeypatch.setattr(PyTorchBinaryScanner, "can_handle", classmethod(lambda _cls, _path: True))
     monkeypatch.setattr("modelaudit.scanners.pytorch_binary_scanner.open", raise_os_error, raising=False)
 
     direct = PyTorchBinaryScanner().scan(str(path))

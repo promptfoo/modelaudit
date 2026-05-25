@@ -45,6 +45,12 @@ class PyTorchBinaryScanner(BaseScanner):
         if ext not in cls.supported_extensions:
             return False
 
+        try:
+            with open(path, "rb"):
+                pass
+        except OSError:
+            return True
+
         # Check if it's actually a pytorch binary file
         try:
             from modelaudit.utils.file.detection import detect_file_format, validate_file_type
