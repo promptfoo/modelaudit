@@ -39,7 +39,8 @@ _TF_METAGRAPH_MIN_BYTES = 8
 _TF_METAGRAPH_MAX_VALIDATE_BYTES = 20 * 1024 * 1024
 _TF_METAGRAPH_MAX_ROUTING_FIELDS = 4096
 _TORCH7_SIGNATURE_READ_BYTES = 4096
-_LIGHTGBM_SIGNATURE_READ_BYTES = 8192
+# Keep content routing aligned with LightGBMScanner._SIGNATURE_READ_BYTES.
+_LIGHTGBM_SIGNATURE_READ_BYTES = 64 * 1024
 _ONNX_MODEL_MAX_ROUTING_FIELDS = 4096
 _ONNX_GRAPH_MAX_ROUTING_FIELDS = 4096
 _ONNX_NODE_MAX_ROUTING_FIELDS = 512
@@ -1771,22 +1772,11 @@ def detect_file_format_from_magic(path: str) -> str:
             if format_result != "unknown":
                 return format_result
 
-            # CNTKv2 has protobuf-style serialization without a fixed first-8-byte magic.
-            # Use bounded signature markers for deterministic identification.
-            f.seek(0)
-            cntk_prefix = f.read(_CNTK_SIGNATURE_READ_BYTES)
-            if _is_cntk_signature(cntk_prefix):
-                return "cntk"
-
             f.seek(0)
             torch7_prefix = f.read(_TORCH7_SIGNATURE_READ_BYTES)
             if _is_torch7_signature(torch7_prefix):
                 return "torch7"
 
-            f.seek(0)
-            lightgbm_prefix = f.read(_LIGHTGBM_SIGNATURE_READ_BYTES)
-            if _is_lightgbm_signature(lightgbm_prefix):
-                return "lightgbm"
             # Protocol 0/1 pickle payloads can evade short magic-byte checks.
             # Probe a bounded prefix and require a valid opcode stream.
             pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
@@ -1831,6 +1821,13 @@ def detect_file_format_from_magic(path: str) -> str:
         return "coreml"
     if _has_budget_exhausted_protobuf_model_candidate(file_path, size):
         return PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+    cntk_prefix = read_magic_bytes(path, _CNTK_SIGNATURE_READ_BYTES)
+    if _is_cntk_signature(cntk_prefix):
+        return "cntk"
+    lightgbm_prefix = read_magic_bytes(path, _LIGHTGBM_SIGNATURE_READ_BYTES)
+    if _is_lightgbm_signature(lightgbm_prefix):
+        return "lightgbm"
 
     return "unknown"
 
@@ -1889,18 +1886,6 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if format_result != "unknown":
             return format_result
 
-        cntk_probe_size = min(size, _CNTK_SIGNATURE_READ_BYTES)
-        if len(prefix) < cntk_probe_size:
-            prefix += f.read(cntk_probe_size - len(prefix))
-        if _is_cntk_signature(prefix):
-            return "cntk"
-
-        lightgbm_probe_size = min(size, _LIGHTGBM_SIGNATURE_READ_BYTES)
-        if len(prefix) < lightgbm_probe_size:
-            prefix += f.read(lightgbm_probe_size - len(prefix))
-        if _is_lightgbm_signature(prefix):
-            return "lightgbm"
-
         if _could_start_proto0_or_1_pickle(prefix):
             max_probe_size = min(size, PROTO0_1_MAX_PROBE_BYTES)
             if len(prefix) < max_probe_size:
@@ -1931,6 +1916,13 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         return "coreml"
     if _has_budget_exhausted_protobuf_model_candidate(file_path, size):
         return PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+    cntk_prefix = read_magic_bytes(path, _CNTK_SIGNATURE_READ_BYTES)
+    if _is_cntk_signature(cntk_prefix):
+        return "cntk"
+    lightgbm_prefix = read_magic_bytes(path, _LIGHTGBM_SIGNATURE_READ_BYTES)
+    if _is_lightgbm_signature(lightgbm_prefix):
+        return "lightgbm"
 
     return "unknown"
 
@@ -1969,10 +1961,6 @@ def detect_file_format(path: str) -> str:
 
     if magic8.startswith(b"\x93NUMPY"):
         return "numpy"
-
-    cntk_prefix = read_magic_bytes(path, _CNTK_SIGNATURE_READ_BYTES)
-    if _is_cntk_signature(cntk_prefix):
-        return "cntk"
 
     if _looks_like_onnx_model_candidate_file(file_path, size):
         return "onnx"
@@ -2044,15 +2032,18 @@ def detect_file_format(path: str) -> str:
     if renamed_tensorflow_format != "unknown":
         return renamed_tensorflow_format
 
-    lightgbm_prefix = read_magic_bytes(path, _LIGHTGBM_SIGNATURE_READ_BYTES)
-    if _is_lightgbm_signature(lightgbm_prefix):
-        return "lightgbm"
-
     if _has_budget_exhausted_protobuf_model_candidate(file_path, size) and detect_format_from_extension(path) in {
         "unknown",
         "protobuf",
     }:
         return PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+    cntk_prefix = read_magic_bytes(path, _CNTK_SIGNATURE_READ_BYTES)
+    if _is_cntk_signature(cntk_prefix):
+        return "cntk"
+    lightgbm_prefix = read_magic_bytes(path, _LIGHTGBM_SIGNATURE_READ_BYTES)
+    if _is_lightgbm_signature(lightgbm_prefix):
+        return "lightgbm"
 
     # For .bin files, do more sophisticated detection
     if ext == ".bin":

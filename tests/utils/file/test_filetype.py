@@ -77,8 +77,10 @@ def _build_cntkv2_bytes(*, include_structure: bool = True) -> bytes:
     return prefix + structure + b" inputs outputs "
 
 
-def _build_lightgbm_text(*, include_tree_details: bool = True) -> bytes:
+def _build_lightgbm_text(*, include_tree_details: bool = True, feature_name_padding: int = 0) -> bytes:
     lines = ["tree", "version=v4", "num_class=1", "num_tree_per_iteration=1", "max_feature_idx=2"]
+    if feature_name_padding:
+        lines.append("feature_names=" + ("f" * feature_name_padding))
     if include_tree_details:
         lines.extend(["Tree=0", "num_leaves=2", "split_feature=0", "leaf_value=0.1 0.2"])
     return ("\n".join(lines) + "\n").encode()
@@ -307,6 +309,36 @@ def test_detect_file_format_routes_renamed_strict_signature_formats(
     assert detect_file_format_from_magic(str(model_path)) == format_name
     assert detect_file_format_for_skip_filter(str(model_path)) == format_name
     assert detect_file_format(str(model_path)) == format_name
+
+
+def test_detect_file_format_keeps_zip_container_ownership_over_embedded_cntk_markers(tmp_path: Path) -> None:
+    archive_path = tmp_path / "cntk-looking.jpg"
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as archive:
+        archive.writestr("markers.bin", _build_cntkv2_bytes())
+
+    assert detect_file_format_from_magic(str(archive_path)) == "zip"
+    assert detect_file_format_for_skip_filter(str(archive_path)) == "zip"
+    assert detect_file_format(str(archive_path)) == "zip"
+
+
+def test_detect_file_format_keeps_coreml_ownership_over_embedded_cntk_markers(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(
+        tmp_path / "cntk-looking.jpg",
+        custom_class="\n\x07version\n\x03uid CompositeFunction primitive_functions",
+    )
+
+    assert detect_file_format_from_magic(str(model_path)) == "coreml"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "coreml"
+    assert detect_file_format(str(model_path)) == "coreml"
+
+
+def test_detect_file_format_routes_renamed_lightgbm_with_large_pre_tree_header(tmp_path: Path) -> None:
+    model_path = tmp_path / "large-header.jpg"
+    model_path.write_bytes(_build_lightgbm_text(feature_name_padding=10 * 1024))
+
+    assert detect_file_format_from_magic(str(model_path)) == "lightgbm"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "lightgbm"
+    assert detect_file_format(str(model_path)) == "lightgbm"
 
 
 @pytest.mark.parametrize(
