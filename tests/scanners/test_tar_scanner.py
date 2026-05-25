@@ -141,6 +141,32 @@ class TestTarScanner:
         assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
     @pytest.mark.parametrize(
+        ("payload", "dangerous_name"),
+        [
+            (b"import os\nos.execvpe('/bin/sh', ['sh', '-c', 'id'], {})\n", "os.execvpe"),
+            (b"from os import spawnv as run\nrun(0, '/bin/sh', ['sh', '-c', 'id'])\n", "os.spawnv"),
+            (b"import os\nos.posix_spawn('/bin/sh', ['sh', '-c', 'id'], {})\n", "os.posix_spawn"),
+            (b"import os\nos.startfile('payload.exe')\n", "os.startfile"),
+        ],
+    )
+    def test_scan_tar_flags_os_process_launch_python_member(
+        self, tmp_path: Path, payload: bytes, dangerous_name: str
+    ) -> None:
+        archive_path = tmp_path / "model_bundle.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].rule_code == "S101"
+        assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+    @pytest.mark.parametrize(
         "payload",
         [
             b"import os\nos.system.__call__('echo hidden')\n",
@@ -238,6 +264,9 @@ class TestTarScanner:
             b"import os\ndict.clear(os.__dict__)\nos.system([])\n",
             b"import subprocess\nsubprocess.__dict__.update({'run': len})\nsubprocess.run([])\n",
             b"import subprocess\nsubprocess.__dict__.clear()\nsubprocess.run([])\n",
+            b"import os\nos.execvpe = len\nos.execvpe([])\n",
+            b"import os\nos.__dict__.update({'spawnv': len})\nos.spawnv([])\n",
+            b"import os\nsetattr(os, 'posix_spawn', len)\nos.posix_spawn([])\n",
         ],
     )
     def test_scan_tar_allows_callable_captured_after_safe_overwrite(self, tmp_path: Path, payload: bytes) -> None:
@@ -279,6 +308,7 @@ class TestTarScanner:
                 b"getattr(os, '__dict__').update({'system': subprocess.run})\nos.system(['id'])\n"
             ),
             b"import os\nimport subprocess\ndict.update(os.__dict__, {'system': subprocess.run})\nos.system(['id'])\n",
+            b"import os\nimport subprocess\nos.execvpe = subprocess.run\nos.execvpe(['id'])\n",
         ],
     )
     def test_scan_tar_reports_dangerous_setattr_replacement(self, tmp_path: Path, payload: bytes) -> None:

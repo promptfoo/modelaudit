@@ -57,6 +57,31 @@ _MACHO_FAT_MAGICS = {
 }
 _VERSIONED_SHARED_OBJECT_SUFFIX_RE = re.compile(r"\.so(?:\.[0-9]+)+$")
 _PYTHON_ARCHIVE_MEMBER_SUFFIXES = (".py", ".pyw")
+_OS_PROCESS_EXECUTION_CALLS = frozenset(
+    {
+        "os.execl",
+        "os.execle",
+        "os.execlp",
+        "os.execlpe",
+        "os.execv",
+        "os.execve",
+        "os.execvp",
+        "os.execvpe",
+        "os.popen",
+        "os.posix_spawn",
+        "os.posix_spawnp",
+        "os.spawnl",
+        "os.spawnle",
+        "os.spawnlp",
+        "os.spawnlpe",
+        "os.spawnv",
+        "os.spawnve",
+        "os.spawnvp",
+        "os.spawnvpe",
+        "os.startfile",
+        "os.system",
+    }
+)
 _HIGH_RISK_PYTHON_CALLS = {
     "__import__",
     "__builtin__.__import__",
@@ -71,8 +96,6 @@ _HIGH_RISK_PYTHON_CALLS = {
     "eval",
     "exec",
     "importlib.import_module",
-    "os.popen",
-    "os.system",
     "pickle.load",
     "pickle.loads",
     "subprocess.call",
@@ -80,6 +103,7 @@ _HIGH_RISK_PYTHON_CALLS = {
     "subprocess.check_output",
     "subprocess.Popen",
     "subprocess.run",
+    *_OS_PROCESS_EXECUTION_CALLS,
 }
 # Retain broad subprocess coverage while excluding public APIs that only construct data.
 _KNOWN_NON_EXECUTING_SUBPROCESS_CALLS = {
@@ -108,10 +132,9 @@ _HIGH_RISK_PYTHON_CALL_RULE_CODES: dict[str, str] = {
     "eval": "S104",
     "exec": "S104",
     "importlib.import_module": "S107",
-    "os.popen": "S101",
-    "os.system": "S101",
     "pickle.load": "S213",
     "pickle.loads": "S213",
+    **dict.fromkeys(_OS_PROCESS_EXECUTION_CALLS, "S101"),
 }
 _HIGH_RISK_PYTHON_CALL_PREFIX_RULE_CODES: tuple[tuple[str, str], ...] = (("subprocess.", "S103"),)
 _FALLBACK_HIGH_RISK_RULE_CODE = "S104"

@@ -160,6 +160,64 @@ def test_scan_zip_flags_aliased_dangerous_python_member(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "dangerous_name",
+    [
+        "os.execl",
+        "os.execle",
+        "os.execlp",
+        "os.execlpe",
+        "os.execv",
+        "os.execve",
+        "os.execvp",
+        "os.execvpe",
+        "os.posix_spawn",
+        "os.posix_spawnp",
+        "os.spawnl",
+        "os.spawnle",
+        "os.spawnlp",
+        "os.spawnlpe",
+        "os.spawnv",
+        "os.spawnve",
+        "os.spawnvp",
+        "os.spawnvpe",
+        "os.startfile",
+    ],
+)
+def test_scan_zip_flags_os_process_launch_python_member(tmp_path: Path, dangerous_name: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", f"import os\n{dangerous_name}('payload')\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S101"
+    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+
+def test_scan_zip_flags_aliased_os_process_launch_python_member(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", "from os import spawnv as run\nrun(0, '/bin/sh', ['sh', '-c', 'id'])\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S101"
+    assert python_checks[0].details["reason"] == "high-risk calls: os.spawnv"
+
+
+@pytest.mark.parametrize(
     "source",
     [
         "import os\nos.system.__call__('echo hidden')\n",
@@ -303,6 +361,9 @@ def test_scan_zip_preserves_captured_dangerous_callable_before_overwrite(tmp_pat
         "import subprocess\nsubprocess.__dict__.update({'run': len})\nsubprocess.run([])\n",
         "import subprocess\nsubprocess.__dict__.pop('run')\nsubprocess.run([])\n",
         "import subprocess\nsubprocess.__dict__.clear()\nsubprocess.run([])\n",
+        "import os\nos.execvpe = len\nos.execvpe([])\n",
+        "import os\nos.__dict__.update({'spawnv': len})\nos.spawnv([])\n",
+        "import os\nsetattr(os, 'posix_spawn', len)\nos.posix_spawn([])\n",
     ],
 )
 def test_scan_zip_allows_callable_captured_after_safe_overwrite(tmp_path: Path, source: str) -> None:
@@ -353,6 +414,7 @@ def test_scan_zip_flags_from_import_dangerous_python_member(tmp_path: Path) -> N
             "import os\nimport subprocess\nos.__dict__.clear()\n"
             "os.__dict__.update({'system': subprocess.run})\nos.system(['id'])\n"
         ),
+        "import os\nimport subprocess\nos.execvpe = subprocess.run\nos.execvpe(['id'])\n",
     ],
 )
 def test_scan_zip_reports_dangerous_setattr_replacement(tmp_path: Path, source: str) -> None:
