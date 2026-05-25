@@ -976,8 +976,16 @@ def is_skops_archive(path: str) -> bool:
     return False
 
 
+def _is_nemo_root_config_member(member_name: str) -> bool:
+    """Return whether a TAR member is a safe spelling of a root NeMo config."""
+    normalized_name = member_name.replace("\\", "/").strip()
+    while normalized_name.startswith("./"):
+        normalized_name = normalized_name[2:]
+    return normalized_name.lower() in _NEMO_CONFIG_ENTRIES
+
+
 def is_nemo_archive(path: str) -> bool:
-    """Return whether a TAR-backed artifact has an archive-root NeMo config."""
+    """Return whether a TAR-backed artifact has a relative root NeMo config."""
     file_path = Path(path)
     if not file_path.is_file():
         return False
@@ -987,8 +995,7 @@ def is_nemo_archive(path: str) -> bool:
             for member in archive:
                 if not member.isfile():
                     continue
-                member_name = _normalize_archive_member_name(member.name)
-                if member_name.lower() in _NEMO_CONFIG_ENTRIES:
+                if _is_nemo_root_config_member(member.name):
                     return True
     except (OSError, tarfile.TarError):
         return False

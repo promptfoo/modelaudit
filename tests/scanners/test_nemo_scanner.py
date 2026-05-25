@@ -644,12 +644,13 @@ class TestCVE202523304HydraTarget:
             for check in result.checks
         )
 
-    def test_renamed_nested_config_basename_tar_is_not_promoted_to_nemo(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("config_name", ["docs/model_config.yaml", "/model_config.yaml"])
+    def test_renamed_non_root_config_tar_is_not_promoted_to_nemo(self, tmp_path: Path, config_name: str) -> None:
         path = _create_nemo_file(
             tmp_path,
             {"model": {"_target_": "os.system", "command": "echo pwned"}},
             filename="generic.jpg",
-            config_name="docs/model_config.yaml",
+            config_name=config_name,
         )
 
         assert not NemoScanner.can_handle(str(path))

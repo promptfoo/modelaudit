@@ -47,7 +47,7 @@ This page shows which model formats work in base install and which require optio
 - Scanner selection is extension- and content-aware; overlapping extensions may be dispatched to different scanners based on file content.
 - Runtime scanner selection is available with `modelaudit scan --scanners ...` and `--exclude-scanner ...`; use `modelaudit scan --list-scanners` to discover scanner IDs.
 - Compressed wrappers enforce limits via `compressed_max_decompressed_bytes`, `compressed_max_decompression_ratio`, and `compressed_max_depth`.
-- Renamed NeMo archives require TAR structure plus an archive-root `model_config.yaml` or `model_config.yml` member before Hydra `_target_` analysis is selected; nested same-name members remain on the generic TAR route. NeMo scanning also retains generic TAR embedded-member checks.
+- Renamed NeMo archives require TAR structure plus a relative archive-root `model_config.yaml` or `model_config.yml` member before Hydra `_target_` analysis is selected; nested or absolute same-name members remain on the generic TAR route. NeMo scanning also retains generic TAR embedded-member checks.
 - R serialized (`.rds/.rda/.rdata`) support is static-only: ModelAudit does not execute R code or evaluate objects in an R runtime.
 - CNTK scanner scope in v1 is `.dnn`/`.cmf`; `.model` remains owned by XGBoost overlap handling.
 - Llamafile wrappers are executable by design: executable presence is reported at `INFO`, and severity escalates only when suspicious runtime indicators or malformed embedded payloads are found.

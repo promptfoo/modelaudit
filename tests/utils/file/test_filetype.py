@@ -743,10 +743,11 @@ def test_detect_file_format_routes_renamed_nemo_archive_by_root_config(tmp_path:
     assert detect_file_format_for_skip_filter(str(archive_path)) == "nemo"
 
 
-def test_detect_file_format_keeps_nested_config_basename_on_tar_route(tmp_path: Path) -> None:
+@pytest.mark.parametrize("config_name", ["docs/model_config.yaml", "/model_config.yaml", "../model_config.yaml"])
+def test_detect_file_format_keeps_non_root_config_names_on_tar_route(tmp_path: Path, config_name: str) -> None:
     archive_path = tmp_path / "generic.jpg"
     with tarfile.open(archive_path, "w") as archive:
-        info = tarfile.TarInfo("docs/model_config.yaml")
+        info = tarfile.TarInfo(config_name)
         payload = b"model:\n  _target_: os.system\n"
         info.size = len(payload)
         archive.addfile(info, io.BytesIO(payload))
