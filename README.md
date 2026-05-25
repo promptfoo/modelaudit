@@ -77,12 +77,12 @@ ModelAudit includes 44 registered scanners covering model, archive, and configur
 | **CoreML**              | `.mlmodel`                                                                | LOW    |
 | **MXNet**               | `*-symbol.json`, `*-NNNN.params`                                          | LOW    |
 | **NeMo**                | `.nemo`                                                                   | MEDIUM |
-| **CNTK**                | `.dnn`, `.cmf`                                                            | MEDIUM |
+| **CNTK**                | `.dnn`, `.cmf`, signature-valid renamed artifacts                         | MEDIUM |
 | **RKNN**                | `.rknn`                                                                   | MEDIUM |
 | **Torch7**              | Serialized artifacts (`.t7`, `.th`, `.net` or renamed)                    | HIGH   |
 | **CatBoost**            | `.cbm`                                                                    | MEDIUM |
 | **XGBoost**             | `.bst`, `.model`, `.json`, `.ubj`                                         | MEDIUM |
-| **LightGBM**            | `.lgb`, `.lightgbm`, `.model`                                             | MEDIUM |
+| **LightGBM**            | `.lgb`, `.lightgbm`, `.model`, signature-valid renamed artifacts          | MEDIUM |
 | **Llamafile**           | Executable wrappers (`.llamafile`, `.exe`, extensionless or renamed)      | MEDIUM |
 | **TorchServe**          | `.mar`                                                                    | HIGH   |
 | **SafeTensors**         | `.safetensors`                                                            | LOW    |
