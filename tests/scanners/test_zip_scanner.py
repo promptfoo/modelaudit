@@ -170,6 +170,13 @@ def test_scan_zip_flags_aliased_dangerous_python_member(tmp_path: Path) -> None:
         "import os\nfrom os import system as run\nos.system = len\nrun('echo hidden')\n",
         "import os\nfrom os import *\nos.system = len\nsystem('echo hidden')\n",
         ("import os\ndef run(action=os.system):\n    os.system = len\n    action('echo hidden')\n"),
+        "import os\nrun = os.system\nsetattr(os, 'system', len)\nrun('echo hidden')\n",
+        (
+            "import os\n"
+            "setattr = lambda target, key, value: None\n"
+            "setattr(os, 'system', len)\n"
+            "os.system('echo hidden')\n"
+        ),
     ],
 )
 def test_scan_zip_preserves_captured_dangerous_callable_before_overwrite(tmp_path: Path, source: str) -> None:
@@ -198,6 +205,11 @@ def test_scan_zip_preserves_captured_dangerous_callable_before_overwrite(tmp_pat
         "import os\nos.system = len\nfrom os import system as run\nrun([])\n",
         "import os\nos.system = len\nfrom os import *\nsystem([])\n",
         ("import os\nos.system = len\ndef run(action=os.system):\n    action([])\n"),
+        "import os\nsetattr(os, 'system', len)\nos.system([])\n",
+        "import os\nreplace = setattr\nreplace(os, 'system', len)\nos.system([])\n",
+        "import os\nresult = setattr(os, 'system', len)\nos.system([])\n",
+        "import os\nresult: None = setattr(os, 'system', len)\nos.system([])\n",
+        "import os\nsetattr(os, 'system', len)\nrun = os.system\nrun([])\n",
     ],
 )
 def test_scan_zip_allows_callable_captured_after_safe_overwrite(tmp_path: Path, source: str) -> None:
@@ -224,6 +236,29 @@ def test_scan_zip_flags_from_import_dangerous_python_member(tmp_path: Path) -> N
     ]
     assert len(python_checks) == 1
     assert python_checks[0].severity == IssueSeverity.WARNING
+    assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import os\nimport subprocess\nsetattr(os, 'system', subprocess.run)\nos.system(['id'])\n",
+        "import os\nimport subprocess\nresult = setattr(os, 'system', subprocess.run)\nos.system(['id'])\n",
+    ],
+)
+def test_scan_zip_reports_dangerous_setattr_replacement(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
 

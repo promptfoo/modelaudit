@@ -391,6 +391,11 @@ def test_scan_detects_implicit_builtins_handler_execution_primitive(
         ),
         (
             b"def handle(data, context):\n"
+            b"    setattr(globals()['__builtins__'], 'eval', len)\n"
+            b"    return globals()['__builtins__']['eval']([])\n"
+        ),
+        (
+            b"def handle(data, context):\n"
             b"    globals()['__builtins__']['eval'] = len\n"
             b"    run = globals()['__builtins__']['eval']\n"
             b"    return run([])\n"
@@ -462,6 +467,11 @@ def test_scan_allows_benign_builtin_shaped_handler_source(tmp_path: Path, handle
             b"def handle(data, context):\n"
             b"    replace = globals()['__builtins__'].update\n"
             b"    replace({'eval': __builtins__['exec']})\n"
+            b"    return globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    setattr(globals()['__builtins__'], 'eval', __builtins__['exec'])\n"
             b"    return globals()['__builtins__']['eval']('pass')\n"
         ),
     ],

@@ -359,6 +359,9 @@ class TestJITScriptDetector:
                 b"invoke = globals()['__builtins__']['eval'].__call__\n"
                 b"invoke([])\n"
             ),
+            b"import builtins\nsetattr(builtins, 'eval', len)\nbuiltins.eval([])\n",
+            b"import builtins\nresult = setattr(builtins, 'eval', len)\nbuiltins.eval([])\n",
+            (b"import builtins as bi\nfrom builtins import setattr as assign\nassign(bi, 'eval', len)\nbi.eval([])\n"),
             b"def payload():\n    eval = len\n    return eval([])\n",
             (
                 b"def payload():\n"
@@ -406,6 +409,7 @@ class TestJITScriptDetector:
                 b"globals()['__builtins__']['exec'] = len\n"
                 b"globals()['__builtins__']['eval']('pass')\n"
             ),
+            b"import builtins\nsetattr(builtins, 'eval', builtins.exec)\nbuiltins.eval('pass')\n",
         ],
     )
     def test_scan_model_detects_dangerous_builtin_reassignment(self, source: bytes) -> None:
@@ -466,6 +470,21 @@ class TestJITScriptDetector:
                 b"import helpers as replace\n"
                 b"replace({'eval': len})\n"
                 b"globals()['__builtins__']['eval']('1 + 1')\n"
+            ),
+            (b"import builtins\nif replace_builtin:\n    setattr(builtins, 'eval', len)\nbuiltins.eval('1 + 1')\n"),
+            (
+                b"import builtins\n"
+                b"setattr = lambda target, key, value: None\n"
+                b"setattr(builtins, 'eval', len)\n"
+                b"builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"try:\n"
+                b"    setattr(builtins, 'eval', len)\n"
+                b"except Exception:\n"
+                b"    pass\n"
+                b"builtins.eval('1 + 1')\n"
             ),
         ],
     )

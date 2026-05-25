@@ -147,6 +147,13 @@ class TestTarScanner:
             b"import os\ninvoke = os.system.__call__\nos.system = len\ninvoke('echo hidden')\n",
             b"import os\nrun = os.system\nos.system = len\nrun('echo hidden')\n",
             b"import os\nfrom os import system as run\nos.system = len\nrun('echo hidden')\n",
+            b"import os\nrun = os.system\nsetattr(os, 'system', len)\nrun('echo hidden')\n",
+            (
+                b"import os\n"
+                b"setattr = lambda target, key, value: None\n"
+                b"setattr(os, 'system', len)\n"
+                b"os.system('echo hidden')\n"
+            ),
         ],
     )
     def test_scan_tar_preserves_captured_dangerous_callable_before_overwrite(
@@ -172,6 +179,9 @@ class TestTarScanner:
             b"import os\nos.system = len\ninvoke = os.system.__call__\ninvoke([])\n",
             b"import os\nos.system = len\nrun = os.system\nrun([])\n",
             b"import os\nos.system = len\nfrom os import system as run\nrun([])\n",
+            b"import os\nsetattr(os, 'system', len)\nos.system([])\n",
+            b"import os\nreplace = setattr\nreplace(os, 'system', len)\nos.system([])\n",
+            b"import os\nsetattr(os, 'system', len)\nrun = os.system\nrun([])\n",
         ],
     )
     def test_scan_tar_allows_callable_captured_after_safe_overwrite(self, tmp_path: Path, payload: bytes) -> None:
@@ -201,6 +211,21 @@ class TestTarScanner:
         assert len(python_checks) == 1
         assert python_checks[0].status == CheckStatus.FAILED
         assert python_checks[0].severity == IssueSeverity.WARNING
+        assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
+    def test_scan_tar_reports_dangerous_setattr_replacement(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = b"import os\nimport subprocess\nsetattr(os, 'system', subprocess.run)\nos.system(['id'])\n"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
         assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
     def test_scan_tar_flags_builtins_getattr_keyword_call_dangerous_python_member(self, tmp_path: Path) -> None:

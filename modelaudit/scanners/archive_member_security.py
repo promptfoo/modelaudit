@@ -297,6 +297,12 @@ _STATIC_DIRECT_MUTATION_ALIAS_PREFIX = "<static direct mutation alias>:"
 _CAPTURED_CALLABLE_REFERENCE_PREFIX = "<captured callable>:"
 _BUILTIN_NAMESPACE_NAMES = {"__builtin__", "__builtins__"}
 _STATIC_MAPPING_MUTATORS = {"__setitem__", "update"}
+_STATIC_ATTRIBUTE_MUTATION_HELPERS = {
+    "setattr",
+    "__builtin__.setattr",
+    "__builtins__.setattr",
+    "builtins.setattr",
+}
 
 
 def _resolve_global_namespace_mappings(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
@@ -801,6 +807,20 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for target_names, value in mutations:
             self._bind_static_reference_names_to_value(target_names, value)
 
+    def _bind_static_setattr_mutation(self, node: ast.Call) -> None:
+        """Model certain builtin ``setattr`` writes to one resolved reference."""
+        if len(node.args) != 3 or node.keywords:
+            return
+
+        helper_names = self._resolve_invoked_reference_names(node.func)
+        if helper_names is None or not helper_names.issubset(_STATIC_ATTRIBUTE_MUTATION_HELPERS):
+            return
+
+        target_names = _resolve_static_attribute_names(node.args[0], node.args[1], self.alias_scopes)
+        if target_names is None or len(target_names) != 1:
+            return
+        self._bind_static_reference_names_to_value(target_names, node.args[2])
+
     def _bind_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
         if isinstance(target, ast.Name):
             self._bind_name(target.id, self._resolve_bound_value_names(value))
@@ -994,6 +1014,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
+        if isinstance(node.value, ast.Call):
+            self._bind_static_setattr_mutation(node.value)
         for target in node.targets:
             self._bind_target_to_value(target, node.value)
             self.visit(target)
@@ -1003,6 +1025,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self.visit(node.annotation)
         if node.value is not None:
             self.visit(node.value)
+            if isinstance(node.value, ast.Call):
+                self._bind_static_setattr_mutation(node.value)
             self._bind_target_to_value(node.target, node.value)
         else:
             self._shadow_binding_target(node.target)
@@ -1022,6 +1046,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self.visit(node.value)
         if isinstance(node.value, ast.Call):
             self._bind_direct_builtin_namespace_mutation(node.value)
+            self._bind_static_setattr_mutation(node.value)
 
     def _visit_loop(self, node: ast.For | ast.AsyncFor) -> None:
         self.visit(node.iter)
