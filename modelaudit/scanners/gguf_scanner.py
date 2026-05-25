@@ -39,6 +39,31 @@ GGML_VARIANT_MAGICS = {
 GGUF_PARSE_INCONCLUSIVE_REASON = "gguf_parse_incomplete"
 GGUF_STRUCTURE_INCONCLUSIVE_REASON = "gguf_structure_validation_failed"
 GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON = "gguf_duplicate_metadata_keys"
+GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON = "gguf_metadata_limit_exceeded"
+GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON = "gguf_tensor_limit_exceeded"
+
+
+class _GgufMetadataLimitExceeded(ValueError):
+    """Raised when declared GGUF metadata would exceed bounded parsing."""
+
+
+class _GgufTensorLimitExceeded(ValueError):
+    """Raised when declared GGUF tensor information would exceed bounded parsing."""
+
+
+class _GgufByteBudget:
+    """Track bounded parser input before allocating decoded GGUF values."""
+
+    def __init__(self, limit: int, section: str, error_type: type[ValueError]) -> None:
+        self.limit = limit
+        self.section = section
+        self.error_type = error_type
+        self.consumed = 0
+
+    def consume(self, size: int) -> None:
+        if size > self.limit - self.consumed:
+            raise self.error_type(f"GGUF {self.section} bytes exceed limit {self.limit}")
+        self.consumed += size
 
 
 class GgufScanner(BaseScanner):
@@ -47,6 +72,13 @@ class GgufScanner(BaseScanner):
     name = "gguf"
     description = "Validates GGUF/GGML model file headers, metadata, and tensor integrity"
     default_max_file_read_size: ClassVar[int] = 0
+    DEFAULT_MAX_METADATA_KEYS: ClassVar[int] = 100_000
+    DEFAULT_MAX_METADATA_BYTES: ClassVar[int] = 256 * 1024 * 1024
+    DEFAULT_MAX_METADATA_ARRAY_ITEMS: ClassVar[int] = 1_000_000
+    DEFAULT_MAX_TOTAL_METADATA_ARRAY_ITEMS: ClassVar[int] = 2_000_000
+    DEFAULT_MAX_METADATA_ARRAY_DEPTH: ClassVar[int] = 32
+    DEFAULT_MAX_TENSORS: ClassVar[int] = 1_000_000
+    DEFAULT_MAX_TENSOR_INFO_BYTES: ClassVar[int] = 256 * 1024 * 1024
     # Include common GGML variant extensions as well
     supported_extensions: ClassVar[list[str]] = [
         ".gguf",
@@ -63,6 +95,34 @@ class GgufScanner(BaseScanner):
             "max_uncompressed",
             100 * 1024 * 1024 * 1024,
         )  # 100GB for large GGUF models
+        self.max_metadata_keys = self._normalize_positive_int_config(
+            self.config.get("gguf_max_metadata_keys"),
+            self.DEFAULT_MAX_METADATA_KEYS,
+        )
+        self.max_metadata_bytes = self._normalize_positive_int_config(
+            self.config.get("gguf_max_metadata_bytes"),
+            self.DEFAULT_MAX_METADATA_BYTES,
+        )
+        self.max_metadata_array_items = self._normalize_positive_int_config(
+            self.config.get("gguf_max_metadata_array_items"),
+            self.DEFAULT_MAX_METADATA_ARRAY_ITEMS,
+        )
+        self.max_total_metadata_array_items = self._normalize_positive_int_config(
+            self.config.get("gguf_max_total_metadata_array_items"),
+            self.DEFAULT_MAX_TOTAL_METADATA_ARRAY_ITEMS,
+        )
+        self.max_metadata_array_depth = self._normalize_positive_int_config(
+            self.config.get("gguf_max_metadata_array_depth"),
+            self.DEFAULT_MAX_METADATA_ARRAY_DEPTH,
+        )
+        self.max_tensors = self._normalize_positive_int_config(
+            self.config.get("gguf_max_tensors"),
+            self.DEFAULT_MAX_TENSORS,
+        )
+        self.max_tensor_info_bytes = self._normalize_positive_int_config(
+            self.config.get("gguf_max_tensor_info_bytes"),
+            self.DEFAULT_MAX_TENSOR_INFO_BYTES,
+        )
 
     @staticmethod
     def _mark_inconclusive(result: ScanResult, reason: str) -> None:
@@ -160,7 +220,18 @@ class GgufScanner(BaseScanner):
         self._finish_result(result)
         return result
 
-    def _read_string(self, f: BinaryIO, max_length: int = 1024 * 1024) -> str:
+    @staticmethod
+    def _read_bytes(f: BinaryIO, size: int, budget: _GgufByteBudget | None = None) -> bytes:
+        if budget is not None:
+            budget.consume(size)
+        return f.read(size)
+
+    def _read_string(
+        self,
+        f: BinaryIO,
+        max_length: int = 1024 * 1024,
+        budget: _GgufByteBudget | None = None,
+    ) -> str:
         """Read a string with length checking for security.
 
         Args:
@@ -173,10 +244,10 @@ class GgufScanner(BaseScanner):
         Raises:
             ValueError: String length exceeds limit, unexpected EOF, or other parsing error
         """
-        (length,) = struct.unpack("<Q", f.read(8))
+        (length,) = struct.unpack("<Q", self._read_bytes(f, 8, budget))
         if length > max_length:
             raise ValueError(f"String length {length} exceeds maximum {max_length}")
-        data = f.read(length)
+        data = self._read_bytes(f, length, budget)
         if len(data) != length:
             raise ValueError("Unexpected end of file while reading string")
         return data.decode("utf-8", "ignore")
@@ -210,13 +281,27 @@ class GgufScanner(BaseScanner):
             },
         )
 
+        if n_kv > self.max_metadata_keys:
+            self._report_metadata_limit(
+                result,
+                f"GGUF declares {n_kv} metadata keys, exceeding limit {self.max_metadata_keys}",
+                declared_metadata_keys=n_kv,
+            )
+            return
+
         # Parse metadata with security checks
         metadata: dict[str, Any] = {}
         chat_templates: dict[str, str] = {}
         metadata_key_occurrences: dict[str, int] = {}
+        metadata_array_items_read = [0]
+        metadata_byte_budget = _GgufByteBudget(
+            self.max_metadata_bytes,
+            "metadata",
+            _GgufMetadataLimitExceeded,
+        )
         try:
             for _i in range(n_kv):
-                key = self._read_string(f)
+                key = self._read_string(f, budget=metadata_byte_budget)
 
                 # Security check for suspicious keys
                 if any(x in key for x in ("../", "..\\", "/", "\\")):
@@ -230,8 +315,13 @@ class GgufScanner(BaseScanner):
                         rule_code="S405",
                     )
 
-                (value_type,) = struct.unpack("<I", f.read(4))
-                value = self._read_value(f, value_type)
+                (value_type,) = struct.unpack("<I", self._read_bytes(f, 4, metadata_byte_budget))
+                value = self._read_value(
+                    f,
+                    value_type,
+                    array_items_read=metadata_array_items_read,
+                    byte_budget=metadata_byte_budget,
+                )
                 occurrence = metadata_key_occurrences.get(key, 0) + 1
                 metadata_key_occurrences[key] = occurrence
                 if self._is_chat_template_key(key) and isinstance(value, str) and value.strip():
@@ -253,6 +343,11 @@ class GgufScanner(BaseScanner):
             result.metadata["metadata"] = metadata
             self._report_duplicate_metadata_keys(metadata_key_occurrences, result)
             self._scan_embedded_chat_templates(chat_templates, result)
+        except _GgufMetadataLimitExceeded as e:
+            self._report_metadata_limit(result, str(e))
+            self._report_duplicate_metadata_keys(metadata_key_occurrences, result)
+            self._scan_embedded_chat_templates(chat_templates, result)
+            return
         except Exception as e:
             # Parsing errors are informational - indicate corruption/format issues, not security threats
             result.add_check(
@@ -267,6 +362,10 @@ class GgufScanner(BaseScanner):
             self._mark_inconclusive(result, GGUF_PARSE_INCONCLUSIVE_REASON)
             self._report_duplicate_metadata_keys(metadata_key_occurrences, result)
             self._scan_embedded_chat_templates(chat_templates, result)
+            return
+
+        if n_tensors > self.max_tensors:
+            self._report_tensor_limit(result, n_tensors)
             return
 
         # Align to tensor data
@@ -302,10 +401,15 @@ class GgufScanner(BaseScanner):
 
         # Parse tensor information
         tensors = []
+        tensor_byte_budget = _GgufByteBudget(
+            self.max_tensor_info_bytes,
+            "tensor information",
+            _GgufTensorLimitExceeded,
+        )
         try:
             for _i in range(n_tensors):
-                t_name = self._read_string(f)
-                (nd,) = struct.unpack("<I", f.read(4))
+                t_name = self._read_string(f, budget=tensor_byte_budget)
+                (nd,) = struct.unpack("<I", self._read_bytes(f, 4, tensor_byte_budget))
 
                 # Hard limit on dimensions to prevent DoS attacks
                 if nd > 1000:
@@ -319,6 +423,7 @@ class GgufScanner(BaseScanner):
                         details={"tensor_name": t_name, "dimensions": nd, "max_allowed": 1000},
                     )
                     # Skip the rest of this tensor's data to prevent DoS
+                    tensor_byte_budget.consume(nd * 8 + 4 + 8)
                     f.seek(nd * 8 + 4 + 8, os.SEEK_CUR)  # Skip dims + type + offset
                     continue
 
@@ -333,9 +438,9 @@ class GgufScanner(BaseScanner):
                         rule_code="S804",
                     )
 
-                dims = [struct.unpack("<Q", f.read(8))[0] for _ in range(nd)]
-                (t_type,) = struct.unpack("<I", f.read(4))
-                (offset,) = struct.unpack("<Q", f.read(8))
+                dims = [struct.unpack("<Q", self._read_bytes(f, 8, tensor_byte_budget))[0] for _ in range(nd)]
+                (t_type,) = struct.unpack("<I", self._read_bytes(f, 4, tensor_byte_budget))
+                (offset,) = struct.unpack("<Q", self._read_bytes(f, 8, tensor_byte_budget))
 
                 tensors.append(
                     {
@@ -347,6 +452,9 @@ class GgufScanner(BaseScanner):
                 )
 
             result.metadata["tensors"] = [{"name": t["name"], "type": t["type"], "dims": t["dims"]} for t in tensors]
+        except _GgufTensorLimitExceeded as e:
+            self._report_tensor_limit(result, n_tensors, message=str(e))
+            return
         except Exception as e:
             # Parsing errors are informational - indicate corruption/format issues, not security threats
             result.add_check(
@@ -601,36 +709,70 @@ class GgufScanner(BaseScanner):
 
         result.bytes_scanned = file_size
 
-    def _read_value(self, f: BinaryIO, vtype: int) -> Any:
+    def _read_value(
+        self,
+        f: BinaryIO,
+        vtype: int,
+        *,
+        array_depth: int = 0,
+        array_items_read: list[int] | None = None,
+        byte_budget: _GgufByteBudget | None = None,
+    ) -> Any:
         """Read a value of the specified type with security checks."""
         if vtype == 0:  # UINT8
-            return struct.unpack("<B", f.read(1))[0]
+            return struct.unpack("<B", self._read_bytes(f, 1, byte_budget))[0]
         if vtype == 1:  # INT8
-            return struct.unpack("<b", f.read(1))[0]
+            return struct.unpack("<b", self._read_bytes(f, 1, byte_budget))[0]
         if vtype == 2:  # UINT16
-            return struct.unpack("<H", f.read(2))[0]
+            return struct.unpack("<H", self._read_bytes(f, 2, byte_budget))[0]
         if vtype == 3:  # INT16
-            return struct.unpack("<h", f.read(2))[0]
+            return struct.unpack("<h", self._read_bytes(f, 2, byte_budget))[0]
         if vtype == 4:  # UINT32
-            return struct.unpack("<I", f.read(4))[0]
+            return struct.unpack("<I", self._read_bytes(f, 4, byte_budget))[0]
         if vtype == 5:  # INT32
-            return struct.unpack("<i", f.read(4))[0]
+            return struct.unpack("<i", self._read_bytes(f, 4, byte_budget))[0]
         if vtype == 6:  # FLOAT32
-            return struct.unpack("<f", f.read(4))[0]
+            return struct.unpack("<f", self._read_bytes(f, 4, byte_budget))[0]
         if vtype == 7:  # BOOL
-            return struct.unpack("<B", f.read(1))[0] != 0
+            return struct.unpack("<B", self._read_bytes(f, 1, byte_budget))[0] != 0
         if vtype == 8:  # STRING
-            return self._read_string(f)
+            return self._read_string(f, budget=byte_budget)
         if vtype == 9:  # ARRAY
-            subtype = struct.unpack("<I", f.read(4))[0]
-            (count,) = struct.unpack("<Q", f.read(8))
-            return [self._read_value(f, subtype) for _ in range(count)]
+            subtype = struct.unpack("<I", self._read_bytes(f, 4, byte_budget))[0]
+            (count,) = struct.unpack("<Q", self._read_bytes(f, 8, byte_budget))
+            next_depth = array_depth + 1
+            if next_depth > self.max_metadata_array_depth:
+                raise _GgufMetadataLimitExceeded(
+                    f"GGUF metadata array depth {next_depth} exceeds limit {self.max_metadata_array_depth}"
+                )
+            if count > self.max_metadata_array_items:
+                raise _GgufMetadataLimitExceeded(
+                    f"GGUF metadata array item count {count} exceeds per-array limit {self.max_metadata_array_items}"
+                )
+
+            if array_items_read is None:
+                array_items_read = [0]
+            if count > self.max_total_metadata_array_items - array_items_read[0]:
+                raise _GgufMetadataLimitExceeded(
+                    f"GGUF metadata array item count exceeds aggregate limit {self.max_total_metadata_array_items}"
+                )
+            array_items_read[0] += count
+            return [
+                self._read_value(
+                    f,
+                    subtype,
+                    array_depth=next_depth,
+                    array_items_read=array_items_read,
+                    byte_budget=byte_budget,
+                )
+                for _ in range(count)
+            ]
         if vtype == 10:  # UINT64
-            return struct.unpack("<Q", f.read(8))[0]
+            return struct.unpack("<Q", self._read_bytes(f, 8, byte_budget))[0]
         if vtype == 11:  # INT64
-            return struct.unpack("<q", f.read(8))[0]
+            return struct.unpack("<q", self._read_bytes(f, 8, byte_budget))[0]
         if vtype == 12:  # FLOAT64
-            return struct.unpack("<d", f.read(8))[0]
+            return struct.unpack("<d", self._read_bytes(f, 8, byte_budget))[0]
 
         raise ValueError(f"Unknown metadata type {vtype}")
 
@@ -668,6 +810,45 @@ class GgufScanner(BaseScanner):
                 "occurrences": duplicate_keys,
                 "analysis_incomplete": True,
                 "scan_outcome_reason": GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON,
+            },
+            rule_code="S902",
+        )
+
+    def _report_metadata_limit(self, result: ScanResult, message: str, **details: Any) -> None:
+        self._mark_inconclusive(result, GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON)
+        result.add_check(
+            name="GGUF Metadata Resource Limits",
+            passed=False,
+            message=message,
+            severity=IssueSeverity.INFO,
+            location=self.current_file_path,
+            details={
+                "max_metadata_keys": self.max_metadata_keys,
+                "max_metadata_bytes": self.max_metadata_bytes,
+                "max_metadata_array_items": self.max_metadata_array_items,
+                "max_total_metadata_array_items": self.max_total_metadata_array_items,
+                "max_metadata_array_depth": self.max_metadata_array_depth,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON,
+                **details,
+            },
+            rule_code="S902",
+        )
+
+    def _report_tensor_limit(self, result: ScanResult, declared_tensors: int, *, message: str | None = None) -> None:
+        self._mark_inconclusive(result, GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON)
+        result.add_check(
+            name="GGUF Tensor Resource Limits",
+            passed=False,
+            message=message or f"GGUF declares {declared_tensors} tensors, exceeding limit {self.max_tensors}",
+            severity=IssueSeverity.INFO,
+            location=self.current_file_path,
+            details={
+                "declared_tensors": declared_tensors,
+                "max_tensors": self.max_tensors,
+                "max_tensor_info_bytes": self.max_tensor_info_bytes,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON,
             },
             rule_code="S902",
         )
@@ -711,16 +892,32 @@ class GgufScanner(BaseScanner):
 
                 # Read metadata fields
                 gguf_metadata = {}
+                if metadata_count > self.max_metadata_keys:
+                    metadata["error_reading_metadata"] = (
+                        f"GGUF declares {metadata_count} metadata keys, exceeding limit {self.max_metadata_keys}"
+                    )
+                    return metadata
+                metadata_array_items_read = [0]
+                metadata_byte_budget = _GgufByteBudget(
+                    self.max_metadata_bytes,
+                    "metadata",
+                    _GgufMetadataLimitExceeded,
+                )
                 for _ in range(metadata_count):
                     try:
                         # Read key
-                        key = self._read_string(f)
+                        key = self._read_string(f, budget=metadata_byte_budget)
 
                         # Read value type
-                        vtype = struct.unpack("<I", f.read(4))[0]
+                        vtype = struct.unpack("<I", self._read_bytes(f, 4, metadata_byte_budget))[0]
 
                         # Read value
-                        value = self._read_value(f, vtype)
+                        value = self._read_value(
+                            f,
+                            vtype,
+                            array_items_read=metadata_array_items_read,
+                            byte_budget=metadata_byte_budget,
+                        )
                         gguf_metadata[key] = value
 
                     except Exception as e:
