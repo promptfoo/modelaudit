@@ -1129,6 +1129,37 @@ class TestCVE202523304HydraTarget:
         )
         assert not any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
 
+    def test_referenced_compressed_nemo_over_route_budget_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_ENTRIES", 2)
+        nested_path = tmp_path / "referenced-payload.tar.gz"
+        with tarfile.open(nested_path, "w:gz") as archive:
+            _add_tar_bytes(archive, "assets/one.bin", b"one")
+            _add_tar_bytes(archive, "assets/two.bin", b"two")
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n")
+        path = tmp_path / "referenced-container.jpg"
+        config = {"model": {"_target_": "nemo.Model"}, "artifact": "nemo:assets/payload.tar.gz"}
+        with tarfile.open(path, "w") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", yaml.safe_dump(config).encode())
+            archive.add(nested_path, arcname="assets/payload.tar.gz")
+
+        result = scan_file(str(path), config={"cache_scan_results": False, "max_tar_entries": 100})
+
+        assert result.scanner_name == "nemo"
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "NeMo Routing"
+            and check.status == CheckStatus.FAILED
+            and "assets/payload.tar.gz" in str(check.location)
+            for check in result.checks
+        )
+        assert not any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
+
     def test_declared_nemo_scans_root_config_beyond_renamed_route_budget(
         self,
         tmp_path: Path,

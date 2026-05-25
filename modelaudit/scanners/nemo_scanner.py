@@ -1005,8 +1005,20 @@ class NemoScanner(BaseScanner):
         """Preserve actionable nested findings while NeMo adds CVE attribution."""
         archive_location = f"{archive_path}:{entry_name}"
         actionable_severities = {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        reasons = nested_result.metadata.get(_INCONCLUSIVE_REASONS_METADATA_KEY)
+        nested_reasons = reasons if isinstance(reasons, list) else []
+        propagated_reasons = [str(reason) for reason in nested_reasons if reason == "nemo_routing_incomplete"]
+        nested_incomplete = nested_result.metadata.get(
+            _INCONCLUSIVE_METADATA_KEY
+        ) == INCONCLUSIVE_SCAN_OUTCOME and bool(propagated_reasons)
+        if nested_incomplete:
+            for reason in propagated_reasons:
+                mark_archive_scan_incomplete(result, reason)
+
         for check in nested_result.checks:
-            if check.status != CheckStatus.FAILED or check.severity not in actionable_severities:
+            if check.status != CheckStatus.FAILED or (
+                check.severity not in actionable_severities and not nested_incomplete
+            ):
                 continue
             check.location = rewrite_extracted_member_location(
                 check.location,
@@ -1016,7 +1028,7 @@ class NemoScanner(BaseScanner):
             )
             result.checks.append(check)
         for issue in nested_result.issues:
-            if issue.severity not in actionable_severities:
+            if issue.severity not in actionable_severities and not nested_incomplete:
                 continue
             issue.location = rewrite_extracted_member_location(
                 issue.location,
