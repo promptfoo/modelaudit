@@ -1048,6 +1048,10 @@ def test_pytorch_zip_scans_unmarked_python_blobs_in_archive_data(tmp_path: Path)
         b"namespace = globals()\nnamespace['__builtins__']['ev' + 'al']('1 + 1')\n",
         b"namespace = globals()\nnamespace.get('__builtins__').get('eval')('1 + 1')\n",
         b"namespace = globals()\ngetattr(namespace['__builtins__'], 'eval')('1 + 1')\n",
+        b"lookup = globals().get\nlookup('__builtins__').get('ev' + 'al')('1 + 1')\n",
+        b"namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n",
+        b"lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
+        b"lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
     ],
 )
 def test_pytorch_zip_scans_static_builtin_indirection_in_archive_data(tmp_path: Path, payload: bytes) -> None:
@@ -1118,6 +1122,8 @@ def test_pytorch_zip_scans_aliased_modeled_builtins_in_archive_data(
             b"namespace['__builtins__']['eval']([])\n"
         ),
         (b"namespace = globals()\nnamespace['__builtins__']['eval'] = len\nnamespace['__builtins__']['eval']([])\n"),
+        b"lookup = globals().get\nlookup('__builtins__').get('len')([1])\n",
+        b"mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
         b"def payload():\n    eval = len\n    return eval([])\n",
         (
             b"def payload():\n"

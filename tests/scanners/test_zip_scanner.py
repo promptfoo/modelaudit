@@ -224,6 +224,10 @@ def test_scan_zip_flags_builtins_getattr_keyword_call_dangerous_python_member(tm
         "namespace = globals()\nnamespace['__builtins__']['ev' + 'al']('1 + 1')\n",
         "namespace = globals()\nnamespace.get('__builtins__').get('eval')('1 + 1')\n",
         "namespace = globals()\ngetattr(namespace['__builtins__'], 'eval')('1 + 1')\n",
+        "lookup = globals().get\nlookup('__builtins__').get('ev' + 'al')('1 + 1')\n",
+        "namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n",
+        "lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
+        "lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
     ],
 )
 def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path, source: str) -> None:
@@ -253,6 +257,8 @@ def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path
         "namespace = globals()\nnamespace['__builtins__']['len']([1])\n",
         ("namespace = globals()\nnamespace = {'__builtins__': {'eval': len}}\nnamespace['__builtins__']['eval']([])\n"),
         ("namespace = globals()\nnamespace['__builtins__']['eval'] = len\nnamespace['__builtins__']['eval']([])\n"),
+        "lookup = globals().get\nlookup('__builtins__').get('len')([1])\n",
+        "mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
     ],
 )
 def test_scan_zip_allows_benign_builtin_shaped_source(tmp_path: Path, source: str) -> None:

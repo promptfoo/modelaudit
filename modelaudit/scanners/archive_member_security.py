@@ -311,9 +311,27 @@ def _resolve_global_namespace_mappings(node: ast.AST, alias_scopes: _AliasScopes
     return None
 
 
+def _resolve_aliased_mapping_accessor_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+    """Resolve receivers for a statically aliased mapping accessor invocation."""
+    if not isinstance(node, ast.Call) or not node.args:
+        return None
+
+    helper_name = _resolve_call_name(node.func)
+    resolved_helper_names = _apply_aliases(helper_name, alias_scopes) if helper_name is not None else None
+    if resolved_helper_names is None:
+        return None
+
+    roots = {
+        helper_name.rsplit(".", maxsplit=1)[0]
+        for helper_name in resolved_helper_names
+        if "." in helper_name and helper_name.rsplit(".", maxsplit=1)[1] in _NAMESPACE_MAPPING_ACCESSORS
+    }
+    return frozenset(roots) if roots else None
+
+
 def _resolve_global_builtin_namespace_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
     """Resolve a statically addressed builtin namespace obtained from ``globals()``."""
-    namespace_node: ast.AST
+    namespace_node: ast.AST | None
     attr_name_node: ast.AST
     if isinstance(node, ast.Subscript):
         namespace_node = node.value
@@ -326,13 +344,19 @@ def _resolve_global_builtin_namespace_roots(node: ast.AST, alias_scopes: _AliasS
     ):
         namespace_node = node.func.value
         attr_name_node = node.args[0]
+    elif isinstance(node, ast.Call) and node.args:
+        accessor_roots = _resolve_aliased_mapping_accessor_roots(node, alias_scopes)
+        if accessor_roots is None or _GLOBAL_NAMESPACE_MAPPING_MARKER not in accessor_roots:
+            return None
+        namespace_node = None
+        attr_name_node = node.args[0]
     else:
         return None
 
     attr_name = _resolve_static_string(attr_name_node)
     if attr_name not in _BUILTIN_NAMESPACE_NAMES:
         return None
-    if _resolve_global_namespace_mappings(namespace_node, alias_scopes) is None:
+    if namespace_node is not None and _resolve_global_namespace_mappings(namespace_node, alias_scopes) is None:
         return None
     return frozenset({attr_name})
 
@@ -463,8 +487,9 @@ def _resolve_namespace_dict_call_names(node: ast.AST, alias_scopes: _AliasScopes
     if isinstance(node, ast.Attribute) and node.attr == "__call__":
         return _resolve_namespace_dict_call_names(node.value, alias_scopes)
 
-    namespace_node: ast.AST
+    namespace_node: ast.AST | None = None
     attr_name_node: ast.AST
+    resolved_target_roots: frozenset[str] | None = None
     if isinstance(node, ast.Subscript):
         namespace_node = node.value
         attr_name_node = node.slice
@@ -476,6 +501,24 @@ def _resolve_namespace_dict_call_names(node: ast.AST, alias_scopes: _AliasScopes
     ):
         namespace_node = node.func.value
         attr_name_node = node.args[0]
+    elif isinstance(node, ast.Call) and node.args:
+        accessor_roots = _resolve_aliased_mapping_accessor_roots(node, alias_scopes)
+        if accessor_roots is None:
+            return None
+        roots = {
+            accessor_root.removesuffix(".__dict__")
+            for accessor_root in accessor_roots
+            if accessor_root.endswith(".__dict__")
+        }
+        roots.update(
+            accessor_root
+            for accessor_root in accessor_roots
+            if accessor_root in _BUILTIN_NAMESPACE_NAMES or accessor_root == "builtins"
+        )
+        if not roots:
+            return None
+        resolved_target_roots = frozenset(roots)
+        attr_name_node = node.args[0]
     else:
         return None
 
@@ -483,16 +526,34 @@ def _resolve_namespace_dict_call_names(node: ast.AST, alias_scopes: _AliasScopes
     if attr_name is None:
         return None
 
-    resolved_target_roots = _resolve_namespace_dict_roots(namespace_node, alias_scopes)
+    if resolved_target_roots is None:
+        assert namespace_node is not None
+        resolved_target_roots = _resolve_namespace_dict_roots(namespace_node, alias_scopes)
     if resolved_target_roots is None:
         return None
     return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
+
+
+def _resolve_bound_namespace_accessor_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+    """Resolve aliased accessor methods on known global or builtin mappings."""
+    if not isinstance(node, ast.Attribute) or node.attr not in _NAMESPACE_MAPPING_ACCESSORS:
+        return None
+
+    target_roots = _resolve_global_namespace_mappings(node.value, alias_scopes)
+    if target_roots is None:
+        target_roots = _resolve_global_builtin_namespace_roots(node.value, alias_scopes)
+    if target_roots is None:
+        return None
+    return frozenset(f"{target_root}.{node.attr}" for target_root in target_roots)
 
 
 def _resolve_static_reference_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
     global_namespace_mappings = _resolve_global_namespace_mappings(node, alias_scopes)
     if global_namespace_mappings is not None:
         return global_namespace_mappings
+    bound_namespace_accessors = _resolve_bound_namespace_accessor_names(node, alias_scopes)
+    if bound_namespace_accessors is not None:
+        return bound_namespace_accessors
     call_name = _resolve_call_name(node)
     if call_name is not None:
         return _apply_aliases(call_name, alias_scopes)

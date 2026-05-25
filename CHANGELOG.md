@@ -50,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect embedded Python builtin execution recovered through static global namespace lookups
 - detect embedded Python builtin execution reached through aliased global namespace mappings
 - avoid embedded Python builtin execution findings after statically safe callable overwrites
+- detect embedded Python builtin execution dispatched through aliased namespace accessors
 
 ## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
 
