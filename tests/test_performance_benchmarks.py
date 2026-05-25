@@ -199,14 +199,14 @@ class TestPerformanceBenchmarks:
         # Expected adversarial findings should not inflate the RSS measurement.
         caplog.set_level(logging.CRITICAL + 1, logger="modelaudit.scanners")
         process = psutil.Process(os.getpid())
-        warmup_results = scan_model_directory_or_file(str(assets_dir), cache_scan_results=False)
+        warmup_results = scan_model_directory_or_file(str(assets_dir), cache_enabled=False)
         assert warmup_results.success, "Warm-up scan should succeed"
         gc.collect()
         initial_memory = process.memory_info().rss / 1024 / 1024  # MB
 
         # Measure repeated scans after lazy scanner imports and caches are warm.
         for _ in range(5):
-            results = scan_model_directory_or_file(str(assets_dir), cache_scan_results=False)
+            results = scan_model_directory_or_file(str(assets_dir), cache_enabled=False)
             assert results.success, "Scan should succeed"
 
         gc.collect()
