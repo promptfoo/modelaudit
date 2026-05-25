@@ -263,6 +263,7 @@ class XGBoostScanner(BaseScanner):
         "binary_load_failed": "xgboost_binary_load_failed",
         "binary_load_timeout": "xgboost_binary_load_timeout",
         "binary_load_exception": "xgboost_binary_load_exception",
+        "read_failed": "xgboost_read_failed",
     }
 
     def __init__(self, config: dict[str, Any] | None = None):
@@ -287,6 +288,24 @@ class XGBoostScanner(BaseScanner):
         result.finish(
             success=not result.has_errors and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
         )
+
+    def _record_read_failure(self, path: str, result: ScanResult, exc: OSError) -> None:
+        """Record unavailable XGBoost bytes as incomplete analysis, not a security finding."""
+        result.add_check(
+            name="XGBoost File Read",
+            passed=False,
+            message=f"Unable to read XGBoost model for analysis: {exc!s}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(exc),
+                "exception_type": type(exc).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": self._INCONCLUSIVE_REASONS["read_failed"],
+            },
+            rule_code="S902",
+        )
+        self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["read_failed"])
 
     @classmethod
     def _find_legacy_header_patterns(cls, header_text: str) -> list[str]:
@@ -374,13 +393,13 @@ class XGBoostScanner(BaseScanner):
         result = self._create_result()
         self.current_file_path = path
 
-        # Add file integrity check
-        self.add_file_integrity_check(path, result)
-
         # Determine file format and dispatch to appropriate scanner
         file_ext = os.path.splitext(path)[1].lower()
 
         try:
+            # Hashing reads the model content and is part of available scan coverage.
+            self.add_file_integrity_check(path, result)
+
             if file_ext == ".json":
                 self._scan_json_model(path, result)
             elif file_ext == ".ubj":
@@ -396,6 +415,8 @@ class XGBoostScanner(BaseScanner):
                     location=path,
                 )
 
+        except OSError as e:
+            self._record_read_failure(path, result, e)
         except Exception as e:
             result.add_check(
                 name="Scan Execution",
@@ -444,6 +465,8 @@ class XGBoostScanner(BaseScanner):
                 why="Malformed JSON may indicate file corruption or crafted exploit",
             )
             self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["json_parse_failed"])
+        except OSError as e:
+            self._record_read_failure(path, result, e)
         except Exception as e:
             result.add_check(
                 name="JSON Analysis",
@@ -478,15 +501,22 @@ class XGBoostScanner(BaseScanner):
             self._validate_xgboost_json_schema(model_data, result, path)
             self._check_json_for_malicious_content(model_data, result, path)
 
+        except OSError as e:
+            self._record_read_failure(path, result, e)
         except Exception as e:
             result.add_check(
                 name="UBJ Analysis",
                 passed=False,
                 message=f"Error analyzing XGBoost UBJ model: {e!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(e)},
-                why="UBJ decoding failures may indicate file corruption or malicious content",
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": self._INCONCLUSIVE_REASONS["ubj_analysis_failed"],
+                },
+                why="UBJ decoding did not complete, so content-based security checks could not be completed",
             )
             self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["ubj_analysis_failed"])
 
@@ -556,6 +586,8 @@ class XGBoostScanner(BaseScanner):
                     details={"safe_mode": True},
                 )
 
+        except OSError as e:
+            self._record_read_failure(path, result, e)
         except Exception as e:
             result.add_check(
                 name="Binary Analysis",
@@ -1092,6 +1124,8 @@ class XGBoostScanner(BaseScanner):
                         },
                     )
 
+        except OSError as e:
+            self._record_read_failure(path, result, e)
         except Exception as e:
             result.add_check(
                 name="Binary Structure Analysis",

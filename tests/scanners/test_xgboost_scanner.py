@@ -584,6 +584,26 @@ class TestXGBoostJSONScanning:
         assert result.metadata["analysis_incomplete"] is True
         assert "max_file_read_size_exceeded" in result.metadata["scan_outcome_reasons"]
 
+    def test_json_read_failure_is_inconclusive_not_security_finding(
+        self,
+        tmp_path: Path,
+        xgboost_scanner: XGBoostScanner,
+        valid_xgboost_json: dict[str, Any],
+    ) -> None:
+        json_file = tmp_path / "unreadable.json"
+        json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
+
+        with patch("modelaudit.scanners.xgboost_scanner.json.load", side_effect=OSError("forced JSON read failure")):
+            result = xgboost_scanner.scan(str(json_file))
+
+        read_checks = [check for check in result.checks if check.name == "XGBoost File Read"]
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_read_failed" in result.metadata["scan_outcome_reasons"]
+        assert len(read_checks) == 1
+        assert read_checks[0].severity == IssueSeverity.INFO
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
     def test_malicious_json_content_detected(self, temp_dir, xgboost_scanner):
         """Test detection of malicious patterns in JSON."""
         malicious_json = {
@@ -708,7 +728,7 @@ class TestXGBoostUBJScanning:
         assert "xgboost_ubj_dependency_missing" in result.metadata["scan_outcome_reasons"]
 
     def test_invalid_ubj_detected(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
-        """Test detection of invalid UBJ content."""
+        """Unsupported UBJ decoding should fail closed without a fabricated security finding."""
         pytest.importorskip("ubjson", reason="ubjson not installed")
         ubj_file = temp_dir / "invalid.ubj"
         ubj_file.write_bytes(b"\xff\xff\xff\xff")  # Invalid UBJ data
@@ -723,6 +743,10 @@ class TestXGBoostUBJScanning:
             result = xgboost_scanner.scan(str(ubj_file))
 
         assert any("Error analyzing XGBoost UBJ model" in str(issue.message) for issue in result.issues)
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_ubj_analysis_failed" in result.metadata["scan_outcome_reasons"]
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 class TestXGBoostBinaryScanning:
@@ -859,10 +883,13 @@ class TestXGBoostBinaryScanning:
             xgboost_scanner._validate_binary_structure(str(binary_file), result)
         xgboost_scanner._finish_scan_result(result)
 
-        assert any("forced read failure" in str(issue.message) for issue in result.issues)
+        read_checks = [check for check in result.checks if check.name == "XGBoost File Read"]
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "xgboost_binary_analysis_failed" in result.metadata["scan_outcome_reasons"]
+        assert "xgboost_read_failed" in result.metadata["scan_outcome_reasons"]
+        assert len(read_checks) == 1
+        assert read_checks[0].severity == IssueSeverity.INFO
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
     def test_binary_structure_validation(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
         """Test binary structure validation."""
@@ -1149,6 +1176,18 @@ class TestXGBoostFailClosedEndToEnd:
         assert result.success is True
         assert result.issues == []
 
+    def test_binary_read_failure_core_is_operational_not_security_finding(self, tmp_path: Path) -> None:
+        binary_file = tmp_path / "unreadable.bst"
+        binary_file.write_bytes(b"binf" + (b"\0" * 64))
+
+        with patch.object(XGBoostScanner, "_scan_binary_model", side_effect=OSError("forced binary read failure")):
+            result = scan_model_directory_or_file(str(binary_file), cache_enabled=False)
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        _assert_inconclusive_metadata(result, binary_file, "xgboost_read_failed")
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
     def test_extensionless_ubjson_nested_zip_detects_malicious_content(
         self, tmp_path: Path, valid_xgboost_json: dict[str, Any]
     ) -> None:
@@ -1230,6 +1269,22 @@ class TestXGBoostFailClosedEndToEnd:
             assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
         finally:
             reset_cache_manager()
+
+    def test_undecodable_ubjson_core_is_inconclusive_not_security_finding(self, tmp_path: Path) -> None:
+        pytest.importorskip("ubjson", reason="ubjson not installed")
+        ubj_file = tmp_path / "undecodable.ubj"
+        ubj_file.write_bytes(_xgboost_ubjson_probe())
+
+        with (
+            patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=True),
+            patch("ubjson.loadb", side_effect=ValueError("unsupported native UBJSON encoding")),
+        ):
+            result = scan_model_directory_or_file(str(ubj_file), cache_enabled=False)
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        _assert_inconclusive_metadata(result, ubj_file, "xgboost_ubj_analysis_failed")
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
     @pytest.mark.parametrize("filename", ["model.bst", "model"])
     def test_missing_ubjson_for_content_routed_header_core_fails_closed_and_is_uncached(
@@ -1471,15 +1526,18 @@ class TestXGBoostScannerIntegration:
         json_result = scanner.scan(str(json_path))
         bst_result = scanner.scan(str(bst_path))
 
-        # Both should scan successfully without critical issues
+        # JSON must scan successfully; a native UBJSON BST may exceed the optional
+        # UBJSON decoder, which is incomplete coverage rather than a security finding.
         assert json_result.success
-        assert bst_result.success
 
         json_critical = [i for i in json_result.issues if i.severity == IssueSeverity.CRITICAL]
         bst_critical = [i for i in bst_result.issues if i.severity == IssueSeverity.CRITICAL]
 
         assert len(json_critical) == 0, f"JSON model had critical issues: {json_critical}"
         assert len(bst_critical) == 0, f"BST model had critical issues: {bst_critical}"
+        if not bst_result.success:
+            assert bst_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert "xgboost_ubj_analysis_failed" in bst_result.metadata["scan_outcome_reasons"]
 
     def test_real_ubj_format_scan(self, temp_dir, valid_xgboost_json):
         """Test scanning of real UBJ format."""
