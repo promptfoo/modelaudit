@@ -374,6 +374,25 @@ def test_pytorch_zip_scanner_normal_archive_skips_relaxed_crc_signal(tmp_path: P
     assert not [check for check in result.checks if check.name == "PyTorch ZIP CRC Handling"]
 
 
+def test_pytorch_zip_scanner_path_traversal_named_pickle_keeps_archive_rule(tmp_path: Path) -> None:
+    model_path = tmp_path / "traversal.pt"
+    with zipfile.ZipFile(model_path, "w") as zip_file:
+        zip_file.writestr("version", "3")
+        zip_file.writestr("../../pickle_payload.bin", b"not a pickle")
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    traversal_checks = [
+        check
+        for check in result.checks
+        if check.name == "Path Traversal Protection" and check.status == CheckStatus.FAILED
+    ]
+    assert len(traversal_checks) == 1
+    assert traversal_checks[0].severity == IssueSeverity.CRITICAL
+    assert traversal_checks[0].rule_code == "S405"
+    assert not [check for check in result.checks if check.rule_code == "S213"]
+
+
 def test_pytorch_zip_scanner_scans_shadowed_duplicate_data_pkl(tmp_path: Path) -> None:
     """A benign last-write duplicate must not hide a malicious earlier data.pkl entry."""
     model_path = tmp_path / "duplicate_data_pkl.pt"

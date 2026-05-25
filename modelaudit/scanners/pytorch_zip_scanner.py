@@ -784,6 +784,7 @@ class PyTorchZipScanner(BaseScanner):
                     passed=False,
                     message=f"Archive entry {name} attempted path traversal outside the archive",
                     severity=IssueSeverity.CRITICAL,
+                    rule_code="S405",
                     location=f"{path}:{name}",
                     details={"entry": name},
                 )

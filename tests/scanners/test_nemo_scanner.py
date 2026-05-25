@@ -573,10 +573,10 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
         assert "scan_outcome" not in result.metadata
 
-    def test_nested_checkpoint_archive_traversal_not_labeled_deserialization_cve(self, tmp_path: Path) -> None:
+    def test_nested_checkpoint_archive_traversal_is_preserved_without_deserialization_cve(self, tmp_path: Path) -> None:
         nested_checkpoint = io.BytesIO()
         with zipfile.ZipFile(nested_checkpoint, "w") as zipf:
-            zipf.writestr("../../evil.pkl", b"not a pickle")
+            zipf.writestr("../../pickle_payload.bin", b"not a pickle")
 
         nemo_path = tmp_path / "checkpoint-archive-traversal.nemo"
         with tarfile.open(nemo_path, "w") as tar:
@@ -585,6 +585,63 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
+        traversal_checks = [check for check in result.checks if check.rule_code == "S405"]
+        assert result.success is False
+        assert len(traversal_checks) == 1
+        assert traversal_checks[0].severity == IssueSeverity.CRITICAL
+        assert traversal_checks[0].location == f"{nemo_path}:model_weights.pt:../../pickle_payload.bin"
+        assert traversal_checks[0].details["entry"] == "model_weights.pt"
+        assert traversal_checks[0].details["nested_scanner"] == "pytorch_zip"
+        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert determine_exit_code(scan_model_directory_or_file(str(nemo_path), cache_enabled=False)) == 1
+
+    def test_metadata_referenced_archive_traversal_is_preserved_without_deserialization_cve(
+        self, tmp_path: Path
+    ) -> None:
+        nested_artifact = io.BytesIO()
+        with zipfile.ZipFile(nested_artifact, "w") as zipf:
+            zipf.writestr("../../evil.pkl", b"not a pickle")
+
+        nemo_path = tmp_path / "referenced-archive-traversal.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "tokenizer": {"model": "nemo:artifacts/bundle.jpg"},
+        }
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "artifacts/bundle.jpg", nested_artifact.getvalue())
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        traversal_checks = [check for check in result.checks if check.rule_code == "S405"]
+        assert result.success is False
+        assert len(traversal_checks) == 1
+        assert traversal_checks[0].severity == IssueSeverity.CRITICAL
+        assert traversal_checks[0].location == f"{nemo_path}:artifacts/bundle.jpg:../../evil.pkl"
+        assert traversal_checks[0].details["entry"] == "artifacts/bundle.jpg"
+        assert traversal_checks[0].details["trusted_content_format"] == "zip"
+        assert traversal_checks[0].details["nested_scanner"] == "zip"
+        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert determine_exit_code(scan_model_directory_or_file(str(nemo_path), cache_enabled=False)) == 1
+
+    def test_metadata_referenced_benign_archive_stays_clean(self, tmp_path: Path) -> None:
+        nested_artifact = io.BytesIO()
+        with zipfile.ZipFile(nested_artifact, "w") as zipf:
+            zipf.writestr("weights/data.bin", b"ordinary weights")
+
+        nemo_path = tmp_path / "referenced-benign-archive.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "tokenizer": {"model": "nemo:artifacts/bundle.jpg"},
+        }
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "artifacts/bundle.jpg", nested_artifact.getvalue())
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert result.success is True
+        assert not [check for check in result.checks if check.name == "NeMo Nested Member Security Finding"]
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
 
 
