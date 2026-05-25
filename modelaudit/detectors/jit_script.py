@@ -153,14 +153,19 @@ def _resolve_alias_aware_dangerous_builtins(tree: ast.AST) -> set[str]:
     return dangerous_builtins
 
 
-def _resolve_alias_aware_os_process_calls(tree: ast.AST) -> set[str]:
-    """Return operating-system process launches reached through static resolution."""
+def _resolve_alias_aware_process_calls(tree: ast.AST) -> tuple[set[str], set[str]]:
+    """Return OS and subprocess process launches reached through static resolution."""
     from modelaudit.scanners.archive_member_security import high_risk_python_calls_in_tree
 
-    return {call.name for call in high_risk_python_calls_in_tree(tree) if call.rule_code == "S101"}
+    calls = high_risk_python_calls_in_tree(tree)
+    return (
+        {call.name for call in calls if call.rule_code == "S101"},
+        {call.name for call in calls if call.rule_code == "S103"},
+    )
 
 
 # Patterns that indicate code execution attempts
+_SUBPROCESS_CODE_EXECUTION_DESCRIPTION = "Subprocess execution detected"
 _OS_CODE_EXECUTION_DESCRIPTION = "OS command execution detected"
 CODE_EXECUTION_PATTERNS = [
     # Direct execution patterns
@@ -169,7 +174,10 @@ CODE_EXECUTION_PATTERNS = [
     (rb"compile\s*\(", "compile() call detected"),
     (rb"__import__\s*\(", "__import__() call detected"),
     # Subprocess patterns
-    (rb"subprocess\.(call|run|Popen|check_output)", "Subprocess execution detected"),
+    (
+        rb"subprocess\.(call|run|Popen|check_call|check_output|getoutput|getstatusoutput)",
+        _SUBPROCESS_CODE_EXECUTION_DESCRIPTION,
+    ),
     (rb"os\.(system|popen|exec\w*|spawn\w*|posix_spawnp?|startfile)", _OS_CODE_EXECUTION_DESCRIPTION),
     # Network patterns
     (rb"socket\.(socket|create_connection)", "Socket creation detected"),
@@ -232,7 +240,10 @@ class JITScriptDetector:
     @staticmethod
     def _ast_contains_dangerous_python(tree: ast.AST) -> bool:
         """Return whether parsed Python contains modeled dangerous operations."""
-        if _resolve_alias_aware_dangerous_builtins(tree) or _resolve_alias_aware_os_process_calls(tree):
+        if _resolve_alias_aware_dangerous_builtins(tree):
+            return True
+        os_process_calls, subprocess_calls = _resolve_alias_aware_process_calls(tree)
+        if os_process_calls or subprocess_calls:
             return True
 
         def is_dangerous_import(module_name: str) -> bool:
@@ -269,10 +280,6 @@ class JITScriptDetector:
                     "requests.post",
                     "requests.put",
                     "requests.delete",
-                    "subprocess.call",
-                    "subprocess.run",
-                    "subprocess.Popen",
-                    "subprocess.check_output",
                 }:
                     return True
         return False
@@ -559,10 +566,11 @@ class JITScriptDetector:
         matches = [bounded] if include_full_source else re.findall(python_code_pattern, bounded)
         bounded_dangerous_builtins: set[str] | None = None
         bounded_os_process_calls: set[str] | None = None
+        bounded_subprocess_calls: set[str] | None = None
         try:
             bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
             bounded_dangerous_builtins = _resolve_alias_aware_dangerous_builtins(bounded_tree)
-            bounded_os_process_calls = _resolve_alias_aware_os_process_calls(bounded_tree)
+            bounded_os_process_calls, bounded_subprocess_calls = _resolve_alias_aware_process_calls(bounded_tree)
         except (SyntaxError, UnicodeDecodeError, ValueError):
             pass
 
@@ -633,6 +641,12 @@ class JITScriptDetector:
                 builtin_name is not None
                 and bounded_dangerous_builtins is not None
                 and builtin_name not in bounded_dangerous_builtins
+            ):
+                continue
+            if (
+                description == _SUBPROCESS_CODE_EXECUTION_DESCRIPTION
+                and bounded_subprocess_calls is not None
+                and not bounded_subprocess_calls
             ):
                 continue
             if (

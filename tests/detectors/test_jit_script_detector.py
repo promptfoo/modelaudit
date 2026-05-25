@@ -286,6 +286,53 @@ class TestJITScriptDetector:
     @pytest.mark.parametrize(
         "source",
         [
+            b"def payload():\n    return subprocess.check_call(['id'])\n",
+            b"def payload():\n    return subprocess.getoutput('id')\n",
+            b"def payload():\n    return subprocess.getstatusoutput('id')\n",
+        ],
+    )
+    def test_scan_model_detects_unmarked_subprocess_process_launch(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            b"def payload():\n    subprocess.run = len\n    return subprocess.run([])\n",
+            b"def payload():\n    subprocess.check_call = len\n    return subprocess.check_call([])\n",
+            b"def payload():\n    subprocess.getoutput = len\n    return subprocess.getoutput([])\n",
+        ],
+    )
+    def test_scan_model_ignores_certain_replaced_subprocess_process_launch(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
+    def test_scan_model_preserves_possible_subprocess_launch_after_conditional_replacement(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def payload():\n"
+            b"    if replace:\n"
+            b"        subprocess.check_call = len\n"
+            b"    return subprocess.check_call(['id'])\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
             b"getattr(__builtins__, 'eval')('1 + 1')\n",
             b"__builtins__['eval']('1 + 1')\n",
             b"getattr(__builtins__, 'ev' + 'al')('1 + 1')\n",
