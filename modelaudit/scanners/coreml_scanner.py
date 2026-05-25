@@ -63,6 +63,95 @@ def _read_varint(data: bytes, offset: int) -> tuple[int, int] | None:
     return None
 
 
+def _skip_group(
+    data: bytes,
+    offset: int,
+    start_field_number: int,
+    *,
+    max_fields: int,
+    fields_seen: int,
+    allow_truncated: bool,
+) -> tuple[int, int, str | None]:
+    """Skip an unknown protobuf group while preserving parser bounds."""
+    group_stack = [start_field_number]
+
+    while group_stack:
+        if offset >= len(data):
+            if allow_truncated:
+                return len(data), fields_seen, None
+            return offset, fields_seen, f"truncated group field {start_field_number}"
+
+        if fields_seen >= max_fields:
+            return offset, fields_seen, f"field count exceeded limit ({max_fields})"
+
+        key_info = _read_varint(data, offset)
+        if key_info is None:
+            return offset, fields_seen, f"truncated or invalid field key in group field {start_field_number}"
+        key, offset = key_info
+        fields_seen += 1
+
+        field_number = key >> 3
+        wire_type = key & 0x07
+        if field_number <= 0:
+            return offset, fields_seen, "invalid field number 0"
+
+        if wire_type == 0:
+            value_info = _read_varint(data, offset)
+            if value_info is None:
+                if allow_truncated:
+                    return len(data), fields_seen, None
+                return offset, fields_seen, f"invalid varint value for field {field_number}"
+            _value, offset = value_info
+            continue
+
+        if wire_type == 1:
+            end = offset + 8
+            if end > len(data):
+                if allow_truncated:
+                    return len(data), fields_seen, None
+                return offset, fields_seen, f"truncated fixed64 field {field_number}"
+            offset = end
+            continue
+
+        if wire_type == 2:
+            length_info = _read_varint(data, offset)
+            if length_info is None:
+                if allow_truncated:
+                    return len(data), fields_seen, None
+                return offset, fields_seen, f"invalid length varint for field {field_number}"
+            declared_length, offset = length_info
+            end = offset + declared_length
+            if end > len(data):
+                if allow_truncated:
+                    return len(data), fields_seen, None
+                return offset, fields_seen, f"truncated length-delimited field {field_number}"
+            offset = end
+            continue
+
+        if wire_type == 3:
+            group_stack.append(field_number)
+            continue
+
+        if wire_type == 4:
+            if field_number != group_stack[-1]:
+                return offset, fields_seen, f"mismatched end group field {field_number}"
+            group_stack.pop()
+            continue
+
+        if wire_type == 5:
+            end = offset + 4
+            if end > len(data):
+                if allow_truncated:
+                    return len(data), fields_seen, None
+                return offset, fields_seen, f"truncated fixed32 field {field_number}"
+            offset = end
+            continue
+
+        return offset, fields_seen, f"unsupported wire type {wire_type} for field {field_number}"
+
+    return offset, fields_seen, None
+
+
 def _parse_message(
     data: bytes,
     *,
@@ -78,15 +167,17 @@ def _parse_message(
     """
     fields: list[_ProtoField] = []
     offset = 0
+    fields_seen = 0
 
     while offset < len(data):
-        if len(fields) >= max_fields:
+        if fields_seen >= max_fields:
             return fields, f"field count exceeded limit ({max_fields})"
 
         key_info = _read_varint(data, offset)
         if key_info is None:
             return fields, "truncated or invalid field key"
         key, offset = key_info
+        fields_seen += 1
 
         field_number = key >> 3
         wire_type = key & 0x07
@@ -143,6 +234,22 @@ def _parse_message(
             )
             offset = end
             continue
+
+        if wire_type == 3:  # start group (deprecated but valid protobuf encoding)
+            offset, fields_seen, group_error = _skip_group(
+                data,
+                offset,
+                field_number,
+                max_fields=max_fields,
+                fields_seen=fields_seen,
+                allow_truncated=allow_truncated,
+            )
+            if group_error:
+                return fields, group_error
+            continue
+
+        if wire_type == 4:
+            return fields, f"unexpected end group field {field_number}"
 
         if wire_type == 5:  # fixed32
             end = offset + 4
