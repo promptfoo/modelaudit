@@ -9,29 +9,39 @@ SCANNERS_DIR = Path(__file__).resolve().parents[2] / "modelaudit" / "scanners"
 
 
 def _extract_literal_rule_codes(path: Path) -> set[str]:
-    """Extract literal `rule_code=\"S...\"` values from scanner source."""
+    """Extract scanner-emitted literal rule codes from assignments and mapping helpers."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
     codes: set[str] = set()
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
-        if not isinstance(node.func, ast.Attribute):
-            continue
 
-        for keyword in node.keywords:
-            if keyword.arg != "rule_code":
-                continue
-            if isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
-                normalized = keyword.value.value.strip().upper()
-                if normalized.startswith("S"):
-                    codes.add(normalized)
+        if isinstance(node.func, ast.Attribute):
+            for keyword in node.keywords:
+                if keyword.arg != "rule_code":
+                    continue
+                if isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
+                    normalized = keyword.value.value.strip().upper()
+                    if normalized.startswith("S"):
+                        codes.add(normalized)
+
+        if (
+            isinstance(node.func, ast.Name)
+            and node.func.id == "_rule"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            normalized = node.args[0].value.strip().upper()
+            if normalized.startswith("S"):
+                codes.add(normalized)
 
     return codes
 
 
 def test_scanner_literal_rule_codes_are_registered() -> None:
-    """All literal scanner rule codes should exist in RuleRegistry."""
+    """All literal scanner rule assignments and mapper returns should be registered."""
     known_codes = set(RuleRegistry.get_all_rules().keys())
     unknown_by_file: dict[str, list[str]] = {}
 
