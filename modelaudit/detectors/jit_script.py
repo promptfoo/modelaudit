@@ -153,7 +153,15 @@ def _resolve_alias_aware_dangerous_builtins(tree: ast.AST) -> set[str]:
     return dangerous_builtins
 
 
+def _resolve_alias_aware_os_process_calls(tree: ast.AST) -> set[str]:
+    """Return operating-system process launches reached through static resolution."""
+    from modelaudit.scanners.archive_member_security import high_risk_python_calls_in_tree
+
+    return {call.name for call in high_risk_python_calls_in_tree(tree) if call.rule_code == "S101"}
+
+
 # Patterns that indicate code execution attempts
+_OS_CODE_EXECUTION_DESCRIPTION = "OS command execution detected"
 CODE_EXECUTION_PATTERNS = [
     # Direct execution patterns
     (rb"exec\s*\(", "exec() call detected"),
@@ -162,7 +170,7 @@ CODE_EXECUTION_PATTERNS = [
     (rb"__import__\s*\(", "__import__() call detected"),
     # Subprocess patterns
     (rb"subprocess\.(call|run|Popen|check_output)", "Subprocess execution detected"),
-    (rb"os\.(system|popen|exec\w*|spawn\w*)", "OS command execution detected"),
+    (rb"os\.(system|popen|exec\w*|spawn\w*|posix_spawnp?|startfile)", _OS_CODE_EXECUTION_DESCRIPTION),
     # Network patterns
     (rb"socket\.(socket|create_connection)", "Socket creation detected"),
     (rb"urllib\.(request|urlopen)", "URL request detected"),
@@ -224,7 +232,7 @@ class JITScriptDetector:
     @staticmethod
     def _ast_contains_dangerous_python(tree: ast.AST) -> bool:
         """Return whether parsed Python contains modeled dangerous operations."""
-        if _resolve_alias_aware_dangerous_builtins(tree):
+        if _resolve_alias_aware_dangerous_builtins(tree) or _resolve_alias_aware_os_process_calls(tree):
             return True
 
         def is_dangerous_import(module_name: str) -> bool:
@@ -267,9 +275,6 @@ class JITScriptDetector:
                     "subprocess.check_output",
                 }:
                     return True
-                if operation.startswith("os.") and re.fullmatch(r"os\.(?:system|popen|exec\w*|spawn\w*)", operation):
-                    return True
-
         return False
 
     @staticmethod
@@ -553,9 +558,11 @@ class JITScriptDetector:
         python_code_pattern = rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+"
         matches = [bounded] if include_full_source else re.findall(python_code_pattern, bounded)
         bounded_dangerous_builtins: set[str] | None = None
+        bounded_os_process_calls: set[str] | None = None
         try:
             bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
             bounded_dangerous_builtins = _resolve_alias_aware_dangerous_builtins(bounded_tree)
+            bounded_os_process_calls = _resolve_alias_aware_os_process_calls(bounded_tree)
         except (SyntaxError, UnicodeDecodeError, ValueError):
             pass
 
@@ -626,6 +633,12 @@ class JITScriptDetector:
                 builtin_name is not None
                 and bounded_dangerous_builtins is not None
                 and builtin_name not in bounded_dangerous_builtins
+            ):
+                continue
+            if (
+                description == _OS_CODE_EXECUTION_DESCRIPTION
+                and bounded_os_process_calls is not None
+                and not bounded_os_process_calls
             ):
                 continue
             if re.search(pattern, bounded):  # Limit search size

@@ -36,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - avoid embedded Python execution findings after certain namespace-map clearing or certain map mutator calls themselves
 - avoid embedded Python process-execution findings for known non-executing `subprocess` formatting and result/error APIs
 - detect embedded Python `os.exec*`, `os.spawn*`, `os.posix_spawn*`, and `os.startfile` process-launch calls
+- detect JIT-scanned embedded Python `os.posix_spawn*` and `os.startfile` process-launch calls while suppressing certain safe replacements
 - preserve embedded Python execution findings when a replacement receiver is conditional, aliased, or a runtime argument
 - fail closed when nested NeMo checkpoint or referenced-artifact analysis is explicitly incomplete
 - preserve concrete nested security findings from checkpoint and referenced artifacts inside NeMo archives

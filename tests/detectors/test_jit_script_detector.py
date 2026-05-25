@@ -239,6 +239,53 @@ class TestJITScriptDetector:
     @pytest.mark.parametrize(
         "source",
         [
+            b"def payload():\n    return os.posix_spawn('/bin/sh', ['sh'], {})\n",
+            b"def payload():\n    return os.posix_spawnp('sh', ['sh'], {})\n",
+            b"def payload():\n    return os.startfile('payload.exe')\n",
+        ],
+    )
+    def test_scan_model_detects_unmarked_os_process_launch(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            b"def payload():\n    os.system = len\n    return os.system([])\n",
+            b"def payload():\n    os.posix_spawn = len\n    return os.posix_spawn([])\n",
+            b"def payload():\n    os.startfile = len\n    return os.startfile([])\n",
+        ],
+    )
+    def test_scan_model_ignores_certain_replaced_os_process_launch(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
+    def test_scan_model_preserves_possible_os_process_launch_after_conditional_replacement(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"def payload():\n"
+            b"    if replace:\n"
+            b"        os.posix_spawn = len\n"
+            b"    return os.posix_spawn('/bin/sh', ['sh'], {})\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "OS command execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
             b"getattr(__builtins__, 'eval')('1 + 1')\n",
             b"__builtins__['eval']('1 + 1')\n",
             b"getattr(__builtins__, 'ev' + 'al')('1 + 1')\n",
