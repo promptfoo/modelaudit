@@ -1706,10 +1706,10 @@ def detect_file_format(path: str) -> str:
     renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
     if renamed_tensorflow_format != "unknown":
         return renamed_tensorflow_format
-    if (
-        _has_budget_exhausted_protobuf_model_candidate(file_path, size)
-        and detect_format_from_extension(path) == "unknown"
-    ):
+    if _has_budget_exhausted_protobuf_model_candidate(file_path, size) and detect_format_from_extension(path) in {
+        "unknown",
+        "protobuf",
+    }:
         return PROTOBUF_MODEL_CANDIDATE_FORMAT
 
     # For .bin files, do more sophisticated detection

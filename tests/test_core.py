@@ -1853,6 +1853,21 @@ def test_scan_file_detects_malicious_budget_exhausted_prefixed_renamed_onnx(tmp_
     assert core_module.determine_exit_code(aggregate) == 1
 
 
+def test_scan_file_detects_malicious_budget_exhausted_onnx_with_protobuf_suffix(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    disguised_onnx = create_mock_onnx(tmp_path / "many-prefixes.pb", op_type="PythonOp")
+    prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=0, count=4097, field_number=8)
+
+    result = scan_file(str(disguised_onnx), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "onnx"
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
+
+
 def test_scan_file_rejects_budget_exhausted_protobuf_without_onnx_structure_cleanly(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     ambiguous_onnx = tmp_path / "ambiguous.jpg"

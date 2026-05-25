@@ -61,6 +61,7 @@ STANDARD_ONNX_DOMAINS: frozenset[str] = frozenset(
 ONNX_STRUCTURE_INCONCLUSIVE_REASON = "onnx_structure_validation_failed"
 ONNX_RAW_DETECTION_INCONCLUSIVE_REASON = "onnx_raw_detection_analysis_incomplete"
 ONNX_WEIGHT_DISTRIBUTION_INCONCLUSIVE_REASON = "onnx_weight_distribution_analysis_incomplete"
+ONNX_TENTATIVE_CANDIDATE_UNAVAILABLE_REASON = "onnx_tentative_candidate_analysis_unavailable"
 _PYTHON_OPERATOR_TYPES: frozenset[str] = frozenset(
     {
         "pyfunc",
@@ -308,7 +309,21 @@ class OnnxScanner(BaseScanner):
             if self._is_tentative_protobuf_route():
                 result.scanner_name = "unknown"
                 result.metadata["tentative_protobuf_candidate_unanalyzed"] = "onnx_dependency_unavailable"
-                result.finish(success=True)
+                _mark_inconclusive_scan_result(result, ONNX_TENTATIVE_CANDIDATE_UNAVAILABLE_REASON)
+                result.add_check(
+                    name="ONNX Candidate Analysis",
+                    passed=False,
+                    message="ONNX analysis dependency is unavailable for an ambiguous protobuf model candidate",
+                    severity=IssueSeverity.INFO,
+                    location=path,
+                    details={
+                        "required_package": "onnx",
+                        "analysis_incomplete": True,
+                        "scan_outcome_reason": ONNX_TENTATIVE_CANDIDATE_UNAVAILABLE_REASON,
+                    },
+                    rule_code="S902",
+                )
+                _finish_scan_result(result)
                 return result
             result.add_check(
                 name="ONNX Library Check",

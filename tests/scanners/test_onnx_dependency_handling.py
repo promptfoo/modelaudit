@@ -43,8 +43,8 @@ def test_onnx_scanner_reports_missing_dependency_as_warning(tmp_path: Path) -> N
     )
 
 
-def test_tentative_protobuf_candidate_without_onnx_dependency_is_rejected_cleanly(tmp_path: Path) -> None:
-    """Optional ONNX support must not turn an unconfirmed candidate into a finding."""
+def test_tentative_protobuf_candidate_without_onnx_dependency_is_inconclusive(tmp_path: Path) -> None:
+    """Optional ONNX support must not turn an unanalyzed candidate into a clean scan."""
     candidate_path = tmp_path / "candidate.jpg"
     candidate_path.write_bytes(b"\x42\x00" * 4097)
 
@@ -53,6 +53,8 @@ def test_tentative_protobuf_candidate_without_onnx_dependency_is_rejected_cleanl
         result = scanner.scan(str(candidate_path))
 
     assert result.scanner_name == "unknown"
-    assert result.success is True
-    assert result.issues == []
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "onnx_tentative_candidate_analysis_unavailable" in result.metadata["scan_outcome_reasons"]
+    assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
     assert result.metadata["tentative_protobuf_candidate_unanalyzed"] == "onnx_dependency_unavailable"

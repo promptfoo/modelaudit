@@ -303,6 +303,15 @@ def test_validate_file_type_accepts_budget_exhausted_onnx_candidate_with_onnx_su
     assert validate_file_type(str(model_path)) is True
 
 
+def test_budget_exhausted_onnx_candidate_with_protobuf_suffix_still_routes_to_analysis(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    model_path = create_mock_onnx(tmp_path / "many-prefixes.pb")
+    prefix_mock_onnx_with_unknown_field(model_path, value_size=0, count=4097, field_number=8)
+
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+
 def test_budget_exhausted_protobuf_probe_does_not_steal_coreml_extension_route(tmp_path: Path) -> None:
     model_path = tmp_path / "ambiguous.mlmodel"
     model_path.write_bytes(b"\x42\x00" * 4097)
