@@ -1597,6 +1597,32 @@ class TestZipScanner:
         assert "size floor" in compression_checks[0].message
         assert compression_checks[0].details["min_uncompressed_size"] == 1024 * 1024
 
+    def test_configured_skip_entry_is_validated_but_not_recursively_scanned(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "owned-entry.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("metadata.json", b'{"owned": true}')
+            archive.writestr("payload.bin", b"payload")
+
+        nested_scan_paths: list[str] = []
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_scan_paths.append(path)
+            result = ScanResult(scanner_name="test")
+            result.finish(success=True)
+            return result
+
+        scanner = ZipScanner(
+            config={
+                NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan,
+                "skip_archive_entries": ["metadata.json"],
+            }
+        )
+        result = scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert not any(path.endswith("_metadata.json") for path in nested_scan_paths)
+        assert any(path.endswith("_payload.bin") for path in nested_scan_paths)
+
     def test_zip_bomb_detection_skips_only_suspicious_entry(self, tmp_path: Path) -> None:
         """Suspicious entries should be skipped while safe entries still route to nested scanning."""
         archive_path = tmp_path / "mixed.zip"

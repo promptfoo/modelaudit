@@ -332,7 +332,7 @@ class KerasZipScanner(BaseScanner):
         return _KERAS_CONFIG_MAX_BYTES
 
     def _get_recursive_archive_scan_config(self, *, skip_weights_entry: bool = False) -> dict[str, Any]:
-        """Return a ZIP scanner config with an explicit bounded per-member extraction limit."""
+        """Return bounded ZIP-recursion config for entries not owned by this scanner."""
         recursive_config = dict(self.config)
         member_size_limits = [self.max_embedded_weights_bytes]
         for config_key in ("max_file_size", "max_entry_size"):
@@ -349,17 +349,20 @@ class KerasZipScanner(BaseScanner):
             recursive_config["max_file_size"] = recursive_member_size_limit
         else:
             recursive_config.pop("max_file_size", None)
+        skip_entries = recursive_config.get("skip_archive_entries", ())
+        if isinstance(skip_entries, str):
+            skip_entry_values: list[str] = [skip_entries]
+        elif isinstance(skip_entries, (list, tuple, set, frozenset)):
+            skip_entry_values = [entry for entry in skip_entries if isinstance(entry, str)]
+        else:
+            skip_entry_values = []
+        owned_entries = [_KERAS_CONFIG_ENTRY, _KERAS_METADATA_ENTRY]
         if skip_weights_entry:
-            skip_entries = recursive_config.get("skip_archive_entries", ())
-            if isinstance(skip_entries, str):
-                skip_entry_values: list[str] = [skip_entries]
-            elif isinstance(skip_entries, (list, tuple, set, frozenset)):
-                skip_entry_values = [entry for entry in skip_entries if isinstance(entry, str)]
-            else:
-                skip_entry_values = []
-            if _KERAS_WEIGHTS_ENTRY not in skip_entry_values:
-                skip_entry_values.append(_KERAS_WEIGHTS_ENTRY)
-            recursive_config["skip_archive_entries"] = skip_entry_values
+            owned_entries.append(_KERAS_WEIGHTS_ENTRY)
+        for owned_entry in owned_entries:
+            if owned_entry not in skip_entry_values:
+                skip_entry_values.append(owned_entry)
+        recursive_config["skip_archive_entries"] = skip_entry_values
         return recursive_config
 
     def _merge_recursive_archive_scan(self, path: str, result: ScanResult) -> None:

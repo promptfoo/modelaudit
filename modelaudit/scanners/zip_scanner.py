@@ -351,6 +351,9 @@ class ZipScanner(BaseScanner):
         if info.is_dir():
             return False, True
 
+        if self._should_skip_archive_entry(name):
+            return False, True
+
         return True, True
 
     def _scan_zip_file(self, path: str, depth: int = 0) -> ScanResult:

@@ -786,12 +786,23 @@ def test_detect_file_format_probe_boundary_prefixed_proto0_pickle(tmp_path: Path
 
 
 def test_detect_file_format_trivial_probe_boundary_prefix_not_pickle(tmp_path: Path) -> None:
-    """Large no-STOP scalar opcode prefixes should not be treated as pickle by themselves."""
+    """Fully inspected scalar-only text should not become a protobuf candidate."""
     payload = tmp_path / "probe-boundary-trivial-prefix-notes.txt"
     payload.write_bytes(b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4 + 1))
 
-    assert detect_file_format(str(payload)) != "pickle"
-    assert detect_file_format_from_magic(str(payload)) != "pickle"
+    assert detect_file_format(str(payload)) == "unknown"
+    assert detect_file_format_from_magic(str(payload)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(payload)) == "unknown"
+
+
+def test_detect_file_format_trivial_text_with_binary_tail_remains_candidate(tmp_path: Path) -> None:
+    """A binary tail after scalar text padding must remain fail-closed."""
+    payload = tmp_path / "probe-boundary-trivial-prefix-with-tail.txt"
+    payload.write_bytes(b"I0\n0" * (PROTO0_1_MAX_PROBE_BYTES // 4 + 1) + (b"\x42\x00" * 4097))
+
+    assert detect_file_format(str(payload)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(payload)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(payload)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
 
 
 def test_detect_file_format_exact_probe_boundary_prefix_without_stop_not_pickle(tmp_path: Path) -> None:

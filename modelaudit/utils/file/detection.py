@@ -283,6 +283,9 @@ PROTO0_1_MAX_PROBE_BYTES: int = 64 * 1024
 # budget aligned with the byte budget so trivial padding cannot hide a later
 # dangerous opcode inside the sampled prefix.
 PROTO0_1_MAX_PROBE_OPCODES: int = PROTO0_1_MAX_PROBE_BYTES
+# Fully inspect short scalar-only text near-matches before candidate routing.
+# Longer files remain unresolved so a late model payload cannot be hidden.
+PROTO0_1_MAX_TRIVIAL_TEXT_VALIDATION_BYTES: int = 1024 * 1024
 PROTO0_1_START_BYTES: bytes = b"()]}cilp0FGIJKLMNSTUVX"
 PROTO0_1_IGNORABLE_TRAILING_BYTES: bytes = b" \t\r\n\x00"
 PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES: tuple[str, ...] = (
@@ -587,9 +590,37 @@ def _looks_like_onnx_model_candidate_file(path: Path, size: int) -> bool:
     return _looks_like_onnx_model_file(path, size) is True
 
 
+def _is_complete_trivial_proto0_or_1_text_stream(path: Path, size: int) -> bool:
+    """Return True for fully inspected scalar-only protocol-text near-matches."""
+    if size <= 0 or size > PROTO0_1_MAX_TRIVIAL_TEXT_VALIDATION_BYTES:
+        return False
+    try:
+        sample = path.read_bytes()
+        sample.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    if len(sample) < 2 or sample[0] not in PROTO0_1_START_BYTES:
+        return False
+
+    opcode_count = 0
+    try:
+        for opcode, _arg, _pos in pickletools.genops(sample):
+            opcode_count += 1
+            if opcode.name == "STOP" or opcode.name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
+                return False
+    except ValueError as exc:
+        if not str(exc).startswith("pickle exhausted before seeing STOP"):
+            return False
+    except Exception:
+        return False
+    return opcode_count >= 2
+
+
 def _has_budget_exhausted_protobuf_model_candidate(path: Path, size: int) -> bool:
     """Return True when a bounded probe leaves a protobuf model candidate."""
-    return _looks_like_onnx_model_file(path, size) is None
+    if _looks_like_onnx_model_file(path, size) is not None:
+        return False
+    return not _is_complete_trivial_proto0_or_1_text_stream(path, size)
 
 
 def _looks_like_coreml_description_proto_prefix(data: bytes) -> bool:
