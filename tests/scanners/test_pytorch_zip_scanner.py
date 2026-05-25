@@ -1040,6 +1040,8 @@ def test_pytorch_zip_scans_unmarked_python_blobs_in_archive_data(tmp_path: Path)
         b"getattr(__builtins__, 'eval')('1 + 1')\n",
         b"__builtins__['ev' + 'al']('1 + 1')\n",
         b"__builtins__.__dict__.get('eval')('1 + 1')\n",
+        b"import builtins as bi\nbi.eval('1 + 1')\n",
+        b"from builtins import eval as run\nrun('1 + 1')\n",
     ],
 )
 def test_pytorch_zip_scans_static_builtin_indirection_in_archive_data(tmp_path: Path, payload: bytes) -> None:
@@ -1063,13 +1065,20 @@ def test_pytorch_zip_scans_static_builtin_indirection_in_archive_data(tmp_path: 
     )
 
 
-def test_pytorch_zip_ignores_ordinary_callback_mapping_in_archive_data(tmp_path: Path) -> None:
-    """An ordinary application lookup with a builtin-shaped key must remain benign."""
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"callbacks = {'eval': len}\ncallbacks['eval']([])\n",
+        b"import builtins as bi\nbi.len([1])\n",
+    ],
+)
+def test_pytorch_zip_ignores_benign_builtin_shaped_access_in_archive_data(tmp_path: Path, payload: bytes) -> None:
+    """Ordinary mappings and harmless builtin use must remain benign."""
     zip_path = tmp_path / "model.pt"
     with zipfile.ZipFile(zip_path, "w") as zipf:
         zipf.writestr("archive/version", "3")
         zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
-        zipf.writestr("archive/data/payload.bin", b"callbacks = {'eval': len}\ncallbacks['eval']([])\n")
+        zipf.writestr("archive/data/payload.bin", payload)
 
     result = PyTorchZipScanner().scan(str(zip_path))
 

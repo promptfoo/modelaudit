@@ -177,6 +177,41 @@ class TestTarScanner:
         assert python_checks[0].rule_code == "S101"
         assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            b"__builtins__['ev' + 'al']('1 + 1')\n",
+            b"getattr(__builtins__, 'eval')('1 + 1')\n",
+            b"__builtins__.__dict__.get('eval')('1 + 1')\n",
+        ],
+    )
+    def test_scan_tar_flags_implicit_builtins_dangerous_python_member(self, tmp_path: Path, payload: bytes) -> None:
+        archive_path = tmp_path / "model_bundle.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].rule_code == "S104"
+        assert python_checks[0].details["reason"] == "high-risk calls: __builtins__.eval"
+
+    def test_scan_tar_allows_ordinary_builtin_shaped_mapping(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = b"callbacks = {'eval': len}\ncallbacks['eval']([])\n"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+
     def test_scan_tar_flags_aliased_getattr_helper_dangerous_python_member(self, tmp_path: Path) -> None:
         """Aliased getattr helpers and module aliases should still resolve risky calls."""
         archive_path = tmp_path / "model_bundle.tar"

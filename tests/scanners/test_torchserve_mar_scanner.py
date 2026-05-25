@@ -234,6 +234,53 @@ def test_scan_detects_keyword_getattr_wrapped_handler_execution_primitive(
     assert "os.system" in handler_failures[0].message
 
 
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        b"def handle(data, context):\n    return __builtins__['ev' + 'al']('1 + 1')\n",
+        b"def handle(data, context):\n    return getattr(__builtins__, 'eval')('1 + 1')\n",
+        b"def handle(data, context):\n    return __builtins__.__dict__.get('eval')('1 + 1')\n",
+    ],
+)
+def test_scan_detects_implicit_builtins_handler_execution_primitive(
+    tmp_path: Path,
+    handler_source: bytes,
+) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={"handler.py": handler_source, "weights.bin": b"weights"},
+        filename="implicit_builtins_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(handler_failures) == 1
+    assert handler_failures[0].severity == IssueSeverity.CRITICAL
+    assert "__builtins__.eval" in handler_failures[0].message
+
+
+def test_scan_allows_ordinary_builtin_shaped_handler_mapping(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": (
+                b"def handle(data, context):\n    callbacks = {'eval': len}\n    return callbacks['eval']([])\n"
+            ),
+            "weights.bin": b"weights",
+        },
+        filename="benign_builtin_mapping_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
+
+
 def test_scan_detects_dunder_call_getattr_wrapped_handler_execution_primitive(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(

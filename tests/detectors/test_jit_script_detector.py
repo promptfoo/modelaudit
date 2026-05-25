@@ -245,6 +245,9 @@ class TestJITScriptDetector:
             b"__builtins__.__dict__['ev' + 'al']('1 + 1')\n",
             b"__builtins__.__dict__.get('ev' + 'al')('1 + 1')\n",
             b"__builtins__.__dict__.__getitem__('eval')('1 + 1')\n",
+            b"import builtins\nbuiltins.eval('1 + 1')\n",
+            b"import builtins as bi\ngetattr(bi, 'ev' + 'al')('1 + 1')\n",
+            b"from builtins import eval as run\nrun('1 + 1')\n",
         ],
     )
     def test_scan_model_detects_unmarked_static_builtin_indirection(self, source: bytes) -> None:
@@ -254,9 +257,15 @@ class TestJITScriptDetector:
 
         assert any(f.type == "ast_dangerous_call" and f.builtin == "eval" for f in findings)
 
-    def test_scan_model_ignores_ordinary_static_callback_mapping(self) -> None:
+    @pytest.mark.parametrize(
+        "source",
+        [
+            b"callbacks = {'eval': len}\ncallbacks['eval']([])\n",
+            b"import builtins as bi\nbi.len([1])\n",
+        ],
+    )
+    def test_scan_model_ignores_benign_builtin_shaped_access(self, source: bytes) -> None:
         detector = JITScriptDetector()
-        source = b"callbacks = {'eval': len}\ncallbacks['eval']([])\n"
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 

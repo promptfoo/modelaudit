@@ -59,6 +59,12 @@ _VERSIONED_SHARED_OBJECT_SUFFIX_RE = re.compile(r"\.so(?:\.[0-9]+)+$")
 _PYTHON_ARCHIVE_MEMBER_SUFFIXES = (".py", ".pyw")
 _HIGH_RISK_PYTHON_CALLS = {
     "__import__",
+    "__builtin__.__import__",
+    "__builtin__.eval",
+    "__builtin__.exec",
+    "__builtins__.__import__",
+    "__builtins__.eval",
+    "__builtins__.exec",
     "builtins.__import__",
     "builtins.eval",
     "builtins.exec",
@@ -82,7 +88,13 @@ _HIGH_RISK_PYTHON_CALLS = {
 # (eval/exec) just because the scanner hard-coded a single fallback.
 _HIGH_RISK_PYTHON_CALL_RULE_CODES: dict[str, str] = {
     "__import__": "S106",
+    "__builtin__.__import__": "S106",
+    "__builtins__.__import__": "S106",
     "builtins.__import__": "S106",
+    "__builtin__.eval": "S104",
+    "__builtin__.exec": "S104",
+    "__builtins__.eval": "S104",
+    "__builtins__.exec": "S104",
     "builtins.eval": "S104",
     "builtins.exec": "S104",
     "eval": "S104",
@@ -370,6 +382,11 @@ def _resolve_namespace_dict_roots(node: ast.AST, alias_scopes: _AliasScopes) -> 
             for resolved_name in resolved_namespace_names
             if resolved_name.endswith(".__dict__")
         }
+        roots.update(
+            resolved_name
+            for resolved_name in resolved_namespace_names
+            if resolved_name in {"__builtin__", "__builtins__"}
+        )
         if roots:
             return frozenset(roots)
 

@@ -203,6 +203,25 @@ def _resolve_dangerous_builtin_reference(node: ast.AST) -> str | None:
     return name if name in DANGEROUS_BUILTINS else None
 
 
+def _resolve_alias_aware_dangerous_builtins(tree: ast.AST) -> set[str]:
+    """Return dangerous builtins reached through shared bounded source resolution."""
+    from modelaudit.scanners.archive_member_security import high_risk_python_calls_in_tree
+
+    builtin_prefixes = ("__builtin__.", "__builtins__.", "builtins.")
+    dangerous_builtins: set[str] = set()
+    for call in high_risk_python_calls_in_tree(tree):
+        if call.name in DANGEROUS_BUILTINS:
+            dangerous_builtins.add(call.name)
+            continue
+        for prefix in builtin_prefixes:
+            if call.name.startswith(prefix):
+                builtin_name = call.name.removeprefix(prefix)
+                if builtin_name in DANGEROUS_BUILTINS:
+                    dangerous_builtins.add(builtin_name)
+                break
+    return dangerous_builtins
+
+
 # Patterns that indicate code execution attempts
 CODE_EXECUTION_PATTERNS = [
     # Direct execution patterns
@@ -267,6 +286,8 @@ class JITScriptDetector:
     @staticmethod
     def _ast_contains_dangerous_python(tree: ast.AST) -> bool:
         """Return whether parsed Python contains modeled dangerous operations."""
+        if _resolve_alias_aware_dangerous_builtins(tree):
+            return True
 
         def is_dangerous_import(module_name: str) -> bool:
             return any(
@@ -761,6 +782,29 @@ class JITScriptDetector:
         visitor = DangerousNodeVisitor()
         visitor.visit(tree)
         findings.extend(visitor.findings)
+
+        reported_builtins = {
+            finding.builtin
+            for finding in findings
+            if finding.type == "ast_dangerous_call" and finding.builtin is not None
+        }
+        for dangerous_builtin in sorted(_resolve_alias_aware_dangerous_builtins(tree) - reported_builtins):
+            findings.append(
+                create_jit_finding(
+                    message=f"AST analysis: Dangerous function call '{dangerous_builtin}'",
+                    severity="CRITICAL",
+                    context=context,
+                    pattern=None,
+                    recommendation="Remove dangerous function calls to prevent code execution",
+                    confidence=0.9,
+                    framework=framework,
+                    code_snippet=None,
+                    type="ast_dangerous_call",
+                    operation=None,
+                    builtin=dangerous_builtin,
+                    import_=None,
+                )
+            )
 
         return findings
 

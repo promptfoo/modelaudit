@@ -204,6 +204,41 @@ def test_scan_zip_flags_builtins_getattr_keyword_call_dangerous_python_member(tm
     assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "__builtins__['ev' + 'al']('1 + 1')\n",
+        "getattr(__builtins__, 'eval')('1 + 1')\n",
+        "__builtins__.__dict__.get('eval')('1 + 1')\n",
+    ],
+)
+def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S104"
+    assert python_checks[0].details["reason"] == "high-risk calls: __builtins__.eval"
+
+
+def test_scan_zip_allows_ordinary_builtin_shaped_mapping(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", "callbacks = {'eval': len}\ncallbacks['eval']([])\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+
+
 def test_scan_zip_flags_aliased_getattr_helper_dangerous_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     source = (
