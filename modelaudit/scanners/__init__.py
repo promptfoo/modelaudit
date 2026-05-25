@@ -281,9 +281,9 @@ class ScannerRegistry:
                             if llamafile_class:
                                 return llamafile_class
                     if scanner_id != "torch7" and (scanner_selection is None or scanner_selection.allows("torch7")):
-                        from modelaudit.utils.file.detection import is_torch7_serialized_file
+                        from modelaudit.utils.file.detection import is_strict_torch7_serialized_file
 
-                        if is_torch7_serialized_file(path):
+                        if is_strict_torch7_serialized_file(path):
                             torch7_class = self._load_scanner("torch7")
                             if torch7_class and torch7_class.can_handle(path):
                                 return torch7_class

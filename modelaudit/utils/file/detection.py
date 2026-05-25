@@ -1221,12 +1221,13 @@ def _is_torch7_signature(prefix: bytes) -> bool:
     return has_torch_marker and has_structure_marker
 
 
-def is_torch7_serialized_file(path: str) -> bool:
-    """Return whether a bounded content probe verifies a Torch7 artifact."""
+def is_strict_torch7_serialized_file(path: str) -> bool:
+    """Return whether an unambiguous bounded probe verifies a Torch7 artifact."""
     try:
-        return _is_torch7_signature(read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES))
+        prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
     except OSError:
         return False
+    return prefix.startswith(b"T7\x00\x00") or _has_torch7_ascii_object_signature(prefix)
 
 
 def _is_lightgbm_signature(prefix: bytes) -> bool:
@@ -1410,11 +1411,6 @@ def detect_file_format_from_magic(path: str) -> str:
             format_result = detect_format_from_magic_bytes(magic4, magic8, magic16, size, file_path)
             if format_result == "zip" and file_path.suffix.lower() == ".mar" and is_torchserve_mar_archive(path):
                 return "torchserve_mar"
-            if format_result == "onnx":
-                f.seek(0)
-                torch7_prefix = f.read(_TORCH7_SIGNATURE_READ_BYTES)
-                if _is_torch7_signature(torch7_prefix):
-                    return "torch7"
             if format_result != "unknown":
                 return format_result
 
@@ -1602,9 +1598,6 @@ def detect_file_format(path: str) -> str:
     if magic8.startswith(b"\x93NUMPY"):
         return "numpy"
     if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
-        torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
-        if _is_torch7_signature(torch7_prefix):
-            return "torch7"
         return "onnx"
 
     # Check first 8 bytes for HDF5 magic

@@ -413,6 +413,13 @@ def test_get_scanner_for_path_routes_raw_pickle_torch_suffixes_to_pickle(
     _assert_scanner_for_path(model_path, expected_scanner_name)
 
 
+def test_get_scanner_for_path_keeps_torch_marker_pickle_on_pickle_scanner(tmp_path: Path) -> None:
+    model_path = tmp_path / "marker-checkpoint.pt"
+    model_path.write_bytes(pickle.dumps({"weights": b"\x00torch.FloatTensor nn.Sequential"}, protocol=4))
+
+    _assert_scanner_for_path(model_path, "pickle")
+
+
 def test_get_scanner_for_path_routes_raw_bin_payload_to_pytorch_binary(tmp_path: Path) -> None:
     model_path = tmp_path / "model.bin"
     model_path.write_bytes(b"\x00" * 128)
