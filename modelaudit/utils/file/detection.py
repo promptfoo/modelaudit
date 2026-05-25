@@ -1158,6 +1158,7 @@ def _is_tensorflow_graph_field_payload(payload: bytes) -> bool:
         if len(graph_def.node) > 0 or any(function.node_def for function in graph_def.library.function):
             return True
     except Exception:
+        # The payload may be a MetaGraphDef rather than a GraphDef; try that representation next.
         pass
     try:
         metagraph = MetaGraphDef()
@@ -1243,8 +1244,8 @@ def _has_bounded_tensorflow_graph_field(path: Path, file_size: int) -> bool:
                     if file_size <= _TF_METAGRAPH_MAX_VALIDATE_BYTES:
                         return True
                     if length > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
-                        # Preserve an uninspectably large structural graph field for fail-closed scanning.
-                        return True
+                        # A length-delimited field alone does not establish TensorFlow structure.
+                        return False
                     return _is_tensorflow_graph_field_payload(stream.read(length))
                 if not _skip_proto_stream_value(
                     stream,
