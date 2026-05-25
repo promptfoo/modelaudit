@@ -307,10 +307,16 @@ def _resolve_getattr_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> fr
 
 def _resolve_namespace_mapping_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
     """Resolve statically selected module namespace mappings."""
+    implicit_builtins_roots = _resolve_globals_builtins_mapping_roots(node, alias_scopes)
+    if implicit_builtins_roots is not None:
+        return implicit_builtins_roots
+
     mapping_name = _resolve_call_name(node)
     if mapping_name is not None:
         resolved_mapping_names = _apply_aliases(mapping_name, alias_scopes)
         if resolved_mapping_names is not None:
+            if mapping_name == "__builtins__" and resolved_mapping_names == frozenset({"__builtins__"}):
+                return frozenset({"builtins"})
             namespace_roots = frozenset(
                 name.removesuffix(".__dict__") for name in resolved_mapping_names if name.endswith(".__dict__")
             )
@@ -339,6 +345,42 @@ def _resolve_namespace_mapping_roots(node: ast.AST, alias_scopes: _AliasScopes) 
 
     target_root = _resolve_call_name(node.args[0])
     return _apply_aliases(target_root, alias_scopes) if target_root is not None else None
+
+
+def _resolve_globals_builtins_mapping_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+    """Resolve the implicit builtins mapping read from an unshadowed globals call."""
+    mapping_node: ast.AST
+    key_node: ast.AST
+    if isinstance(node, ast.Subscript):
+        mapping_node = node.value
+        key_node = node.slice
+    elif (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"get", "__getitem__"}
+        and node.args
+        and not node.keywords
+    ):
+        if node.func.attr == "__getitem__" and len(node.args) != 1:
+            return None
+        if node.func.attr == "get" and len(node.args) not in {1, 2}:
+            return None
+        mapping_node = node.func.value
+        key_node = node.args[0]
+    else:
+        return None
+
+    if _resolve_static_string(key_node) != "__builtins__" or not isinstance(mapping_node, ast.Call):
+        return None
+    if mapping_node.args or mapping_node.keywords:
+        return None
+    helper_name = _resolve_call_name(mapping_node.func)
+    if helper_name is None:
+        return None
+    resolved_helpers = _apply_aliases(helper_name, alias_scopes)
+    if resolved_helpers is None or not (resolved_helpers & {"globals", "builtins.globals"}):
+        return None
+    return frozenset({"builtins"})
 
 
 def _resolve_namespace_mapping_lookup_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
@@ -377,7 +419,10 @@ def _resolve_namespace_mapping_lookup_names(node: ast.AST, alias_scopes: _AliasS
 def _resolve_static_reference_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
     call_name = _resolve_call_name(node)
     if call_name is not None:
-        return _apply_aliases(call_name, alias_scopes)
+        resolved_names = _apply_aliases(call_name, alias_scopes)
+        if call_name == "__builtins__" and resolved_names == frozenset({"__builtins__"}):
+            return frozenset({"builtins.__dict__"})
+        return resolved_names
     getattr_names = _resolve_getattr_call_names(node, alias_scopes)
     if getattr_names is not None:
         return getattr_names

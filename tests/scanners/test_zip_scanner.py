@@ -283,6 +283,82 @@ def test_scan_zip_ignores_shadowed_namespace_mapping_helper(tmp_path: Path) -> N
     )
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "__builtins__['ev' + 'al']('1 + 1')\n",
+        "__builtins__.get('ev' + 'al')('1 + 1')\n",
+        "namespace = __builtins__\nnamespace['ev' + 'al']('1 + 1')\n",
+    ],
+)
+def test_scan_zip_flags_implicit_builtins_mapping_dangerous_python_member(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S104"
+    assert python_checks[0].details["reason"] == "high-risk calls: builtins.eval"
+
+
+def test_scan_zip_ignores_shadowed_implicit_builtins_mapping(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "__builtins__ = {'eval': print}\n__builtins__['eval']('safe')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "globals()['__builtins__']['ev' + 'al']('1 + 1')\n",
+        "globals().get('__builtins__').get('ev' + 'al')('1 + 1')\n",
+        "namespace = globals()['__builtins__']\nnamespace['ev' + 'al']('1 + 1')\n",
+    ],
+)
+def test_scan_zip_flags_globals_builtins_mapping_dangerous_python_member(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S104"
+    assert python_checks[0].details["reason"] == "high-risk calls: builtins.eval"
+
+
+def test_scan_zip_ignores_shadowed_globals_builtins_mapping(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "globals = lambda: {'__builtins__': {'eval': print}}\nglobals()['__builtins__']['eval']('safe')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(
+        check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
 def test_scan_zip_bounds_large_concatenated_getattr_names(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     padding = " + ".join(["''"] * 300)
