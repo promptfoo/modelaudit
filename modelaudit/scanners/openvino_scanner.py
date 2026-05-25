@@ -283,7 +283,9 @@ class OpenVinoScanner(BaseScanner):
         if version:
             result.metadata["ir_version"] = version
 
-        for layer in root.findall(".//layer"):
+        root_tag = str(root.tag)
+        namespace_prefix = root_tag.rsplit("}", 1)[0] + "}" if root_tag.startswith("{") else ""
+        for layer in root.findall(f".//{namespace_prefix}layer"):
             layer_type = layer.attrib.get("type", "").strip().lower()
             layer_name = layer.attrib.get("name", "")
             if layer_type in {"python", "custom"}:
