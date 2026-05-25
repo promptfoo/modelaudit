@@ -22,9 +22,15 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.sevenzip_scanner import HAS_PY7ZR, SevenZipScanner, _RecursiveScanBudget
+from modelaudit.scanners.sevenzip_scanner import (
+    HAS_PY7ZR,
+    SevenZipScanner,
+    _NestedMemberProbeResult,
+    _RecursiveScanBudget,
+)
 
 # Skip all tests if py7zr is not available for asset generation
 pytest_plugins: list[str] = []
@@ -1362,7 +1368,7 @@ class TestSevenZipScannerHardening:
             patch.object(
                 scanner,
                 "_probe_extensionless_members",
-                return_value=dict.fromkeys(extensionless_members[:3], False),
+                return_value={name: _NestedMemberProbeResult(None) for name in extensionless_members[:3]},
             ) as mock_probe,
             patch("os.path.getsize", return_value=32),
         ):
@@ -1392,7 +1398,11 @@ class TestSevenZipScannerHardening:
         with (
             patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
             patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
-            patch.object(scanner, "_probe_extensionless_members", return_value={"payload.jpg": "zip"}) as mock_probe,
+            patch.object(
+                scanner,
+                "_probe_extensionless_members",
+                return_value={"payload.jpg": _NestedMemberProbeResult("zip")},
+            ) as mock_probe,
             patch.object(scanner, "_extract_and_scan_files", return_value=True) as mock_extract,
             patch("os.path.getsize", return_value=32),
         ):
@@ -1420,7 +1430,11 @@ class TestSevenZipScannerHardening:
         with (
             patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
             patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
-            patch.object(scanner, "_probe_extensionless_members", return_value={"payload.jpg": "zip"}),
+            patch.object(
+                scanner,
+                "_probe_extensionless_members",
+                return_value={"payload.jpg": _NestedMemberProbeResult("zip")},
+            ),
             patch("os.path.getsize", return_value=32),
         ):
             mock_archive = MagicMock()
@@ -1458,8 +1472,8 @@ class TestSevenZipScannerHardening:
         fake_archive = FakeArchive()
 
         assert scanner._probe_extensionless_members(fake_archive, ["payload_a.jpg", "payload_b.jpg"]) == {
-            "payload_a.jpg": "zip",
-            "payload_b.jpg": "zip",
+            "payload_a.jpg": _NestedMemberProbeResult("zip"),
+            "payload_b.jpg": _NestedMemberProbeResult("zip"),
         }
         assert fake_archive.targets == [["payload_a.jpg"], ["payload_b.jpg"]]
         assert fake_archive.reset_count == 2
@@ -1538,6 +1552,105 @@ class TestSevenZipScannerHardening:
         assert result.success is True
         assert result.metadata["scannable_files"] == 0
         assert not result.issues
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_high_risk_python_member_is_scanned_through_shared_archive_security(self, tmp_path: Path) -> None:
+        """Python source members must not bypass the AST archive-member detector."""
+        import py7zr  # type: ignore[import-untyped]
+
+        archive_path = tmp_path / "python_sidecar.7z"
+        source_path = tmp_path / "setup.py"
+        source_path.write_bytes(b"import os\nos.system('echo hidden')\n")
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(source_path, "assets/setup.py")
+
+        result = SevenZipScanner().scan(str(archive_path))
+        security_checks = [
+            check
+            for check in result.checks
+            if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+        ]
+
+        assert len(security_checks) == 1
+        assert "high-risk calls: os.system" in security_checks[0].message
+        assert security_checks[0].rule_code == "S101"
+        aggregate = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
+        assert determine_exit_code(aggregate) == 1
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_benign_python_and_ordinary_members_stay_clean(self, tmp_path: Path) -> None:
+        """Scanning generic member types must not turn inert sidecars into findings."""
+        import py7zr  # type: ignore[import-untyped]
+
+        archive_path = tmp_path / "benign_sidecars.7z"
+        source_path = tmp_path / "setup.py"
+        notes_path = tmp_path / "readme.dat"
+        source_path.write_bytes(b"def transform(value):\n    return value\n")
+        notes_path.write_bytes(b"ordinary model notes")
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(source_path, "assets/setup.py")
+            archive.write(notes_path, "assets/readme.dat")
+
+        result = SevenZipScanner().scan(str(archive_path))
+
+        assert result.success is True
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_unparseable_python_member_marks_scan_inconclusive(self, tmp_path: Path) -> None:
+        """Unparseable Python source must fail closed instead of silently clearing coverage."""
+        import py7zr  # type: ignore[import-untyped]
+
+        archive_path = tmp_path / "unparseable_python.7z"
+        source_path = tmp_path / "broken.py"
+        source_path.write_bytes(b"def broken(:\n")
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(source_path, "assets/broken.py")
+
+        result = SevenZipScanner().scan(str(archive_path))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "sevenzip_python_member_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        parse_checks = [
+            check
+            for check in result.checks
+            if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+        ]
+        assert len(parse_checks) == 1
+        assert parse_checks[0].severity == IssueSeverity.INFO
+        aggregate = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
+        assert determine_exit_code(aggregate) == 2
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_disguised_executable_members_are_detected_by_content(self, tmp_path: Path) -> None:
+        """Executable bytes must not disappear behind inert member suffixes."""
+        import py7zr  # type: ignore[import-untyped]
+
+        distant_pe_header = bytearray(b"\x00" * 2052)
+        distant_pe_header[:2] = b"MZ"
+        distant_pe_header[0x3C:0x40] = (2048).to_bytes(4, "little")
+        distant_pe_header[2048:2052] = b"PE\x00\x00"
+        archive_path = tmp_path / "executable_sidecars.7z"
+        elf_path = tmp_path / "payload.dat"
+        pe_path = tmp_path / "loader.txt"
+        elf_path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+        pe_path.write_bytes(bytes(distant_pe_header))
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(elf_path, "assets/payload.dat")
+            archive.write(pe_path, "assets/loader.txt")
+
+        result = SevenZipScanner().scan(str(archive_path))
+        security_messages = {
+            check.message
+            for check in result.checks
+            if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
+        }
+
+        assert "Executable file found in 7z archive: assets/payload.dat" in security_messages
+        assert "Executable file found in 7z archive: assets/loader.txt" in security_messages
+        aggregate = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
+        assert determine_exit_code(aggregate) == 1
 
     # -- cumulative entry count -----------------------------------------------
 
