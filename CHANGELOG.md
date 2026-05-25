@@ -39,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - classify malformed recognized ONNX model parsing as incomplete coverage rather than a security finding
 - preserve MetaGraph security findings from malformed content-routed payloads while reporting incomplete coverage
 - preserve SavedModel security findings from malformed content-routed payloads while reporting incomplete coverage
+- avoid reporting ordinary `sklearn` references in Skops model-card prose as unsafe joblib fallback evidence
 
 ## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
 
