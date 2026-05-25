@@ -43,19 +43,28 @@ class ProtobufModelCandidateScanner(BaseScanner):
         candidate_config[FORMAT_VALIDATION_CONFIG_KEY] = format_validation
         scanner_selection = policy_from_config(candidate_config)
 
+        incomplete_result: ScanResult | None = None
         last_rejection: ScanResult | None = None
         for scanner_id, scanner_class in (("onnx", OnnxScanner), ("coreml", CoreMLScanner)):
             if not allows_protobuf_model_candidate_analyzer(scanner_selection, scanner_id):
                 continue
             result = scanner_class(config=candidate_config).scan(path)
-            if result.scanner_name != "unknown" or not result.success:
+            if result.scanner_name != "unknown":
                 return result
+            if not result.success:
+                incomplete_result = incomplete_result or result
+                continue
             last_rejection = result
 
+        fallback_result = self._scan_filename_owned_fallback(path, scanner_selection)
+        if fallback_result is not None:
+            return fallback_result
+        if incomplete_result is not None:
+            return incomplete_result
         if last_rejection is None:  # pragma: no cover - routing filters unusable selections
             result = self._create_result()
             result.scanner_name = "unknown"
             result.metadata["tentative_protobuf_candidate_unanalyzed"] = "scanner_selection_excluded_analyzers"
             result.finish(success=True)
             return result
-        return self._scan_filename_owned_fallback(path, scanner_selection) or last_rejection
+        return last_rejection
