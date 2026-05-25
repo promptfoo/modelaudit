@@ -2076,6 +2076,7 @@ def test_scan_file_routes_oversized_renamed_tf_metagraph_to_fail_closed_scan(tmp
 
 
 def test_scan_file_rejects_malformed_protobuf_near_match_without_finding(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
     malformed_payload = tmp_path / "malformed-large.jpg"
     malformed_payload.write_bytes(b"\x12" + (b"x" * _MAX_PARSE_BYTES))
     cache_dir = tmp_path / "cache"
@@ -2094,10 +2095,7 @@ def test_scan_file_rejects_malformed_protobuf_near_match_without_finding(tmp_pat
         assert result.success is True
         assert repeated_result.success is True
         assert result.issues == []
-        assert (
-            result.metadata.get("tentative_protobuf_candidate_rejected") is True
-            or result.metadata.get("tentative_protobuf_candidate_unanalyzed") == "onnx_dependency_unavailable"
-        )
+        assert result.metadata.get("tentative_protobuf_candidate_rejected") is True
         assert "scan_outcome" not in result.metadata
     finally:
         reset_cache_manager()

@@ -282,6 +282,7 @@ class TestDirectoryFileFiltering:
         assert any(issue.details.get("op_type") == "PythonOp" for issue in results.issues)
 
     def test_budget_exhausted_protobuf_near_match_is_rejected_without_findings(self, tmp_path: Path) -> None:
+        pytest.importorskip("onnx")
         ambiguous_payload = tmp_path / "ambiguous.jpg"
         ambiguous_payload.write_bytes(b"\x12" + (b"x" * (20 * 1024 * 1024)))
 
@@ -291,6 +292,22 @@ class TestDirectoryFileFiltering:
         assert determine_exit_code(results) == 0
         assert results.success is True
         assert results.issues == []
+
+    def test_budget_exhausted_protobuf_candidate_without_onnx_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ambiguous_payload = tmp_path / "ambiguous.jpg"
+        ambiguous_payload.write_bytes(b"\x42\x00" * 4097)
+        monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert determine_exit_code(results) == 2
+        assert results.success is False
+        assert any("dependency is unavailable" in issue.message for issue in results.issues)
 
     @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
     def test_disguised_pickle_with_default_hidden_or_basename_skip_is_scanned(
