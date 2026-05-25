@@ -508,6 +508,18 @@ class KerasZipScanner(BaseScanner):
             self._merge_recursive_archive_scan(path, result)
             result.finish(success=False)
             return result
+        except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as e:
+            self._mark_inconclusive_scan_result(result, "keras_zip_archive_read_failed")
+            result.add_check(
+                name="Keras ZIP Archive Read",
+                passed=False,
+                message=f"Unable to complete Keras ZIP scan due to archive read failure: {e!s}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={"exception": str(e), "exception_type": type(e).__name__},
+            )
+            self._finish_scan_result(result)
+            return result
         except Exception as e:
             result.add_check(
                 name="Keras ZIP File Scan",
