@@ -1628,6 +1628,8 @@ def detect_file_format(path: str) -> str:
 
     # Compound tar wrappers should route to TAR scanner semantics.
     if filename_lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
+        if _detect_compression_format(header) is not None or _is_tar_archive(path):
+            return "tar"
         torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
         if _is_torch7_signature(torch7_prefix):
             return "torch7"

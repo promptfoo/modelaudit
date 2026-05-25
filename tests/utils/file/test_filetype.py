@@ -429,6 +429,23 @@ def test_torch7_magic_keeps_binary_marker_only_routing(tmp_path: Path) -> None:
     assert detect_file_format_from_magic(str(torch7_path)) == "torch7"
 
 
+def test_torch7_markers_in_gzip_header_do_not_override_tar_archive(tmp_path: Path) -> None:
+    tar_payload = io.BytesIO()
+    with tarfile.open(fileobj=tar_payload, mode="w") as archive:
+        info = tarfile.TarInfo("weights.bin")
+        info.size = len(b"safe weights")
+        archive.addfile(info, io.BytesIO(b"safe weights"))
+
+    archive_path = tmp_path / "weights.tar.gz"
+    with (
+        archive_path.open("wb") as target,
+        gzip.GzipFile(filename="torch_tensor", mode="wb", fileobj=target) as compressed,
+    ):
+        compressed.write(tar_payload.getvalue())
+
+    assert detect_file_format(str(archive_path)) == "tar"
+
+
 def test_detect_executorch_binary_requires_valid_flatbuffer_structure(tmp_path: Path) -> None:
     executorch_path = tmp_path / "program.pte"
     executorch_path.write_bytes(b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x04\x00\x00\x00")

