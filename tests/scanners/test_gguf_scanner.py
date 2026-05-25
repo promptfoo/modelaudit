@@ -12,6 +12,7 @@ from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SC
 from modelaudit.scanners.gguf_scanner import (
     GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON,
     GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON,
+    GGUF_PARSE_INCONCLUSIVE_REASON,
     GGUF_TENSOR_LIMIT_INCONCLUSIVE_REASON,
     GgufScanner,
 )
@@ -402,6 +403,28 @@ def test_gguf_scanner_scans_malicious_template_before_truncated_metadata(tmp_pat
     assert determine_exit_code(aggregate) == 1
 
 
+def test_gguf_scanner_reports_duplicate_key_before_truncated_duplicate_value(tmp_path: Path) -> None:
+    path = tmp_path / "truncated-duplicate-template.gguf"
+    key = "tokenizer.chat_template"
+    _write_gguf_string_metadata_entries(
+        path,
+        [(key, "{{ message['content'] }}")],
+        declared_count=2,
+    )
+    with path.open("ab") as f:
+        encoded_key = key.encode("utf-8")
+        f.write(struct.pack("<Q", len(encoded_key)))
+        f.write(encoded_key)
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert GGUF_PARSE_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    assert GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    assert any(check.name == "GGUF Duplicate Metadata Keys" for check in direct.checks)
+    _assert_inconclusive_exit2(aggregate, GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON)
+
+
 def test_gguf_metadata_array_item_limit_is_inconclusive_and_not_cached(tmp_path: Path) -> None:
     path = tmp_path / "bounded-array.gguf"
     _write_gguf_raw_metadata_entries(
@@ -490,6 +513,29 @@ def test_gguf_scanner_keeps_malicious_template_found_before_array_limit(tmp_path
         str(path),
         cache_enabled=False,
         gguf_max_metadata_array_items=1,
+    )
+
+    assert GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in direct.checks
+    )
+    assert determine_exit_code(aggregate) == 1
+
+
+def test_gguf_scanner_keeps_malicious_template_found_before_key_count_limit(tmp_path: Path) -> None:
+    path = tmp_path / "template-before-key-count-limit.gguf"
+    _write_gguf_string_metadata_entries(
+        path,
+        [("tokenizer.chat_template", "{{ ''.__class__.__mro__[1].__subclasses__() }}")],
+        declared_count=2,
+    )
+
+    direct = GgufScanner(config={"gguf_max_metadata_keys": 1}).scan(str(path))
+    aggregate = scan_model_directory_or_file(
+        str(path),
+        cache_enabled=False,
+        gguf_max_metadata_keys=1,
     )
 
     assert GGUF_METADATA_LIMIT_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]

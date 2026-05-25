@@ -281,13 +281,13 @@ class GgufScanner(BaseScanner):
             },
         )
 
-        if n_kv > self.max_metadata_keys:
+        metadata_key_limit_exceeded = n_kv > self.max_metadata_keys
+        if metadata_key_limit_exceeded:
             self._report_metadata_limit(
                 result,
                 f"GGUF declares {n_kv} metadata keys, exceeding limit {self.max_metadata_keys}",
                 declared_metadata_keys=n_kv,
             )
-            return
 
         # Parse metadata with security checks
         metadata: dict[str, Any] = {}
@@ -300,8 +300,10 @@ class GgufScanner(BaseScanner):
             _GgufMetadataLimitExceeded,
         )
         try:
-            for _i in range(n_kv):
+            for _i in range(min(n_kv, self.max_metadata_keys)):
                 key = self._read_string(f, budget=metadata_byte_budget)
+                occurrence = metadata_key_occurrences.get(key, 0) + 1
+                metadata_key_occurrences[key] = occurrence
 
                 # Security check for suspicious keys
                 if any(x in key for x in ("../", "..\\", "/", "\\")):
@@ -322,8 +324,6 @@ class GgufScanner(BaseScanner):
                     array_items_read=metadata_array_items_read,
                     byte_budget=metadata_byte_budget,
                 )
-                occurrence = metadata_key_occurrences.get(key, 0) + 1
-                metadata_key_occurrences[key] = occurrence
                 if self._is_chat_template_key(key) and isinstance(value, str) and value.strip():
                     self._record_chat_template_occurrence(chat_templates, key, value, occurrence)
                 metadata[key] = value
@@ -343,6 +343,8 @@ class GgufScanner(BaseScanner):
             result.metadata["metadata"] = metadata
             self._report_duplicate_metadata_keys(metadata_key_occurrences, result)
             self._scan_embedded_chat_templates(chat_templates, result)
+            if metadata_key_limit_exceeded:
+                return
         except _GgufMetadataLimitExceeded as e:
             self._report_metadata_limit(result, str(e))
             self._report_duplicate_metadata_keys(metadata_key_occurrences, result)
