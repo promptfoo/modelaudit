@@ -3,7 +3,11 @@ from __future__ import annotations
 import base64
 from pathlib import Path
 
-from modelaudit.scanners.base import IssueSeverity
+import pytest
+
+from modelaudit.cache import get_cache_manager, reset_cache_manager
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.coreml_scanner import CoreMLScanner
 from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension
 
@@ -567,8 +571,10 @@ def test_coreml_scanner_recursion_limit_fails_closed(tmp_path: Path) -> None:
     result = CoreMLScanner().scan(str(model_path))
 
     assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "coreml_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
     assert any(
-        issue.severity == IssueSeverity.CRITICAL
+        issue.severity == IssueSeverity.INFO
         and "traversal reached the safe depth limit" in issue.message
         and issue.details.get("max_recursive_message_depth") == CoreMLScanner.MAX_RECURSIVE_MESSAGE_DEPTH
         for issue in result.issues
@@ -623,6 +629,121 @@ def test_coreml_scanner_oversized_truncated_benign_layers_fail_closed(tmp_path: 
     assert not any(check.name == "CoreML Custom Code Path Check" for check in result.checks)
 
 
+def test_coreml_routed_malformed_neural_block_is_inconclusive_and_uncached(tmp_path: Path) -> None:
+    """Content-routed malformed CoreML structure is incomplete coverage, not malicious evidence."""
+    model_path = _write_model(
+        tmp_path / "renamed_benign.payload",
+        _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            neural_network=_field_bytes(1, b"ab")[:-1],
+        ),
+    )
+    cache_dir = tmp_path / "cache"
+
+    direct_result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert direct_result.scanner_name == "coreml"
+    assert direct_result.success is False
+    assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "coreml_analysis_incomplete" in direct_result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "CoreML Neural Network Parse"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.INFO
+        for check in direct_result.checks
+    )
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in direct_result.issues)
+
+    reset_cache_manager()
+    try:
+        first_result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second_result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for result in (first_result, second_result):
+            metadata = result.file_metadata[str(model_path)]
+            assert determine_exit_code(result) == 2
+            assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            assert "coreml_analysis_incomplete" in metadata.get("scan_outcome_reasons")
+            assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+@pytest.mark.parametrize(
+    ("payload", "check_name"),
+    [
+        (
+            _build_model(
+                description=_build_description(metadata=_build_metadata()) + b"\x0a\x05abc",
+                neural_network=_build_neural_network(layers=[_build_layer("safe")]),
+            ),
+            "CoreML Description Parse",
+        ),
+        (
+            _build_model(
+                description=_build_description(metadata=_build_metadata() + b"\x0a\x05abc"),
+                neural_network=_build_neural_network(layers=[_build_layer("safe")]),
+            ),
+            "CoreML Metadata Parse",
+        ),
+        (
+            _build_model(
+                description=_build_description(
+                    metadata=_build_metadata() + _field_bytes(100, b"\x0a\x05abc"),
+                ),
+                neural_network=_build_neural_network(layers=[_build_layer("safe")]),
+            ),
+            "CoreML User Metadata Entry Parse",
+        ),
+        (
+            _build_model(
+                description=_build_description(metadata=_build_metadata()),
+                neural_network=_build_neural_network(layers=[b"\x0a\x05abc"]),
+            ),
+            "CoreML Layer Parse",
+        ),
+        (
+            _build_model(
+                description=_build_description(metadata=_build_metadata()),
+                neural_network=_build_neural_network(
+                    layers=[_field_bytes(1, b"safe") + _field_bytes(500, b"\x0a\x05abc")],
+                ),
+            ),
+            "CoreML Custom Layer Parse",
+        ),
+    ],
+)
+def test_coreml_malformed_nested_parse_surfaces_are_inconclusive(
+    tmp_path: Path,
+    payload: bytes,
+    check_name: str,
+) -> None:
+    model_path = _write_model(tmp_path / f"{check_name.replace(' ', '_')}.mlmodel", payload)
+
+    result = CoreMLScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "coreml_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == check_name and check.status == CheckStatus.FAILED and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
 def test_coreml_scanner_malformed_custom_model_fails_closed(tmp_path: Path) -> None:
     model_path = _write_model(
         tmp_path / "malformed_custom_model.mlmodel",
@@ -634,8 +755,10 @@ def test_coreml_scanner_malformed_custom_model_fails_closed(tmp_path: Path) -> N
     result = CoreMLScanner().scan(str(model_path))
 
     assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "coreml_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
     assert any(
-        issue.severity == IssueSeverity.CRITICAL
+        issue.severity == IssueSeverity.INFO
         and "Unable to parse CoreML custom model block" in issue.message
         and issue.details.get("field_path") == "model[555]"
         for issue in result.issues
@@ -656,8 +779,10 @@ def test_coreml_scanner_truncated_linked_model_file_fails_closed(tmp_path: Path)
     result = CoreMLScanner().scan(str(model_path))
 
     assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "coreml_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
     assert any(
-        issue.severity == IssueSeverity.CRITICAL
+        issue.severity == IssueSeverity.INFO
         and "Unable to parse CoreML linked-model file entry" in issue.message
         and issue.details.get("field_path") == "model[556].linkedModelFile"
         and issue.details.get("parse_error") == "truncated length-delimited field 1"
@@ -685,13 +810,42 @@ def test_coreml_scanner_truncated_nested_linked_model_fails_closed_without_bound
 
     assert result.success is False
     assert result.metadata.get("coreml_bounded_read_truncated") is not True
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "coreml_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
     assert any(
-        issue.severity == IssueSeverity.CRITICAL
+        issue.severity == IssueSeverity.INFO
         and "Unable to parse CoreML linked-model block" in issue.message
         and "][1:0][556]" in issue.details.get("field_path", "")
         and issue.details.get("parse_error") == "truncated length-delimited field 1"
         for issue in result.issues
     )
+
+
+def test_coreml_incomplete_linked_model_preserves_custom_layer_finding_exit1(tmp_path: Path) -> None:
+    model_path = _write_model(
+        tmp_path / "malicious_with_malformed_link.payload",
+        _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            neural_network=_build_neural_network(layers=[_build_layer("danger", custom_class="EvilRuntimeLayer")]),
+            linked_model=_field_bytes(1, b"\x0a\x05abc"),
+        ),
+    )
+
+    direct_result = scan_file(str(model_path), config={"cache_scan_results": False})
+    aggregate_result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert direct_result.scanner_name == "coreml"
+    assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "coreml_analysis_incomplete" in direct_result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "Custom CoreML layer detected" in issue.message
+        for issue in direct_result.issues
+    )
+    assert any(
+        issue.severity == IssueSeverity.INFO and "Unable to parse CoreML linked-model file entry" in issue.message
+        for issue in direct_result.issues
+    )
+    assert determine_exit_code(aggregate_result) == 1
 
 
 def test_coreml_scanner_corrupt_protobuf_handling(tmp_path: Path) -> None:
@@ -702,6 +856,8 @@ def test_coreml_scanner_corrupt_protobuf_handling(tmp_path: Path) -> None:
     result = CoreMLScanner().scan(str(corrupt_path))
 
     assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "coreml_protobuf_parse_failed" in result.metadata["scan_outcome_reasons"]
     assert any(
         "Invalid CoreML protobuf structure" in issue.message or "CoreML .mlmodel protobuf structure" in issue.message
         for issue in result.issues
