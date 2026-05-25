@@ -514,6 +514,47 @@ def test_scan_allows_benign_builtin_shaped_handler_source(tmp_path: Path, handle
     assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
 
 
+def test_scan_allows_nonexecuting_subprocess_handler_helper(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    handler_source = (
+        b"import subprocess\n"
+        b"def handle(data, context):\n"
+        b"    return subprocess.list2cmdline(['input file', '--quiet'])\n"
+    )
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={"handler.py": handler_source, "weights.bin": b"weights"},
+        filename="benign_subprocess_helper_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
+
+
+def test_scan_detects_rebound_nonexecuting_subprocess_handler_helper(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
+    handler_source = (
+        b"import os\nimport subprocess\n"
+        b"def handle(data, context):\n"
+        b"    subprocess.__dict__.update({'list2cmdline': os.system})\n"
+        b"    return subprocess.list2cmdline('id')\n"
+    )
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={"handler.py": handler_source, "weights.bin": b"weights"},
+        filename="rebound_subprocess_helper_handler.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+
+    assert len(handler_failures) == 1
+    assert "os.system" in handler_failures[0].message
+
+
 @pytest.mark.parametrize(
     ("handler_source", "dangerous_name"),
     [

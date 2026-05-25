@@ -307,6 +307,11 @@ class TestTarScanner:
                 b"subprocess.__dict__.update({'run': run})\nsubprocess.run([])\n",
                 "subprocess.Popen",
             ),
+            (
+                b"import os\nimport subprocess\nsubprocess.__dict__.update({'list2cmdline': os.system})\n"
+                b"subprocess.list2cmdline(['id'])\n",
+                "os.system",
+            ),
         ],
     )
     def test_scan_tar_reports_dangerous_subprocess_mapping_replacement(
@@ -806,6 +811,22 @@ class TestTarScanner:
         assert not any(check.name == "Python Archive Member Security" for check in result.checks)
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
+    def test_scan_tar_ignores_nonexecuting_subprocess_helper(self, tmp_path: Path) -> None:
+        """subprocess.list2cmdline formats arguments without launching a process."""
+        archive_path = tmp_path / "model_bundle.tar"
+        source = b"import subprocess\nsubprocess.list2cmdline(['input file', '--quiet'])\n"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("preprocess.py")
+            info.size = len(source)
+            archive.addfile(info, tarfile.io.BytesIO(source))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
     @pytest.mark.parametrize("dispatch", [b"handlers['system'](1.0)\n", b"handlers.get('system')(1.0)\n"])
     def test_scan_tar_ignores_benign_dictionary_dispatch_python_member(self, tmp_path: Path, dispatch: bytes) -> None:
         """Ordinary application dictionaries should not be treated as module namespaces."""
@@ -895,6 +916,12 @@ class TestTarScanner:
         [
             (b"import os\nos.system('echo hidden')\n", "S101", "os.system"),
             (b"import subprocess\nsubprocess.run(['echo'], check=False)\n", "S103", "subprocess.run"),
+            (b"import subprocess\nsubprocess.getoutput('echo hidden')\n", "S103", "subprocess.getoutput"),
+            (
+                b"import subprocess\nsubprocess.getstatusoutput('echo hidden')\n",
+                "S103",
+                "subprocess.getstatusoutput",
+            ),
             (b"import importlib\nimportlib.import_module('os')\n", "S107", "importlib.import_module"),
             (b"eval('1 + 1')\n", "S104", "eval"),
             (b"import pickle\npickle.loads(b'\\x80\\x04N.')\n", "S213", "pickle.loads"),

@@ -81,6 +81,8 @@ _HIGH_RISK_PYTHON_CALLS = {
     "subprocess.Popen",
     "subprocess.run",
 }
+# Retain broad subprocess coverage while excluding helpers that only transform data.
+_KNOWN_NON_EXECUTING_SUBPROCESS_CALLS = {"subprocess.list2cmdline"}
 
 # Map each high-risk call name to the rule code that best describes its risk
 # category. SARIF consumers, dashboards, and per-rule severity overrides rely
@@ -676,7 +678,9 @@ def _resolve_static_assignment_target_names(node: ast.AST, alias_scopes: _AliasS
 
 
 def _is_high_risk_python_call_name(name: str) -> bool:
-    return name in _HIGH_RISK_PYTHON_CALLS or name.startswith("subprocess.")
+    return name in _HIGH_RISK_PYTHON_CALLS or (
+        name.startswith("subprocess.") and name not in _KNOWN_NON_EXECUTING_SUBPROCESS_CALLS
+    )
 
 
 def _wildcard_import_aliases(

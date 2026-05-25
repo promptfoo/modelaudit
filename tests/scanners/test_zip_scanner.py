@@ -383,6 +383,11 @@ def test_scan_zip_reports_dangerous_setattr_replacement(tmp_path: Path, source: 
             "subprocess.__dict__.update({'run': run})\nsubprocess.run([])\n",
             "subprocess.Popen",
         ),
+        (
+            "import os\nimport subprocess\nsubprocess.__dict__.update({'list2cmdline': os.system})\n"
+            "subprocess.list2cmdline(['id'])\n",
+            "os.system",
+        ),
         ("import subprocess\nsubprocess.__dict__.pop('run')(['id'])\n", "subprocess.run"),
     ],
 )
@@ -926,6 +931,18 @@ def test_scan_zip_ignores_benign_python_member(tmp_path: Path) -> None:
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
+def test_scan_zip_ignores_nonexecuting_subprocess_helper(tmp_path: Path) -> None:
+    archive_path = tmp_path / "source_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("preprocess.py", "import subprocess\nsubprocess.list2cmdline(['input file', '--quiet'])\n")
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert result.success is True
+    assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
 @pytest.mark.parametrize("dispatch", ["handlers['system'](1.0)", "handlers.get('system')(1.0)"])
 def test_scan_zip_ignores_benign_dictionary_dispatch_python_member(tmp_path: Path, dispatch: str) -> None:
     archive_path = tmp_path / "source_bundle.zip"
@@ -1132,6 +1149,8 @@ def test_scan_zip_ignores_benign_python_file_operations(tmp_path: Path) -> None:
         ("import os\nos.system('echo hidden')\n", "S101", "os.system"),
         ("import os\nos.popen('echo hidden')\n", "S101", "os.popen"),
         ("import subprocess\nsubprocess.run(['echo'], check=False)\n", "S103", "subprocess.run"),
+        ("import subprocess\nsubprocess.getoutput('echo hidden')\n", "S103", "subprocess.getoutput"),
+        ("import subprocess\nsubprocess.getstatusoutput('echo hidden')\n", "S103", "subprocess.getstatusoutput"),
         ("import importlib\nimportlib.import_module('os')\n", "S107", "importlib.import_module"),
         ("eval('1 + 1')\n", "S104", "eval"),
         ("import pickle\npickle.loads(b'\\x80\\x04N.')\n", "S213", "pickle.loads"),
