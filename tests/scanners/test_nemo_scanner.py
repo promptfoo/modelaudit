@@ -624,6 +624,26 @@ class TestCVE202523304HydraTarget:
             for check in result.checks
         )
 
+    def test_nested_renamed_nemo_member_detects_dangerous_target(self, tmp_path: Path) -> None:
+        member_path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": "os.system", "command": "echo pwned"}},
+            filename="model.jpg",
+        )
+        archive_path = tmp_path / "bundle.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.write(member_path, arcname="models/model.jpg")
+
+        result = scan_file(str(archive_path), config={"cache_scan_results": False})
+
+        assert result.scanner_name == "zip"
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.details["target"] == "os.system"
+            for check in result.checks
+        )
+
     def test_renamed_generic_tar_yaml_is_not_promoted_to_nemo(self, tmp_path: Path) -> None:
         path = _create_nemo_file(
             tmp_path,
@@ -637,6 +657,22 @@ class TestCVE202523304HydraTarget:
         result = scan_file(str(path), config={"cache_scan_results": False})
 
         assert result.scanner_name == "tar"
+        assert not any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
+
+    def test_nested_renamed_generic_tar_yaml_is_not_promoted_to_nemo(self, tmp_path: Path) -> None:
+        member_path = _create_nemo_file(
+            tmp_path,
+            {"model": {"_target_": "os.system", "command": "echo pwned"}},
+            filename="generic.jpg",
+            config_name="config.yaml",
+        )
+        archive_path = tmp_path / "bundle.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.write(member_path, arcname="models/generic.jpg")
+
+        result = scan_file(str(archive_path), config={"cache_scan_results": False})
+
+        assert result.scanner_name == "zip"
         assert not any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
 
     def test_dangerous_subprocess_detected(self, tmp_path):
