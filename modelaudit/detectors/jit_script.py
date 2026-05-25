@@ -295,12 +295,15 @@ class JITScriptDetector:
         import_pattern, from_pattern = patterns or _compile_dangerous_import_patterns(dangerous_import)
         return import_pattern.search(source) is not None or from_pattern.search(source) is not None
 
-    def scan_torchscript(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
+    def scan_torchscript(
+        self, data: bytes, context: str = "", *, scan_embedded_python: bool = True
+    ) -> list["JITScriptFinding"]:
         """Scan TorchScript model data for dangerous operations.
 
         Args:
             data: Binary model data
             context: Context string for reporting
+            scan_embedded_python: Whether to inspect embedded Python snippets in this pass.
 
         Returns:
             List of findings with details
@@ -354,7 +357,7 @@ class JITScriptDetector:
         # Look for embedded Python code even when framework markers are absent.
         # Scanner callers can hand us raw code-bearing blobs, and an attacker can
         # remove marker strings without removing the executable payload.
-        if b"def " in data or b"class " in data:
+        if scan_embedded_python and (b"def " in data or b"class " in data):
             code_findings = self._extract_and_check_python_code(data, "TorchScript", context)
             findings.extend(code_findings)
 
@@ -379,12 +382,15 @@ class JITScriptDetector:
 
         return findings
 
-    def scan_tensorflow(self, data: bytes, context: str = "") -> list["JITScriptFinding"]:
+    def scan_tensorflow(
+        self, data: bytes, context: str = "", *, scan_embedded_python: bool = True
+    ) -> list["JITScriptFinding"]:
         """Scan TensorFlow SavedModel for dangerous operations.
 
         Args:
             data: Binary model data or protobuf
             context: Context string for reporting
+            scan_embedded_python: Whether to inspect embedded Python snippets in this pass.
 
         Returns:
             List of findings with details
@@ -438,7 +444,7 @@ class JITScriptDetector:
                 )
 
             # Check for embedded Python code in SavedFunction
-            if b"python_function" in data or b"function_spec" in data:
+            if scan_embedded_python and (b"python_function" in data or b"function_spec" in data):
                 code_findings = self._extract_and_check_python_code(data, "TensorFlow", context)
                 findings.extend(code_findings)
 
@@ -1045,18 +1051,20 @@ class JITScriptDetector:
             elif b"onnx" in data or b"ai.onnx" in data:
                 model_type = "onnx"
 
+        dangerous_python_source = self._looks_like_dangerous_python_source(data)
+
         # Scan based on model type
         if model_type in ["pytorch", "torchscript"]:
-            findings.extend(self.scan_torchscript(data, context))
+            findings.extend(self.scan_torchscript(data, context, scan_embedded_python=not dangerous_python_source))
             findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
 
         if model_type in ["tensorflow", "tf", "keras"]:
-            findings.extend(self.scan_tensorflow(data, context))
+            findings.extend(self.scan_tensorflow(data, context, scan_embedded_python=not dangerous_python_source))
 
         if model_type == "onnx":
             findings.extend(self.scan_onnx(data, context))
 
-        if model_type == "pickle" and (b"def " in data or b"class " in data):
+        if model_type == "pickle" and not dangerous_python_source and (b"def " in data or b"class " in data):
             findings.extend(self._extract_and_check_python_code(data, "Generic Python", context))
 
         # Always check for generic dangerous patterns
@@ -1065,12 +1073,12 @@ class JITScriptDetector:
         # because that causes false positives (e.g. TorchScript patterns matching ONNX metadata)
         if model_type == "unknown":
             # Check all frameworks if type is unknown
-            findings.extend(self.scan_torchscript(data, context))
+            findings.extend(self.scan_torchscript(data, context, scan_embedded_python=not dangerous_python_source))
             findings.extend(self.scan_advanced_torchscript_vulnerabilities(data, context))
-            findings.extend(self.scan_tensorflow(data, context))
+            findings.extend(self.scan_tensorflow(data, context, scan_embedded_python=not dangerous_python_source))
             findings.extend(self.scan_onnx(data, context))
 
-        if self._looks_like_dangerous_python_source(data):
+        if dangerous_python_source:
             findings.extend(
                 self._extract_and_check_python_code(
                     data,

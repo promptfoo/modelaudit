@@ -211,6 +211,43 @@ class TestJITScriptDetector:
         assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
         assert any(f.type == "dangerous_builtin" and f.builtin == "eval" for f in findings)
 
+    @pytest.mark.parametrize(
+        ("model_type", "data"),
+        [
+            ("pytorch", b"def payload():\n    import os\n    return os.system('id')\n"),
+            ("unknown", b"def payload():\n    import os\n    return os.system('id')\n"),
+            (
+                "tensorflow",
+                b"SavedFunction = True\npython_function = True\n"
+                b"def payload():\n    import os\n    return os.system('id')\n",
+            ),
+            ("pickle", b"def payload():\n    import os\n    return os.system('id')\n"),
+        ],
+    )
+    def test_scan_model_reports_complete_dangerous_python_source_once(self, model_type: str, data: bytes) -> None:
+        findings = JITScriptDetector().scan_model(data, model_type, "payload.bin")
+        identities = [
+            (finding.type, finding.message, finding.pattern, finding.operation, finding.builtin, finding.import_)
+            for finding in findings
+        ]
+
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "OS command execution detected"
+            for finding in findings
+        )
+        assert len(identities) == len(set(identities))
+
+    def test_scan_model_keeps_dangerous_python_extraction_from_binary_torchscript_blob(self) -> None:
+        data = b"\x00binary model prefix\ndef payload():\n    import os\n    return os.system('id')\n"
+
+        findings = JITScriptDetector().scan_model(data, "pytorch", "payload.bin")
+
+        assert any(finding.type == "dangerous_import" and finding.import_ == "os" for finding in findings)
+        assert any(
+            finding.type == "code_execution_pattern" and finding.pattern == "OS command execution detected"
+            for finding in findings
+        )
+
     def test_scan_model_ignores_unmarked_benign_python_source(self) -> None:
         detector = JITScriptDetector()
         data = b"""

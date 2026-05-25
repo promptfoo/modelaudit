@@ -1223,11 +1223,15 @@ def test_pytorch_zip_scans_unmarked_pty_process_launch_in_archive_data(tmp_path:
         for check in result.checks
         if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
     ]
-    assert any(
-        check.location == f"{zip_path}:archive/data/payload.bin"
-        and "Pseudo-terminal process execution detected" in check.message
+    matching_failures = [
+        check
         for check in jit_failures
-    )
+        if (
+            check.location == f"{zip_path}:archive/data/payload.bin"
+            and "Pseudo-terminal process execution detected" in check.message
+        )
+    ]
+    assert len(matching_failures) == 1
 
 
 def test_pytorch_zip_ignores_certain_replaced_pty_process_launch_in_archive_data(tmp_path: Path) -> None:
