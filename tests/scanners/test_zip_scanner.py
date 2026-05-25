@@ -236,6 +236,8 @@ def test_scan_zip_flags_concatenated_getattr_name_dangerous_python_member(tmp_pa
         "import os\nos.__dict__.get('sys' + 'tem').__call__('echo hidden')\n",
         "import os\nnamespace = os.__dict__\nnamespace['sys' + 'tem']('echo hidden')\n",
         "import os\nnamespace = vars(os)\nnamespace.get('sys' + 'tem')('echo hidden')\n",
+        "import os\ngetattr(os, '__dict__')['sys' + 'tem']('echo hidden')\n",
+        "import os\nos.__getattribute__('sys' + 'tem')('echo hidden')\n",
     ],
 )
 def test_scan_zip_flags_namespace_mapping_dangerous_python_member(tmp_path: Path, source: str) -> None:

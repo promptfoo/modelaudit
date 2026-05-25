@@ -260,6 +260,18 @@ def _resolve_getattr_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> fr
     if not isinstance(node, ast.Call):
         return None
 
+    if isinstance(node.func, ast.Attribute) and node.func.attr == "__getattribute__":
+        if len(node.args) != 1 or node.keywords:
+            return None
+        target_root = _resolve_call_name(node.func.value)
+        attr_name = _resolve_static_string(node.args[0])
+        if target_root is None or attr_name is None:
+            return None
+        resolved_target_roots = _apply_aliases(target_root, alias_scopes)
+        if resolved_target_roots is None:
+            return None
+        return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
+
     helper_name = _resolve_call_name(node.func)
     if helper_name is None:
         return None
@@ -304,6 +316,14 @@ def _resolve_namespace_mapping_roots(node: ast.AST, alias_scopes: _AliasScopes) 
             )
             if namespace_roots:
                 return namespace_roots
+
+    getattr_names = _resolve_getattr_call_names(node, alias_scopes)
+    if getattr_names is not None:
+        namespace_roots = frozenset(
+            name.removesuffix(".__dict__") for name in getattr_names if name.endswith(".__dict__")
+        )
+        if namespace_roots:
+            return namespace_roots
 
     if not isinstance(node, ast.Call):
         return None
