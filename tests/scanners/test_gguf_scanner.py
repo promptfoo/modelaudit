@@ -9,7 +9,11 @@ import pytest
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import DEFAULT_MAX_FILE_READ_SIZE, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
-from modelaudit.scanners.gguf_scanner import GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON, GgufScanner
+from modelaudit.scanners.gguf_scanner import (
+    GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON,
+    GGUF_PARSE_INCONCLUSIVE_REASON,
+    GgufScanner,
+)
 from tests.helpers import create_mock_gguf
 
 
@@ -364,6 +368,28 @@ def test_gguf_scanner_scans_malicious_template_before_truncated_metadata(tmp_pat
         for check in direct.checks
     )
     assert determine_exit_code(aggregate) == 1
+
+
+def test_gguf_scanner_reports_duplicate_key_before_truncated_duplicate_value(tmp_path: Path) -> None:
+    path = tmp_path / "truncated-duplicate-template.gguf"
+    key = "tokenizer.chat_template"
+    _write_gguf_string_metadata_entries(
+        path,
+        [(key, "{{ message['content'] }}")],
+        declared_count=2,
+    )
+    with path.open("ab") as f:
+        encoded_key = key.encode("utf-8")
+        f.write(struct.pack("<Q", len(encoded_key)))
+        f.write(encoded_key)
+
+    direct = GgufScanner().scan(str(path))
+    aggregate = scan_model_directory_or_file(str(path), cache_enabled=False)
+
+    assert GGUF_PARSE_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    assert GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON in direct.metadata["scan_outcome_reasons"]
+    assert any(check.name == "GGUF Duplicate Metadata Keys" for check in direct.checks)
+    _assert_inconclusive_exit2(aggregate, GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON)
 
 
 def test_gguf_scanner_fails_closed_on_oversized_chat_templates(tmp_path: Path) -> None:

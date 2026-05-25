@@ -217,6 +217,8 @@ class GgufScanner(BaseScanner):
         try:
             for _i in range(n_kv):
                 key = self._read_string(f)
+                occurrence = metadata_key_occurrences.get(key, 0) + 1
+                metadata_key_occurrences[key] = occurrence
 
                 # Security check for suspicious keys
                 if any(x in key for x in ("../", "..\\", "/", "\\")):
@@ -232,8 +234,6 @@ class GgufScanner(BaseScanner):
 
                 (value_type,) = struct.unpack("<I", f.read(4))
                 value = self._read_value(f, value_type)
-                occurrence = metadata_key_occurrences.get(key, 0) + 1
-                metadata_key_occurrences[key] = occurrence
                 if self._is_chat_template_key(key) and isinstance(value, str) and value.strip():
                     self._record_chat_template_occurrence(chat_templates, key, value, occurrence)
                 metadata[key] = value
