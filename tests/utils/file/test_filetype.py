@@ -341,6 +341,18 @@ def test_detect_file_format_routes_renamed_lightgbm_with_large_pre_tree_header(t
     assert detect_file_format(str(model_path)) == "lightgbm"
 
 
+def test_detect_file_format_prioritizes_cntk_over_budget_exhausted_protobuf_candidate(tmp_path: Path) -> None:
+    model_path = tmp_path / "protobuf-looking-cntk.jpg"
+    cntk_markers = _build_cntkv2_bytes()
+    model_path.write_bytes(
+        b"\xa2\x06" + bytes([len(cntk_markers)]) + cntk_markers + (b"\x08\x01" * 4097),
+    )
+
+    assert detect_file_format_from_magic(str(model_path)) == "cntk"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "cntk"
+    assert detect_file_format(str(model_path)) == "cntk"
+
+
 @pytest.mark.parametrize(
     "payload",
     [_build_cntkv2_bytes(include_structure=False), _build_lightgbm_text(include_tree_details=False)],
