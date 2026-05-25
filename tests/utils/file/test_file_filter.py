@@ -261,6 +261,17 @@ class TestFileFilter:
         assert detect_file_format_for_skip_filter(str(disguised_lightgbm)) == "lightgbm"
         assert not should_skip_file(str(disguised_lightgbm))
 
+    def test_strong_r_workspace_bypasses_skip_without_promoting_weak_near_match(self, tmp_path: Path) -> None:
+        disguised_workspace = tmp_path / "workspace.jpg"
+        disguised_workspace.write_bytes(b"RDX3\nX\nworkspace\nmodel")
+        ambiguous_text = tmp_path / "notes.jpg"
+        ambiguous_text.write_bytes(b"X\nordinary exported table\n")
+
+        assert detect_file_format_for_skip_filter(str(disguised_workspace)) == "r_serialized"
+        assert not should_skip_file(str(disguised_workspace))
+        assert detect_file_format_for_skip_filter(str(ambiguous_text)) == "unknown"
+        assert should_skip_file(str(ambiguous_text))
+
     def test_disguised_xml_models_with_long_prologs_bypass_default_skip(self, tmp_path: Path) -> None:
         """Skipped suffixes must not hide XML model roots after long benign prologs."""
         disguised_openvino = tmp_path / "openvino.txt"

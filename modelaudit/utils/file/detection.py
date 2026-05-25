@@ -29,6 +29,7 @@ R_SERIALIZATION_MARKERS = {
     b"A\n",
     b"B\n",
 }
+_R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
 _CNTK_LEGACY_MAGIC = b"B\x00C\x00N\x00\x00\x00"
 _CNTK_LEGACY_VERSION_MARKER = b"B\x00V\x00e\x00r\x00s\x00i\x00o\x00n\x00\x00\x00"
 _CNTK_V2_REQUIRED_MARKERS = (b"\x0a\x07version", b"\x0a\x03uid")
@@ -1260,8 +1261,6 @@ def detect_format_from_magic_bytes(
 
     if any(magic16.startswith(header) for header in R_WORKSPACE_HEADERS):
         return "r_serialized"
-    if any(magic16.startswith(marker) for marker in R_SERIALIZATION_MARKERS):
-        return "r_serialized"
 
     if _looks_like_binary_pickle_protocol(magic4):
         return "pickle"
@@ -1305,6 +1304,10 @@ def detect_file_format_from_magic(path: str) -> str:
 
             if _looks_like_tflite_header(magic8):
                 return "tflite"
+            if file_path.suffix.lower() in _R_SERIALIZED_EXTENSIONS and any(
+                magic16.startswith(marker) for marker in R_SERIALIZATION_MARKERS
+            ):
+                return "r_serialized"
 
             if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
                 return "executorch"
@@ -1505,6 +1508,8 @@ def detect_file_format(path: str) -> str:
         return "gguf"
     if magic4 in GGML_MAGIC_VARIANTS:
         return "ggml"
+    if any(magic16.startswith(header) for header in R_WORKSPACE_HEADERS):
+        return "r_serialized"
 
     ext = file_path.suffix.lower()
     filename_lower = file_path.name.lower()
