@@ -38,6 +38,7 @@ GGML_VARIANT_MAGICS = {
 }
 GGUF_PARSE_INCONCLUSIVE_REASON = "gguf_parse_incomplete"
 GGUF_STRUCTURE_INCONCLUSIVE_REASON = "gguf_structure_validation_failed"
+GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON = "gguf_duplicate_metadata_keys"
 
 
 class GgufScanner(BaseScanner):
@@ -211,6 +212,8 @@ class GgufScanner(BaseScanner):
 
         # Parse metadata with security checks
         metadata: dict[str, Any] = {}
+        chat_templates: dict[str, str] = {}
+        metadata_key_occurrences: dict[str, int] = {}
         try:
             for _i in range(n_kv):
                 key = self._read_string(f)
@@ -229,6 +232,10 @@ class GgufScanner(BaseScanner):
 
                 (value_type,) = struct.unpack("<I", f.read(4))
                 value = self._read_value(f, value_type)
+                occurrence = metadata_key_occurrences.get(key, 0) + 1
+                metadata_key_occurrences[key] = occurrence
+                if self._is_chat_template_key(key) and isinstance(value, str) and value.strip():
+                    self._record_chat_template_occurrence(chat_templates, key, value, occurrence)
                 metadata[key] = value
 
                 # Security check for suspicious values
@@ -244,7 +251,8 @@ class GgufScanner(BaseScanner):
                     )
 
             result.metadata["metadata"] = metadata
-            self._scan_embedded_chat_template(metadata, result)
+            self._report_duplicate_metadata_keys(metadata_key_occurrences, result)
+            self._scan_embedded_chat_templates(chat_templates, result)
         except Exception as e:
             # Parsing errors are informational - indicate corruption/format issues, not security threats
             result.add_check(
@@ -257,6 +265,8 @@ class GgufScanner(BaseScanner):
                 rule_code="S902",
             )
             self._mark_inconclusive(result, GGUF_PARSE_INCONCLUSIVE_REASON)
+            self._report_duplicate_metadata_keys(metadata_key_occurrences, result)
+            self._scan_embedded_chat_templates(chat_templates, result)
             return
 
         # Align to tensor data
@@ -624,14 +634,45 @@ class GgufScanner(BaseScanner):
 
         raise ValueError(f"Unknown metadata type {vtype}")
 
-    def _scan_embedded_chat_template(self, metadata: dict[str, Any], result: ScanResult) -> None:
-        templates = {
-            key: value
-            for key, value in metadata.items()
-            if (key == "tokenizer.chat_template" or key.startswith("tokenizer.chat_template."))
-            and isinstance(value, str)
-            and value.strip()
-        }
+    @staticmethod
+    def _is_chat_template_key(key: str) -> bool:
+        return key == "tokenizer.chat_template" or key.startswith("tokenizer.chat_template.")
+
+    @staticmethod
+    def _record_chat_template_occurrence(
+        templates: dict[str, str],
+        key: str,
+        value: str,
+        occurrence: int,
+    ) -> None:
+        """Retain every parsed template even when GGUF metadata keys collide."""
+        location = key if occurrence == 1 else f"{key} [metadata occurrence {occurrence}]"
+        while location in templates:
+            location = f"{location} [duplicate]"
+        templates[location] = value
+
+    def _report_duplicate_metadata_keys(self, occurrences: dict[str, int], result: ScanResult) -> None:
+        duplicate_keys = {key: count for key, count in occurrences.items() if count > 1}
+        if not duplicate_keys:
+            return
+
+        self._mark_inconclusive(result, GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON)
+        result.add_check(
+            name="GGUF Duplicate Metadata Keys",
+            passed=False,
+            message="GGUF contains duplicate metadata keys with ambiguous consumer interpretation",
+            severity=IssueSeverity.INFO,
+            location=self.current_file_path,
+            details={
+                "duplicate_keys": sorted(duplicate_keys),
+                "occurrences": duplicate_keys,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": GGUF_DUPLICATE_METADATA_INCONCLUSIVE_REASON,
+            },
+            rule_code="S902",
+        )
+
+    def _scan_embedded_chat_templates(self, templates: dict[str, str], result: ScanResult) -> None:
         if not templates:
             return
 
