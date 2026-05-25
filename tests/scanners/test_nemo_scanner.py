@@ -434,6 +434,36 @@ class TestNemoArchiveVulnerabilityCoverage:
             for check in result.checks
         )
 
+    def test_large_disguised_executable_is_detected_from_bounded_prefix(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "large-embedded-executable.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "assets/payload.jpg", b"\x7fELF" + (b"\x00" * (10 * 1024 * 1024 + 1)))
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        checks = [check for check in result.checks if check.name == "Executable Archive Member Detection"]
+        assert len(checks) == 1
+        assert checks[0].details["entry"] == "assets/payload.jpg"
+
+    def test_declared_nemo_embedded_pe_after_initial_probe_is_detected(self, tmp_path: Path) -> None:
+        payload = bytearray(b"MZ" + (b"\0" * (8192 + 4 - 2)))
+        payload[0x3C:0x40] = (8192).to_bytes(4, "little")
+        payload[8192:8196] = b"PE\0\0"
+        nemo_path = tmp_path / "embedded-pe.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "assets/payload.jpg", bytes(payload))
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert any(
+            check.name == "Executable Archive Member Detection"
+            and check.status == CheckStatus.FAILED
+            and check.details["entry"] == "assets/payload.jpg"
+            for check in result.checks
+        )
+
     def test_benign_embedded_python_member_does_not_create_security_finding(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "benign-handler.nemo"
         with tarfile.open(nemo_path, "w") as tar:
@@ -521,6 +551,7 @@ class TestNemoArchiveVulnerabilityCoverage:
             _member: tarfile.TarInfo,
             *,
             suffix_source: str | None = None,
+            max_bytes: int | None = None,
         ) -> str | None:
             return None
 

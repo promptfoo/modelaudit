@@ -15,7 +15,7 @@ from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete, member_scan_incomplete
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
 from .archive_member_security import scan_archive_member_for_known_risks
-from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
+from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
     "/etc",
@@ -41,15 +41,6 @@ TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY = "_tar_security_only_nested_
 _GZIP_MAGIC = b"\x1f\x8b"
 _BZIP2_MAGIC = b"BZh"
 _XZ_MAGIC = b"\xfd7zXZ\x00"
-_SECURITY_RELEVANT_NESTED_SCANNERS = {
-    "compressed",
-    "keras_zip",
-    "pytorch_zip",
-    "sevenzip",
-    "tar",
-    "torchserve_mar",
-    "zip",
-}
 
 
 class TarScanner(BaseScanner):
@@ -217,17 +208,6 @@ class TarScanner(BaseScanner):
         if callable(nested_scan_callback):
             return nested_scan_callback(path, nested_config)
         return scan_nested_file(path, nested_config)
-
-    @staticmethod
-    def _merge_nested_security_findings(result: ScanResult, nested_result: ScanResult) -> None:
-        """Merge only actionable nested findings when subtype analysis owns interpretation."""
-        actionable_severities = {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        result.checks.extend(
-            check
-            for check in nested_result.checks
-            if check.status == CheckStatus.FAILED and check.severity in actionable_severities
-        )
-        result.issues.extend(issue for issue in nested_result.issues if issue.severity in actionable_severities)
 
     @staticmethod
     def _rewrite_archive_location(location: str | None, tmp_path: str, archive_location: str) -> str:
@@ -623,33 +603,23 @@ class TarScanner(BaseScanner):
                                 python_analysis_incomplete_reason="tar_python_member_analysis_incomplete",
                             )
 
-                            nested_config = dict(self.config)
-                            nested_config.pop(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY, None)
-                            nested_config["_archive_depth"] = depth + 1
-                            file_result = self._scan_nested_archive_entry(tmp_path, nested_config)
-                            self._rewrite_nested_result_context(file_result, tmp_path, path, name)
-
                             if name in security_only_nested_entries:
-                                self._merge_nested_security_findings(result, file_result)
-                                has_actionable_nested_finding = any(
-                                    issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-                                    for issue in file_result.issues
-                                )
-                                if member_scan_incomplete(file_result) and (
-                                    has_actionable_nested_finding
-                                    or file_result.scanner_name in _SECURITY_RELEVANT_NESTED_SCANNERS
-                                ):
-                                    scan_complete = False
-                                asset_entry = asset_from_scan_result(f"{path}:{name}", file_result)
+                                result.bytes_scanned += total_size
+                                asset_entry = {"path": f"{path}:{name}", "type": "nemo_managed"}
                             else:
+                                nested_config = dict(self.config)
+                                nested_config.pop(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY, None)
+                                nested_config["_archive_depth"] = depth + 1
+                                file_result = self._scan_nested_archive_entry(tmp_path, nested_config)
+                                self._rewrite_nested_result_context(file_result, tmp_path, path, name)
                                 if member_scan_incomplete(file_result):
                                     scan_complete = False
 
                                 result.merge(file_result)
                                 asset_entry = asset_from_scan_result(f"{path}:{name}", file_result)
 
-                            if file_result.scanner_name == "unknown":
-                                result.bytes_scanned += total_size
+                                if file_result.scanner_name == "unknown":
+                                    result.bytes_scanned += total_size
 
                         asset_entry.setdefault("size", member.size)
                         contents.append(asset_entry)

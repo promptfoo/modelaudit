@@ -14,8 +14,14 @@ from typing import Any, ClassVar
 
 from ..utils import is_absolute_archive_path, sanitize_archive_path
 from ..utils.file.detection import is_nemo_archive
+from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
+from .archive_member_security import (
+    is_executable_archive_member_name,
+    is_python_archive_member_name,
+    scan_archive_member_for_known_risks,
+)
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .tar_scanner import (
     TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY,
     TarScanner,
@@ -134,6 +140,9 @@ CVE_2025_23304_REMEDIATION = (
 )
 NEMO_CHECKPOINT_MEMBER_EXTENSIONS = frozenset({".ckpt", ".pt", ".pth", ".pkl", ".pickle"})
 NEMO_MAX_CHECKPOINT_SCAN_BYTES = 50 * 1024 * 1024
+NEMO_MAX_PYTHON_ANALYSIS_BYTES = 10 * 1024 * 1024
+NEMO_EXECUTABLE_INITIAL_PROBE_BYTES = 1024
+NEMO_EXECUTABLE_PE_PROBE_BYTES = (1024 * 1024) + 4
 
 _INCONCLUSIVE_METADATA_KEY = "scan_outcome"
 _INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
@@ -211,6 +220,7 @@ class NemoScanner(BaseScanner):
         result = self._create_result()
         file_size = self.get_file_size(path)
         result.metadata["file_size"] = file_size
+        is_declared_nemo = os.path.splitext(path)[1].lower() in self.supported_extensions
 
         tar_scanner = TarScanner(config=dict(self.config))
         try:
@@ -232,6 +242,10 @@ class NemoScanner(BaseScanner):
             self._finish_scan_result(result)
             return result
 
+        if is_declared_nemo:
+            preflight_result.finish(success=True)
+            result.merge(preflight_result)
+
         nemo_owned_entries: set[str] = set()
         if not HAS_YAML:
             result.add_check(
@@ -243,7 +257,12 @@ class NemoScanner(BaseScanner):
             )
         else:
             try:
-                self._scan_nemo_archive(path, result, nemo_owned_entries)
+                self._scan_nemo_archive(
+                    path,
+                    result,
+                    nemo_owned_entries,
+                    inspect_embedded_members=is_declared_nemo,
+                )
             except tarfile.TarError as e:
                 result.add_check(
                     name="NeMo Archive Integrity",
@@ -254,12 +273,13 @@ class NemoScanner(BaseScanner):
                 )
                 result.success = False
 
-        tar_config = dict(self.config)
-        tar_config[TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY] = nemo_owned_entries
-        # The enclosing NeMo result controls whether this artifact is complete
-        # enough to cache; nested TAR dispatch must not persist partial results.
-        tar_config["cache_enabled"] = False
-        result.merge(TarScanner(config=tar_config).scan(path))
+        if not is_declared_nemo:
+            tar_config = dict(self.config)
+            tar_config[TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY] = nemo_owned_entries
+            # The enclosing NeMo result controls whether this artifact is
+            # complete enough to cache; nested TAR dispatch must not persist partial results.
+            tar_config["cache_enabled"] = False
+            result.merge(TarScanner(config=tar_config).scan(path))
 
         result.bytes_scanned = file_size
         self._finish_scan_result(result)
@@ -303,7 +323,14 @@ class NemoScanner(BaseScanner):
 
         result.finish(success=result.success and not result.has_errors)
 
-    def _scan_nemo_archive(self, path: str, result: ScanResult, nemo_owned_entries: set[str]) -> None:
+    def _scan_nemo_archive(
+        self,
+        path: str,
+        result: ScanResult,
+        nemo_owned_entries: set[str],
+        *,
+        inspect_embedded_members: bool,
+    ) -> None:
         """Extract and scan YAML configs from a NeMo tar archive."""
         yaml_configs_found = 0
         yaml_config_files_found = 0
@@ -382,6 +409,9 @@ class NemoScanner(BaseScanner):
 
                 if not member.isfile():
                     continue
+
+                if inspect_embedded_members:
+                    self._scan_embedded_member_for_known_risks(tar, member, path, result)
 
                 # Check for suspicious files in the archive
                 if name_lower.endswith((".py", ".sh", ".bat", ".cmd", ".ps1")):
@@ -516,6 +546,78 @@ class NemoScanner(BaseScanner):
                 message=f"Found {yaml_configs_found} YAML config(s)",
                 location=path,
             )
+
+    def _scan_embedded_member_for_known_risks(
+        self,
+        tar: tarfile.TarFile,
+        member: tarfile.TarInfo,
+        archive_path: str,
+        result: ScanResult,
+    ) -> None:
+        """Apply bounded generic archive-member security checks inside NeMo files."""
+        member_name_lower = member.name.lower()
+        is_python_member = is_python_archive_member_name(member_name_lower)
+        if is_executable_archive_member_name(member_name_lower):
+            scan_archive_member_for_known_risks(
+                archive_kind="NeMo",
+                archive_path=archive_path,
+                member_name=member.name,
+                tmp_path=None,
+                total_size=member.size,
+                result=result,
+                max_python_analysis_bytes=NEMO_MAX_PYTHON_ANALYSIS_BYTES,
+                python_analysis_incomplete_reason="nemo_python_member_analysis_incomplete",
+            )
+            return
+
+        if is_python_member and member.size > NEMO_MAX_PYTHON_ANALYSIS_BYTES:
+            scan_archive_member_for_known_risks(
+                archive_kind="NeMo",
+                archive_path=archive_path,
+                member_name=member.name,
+                tmp_path=None,
+                total_size=member.size,
+                result=result,
+                max_python_analysis_bytes=NEMO_MAX_PYTHON_ANALYSIS_BYTES,
+                python_analysis_incomplete_reason="nemo_python_member_analysis_incomplete",
+            )
+            return
+
+        max_bytes = None
+        if not is_python_member:
+            max_bytes = (
+                NEMO_EXECUTABLE_PE_PROBE_BYTES
+                if self._member_starts_with_portable_executable_magic(tar, member)
+                else NEMO_EXECUTABLE_INITIAL_PROBE_BYTES
+            )
+        extracted_path = self._extract_member_to_tempfile(tar, member, max_bytes=max_bytes)
+        if extracted_path is None:
+            return
+
+        try:
+            scan_archive_member_for_known_risks(
+                archive_kind="NeMo",
+                archive_path=archive_path,
+                member_name=member.name,
+                tmp_path=extracted_path,
+                total_size=member.size,
+                result=result,
+                max_python_analysis_bytes=NEMO_MAX_PYTHON_ANALYSIS_BYTES,
+                python_analysis_incomplete_reason="nemo_python_member_analysis_incomplete",
+            )
+        finally:
+            try:
+                os.unlink(extracted_path)
+            except OSError:
+                logger.debug("Failed to remove temporary NeMo member security file: %s", extracted_path)
+
+    @staticmethod
+    def _member_starts_with_portable_executable_magic(tar: tarfile.TarFile, member: tarfile.TarInfo) -> bool:
+        member_file = tar.extractfile(member)
+        if member_file is None:
+            return False
+        with member_file:
+            return member_file.read(2) == b"MZ"
 
     @staticmethod
     def _resolve_archive_link_member_name(member: tarfile.TarInfo) -> str | None:
@@ -657,6 +759,7 @@ class NemoScanner(BaseScanner):
                 )
                 return
 
+            self._merge_nested_security_findings(result, nested_result, extracted_path, archive_path, report_entry)
             critical_issues = [
                 issue
                 for issue in nested_result.issues
@@ -767,6 +870,13 @@ class NemoScanner(BaseScanner):
                 )
                 return True
 
+            self._merge_nested_security_findings(
+                result,
+                nested_result,
+                extracted_path,
+                archive_path,
+                referenced_member_name,
+            )
             critical_issues = [
                 issue
                 for issue in nested_result.issues
@@ -792,6 +902,38 @@ class NemoScanner(BaseScanner):
                 os.unlink(extracted_path)
             except OSError:
                 logger.debug("Failed to remove temporary NeMo referenced scan file: %s", extracted_path)
+
+    @staticmethod
+    def _merge_nested_security_findings(
+        result: ScanResult,
+        nested_result: ScanResult,
+        extracted_path: str,
+        archive_path: str,
+        entry_name: str,
+    ) -> None:
+        """Preserve actionable nested findings while NeMo adds CVE attribution."""
+        archive_location = f"{archive_path}:{entry_name}"
+        actionable_severities = {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+        for check in nested_result.checks:
+            if check.status != CheckStatus.FAILED or check.severity not in actionable_severities:
+                continue
+            check.location = rewrite_extracted_member_location(
+                check.location,
+                extracted_path,
+                archive_location,
+                preserve_non_delimited_suffix=False,
+            )
+            result.checks.append(check)
+        for issue in nested_result.issues:
+            if issue.severity not in actionable_severities:
+                continue
+            issue.location = rewrite_extracted_member_location(
+                issue.location,
+                extracted_path,
+                archive_location,
+                preserve_non_delimited_suffix=False,
+            )
+            result.issues.append(issue)
 
     @classmethod
     def _collect_nemo_member_references(
@@ -890,6 +1032,7 @@ class NemoScanner(BaseScanner):
         member: tarfile.TarInfo,
         *,
         suffix_source: str | None = None,
+        max_bytes: int | None = None,
     ) -> str | None:
         member_file = tar.extractfile(member)
         if member_file is None:
@@ -897,11 +1040,16 @@ class NemoScanner(BaseScanner):
 
         _root, suffix = os.path.splitext(suffix_source or member.name)
         with member_file, tempfile.NamedTemporaryFile(suffix=suffix or ".bin", delete=False) as temp_file:
+            remaining = max_bytes
             while True:
-                chunk = member_file.read(64 * 1024)
+                if remaining is not None and remaining <= 0:
+                    break
+                chunk = member_file.read(64 * 1024 if remaining is None else min(64 * 1024, remaining))
                 if not chunk:
                     break
                 temp_file.write(chunk)
+                if remaining is not None:
+                    remaining -= len(chunk)
             return temp_file.name
 
     def _add_checkpoint_deserialization_check(
