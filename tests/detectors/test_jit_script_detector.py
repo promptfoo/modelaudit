@@ -304,6 +304,8 @@ class TestJITScriptDetector:
             b"import builtins\nbuiltins.eval = len\nbuiltins.eval([])\n",
             b"lookup = globals().get\nlookup('__builtins__').get('len')([1])\n",
             b"mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
+            b"globals()['__builtins__'].__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
+            b"globals()['__builtins__'].update({'eval': len})\nglobals()['__builtins__']['eval']([])\n",
             b"def payload():\n    eval = len\n    return eval([])\n",
             (
                 b"def payload():\n"
@@ -320,26 +322,63 @@ class TestJITScriptDetector:
 
         assert findings == []
 
-    def test_scan_model_detects_dangerous_builtin_reassignment(self) -> None:
+    @pytest.mark.parametrize(
+        "source",
+        [
+            (
+                b"namespace = globals()\n"
+                b"namespace['__builtins__']['eval'] = __builtins__['exec']\n"
+                b"namespace['__builtins__']['eval']('pass')\n"
+            ),
+            (
+                b"globals()['__builtins__'].__setitem__('eval', __builtins__['exec'])\n"
+                b"globals()['__builtins__']['eval']('pass')\n"
+            ),
+            (
+                b"globals()['__builtins__'].update({'eval': __builtins__['exec']})\n"
+                b"globals()['__builtins__']['eval']('pass')\n"
+            ),
+        ],
+    )
+    def test_scan_model_detects_dangerous_builtin_reassignment(self, source: bytes) -> None:
         detector = JITScriptDetector()
-        source = (
-            b"namespace = globals()\n"
-            b"namespace['__builtins__']['eval'] = __builtins__['exec']\n"
-            b"namespace['__builtins__']['eval']('pass')\n"
-        )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
         assert any(f.type == "ast_dangerous_call" and f.builtin == "exec" for f in findings)
 
-    def test_scan_model_preserves_possible_builtin_execution_after_conditional_safe_overwrite(self) -> None:
+    @pytest.mark.parametrize(
+        "source",
+        [
+            (
+                b"namespace = globals()\n"
+                b"if replace_builtin:\n"
+                b"    namespace['__builtins__']['eval'] = len\n"
+                b"namespace['__builtins__']['eval']('1 + 1')\n"
+            ),
+            (
+                b"if replace_builtin:\n"
+                b"    globals()['__builtins__'].__setitem__('eval', len)\n"
+                b"globals()['__builtins__']['eval']('1 + 1')\n"
+            ),
+            (
+                b"if replace_builtin:\n"
+                b"    globals()['__builtins__'].update({'eval': len})\n"
+                b"globals()['__builtins__']['eval']('1 + 1')\n"
+            ),
+            (
+                b"get_names = globals\n"
+                b"if replace_globals:\n"
+                b"    get_names = lambda: {'__builtins__': {'eval': len}}\n"
+                b"get_names()['__builtins__'].__setitem__('eval', len)\n"
+                b"globals()['__builtins__']['eval']('1 + 1')\n"
+            ),
+        ],
+    )
+    def test_scan_model_preserves_possible_builtin_execution_after_conditional_safe_overwrite(
+        self, source: bytes
+    ) -> None:
         detector = JITScriptDetector()
-        source = (
-            b"namespace = globals()\n"
-            b"if replace_builtin:\n"
-            b"    namespace['__builtins__']['eval'] = len\n"
-            b"namespace['__builtins__']['eval']('1 + 1')\n"
-        )
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 

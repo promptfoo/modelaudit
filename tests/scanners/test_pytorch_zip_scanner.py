@@ -1124,6 +1124,8 @@ def test_pytorch_zip_scans_aliased_modeled_builtins_in_archive_data(
         (b"namespace = globals()\nnamespace['__builtins__']['eval'] = len\nnamespace['__builtins__']['eval']([])\n"),
         b"lookup = globals().get\nlookup('__builtins__').get('len')([1])\n",
         b"mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
+        b"globals()['__builtins__'].__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
+        b"globals()['__builtins__'].update({'eval': len})\nglobals()['__builtins__']['eval']([])\n",
         b"def payload():\n    eval = len\n    return eval([])\n",
         (
             b"def payload():\n"
@@ -1149,13 +1151,26 @@ def test_pytorch_zip_ignores_benign_builtin_shaped_access_in_archive_data(tmp_pa
     )
 
 
-def test_pytorch_zip_detects_dangerous_builtin_reassignment_in_archive_data(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "payload",
+    [
+        (
+            b"namespace = globals()\n"
+            b"namespace['__builtins__']['eval'] = __builtins__['exec']\n"
+            b"namespace['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            b"globals()['__builtins__'].__setitem__('eval', __builtins__['exec'])\n"
+            b"globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            b"globals()['__builtins__'].update({'eval': __builtins__['exec']})\n"
+            b"globals()['__builtins__']['eval']('pass')\n"
+        ),
+    ],
+)
+def test_pytorch_zip_detects_dangerous_builtin_reassignment_in_archive_data(tmp_path: Path, payload: bytes) -> None:
     zip_path = tmp_path / "model.pt"
-    payload = (
-        b"namespace = globals()\n"
-        b"namespace['__builtins__']['eval'] = __builtins__['exec']\n"
-        b"namespace['__builtins__']['eval']('pass')\n"
-    )
     with zipfile.ZipFile(zip_path, "w") as zipf:
         zipf.writestr("archive/version", "3")
         zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))

@@ -230,6 +230,8 @@ class TestTarScanner:
             ),
             b"lookup = globals().get\nlookup('__builtins__').get('len')([1])\n",
             b"mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
+            b"globals()['__builtins__'].__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
+            b"globals()['__builtins__'].update({'eval': len})\nglobals()['__builtins__']['eval']([])\n",
         ],
     )
     def test_scan_tar_allows_benign_builtin_shaped_source(self, tmp_path: Path, payload: bytes) -> None:
@@ -243,13 +245,26 @@ class TestTarScanner:
 
         assert not any(check.name == "Python Archive Member Security" for check in result.checks)
 
-    def test_scan_tar_reports_dangerous_builtin_reassignment(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            (
+                b"namespace = globals()\n"
+                b"namespace['__builtins__']['eval'] = __builtins__['exec']\n"
+                b"namespace['__builtins__']['eval']('pass')\n"
+            ),
+            (
+                b"globals()['__builtins__'].__setitem__('eval', __builtins__['exec'])\n"
+                b"globals()['__builtins__']['eval']('pass')\n"
+            ),
+            (
+                b"globals()['__builtins__'].update({'eval': __builtins__['exec']})\n"
+                b"globals()['__builtins__']['eval']('pass')\n"
+            ),
+        ],
+    )
+    def test_scan_tar_reports_dangerous_builtin_reassignment(self, tmp_path: Path, payload: bytes) -> None:
         archive_path = tmp_path / "model_bundle.tar"
-        payload = (
-            b"namespace = globals()\n"
-            b"namespace['__builtins__']['eval'] = __builtins__['exec']\n"
-            b"namespace['__builtins__']['eval']('pass')\n"
-        )
         with tarfile.open(archive_path, "w") as archive:
             info = tarfile.TarInfo("handler.py")
             info.size = len(payload)

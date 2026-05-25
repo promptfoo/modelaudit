@@ -361,6 +361,39 @@ def _resolve_global_builtin_namespace_roots(node: ast.AST, alias_scopes: _AliasS
     return frozenset({attr_name})
 
 
+def _resolve_direct_global_builtin_namespace_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+    """Resolve builtin mappings fetched directly from an unshadowed ``globals()`` call."""
+    namespace_node: ast.AST
+    attr_name_node: ast.AST
+    if isinstance(node, ast.Subscript):
+        namespace_node = node.value
+        attr_name_node = node.slice
+    elif (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _NAMESPACE_MAPPING_ACCESSORS
+        and node.args
+    ):
+        namespace_node = node.func.value
+        attr_name_node = node.args[0]
+    else:
+        return None
+
+    if (
+        not isinstance(namespace_node, ast.Call)
+        or namespace_node.args
+        or namespace_node.keywords
+        or not isinstance(namespace_node.func, ast.Name)
+        or namespace_node.func.id != "globals"
+        or any("globals" in aliases for aliases in alias_scopes)
+    ):
+        return None
+    attr_name = _resolve_static_string(attr_name_node)
+    if attr_name not in _BUILTIN_NAMESPACE_NAMES:
+        return None
+    return frozenset({attr_name})
+
+
 def _resolve_static_attribute_names(
     target_root_node: ast.AST, attr_name_node: ast.AST, alias_scopes: _AliasScopes
 ) -> frozenset[str] | None:
@@ -645,9 +678,45 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if target_names is None:
             return
 
+        self._bind_static_reference_names_to_value(target_names, value)
+
+    def _bind_static_reference_names_to_value(self, target_names: frozenset[str], value: ast.AST) -> None:
         resolved_value_names = self._resolve_reference_names(value)
         for target_name in target_names:
             self._bind_name(self._static_reference_override_key(target_name), resolved_value_names)
+
+    def _bind_direct_builtin_namespace_mutation(self, node: ast.Call) -> None:
+        """Model unconditional mutations of a directly addressed builtin mapping."""
+        if not isinstance(node.func, ast.Attribute) or node.keywords:
+            return
+
+        target_roots = _resolve_direct_global_builtin_namespace_roots(node.func.value, self.alias_scopes)
+        if target_roots is None:
+            return
+
+        mutations: list[tuple[frozenset[str], ast.AST]] = []
+        if node.func.attr == "__setitem__":
+            if len(node.args) != 2:
+                return
+            attr_name = _resolve_static_string(node.args[0])
+            if attr_name is None:
+                return
+            mutations.append((frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), node.args[1]))
+        elif node.func.attr == "update":
+            if len(node.args) != 1 or not isinstance(node.args[0], ast.Dict):
+                return
+            for attr_name_node, value_node in zip(node.args[0].keys, node.args[0].values, strict=True):
+                if attr_name_node is None:
+                    return
+                attr_name = _resolve_static_string(attr_name_node)
+                if attr_name is None:
+                    return
+                mutations.append((frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), value_node))
+        else:
+            return
+
+        for target_names, value in mutations:
+            self._bind_static_reference_names_to_value(target_names, value)
 
     def _bind_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
         if isinstance(target, ast.Name):
@@ -852,6 +921,11 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self.visit(node.value)
         self._bind_target_to_value(node.target, node.value)
         self.visit(node.target)
+
+    def visit_Expr(self, node: ast.Expr) -> None:
+        self.visit(node.value)
+        if isinstance(node.value, ast.Call):
+            self._bind_direct_builtin_namespace_mutation(node.value)
 
     def _visit_loop(self, node: ast.For | ast.AsyncFor) -> None:
         self.visit(node.iter)
