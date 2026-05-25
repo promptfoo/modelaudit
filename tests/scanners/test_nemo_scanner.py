@@ -294,6 +294,27 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert len(cve_checks) == 1
         assert cve_checks[0].severity == IssueSeverity.CRITICAL
 
+    def test_subdirectory_hardlink_checkpoint_alias_resolves_target_from_archive_root(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "checkpoint-hardlink-alias.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "payload.pkl", _build_malicious_pickle())
+            link_info = tarfile.TarInfo(name="assets/model_weights.ckpt")
+            link_info.type = tarfile.LNKTYPE
+            link_info.linkname = "payload.pkl"
+            tar.addfile(link_info)
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        cve_checks = [
+            check
+            for check in result.checks
+            if check.details.get("cve_id") == "CVE-2025-23249"
+            and check.details.get("entry") == "assets/model_weights.ckpt"
+        ]
+        assert len(cve_checks) == 1
+        assert cve_checks[0].severity == IssueSeverity.CRITICAL
+
     def test_large_checkpoint_member_fails_closed(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "checkpoint-large.nemo"
         with tarfile.open(nemo_path, "w") as tar:

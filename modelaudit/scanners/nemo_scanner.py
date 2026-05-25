@@ -708,8 +708,11 @@ class NemoScanner(BaseScanner):
         if is_absolute_archive_path(linkname):
             return None
 
-        member_dir = posixpath.dirname(member.name.replace("\\", "/"))
-        candidate = posixpath.join(member_dir, linkname)
+        if member.islnk():
+            candidate = linkname
+        else:
+            member_dir = posixpath.dirname(member.name.replace("\\", "/"))
+            candidate = posixpath.join(member_dir, linkname)
         return NemoScanner._normalize_safe_archive_member_name(candidate)
 
     def _add_archive_path_traversal_check(
