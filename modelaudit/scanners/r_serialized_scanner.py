@@ -636,7 +636,12 @@ class RSerializedScanner(BaseScanner):
                 message=f"Failed to safely read R serialized payload: {exc}",
                 severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(exc), "exception_type": type(exc).__name__},
+                details={
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": _DECODE_INCONCLUSIVE_REASON,
+                },
                 why=(
                     "Malformed or unsafe compressed streams are treated as scan failures to avoid "
                     "unsafe parsing behavior."
@@ -724,7 +729,11 @@ class RSerializedScanner(BaseScanner):
                 ),
                 severity=IssueSeverity.INFO,
                 location=path,
-                details={"max_extracted_strings": self.max_extracted_strings},
+                details={
+                    "max_extracted_strings": self.max_extracted_strings,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": _STRING_EXTRACTION_INCONCLUSIVE_REASON,
+                },
                 why=(
                     "An extracted-string ceiling limits resource usage. Review with higher limits if deeper "
                     "inspection is needed."

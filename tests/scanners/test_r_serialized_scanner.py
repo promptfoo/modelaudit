@@ -128,6 +128,9 @@ def test_scan_decode_failure_is_explicitly_inconclusive(tmp_path: Path) -> None:
     assert direct.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     assert direct.metadata["scan_outcome_reasons"] == ["r_serialized_decode_incomplete"]
     assert all(check.severity not in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for check in direct.checks)
+    decompression_check = _check_by_name(direct, "R Serialized Decompression")[0]
+    assert decompression_check.details["analysis_incomplete"] is True
+    assert decompression_check.details["scan_outcome_reason"] == "r_serialized_decode_incomplete"
 
     metadata = next(iter(aggregate.file_metadata.values()))
     assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
@@ -163,6 +166,8 @@ def test_scan_string_extraction_ceiling_reports_incomplete_late_payload_analysis
     assert len(ceiling_checks) == 1
     assert ceiling_checks[0].severity == IssueSeverity.INFO
     assert "configured extracted-string ceiling" in ceiling_checks[0].message
+    assert ceiling_checks[0].details["analysis_incomplete"] is True
+    assert ceiling_checks[0].details["scan_outcome_reason"] == "r_serialized_string_extraction_incomplete"
 
 
 def test_scan_string_extraction_ceiling_is_exit2_and_not_cached(tmp_path: Path) -> None:
