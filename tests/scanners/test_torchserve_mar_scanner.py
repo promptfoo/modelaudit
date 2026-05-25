@@ -201,6 +201,85 @@ def test_scan_benign_mar_with_safe_handler(tmp_path: Path) -> None:
     assert len(handler_failures) == 0
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\x7fELF" + b"\x00" * 64,
+        b"MZ" + b"\x00" * 58 + (64).to_bytes(4, "little") + b"PE\x00\x00" + b"\x00" * 16,
+    ],
+)
+def test_scan_flags_content_disguised_executable_extra_file(tmp_path: Path, payload: bytes) -> None:
+    manifest = {
+        "model": {
+            "handler": "handler.py",
+            "serializedFile": "weights.bin",
+            "extraFiles": "native/payload.dat",
+        },
+    }
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return data\n",
+            "weights.bin": b"weights",
+            "native/payload.dat": payload,
+        },
+        filename="disguised_executable_extra_file.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    aggregate = core.scan_model_directory_or_file(str(mar_path), cache_enabled=False)
+
+    executable_checks = _failed_checks(result, "TorchServe Executable Extra File Detection")
+    assert len(executable_checks) == 1
+    assert executable_checks[0].rule_code == "S603"
+    assert executable_checks[0].details["entry"] == "native/payload.dat"
+    assert core.determine_exit_code(aggregate) == 1
+
+
+def test_scan_allows_benign_ordinary_named_extra_file(tmp_path: Path) -> None:
+    manifest = {
+        "model": {
+            "handler": "handler.py",
+            "serializedFile": "weights.bin",
+            "extraFiles": "native/payload.dat",
+        },
+    }
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return data\n",
+            "weights.bin": b"weights",
+            "native/payload.dat": b"compiled feature metadata\n",
+        },
+        filename="benign_extra_file.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    aggregate = core.scan_model_directory_or_file(str(mar_path), cache_enabled=False)
+
+    assert _failed_checks(result, "TorchServe Executable Extra File Detection") == []
+    assert core.determine_exit_code(aggregate) == 0
+
+
+def test_scan_does_not_classify_serialized_weight_signature_as_extra_file(tmp_path: Path) -> None:
+    manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.dat"}}
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return data\n",
+            "weights.dat": b"\x7fELF" + b"\x00" * 64,
+        },
+        filename="serialized_weight_signature.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+
+    assert _failed_checks(result, "TorchServe Executable Extra File Detection") == []
+
+
 def test_scan_flags_duplicate_handler_member_even_when_benign_copy_is_last(tmp_path: Path) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
     mar_path = _create_mar_archive(

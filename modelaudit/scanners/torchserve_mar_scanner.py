@@ -21,6 +21,7 @@ from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_locations import rewrite_extracted_member_location
+from .archive_member_security import is_executable_archive_member_content, is_executable_archive_member_name
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -1395,6 +1396,11 @@ class TorchServeMarScanner(BaseScanner):
             for path in manifest_context.get("serialized_paths", [])
             if self._is_path_like_reference("serializedFile", path)
         }
+        extra_file_refs = {
+            self._normalize_member_name(path)
+            for field, path in manifest_context.get("path_references", [])
+            if field == "extraFiles" and self._is_path_like_reference(field, path)
+        }
         archive_member_names = {
             self._normalize_member_name(info.filename)
             for info in member_infos
@@ -1586,6 +1592,20 @@ class TorchServeMarScanner(BaseScanner):
 
             try:
                 from .. import core
+
+                if normalized_member in extra_file_refs and (
+                    is_executable_archive_member_name(normalized_member)
+                    or is_executable_archive_member_content(temp_path)
+                ):
+                    result.add_check(
+                        name="TorchServe Executable Extra File Detection",
+                        passed=False,
+                        message=f"Executable file found in TorchServe MAR extraFiles member: {member_name}",
+                        severity=IssueSeverity.WARNING,
+                        rule_code="S603",
+                        location=f"{archive_path}:{member_name}",
+                        details={"entry": member_name, "manifest_field": "extraFiles"},
+                    )
 
                 nested_config = dict(self.config)
                 nested_config["_mar_depth"] = current_depth + 1
