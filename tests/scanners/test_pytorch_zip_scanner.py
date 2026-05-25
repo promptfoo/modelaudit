@@ -370,6 +370,47 @@ def test_pytorch_zip_scanner_detects_disguised_executable_sidecar_by_content(tmp
     assert "Executable file found in PyTorch model: archive/weights/loader.dat" in finding_messages
 
 
+def test_pytorch_zip_scanner_fails_closed_on_over_budget_pe_header_offset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Untrusted PE offsets must not trigger oversized reads or hide an MZ sidecar."""
+    model_path = create_mock_pytorch_zip(tmp_path / "oversized_pe_offset.pt", prefix="archive")
+    sidecar = bytearray(b"\x00" * 64)
+    sidecar[:2] = b"MZ"
+    sidecar[0x3C:0x40] = ((1024 * 1024) + 1).to_bytes(4, "little")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("archive/weights/loader.dat", bytes(sidecar))
+
+    original = PyTorchZipScanner._read_member_prefix
+    content_probe_limits: list[int] = []
+
+    def record_content_probe(
+        self: PyTorchZipScanner,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        limit: int,
+        *,
+        phase: str,
+        result: ScanResult,
+    ) -> bytes:
+        if phase == "executable member content probe" and entry.filename.endswith("loader.dat"):
+            content_probe_limits.append(limit)
+        return original(self, zip_file, entry, limit, phase=phase, result=result)
+
+    monkeypatch.setattr(PyTorchZipScanner, "_read_member_prefix", record_content_probe)
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert content_probe_limits == [1024]
+    assert any(
+        check.name == "Executable File Detection"
+        and check.status == CheckStatus.FAILED
+        and check.details.get("file") == "archive/weights/loader.dat"
+        for check in result.checks
+    )
+
+
 def test_pytorch_zip_scanner_does_not_treat_tensor_storage_bytes_as_executable_sidecar(tmp_path: Path) -> None:
     """Arbitrary tensor storage bytes are not evidence of an executable archive member."""
     model_path = create_mock_pytorch_zip(tmp_path / "tensor_bytes.pt", prefix="archive")

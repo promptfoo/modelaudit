@@ -146,8 +146,12 @@ def _looks_like_portable_executable(
         "little",
         signed=False,
     )
-    if not _PORTABLE_EXECUTABLE_MIN_HEADER_OFFSET <= pe_offset <= _PORTABLE_EXECUTABLE_MAX_HEADER_OFFSET:
+    if pe_offset < _PORTABLE_EXECUTABLE_MIN_HEADER_OFFSET:
         return False
+    if pe_offset > _PORTABLE_EXECUTABLE_MAX_HEADER_OFFSET:
+        # A PE pointer beyond the bounded probe budget is attacker-controlled
+        # ambiguity, not evidence that an MZ sidecar is benign.
+        return True
 
     if pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE) <= len(prefix):
         return prefix[pe_offset : pe_offset + len(_PORTABLE_EXECUTABLE_SIGNATURE)] == _PORTABLE_EXECUTABLE_SIGNATURE
