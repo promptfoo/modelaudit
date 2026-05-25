@@ -671,6 +671,8 @@ def _looks_like_coreml_model_proto_prefix(data: bytes) -> bool:
                 break
             _length, value_start, value_end, actual_value_end = bounds
             if actual_value_end > len(data):
+                if field_number in _COREML_MODEL_TYPE_FIELDS:
+                    has_model_type = True
                 break
             if field_number == 2 and _looks_like_coreml_description_proto_prefix(data[value_start:value_end]):
                 has_description = True
@@ -698,7 +700,7 @@ def _looks_like_coreml_model_proto_prefix(data: bytes) -> bool:
         if has_specification_version and has_description and has_model_type:
             return True
 
-    return False
+    return has_specification_version and has_description and has_model_type
 
 
 def _looks_like_coreml_model_file(path: Path, size: int) -> bool:

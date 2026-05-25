@@ -99,6 +99,8 @@ def create_mock_coreml(
     *,
     custom_class: str | None = None,
     custom_parameter: tuple[str, str] | None = None,
+    model_type_first: bool = False,
+    model_type_padding: int = 0,
 ) -> Path:
     """Create a minimal structurally valid CoreML model fixture."""
     metadata = _coreml_field_bytes(1, b"Mock CoreML model")
@@ -112,8 +114,11 @@ def create_mock_coreml(
             parameter = _coreml_field_bytes(1, key.encode("utf-8")) + _coreml_field_bytes(2, parameter_value)
             custom += _coreml_field_bytes(30, parameter)
         layer += _coreml_field_bytes(500, custom)
-    neural_network = _coreml_field_bytes(1, layer)
-    model = _coreml_field_varint(1, 8) + _coreml_field_bytes(2, description) + _coreml_field_bytes(500, neural_network)
+    neural_network = _coreml_field_bytes(1, layer) + (b"\x00" * model_type_padding)
+    fields = [_coreml_field_varint(1, 8), _coreml_field_bytes(2, description), _coreml_field_bytes(500, neural_network)]
+    if model_type_first:
+        fields = [fields[1], fields[2], fields[0]]
+    model = b"".join(fields)
     path.write_bytes(model)
     return path
 
