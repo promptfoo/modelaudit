@@ -139,7 +139,6 @@ def test_tf_metagraph_scanner_read_failure_is_operational_not_security_finding(
     def raise_os_error(_path: str, _limit: int) -> tuple[bytes, bool]:
         raise OSError("simulated MetaGraph read failure")
 
-    monkeypatch.setattr(TensorFlowMetaGraphScanner, "can_handle", classmethod(lambda _cls, _path: True))
     monkeypatch.setattr("modelaudit.scanners.tf_metagraph_scanner._read_bounded", raise_os_error)
 
     result = TensorFlowMetaGraphScanner().scan(str(unreadable_meta))

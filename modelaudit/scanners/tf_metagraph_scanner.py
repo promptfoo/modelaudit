@@ -263,6 +263,8 @@ class TensorFlowMetaGraphScanner(BaseScanner):
             if truncated:
                 return False
             metagraph = _parse_metagraph(content)
+        except OSError:
+            return True
         except Exception:
             return False
 
