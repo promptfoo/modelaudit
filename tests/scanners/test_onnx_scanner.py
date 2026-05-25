@@ -583,7 +583,6 @@ def test_onnx_scanner_function_default_graph_python_op_still_flagged(tmp_path: P
         ["Y"],
         [if_node],
         [helper.make_opsetid("", 13)],
-        attributes=["then_graph", "else_graph"],
         attribute_protos=[
             helper.make_attribute("then_graph", then_branch),
             helper.make_attribute("else_graph", else_branch),
@@ -603,7 +602,7 @@ def test_onnx_scanner_function_default_graph_python_op_still_flagged(tmp_path: P
         functions=[function],
         opset_imports=[helper.make_opsetid("", 13), helper.make_opsetid("local", 1)],
     )
-    model.ir_version = 8
+    model.ir_version = 9
     onnx.checker.check_model(model)
     model_path = tmp_path / "function_default_graph_python_op.onnx"
     onnx.save(model, str(model_path))
