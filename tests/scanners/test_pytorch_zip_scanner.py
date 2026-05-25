@@ -1034,6 +1034,51 @@ def test_pytorch_zip_scans_unmarked_python_blobs_in_archive_data(tmp_path: Path)
     assert any(check.location == f"{zip_path}:archive/data/payload.bin" for check in jit_failures)
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"getattr(__builtins__, 'eval')('1 + 1')\n",
+        b"__builtins__['ev' + 'al']('1 + 1')\n",
+        b"__builtins__.__dict__.get('eval')('1 + 1')\n",
+    ],
+)
+def test_pytorch_zip_scans_static_builtin_indirection_in_archive_data(tmp_path: Path, payload: bytes) -> None:
+    """A disguised source member using the builtin namespace still receives JIT analysis."""
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    jit_failures = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert any(
+        check.location == f"{zip_path}:archive/data/payload.bin" and "Dangerous function call 'eval'" in check.message
+        for check in jit_failures
+    )
+
+
+def test_pytorch_zip_ignores_ordinary_callback_mapping_in_archive_data(tmp_path: Path) -> None:
+    """An ordinary application lookup with a builtin-shaped key must remain benign."""
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", b"callbacks = {'eval': len}\ncallbacks['eval']([])\n")
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
 def test_pytorch_zip_ignores_non_source_eval_text_in_archive_data(tmp_path: Path) -> None:
     """Plain payload text containing a dangerous substring must not become a JIT false positive."""
     zip_path = tmp_path / "model.pt"
