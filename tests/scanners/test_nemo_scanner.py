@@ -434,6 +434,26 @@ class TestNemoArchiveVulnerabilityCoverage:
             for check in result.checks
         )
 
+    def test_renamed_nemo_retains_auxiliary_yaml_template_scanning(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "templated-model.jpg"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(
+                tar,
+                "chat_model_config.yaml",
+                b"chat_template: \"{{ ''.__class__.__mro__[1].__subclasses__() }}\"\n",
+            )
+
+        result = scan_file(str(nemo_path), config={"cache_scan_results": False})
+
+        assert result.scanner_name == "nemo"
+        assert any(
+            check.name == "Jinja2 Template Injection Detection"
+            and check.status == CheckStatus.FAILED
+            and "chat_model_config.yaml" in str(check.location)
+            for check in result.checks
+        )
+
     def test_large_disguised_executable_is_detected_from_bounded_prefix(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "large-embedded-executable.nemo"
         with tarfile.open(nemo_path, "w") as tar:
@@ -806,6 +826,30 @@ class TestCVE202523304HydraTarget:
             for check in result.checks
         )
 
+    @pytest.mark.parametrize("link_type", [tarfile.SYMTYPE, tarfile.LNKTYPE])
+    def test_core_routes_renamed_nemo_archive_with_linked_root_config(
+        self,
+        tmp_path: Path,
+        link_type: bytes,
+    ) -> None:
+        path = tmp_path / "linked-config.jpg"
+        with tarfile.open(path, "w") as archive:
+            _add_tar_bytes(archive, "payload.txt", b"model:\n  _target_: os.system\n  command: echo pwned\n")
+            link_info = tarfile.TarInfo("model_config.yaml")
+            link_info.type = link_type
+            link_info.linkname = "payload.txt"
+            archive.addfile(link_info)
+
+        result = scan_file(str(path), config={"cache_scan_results": False})
+
+        assert result.scanner_name == "nemo"
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.details["target"] == "os.system"
+            for check in result.checks
+        )
+
     def test_renamed_nemo_root_config_within_route_budget_is_scanned(
         self,
         tmp_path: Path,
@@ -846,6 +890,33 @@ class TestCVE202523304HydraTarget:
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "nemo_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert not any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
+
+    def test_nested_compressed_nemo_over_route_budget_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_ENTRIES", 2)
+        nested_path = tmp_path / "payload.tar.gz"
+        with tarfile.open(nested_path, "w:gz") as archive:
+            _add_tar_bytes(archive, "assets/one.bin", b"one")
+            _add_tar_bytes(archive, "assets/two.bin", b"two")
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n  command: echo pwned\n")
+        outer_path = tmp_path / "outer.tar"
+        with tarfile.open(outer_path, "w") as archive:
+            archive.add(nested_path, arcname="models/payload.tar.gz")
+
+        result = scan_file(str(outer_path), config={"cache_scan_results": False, "max_tar_entries": 100})
+
+        assert result.scanner_name == "tar"
+        assert result.success is False
+        assert any(
+            check.name == "NeMo Routing"
+            and check.status == CheckStatus.FAILED
+            and "models/payload.tar.gz" in str(check.location)
+            for check in result.checks
+        )
         assert not any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
 
     def test_declared_nemo_scans_root_config_beyond_renamed_route_budget(

@@ -1,5 +1,6 @@
 import json
 import pickletools
+import posixpath
 import re
 import struct
 import tarfile
@@ -1071,6 +1072,39 @@ def _is_nemo_root_config_member(member_name: str) -> bool:
     return normalized_name.lower() in _NEMO_CONFIG_ENTRIES
 
 
+def _resolve_safe_tar_link_target_name(member: tarfile.TarInfo) -> str | None:
+    """Resolve an in-archive TAR link without permitting extraction-root escape."""
+    link_name = member.linkname.replace("\\", "/")
+    if PurePosixPath(link_name).is_absolute() or re.match(r"^[A-Za-z]:/", link_name):
+        return None
+
+    member_dir = posixpath.dirname(member.name.replace("\\", "/"))
+    target_name = posixpath.normpath(posixpath.join(member_dir, link_name))
+    if target_name in {"", ".", ".."} or target_name.startswith("../"):
+        return None
+    while target_name.startswith("./"):
+        target_name = target_name[2:]
+    return target_name
+
+
+def _is_nemo_root_config_tar_member(archive: tarfile.TarFile, member: tarfile.TarInfo) -> bool:
+    """Return whether a root config entry is a readable file or safe in-archive link."""
+    if not _is_nemo_root_config_member(member.name):
+        return False
+    if member.isfile():
+        return True
+    if not (member.issym() or member.islnk()):
+        return False
+
+    target_name = _resolve_safe_tar_link_target_name(member)
+    if target_name is None:
+        return False
+    try:
+        return archive.getmember(target_name).isfile()
+    except KeyError:
+        return False
+
+
 def _detect_tar_route(path: str) -> str | None:
     """Return the safe content route for a valid TAR-backed artifact."""
     file_path = Path(path)
@@ -1081,14 +1115,10 @@ def _detect_tar_route(path: str) -> str | None:
         with tarfile.open(file_path, "r:*") as archive:
             if file_path.suffix.lower() == ".nemo":
                 return "tar"
-            entry_count = 0
-            for member in archive:
-                entry_count += 1
+            for entry_count, member in enumerate(archive, start=1):
                 if entry_count > _NEMO_ROUTE_MAX_ENTRIES:
                     return NEMO_ROUTING_INCONCLUSIVE_FORMAT
-                if not member.isfile():
-                    continue
-                if _is_nemo_root_config_member(member.name):
+                if _is_nemo_root_config_tar_member(archive, member):
                     return "nemo"
     except (OSError, tarfile.TarError):
         return None
@@ -1488,8 +1518,10 @@ def detect_file_format_from_magic(path: str) -> str:
             format_result = detect_format_from_magic_bytes(magic4, magic8, magic16, size, file_path)
             if format_result == "zip" and file_path.suffix.lower() == ".mar" and is_torchserve_mar_archive(path):
                 return "torchserve_mar"
-            if format_result in {"gzip", "bzip2", "xz"} and _detect_tar_route(path) == "nemo":
-                return "nemo"
+            if format_result in {"gzip", "bzip2", "xz"}:
+                tar_route = _detect_tar_route(path)
+                if tar_route in {"nemo", NEMO_ROUTING_INCONCLUSIVE_FORMAT}:
+                    return tar_route
             if format_result != "unknown":
                 return format_result
 

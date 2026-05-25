@@ -584,7 +584,10 @@ class TarScanner(BaseScanner):
                     tmp_path, total_size = self._extract_member_to_tempfile(tar, member, suffix=suffix)
                     try:
                         if is_tar_extension and tarfile.is_tarfile(tmp_path):
-                            nested_result = self._scan_tar_file(tmp_path, depth + 1)
+                            nested_config = dict(self.config)
+                            nested_config.pop(TAR_SECURITY_ONLY_NESTED_MEMBER_ENTRIES_CONFIG_KEY, None)
+                            nested_config["_archive_depth"] = depth + 1
+                            nested_result = self._scan_nested_archive_entry(tmp_path, nested_config)
                             if member_scan_incomplete(nested_result):
                                 scan_complete = False
 

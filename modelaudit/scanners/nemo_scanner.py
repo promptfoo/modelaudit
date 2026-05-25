@@ -335,6 +335,7 @@ class NemoScanner(BaseScanner):
         yaml_configs_found = 0
         yaml_config_files_found = 0
         scanned_member_entries: set[str] = set()
+        scanned_yaml_sources: set[str] = set()
 
         with tarfile.open(path, "r:*") as tar:
             for member in tar:
@@ -405,6 +406,30 @@ class NemoScanner(BaseScanner):
                                         location=f"{path}:{member.name}",
                                         details={"entry": member.name, "target": member.linkname},
                                     )
+                    elif self._is_root_config_member_name(member.name):
+                        link_target_name = self._resolve_archive_link_member_name(member)
+                        if link_target_name is not None:
+                            try:
+                                target_member = tar.getmember(link_target_name)
+                            except KeyError:
+                                target_member = None
+                            if (
+                                target_member is not None
+                                and target_member.isfile()
+                                and target_member.name not in scanned_yaml_sources
+                            ):
+                                yaml_config_files_found += 1
+                                if self._scan_yaml_config_member(
+                                    tar,
+                                    target_member,
+                                    member.name,
+                                    path,
+                                    result,
+                                    nemo_owned_entries,
+                                    scanned_member_entries,
+                                ):
+                                    yaml_configs_found += 1
+                                scanned_yaml_sources.add(target_member.name)
                     continue
 
                 if not member.isfile():
@@ -426,89 +451,20 @@ class NemoScanner(BaseScanner):
 
                 # Parse YAML config files
                 if name_lower.endswith((".yaml", ".yml")):
-                    nemo_owned_entries.add(member.name)
+                    if member.name in scanned_yaml_sources:
+                        continue
                     yaml_config_files_found += 1
-                    if member.size > self.MAX_CONFIG_SIZE:
-                        self._mark_inconclusive_scan_result(
-                            result,
-                            reason="nemo_config_size_limit",
-                            check_name="NeMo Config Size Check",
-                            message=(f"Config file too large: {member.name} ({member.size} bytes)"),
-                            location=f"{path}:{member.name}",
-                            severity=IssueSeverity.WARNING,
-                            details={
-                                "config_file": member.name,
-                                "size_bytes": member.size,
-                                "max_config_size": self.MAX_CONFIG_SIZE,
-                            },
-                        )
-                        continue
-
-                    f = tar.extractfile(member)
-                    if f is None:
-                        continue
-                    with f:
-                        try:
-                            raw = f.read(self.MAX_CONFIG_SIZE + 1)
-                            if len(raw) > self.MAX_CONFIG_SIZE:
-                                self._mark_inconclusive_scan_result(
-                                    result,
-                                    reason="nemo_config_size_limit",
-                                    check_name="NeMo Config Size Check",
-                                    message=(f"Config file too large: {member.name} ({len(raw)} bytes)"),
-                                    location=f"{path}:{member.name}",
-                                    severity=IssueSeverity.WARNING,
-                                    details={
-                                        "config_file": member.name,
-                                        "size_bytes": len(raw),
-                                        "max_config_size": self.MAX_CONFIG_SIZE,
-                                    },
-                                )
-                                continue
-                            config = yaml.safe_load(raw)
-                            if isinstance(config, dict | list):
-                                yaml_configs_found += 1
-                                self._check_hydra_targets(config, member.name, path, result)
-                                for config_path, referenced_member_name in self._collect_nemo_member_references(config):
-                                    nemo_owned_entries.add(referenced_member_name)
-                                    if referenced_member_name in scanned_member_entries:
-                                        continue
-                                    referenced_member_scanned = self._scan_config_referenced_member(
-                                        tar,
-                                        referenced_member_name,
-                                        path,
-                                        result,
-                                        config_file=member.name,
-                                        config_path=config_path,
-                                    )
-                                    if referenced_member_scanned:
-                                        scanned_member_entries.add(referenced_member_name)
-                            else:
-                                self._mark_inconclusive_scan_result(
-                                    result,
-                                    reason="nemo_config_invalid_structure",
-                                    check_name="NeMo Config Structure",
-                                    message=(
-                                        f"YAML config {member.name} has unsupported "
-                                        f"top-level type: {type(config).__name__}"
-                                    ),
-                                    location=f"{path}:{member.name}",
-                                    details={
-                                        "config_file": member.name,
-                                        "expected_type": "dict_or_list",
-                                        "actual_type": type(config).__name__,
-                                    },
-                                )
-                        except yaml.YAMLError:
-                            logger.debug("Failed to parse YAML config %s in %s", member.name, path)
-                            self._mark_inconclusive_scan_result(
-                                result,
-                                reason="nemo_config_yaml_parse_failed",
-                                check_name="NeMo Config YAML Parsing",
-                                message=f"Failed to parse YAML config {member.name}",
-                                location=f"{path}:{member.name}",
-                                details={"config_file": member.name},
-                            )
+                    if self._scan_yaml_config_member(
+                        tar,
+                        member,
+                        member.name,
+                        path,
+                        result,
+                        nemo_owned_entries,
+                        scanned_member_entries,
+                    ):
+                        yaml_configs_found += 1
+                    scanned_yaml_sources.add(member.name)
 
                 if name_lower.endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS)):
                     nemo_owned_entries.add(member.name)
@@ -618,6 +574,106 @@ class NemoScanner(BaseScanner):
             return False
         with member_file:
             return member_file.read(2) == b"MZ"
+
+    def _scan_yaml_config_member(
+        self,
+        tar: tarfile.TarFile,
+        member: tarfile.TarInfo,
+        config_file: str,
+        archive_path: str,
+        result: ScanResult,
+        nemo_owned_entries: set[str],
+        scanned_member_entries: set[str],
+    ) -> bool:
+        """Analyze one YAML config entry, including a safe root-config link target."""
+        if member.size > self.MAX_CONFIG_SIZE:
+            self._mark_inconclusive_scan_result(
+                result,
+                reason="nemo_config_size_limit",
+                check_name="NeMo Config Size Check",
+                message=f"Config file too large: {config_file} ({member.size} bytes)",
+                location=f"{archive_path}:{config_file}",
+                severity=IssueSeverity.WARNING,
+                details={
+                    "config_file": config_file,
+                    "size_bytes": member.size,
+                    "max_config_size": self.MAX_CONFIG_SIZE,
+                },
+            )
+            return False
+
+        member_file = tar.extractfile(member)
+        if member_file is None:
+            return False
+        with member_file:
+            try:
+                raw = member_file.read(self.MAX_CONFIG_SIZE + 1)
+                if len(raw) > self.MAX_CONFIG_SIZE:
+                    self._mark_inconclusive_scan_result(
+                        result,
+                        reason="nemo_config_size_limit",
+                        check_name="NeMo Config Size Check",
+                        message=f"Config file too large: {config_file} ({len(raw)} bytes)",
+                        location=f"{archive_path}:{config_file}",
+                        severity=IssueSeverity.WARNING,
+                        details={
+                            "config_file": config_file,
+                            "size_bytes": len(raw),
+                            "max_config_size": self.MAX_CONFIG_SIZE,
+                        },
+                    )
+                    return False
+                config = yaml.safe_load(raw)
+            except yaml.YAMLError:
+                logger.debug("Failed to parse YAML config %s in %s", config_file, archive_path)
+                self._mark_inconclusive_scan_result(
+                    result,
+                    reason="nemo_config_yaml_parse_failed",
+                    check_name="NeMo Config YAML Parsing",
+                    message=f"Failed to parse YAML config {config_file}",
+                    location=f"{archive_path}:{config_file}",
+                    details={"config_file": config_file},
+                )
+                return False
+
+        if not isinstance(config, dict | list):
+            self._mark_inconclusive_scan_result(
+                result,
+                reason="nemo_config_invalid_structure",
+                check_name="NeMo Config Structure",
+                message=f"YAML config {config_file} has unsupported top-level type: {type(config).__name__}",
+                location=f"{archive_path}:{config_file}",
+                details={
+                    "config_file": config_file,
+                    "expected_type": "dict_or_list",
+                    "actual_type": type(config).__name__,
+                },
+            )
+            return False
+
+        self._check_hydra_targets(config, config_file, archive_path, result)
+        for config_path, referenced_member_name in self._collect_nemo_member_references(config):
+            nemo_owned_entries.add(referenced_member_name)
+            if referenced_member_name in scanned_member_entries:
+                continue
+            referenced_member_scanned = self._scan_config_referenced_member(
+                tar,
+                referenced_member_name,
+                archive_path,
+                result,
+                config_file=config_file,
+                config_path=config_path,
+            )
+            if referenced_member_scanned:
+                scanned_member_entries.add(referenced_member_name)
+        return True
+
+    @staticmethod
+    def _is_root_config_member_name(member_name: str) -> bool:
+        normalized_name = member_name.replace("\\", "/")
+        while normalized_name.startswith("./"):
+            normalized_name = normalized_name[2:]
+        return normalized_name.lower() in {"model_config.yaml", "model_config.yml"}
 
     @staticmethod
     def _resolve_archive_link_member_name(member: tarfile.TarInfo) -> str | None:
