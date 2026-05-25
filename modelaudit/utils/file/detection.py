@@ -1245,12 +1245,14 @@ def _is_lightgbm_signature(prefix: bytes) -> bool:
     return (starts_with_tree or "tree=" in preview) and header_hits >= 3 and tree_hits >= 2 and not xgboost_like
 
 
+def _is_lightgbm_native_tree_record(line: str) -> bool:
+    return line == "tree" or line.startswith("tree=")
+
+
 def _is_content_routed_lightgbm_signature(prefix: bytes) -> bool:
     """Require native tree framing before routing a misleading suffix as LightGBM."""
     preview = prefix.decode("utf-8", errors="ignore").replace("\x00", "\n").lower()
-    native_lines = [
-        line.lstrip() for line in preview.splitlines() if line.strip() and not line.lstrip().startswith("#")
-    ]
+    native_lines = [line.strip() for line in preview.splitlines() if line.strip() and not line.lstrip().startswith("#")]
     if not native_lines:
         return False
 
@@ -1259,12 +1261,12 @@ def _is_content_routed_lightgbm_signature(prefix: bytes) -> bool:
     if nul_offset >= 0:
         binary_payload_preview = prefix[nul_offset + 1 :].decode("utf-8", errors="ignore").replace("\x00", "\n").lower()
         binary_payload_lines = [
-            line.lstrip()
+            line.strip()
             for line in binary_payload_preview.splitlines()
             if line.strip() and not line.lstrip().startswith("#")
         ]
-    has_tree_record = native_lines[0].startswith("tree") or any(
-        line.startswith("tree") for line in binary_payload_lines
+    has_tree_record = _is_lightgbm_native_tree_record(native_lines[0]) or any(
+        _is_lightgbm_native_tree_record(line) for line in binary_payload_lines
     )
     return has_tree_record and _is_lightgbm_signature(prefix)
 
@@ -1444,13 +1446,6 @@ def detect_file_format_from_magic(path: str) -> str:
             if format_result != "unknown":
                 return format_result
 
-            # CNTKv2 has protobuf-style serialization without a fixed first-8-byte magic.
-            # Use bounded signature markers for deterministic identification.
-            f.seek(0)
-            cntk_prefix = f.read(_CNTK_SIGNATURE_READ_BYTES)
-            if file_path.suffix.lower() != ".model" and _is_cntk_signature(cntk_prefix):
-                return "cntk"
-
             # Protocol 0/1 pickle payloads can evade short magic-byte checks.
             # Probe a bounded prefix and require a valid opcode stream.
             pickle_probe_sample = _read_pickle_probe_sample(file_path, size, magic16)
@@ -1464,6 +1459,13 @@ def detect_file_format_from_magic(path: str) -> str:
             torch7_prefix = f.read(_TORCH7_SIGNATURE_READ_BYTES)
             if _is_torch7_signature(torch7_prefix):
                 return "torch7"
+
+            # CNTKv2 has protobuf-style serialization without a fixed first-8-byte magic.
+            # Use bounded signature markers for deterministic identification after serialized formats.
+            f.seek(0)
+            cntk_prefix = f.read(_CNTK_SIGNATURE_READ_BYTES)
+            if file_path.suffix.lower() != ".model" and _is_cntk_signature(cntk_prefix):
+                return "cntk"
 
             f.seek(0)
             lightgbm_prefix = f.read(_LIGHTGBM_SIGNATURE_READ_BYTES)
@@ -1558,24 +1560,6 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if format_result != "unknown":
             return format_result
 
-        cntk_probe_size = min(size, _CNTK_SIGNATURE_READ_BYTES)
-        if len(prefix) < cntk_probe_size:
-            prefix += f.read(cntk_probe_size - len(prefix))
-        if file_path.suffix.lower() != ".model" and _is_cntk_signature(prefix[:cntk_probe_size]):
-            return "cntk"
-
-        torch7_probe_size = min(size, _TORCH7_SIGNATURE_READ_BYTES)
-        if len(prefix) < torch7_probe_size:
-            prefix += f.read(torch7_probe_size - len(prefix))
-        if _is_torch7_signature(prefix):
-            return "torch7"
-
-        lightgbm_probe_size = min(size, _LIGHTGBM_SIGNATURE_READ_BYTES)
-        if len(prefix) < lightgbm_probe_size:
-            prefix += f.read(lightgbm_probe_size - len(prefix))
-        if _is_content_routed_lightgbm_signature(prefix[:lightgbm_probe_size]):
-            return "lightgbm"
-
         if _could_start_proto0_or_1_pickle(prefix):
             max_probe_size = min(size, PROTO0_1_MAX_PROBE_BYTES)
             if len(prefix) < max_probe_size:
@@ -1585,6 +1569,24 @@ def detect_file_format_for_skip_filter(path: str) -> str:
                 sample_is_prefix=size > min(size, PROTO0_1_MAX_PROBE_BYTES),
             ):
                 return "pickle"
+
+        torch7_probe_size = min(size, _TORCH7_SIGNATURE_READ_BYTES)
+        if len(prefix) < torch7_probe_size:
+            prefix += f.read(torch7_probe_size - len(prefix))
+        if _is_torch7_signature(prefix):
+            return "torch7"
+
+        cntk_probe_size = min(size, _CNTK_SIGNATURE_READ_BYTES)
+        if len(prefix) < cntk_probe_size:
+            prefix += f.read(cntk_probe_size - len(prefix))
+        if file_path.suffix.lower() != ".model" and _is_cntk_signature(prefix[:cntk_probe_size]):
+            return "cntk"
+
+        lightgbm_probe_size = min(size, _LIGHTGBM_SIGNATURE_READ_BYTES)
+        if len(prefix) < lightgbm_probe_size:
+            prefix += f.read(lightgbm_probe_size - len(prefix))
+        if _is_content_routed_lightgbm_signature(prefix[:lightgbm_probe_size]):
+            return "lightgbm"
 
         if _could_be_xml_prefix(prefix):
             xml_probe_size = min(size, _XML_MODEL_SIGNATURE_READ_BYTES)
@@ -1712,15 +1714,15 @@ def detect_file_format(path: str) -> str:
     if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
 
+    torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
+    if _is_torch7_signature(torch7_prefix):
+        return "torch7"
+
     signature_prefix = read_magic_bytes(path, max(_CNTK_SIGNATURE_READ_BYTES, _LIGHTGBM_SIGNATURE_READ_BYTES))
     if ext != ".model" and _is_cntk_signature(signature_prefix[:_CNTK_SIGNATURE_READ_BYTES]):
         return "cntk"
     if _is_content_routed_lightgbm_signature(signature_prefix[:_LIGHTGBM_SIGNATURE_READ_BYTES]):
         return "lightgbm"
-
-    torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
-    if _is_torch7_signature(torch7_prefix):
-        return "torch7"
 
     # For .bin files, do more sophisticated detection
     if ext == ".bin":

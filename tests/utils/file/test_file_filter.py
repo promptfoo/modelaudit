@@ -255,6 +255,25 @@ class TestFileFilter:
         assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
         assert should_skip_file(str(near_match))
 
+    @pytest.mark.parametrize("embedded_format", ["cntk", "lightgbm"])
+    def test_disguised_torch7_outranks_embedded_content_signatures(
+        self,
+        tmp_path: Path,
+        embedded_format: str,
+    ) -> None:
+        disguised_torch7 = tmp_path / f"payload-{embedded_format}.jpg"
+        payload = b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+        if embedded_format == "cntk":
+            embedded_payload = tmp_path / "embedded.cmf"
+            _write_cntkv2(embedded_payload)
+            payload += embedded_payload.read_bytes()
+        else:
+            payload += b"\x00" + _build_lightgbm_text().encode("utf-8")
+        disguised_torch7.write_bytes(payload)
+
+        assert detect_file_format_for_skip_filter(str(disguised_torch7)) == "torch7"
+        assert not should_skip_file(str(disguised_torch7))
+
     def test_disguised_llamafile_bypasses_default_skip(self, tmp_path: Path) -> None:
         disguised_llamafile = tmp_path / "payload.jpg"
         disguised_llamafile.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile runtime")
@@ -335,11 +354,15 @@ class TestFileFilter:
         disguised_lightgbm.write_bytes(b"\x01opaque tree prelude\x00" + _build_lightgbm_text().encode("utf-8"))
         prose_prefixed = tmp_path / "notes.jpg"
         prose_prefixed.write_text("notes about a model\n" + _build_lightgbm_text(), encoding="utf-8")
+        tree_prefixed_prose = tmp_path / "tree-notes.jpg"
+        tree_prefixed_prose.write_text("tree model notes\n" + _build_lightgbm_text(), encoding="utf-8")
 
         assert detect_file_format_for_skip_filter(str(disguised_lightgbm)) == "lightgbm"
         assert detect_file_format_for_skip_filter(str(prose_prefixed)) == "unknown"
+        assert detect_file_format_for_skip_filter(str(tree_prefixed_prose)) == "unknown"
         assert not should_skip_file(str(disguised_lightgbm))
         assert should_skip_file(str(prose_prefixed))
+        assert should_skip_file(str(tree_prefixed_prose))
 
     def test_disguised_cntk_model_bypasses_default_skip(self, tmp_path: Path) -> None:
         """Default skip filtering must preserve strict CNTK signatures under skipped suffixes."""

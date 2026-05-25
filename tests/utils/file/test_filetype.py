@@ -477,6 +477,31 @@ def test_torch7_content_takes_priority_over_recognized_suffix(tmp_path: Path, fi
     assert detect_file_format_from_magic(str(torch7_path)) == "torch7"
 
 
+@pytest.mark.parametrize(
+    "embedded_signature",
+    [
+        b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+        b" CompositeFunction primitive_functions ",
+        (
+            b"\x00tree=0\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
+            b"tree_sizes=12\nnum_leaves=2\nsplit_feature=0\nleaf_value=0.1 0.2\n"
+        ),
+    ],
+    ids=["cntk", "lightgbm"],
+)
+def test_torch7_content_takes_priority_over_embedded_content_signatures(
+    tmp_path: Path,
+    embedded_signature: bytes,
+) -> None:
+    torch7_path = tmp_path / "mixed-payload.jpg"
+    torch7_path.write_bytes(
+        b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n" + embedded_signature
+    )
+
+    assert detect_file_format(str(torch7_path)) == "torch7"
+    assert detect_file_format_from_magic(str(torch7_path)) == "torch7"
+
+
 def test_torch7_magic_rejects_malformed_ascii_version_header(tmp_path: Path) -> None:
     source_path = tmp_path / "malformed-header.py"
     source_path.write_bytes(b"4\n1\n9\nV payload\n13\nnn.Sequential\n")
