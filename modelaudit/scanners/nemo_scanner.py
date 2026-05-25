@@ -13,8 +13,9 @@ import tarfile
 import tempfile
 from typing import Any, ClassVar
 
+from ..core_results import mark_operational_scan_error
 from ..utils import is_absolute_archive_path, sanitize_archive_path
-from ..utils.file.detection import is_nemo_archive
+from ..utils.file.detection import NEMO_ROUTING_INCONCLUSIVE_FORMAT, is_nemo_archive
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete
 from .archive_member_security import (
@@ -1014,10 +1015,16 @@ class NemoScanner(BaseScanner):
         if nested_incomplete:
             for reason in propagated_reasons:
                 mark_archive_scan_incomplete(result, reason)
+                mark_operational_scan_error(result, reason)
 
         for check in nested_result.checks:
+            is_incomplete_routing_check = (
+                nested_incomplete
+                and check.name == "NeMo Routing"
+                and check.details.get("format") == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+            )
             if check.status != CheckStatus.FAILED or (
-                check.severity not in actionable_severities and not nested_incomplete
+                check.severity not in actionable_severities and not is_incomplete_routing_check
             ):
                 continue
             check.location = rewrite_extracted_member_location(
@@ -1028,7 +1035,7 @@ class NemoScanner(BaseScanner):
             )
             result.checks.append(check)
         for issue in nested_result.issues:
-            if issue.severity not in actionable_severities and not nested_incomplete:
+            if issue.severity not in actionable_severities:
                 continue
             issue.location = rewrite_extracted_member_location(
                 issue.location,

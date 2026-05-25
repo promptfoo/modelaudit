@@ -18,7 +18,7 @@ except ImportError:
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
-from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.nemo_scanner import NemoScanner, _get_nested_scanner_for_file
 from modelaudit.utils.file import detection as file_detection
 
@@ -1152,6 +1152,8 @@ class TestCVE202523304HydraTarget:
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "nemo_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert result.metadata["operational_error"] is True
+        assert result.metadata["operational_error_reason"] == "nemo_routing_incomplete"
         assert any(
             check.name == "NeMo Routing"
             and check.status == CheckStatus.FAILED
@@ -1159,6 +1161,67 @@ class TestCVE202523304HydraTarget:
             for check in result.checks
         )
         assert not any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
+
+    def test_referenced_incomplete_nemo_route_takes_precedence_over_security_findings(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(file_detection, "_NEMO_ROUTE_MAX_ENTRIES", 2)
+        nested_path = tmp_path / "referenced-payload.tar.gz"
+        with tarfile.open(nested_path, "w:gz") as archive:
+            _add_tar_bytes(archive, "assets/one.bin", b"one")
+            _add_tar_bytes(archive, "assets/two.bin", b"two")
+            _add_tar_bytes(archive, "model_config.yaml", b"model:\n  _target_: os.system\n")
+        path = tmp_path / "referenced-malicious-container.jpg"
+        config = {"model": {"_target_": "os.system"}, "artifact": "nemo:assets/payload.tar.gz"}
+        with tarfile.open(path, "w") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", yaml.safe_dump(config).encode())
+            archive.add(nested_path, arcname="assets/payload.tar.gz")
+
+        result = scan_model_directory_or_file(
+            str(path),
+            config={"cache_scan_results": False, "max_tar_entries": 100},
+        )
+
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+        assert determine_exit_code(result) == 2
+
+    def test_nested_incomplete_nemo_route_does_not_promote_unrelated_info_checks(self, tmp_path: Path) -> None:
+        extracted_path = str(tmp_path / "nested-payload.tar.gz")
+        result = ScanResult(scanner_name="nemo")
+        nested_result = ScanResult(scanner_name="nemo")
+        nested_result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        nested_result.metadata["scan_outcome_reasons"] = ["nemo_routing_incomplete"]
+        nested_result.add_check(
+            name="NeMo Routing",
+            passed=False,
+            message="Bounded route incomplete",
+            severity=IssueSeverity.INFO,
+            location=extracted_path,
+            details={"format": file_detection.NEMO_ROUTING_INCONCLUSIVE_FORMAT},
+        )
+        nested_result.add_check(
+            name="Hydra _target_ Review",
+            passed=False,
+            message="Review target",
+            severity=IssueSeverity.INFO,
+            location=extracted_path,
+            details={"target": "skops.io.load"},
+        )
+        assert len(nested_result.issues) == 2
+
+        NemoScanner._merge_nested_security_findings(
+            result,
+            nested_result,
+            extracted_path,
+            str(tmp_path / "outer.nemo"),
+            "assets/payload.tar.gz",
+        )
+
+        assert [check.name for check in result.checks] == ["NeMo Routing"]
+        assert result.issues == []
+        assert result.metadata["operational_error"] is True
 
     def test_declared_nemo_scans_root_config_beyond_renamed_route_budget(
         self,
