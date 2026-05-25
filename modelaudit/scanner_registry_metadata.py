@@ -377,7 +377,7 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
     "cntk": {
         "module": "modelaudit.scanners.cntk_scanner",
         "class": "CntkScanner",
-        "description": "Scans CNTK .dnn/.cmf model artifacts",
+        "description": "Scans signature-confirmed CNTK model artifacts for load-time execution indicators",
         "extensions": [".dnn", ".cmf"],
         "priority": 18,
         "dependencies": [],

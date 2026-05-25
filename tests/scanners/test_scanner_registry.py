@@ -1,3 +1,4 @@
+import base64
 import bz2
 import gzip
 import io
@@ -12,6 +13,7 @@ from typing import Literal
 
 import pytest
 
+from modelaudit import core as core_module
 from modelaudit.config.constants import SCANNABLE_MODEL_EXTENSIONS
 from modelaudit.core import scan_file
 from modelaudit.scanner_registry_metadata import (
@@ -35,6 +37,7 @@ _REPRESENTATIVE_SCANNER_IDS = [
     "compressed",
     "tar",
     "tf_savedmodel",
+    "cntk",
     "metadata",
     "manifest",
 ]
@@ -77,6 +80,12 @@ def _assert_scanner_for_path(path: Path, expected_scanner_name: str) -> None:
 
     assert scanner_class is not None
     assert scanner_class.name == expected_scanner_name
+
+
+def _assert_shared_zip_route(path: Path, expected_scanner_name: str) -> None:
+    _assert_scanner_for_path(path, expected_scanner_name)
+    assert core_module._select_preferred_scanner_id(str(path), "zip", path.suffix.lower()) == expected_scanner_name
+    assert _select_nested_scanner_id(str(path), header_format="zip") == expected_scanner_name
 
 
 def test_scanner_registry_contains_all_scanners():
@@ -352,6 +361,28 @@ def test_select_nested_scanner_id_does_not_route_compressed_non_target_suffix_to
 
 
 @pytest.mark.parametrize(
+    ("header_format", "suffix", "scanner_id"),
+    [
+        ("gzip", ".joblib", "joblib"),
+        ("gzip", ".rds", "r_serialized"),
+        ("tar", ".nemo", "nemo"),
+        ("cntk", ".jpg", "cntk"),
+    ],
+)
+def test_top_level_and_nested_routing_share_non_zip_content_decisions(
+    tmp_path: Path,
+    header_format: str,
+    suffix: str,
+    scanner_id: str,
+) -> None:
+    model_path = tmp_path / f"model{suffix}"
+    model_path.write_bytes(b"content-route-contract")
+
+    assert core_module._select_preferred_scanner_id(str(model_path), header_format, suffix) == scanner_id
+    assert _select_nested_scanner_id(str(model_path), header_format=header_format) == scanner_id
+
+
+@pytest.mark.parametrize(
     ("header_format", "scanner_id"),
     [
         ("pickle", "pickle"),
@@ -394,6 +425,12 @@ def test_get_scanner_for_path_preserves_zip_backed_pytorch_suffix_collision_disp
     _assert_scanner_for_path(model_path, expected_scanner_name)
 
 
+def test_get_scanner_for_path_routes_renamed_pytorch_zip_by_shared_content_contract(tmp_path: Path) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "model.jpg")
+
+    _assert_shared_zip_route(model_path, "pytorch_zip")
+
+
 @pytest.mark.parametrize(
     ("suffix", "expected_scanner_name"),
     [
@@ -422,28 +459,83 @@ def test_get_scanner_for_path_routes_raw_bin_payload_to_pytorch_binary(tmp_path:
 
 def test_get_scanner_for_path_routes_misnamed_keras_zip_by_content(tmp_path: Path) -> None:
     model_path = _write_zip_archive(
-        tmp_path / "model.zip",
+        tmp_path / "model.jpg",
         {
             "config.json": json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode("utf-8"),
             "metadata.json": json.dumps({"keras_version": "3.0.0"}).encode("utf-8"),
         },
     )
 
-    _assert_scanner_for_path(model_path, "keras_zip")
+    _assert_shared_zip_route(model_path, "keras_zip")
+
+
+def test_get_scanner_for_file_preserves_keras_lambda_analysis_for_renamed_archive(tmp_path: Path) -> None:
+    encoded_code = base64.b64encode(b"exec(\"print('malicious')\")").decode()
+    model_path = _write_zip_archive(
+        tmp_path / "lambda.jpg",
+        {
+            "config.json": json.dumps(
+                {
+                    "class_name": "Functional",
+                    "config": {
+                        "layers": [
+                            {
+                                "class_name": "Lambda",
+                                "name": "lambda_1",
+                                "config": {"function": [encoded_code, None, None], "function_type": "lambda"},
+                            }
+                        ]
+                    },
+                }
+            ).encode("utf-8"),
+            "metadata.json": json.dumps({"keras_version": "3.0.0"}).encode("utf-8"),
+        },
+    )
+
+    scanner = get_scanner_for_file(str(model_path))
+
+    assert scanner is not None
+    assert scanner.name == "keras_zip"
+    result = scanner.scan(str(model_path))
+    assert any("lambda" in issue.message.lower() for issue in result.issues)
+
+
+def test_get_scanner_for_file_preserves_keras_h5_analysis_for_renamed_model(tmp_path: Path) -> None:
+    h5py = pytest.importorskip("h5py")
+    model_path = tmp_path / "lambda-h5.jpg"
+    with h5py.File(model_path, "w") as handle:
+        handle.attrs["model_config"] = json.dumps(
+            {
+                "class_name": "Sequential",
+                "config": {
+                    "layers": [{"class_name": "Lambda", "config": {"function": "lambda x: x * 2"}}],
+                },
+            }
+        )
+        handle.attrs["keras_version"] = "3.11.2"
+
+    scanner = get_scanner_for_file(str(model_path))
+
+    assert scanner is not None
+    assert scanner.name == "keras_h5"
+    assert core_module._select_preferred_scanner_id(str(model_path), "hdf5", ".jpg") == "keras_h5"
+    assert _select_nested_scanner_id(str(model_path), header_format="hdf5") == "keras_h5"
+    result = scanner.scan(str(model_path))
+    assert any("CVE-2025-9905" in issue.message for issue in result.issues)
 
 
 def test_get_scanner_for_path_routes_generic_zip_without_keras_markers_to_zip(tmp_path: Path) -> None:
     model_path = _write_zip_archive(
-        tmp_path / "generic.zip",
+        tmp_path / "generic.jpg",
         {"config.json": json.dumps({"model_type": "bert"}).encode("utf-8")},
     )
 
-    _assert_scanner_for_path(model_path, "zip")
+    _assert_shared_zip_route(model_path, "zip")
 
 
 def test_get_scanner_for_path_routes_misnamed_skops_zip_by_schema_content(tmp_path: Path) -> None:
     model_path = _write_zip_archive(
-        tmp_path / "model.zip",
+        tmp_path / "model.jpg",
         {
             "schema.json": json.dumps(
                 {
@@ -457,12 +549,12 @@ def test_get_scanner_for_path_routes_misnamed_skops_zip_by_schema_content(tmp_pa
         },
     )
 
-    _assert_scanner_for_path(model_path, "skops")
+    _assert_shared_zip_route(model_path, "skops")
 
 
 def test_get_scanner_for_path_routes_generic_zip_without_skops_markers_to_zip(tmp_path: Path) -> None:
     model_path = _write_zip_archive(
-        tmp_path / "generic.zip",
+        tmp_path / "generic.jpg",
         {
             "schema.json": json.dumps(
                 {
@@ -475,7 +567,7 @@ def test_get_scanner_for_path_routes_generic_zip_without_skops_markers_to_zip(tm
         },
     )
 
-    _assert_scanner_for_path(model_path, "zip")
+    _assert_shared_zip_route(model_path, "zip")
 
 
 def test_get_scanner_for_file_routes_disguised_rar_by_header(tmp_path: Path) -> None:
@@ -498,9 +590,9 @@ def test_get_scanner_for_file_rejects_rar_suffix_without_magic(tmp_path: Path) -
     assert scanner is None
 
 
-def test_get_scanner_for_path_routes_valid_mar_archive_to_torchserve_mar(tmp_path: Path) -> None:
+def test_get_scanner_for_path_routes_renamed_mar_archive_to_torchserve_mar(tmp_path: Path) -> None:
     mar_path = _write_zip_archive(
-        tmp_path / "model.mar",
+        tmp_path / "model.jpg",
         {
             "MAR-INF/MANIFEST.json": json.dumps(
                 {"model": {"handler": "handler.py", "serializedFile": "model.bin"}}
@@ -510,7 +602,19 @@ def test_get_scanner_for_path_routes_valid_mar_archive_to_torchserve_mar(tmp_pat
         },
     )
 
-    _assert_scanner_for_path(mar_path, "torchserve_mar")
+    _assert_shared_zip_route(mar_path, "torchserve_mar")
+
+
+def test_get_scanner_for_path_routes_renamed_executorch_archive_by_content(tmp_path: Path) -> None:
+    model_path = _write_zip_archive(
+        tmp_path / "model.jpg",
+        {
+            "bytecode.pkl": pickle.dumps({"weights": [1, 2, 3]}),
+            "version": b"1",
+        },
+    )
+
+    _assert_shared_zip_route(model_path, "executorch")
 
 
 def test_get_scanner_for_path_routes_non_torchserve_mar_zip_to_zip(tmp_path: Path) -> None:
