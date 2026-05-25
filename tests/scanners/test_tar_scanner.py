@@ -197,6 +197,30 @@ class TestTarScanner:
         assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
 
     @pytest.mark.parametrize(
+        ("payload", "dangerous_name"),
+        [
+            (b"import pty\npty.spawn('/bin/sh')\n", "pty.spawn"),
+            (b"from pty import spawn as run\nrun('/bin/sh')\n", "pty.spawn"),
+        ],
+    )
+    def test_scan_tar_flags_pty_process_launch_python_member(
+        self, tmp_path: Path, payload: bytes, dangerous_name: str
+    ) -> None:
+        archive_path = tmp_path / "model_bundle.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].rule_code == "S111"
+        assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+    @pytest.mark.parametrize(
         "payload",
         [
             b"import os\nos.system.__call__('echo hidden')\n",
@@ -298,6 +322,7 @@ class TestTarScanner:
             b"import os\nos.__dict__.update({'spawnv': len})\nos.spawnv([])\n",
             b"import os\nsetattr(os, 'posix_spawn', len)\nos.posix_spawn([])\n",
             b"import asyncio\nasyncio.create_subprocess_shell = len\nasyncio.create_subprocess_shell([])\n",
+            b"import pty\npty.spawn = len\npty.spawn([])\n",
         ],
     )
     def test_scan_tar_allows_callable_captured_after_safe_overwrite(self, tmp_path: Path, payload: bytes) -> None:
@@ -344,6 +369,7 @@ class TestTarScanner:
                 b"import asyncio\nimport subprocess\nasyncio.create_subprocess_exec = subprocess.run\n"
                 b"asyncio.create_subprocess_exec(['id'])\n"
             ),
+            b"import pty\nimport subprocess\npty.spawn = subprocess.run\npty.spawn(['id'])\n",
         ],
     )
     def test_scan_tar_reports_dangerous_setattr_replacement(self, tmp_path: Path, payload: bytes) -> None:
@@ -1001,6 +1027,7 @@ class TestTarScanner:
                 "S103",
                 "subprocess.getstatusoutput",
             ),
+            (b"import pty\npty.spawn('/bin/sh')\n", "S111", "pty.spawn"),
             (b"import importlib\nimportlib.import_module('os')\n", "S107", "importlib.import_module"),
             (b"eval('1 + 1')\n", "S104", "eval"),
             (b"import pickle\npickle.loads(b'\\x80\\x04N.')\n", "S213", "pickle.loads"),

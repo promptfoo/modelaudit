@@ -86,6 +86,13 @@ RULE_CATALOG: tuple[RuleCatalogEntry, ...] = (
         patterns=(r"import\s+ctypes", r"from\s+ctypes\s+import", r"ctypes\."),
     ),
     RuleCatalogEntry(
+        code="S111",
+        name="pty process spawn usage",
+        severity="CRITICAL",
+        description="Pseudo-terminal process spawning via pty.spawn",
+        patterns=(r"pty\.spawn\s*\(",),
+    ),
+    RuleCatalogEntry(
         code="S115",
         name="Builtins code-execution access",
         severity="HIGH",

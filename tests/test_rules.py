@@ -41,6 +41,12 @@ class TestRuleRegistry:
         assert rule.name == "os module import"
         assert rule.default_severity == Severity.CRITICAL
 
+    def test_get_pty_spawn_rule(self) -> None:
+        rule = RuleRegistry.get_rule("S111")
+        assert rule is not None
+        assert rule.name == "pty process spawn usage"
+        assert rule.default_severity == Severity.CRITICAL
+
     def test_get_nonexistent_rule(self):
         """Test getting a rule that doesn't exist."""
         rule = RuleRegistry.get_rule("S9999")
@@ -93,6 +99,7 @@ class TestRuleRegistry:
         assert all(100 <= int(code[1:]) <= 199 for code in rules)
         assert "S101" in rules
         assert "S110" in rules
+        assert "S111" in rules
         assert "S201" not in rules  # Pickle rule, not in range
 
         # Get pickle rules (S200-S299)
@@ -469,6 +476,7 @@ class TestRulePatterns:
             ("import runpy", "S108"),
             ("import webbrowser", "S109"),
             ("import ctypes", "S110"),
+            ("pty.spawn('/bin/sh')", "S111"),
         ]
 
         for message, expected_code in test_cases:

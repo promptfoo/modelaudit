@@ -269,6 +269,48 @@ def test_scan_zip_preserves_possible_asyncio_launch_after_conditional_overwrite(
 
 
 @pytest.mark.parametrize(
+    ("source", "dangerous_name"),
+    [
+        ("import pty\npty.spawn('/bin/sh')\n", "pty.spawn"),
+        ("from pty import spawn as run\nrun('/bin/sh')\n", "pty.spawn"),
+    ],
+)
+def test_scan_zip_flags_pty_process_launch_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S111"
+    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+
+
+def test_scan_zip_preserves_possible_pty_launch_after_conditional_overwrite(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = "import pty\nif replace:\n    pty.spawn = len\npty.spawn('/bin/sh')\n"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].rule_code == "S111"
+    assert python_checks[0].details["reason"] == "high-risk calls: pty.spawn"
+
+
+@pytest.mark.parametrize(
     "source",
     [
         "import os\nos.system.__call__('echo hidden')\n",
@@ -416,6 +458,7 @@ def test_scan_zip_preserves_captured_dangerous_callable_before_overwrite(tmp_pat
         "import os\nos.__dict__.update({'spawnv': len})\nos.spawnv([])\n",
         "import os\nsetattr(os, 'posix_spawn', len)\nos.posix_spawn([])\n",
         "import asyncio\nasyncio.create_subprocess_shell = len\nasyncio.create_subprocess_shell([])\n",
+        "import pty\npty.spawn = len\npty.spawn([])\n",
     ],
 )
 def test_scan_zip_allows_callable_captured_after_safe_overwrite(tmp_path: Path, source: str) -> None:
@@ -471,6 +514,7 @@ def test_scan_zip_flags_from_import_dangerous_python_member(tmp_path: Path) -> N
             "import asyncio\nimport subprocess\nasyncio.create_subprocess_exec = subprocess.run\n"
             "asyncio.create_subprocess_exec(['id'])\n"
         ),
+        "import pty\nimport subprocess\npty.spawn = subprocess.run\npty.spawn(['id'])\n",
     ],
 )
 def test_scan_zip_reports_dangerous_setattr_replacement(tmp_path: Path, source: str) -> None:
@@ -1284,6 +1328,7 @@ def test_scan_zip_ignores_benign_python_file_operations(tmp_path: Path) -> None:
         ("import subprocess\nsubprocess.run(['echo'], check=False)\n", "S103", "subprocess.run"),
         ("import subprocess\nsubprocess.getoutput('echo hidden')\n", "S103", "subprocess.getoutput"),
         ("import subprocess\nsubprocess.getstatusoutput('echo hidden')\n", "S103", "subprocess.getstatusoutput"),
+        ("import pty\npty.spawn('/bin/sh')\n", "S111", "pty.spawn"),
         ("import importlib\nimportlib.import_module('os')\n", "S107", "importlib.import_module"),
         ("eval('1 + 1')\n", "S104", "eval"),
         ("import pickle\npickle.loads(b'\\x80\\x04N.')\n", "S213", "pickle.loads"),

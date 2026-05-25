@@ -1040,6 +1040,7 @@ def test_pytorch_zip_scans_unmarked_python_blobs_in_archive_data(tmp_path: Path)
         b"def payload():\n    return os.posix_spawn('/bin/sh', ['sh'], {})\n",
         b"def payload():\n    return os.posix_spawnp('sh', ['sh'], {})\n",
         b"def payload():\n    return os.startfile('payload.exe')\n",
+        b"def payload():\n    from os import spawnv as run\n    return run(0, '/bin/sh', ['sh'])\n",
     ],
 )
 def test_pytorch_zip_scans_unmarked_os_process_launch_in_archive_data(tmp_path: Path, payload: bytes) -> None:
@@ -1091,6 +1092,7 @@ def test_pytorch_zip_ignores_certain_replaced_os_process_launch_in_archive_data(
         b"def payload():\n    return subprocess.check_call(['id'])\n",
         b"def payload():\n    return subprocess.getoutput('id')\n",
         b"def payload():\n    return subprocess.getstatusoutput('id')\n",
+        b"def payload():\n    from subprocess import check_call as run\n    return run(['id'])\n",
     ],
 )
 def test_pytorch_zip_scans_unmarked_subprocess_launch_in_archive_data(tmp_path: Path, payload: bytes) -> None:
@@ -1145,6 +1147,7 @@ def test_pytorch_zip_ignores_nonexecuting_or_replaced_subprocess_launch_in_archi
     [
         b"async def payload():\n    return await asyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
         b"async def payload():\n    return await asyncio.create_subprocess_shell('id')\n",
+        (b"async def payload():\n    from asyncio import create_subprocess_shell as run\n    return await run('id')\n"),
     ],
 )
 def test_pytorch_zip_scans_unmarked_asyncio_process_launch_in_archive_data(tmp_path: Path, payload: bytes) -> None:
@@ -1186,6 +1189,50 @@ def test_pytorch_zip_ignores_certain_replaced_asyncio_process_launch_in_archive_
     tmp_path: Path, payload: bytes
 ) -> None:
     zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    assert not any(
+        check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"def payload():\n    return pty.spawn('/bin/sh')\n",
+        b"def payload():\n    from pty import spawn as run\n    return run('/bin/sh')\n",
+    ],
+)
+def test_pytorch_zip_scans_unmarked_pty_process_launch_in_archive_data(tmp_path: Path, payload: bytes) -> None:
+    zip_path = tmp_path / "model.pt"
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        zipf.writestr("archive/version", "3")
+        zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))
+        zipf.writestr("archive/data/payload.bin", payload)
+
+    result = PyTorchZipScanner().scan(str(zip_path))
+
+    jit_failures = [
+        check
+        for check in result.checks
+        if check.name == "JIT/Script Code Execution Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert any(
+        check.location == f"{zip_path}:archive/data/payload.bin"
+        and "Pseudo-terminal process execution detected" in check.message
+        for check in jit_failures
+    )
+
+
+def test_pytorch_zip_ignores_certain_replaced_pty_process_launch_in_archive_data(tmp_path: Path) -> None:
+    zip_path = tmp_path / "model.pt"
+    payload = b"def payload():\n    pty.spawn = len\n    return pty.spawn([])\n"
     with zipfile.ZipFile(zip_path, "w") as zipf:
         zipf.writestr("archive/version", "3")
         zipf.writestr("archive/data.pkl", pickle.dumps({"weights": [1, 2, 3]}))

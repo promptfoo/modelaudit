@@ -242,6 +242,7 @@ class TestJITScriptDetector:
             b"def payload():\n    return os.posix_spawn('/bin/sh', ['sh'], {})\n",
             b"def payload():\n    return os.posix_spawnp('sh', ['sh'], {})\n",
             b"def payload():\n    return os.startfile('payload.exe')\n",
+            b"def payload():\n    from os import spawnv as run\n    return run(0, '/bin/sh', ['sh'])\n",
         ],
     )
     def test_scan_model_detects_unmarked_os_process_launch(self, source: bytes) -> None:
@@ -289,6 +290,7 @@ class TestJITScriptDetector:
             b"def payload():\n    return subprocess.check_call(['id'])\n",
             b"def payload():\n    return subprocess.getoutput('id')\n",
             b"def payload():\n    return subprocess.getstatusoutput('id')\n",
+            b"def payload():\n    from subprocess import check_call as run\n    return run(['id'])\n",
         ],
     )
     def test_scan_model_detects_unmarked_subprocess_process_launch(self, source: bytes) -> None:
@@ -335,6 +337,10 @@ class TestJITScriptDetector:
         [
             b"async def payload():\n    return await asyncio.create_subprocess_exec('/bin/sh', '-c', 'id')\n",
             b"async def payload():\n    return await asyncio.create_subprocess_shell('id')\n",
+            (
+                b"async def payload():\n    from asyncio import create_subprocess_shell as run\n"
+                b"    return await run('id')\n"
+            ),
         ],
     )
     def test_scan_model_detects_unmarked_asyncio_process_launch(self, source: bytes) -> None:
@@ -371,6 +377,42 @@ class TestJITScriptDetector:
 
         assert any(
             f.type == "code_execution_pattern" and f.pattern == "Subprocess execution detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            b"def payload():\n    return pty.spawn('/bin/sh')\n",
+            b"def payload():\n    from pty import spawn as run\n    return run('/bin/sh')\n",
+        ],
+    )
+    def test_scan_model_detects_unmarked_pty_process_launch(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Pseudo-terminal process execution detected"
+            for f in findings
+        )
+
+    def test_scan_model_ignores_certain_replaced_pty_process_launch(self) -> None:
+        detector = JITScriptDetector()
+        source = b"def payload():\n    pty.spawn = len\n    return pty.spawn([])\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
+    def test_scan_model_preserves_possible_pty_launch_after_conditional_replacement(self) -> None:
+        detector = JITScriptDetector()
+        source = b"def payload():\n    if replace:\n        pty.spawn = len\n    return pty.spawn('/bin/sh')\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Pseudo-terminal process execution detected"
+            for f in findings
         )
 
     @pytest.mark.parametrize(

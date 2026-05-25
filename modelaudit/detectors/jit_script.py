@@ -153,20 +153,22 @@ def _resolve_alias_aware_dangerous_builtins(tree: ast.AST) -> set[str]:
     return dangerous_builtins
 
 
-def _resolve_alias_aware_process_calls(tree: ast.AST) -> tuple[set[str], set[str]]:
-    """Return OS and subprocess process launches reached through static resolution."""
+def _resolve_alias_aware_process_calls(tree: ast.AST) -> tuple[set[str], set[str], set[str]]:
+    """Return OS, subprocess, and pseudo-terminal launches reached through static resolution."""
     from modelaudit.scanners.archive_member_security import high_risk_python_calls_in_tree
 
     calls = high_risk_python_calls_in_tree(tree)
     return (
         {call.name for call in calls if call.rule_code == "S101"},
         {call.name for call in calls if call.rule_code == "S103"},
+        {call.name for call in calls if call.rule_code == "S111"},
     )
 
 
 # Patterns that indicate code execution attempts
 _SUBPROCESS_CODE_EXECUTION_DESCRIPTION = "Subprocess execution detected"
 _OS_CODE_EXECUTION_DESCRIPTION = "OS command execution detected"
+_PTY_CODE_EXECUTION_DESCRIPTION = "Pseudo-terminal process execution detected"
 CODE_EXECUTION_PATTERNS = [
     # Direct execution patterns
     (rb"exec\s*\(", "exec() call detected"),
@@ -180,6 +182,7 @@ CODE_EXECUTION_PATTERNS = [
     ),
     (rb"asyncio\.create_subprocess_(?:exec|shell)", _SUBPROCESS_CODE_EXECUTION_DESCRIPTION),
     (rb"os\.(system|popen|exec\w*|spawn\w*|posix_spawnp?|startfile)", _OS_CODE_EXECUTION_DESCRIPTION),
+    (rb"pty\.spawn", _PTY_CODE_EXECUTION_DESCRIPTION),
     # Network patterns
     (rb"socket\.(socket|create_connection)", "Socket creation detected"),
     (rb"urllib\.(request|urlopen)", "URL request detected"),
@@ -243,8 +246,8 @@ class JITScriptDetector:
         """Return whether parsed Python contains modeled dangerous operations."""
         if _resolve_alias_aware_dangerous_builtins(tree):
             return True
-        os_process_calls, subprocess_calls = _resolve_alias_aware_process_calls(tree)
-        if os_process_calls or subprocess_calls:
+        os_process_calls, subprocess_calls, pty_process_calls = _resolve_alias_aware_process_calls(tree)
+        if os_process_calls or subprocess_calls or pty_process_calls:
             return True
 
         def is_dangerous_import(module_name: str) -> bool:
@@ -568,10 +571,13 @@ class JITScriptDetector:
         bounded_dangerous_builtins: set[str] | None = None
         bounded_os_process_calls: set[str] | None = None
         bounded_subprocess_calls: set[str] | None = None
+        bounded_pty_process_calls: set[str] | None = None
         try:
             bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
             bounded_dangerous_builtins = _resolve_alias_aware_dangerous_builtins(bounded_tree)
-            bounded_os_process_calls, bounded_subprocess_calls = _resolve_alias_aware_process_calls(bounded_tree)
+            bounded_os_process_calls, bounded_subprocess_calls, bounded_pty_process_calls = (
+                _resolve_alias_aware_process_calls(bounded_tree)
+            )
         except (SyntaxError, UnicodeDecodeError, ValueError):
             pass
 
@@ -635,6 +641,24 @@ class JITScriptDetector:
                 # Failed to process this code snippet
                 continue
 
+        def add_code_execution_pattern_finding(description: str) -> None:
+            findings.append(
+                create_jit_finding(
+                    message=description,
+                    severity="CRITICAL",
+                    context=context,
+                    pattern=description,
+                    recommendation="This pattern indicates potential code execution - review carefully",
+                    confidence=0.8,
+                    framework=framework,
+                    code_snippet=None,
+                    type="code_execution_pattern",
+                    operation=None,
+                    builtin=None,
+                    import_=None,
+                )
+            )
+
         # Check for common code execution patterns in binary
         for pattern, description in CODE_EXECUTION_PATTERNS:
             builtin_name = _BUILTIN_CODE_EXECUTION_PATTERN_NAMES.get(description)
@@ -656,23 +680,24 @@ class JITScriptDetector:
                 and not bounded_os_process_calls
             ):
                 continue
+            if (
+                description == _PTY_CODE_EXECUTION_DESCRIPTION
+                and bounded_pty_process_calls is not None
+                and not bounded_pty_process_calls
+            ):
+                continue
             if re.search(pattern, bounded):  # Limit search size
-                findings.append(
-                    create_jit_finding(
-                        message=description,
-                        severity="CRITICAL",
-                        context=context,
-                        pattern=description,
-                        recommendation="This pattern indicates potential code execution - review carefully",
-                        confidence=0.8,
-                        framework=framework,
-                        code_snippet=None,
-                        type="code_execution_pattern",
-                        operation=None,
-                        builtin=None,
-                        import_=None,
-                    )
-                )
+                add_code_execution_pattern_finding(description)
+
+        reported_patterns = {finding.pattern for finding in findings if finding.type == "code_execution_pattern"}
+        for calls, description in (
+            (bounded_os_process_calls, _OS_CODE_EXECUTION_DESCRIPTION),
+            (bounded_subprocess_calls, _SUBPROCESS_CODE_EXECUTION_DESCRIPTION),
+            (bounded_pty_process_calls, _PTY_CODE_EXECUTION_DESCRIPTION),
+        ):
+            if calls and description not in reported_patterns:
+                add_code_execution_pattern_finding(description)
+                reported_patterns.add(description)
 
         return findings
 
