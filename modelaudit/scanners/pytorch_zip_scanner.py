@@ -22,7 +22,7 @@ from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTE
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
-from .archive_member_security import is_executable_archive_member_name
+from .archive_member_security import has_executable_archive_member_signature, is_executable_archive_member_name
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 from .picklescan_adapter import apply_pickle_member_context
@@ -1621,6 +1621,7 @@ class PyTorchZipScanner(BaseScanner):
         """Detect suspicious non-pickle files in the archive"""
         python_files_found = False
         executable_files_found = False
+        executable_probe_failures: list[dict[str, str]] = []
         member_names = {self._get_zip_member_name(entry).replace("\\", "/").lstrip("/") for entry in safe_entries}
         entries_by_normalized_name = {
             self._get_zip_member_name(entry).replace("\\", "/").lstrip("/"): entry for entry in safe_entries
@@ -1650,17 +1651,53 @@ class PyTorchZipScanner(BaseScanner):
                     details={"file": name},
                 )
                 python_files_found = True
-            # Check for shell scripts or other executable files
-            elif is_executable_archive_member_name(normalized_name_lower):
-                result.add_check(
-                    name="Executable File Detection",
-                    passed=False,
-                    message=f"Executable file found in PyTorch model: {name}",
-                    severity=IssueSeverity.CRITICAL,
-                    location=f"{path}:{name}",
-                    details={"file": name},
-                )
-                executable_files_found = True
+            else:
+                executable_by_name = is_executable_archive_member_name(normalized_name_lower)
+                executable_by_content = False
+                # Raw numbered tensor storage members are arbitrary bytes
+                # rather than loadable files, so content signatures there are
+                # not executable evidence.
+                if not executable_by_name and not _PYTORCH_STORAGE_BLOB_MEMBER_PATTERN.match(normalized_name):
+                    try:
+                        executable_by_content = self._has_executable_member_signature(zip_file, entry, result)
+                    except Exception as exc:
+                        executable_probe_failures.append(
+                            {
+                                "zip_entry": name,
+                                "exception": str(exc),
+                                "exception_type": type(exc).__name__,
+                            }
+                        )
+                        continue
+
+                if executable_by_name or executable_by_content:
+                    result.add_check(
+                        name="Executable File Detection",
+                        passed=False,
+                        message=f"Executable file found in PyTorch model: {name}",
+                        severity=IssueSeverity.CRITICAL,
+                        location=f"{path}:{name}",
+                        details={"file": name},
+                    )
+                    executable_files_found = True
+
+        if executable_probe_failures:
+            mark_inconclusive_scan_result(result, "pytorch_zip_executable_member_probe_failed")
+            result.add_check(
+                name="Executable Content Probe",
+                passed=False,
+                message=(
+                    f"{len(executable_probe_failures)} PyTorch ZIP member(s) could not be analyzed "
+                    "for hidden executable content"
+                ),
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "entries": executable_probe_failures,
+                    "failed_count": len(executable_probe_failures),
+                    "analysis_incomplete": True,
+                },
+            )
 
         # Add positive checks if no suspicious files found
         if not python_files_found and safe_entries:
@@ -1671,13 +1708,30 @@ class PyTorchZipScanner(BaseScanner):
                 location=path,
             )
 
-        if not executable_files_found and safe_entries:
+        if not executable_files_found and safe_entries and not executable_probe_failures:
             result.add_check(
                 name="Executable File Detection",
                 passed=True,
                 message="No executable files found in model",
                 location=path,
             )
+
+    def _has_executable_member_signature(
+        self,
+        zip_file: zipfile.ZipFile,
+        entry: zipfile.ZipInfo,
+        result: ScanResult,
+    ) -> bool:
+        """Inspect a member for strong executable bytes through bounded reads."""
+        return has_executable_archive_member_signature(
+            lambda limit: self._read_member_prefix(
+                zip_file,
+                entry,
+                limit,
+                phase="executable member content probe",
+                result=result,
+            )
+        )
 
     def _validate_pytorch_structure(self, pickle_files: list[zipfile.ZipInfo], result: ScanResult) -> None:
         """Validate that the PyTorch model has expected structure"""
