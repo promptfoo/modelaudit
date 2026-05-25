@@ -53,7 +53,9 @@ _ONNX_MODEL_TOP_LEVEL_TAG_START_BYTES = frozenset(
         0x72,  # metadata_props
     }
 )
-_COREML_PROTO_PREFIX_WIRE_TYPES = frozenset({0, 1, 2, 5})
+_COREML_PROTO_PREFIX_WIRE_TYPES = frozenset({0, 1, 2, 3, 5})
+_COREML_MAX_DESCRIPTION_PREFIX_FIELDS = 512
+_COREML_MAX_MODEL_PREFIX_FIELDS = 10000
 _COREML_MODEL_TYPE_FIELDS = frozenset(
     {
         200,
@@ -382,6 +384,51 @@ def _skip_proto_value(data: bytes, offset: int, wire_type: int, end: int | None 
     return None
 
 
+def _skip_coreml_proto_group(
+    data: bytes,
+    offset: int,
+    start_field_number: int,
+    *,
+    remaining_fields: int,
+    end: int | None = None,
+) -> tuple[int, int] | None:
+    """Skip a well-formed unknown CoreML protobuf group within a field budget."""
+    limit = len(data) if end is None else min(end, len(data))
+    group_stack = [start_field_number]
+    fields_seen = 0
+
+    while group_stack and offset < limit and fields_seen < remaining_fields:
+        tag_result = _read_proto_varint(data, offset, limit)
+        if tag_result is None:
+            return None
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return None
+
+        fields_seen += 1
+        if wire_type == 3:
+            group_stack.append(field_number)
+            offset = value_offset
+            continue
+        if wire_type == 4:
+            if field_number != group_stack[-1]:
+                return None
+            group_stack.pop()
+            offset = value_offset
+            continue
+
+        next_offset = _skip_proto_value(data, value_offset, wire_type, limit)
+        if next_offset is None:
+            return None
+        offset = next_offset
+
+    if group_stack:
+        return None
+    return offset, fields_seen
+
+
 def _looks_like_onnx_node_proto_prefix(data: bytes) -> bool:
     """Return True when a bounded prefix resembles an ONNX NodeProto."""
     offset = 0
@@ -533,7 +580,7 @@ def _looks_like_coreml_description_proto_prefix(data: bytes) -> bool:
     """Return True when a bounded prefix resembles a CoreML ModelDescription."""
     offset = 0
     fields_seen = 0
-    while offset < len(data) and fields_seen < 512:
+    while offset < len(data) and fields_seen < _COREML_MAX_DESCRIPTION_PREFIX_FIELDS:
         tag_result = _read_proto_varint(data, offset)
         if tag_result is None:
             return False
@@ -546,10 +593,22 @@ def _looks_like_coreml_description_proto_prefix(data: bytes) -> bool:
         if wire_type == 2 and field_number in _COREML_DESCRIPTION_FIELD_HINTS:
             return True
 
-        next_offset = _skip_proto_value(data, value_offset, wire_type)
-        if next_offset is None:
-            return False
-        offset = next_offset
+        if wire_type == 3:
+            group_result = _skip_coreml_proto_group(
+                data,
+                value_offset,
+                field_number,
+                remaining_fields=_COREML_MAX_DESCRIPTION_PREFIX_FIELDS - fields_seen - 1,
+            )
+            if group_result is None:
+                return False
+            offset, group_fields_seen = group_result
+            fields_seen += group_fields_seen
+        else:
+            next_offset = _skip_proto_value(data, value_offset, wire_type)
+            if next_offset is None:
+                return False
+            offset = next_offset
         fields_seen += 1
 
     return False
@@ -574,7 +633,7 @@ def _looks_like_coreml_model_proto_prefix(data: bytes) -> bool:
     has_specification_version = False
     has_description = False
     has_model_type = False
-    while offset < len(data) and fields_seen < 10000:
+    while offset < len(data) and fields_seen < _COREML_MAX_MODEL_PREFIX_FIELDS:
         tag_result = _read_proto_varint(data, offset)
         if tag_result is None:
             break
@@ -602,6 +661,17 @@ def _looks_like_coreml_model_proto_prefix(data: bytes) -> bool:
             elif field_number in _COREML_MODEL_TYPE_FIELDS:
                 has_model_type = True
             offset = actual_value_end
+        elif wire_type == 3:
+            group_result = _skip_coreml_proto_group(
+                data,
+                value_offset,
+                field_number,
+                remaining_fields=_COREML_MAX_MODEL_PREFIX_FIELDS - fields_seen - 1,
+            )
+            if group_result is None:
+                break
+            offset, group_fields_seen = group_result
+            fields_seen += group_fields_seen
         else:
             next_offset = _skip_proto_value(data, value_offset, wire_type)
             if next_offset is None:

