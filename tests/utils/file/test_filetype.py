@@ -15,6 +15,7 @@ import pytest
 
 from modelaudit.scanner_registry_metadata import get_extension_format_map
 from modelaudit.utils.file.detection import (
+    MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     PROTO0_1_MAX_PROBE_BYTES,
     detect_file_format,
     detect_file_format_for_skip_filter,
@@ -316,6 +317,36 @@ def test_detect_file_format_routes_renamed_mxnet_symbol_and_rejects_near_match(t
     assert detect_file_format(str(near_match)) == "unknown"
     assert detect_file_format_from_magic(str(near_match)) == "unknown"
     assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+
+
+def test_detect_file_format_routes_renamed_mxnet_after_leading_whitespace(tmp_path: Path) -> None:
+    model_path = tmp_path / "whitespace.jpg"
+    model_path.write_text(
+        (" " * 1024) + '{"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "mxnet"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "mxnet"
+
+
+def test_detect_oversized_renamed_mxnet_requires_top_level_graph_contract(tmp_path: Path) -> None:
+    padding = "x" * (MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
+    delayed_nodes = tmp_path / "delayed-nodes.jpg"
+    delayed_nodes.write_text(
+        '{"arg_nodes":[0],"heads":[[0,0,0]],"nodes":[{"attrs":"' + padding + '","op":"Custom","name":"load"}]}',
+        encoding="utf-8",
+    )
+    unrelated = tmp_path / "unrelated.jpg"
+    unrelated.write_text(
+        '{"nodes":[],"op":"Custom","name":"load","attrs":"' + padding + '"}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(delayed_nodes)) == "mxnet"
+    assert detect_file_format_for_skip_filter(str(delayed_nodes)) == "mxnet"
+    assert detect_file_format(str(unrelated)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(unrelated)) == "unknown"
 
 
 def test_detect_r_serialized_magic_headers(tmp_path: Path) -> None:

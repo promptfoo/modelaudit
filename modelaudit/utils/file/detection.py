@@ -124,7 +124,6 @@ _XML_MODEL_ROOT_FORMATS = {
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
 MXNET_SYMBOL_SIGNATURE_READ_BYTES = 10 * 1024 * 1024
 _MXNET_SYMBOL_REQUIRED_MARKERS = (b'"nodes"', b'"arg_nodes"', b'"heads"')
-_MXNET_SYMBOL_PREFIX_NODE_MARKERS = (b'"nodes"', b'"op"', b'"name"')
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -265,16 +264,14 @@ def is_mxnet_symbol_graph_file(path: str | Path) -> bool:
 
         read_size = min(file_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
         with file_path.open("rb") as handle:
-            prefix = handle.read(min(read_size, _TAR_BLOCK_SIZE))
+            prefix = handle.read(read_size)
             if not prefix.lstrip().startswith(b"{"):
                 return False
-            if len(prefix) < read_size:
-                prefix += handle.read(read_size - len(prefix))
     except OSError:
         return False
 
     if file_size > MXNET_SYMBOL_SIGNATURE_READ_BYTES:
-        return all(marker in prefix for marker in _MXNET_SYMBOL_PREFIX_NODE_MARKERS)
+        return all(marker in prefix for marker in _MXNET_SYMBOL_REQUIRED_MARKERS)
     if not all(marker in prefix for marker in _MXNET_SYMBOL_REQUIRED_MARKERS):
         return False
 
@@ -287,7 +284,8 @@ def is_mxnet_symbol_graph_file(path: str | Path) -> bool:
 
 def _could_be_renamed_mxnet_symbol(file_path: Path, prefix: bytes) -> bool:
     """Return whether content-based MXNet routing is needed for this path."""
-    return file_path.suffix.lower() != ".json" and prefix.lstrip().startswith(b"{")
+    trimmed_prefix = prefix.lstrip()
+    return file_path.suffix.lower() != ".json" and (trimmed_prefix.startswith(b"{") or not trimmed_prefix)
 
 
 _MIN_BINARY_PICKLE_PROTOCOL = 1
