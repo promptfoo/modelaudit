@@ -1889,6 +1889,12 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if format_result != "unknown":
             return format_result
 
+        cntk_probe_size = min(size, _CNTK_SIGNATURE_READ_BYTES)
+        if len(prefix) < cntk_probe_size:
+            prefix += f.read(cntk_probe_size - len(prefix))
+        if _is_cntk_signature(prefix):
+            return "cntk"
+
         lightgbm_probe_size = min(size, _LIGHTGBM_SIGNATURE_READ_BYTES)
         if len(prefix) < lightgbm_probe_size:
             prefix += f.read(lightgbm_probe_size - len(prefix))
@@ -1963,6 +1969,11 @@ def detect_file_format(path: str) -> str:
 
     if magic8.startswith(b"\x93NUMPY"):
         return "numpy"
+
+    cntk_prefix = read_magic_bytes(path, _CNTK_SIGNATURE_READ_BYTES)
+    if _is_cntk_signature(cntk_prefix):
+        return "cntk"
+
     if _looks_like_onnx_model_candidate_file(file_path, size):
         return "onnx"
     if _looks_like_coreml_model_candidate_file(file_path, size, magic4):
@@ -2032,6 +2043,11 @@ def detect_file_format(path: str) -> str:
     renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
     if renamed_tensorflow_format != "unknown":
         return renamed_tensorflow_format
+
+    lightgbm_prefix = read_magic_bytes(path, _LIGHTGBM_SIGNATURE_READ_BYTES)
+    if _is_lightgbm_signature(lightgbm_prefix):
+        return "lightgbm"
+
     if _has_budget_exhausted_protobuf_model_candidate(file_path, size) and detect_format_from_extension(path) in {
         "unknown",
         "protobuf",

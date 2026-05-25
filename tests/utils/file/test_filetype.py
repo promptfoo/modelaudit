@@ -71,6 +71,19 @@ def _build_tf_savedmodel_bytes() -> bytes:
     return cast(bytes, saved_model.SerializeToString())
 
 
+def _build_cntkv2_bytes(*, include_structure: bool = True) -> bytes:
+    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+    structure = b" CompositeFunction primitive_functions " if include_structure else b""
+    return prefix + structure + b" inputs outputs "
+
+
+def _build_lightgbm_text(*, include_tree_details: bool = True) -> bytes:
+    lines = ["tree", "version=v4", "num_class=1", "num_tree_per_iteration=1", "max_feature_idx=2"]
+    if include_tree_details:
+        lines.extend(["Tree=0", "num_leaves=2", "split_feature=0", "leaf_value=0.1 0.2"])
+    return ("\n".join(lines) + "\n").encode()
+
+
 def test_detect_file_format_directory(tmp_path):
     """Test detecting a directory format."""
     # Create a regular directory
@@ -277,6 +290,36 @@ def test_detect_file_format_routes_renamed_coreml_structure_and_rejects_near_mat
         assert detect_file_format(str(rejected_path)) == "unknown"
         assert detect_file_format_from_magic(str(rejected_path)) == "unknown"
         assert detect_file_format_for_skip_filter(str(rejected_path)) == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("format_name", "payload"),
+    [("cntk", _build_cntkv2_bytes()), ("lightgbm", _build_lightgbm_text())],
+)
+def test_detect_file_format_routes_renamed_strict_signature_formats(
+    tmp_path: Path,
+    format_name: str,
+    payload: bytes,
+) -> None:
+    model_path = tmp_path / f"{format_name}.jpg"
+    model_path.write_bytes(payload)
+
+    assert detect_file_format_from_magic(str(model_path)) == format_name
+    assert detect_file_format_for_skip_filter(str(model_path)) == format_name
+    assert detect_file_format(str(model_path)) == format_name
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [_build_cntkv2_bytes(include_structure=False), _build_lightgbm_text(include_tree_details=False)],
+)
+def test_detect_file_format_rejects_renamed_signature_near_matches(tmp_path: Path, payload: bytes) -> None:
+    model_path = tmp_path / "near-match.jpg"
+    model_path.write_bytes(payload)
+
+    assert detect_file_format_from_magic(str(model_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "unknown"
+    assert detect_file_format(str(model_path)) == "unknown"
 
 
 @pytest.mark.parametrize(

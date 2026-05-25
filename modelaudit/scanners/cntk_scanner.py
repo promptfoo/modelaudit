@@ -15,16 +15,15 @@ from .base import BaseScanner, IssueSeverity, ScanResult
 # 2) CNTKv2 protobuf artifacts include protobuf key markers for "version" and
 #    "uid", typically alongside structure keys like "CompositeFunction" and
 #    "primitive_functions".
-# 3) ".model" is intentionally excluded from v1 scanner ownership because it
-#    overlaps with XGBoost's ".model" extension in this codebase.
+# 3) Strict content markers disambiguate CNTK from formats that share common
+#    extensions such as XGBoost's ".model".
 DISCOVERY_ASSUMPTIONS = [
     "Legacy CNTK marker uses UTF-16LE BCN/BVersion section headers.",
     "CNTKv2 artifacts expose protobuf key markers for version/uid and graph structure fields.",
-    "The .model extension is excluded in v1 to avoid ambiguity with XGBoost .model files.",
+    "Strict content markers permit CNTK ownership independently of a file extension.",
 ]
 
 _CNTK_SUPPORTED_EXTENSIONS = frozenset({".dnn", ".cmf"})
-_CNTK_CANDIDATE_EXTENSIONS = frozenset({".dnn", ".cmf", ".model"})
 
 _MAX_SIGNATURE_BYTES = 4096
 _MAX_SCAN_BYTES = 10 * 1024 * 1024  # 10MB parser budget per file
@@ -124,18 +123,13 @@ def _has_cntkv2_structure_markers(prefix: bytes) -> bool:
     return any(marker in prefix for marker in _CNTK_V2_STRUCTURE_MARKERS)
 
 
-def _detect_cntk_variant(prefix: bytes, extension: str) -> tuple[str, str]:
-    if extension not in _CNTK_CANDIDATE_EXTENSIONS:
-        return "not_cntk", "extension_not_cntk_candidate"
-
+def _detect_cntk_variant(prefix: bytes) -> tuple[str, str]:
     if prefix.startswith(_CNTK_LEGACY_MAGIC):
         if _CNTK_LEGACY_VERSION_MARKER in prefix:
             return "legacy_v1", "legacy_bcn_and_bversion_markers"
         return "unsupported_cntk_variant", "legacy_marker_without_bversion_marker"
 
     if _has_cntkv2_core_markers(prefix):
-        if extension == ".model":
-            return "unsupported_cntk_variant", "cntkv2_model_extension_deferred_v1"
         if _has_cntkv2_structure_markers(prefix):
             return "cntk_v2", "protobuf_core_and_structure_markers"
         return "unsupported_cntk_variant", "protobuf_core_markers_without_structure_markers"
@@ -267,7 +261,7 @@ class CntkScanner(BaseScanner):
     """Scanner for CNTK model files with strict format detection."""
 
     name = "cntk"
-    description = "Scans CNTK .dnn/.cmf model artifacts for load-time execution indicators"
+    description = "Scans signature-confirmed CNTK model artifacts for load-time execution indicators"
     supported_extensions: ClassVar[list[str]] = [".dnn", ".cmf"]
 
     @classmethod
@@ -275,12 +269,8 @@ class CntkScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        extension = os.path.splitext(path)[1].lower()
-        if extension not in _CNTK_SUPPORTED_EXTENSIONS:
-            return False
-
         prefix = _read_prefix(path)
-        variant, _reason = _detect_cntk_variant(prefix, extension)
+        variant, _reason = _detect_cntk_variant(prefix)
         return variant in {"legacy_v1", "cntk_v2"}
 
     def scan(self, path: str) -> ScanResult:
@@ -297,9 +287,8 @@ class CntkScanner(BaseScanner):
         result.metadata["scan_byte_limit"] = _MAX_SCAN_BYTES
         result.metadata["discovery_assumptions"] = DISCOVERY_ASSUMPTIONS
 
-        extension = os.path.splitext(path)[1].lower()
         signature_prefix = _read_prefix(path)
-        variant, variant_reason = _detect_cntk_variant(signature_prefix, extension)
+        variant, variant_reason = _detect_cntk_variant(signature_prefix)
         result.metadata["cntk_variant"] = variant
         result.metadata["variant_reason"] = variant_reason
         result.metadata["signature_prefix_bytes"] = min(len(signature_prefix), _MAX_SIGNATURE_BYTES)
@@ -310,7 +299,7 @@ class CntkScanner(BaseScanner):
                 passed=False,
                 message=(
                     "Unsupported or out-of-scope CNTK variant detected. "
-                    "Current scanner supports only signature-backed .dnn/.cmf variants."
+                    "Current scanner supports only variants with strict CNTK content signatures."
                 ),
                 severity=IssueSeverity.INFO,
                 location=path,
