@@ -1221,6 +1221,15 @@ def _is_torch7_signature(prefix: bytes) -> bool:
     return has_torch_marker and has_structure_marker
 
 
+def has_structural_torch7_signature(path: str) -> bool:
+    """Return whether a file contains an explicit serialized Torch7 object signature."""
+    try:
+        prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
+    except OSError:
+        return False
+    return prefix.startswith(b"T7\x00\x00") or _has_torch7_ascii_object_signature(prefix)
+
+
 def is_torch7_suffix_override_candidate(path: str) -> bool:
     """Return whether suffix dispatch may be safely overridden by Torch7."""
     try:

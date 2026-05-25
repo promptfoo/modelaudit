@@ -1019,6 +1019,41 @@ def test_scan_file_preserves_zip_findings_in_llamafile_polyglot(tmp_path: Path, 
     _assert_system_pickle_detected(result, "payload.pkl")
 
 
+def test_scan_file_preserves_torch7_findings_in_llamafile_polyglot(tmp_path: Path) -> None:
+    polyglot = tmp_path / "payload.jpg"
+    polyglot.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"llamafile runtime\n"
+        + b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
+        + b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+        + b"cmd = os.execute('id')\n"
+    )
+
+    result = scan_file(str(polyglot), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "llamafile"
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.WARNING
+        for check in result.checks
+    )
+
+
+def test_scan_file_does_not_merge_torch7_for_llamafile_text_near_match(tmp_path: Path) -> None:
+    executable = tmp_path / "payload.jpg"
+    executable.write_bytes(
+        b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime includes torch tensor metadata\n"
+    )
+
+    result = scan_file(str(executable), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "llamafile"
+    assert not any(check.name.startswith("Torch7 ") for check in result.checks)
+
+
 @pytest.mark.parametrize("container_kind", ["pytorch", "executorch", "skops"])
 def test_scan_file_preserves_subtype_zip_findings_in_llamafile_polyglot(
     tmp_path: Path,

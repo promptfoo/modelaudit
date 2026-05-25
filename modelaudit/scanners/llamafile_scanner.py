@@ -9,10 +9,12 @@ import tempfile
 from pathlib import Path
 from typing import Any, ClassVar
 
+from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from ..utils.file.detection import (
     LLAMAFILE_MARKER,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    has_structural_torch7_signature,
     is_llamafile_executable,
 )
 from ._evidence_redaction import redact_evidence_string
@@ -233,7 +235,7 @@ class LlamafileScanner(BaseScanner):
                     "scan_outcome_reason": LLAMAFILE_RUNTIME_PREVIEW_READ_REASON,
                 },
             )
-            self._merge_container_findings(path_obj, result)
+            self._merge_polyglot_findings(path_obj, result)
             result.finish(success=False)
             return result
 
@@ -242,7 +244,7 @@ class LlamafileScanner(BaseScanner):
 
         payload_bytes_scanned = self._scan_embedded_payload(path_obj, result)
         result.bytes_scanned += payload_bytes_scanned
-        self._merge_container_findings(path_obj, result)
+        self._merge_polyglot_findings(path_obj, result)
 
         result.finish(
             success=not result.has_errors and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
@@ -442,8 +444,23 @@ class LlamafileScanner(BaseScanner):
         if reason not in reasons:
             reasons.append(reason)
 
-    def _merge_container_findings(self, path: Path, result: ScanResult) -> None:
-        """Preserve trusted container coverage for executable ZIP polyglots."""
+    def _merge_polyglot_findings(self, path: Path, result: ScanResult) -> None:
+        """Preserve trusted secondary-format coverage for executable polyglots."""
+        if has_structural_torch7_signature(str(path)):
+            from .torch7_scanner import Torch7Scanner
+
+            scanner_selection = policy_from_config(self.config)
+            if scanner_selection.allows("torch7"):
+                result.merge(Torch7Scanner(config=self.config).scan(str(path)))
+            else:
+                add_scanner_selection_skip_check(
+                    result,
+                    str(path),
+                    "torch7",
+                    scanner_selection,
+                    context="embedded Llamafile/Torch7 polyglot analysis",
+                )
+
         merge_executable_zip_container_findings(
             str(path),
             result,

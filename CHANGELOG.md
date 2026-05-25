@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
 - detect signature-valid Torch7 payloads even when renamed with misleading suffixes
 - detect acquired executable Llamafile payloads with misleading suffixes, retain archive-polyglot coverage, and classify unavailable runtime previews as inconclusive
+- preserve Torch7 Lua findings in executable Llamafile/Torch7 polyglot payloads
 
 ### Performance Improvements
 
