@@ -492,7 +492,7 @@ class PmmlScanner(BaseScanner):
         return cls._xml_namespace(tag) == root_namespace
 
     def _get_all_text_content(self, element: Any) -> tuple[str, bool]:
-        """Collect Extension text and report whether traversal hit the node budget."""
+        """Collect Extension text/attribute values and report bounded traversal truncation."""
         text_parts: list[str] = []
         stack = [element]
         nodes_seen = 0
@@ -514,6 +514,7 @@ class PmmlScanner(BaseScanner):
                 text_parts.append(current.text.strip())
             if current.tail:
                 text_parts.append(current.tail.strip())
+            text_parts.extend(str(value).strip() for value in current.attrib.values() if str(value).strip())
 
             try:
                 child_count = len(current)
