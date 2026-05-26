@@ -202,13 +202,15 @@ def test_scan_benign_mar_with_safe_handler(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "payload",
+    ("payload", "expected_rule_code"),
     [
-        b"\x7fELF" + b"\x00" * 64,
-        b"MZ" + b"\x00" * 58 + (64).to_bytes(4, "little") + b"PE\x00\x00" + b"\x00" * 16,
+        (b"\x7fELF" + b"\x00" * 64, "S502"),
+        (b"MZ" + b"\x00" * 58 + (64).to_bytes(4, "little") + b"PE\x00\x00" + b"\x00" * 16, "S501"),
     ],
 )
-def test_scan_flags_content_disguised_executable_extra_file(tmp_path: Path, payload: bytes) -> None:
+def test_scan_flags_content_disguised_executable_extra_file(
+    tmp_path: Path, payload: bytes, expected_rule_code: str
+) -> None:
     manifest = {
         "model": {
             "handler": "handler.py",
@@ -232,8 +234,37 @@ def test_scan_flags_content_disguised_executable_extra_file(tmp_path: Path, payl
 
     executable_checks = _failed_checks(result, "TorchServe Executable Extra File Detection")
     assert len(executable_checks) == 1
-    assert executable_checks[0].rule_code == "S603"
+    assert executable_checks[0].rule_code == expected_rule_code
     assert executable_checks[0].details["entry"] == "native/payload.dat"
+    assert core.determine_exit_code(aggregate) == 1
+
+
+def test_scan_flags_name_disguised_executable_extra_file(tmp_path: Path) -> None:
+    manifest = {
+        "model": {
+            "handler": "handler.py",
+            "serializedFile": "weights.bin",
+            "extraFiles": "native/payload.so",
+        },
+    }
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=manifest,
+        entries={
+            "handler.py": b"def handle(data, context):\n    return data\n",
+            "weights.bin": b"weights",
+            "native/payload.so": b"compiled sidecar metadata\n",
+        },
+        filename="name_disguised_executable_extra_file.mar",
+    )
+
+    result = TorchServeMarScanner().scan(str(mar_path))
+    aggregate = core.scan_model_directory_or_file(str(mar_path), cache_enabled=False)
+
+    executable_checks = _failed_checks(result, "TorchServe Executable Extra File Detection")
+    assert len(executable_checks) == 1
+    assert executable_checks[0].rule_code == "S502"
+    assert executable_checks[0].details["entry"] == "native/payload.so"
     assert core.determine_exit_code(aggregate) == 1
 
 

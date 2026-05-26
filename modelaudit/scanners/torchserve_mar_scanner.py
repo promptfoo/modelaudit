@@ -21,7 +21,7 @@ from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_locations import rewrite_extracted_member_location
-from .archive_member_security import is_executable_archive_member_content, is_executable_archive_member_name
+from .archive_member_security import executable_archive_member_rule_code
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -1593,16 +1593,18 @@ class TorchServeMarScanner(BaseScanner):
             try:
                 from .. import core
 
-                if normalized_member in extra_file_refs and (
-                    is_executable_archive_member_name(normalized_member)
-                    or is_executable_archive_member_content(temp_path)
-                ):
+                executable_rule_code = (
+                    executable_archive_member_rule_code(normalized_member, temp_path)
+                    if normalized_member in extra_file_refs
+                    else None
+                )
+                if executable_rule_code is not None:
                     result.add_check(
                         name="TorchServe Executable Extra File Detection",
                         passed=False,
                         message=f"Executable file found in TorchServe MAR extraFiles member: {member_name}",
                         severity=IssueSeverity.WARNING,
-                        rule_code="S603",
+                        rule_code=executable_rule_code,
                         location=f"{archive_path}:{member_name}",
                         details={"entry": member_name, "manifest_field": "extraFiles"},
                     )
