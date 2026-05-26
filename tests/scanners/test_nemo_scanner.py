@@ -5,6 +5,7 @@ import pickle
 import tarfile
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -644,6 +645,16 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert executable_checks[0].details["nested_scanner"] == "pytorch_zip"
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
         assert determine_exit_code(scan_model_directory_or_file(str(nemo_path), cache_enabled=False)) == 1
+
+    def test_structured_embedded_code_rules_are_not_deserialization_cves(self) -> None:
+        issue = SimpleNamespace(
+            details={},
+            message="Executable interpreter content found in archive/pickle_payload",
+            rule_code="S507",
+            type="Python script embedded",
+        )
+
+        assert NemoScanner._is_nested_checkpoint_deserialization_issue(issue) is False
 
     def test_metadata_referenced_benign_archive_stays_clean(self, tmp_path: Path) -> None:
         nested_artifact = io.BytesIO()

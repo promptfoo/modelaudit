@@ -131,7 +131,7 @@ CVE_2025_23304_REMEDIATION = (
 NEMO_CHECKPOINT_MEMBER_EXTENSIONS = frozenset({".ckpt", ".pt", ".pth", ".pkl", ".pickle"})
 NEMO_MAX_CHECKPOINT_SCAN_BYTES = 50 * 1024 * 1024
 _NESTED_NON_DESERIALIZATION_RULE_CODES = frozenset(
-    {"S405", "S406", "S408", "S410", "S501", "S502", "S503", "S504", "S505", "S506"}
+    {"S405", "S406", "S408", "S410", "S501", "S502", "S503", "S504", "S505", "S506", "S507", "S508", "S509"}
 )
 
 _INCONCLUSIVE_METADATA_KEY = "scan_outcome"
