@@ -263,6 +263,8 @@ class TestJITScriptDetector:
             b"globals()['__builtins__'].eval('1 + 1')\n",
             b"builtins_ref = globals()['__builtins__']\ngetattr(builtins_ref, 'eval')('1 + 1')\n",
             b"global_namespace = globals()\nglobal_namespace['__builtins__']['eval']('1 + 1')\n",
+            b"run = globals()['__builtins__']['eval']\nrun.__call__('1 + 1')\n",
+            b"run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun('1 + 1')\n",
         ],
     )
     def test_scan_model_detects_unmarked_static_builtin_indirection(self, source: bytes) -> None:

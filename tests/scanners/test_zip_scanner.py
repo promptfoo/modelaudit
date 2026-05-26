@@ -159,6 +159,49 @@ def test_scan_zip_flags_aliased_dangerous_python_member(tmp_path: Path) -> None:
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import os\nos.system.__call__('echo hidden')\n",
+        "import os\nrun = os.system\nos.system = len\nrun('echo hidden')\n",
+        "import os\nsetattr(os, 'system', factory())\nos.system('echo hidden')\n",
+        "import os\nos.__dict__.update({'system': factory()})\nos.system('echo hidden')\n",
+    ],
+)
+def test_scan_zip_preserves_possible_os_system_after_static_overwrites(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].details["reason"] == "high-risk calls: os.system"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import os\nsetattr(os, 'system', len)\nos.system([])\n",
+        "import os\nos.__dict__.update({'system': len})\nos.system([])\n",
+        "import os\nreplace = os.__dict__.update\nreplace({'system': len})\nos.system([])\n",
+    ],
+)
+def test_scan_zip_allows_static_safe_os_system_replacements(tmp_path: Path, source: str) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+
+
 def test_scan_zip_flags_from_import_dangerous_python_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
