@@ -1783,6 +1783,40 @@ class TestSevenZipScannerHardening:
             assert result.metadata["scannable_files"] == 1
             mock_scan_extracted_file.assert_called_once()
 
+    def test_extensionless_xgboost_probe_reaches_full_extraction(self, tmp_path: Path) -> None:
+        """Header probes should route extensionless XGBoost UBJSON members through extraction."""
+        scanner = SevenZipScanner()
+        archive_path = tmp_path / "xgboost_probe.7z"
+        archive_path.write_bytes(scanner._SEVENZIP_MAGIC + b"\0" * 26)
+        payload = b"{L" + (b"\0" * 8) + b"learner" + b"learner_model_param" + b"version"
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_has_7z_magic", return_value=True),
+            patch.object(scanner, "_scan_extracted_file", return_value=_mock_scan_result()) as mock_scan_extracted_file,
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.islink", return_value=False),
+            patch("os.path.getsize", return_value=32),
+        ):
+
+            def fake_extract(*_args: Any, **kwargs: Any) -> None:
+                factory = kwargs.get("factory")
+                if factory is not None:
+                    factory.create("nested_payload").write(payload)
+
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["nested_payload"]
+            mock_archive.getinfo.return_value = MagicMock(uncompressed=len(payload), is_directory=False)
+            mock_archive.extract.side_effect = fake_extract
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(str(archive_path))
+
+            assert result.success
+            assert result.metadata["scannable_files"] == 1
+            mock_scan_extracted_file.assert_called_once()
+
     # -- default config includes new limits -----------------------------------
 
     def test_default_configuration_includes_new_limits(self) -> None:

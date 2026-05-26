@@ -566,6 +566,8 @@ class XGBoostScanner(BaseScanner):
 
             # Basic binary structure validation
             self._validate_binary_structure(path, result)
+            if self._INCONCLUSIVE_REASONS["read_failed"] in result.metadata.get("scan_outcome_reasons", []):
+                return
 
             # Attempt safe XGBoost loading if enabled
             if self.enable_xgb_loading:

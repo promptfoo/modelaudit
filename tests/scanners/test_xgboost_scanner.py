@@ -897,6 +897,27 @@ class TestXGBoostBinaryScanning:
         assert read_checks[0].severity == IssueSeverity.INFO
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
+    def test_binary_read_failure_skips_optional_loading_and_safe_mode_check(self, temp_dir: Path) -> None:
+        binary_file = temp_dir / "unreadable.bst"
+        binary_file.write_bytes(b"binf" + (b"\0" * 64))
+        scanner = XGBoostScanner({"enable_xgb_loading": True})
+        result = scanner._create_result()
+
+        def record_read_failure(path: str, nested_result: ScanResult) -> None:
+            scanner._record_read_failure(path, nested_result, OSError("forced read failure"))
+
+        with (
+            patch.object(scanner, "_is_pickle_file", return_value=False),
+            patch.object(scanner, "_is_ubjson_file", return_value=False),
+            patch.object(scanner, "_validate_binary_structure", side_effect=record_read_failure),
+            patch.object(scanner, "_safe_xgboost_load") as mock_safe_load,
+        ):
+            scanner._scan_binary_model(str(binary_file), result)
+
+        mock_safe_load.assert_not_called()
+        assert "xgboost_read_failed" in result.metadata["scan_outcome_reasons"]
+        assert not any(check.name == "XGBoost Loading" for check in result.checks)
+
     def test_binary_structure_validation(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
         """Test binary structure validation."""
         # Create a file with some XGBoost-like content

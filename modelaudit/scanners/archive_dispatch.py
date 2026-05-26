@@ -1,6 +1,8 @@
 """Nested archive dispatch helpers used by recursive scanners."""
 
+import json
 import os
+import zipfile
 from collections.abc import Callable
 from typing import Any
 
@@ -14,6 +16,9 @@ from ..scanner_selection import (
     policy_from_config,
 )
 from ..utils.file.detection import (
+    EXECUTABLE_ZIP_POLYGLOT_FORMAT,
+    LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
+    NEMO_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
     detect_file_format,
     detect_file_format_from_magic,
@@ -44,6 +49,8 @@ _COMPRESSED_HEADER_FORMATS: frozenset[str] = frozenset(
 _R_SERIALIZED_EXTENSIONS: frozenset[str] = frozenset({".rds", ".rda", ".rdata"})
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
+_LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
+SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY = "_skip_composed_archive_member_scan"
 
 
 def _select_nested_scanner_id(path: str) -> str | None:
@@ -147,14 +154,160 @@ def _make_incomplete_xml_model_result(path: str) -> ScanResult:
     return result
 
 
+def _deduplicate_exact_merged_findings(result: ScanResult) -> None:
+    """Remove identical output emitted by composed subtype and ZIP analyses."""
+
+    def signature(item: Any) -> str:
+        payload = item.model_dump(mode="json", exclude={"timestamp"})
+        return json.dumps(payload, sort_keys=True, default=str)
+
+    seen_issues: set[str] = set()
+    unique_issues = []
+    for issue in result.issues:
+        issue_signature = signature(issue)
+        if issue_signature in seen_issues:
+            continue
+        seen_issues.add(issue_signature)
+        unique_issues.append(issue)
+    result.issues = unique_issues
+
+    seen_checks: set[str] = set()
+    unique_checks = []
+    for check in result.checks:
+        check_signature = signature(check)
+        if check_signature in seen_checks:
+            continue
+        seen_checks.add(check_signature)
+        unique_checks.append(check)
+    result.checks = unique_checks
+
+
+def merge_executable_zip_container_findings(
+    path: str,
+    result: ScanResult,
+    config: dict[str, Any] | None,
+    *,
+    context: str,
+) -> None:
+    """Merge all enabled subtype checks and one generic ZIP member traversal."""
+    from . import _registry
+    from .zip_scanner import ZipScanner
+
+    try:
+        if not zipfile.is_zipfile(path):
+            return
+    except OSError:
+        return
+
+    scanner_selection = policy_from_config(config)
+    ext = os.path.splitext(path)[1].lower()
+    subtype_ids: list[str] = []
+    if is_torchserve_mar_archive(path):
+        subtype_ids.append("torchserve_mar")
+    if is_keras_zip_archive(path, allow_config_only=ext == ".keras"):
+        subtype_ids.append("keras_zip")
+    if is_pytorch_zip_archive(path):
+        subtype_ids.append("pytorch_zip")
+    if is_executorch_archive(path):
+        subtype_ids.append("executorch")
+    if is_skops_archive(path):
+        subtype_ids.append("skops")
+
+    subtype_config = dict(config or {})
+    subtype_config[SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY] = True
+    for subtype_id in subtype_ids:
+        if scanner_selection.allows(subtype_id):
+            subtype_scanner = _registry.load_scanner_by_id(subtype_id)
+            if subtype_scanner:
+                result.merge(subtype_scanner(config=subtype_config).scan(path))
+        else:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                subtype_id,
+                scanner_selection,
+                context=f"{context} subtype analysis",
+            )
+
+    if scanner_selection.allows("zip"):
+        result.merge(ZipScanner(config=config).scan_archive_members(path))
+    else:
+        add_scanner_selection_skip_check(
+            result,
+            path,
+            "zip",
+            scanner_selection,
+            context=f"{context} ZIP member analysis",
+        )
+
+    _deduplicate_exact_merged_findings(result)
+
+
+def _make_incomplete_llamafile_routing_result(path: str, config: dict[str, Any] | None) -> ScanResult:
+    """Fail closed when bounded nested Llamafile routing cannot read its marker probe."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="Llamafile Routing",
+        passed=False,
+        message="Llamafile routing was inconclusive because bounded marker bytes could not be read",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    mark_inconclusive_scan_result(result, _LLAMAFILE_ROUTING_INCOMPLETE_REASON)
+    mark_operational_scan_error(result, _LLAMAFILE_ROUTING_INCOMPLETE_REASON)
+
+    merge_executable_zip_container_findings(
+        path,
+        result,
+        config,
+        context="inconclusive nested executable ZIP polyglot",
+    )
+
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_nemo_routing_result(path: str) -> ScanResult:
+    """Fail closed when bounded nested NeMo structural routing cannot decide."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="NeMo Routing",
+        passed=False,
+        message="NeMo routing was inconclusive because the bounded TAR member probe reached its limit",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": NEMO_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    mark_inconclusive_scan_result(result, "nemo_routing_incomplete")
+    mark_operational_scan_error(result, "nemo_routing_incomplete")
+    result.finish(success=False)
+    return result
+
+
 def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     """Scan an extracted archive member without importing `modelaudit.core`."""
     from . import _registry
 
     scanner_selection = policy_from_config(config)
     scanner_class = None
-    scanner_id = _select_nested_scanner_id(path)
     trusted_content_format = detect_file_format_from_magic(path)
+    if trusted_content_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
+        return _make_incomplete_llamafile_routing_result(path, config)
+    if trusted_content_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
+        return _make_incomplete_nemo_routing_result(path)
+    if trusted_content_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT:
+        result = ScanResult(scanner_name="zip")
+        merge_executable_zip_container_findings(
+            path,
+            result,
+            config,
+            context="nested executable ZIP polyglot",
+        )
+        result.finish(success=not result.has_errors)
+        return result
+
+    scanner_id = _select_nested_scanner_id(path)
     skipped_preferred_scanner_id: str | None = None
     if scanner_id and scanner_selection.allows(scanner_id):
         scanner_class = _registry.load_scanner_by_id(scanner_id)

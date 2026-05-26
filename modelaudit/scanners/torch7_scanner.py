@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import re
-from pathlib import Path
 from typing import Any, ClassVar
 
 from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
@@ -54,7 +53,7 @@ SAFE_REQUIRE_MODULES = frozenset(
 
 
 class Torch7Scanner(BaseScanner):
-    """Static scanner for Torch7 `.t7` / `.th` / `.net` artifacts."""
+    """Static scanner for signature-valid Torch7 serialized artifacts."""
 
     name = "torch7"
     description = "Scans Torch7 serialized model files for Lua execution and dynamic loading indicators"
@@ -67,9 +66,8 @@ class Torch7Scanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
+        """Recognize Torch7 by bounded serialized-content markers, regardless of suffix."""
         if not os.path.isfile(path):
-            return False
-        if Path(path).suffix.lower() not in cls.supported_extensions:
             return False
 
         try:
