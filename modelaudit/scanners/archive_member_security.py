@@ -294,6 +294,7 @@ _GLOBAL_NAMESPACE_HELPERS = {"globals", "builtins.globals"}
 _GLOBAL_NAMESPACE_MAPPING_MARKER = "<globals mapping>"
 _STATIC_REFERENCE_OVERRIDE_PREFIX = "<static reference override>:"
 _STATIC_DIRECT_MUTATION_ALIAS_PREFIX = "<static direct mutation alias>:"
+_STATIC_ATTRIBUTE_MUTATION_ALIAS_PREFIX = "<static attribute mutation alias>:"
 _CAPTURED_CALLABLE_REFERENCE_PREFIX = "<captured callable>:"
 _BUILTIN_NAMESPACE_NAMES = {"__builtin__", "__builtins__"}
 _STATIC_MAPPING_MUTATORS = {"__setitem__", "update"}
@@ -659,7 +660,9 @@ def _binding_names(target: ast.AST) -> Iterator[str]:
 
 class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def __init__(self, tracked_call_names: frozenset[str] | None = None) -> None:
-        self.alias_scopes: _AliasScopes = [{}]
+        self.alias_scopes: _AliasScopes = [
+            {self._static_attribute_mutation_alias_key("setattr"): frozenset({"setattr"})}
+        ]
         self._class_scope_ids: set[int] = set()
         self.risky_calls: set[str] = set()
         self.tracked_call_names = tracked_call_names
@@ -667,6 +670,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def _bind_import_name(self, local_name: str, import_name: str) -> None:
         effective_names = self._effective_reference_names(frozenset({import_name}))
         self._bind_name(local_name, self._capture_callable_names(effective_names))
+        helper_names = self._static_attribute_mutation_helper_names(effective_names)
+        if helper_names is not None:
+            self._bind_name(self._static_attribute_mutation_alias_key(local_name), helper_names)
 
     def _record_import(self, alias: ast.alias, import_name: str) -> None:
         self._bind_import_name(alias.asname or alias.name, import_name)
@@ -675,6 +681,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self.alias_scopes[-1][name] = resolved_names
         if not name.startswith("<") and self._lookup_static_direct_mutation_alias(name) is not None:
             self.alias_scopes[-1][self._static_direct_mutation_alias_key(name)] = None
+        if not name.startswith("<") and self._lookup_static_attribute_mutation_alias_entry(name) is not _MISSING_ALIAS:
+            self.alias_scopes[-1][self._static_attribute_mutation_alias_key(name)] = None
 
     @staticmethod
     def _static_reference_override_key(reference_name: str) -> str:
@@ -683,6 +691,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     @staticmethod
     def _static_direct_mutation_alias_key(name: str) -> str:
         return f"{_STATIC_DIRECT_MUTATION_ALIAS_PREFIX}{name}"
+
+    @staticmethod
+    def _static_attribute_mutation_alias_key(name: str) -> str:
+        return f"{_STATIC_ATTRIBUTE_MUTATION_ALIAS_PREFIX}{name}"
 
     def _lookup_static_reference_override(self, reference_name: str) -> _AliasValue:
         override_key = self._static_reference_override_key(reference_name)
@@ -698,6 +710,13 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 return aliases[alias_key]
         return None
 
+    def _lookup_static_attribute_mutation_alias_entry(self, name: str) -> _AliasValue | object:
+        alias_key = self._static_attribute_mutation_alias_key(name)
+        for aliases in reversed(self.alias_scopes):
+            if alias_key in aliases:
+                return aliases[alias_key]
+        return _MISSING_ALIAS
+
     def _resolve_certain_direct_builtin_mutator_names(self, node: ast.AST) -> frozenset[str] | None:
         direct_mutator_names = _resolve_direct_global_builtin_mutator_names(node, self.alias_scopes)
         if direct_mutator_names is not None:
@@ -705,6 +724,23 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if isinstance(node, ast.Name):
             return self._lookup_static_direct_mutation_alias(node.id)
         return None
+
+    def _static_attribute_mutation_helper_names(self, resolved_names: _AliasValue) -> frozenset[str] | None:
+        if resolved_names is None:
+            return None
+        helper_names = frozenset(self._invoked_callable_reference_name(name) for name in resolved_names)
+        return helper_names if helper_names and helper_names.issubset(_STATIC_ATTRIBUTE_MUTATION_HELPERS) else None
+
+    def _resolve_certain_static_attribute_mutation_helper_names(self, node: ast.AST) -> frozenset[str] | None:
+        call_name = _resolve_call_name(node)
+        if call_name is not None:
+            helper_names = self._lookup_static_attribute_mutation_alias_entry(
+                self._invoked_callable_reference_name(call_name)
+            )
+            if helper_names is not _MISSING_ALIAS:
+                return helper_names if isinstance(helper_names, frozenset) else None
+
+        return self._static_attribute_mutation_helper_names(self._resolve_invoked_reference_names(node))
 
     def _is_tracked_call_name(self, name: str) -> bool:
         return (
@@ -812,8 +848,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if len(node.args) != 3 or node.keywords:
             return
 
-        helper_names = self._resolve_invoked_reference_names(node.func)
-        if helper_names is None or not helper_names.issubset(_STATIC_ATTRIBUTE_MUTATION_HELPERS):
+        helper_names = self._resolve_certain_static_attribute_mutation_helper_names(node.func)
+        if helper_names is None:
             return
 
         target_names = _resolve_static_attribute_names(node.args[0], node.args[1], self.alias_scopes)
@@ -827,6 +863,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             direct_mutator_names = self._resolve_certain_direct_builtin_mutator_names(value)
             if direct_mutator_names is not None:
                 self._bind_name(self._static_direct_mutation_alias_key(target.id), direct_mutator_names)
+            attribute_mutation_names = self._resolve_certain_static_attribute_mutation_helper_names(value)
+            if attribute_mutation_names is not None:
+                self._bind_name(self._static_attribute_mutation_alias_key(target.id), attribute_mutation_names)
         elif isinstance(target, (ast.Attribute, ast.Subscript)):
             self._bind_static_reference_target_to_value(target, value)
         elif isinstance(target, ast.Starred):
@@ -924,7 +963,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         current_scope = self.alias_scopes[-1]
         branch_names = {name for scope in branch_scopes for name in scope}
         for name in branch_names:
-            if name.startswith(_STATIC_DIRECT_MUTATION_ALIAS_PREFIX):
+            if name.startswith((_STATIC_DIRECT_MUTATION_ALIAS_PREFIX, _STATIC_ATTRIBUTE_MUTATION_ALIAS_PREFIX)):
                 certainty_base_value = current_scope.get(name, _MISSING_ALIAS)
                 values = [scope.get(name, certainty_base_value) for scope in branch_scopes]
                 first_value = values[0]
@@ -1014,8 +1053,6 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
-        if isinstance(node.value, ast.Call):
-            self._bind_static_setattr_mutation(node.value)
         for target in node.targets:
             self._bind_target_to_value(target, node.value)
             self.visit(target)
@@ -1025,8 +1062,6 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self.visit(node.annotation)
         if node.value is not None:
             self.visit(node.value)
-            if isinstance(node.value, ast.Call):
-                self._bind_static_setattr_mutation(node.value)
             self._bind_target_to_value(node.target, node.value)
         else:
             self._shadow_binding_target(node.target)
@@ -1046,7 +1081,6 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self.visit(node.value)
         if isinstance(node.value, ast.Call):
             self._bind_direct_builtin_namespace_mutation(node.value)
-            self._bind_static_setattr_mutation(node.value)
 
     def _visit_loop(self, node: ast.For | ast.AsyncFor) -> None:
         self.visit(node.iter)
@@ -1160,6 +1194,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 if self._is_tracked_call_name(resolved_name):
                     self.risky_calls.add(resolved_name)
         self.generic_visit(node)
+        self._bind_static_setattr_mutation(node)
 
 
 def statically_resolved_python_call_names_in_tree(tree: ast.AST, tracked_call_names: frozenset[str]) -> set[str]:
