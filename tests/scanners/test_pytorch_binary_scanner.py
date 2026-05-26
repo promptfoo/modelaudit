@@ -92,6 +92,25 @@ def test_pytorch_binary_read_failure_is_inconclusive_not_security_finding(
     assert determine_exit_code(aggregate) == 2
 
 
+def test_pytorch_binary_can_handle_routes_detection_read_failures_without_extra_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable.bin"
+    path.write_bytes(b"benign binary tensor weights" * 10)
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> str:
+        raise OSError("simulated format detection read failure")
+
+    def fail_preflight_open(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("can_handle should not preflight-open .bin files")
+
+    monkeypatch.setattr("modelaudit.utils.file.detection.detect_file_format", raise_os_error)
+    monkeypatch.setattr("modelaudit.scanners.pytorch_binary_scanner.open", fail_preflight_open, raising=False)
+
+    assert PyTorchBinaryScanner.can_handle(str(path)) is True
+
+
 def test_pytorch_binary_scanner_reports_tiny_top_level_bin_files(tmp_path: Path) -> None:
     """Top-level tiny .bin files should retain the existing size-only signal."""
     scanner = PyTorchBinaryScanner()

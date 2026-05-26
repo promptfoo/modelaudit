@@ -290,6 +290,8 @@ class NumPyScanner(BaseScanner):
                             else:
                                 # Fallback for newer NumPy versions
                                 shape, fortran, dtype = fmt.read_array_header_2_0(f)
+                    except OSError:
+                        raise
                     except Exception as header_error:
                         result.add_check(
                             name="NumPy Header Read",
@@ -577,7 +579,6 @@ class NumPyScanner(BaseScanner):
                 message=f"Unable to read NumPy file: {e}",
                 severity=IssueSeverity.INFO,
                 location=path,
-                rule_code="S902",
                 details={
                     "exception": str(e),
                     "exception_type": type(e).__name__,
