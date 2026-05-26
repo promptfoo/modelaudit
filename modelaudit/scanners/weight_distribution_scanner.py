@@ -382,15 +382,20 @@ class WeightDistributionScanner(BaseScanner):
             with h5py.File(path, "r") as f:
                 # Navigate through the HDF5 structure to find weights
                 def extract_weights(name, obj):
-                    if isinstance(obj, h5py.Dataset) and ("kernel" in name or "weight" in name):
+                    if (
+                        isinstance(obj, h5py.Dataset)
+                        and ("kernel" in name or "weight" in name)
+                        and np.issubdtype(obj.dtype, np.number)
+                    ):
                         array = np.array(obj)
-                        if np.issubdtype(array.dtype, np.number):
-                            weights_info[name] = array
+                        weights_info[name] = array
 
                 f.visititems(extract_weights)
 
         except Exception as e:
             logger.debug(f"Failed to extract weights from {path}: {e}")
+            if os.path.splitext(path)[1].lower() == ".keras" and zipfile.is_zipfile(path):
+                return {}
             raise RuntimeError(f"Failed to extract Keras weights from {path}") from e
 
         return weights_info

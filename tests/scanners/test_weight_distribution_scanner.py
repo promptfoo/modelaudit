@@ -186,7 +186,10 @@ def _has_tensorflow_cached():
 
 
 @pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
-def test_non_numeric_hdf5_weight_metadata_is_not_a_security_finding(tmp_path: Path) -> None:
+def test_non_numeric_hdf5_weight_metadata_is_not_a_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import h5py
     import numpy as np
 
@@ -194,11 +197,37 @@ def test_non_numeric_hdf5_weight_metadata_is_not_a_security_finding(tmp_path: Pa
     with h5py.File(path, "w") as hdf5_file:
         hdf5_file.create_dataset("metadata/weight_names", data=np.array([[b"a", b"b"], [b"c", b"d"]]))
 
+    original_array = np.array
+
+    def fail_if_non_numeric_dataset_is_materialized(obj: object, *args: object, **kwargs: object) -> Any:
+        if isinstance(obj, h5py.Dataset) and obj.name.endswith("metadata/weight_names"):
+            raise AssertionError("non-numeric HDF5 weight metadata should not be materialized")
+        return original_array(obj, *args, **kwargs)
+
+    monkeypatch.setattr(np, "array", fail_if_non_numeric_dataset_is_materialized)
+
     result = core.scan_model_directory_or_file(str(path), scanners=["weight_distribution"], cache_enabled=False)
 
     assert result.scanner_names == ["weight_distribution"]
     assert core.determine_exit_code(result) == 0
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+@pytest.mark.skipif(not has_h5py(), reason="h5py required")
+def test_zip_backed_keras_weight_distribution_stays_optional(tmp_path: Path) -> None:
+    path = tmp_path / "model.keras"
+    with zipfile.ZipFile(path, "w") as keras_archive:
+        keras_archive.writestr("metadata.json", "{}")
+        keras_archive.writestr("config.json", "{}")
+
+    direct = WeightDistributionScanner().scan(str(path))
+    assert direct.success is True
+    assert direct.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+
+    aggregate = core.scan_model_directory_or_file(str(path), scanners=["weight_distribution"], cache_enabled=False)
+    assert aggregate.success is True
+    assert core.determine_exit_code(aggregate) == 0
+    assert aggregate.file_metadata[str(path)].get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
 
 
 @pytest.mark.skipif(not HAS_NUMPY or not has_h5py(), reason="numpy and h5py required")
