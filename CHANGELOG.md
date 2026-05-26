@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - route signature-confirmed CNTK and LightGBM artifacts with misleading filenames through security analysis
 - share trusted-content routing across direct, nested, and helper scans so renamed specialized archives retain their format-specific analysis
 - fail closed when nested NeMo checkpoint or referenced-artifact analysis is explicitly incomplete
+- preserve concrete nested security findings from checkpoint and referenced artifacts inside NeMo archives
+- keep PyTorch ZIP path traversal findings attributed to archive safety rules regardless of member names
+- classify executable archive members by their hazard type rather than attacker-controlled name fragments
+- preserve Keras ZIP Python and executable member attribution when filenames contain misleading pickle terms
+- classify incomplete ExecuTorch format scans and embedded Python members without misreporting eval/exec findings
+- classify corrupt magic-confirmed TAR parsing as incomplete analysis rather than a security finding
+- preserve PyTorch ZIP findings when later analysis fails and classify parse failures as incomplete coverage
 
 ## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
 

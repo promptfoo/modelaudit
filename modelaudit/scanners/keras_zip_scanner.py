@@ -31,7 +31,7 @@ from ..config.explanations import (
     get_pattern_explanation,
 )
 from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded
-from .archive_member_security import is_executable_archive_member_name
+from .archive_member_security import executable_archive_member_rule_code, is_executable_archive_member_name
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
     check_custom_loss_config,
@@ -564,6 +564,7 @@ class KerasZipScanner(BaseScanner):
                     severity=IssueSeverity.WARNING,
                     location=f"{archive_path}/{filename}",
                     details={"filename": filename},
+                    rule_code="S507",
                 )
             elif is_executable_archive_member_name(normalized_name):
                 result.add_check(
@@ -573,6 +574,7 @@ class KerasZipScanner(BaseScanner):
                     severity=IssueSeverity.CRITICAL,
                     location=f"{archive_path}/{filename}",
                     details={"filename": filename},
+                    rule_code=executable_archive_member_rule_code(filename),
                 )
 
     @staticmethod

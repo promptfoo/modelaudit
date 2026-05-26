@@ -14,6 +14,7 @@ from typing import Any, ClassVar
 
 from ..utils import is_absolute_archive_path, sanitize_archive_path
 from ..utils.file.detection import detect_file_format_from_magic
+from ._archive_locations import rewrite_extracted_member_location
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 try:
@@ -129,6 +130,9 @@ CVE_2025_23304_REMEDIATION = (
 )
 NEMO_CHECKPOINT_MEMBER_EXTENSIONS = frozenset({".ckpt", ".pt", ".pth", ".pkl", ".pickle"})
 NEMO_MAX_CHECKPOINT_SCAN_BYTES = 50 * 1024 * 1024
+_NESTED_NON_DESERIALIZATION_RULE_CODES = frozenset(
+    {"S405", "S406", "S408", "S410", "S501", "S502", "S503", "S504", "S505", "S506", "S507", "S508", "S509"}
+)
 
 _INCONCLUSIVE_METADATA_KEY = "scan_outcome"
 _INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
@@ -631,6 +635,14 @@ class NemoScanner(BaseScanner):
                 entry=report_entry,
                 source_entry=member.name,
             )
+            self._propagate_nested_security_findings(
+                result,
+                nested_result,
+                extracted_path=extracted_path,
+                archive_path=archive_path,
+                entry=report_entry,
+                source_entry=member.name,
+            )
 
             critical_issues = [
                 issue
@@ -758,6 +770,19 @@ class NemoScanner(BaseScanner):
                         "trusted_content_format": trusted_content_format,
                     },
                 )
+            self._propagate_nested_security_findings(
+                result,
+                nested_result,
+                extracted_path=extracted_path,
+                archive_path=archive_path,
+                entry=referenced_member_name,
+                source_entry=member.name,
+                extra_details={
+                    "config_file": config_file,
+                    "config_path": config_path,
+                    "trusted_content_format": trusted_content_format,
+                },
+            )
 
             critical_issues = [
                 issue
@@ -783,6 +808,47 @@ class NemoScanner(BaseScanner):
                 os.unlink(extracted_path)
             except OSError:
                 logger.debug("Failed to remove temporary NeMo referenced scan file: %s", extracted_path)
+
+    def _propagate_nested_security_findings(
+        self,
+        result: ScanResult,
+        nested_result: ScanResult,
+        *,
+        extracted_path: str,
+        archive_path: str,
+        entry: str,
+        source_entry: str,
+        extra_details: dict[str, Any] | None = None,
+    ) -> None:
+        """Preserve concrete findings from nested artifact scans with NeMo provenance."""
+        for issue in nested_result.issues:
+            if issue.severity not in (IssueSeverity.WARNING, IssueSeverity.CRITICAL):
+                continue
+            if issue.severity == IssueSeverity.CRITICAL and self._is_nested_checkpoint_deserialization_issue(issue):
+                continue
+
+            result.add_check(
+                name="NeMo Nested Member Security Finding",
+                passed=False,
+                message=issue.message,
+                severity=issue.severity,
+                location=rewrite_extracted_member_location(
+                    issue.location,
+                    extracted_path,
+                    f"{archive_path}:{entry}",
+                    preserve_non_delimited_suffix=True,
+                ),
+                details={
+                    **issue.details,
+                    "entry": entry,
+                    "source_entry": source_entry,
+                    "nested_scanner": nested_result.scanner_name,
+                    "nested_issue_type": issue.type,
+                    **(extra_details or {}),
+                },
+                why=issue.why,
+                rule_code=issue.rule_code,
+            )
 
     def _propagate_nested_incomplete_result(
         self,
@@ -878,6 +944,9 @@ class NemoScanner(BaseScanner):
 
     @staticmethod
     def _is_nested_checkpoint_deserialization_issue(issue: Any) -> bool:
+        if issue.rule_code in _NESTED_NON_DESERIALIZATION_RULE_CODES:
+            return False
+
         details = issue.details if isinstance(issue.details, dict) else {}
         text = " ".join(
             str(part).lower()
