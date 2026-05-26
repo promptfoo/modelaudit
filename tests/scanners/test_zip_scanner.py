@@ -17,6 +17,8 @@ import pytest
 from modelaudit import core
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import build_cache_version_context
+from modelaudit.config import ModelAuditConfig, reset_config, set_config
+from modelaudit.rules import Severity
 from modelaudit.scanner_selection import normalize_scanner_selection_config
 from modelaudit.scanners import _registry, archive_dispatch
 from modelaudit.scanners import zip_scanner as zip_scanner_module
@@ -2068,7 +2070,11 @@ class TestZipScanner:
             info.external_attr = (stat.S_IFLNK | 0o777) << 16
             archive.writestr(info, "a" * (ZipScanner.MAX_SYMLINK_TARGET_BYTES + 1))
 
-        result = self.scanner.scan(str(archive_path))
+        set_config(ModelAuditConfig(severity={"S406": Severity.CRITICAL}))
+        try:
+            result = self.scanner.scan(str(archive_path))
+        finally:
+            reset_config()
 
         assert result.success is False
         symlink_checks = [
@@ -2079,7 +2085,9 @@ class TestZipScanner:
         assert len(symlink_checks) == 1
         assert "symlink target exceeds maximum size" in symlink_checks[0].message.lower()
         assert symlink_checks[0].details.get("entry") == "link.txt"
+        assert symlink_checks[0].rule_code == "S902"
         assert symlink_checks[0].severity == IssueSeverity.INFO
+        assert not any(issue.rule_code == "S406" for issue in result.issues)
         assert "zip_symlink_target_read_incomplete" in result.metadata["scan_outcome_reasons"]
         _assert_inconclusive_zip_aggregate_not_cached(
             archive_path,

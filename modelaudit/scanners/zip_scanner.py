@@ -298,6 +298,7 @@ class ZipScanner(BaseScanner):
                     passed=False,
                     message=f"Unable to read symlink target for {name}: {exc!s}",
                     severity=IssueSeverity.INFO,
+                    rule_code="S902",
                     location=f"{archive_path}:{name}",
                     details={
                         "entry": name,
