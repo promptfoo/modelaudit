@@ -937,6 +937,25 @@ def test_scan_nested_file_routes_renamed_mxnet_symbol_by_structure(tmp_path: Pat
     assert any(issue.details.get("attribute") == "library" for issue in result.issues)
 
 
+def test_scan_nested_file_fails_closed_for_renamed_mxnet_shadowed_nodes(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "payload.dat"
+    extracted_member.write_text(
+        '{"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]],"nodes":[{"op":"null","name":"data"}]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert result.success is False
+    assert "mxnet_symbol_duplicate_root_keys" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "MXNet Symbol JSON Analysis" and check.details.get("duplicate_root_keys") == ["nodes"]
+        for check in result.checks
+    )
+
+
 def test_scan_nested_file_canonical_mxnet_symbol_bypasses_routing_value_budget(tmp_path: Path) -> None:
     extracted_member = tmp_path / "large-symbol.json"
     extracted_member.write_text(

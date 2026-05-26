@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+from io import BytesIO
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -13,6 +14,7 @@ from modelaudit.scanner_selection import add_scanner_selection_skip_check, polic
 from modelaudit.utils.file.detection import (
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     has_mxnet_symbol_graph_structure,
+    inspect_mxnet_symbol_root_keys,
     is_mxnet_symbol_graph_file,
 )
 
@@ -251,6 +253,9 @@ class MXNetScanner(BaseScanner):
             self._scan_filename_owned_json_overlap(path, result)
             return False
 
+        duplicate_root_keys = inspect_mxnet_symbol_root_keys(BytesIO(raw_bytes))
+        self._record_symbol_root_key_ambiguity(path, result, duplicate_root_keys)
+
         try:
             payload = json.loads(raw_bytes.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError, TypeError) as exc:
@@ -302,6 +307,29 @@ class MXNetScanner(BaseScanner):
         self._scan_xgboost_overlap(path, payload, result)
         self._scan_filename_owned_json_overlap(path, result)
         return True
+
+    def _record_symbol_root_key_ambiguity(
+        self,
+        path: str,
+        result: ScanResult,
+        duplicate_keys: set[str],
+    ) -> None:
+        """Fail closed when JSON decoding could hide MXNet graph root content."""
+        if duplicate_keys:
+            reason = "mxnet_symbol_duplicate_root_keys"
+            result.add_check(
+                name="MXNet Symbol JSON Analysis",
+                passed=False,
+                message="Symbol graph contains duplicate root graph keys; shadowed content cannot be safely analyzed",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": reason,
+                    "duplicate_root_keys": sorted(duplicate_keys),
+                },
+            )
+            self._mark_inconclusive_scan_result(result, reason)
 
     def scan_parsed_symbol_security(self, path: str, payload: dict[str, Any], result: ScanResult) -> None:
         """Apply MXNet symbol-specific security checks to an already parsed overlap."""

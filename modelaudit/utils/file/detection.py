@@ -6,6 +6,7 @@ import struct
 import tarfile
 import zipfile
 from pathlib import Path, PurePosixPath
+from typing import BinaryIO
 
 from ...scanner_registry_metadata import get_extension_format_map
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
@@ -144,6 +145,8 @@ MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT = "mxnet_symbol_routing_inconclusive"
 _JSON_NUMBER_PREFIX_RE = re.compile(rb"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
 _MXNET_SYMBOL_PREFIX_MAX_VALUES = 4096
 _MXNET_SYMBOL_MAX_KEY_BYTES = 64
+_MXNET_SYMBOL_ROOT_KEYS = frozenset({"nodes", "arg_nodes", "heads"})
+_MXNET_SYMBOL_STREAM_CHUNK_BYTES = 64 * 1024
 LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT = "llamafile_routing_inconclusive"
 NEMO_ROUTING_INCONCLUSIVE_FORMAT = "nemo_routing_inconclusive"
 XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT = "xgboost_ubjson_routing_inconclusive"
@@ -339,6 +342,87 @@ def has_mxnet_symbol_graph_structure(payload: object) -> bool:
         isinstance(node, dict) and isinstance(node.get("op"), str) and isinstance(node.get("name"), str)
         for node in nodes
     )
+
+
+def inspect_mxnet_symbol_root_keys(handle: BinaryIO) -> set[str]:
+    """Return duplicate MXNet graph root keys using constant parser state."""
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    started = False
+    depth = 0
+    in_string = False
+    escaped = False
+    collecting_key = False
+    key_overflow = False
+    raw_key = bytearray()
+    expecting_key = False
+    decoder = json.JSONDecoder()
+
+    initial = handle.read(3)
+    if initial != b"\xef\xbb\xbf":
+        handle.seek(0)
+
+    while chunk := handle.read(_MXNET_SYMBOL_STREAM_CHUNK_BYTES):
+        for byte in chunk:
+            if in_string:
+                if collecting_key:
+                    if len(raw_key) < _MXNET_SYMBOL_MAX_KEY_BYTES:
+                        raw_key.append(byte)
+                    else:
+                        key_overflow = True
+
+                if escaped:
+                    escaped = False
+                elif byte == ord("\\"):
+                    escaped = True
+                elif byte == ord('"'):
+                    in_string = False
+                    if collecting_key:
+                        if not key_overflow:
+                            try:
+                                key = decoder.decode(raw_key.decode("utf-8"))
+                            except (UnicodeDecodeError, json.JSONDecodeError):
+                                key = None
+                            if key in _MXNET_SYMBOL_ROOT_KEYS:
+                                if key in seen:
+                                    duplicates.add(key)
+                                seen.add(key)
+                        collecting_key = False
+                        key_overflow = False
+                        expecting_key = False
+                continue
+
+            if not started:
+                if byte in b" \t\r\n":
+                    continue
+                if byte != ord("{"):
+                    return set()
+                started = True
+                depth = 1
+                expecting_key = True
+                continue
+
+            if byte == ord('"'):
+                if depth == 1 and expecting_key:
+                    collecting_key = True
+                    raw_key = bytearray(b'"')
+                in_string = True
+                escaped = False
+                continue
+
+            if byte in {ord("{"), ord("[")}:
+                depth += 1
+            elif byte == ord("}") and depth == 1:
+                return duplicates if seen >= _MXNET_SYMBOL_ROOT_KEYS else set()
+            elif byte in {ord("}"), ord("]")}:
+                if depth > 1:
+                    depth -= 1
+                else:
+                    return set()
+            elif byte == ord(",") and depth == 1:
+                expecting_key = True
+
+    return duplicates if seen >= _MXNET_SYMBOL_ROOT_KEYS else set()
 
 
 def _detect_mxnet_symbol_prefix_route(

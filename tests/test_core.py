@@ -2010,6 +2010,25 @@ def test_scan_file_routes_misnamed_mxnet_symbol_and_detects_custom_library(tmp_p
     )
 
 
+def test_scan_file_fails_closed_for_renamed_mxnet_shadowed_nodes(tmp_path: Path) -> None:
+    disguised_symbol = tmp_path / "payload.jpg"
+    disguised_symbol.write_text(
+        '{"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]],"nodes":[{"op":"null","name":"data"}]}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(disguised_symbol), config={"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert result.success is False
+    assert "mxnet_symbol_duplicate_root_keys" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "MXNet Symbol JSON Analysis" and check.details.get("duplicate_root_keys") == ["nodes"]
+        for check in result.checks
+    )
+
+
 def test_scan_file_fails_closed_for_renamed_oversized_mxnet_symbol_prefix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

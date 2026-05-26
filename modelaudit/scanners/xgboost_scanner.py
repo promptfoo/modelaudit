@@ -52,7 +52,6 @@ XGBOOST_CONTENT_ROUTED_JSON_CONFIG_KEY = "_xgboost_content_routed_json"
 XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY = "_xgboost_content_routed_ubjson"
 _JSON_KEY_MAX_BYTES = 256
 _JSON_WHITESPACE_BYTES = frozenset(b" \t\r\n")
-_MXNET_ROOT_GRAPH_KEYS = frozenset({"nodes", "arg_nodes", "heads"})
 
 
 def configure_content_routed_json_scan(config: dict[str, Any], *, max_bytes: int) -> None:
@@ -224,84 +223,6 @@ def _json_file_has_xgboost_markers(path: str, max_bytes: int) -> bool:
                     expecting_key = True
 
     return False
-
-
-def _find_duplicate_mxnet_root_graph_keys(path: str) -> set[str]:
-    """Return duplicated MXNet graph keys from the root object using bounded state."""
-    seen: set[str] = set()
-    duplicates: set[str] = set()
-    started = False
-    stack: list[int] = []
-    in_string = False
-    escaped = False
-    collecting_key = False
-    key_overflow = False
-    raw_key = bytearray()
-    expecting_key = False
-
-    with open(path, "rb") as f:
-        initial = f.read(3)
-        if initial != b"\xef\xbb\xbf":
-            f.seek(0)
-
-        while chunk := f.read(XGBOOST_JSON_ROUTING_CHUNK_BYTES):
-            for byte in chunk:
-                if in_string:
-                    if collecting_key:
-                        if len(raw_key) < _JSON_KEY_MAX_BYTES:
-                            raw_key.append(byte)
-                        else:
-                            key_overflow = True
-
-                    if escaped:
-                        escaped = False
-                    elif byte == ord("\\"):
-                        escaped = True
-                    elif byte == ord('"'):
-                        in_string = False
-                        if collecting_key:
-                            key = _decode_json_key(bytes(raw_key), key_overflow)
-                            if key in _MXNET_ROOT_GRAPH_KEYS:
-                                if key in seen:
-                                    duplicates.add(key)
-                                seen.add(key)
-                            collecting_key = False
-                            key_overflow = False
-                            expecting_key = False
-                    continue
-
-                if not started:
-                    if byte in _JSON_WHITESPACE_BYTES:
-                        continue
-                    if byte != ord("{"):
-                        return set()
-                    started = True
-                    stack.append(ord("}"))
-                    expecting_key = True
-                    continue
-
-                if byte == ord('"'):
-                    if len(stack) == 1 and expecting_key:
-                        collecting_key = True
-                        raw_key = bytearray(b'"')
-                    in_string = True
-                    escaped = False
-                    continue
-
-                if byte == ord("{"):
-                    stack.append(ord("}"))
-                elif byte == ord("["):
-                    stack.append(ord("]"))
-                elif byte in {ord("}"), ord("]")}:
-                    if not stack or stack[-1] != byte:
-                        return set()
-                    if len(stack) == 1:
-                        return duplicates if seen >= _MXNET_ROOT_GRAPH_KEYS else set()
-                    stack.pop()
-                elif byte == ord(",") and len(stack) == 1:
-                    expecting_key = True
-
-    return duplicates if seen >= _MXNET_ROOT_GRAPH_KEYS else set()
 
 
 class XGBoostScanner(BaseScanner):
@@ -542,10 +463,13 @@ class XGBoostScanner(BaseScanner):
 
     def _scan_json_model(self, path: str, result: ScanResult) -> None:
         """Scan XGBoost JSON model for security issues."""
+        from ..utils.file.detection import inspect_mxnet_symbol_root_keys
+
         file_size = os.path.getsize(path)
 
         try:
-            duplicate_mxnet_root_keys = _find_duplicate_mxnet_root_graph_keys(path)
+            with open(path, "rb") as f:
+                duplicate_mxnet_root_keys = inspect_mxnet_symbol_root_keys(f)
             with open(path, encoding="utf-8") as f:
                 model_data = json.load(f)
 
