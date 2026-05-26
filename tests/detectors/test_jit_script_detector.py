@@ -366,6 +366,8 @@ class TestJITScriptDetector:
             b"import builtins\nreplace = builtins.__dict__.update\nreplace({'eval': len})\nbuiltins.eval([])\n",
             b"import builtins\ngetattr(builtins, '__dict__').update({'eval': len})\nbuiltins.eval([])\n",
             b"import builtins\nnamespace = builtins.__dict__\nnamespace.update({'eval': len})\nbuiltins.eval([])\n",
+            b"import builtins\ndict.update(builtins.__dict__, {'eval': len})\nbuiltins.eval([])\n",
+            b"import builtins\nimport operator\noperator.setitem(builtins.__dict__, 'eval', len)\nbuiltins.eval([])\n",
             b"def payload():\n    eval = len\n    return eval([])\n",
             (
                 b"def payload():\n"
@@ -419,6 +421,11 @@ class TestJITScriptDetector:
             (
                 b"import builtins\nnamespace = builtins.__dict__\n"
                 b"namespace.update({'eval': builtins.exec})\nbuiltins.eval('pass')\n"
+            ),
+            b"import builtins\ndict.update(builtins.__dict__, {'eval': builtins.exec})\nbuiltins.eval('pass')\n",
+            (
+                b"import builtins\nimport operator\n"
+                b"operator.setitem(builtins.__dict__, 'eval', builtins.exec)\nbuiltins.eval('pass')\n"
             ),
         ],
     )
@@ -557,6 +564,14 @@ class TestJITScriptDetector:
                 b"def invoke(namespace=builtins.__dict__):\n"
                 b"    namespace.update({'eval': len})\n"
                 b"    return builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"replace = dict.update\n"
+                b"if swap:\n"
+                b"    replace = lambda target, values: None\n"
+                b"replace(builtins.__dict__, {'eval': len})\n"
+                b"builtins.eval('1 + 1')\n"
             ),
             (
                 b"import builtins\n"

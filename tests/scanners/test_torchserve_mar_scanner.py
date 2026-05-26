@@ -390,6 +390,12 @@ def test_scan_detects_implicit_builtins_handler_execution_primitive(
             b"    return builtins.eval([])\n"
         ),
         (
+            b"import builtins\n"
+            b"def handle(data, context):\n"
+            b"    dict.update(builtins.__dict__, {'eval': len})\n"
+            b"    return builtins.eval([])\n"
+        ),
+        (
             b"def handle(data, context):\n"
             b"    replace = globals()['__builtins__'].__setitem__\n"
             b"    replace('eval', len)\n"
@@ -503,6 +509,13 @@ def test_scan_allows_benign_builtin_shaped_handler_source(tmp_path: Path, handle
             b"import builtins\n"
             b"def handle(data, context):\n"
             b"    getattr(builtins, '__dict__').update({'eval': builtins.exec})\n"
+            b"    return builtins.eval('pass')\n",
+            "builtins.exec",
+        ),
+        (
+            b"import builtins\n"
+            b"def handle(data, context):\n"
+            b"    dict.update(builtins.__dict__, {'eval': builtins.exec})\n"
             b"    return builtins.eval('pass')\n",
             "builtins.exec",
         ),
