@@ -1095,10 +1095,11 @@ def test_scan_file_preserves_zip_findings_in_llamafile_polyglot(tmp_path: Path, 
         (b"", b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('id')\n"),
         (
             b"A" * (64 * 1024),
-            b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\ncmd = os.execute('id')\n",
+            b"4\n1\n3\nV 1\n17\ntorch.FloatTensor\ncmd = os.execute('id')\n",
         ),
+        (b"GGUFnot-a-valid-model", b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('id')\n"),
     ],
-    ids=["ascii", "binary", "late-ascii"],
+    ids=["ascii", "binary", "late-ascii-no-boundary", "decoy-gguf-before-binary"],
 )
 def test_scan_file_preserves_torch7_findings_in_llamafile_polyglot(
     tmp_path: Path,

@@ -27,6 +27,7 @@ GGUF_MARKER = b"GGUF"
 LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON = "llamafile_payload_scan_limited"
 LLAMAFILE_RUNTIME_PREVIEW_READ_REASON = "llamafile_runtime_preview_read_failed"
 LLAMAFILE_TORCH7_CARVE_FAILURE_REASON = "llamafile_torch7_payload_carve_failed"
+LLAMAFILE_TORCH7_ANALYSIS_INCOMPLETE_REASON = "llamafile_torch7_analysis_incomplete"
 TORCH7_SIGNATURE_WINDOW_BYTES = 4096
 
 ELF_MAGIC = b"\x7fELF"
@@ -238,7 +239,11 @@ class LlamafileScanner(BaseScanner):
                 },
             )
             try:
-                _, torch7_offset = self._find_embedded_payload_offsets(path_obj, self.max_payload_scan_bytes)
+                _, torch7_offset = self._find_embedded_payload_offsets(
+                    path_obj,
+                    self.max_payload_scan_bytes,
+                    stop_at_gguf=False,
+                )
             except OSError:
                 torch7_offset = None
             self._merge_polyglot_findings(path_obj, result, torch7_offset)
@@ -249,7 +254,13 @@ class LlamafileScanner(BaseScanner):
         self._scan_runtime_strings(path, b"\n".join(runtime_blobs), result)
 
         gguf_offset, torch7_offset = self._find_embedded_payload_offsets(path_obj, self.max_payload_scan_bytes)
-        payload_bytes_scanned = self._scan_embedded_payload(path_obj, result, gguf_offset)
+        payload_bytes_scanned, valid_gguf_payload = self._scan_embedded_payload(path_obj, result, gguf_offset)
+        if gguf_offset is not None and torch7_offset is None and not valid_gguf_payload:
+            _, torch7_offset = self._find_embedded_payload_offsets(
+                path_obj,
+                self.max_payload_scan_bytes,
+                stop_at_gguf=False,
+            )
         result.bytes_scanned += payload_bytes_scanned
         self._merge_polyglot_findings(path_obj, result, torch7_offset)
 
@@ -327,7 +338,7 @@ class LlamafileScanner(BaseScanner):
             },
         )
 
-    def _scan_embedded_payload(self, path: Path, result: ScanResult, gguf_offset: int | None) -> int:
+    def _scan_embedded_payload(self, path: Path, result: ScanResult, gguf_offset: int | None) -> tuple[int, bool]:
         if gguf_offset is None:
             file_size = self.get_file_size(str(path))
             details = {"max_scan_bytes": self.max_payload_scan_bytes}
@@ -347,7 +358,7 @@ class LlamafileScanner(BaseScanner):
                 location=str(path),
                 details=details,
             )
-            return 0
+            return 0, False
 
         file_size = self.get_file_size(str(path))
         payload_available = max(0, file_size - gguf_offset)
@@ -385,7 +396,7 @@ class LlamafileScanner(BaseScanner):
                 location=f"{path} (llamafile:{gguf_offset})",
                 details={"offset": gguf_offset, "available_bytes": payload_available},
             )
-            return 0
+            return 0, False
 
         carved_path = self._carve_payload(path, gguf_offset, carve_size)
         if carved_path is None:
@@ -396,7 +407,7 @@ class LlamafileScanner(BaseScanner):
                 severity=IssueSeverity.CRITICAL,
                 location=f"{path} (llamafile:{gguf_offset})",
             )
-            return 0
+            return 0, False
 
         try:
             from modelaudit.scanners.gguf_scanner import GgufScanner
@@ -409,11 +420,11 @@ class LlamafileScanner(BaseScanner):
                     severity=IssueSeverity.WARNING,
                     location=f"{path} (llamafile:{gguf_offset})",
                 )
-                return carve_size
+                return carve_size, False
 
             embedded_result = GgufScanner(config=self.config).scan(str(carved_path))
             self._append_embedded_findings(result, embedded_result, gguf_offset)
-            return carve_size
+            return carve_size, embedded_result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
         finally:
             carved_path.unlink(missing_ok=True)
 
@@ -479,10 +490,10 @@ class LlamafileScanner(BaseScanner):
         scanner = Torch7Scanner(config=self.config)
         payload_available = max(0, self.get_file_size(str(path)) - offset)
         carve_size = min(payload_available, scanner.max_scan_bytes + 1)
-        result.metadata["embedded_torch7_offset"] = offset
-        result.metadata["embedded_torch7_size"] = carve_size
         carved_path = self._carve_payload(path, offset, carve_size, suffix=".t7")
         if carved_path is None:
+            result.metadata["embedded_torch7_offset"] = offset
+            result.metadata["embedded_torch7_size"] = carve_size
             self._mark_inconclusive(result, LLAMAFILE_TORCH7_CARVE_FAILURE_REASON)
             result.add_check(
                 name="Llamafile Embedded Torch7 Payload Carve",
@@ -494,25 +505,41 @@ class LlamafileScanner(BaseScanner):
             return
 
         try:
+            if not scanner.can_handle(str(carved_path)):
+                return
+
+            result.metadata["embedded_torch7_offset"] = offset
+            result.metadata["embedded_torch7_size"] = carve_size
             embedded_result = scanner.scan(str(carved_path))
-            embedded_location = f"{path} (llamafile:{offset})"
-            for check in embedded_result.checks:
-                check.location = embedded_location
-                check.details = {
-                    **check.details,
-                    "embedded_offset": offset,
-                    "embedded_scanner": embedded_result.scanner_name,
-                }
-            for issue in embedded_result.issues:
-                issue.location = embedded_location
-                issue.details = {
-                    **issue.details,
-                    "embedded_offset": offset,
-                    "embedded_scanner": embedded_result.scanner_name,
-                }
-            result.merge(embedded_result)
+            self._append_torch7_findings(result, embedded_result, offset)
         finally:
             carved_path.unlink(missing_ok=True)
+
+    def _append_torch7_findings(self, result: ScanResult, embedded: ScanResult, offset: int) -> None:
+        embedded_location = f"{self.current_file_path} (llamafile:{offset})"
+        for check in embedded.checks:
+            check.location = embedded_location
+            check.details = {
+                **check.details,
+                "embedded_offset": offset,
+                "embedded_scanner": embedded.scanner_name,
+            }
+        for issue in embedded.issues:
+            issue.location = embedded_location
+            issue.details = {
+                **issue.details,
+                "embedded_offset": offset,
+                "embedded_scanner": embedded.scanner_name,
+            }
+
+        result.checks.extend(embedded.checks)
+        result.issues.extend(embedded.issues)
+        result.bytes_scanned += embedded.bytes_scanned
+        result.metadata["embedded_torch7_metadata"] = dict(embedded.metadata)
+        if embedded.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME or (
+            not embedded.success and not embedded.has_errors
+        ):
+            self._mark_inconclusive(result, LLAMAFILE_TORCH7_ANALYSIS_INCOMPLETE_REASON)
 
     def _carve_payload(self, path: Path, offset: int, size: int, suffix: str = ".gguf") -> Path | None:
         try:
@@ -532,12 +559,18 @@ class LlamafileScanner(BaseScanner):
             return None
 
     @staticmethod
-    def _find_embedded_payload_offsets(path: Path, max_scan_bytes: int) -> tuple[int | None, int | None]:
-        """Find a primary GGUF payload and preceding Torch7 polyglot payload in one bounded pass."""
+    def _find_embedded_payload_offsets(
+        path: Path,
+        max_scan_bytes: int,
+        *,
+        stop_at_gguf: bool = True,
+    ) -> tuple[int | None, int | None]:
+        """Find GGUF and Torch7 payload signatures in one bounded pass."""
         search_limit = min(path.stat().st_size, max_scan_bytes)
         overlap = max(len(GGUF_MARKER) - 1, TORCH7_SIGNATURE_WINDOW_BYTES - 1)
         scanned = 0
         carry = b""
+        gguf_offset: int | None = None
         torch7_offset: int | None = None
 
         with path.open("rb") as handle:
@@ -549,20 +582,28 @@ class LlamafileScanner(BaseScanner):
 
                 haystack = carry + chunk
                 window_offset = scanned - len(carry)
-                gguf_relative_index = haystack.find(GGUF_MARKER)
-                torch7_window = haystack if gguf_relative_index == -1 else haystack[:gguf_relative_index]
+                if gguf_offset is None:
+                    gguf_relative_index = haystack.find(GGUF_MARKER)
+                    if gguf_relative_index != -1:
+                        gguf_offset = window_offset + gguf_relative_index
+                else:
+                    gguf_relative_index = -1
+
                 if torch7_offset is None:
+                    torch7_window = (
+                        haystack if not stop_at_gguf or gguf_relative_index == -1 else haystack[:gguf_relative_index]
+                    )
                     torch7_relative_index = find_structural_torch7_offset(torch7_window)
                     if torch7_relative_index is not None:
                         torch7_offset = window_offset + torch7_relative_index
 
-                if gguf_relative_index != -1:
-                    return window_offset + gguf_relative_index, torch7_offset
+                if stop_at_gguf and gguf_relative_index != -1:
+                    return gguf_offset, torch7_offset
 
                 carry = haystack[-overlap:] if overlap > 0 else b""
                 scanned += len(chunk)
 
-        return None, torch7_offset
+        return gguf_offset, torch7_offset
 
     @staticmethod
     def _find_casefolded_marker_offset(

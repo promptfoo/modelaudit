@@ -1261,31 +1261,25 @@ def _is_tensorflow_metagraph_file(path: str) -> bool:
 
 def _find_torch7_ascii_object_signature_offset(prefix: bytes) -> int | None:
     """Return the offset of a Torch7 ASCII serialized Torch object header."""
-    fields = prefix.splitlines()
-    field_offsets: list[int] = []
-    position = 0
-    for field in prefix.splitlines(keepends=True):
-        field_offsets.append(position)
-        position += len(field)
-
-    for field_offset in range(len(fields) - 5):
-        if fields[field_offset] != b"4":
+    for match in re.finditer(rb"4(?:\r\n|[\r\n])", prefix):
+        fields = prefix[match.start() :].splitlines()
+        if len(fields) < 6:
             continue
         try:
-            object_index = int(fields[field_offset + 1])
-            version_length = int(fields[field_offset + 2])
-            class_name_length = int(fields[field_offset + 4])
+            object_index = int(fields[1])
+            version_length = int(fields[2])
+            class_name_length = int(fields[4])
         except ValueError:
             continue
 
-        version = fields[field_offset + 3]
-        class_name = fields[field_offset + 5]
+        version = fields[3]
+        class_name = fields[5]
         if object_index <= 0 or version_length != len(version) or class_name_length != len(class_name):
             continue
         if re.fullmatch(rb"V [+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", version) is None:
             continue
         if class_name.startswith((b"torch.", b"nn.", b"cunn.", b"cutorch.")):
-            return field_offsets[field_offset]
+            return match.start()
     return None
 
 

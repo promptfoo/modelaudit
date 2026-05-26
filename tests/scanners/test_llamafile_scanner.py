@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import struct
 from pathlib import Path
 
@@ -149,6 +150,33 @@ def test_llamafile_scanner_benign_sample_has_no_high_severity(tmp_path: Path) ->
     ]
     assert high_severity == []
     assert result.metadata.get("embedded_payload_offset") is not None
+
+
+def test_llamafile_torch7_polyglot_preserves_outer_integrity_metadata(tmp_path: Path) -> None:
+    binary = tmp_path / "embedded-torch7.llamafile"
+    binary.write_bytes(
+        _build_llamafile_blob(
+            embedded_payload=b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('id')\n",
+        )
+    )
+    expected_size = binary.stat().st_size
+    expected_sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata["file_size"] == expected_size
+    assert result.metadata["file_hashes"]["sha256"] == expected_sha256
+
+
+def test_llamafile_ignores_truncated_embedded_torch7_marker(tmp_path: Path) -> None:
+    binary = tmp_path / "truncated-torch7-marker.llamafile"
+    binary.write_bytes(_build_llamafile_blob(embedded_payload=b"T7\x00\x00"))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.success is True
+    assert "embedded_torch7_offset" not in result.metadata
+    assert not any(check.name.startswith("Torch7 ") for check in result.checks)
 
 
 def test_llamafile_runtime_preview_read_failure_is_inconclusive_not_security_finding(
