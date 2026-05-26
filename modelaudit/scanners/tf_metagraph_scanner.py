@@ -341,7 +341,26 @@ class TensorFlowMetaGraphScanner(BaseScanner):
             result.finish(success=False)
             return result
 
-        metagraph, parse_error = _parse_metagraph_preserving_partial(content)
+        try:
+            metagraph, parse_error = _parse_metagraph_preserving_partial(content)
+        except Exception as e:
+            mark_inconclusive_scan_result(result, METAGRAPH_PARSE_INCONCLUSIVE_REASON)
+            result.add_check(
+                name="MetaGraph Protobuf Parsing",
+                passed=False,
+                message=f"Invalid or corrupt TensorFlow MetaGraph protobuf: {e}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": METAGRAPH_PARSE_INCONCLUSIVE_REASON,
+                },
+            )
+            result.finish(success=False)
+            return result
+
         if parse_error is not None:
             mark_inconclusive_scan_result(result, METAGRAPH_PARSE_INCONCLUSIVE_REASON)
             result.add_check(

@@ -1361,14 +1361,15 @@ def _is_tensorflow_metagraph_file(path: str) -> bool:
         if not metagraph.HasField("graph_def"):
             return False
 
-        if parse_failed:
-            return any(node.name and node.op for node in metagraph.graph_def.node) or any(
-                node.name and node.op for function in metagraph.graph_def.library.function for node in function.node_def
-            )
-
         graph_node_count = len(metagraph.graph_def.node)
         function_node_count = sum(len(function.node_def) for function in metagraph.graph_def.library.function)
         collection_count = len(metagraph.collection_def)
+        if parse_failed:
+            return (
+                any(node.op for node in metagraph.graph_def.node)
+                or any(node.op for function in metagraph.graph_def.library.function for node in function.node_def)
+                or collection_count > 0
+            )
         return graph_node_count > 0 or function_node_count > 0 or collection_count > 0
     except Exception:
         return False
