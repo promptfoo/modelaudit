@@ -143,8 +143,42 @@ class TestTarScanner:
     @pytest.mark.parametrize(
         "payload",
         [
+            b"import os\nos.system.__call__('echo hidden')\n",
+            b"import os\ninvoke = os.system.__call__\nos.system = len\ninvoke('echo hidden')\n",
             b"import os\nrun = os.system\nos.system = len\nrun('echo hidden')\n",
             b"import os\nfrom os import system as run\nos.system = len\nrun('echo hidden')\n",
+            b"import os\nrun = os.system\nsetattr(os, 'system', len)\nrun('echo hidden')\n",
+            b"import os\nrun = os.system\nos.__dict__.update({'system': len})\nrun('echo hidden')\n",
+            b"import os\nif replace:\n    os.__dict__.update({'system': len})\nos.system('echo hidden')\n",
+            (
+                b"import os\nif swap:\n    os = make_module()\n"
+                b"os.__dict__.update({'system': len})\nos.system('echo hidden')\n"
+            ),
+            b"import os\nif swap:\n    os = make_module()\nsetattr(os, 'system', len)\nos.system('echo hidden')\n",
+            b"import os\nif swap:\n    os = make_module()\nos.system = len\nos.system('echo hidden')\n",
+            (
+                b"import os\nif swap:\n    os = make_module()\ntarget = os\n"
+                b"target.__dict__.update({'system': len})\nos.system('echo hidden')\n"
+            ),
+            (
+                b"import os\nif swap:\n    os = make_module()\ntarget = os\n"
+                b"setattr(target, 'system', len)\nos.system('echo hidden')\n"
+            ),
+            (
+                b"import os\nif swap:\n    os = make_module()\ntarget = os\n"
+                b"target.system = len\nos.system('echo hidden')\n"
+            ),
+            (
+                b"import os\ndef hide(target=os):\n"
+                b"    target.__dict__.update({'system': len})\n"
+                b"    os.system('echo hidden')\n"
+            ),
+            (
+                b"import os\n"
+                b"setattr = lambda target, key, value: None\n"
+                b"setattr(os, 'system', len)\n"
+                b"os.system('echo hidden')\n"
+            ),
         ],
     )
     def test_scan_tar_preserves_captured_dangerous_callable_before_overwrite(
@@ -166,8 +200,18 @@ class TestTarScanner:
     @pytest.mark.parametrize(
         "payload",
         [
+            b"import os\nos.system = len\nos.system.__call__([])\n",
+            b"import os\nos.system = len\ninvoke = os.system.__call__\ninvoke([])\n",
             b"import os\nos.system = len\nrun = os.system\nrun([])\n",
             b"import os\nos.system = len\nfrom os import system as run\nrun([])\n",
+            b"import os\nsetattr(os, 'system', len)\nos.system([])\n",
+            b"import os\nreplace = setattr\nreplace(os, 'system', len)\nos.system([])\n",
+            b"import os\nsetattr(os, 'system', len)\nrun = os.system\nrun([])\n",
+            b"import os\nos.__dict__.__setitem__('system', len)\nos.system([])\n",
+            b"import os\nos.__dict__.update({'system': len})\nos.system([])\n",
+            b"import os\nvars(os).update({'system': len})\nos.system([])\n",
+            b"import os\nreplace = os.__dict__.update\nreplace({'system': len})\nos.system([])\n",
+            b"import os\nos.__dict__.update({'system': len})\nrun = os.system\nrun([])\n",
         ],
     )
     def test_scan_tar_allows_callable_captured_after_safe_overwrite(self, tmp_path: Path, payload: bytes) -> None:
@@ -197,6 +241,27 @@ class TestTarScanner:
         assert len(python_checks) == 1
         assert python_checks[0].status == CheckStatus.FAILED
         assert python_checks[0].severity == IssueSeverity.WARNING
+        assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            b"import os\nimport subprocess\nsetattr(os, 'system', subprocess.run)\nos.system(['id'])\n",
+            b"import os\nimport subprocess\nos.__dict__.update({'system': subprocess.run})\nos.system(['id'])\n",
+        ],
+    )
+    def test_scan_tar_reports_dangerous_setattr_replacement(self, tmp_path: Path, payload: bytes) -> None:
+        archive_path = tmp_path / "model_bundle.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
         assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
     def test_scan_tar_flags_builtins_getattr_keyword_call_dangerous_python_member(self, tmp_path: Path) -> None:
@@ -234,6 +299,11 @@ class TestTarScanner:
             (b"namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n"),
             b"lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
             b"lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
+            (
+                b"run = globals()['__builtins__']['eval']\n"
+                b"globals()['__builtins__']['eval'] = len\n"
+                b"run.__call__('1 + 1')\n"
+            ),
             (b"run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun('1 + 1')\n"),
             (
                 b"run = globals()['__builtins__']['eval']\n"
@@ -290,6 +360,7 @@ class TestTarScanner:
             b"mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
             b"globals()['__builtins__'].__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
             b"globals()['__builtins__'].update({'eval': len})\nglobals()['__builtins__']['eval']([])\n",
+            b"import builtins\nbuiltins.__dict__.update({'eval': len})\nbuiltins.eval([])\n",
             (
                 b"replace = globals()['__builtins__'].__setitem__\n"
                 b"replace('eval', len)\n"
@@ -301,6 +372,7 @@ class TestTarScanner:
                 b"globals()['__builtins__']['eval']([])\n"
             ),
             (b"globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
+            (b"globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun.__call__([])\n"),
             (b"globals()['__builtins__'].__setitem__('eval', len)\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
             (
                 b"replace = globals()['__builtins__'].__setitem__\n"
@@ -322,34 +394,45 @@ class TestTarScanner:
         assert not any(check.name == "Python Archive Member Security" for check in result.checks)
 
     @pytest.mark.parametrize(
-        "payload",
+        ("payload", "dangerous_name"),
         [
             (
                 b"namespace = globals()\n"
                 b"namespace['__builtins__']['eval'] = __builtins__['exec']\n"
-                b"namespace['__builtins__']['eval']('pass')\n"
+                b"namespace['__builtins__']['eval']('pass')\n",
+                "__builtins__.exec",
             ),
             (
                 b"globals()['__builtins__'].__setitem__('eval', __builtins__['exec'])\n"
-                b"globals()['__builtins__']['eval']('pass')\n"
+                b"globals()['__builtins__']['eval']('pass')\n",
+                "__builtins__.exec",
             ),
             (
                 b"globals()['__builtins__'].update({'eval': __builtins__['exec']})\n"
-                b"globals()['__builtins__']['eval']('pass')\n"
+                b"globals()['__builtins__']['eval']('pass')\n",
+                "__builtins__.exec",
             ),
             (
                 b"replace = globals()['__builtins__'].__setitem__\n"
                 b"replace('eval', __builtins__['exec'])\n"
-                b"globals()['__builtins__']['eval']('pass')\n"
+                b"globals()['__builtins__']['eval']('pass')\n",
+                "__builtins__.exec",
             ),
             (
                 b"replace = globals()['__builtins__'].update\n"
                 b"replace({'eval': __builtins__['exec']})\n"
-                b"globals()['__builtins__']['eval']('pass')\n"
+                b"globals()['__builtins__']['eval']('pass')\n",
+                "__builtins__.exec",
+            ),
+            (
+                b"import builtins\nbuiltins.__dict__.update({'eval': builtins.exec})\nbuiltins.eval('pass')\n",
+                "builtins.exec",
             ),
         ],
     )
-    def test_scan_tar_reports_dangerous_builtin_reassignment(self, tmp_path: Path, payload: bytes) -> None:
+    def test_scan_tar_reports_dangerous_builtin_reassignment(
+        self, tmp_path: Path, payload: bytes, dangerous_name: str
+    ) -> None:
         archive_path = tmp_path / "model_bundle.tar"
         with tarfile.open(archive_path, "w") as archive:
             info = tarfile.TarInfo("handler.py")
@@ -362,7 +445,7 @@ class TestTarScanner:
         assert len(python_checks) == 1
         assert python_checks[0].status == CheckStatus.FAILED
         assert python_checks[0].rule_code == "S104"
-        assert python_checks[0].details["reason"] == "high-risk calls: __builtins__.exec"
+        assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
 
     def test_scan_tar_flags_aliased_getattr_helper_dangerous_python_member(self, tmp_path: Path) -> None:
         """Aliased getattr helpers and module aliases should still resolve risky calls."""
