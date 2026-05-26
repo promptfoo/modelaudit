@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - classify incomplete ExecuTorch format scans and embedded Python members without misreporting eval/exec findings
 - classify corrupt magic-confirmed TAR parsing as incomplete analysis rather than a security finding
 - preserve PyTorch ZIP findings when later analysis fails and classify parse failures as incomplete coverage
+- classify Keras ZIP archive-read failures as incomplete coverage while preserving earlier security findings
 
 ## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
 
