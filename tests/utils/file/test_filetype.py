@@ -15,6 +15,7 @@ from typing import cast
 import pytest
 
 from modelaudit.scanner_registry_metadata import get_extension_format_map
+from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
     PROTO0_1_MAX_PROBE_BYTES,
@@ -28,7 +29,7 @@ from modelaudit.utils.file.detection import (
     validate_file_type,
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
-from tests.helpers import create_mock_onnx
+from tests.helpers import create_mock_mxnet_symbol, create_mock_onnx
 from tests.helpers.file_creators import create_v7_tar_archive
 
 
@@ -311,6 +312,70 @@ def test_detect_format_from_extension_mxnet_symbol(tmp_path: Path) -> None:
     symbol_path.write_text('{"nodes":[{"op":"null","name":"data","inputs":[]}],"arg_nodes":[0],"heads":[[0,0,0]]}')
 
     assert detect_format_from_extension(str(symbol_path)) == "mxnet"
+
+
+def test_detect_file_format_routes_renamed_mxnet_symbol_and_rejects_near_match(tmp_path: Path) -> None:
+    model_path = create_mock_mxnet_symbol(tmp_path / "model.jpg")
+    near_match = tmp_path / "graph.jpg"
+    near_match.write_text(
+        '{"nodes":[{"op":"Custom"}],"arg_nodes":[],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "mxnet"
+    assert detect_file_format_from_magic(str(model_path)) == "mxnet"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "mxnet"
+    assert detect_file_format(str(near_match)) == "unknown"
+    assert detect_file_format_from_magic(str(near_match)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+
+
+def test_detect_file_format_routes_renamed_mxnet_after_leading_whitespace(tmp_path: Path) -> None:
+    model_path = tmp_path / "whitespace.jpg"
+    model_path.write_text(
+        (" " * 1024) + '{"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "mxnet"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "mxnet"
+
+
+def test_detect_oversized_renamed_mxnet_requires_top_level_graph_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    padding = "x" * 256
+    delayed_nodes = tmp_path / "delayed-nodes.jpg"
+    delayed_nodes.write_text(
+        '{"arg_nodes":[0],"heads":[[0,0,0]],"nodes":[{"attrs":"' + padding + '","op":"Custom","name":"load"}]}',
+        encoding="utf-8",
+    )
+    unrelated = tmp_path / "unrelated.jpg"
+    unrelated.write_text(
+        '{"nodes":[],"op":"Custom","name":"load","attrs":"' + padding + '"}',
+        encoding="utf-8",
+    )
+    nested_markers = tmp_path / "nested-markers.jpg"
+    nested_markers.write_text(
+        '{"metadata":{"nodes":[],"arg_nodes":[],"heads":[]},"padding":"' + padding + '"}',
+        encoding="utf-8",
+    )
+    string_markers = tmp_path / "string-markers.jpg"
+    string_markers.write_text(
+        '{"description":"\\"nodes\\": [] \\"arg_nodes\\": [] \\"heads\\": []","padding":"' + padding + '"}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(delayed_nodes)) == "mxnet"
+    assert detect_file_format_for_skip_filter(str(delayed_nodes)) == "mxnet"
+    assert detect_file_format(str(unrelated)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(unrelated)) == "unknown"
+    assert detect_file_format(str(nested_markers)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(nested_markers)) == "unknown"
+    assert detect_file_format(str(string_markers)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(string_markers)) == "unknown"
 
 
 def test_detect_r_serialized_magic_headers(tmp_path: Path) -> None:

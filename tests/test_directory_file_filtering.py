@@ -15,6 +15,7 @@ import pytest
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.utils.file.detection import LLAMAFILE_ROUTE_SCAN_BYTES, LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
 from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
+from tests.helpers import create_mock_mxnet_symbol
 
 
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
@@ -306,6 +307,19 @@ class TestDirectoryFileFiltering:
         results = scan_model_directory_or_file(str(tmp_path))
 
         assert results["files_scanned"] == 0
+
+    def test_disguised_malicious_mxnet_symbol_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should preserve renamed MXNet symbol graphs for analysis."""
+        disguised_symbol = create_mock_mxnet_symbol(
+            tmp_path / "model.jpg",
+            custom_library="../../tmp/libevil.so",
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "mxnet" in results.scanner_names
+        assert any(str(disguised_symbol) in (issue.location or "") for issue in results.issues)
 
     def test_disguised_torch7_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         """Directory scans should preserve signature-valid Torch7 payloads despite misleading suffixes."""

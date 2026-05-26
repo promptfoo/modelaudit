@@ -139,11 +139,13 @@ _XML_MODEL_ROOT_FORMATS = {
     "pmml": "pmml",
 }
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
+MXNET_SYMBOL_SIGNATURE_READ_BYTES = 10 * 1024 * 1024
 LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT = "llamafile_routing_inconclusive"
 NEMO_ROUTING_INCONCLUSIVE_FORMAT = "nemo_routing_inconclusive"
 XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT = "xgboost_ubjson_routing_inconclusive"
 EXECUTABLE_ZIP_POLYGLOT_FORMAT = "executable_zip_polyglot"
 _XGBOOST_UBJSON_ROUTE_READ_BYTES = 256 * 1024
+_MXNET_SYMBOL_REQUIRED_ARRAY_KEYS = frozenset({"nodes", "arg_nodes", "heads"})
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -315,6 +317,142 @@ def _could_be_xml_prefix(prefix: bytes) -> bool:
     """Return whether a bounded prefix plausibly begins an XML document."""
     trimmed = prefix[3:] if prefix.startswith(b"\xef\xbb\xbf") else prefix
     return trimmed.lstrip().startswith(b"<")
+
+
+def has_mxnet_symbol_graph_structure(payload: object) -> bool:
+    """Return whether decoded JSON has the minimum MXNet symbol graph contract."""
+    if not isinstance(payload, dict):
+        return False
+
+    nodes = payload.get("nodes")
+    arg_nodes = payload.get("arg_nodes")
+    heads = payload.get("heads")
+    if not isinstance(nodes, list) or not isinstance(arg_nodes, list) or not isinstance(heads, list):
+        return False
+    if not nodes:
+        return False
+
+    return any(
+        isinstance(node, dict) and isinstance(node.get("op"), str) and isinstance(node.get("name"), str)
+        for node in nodes
+    )
+
+
+def _top_level_json_array_keys(prefix: bytes) -> set[str]:
+    """Return top-level JSON object keys whose sampled values begin with arrays."""
+    keys: set[str] = set()
+    cursor = 0
+    prefix_length = len(prefix)
+    while cursor < prefix_length and chr(prefix[cursor]).isspace():
+        cursor += 1
+    if cursor >= prefix_length or prefix[cursor] != ord("{"):
+        return keys
+
+    cursor += 1
+    depth = 1
+    expecting_key = True
+
+    while cursor < prefix_length and depth > 0:
+        byte = prefix[cursor]
+        if chr(byte).isspace():
+            cursor += 1
+            continue
+
+        if byte == ord('"'):
+            raw_key = bytearray()
+            cursor += 1
+            escaped = False
+            while cursor < prefix_length:
+                current = prefix[cursor]
+                if escaped:
+                    raw_key.append(current)
+                    escaped = False
+                elif current == ord("\\"):
+                    escaped = True
+                elif current == ord('"'):
+                    break
+                else:
+                    raw_key.append(current)
+                cursor += 1
+            if cursor >= prefix_length:
+                break
+
+            cursor += 1
+            if depth == 1 and expecting_key:
+                value_cursor = cursor
+                while value_cursor < prefix_length and chr(prefix[value_cursor]).isspace():
+                    value_cursor += 1
+                if value_cursor < prefix_length and prefix[value_cursor] == ord(":"):
+                    value_cursor += 1
+                    while value_cursor < prefix_length and chr(prefix[value_cursor]).isspace():
+                        value_cursor += 1
+                    if value_cursor < prefix_length and prefix[value_cursor] == ord("["):
+                        try:
+                            keys.add(raw_key.decode("utf-8"))
+                            if _MXNET_SYMBOL_REQUIRED_ARRAY_KEYS.issubset(keys):
+                                return keys
+                        except UnicodeDecodeError:
+                            pass
+                    cursor = value_cursor
+                    expecting_key = False
+                continue
+            continue
+
+        if byte in {ord("{"), ord("[")}:
+            depth += 1
+            expecting_key = False
+        elif byte in {ord("}"), ord("]")}:
+            depth -= 1
+        elif depth == 1 and byte == ord(","):
+            expecting_key = True
+        cursor += 1
+
+    return keys
+
+
+def _has_mxnet_symbol_top_level_array_keys(prefix: bytes) -> bool:
+    return _MXNET_SYMBOL_REQUIRED_ARRAY_KEYS.issubset(_top_level_json_array_keys(prefix))
+
+
+def is_mxnet_symbol_graph_file(path: str | Path) -> bool:
+    """Recognize JSON MXNet symbol graphs under misleading filenames.
+
+    Large graph-like JSON files are preserved for the MXNet scanner, which
+    already fails closed when its bounded parser cannot complete analysis.
+    """
+    file_path = Path(path)
+    if not file_path.is_file():
+        return False
+
+    try:
+        file_size = file_path.stat().st_size
+        if file_size < 4:
+            return False
+
+        read_size = min(file_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
+        with file_path.open("rb") as handle:
+            prefix = handle.read(read_size)
+            if not prefix.lstrip().startswith(b"{"):
+                return False
+    except OSError:
+        return False
+
+    if not _has_mxnet_symbol_top_level_array_keys(prefix):
+        return False
+    if file_size > MXNET_SYMBOL_SIGNATURE_READ_BYTES:
+        return True
+
+    try:
+        payload = json.loads(prefix)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return has_mxnet_symbol_graph_structure(payload)
+
+
+def _could_be_renamed_mxnet_symbol(file_path: Path, prefix: bytes) -> bool:
+    """Return whether content-based MXNet routing is needed for this path."""
+    trimmed_prefix = prefix.lstrip()
+    return file_path.suffix.lower() != ".json" and (trimmed_prefix.startswith(b"{") or not trimmed_prefix)
 
 
 _MIN_BINARY_PICKLE_PROTOCOL = 1
@@ -1449,6 +1587,12 @@ def detect_format_from_magic_bytes(
 
     if file_path is not None and _looks_like_onnx_model_candidate_file(file_path, file_size, magic4):
         return "onnx"
+    if (
+        file_path is not None
+        and _could_be_renamed_mxnet_symbol(file_path, magic16)
+        and is_mxnet_symbol_graph_file(file_path)
+    ):
+        return "mxnet"
 
     # Check longer magic sequences
     match magic8:
@@ -1530,6 +1674,8 @@ def detect_file_format_from_magic(path: str) -> str:
                     return tar_route
             if format_result != "unknown":
                 return format_result
+            if _could_be_renamed_mxnet_symbol(file_path, header) and is_mxnet_symbol_graph_file(file_path):
+                return "mxnet"
 
             # Protocol 0/1 pickle payloads can evade short magic-byte checks.
             # Probe a bounded prefix and require a valid opcode stream.
@@ -1592,6 +1738,8 @@ def detect_file_format_from_magic(path: str) -> str:
 
     if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
         return "onnx"
+    if _could_be_renamed_mxnet_symbol(file_path, magic8) and is_mxnet_symbol_graph_file(file_path):
+        return "mxnet"
 
     return "unknown"
 
@@ -1681,6 +1829,8 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             return format_result
         if format_result != "unknown":
             return format_result
+        if _could_be_renamed_mxnet_symbol(file_path, prefix) and is_mxnet_symbol_graph_file(file_path):
+            return "mxnet"
 
         if _could_start_proto0_or_1_pickle(prefix):
             max_probe_size = min(size, PROTO0_1_MAX_PROBE_BYTES)
@@ -1768,6 +1918,8 @@ def detect_file_format(path: str) -> str:
         return "numpy"
     if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
         return "onnx"
+    if _could_be_renamed_mxnet_symbol(file_path, header) and is_mxnet_symbol_graph_file(file_path):
+        return "mxnet"
 
     # Check first 8 bytes for HDF5 magic
     hdf5_magic = b"\x89HDF\r\n\x1a\n"

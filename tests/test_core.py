@@ -19,11 +19,12 @@ from modelaudit import core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import normalize_material_scan_config
 from modelaudit.core import scan_file, scan_model_directory_or_file
-from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner
+from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner, mxnet_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
+from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import LLAMAFILE_ROUTE_SCAN_BYTES, LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
-from tests.helpers import create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
+from tests.helpers import create_mock_gguf, create_mock_mxnet_symbol, create_mock_onnx, create_mock_pytorch_zip
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
 
@@ -1940,6 +1941,43 @@ def test_scan_file_routes_misnamed_gguf_by_header(tmp_path: Path) -> None:
 
     assert result.scanner_name == "gguf"
     assert result.metadata["format"] == "gguf"
+
+
+def test_scan_file_routes_misnamed_mxnet_symbol_and_detects_custom_library(tmp_path: Path) -> None:
+    disguised_symbol = create_mock_mxnet_symbol(
+        tmp_path / "model.jpg",
+        custom_library="../../tmp/libevil.so",
+    )
+
+    result = scan_file(str(disguised_symbol))
+
+    assert result.scanner_name == "mxnet"
+    assert any(
+        issue.message == "Suspicious library reference in MXNet graph attributes"
+        and issue.details.get("attribute") == "library"
+        for issue in result.issues
+    )
+
+
+def test_scan_file_fails_closed_for_renamed_oversized_mxnet_symbol_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    monkeypatch.setattr(mxnet_scanner, "MAX_SYMBOL_READ_BYTES", 128)
+    disguised_symbol = tmp_path / "large.jpg"
+    disguised_symbol.write_text(
+        '{"nodes":[{"op":"Custom","name":"custom_loader"}],"arg_nodes":[0],"heads":[[0,0,0]],"padding":"'
+        + ("x" * 256)
+        + '"}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(disguised_symbol))
+
+    assert result.scanner_name == "mxnet"
+    assert result.success is False
+    assert "mxnet_symbol_truncated" in result.metadata["scan_outcome_reasons"]
 
 
 def test_scan_file_routes_misnamed_ggml_by_header(tmp_path: Path) -> None:
