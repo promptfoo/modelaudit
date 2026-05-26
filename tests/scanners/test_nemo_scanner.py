@@ -1014,7 +1014,7 @@ class TestCVE202523304HydraTarget:
             for check in result.checks
         )
 
-    def test_core_does_not_promote_forward_hardlink_root_config(self, tmp_path: Path) -> None:
+    def test_core_routes_forward_hardlink_root_config(self, tmp_path: Path) -> None:
         path = tmp_path / "forward-hardlink-config.jpg"
         with tarfile.open(path, "w") as archive:
             link_info = tarfile.TarInfo("model_config.yaml")
@@ -1025,8 +1025,13 @@ class TestCVE202523304HydraTarget:
 
         result = scan_file(str(path), config={"cache_scan_results": False})
 
-        assert result.scanner_name == "tar"
-        assert not any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
+        assert result.scanner_name == "nemo"
+        assert any(
+            check.name == "CVE-2025-23304: Dangerous Hydra _target_"
+            and check.status == CheckStatus.FAILED
+            and check.details["target"] == "os.system"
+            for check in result.checks
+        )
 
     @pytest.mark.parametrize(
         ("config_name", "payload_name"),

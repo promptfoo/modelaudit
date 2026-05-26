@@ -1228,8 +1228,11 @@ def _resolve_safe_tar_link_target_name(member: tarfile.TarInfo) -> str | None:
     if PurePosixPath(link_name).is_absolute() or re.match(r"^[A-Za-z]:/", link_name):
         return None
 
-    member_dir = posixpath.dirname(member.name.replace("\\", "/"))
-    target_name = posixpath.normpath(posixpath.join(member_dir, link_name))
+    if member.islnk():
+        target_name = link_name
+    else:
+        member_dir = posixpath.dirname(member.name.replace("\\", "/"))
+        target_name = posixpath.join(member_dir, link_name)
     return _normalize_safe_tar_member_name(target_name)
 
 
@@ -1262,7 +1265,7 @@ def _detect_tar_route(path: str) -> str | None:
                 target_name = _resolve_safe_tar_link_target_name(member)
                 if target_name in regular_member_names:
                     return "nemo"
-                if member.issym() and target_name is not None:
+                if target_name is not None:
                     linked_root_config_targets.add(target_name)
     except (OSError, tarfile.TarError):
         return None
