@@ -970,6 +970,26 @@ def test_scan_nested_file_runs_xgboost_checks_for_renamed_mxnet_json_overlap(tmp
     assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
 
 
+def test_scan_nested_file_fails_closed_for_xgboost_shadowed_mxnet_nodes(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "polyglot.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]],"nodes":[]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "XGBoost / MXNet JSON Routing" and check.details.get("duplicate_root_keys") == ["nodes"]
+        for check in result.checks
+    )
+
+
 def test_scan_nested_file_mxnet_only_selection_preserves_overlap_security_analysis(tmp_path: Path) -> None:
     extracted_member = tmp_path / "polyglot.json"
     extracted_member.write_text(

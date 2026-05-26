@@ -52,6 +52,32 @@ XGBOOST_CONTENT_ROUTED_JSON_CONFIG_KEY = "_xgboost_content_routed_json"
 XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY = "_xgboost_content_routed_ubjson"
 _JSON_KEY_MAX_BYTES = 256
 _JSON_WHITESPACE_BYTES = frozenset(b" \t\r\n")
+_MXNET_ROOT_GRAPH_KEYS = frozenset({"nodes", "arg_nodes", "heads"})
+
+
+class _JSONObject(dict[str, Any]):
+    """Retain security-relevant duplicate-key metadata on a decoded JSON object."""
+
+    duplicate_mxnet_root_graph_keys: set[str]
+
+    def __init__(self, pairs: list[tuple[str, Any]], duplicate_keys: set[str]) -> None:
+        super().__init__(pairs)
+        self.duplicate_mxnet_root_graph_keys = duplicate_keys
+
+
+def _decode_json_object(pairs: list[tuple[str, Any]]) -> _JSONObject:
+    """Decode an object while preserving whether graph keys were shadowed."""
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for key, _item in pairs:
+        if key not in _MXNET_ROOT_GRAPH_KEYS:
+            continue
+        if key in seen:
+            duplicates.add(key)
+        seen.add(key)
+    if not seen >= _MXNET_ROOT_GRAPH_KEYS:
+        duplicates.clear()
+    return _JSONObject(pairs, duplicates)
 
 
 def configure_content_routed_json_scan(config: dict[str, Any], *, max_bytes: int) -> None:
@@ -467,7 +493,10 @@ class XGBoostScanner(BaseScanner):
 
         try:
             with open(path, encoding="utf-8") as f:
-                model_data = json.load(f)
+                model_data = json.load(f, object_pairs_hook=_decode_json_object)
+            duplicate_mxnet_root_keys = (
+                model_data.duplicate_mxnet_root_graph_keys if isinstance(model_data, _JSONObject) else set()
+            )
 
             result.add_check(
                 name="JSON Parsing",
@@ -479,6 +508,7 @@ class XGBoostScanner(BaseScanner):
 
             self.scan_parsed_json_security(path, model_data, result)
             self._scan_filename_owned_json_overlap(path, result)
+            self._record_duplicate_mxnet_root_keys(duplicate_mxnet_root_keys, result, path)
             self._record_mxnet_symbol_overlap(model_data, result, path)
 
         except json.JSONDecodeError as e:
@@ -550,6 +580,25 @@ class XGBoostScanner(BaseScanner):
                     scanner_selection,
                     context="overlapping Jinja JSON analysis",
                 )
+
+    def _record_duplicate_mxnet_root_keys(self, duplicate_keys: set[str], result: ScanResult, path: str) -> None:
+        """Fail closed when JSON key shadowing can discard MXNet graph content."""
+        if not duplicate_keys:
+            return
+        reason = self._INCONCLUSIVE_REASONS["json_mxnet_overlap"]
+        result.add_check(
+            name="XGBoost / MXNet JSON Routing",
+            passed=False,
+            message="JSON model contains duplicate MXNet graph keys; shadowed graph content cannot be safely analyzed",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "analysis_incomplete": True,
+                "scan_outcome_reason": reason,
+                "duplicate_root_keys": sorted(duplicate_keys),
+            },
+        )
+        self._mark_inconclusive_scan_result(result, reason)
 
     def _record_mxnet_symbol_overlap(self, data: object, result: ScanResult, path: str) -> None:
         """Run MXNet security checks and fail closed when JSON ownership overlaps."""
