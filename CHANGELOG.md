@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
+- detect dangerous OpenVINO layers inside namespace-qualified IR models
 - classify unavailable pickle reads and stream coverage as inconclusive rather than security findings
 - route renamed structurally valid MXNet symbol graphs through existing suspicious-reference analysis
 - restore content routing for extensionless XGBoost UBJSON models and classify unavailable or undecodable XGBoost reads as inconclusive
