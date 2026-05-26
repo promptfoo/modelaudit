@@ -71,12 +71,10 @@ class ExecuTorchScanner(BaseScanner):
                 details={"path": path, "format": "executorch_binary"},
             )
 
-        should_scan_archive = header.startswith(b"PK")
-        if valid_binary_program and not should_scan_archive:
-            try:
-                should_scan_archive = zipfile.is_zipfile(path)
-            except OSError:
-                should_scan_archive = False
+        try:
+            should_scan_archive = header.startswith(b"PK") or zipfile.is_zipfile(path)
+        except OSError:
+            should_scan_archive = header.startswith(b"PK")
 
         if valid_binary_program and not should_scan_archive:
             result.bytes_scanned = file_size
