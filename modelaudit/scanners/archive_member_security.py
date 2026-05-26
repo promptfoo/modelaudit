@@ -43,8 +43,11 @@ _PORTABLE_EXECUTABLE_SIGNATURE = b"PE\x00\x00"
 _EXECUTABLE_ARCHIVE_MEMBER_MAGIC_RULE_CODES = (
     ((b"\x7fELF",), "S502"),
     ((b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe"), "S503"),
-    ((b"#!",), "S504"),
 )
+_SHEBANG_SHELL_INTERPRETERS = frozenset({"ash", "bash", "dash", "fish", "ksh", "sh", "zsh"})
+_SHEBANG_POWERSHELL_INTERPRETERS = frozenset({"powershell", "pwsh"})
+_SHEBANG_JAVASCRIPT_INTERPRETERS = frozenset({"deno", "node", "nodejs"})
+_SHEBANG_PYTHON_INTERPRETER_RE = re.compile(r"^(?:python(?:[0-9]+(?:\.[0-9]+)*)?|pypy(?:[0-9]+)?)$")
 _MACHO_FAT_MAGIC_32_BE = b"\xca\xfe\xba\xbe"
 _MACHO_FAT_MAGIC_32_LE = b"\xbe\xba\xfe\xca"
 _MACHO_FAT_MAGIC_64_BE = b"\xca\xfe\xba\xbf"
@@ -136,14 +139,17 @@ def is_executable_archive_member_name(member_name: str) -> bool:
 
 def executable_archive_member_rule_code(member_name: str, *, path: str | None = None) -> str | None:
     """Return the rule code for an executable archive member name or content probe."""
+    if path is not None:
+        content_rule_code = _executable_archive_member_content_rule_code(path)
+        if content_rule_code is not None:
+            return content_rule_code
+
     normalized_name = member_name.lower()
     for suffixes, rule_code in _EXECUTABLE_ARCHIVE_MEMBER_SUFFIX_RULE_CODES:
         if normalized_name.endswith(suffixes):
             return rule_code
     if _VERSIONED_SHARED_OBJECT_SUFFIX_RE.search(normalized_name):
         return "S502"
-    if path is not None:
-        return _executable_archive_member_content_rule_code(path)
     return None
 
 
@@ -190,6 +196,60 @@ def _looks_like_macho_fat_binary(prefix: bytes) -> bool:
     return len(prefix) >= 8 + (arch_count * arch_entry_size)
 
 
+def _normalized_shebang_command_name(command: str) -> str:
+    normalized = command.rsplit("/", 1)[-1].lower()
+    if normalized.endswith(".exe"):
+        normalized = normalized.removesuffix(".exe")
+    return normalized
+
+
+def _env_shebang_command_tokens(tokens: list[str]) -> list[str]:
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-S":
+            index += 1
+            continue
+        if token in {"-i", "--ignore-environment"}:
+            index += 1
+            continue
+        if token in {"-u", "--unset"}:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        if "=" in token and not token.startswith(("/", ".")):
+            index += 1
+            continue
+        return tokens[index:]
+    return []
+
+
+def _shebang_rule_code(prefix: bytes) -> str | None:
+    if not prefix.startswith(b"#!"):
+        return None
+
+    shebang_command = prefix.splitlines()[0][2:].strip().decode("utf-8", errors="ignore")
+    if not shebang_command:
+        return "S504"
+
+    tokens = re.split(r"\s+", shebang_command)
+    command_name = _normalized_shebang_command_name(tokens[0])
+    if command_name == "env":
+        env_tokens = _env_shebang_command_tokens(tokens[1:])
+        if env_tokens:
+            command_name = _normalized_shebang_command_name(env_tokens[0])
+
+    if _SHEBANG_PYTHON_INTERPRETER_RE.fullmatch(command_name):
+        return "S507"
+    if command_name in _SHEBANG_POWERSHELL_INTERPRETERS:
+        return "S506"
+    if command_name in _SHEBANG_JAVASCRIPT_INTERPRETERS:
+        return "S508"
+    return "S504"
+
+
 def _executable_archive_member_content_rule_code(path: str) -> str | None:
     """Return the rule code for a bounded executable-content signature probe."""
     try:
@@ -198,6 +258,9 @@ def _executable_archive_member_content_rule_code(path: str) -> str | None:
     except OSError:
         return None
 
+    shebang_rule_code = _shebang_rule_code(prefix)
+    if shebang_rule_code is not None:
+        return shebang_rule_code
     for prefixes, rule_code in _EXECUTABLE_ARCHIVE_MEMBER_MAGIC_RULE_CODES:
         if prefix.startswith(prefixes):
             return rule_code
@@ -247,6 +310,18 @@ def _apply_aliases(call_name: str, alias_scopes: _AliasScopes) -> frozenset[str]
     return frozenset(f"{resolved_head}.{suffix}" for resolved_head in resolved_heads)
 
 
+def _normalize_builtins_name(name: str) -> str:
+    if name == "__builtins__":
+        return "builtins"
+    if name.startswith("__builtins__."):
+        return f"builtins.{name.removeprefix('__builtins__.')}"
+    return name
+
+
+def _normalize_namespace_roots(roots: frozenset[str]) -> frozenset[str]:
+    return frozenset(_normalize_builtins_name(root) for root in roots)
+
+
 _MAX_STATIC_STRING_LENGTH = 1024
 _MAX_STATIC_STRING_PARTS = 256
 
@@ -291,7 +366,10 @@ def _resolve_static_attribute_names(
     resolved_target_roots = _apply_aliases(target_root, alias_scopes)
     if resolved_target_roots is None:
         return None
-    return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
+    return frozenset(
+        f"{resolved_target_root}.{attr_name}"
+        for resolved_target_root in _normalize_namespace_roots(resolved_target_roots)
+    )
 
 
 def _resolve_getattr_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
@@ -334,17 +412,45 @@ def _resolve_dunder_getattribute_call_names(node: ast.AST, alias_scopes: _AliasS
 
     helper_name = _resolve_call_name(node.func)
     resolved_helper_names = _apply_aliases(helper_name, alias_scopes) if helper_name is not None else None
-    if resolved_helper_names is not None and resolved_helper_names & {
-        "object.__getattribute__",
-        "builtins.object.__getattribute__",
-    }:
-        if len(node.args) < 2:
-            return None
-        return _resolve_static_attribute_names(node.args[0], node.args[1], alias_scopes)
+    resolved_attribute_names: set[str] = set()
+    if resolved_helper_names is not None:
+        if (
+            resolved_helper_names & {"object.__getattribute__", "builtins.object.__getattribute__"}
+            and len(node.args) >= 2
+        ):
+            object_attribute_names = _resolve_static_attribute_names(node.args[0], node.args[1], alias_scopes)
+            if object_attribute_names is not None:
+                resolved_attribute_names.update(object_attribute_names)
+
+        if node.args:
+            attr_name = _resolve_static_string(node.args[0])
+            if attr_name is not None:
+                for resolved_helper_name in resolved_helper_names:
+                    normalized_helper_name = _normalize_builtins_name(resolved_helper_name)
+                    if normalized_helper_name in {"object.__getattribute__", "builtins.object.__getattribute__"}:
+                        continue
+                    if normalized_helper_name.endswith(".__getattribute__"):
+                        resolved_attribute_names.add(
+                            f"{normalized_helper_name.removesuffix('.__getattribute__')}.{attr_name}"
+                        )
+
+    if resolved_attribute_names:
+        return frozenset(resolved_attribute_names)
 
     if not isinstance(node.func, ast.Attribute) or node.func.attr != "__getattribute__" or not node.args:
         return None
     return _resolve_static_attribute_names(node.func.value, node.args[0], alias_scopes)
+
+
+def _namespace_roots_from_dict_names(resolved_names: frozenset[str] | None) -> frozenset[str] | None:
+    if resolved_names is None:
+        return None
+    roots = {
+        _normalize_builtins_name(resolved_name.removesuffix(".__dict__"))
+        for resolved_name in resolved_names
+        if resolved_name.endswith(".__dict__")
+    }
+    return frozenset(roots) if roots else None
 
 
 def _resolve_namespace_dict_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
@@ -360,34 +466,40 @@ def _resolve_namespace_dict_roots(node: ast.AST, alias_scopes: _AliasScopes) -> 
 
     if target_root_node is not None:
         target_root = _resolve_call_name(target_root_node)
-        return _apply_aliases(target_root, alias_scopes) if target_root is not None else None
+        resolved_roots = _apply_aliases(target_root, alias_scopes) if target_root is not None else None
+        return _normalize_namespace_roots(resolved_roots) if resolved_roots is not None else None
 
     namespace_name = _resolve_call_name(namespace_node)
     resolved_namespace_names = _apply_aliases(namespace_name, alias_scopes) if namespace_name is not None else None
-    if resolved_namespace_names is not None:
-        roots = {
-            resolved_name.removesuffix(".__dict__")
-            for resolved_name in resolved_namespace_names
-            if resolved_name.endswith(".__dict__")
-        }
-        if roots:
-            return frozenset(roots)
+    roots = _namespace_roots_from_dict_names(resolved_namespace_names)
+    if roots is not None:
+        return roots
 
     resolved_namespace_names = _resolve_getattr_call_names(namespace_node, alias_scopes)
     if resolved_namespace_names is None:
         resolved_namespace_names = _resolve_dunder_getattribute_call_names(namespace_node, alias_scopes)
-    if resolved_namespace_names is None:
-        return None
-
-    roots = {
-        resolved_name.removesuffix(".__dict__")
-        for resolved_name in resolved_namespace_names
-        if resolved_name.endswith(".__dict__")
-    }
-    return frozenset(roots) if roots else None
+    return _namespace_roots_from_dict_names(resolved_namespace_names)
 
 
 _NAMESPACE_MAPPING_ACCESSORS = {"get", "__getitem__", "pop", "setdefault"}
+_NAMESPACE_MAPPING_ACCESSORS_WITH_FALLBACK = {"get", "pop", "setdefault"}
+
+
+def _split_bound_namespace_mapping_accessor(helper_name: str) -> tuple[str, str] | None:
+    normalized_helper_name = _normalize_builtins_name(helper_name)
+    for accessor in _NAMESPACE_MAPPING_ACCESSORS:
+        suffix = f".__dict__.{accessor}"
+        if normalized_helper_name.endswith(suffix):
+            return normalized_helper_name[: -len(suffix)], accessor
+    return None
+
+
+def _unbound_namespace_mapping_accessor(helper_name: str) -> str | None:
+    normalized_helper_name = _normalize_builtins_name(helper_name)
+    for accessor in _NAMESPACE_MAPPING_ACCESSORS:
+        if normalized_helper_name in {f"dict.{accessor}", f"builtins.dict.{accessor}"}:
+            return accessor
+    return None
 
 
 def _resolve_namespace_dict_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
@@ -395,30 +507,81 @@ def _resolve_namespace_dict_call_names(node: ast.AST, alias_scopes: _AliasScopes
     if isinstance(node, ast.Attribute) and node.attr == "__call__":
         return _resolve_namespace_dict_call_names(node.value, alias_scopes)
 
-    namespace_node: ast.AST
-    attr_name_node: ast.AST
     if isinstance(node, ast.Subscript):
-        namespace_node = node.value
-        attr_name_node = node.slice
-    elif (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in _NAMESPACE_MAPPING_ACCESSORS
-        and node.args
-    ):
-        namespace_node = node.func.value
+        attr_name = _resolve_static_string(node.slice)
+        if attr_name is None:
+            return None
+        subscript_target_roots = _resolve_namespace_dict_roots(node.value, alias_scopes)
+        if subscript_target_roots is None:
+            return None
+        return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in subscript_target_roots)
+
+    if not isinstance(node, ast.Call) or not node.args:
+        return None
+
+    resolved_target_roots: frozenset[str] | None = None
+    attr_name_node: ast.AST | None = None
+    fallback_node: ast.AST | None = None
+    accessors: set[str] = set()
+
+    helper_name = _resolve_call_name(node.func)
+    resolved_helper_names = _apply_aliases(helper_name, alias_scopes) if helper_name is not None else None
+
+    if isinstance(node.func, ast.Attribute) and node.func.attr in _NAMESPACE_MAPPING_ACCESSORS:
+        accessors.add(node.func.attr)
         attr_name_node = node.args[0]
-    else:
+        resolved_target_roots = _resolve_namespace_dict_roots(node.func.value, alias_scopes)
+        if node.func.attr in _NAMESPACE_MAPPING_ACCESSORS_WITH_FALLBACK and len(node.args) >= 2:
+            fallback_node = node.args[1]
+
+    if resolved_target_roots is None and resolved_helper_names is not None:
+        bound_roots: set[str] = set()
+        bound_accessors: set[str] = set()
+        for resolved_helper_name in resolved_helper_names:
+            bound_accessor = _split_bound_namespace_mapping_accessor(resolved_helper_name)
+            if bound_accessor is None:
+                continue
+            root, accessor = bound_accessor
+            bound_roots.add(root)
+            bound_accessors.add(accessor)
+        if bound_roots:
+            accessors = bound_accessors
+            attr_name_node = node.args[0]
+            resolved_target_roots = frozenset(bound_roots)
+            if bound_accessors & _NAMESPACE_MAPPING_ACCESSORS_WITH_FALLBACK and len(node.args) >= 2:
+                fallback_node = node.args[1]
+
+    if resolved_target_roots is None and resolved_helper_names is not None and len(node.args) >= 2:
+        unbound_accessors: set[str] = set()
+        for resolved_helper_name in resolved_helper_names:
+            unbound_accessor = _unbound_namespace_mapping_accessor(resolved_helper_name)
+            if unbound_accessor is not None:
+                unbound_accessors.add(unbound_accessor)
+        if unbound_accessors:
+            accessors = unbound_accessors
+            attr_name_node = node.args[1]
+            resolved_target_roots = _resolve_namespace_dict_roots(node.args[0], alias_scopes)
+            if unbound_accessors & _NAMESPACE_MAPPING_ACCESSORS_WITH_FALLBACK and len(node.args) >= 3:
+                fallback_node = node.args[2]
+
+    if attr_name_node is None or resolved_target_roots is None:
         return None
 
     attr_name = _resolve_static_string(attr_name_node)
     if attr_name is None:
         return None
 
-    resolved_target_roots = _resolve_namespace_dict_roots(namespace_node, alias_scopes)
-    if resolved_target_roots is None:
-        return None
-    return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
+    resolved_names = {f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots}
+    if (
+        fallback_node is not None
+        and accessors & _NAMESPACE_MAPPING_ACCESSORS_WITH_FALLBACK
+        and not any(_is_high_risk_python_call_name(resolved_name) for resolved_name in resolved_names)
+    ):
+        fallback_names = _resolve_static_reference_names(fallback_node, alias_scopes)
+        if fallback_names is not None:
+            resolved_names.update(fallback_names)
+
+    return frozenset(resolved_names)
 
 
 def _resolve_static_reference_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
