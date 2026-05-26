@@ -34,6 +34,40 @@ MAX_HEADER_BYTES = 16 * 1024 * 1024
 SAFETENSORS_HEADER_INCONCLUSIVE_REASON = "safetensors_header_validation_failed"
 SAFETENSORS_STRUCTURE_INCONCLUSIVE_REASON = "safetensors_structure_validation_failed"
 SAFETENSORS_HEADER_LIMIT_INCONCLUSIVE_REASON = "safetensors_header_size_limit_exceeded"
+_DOCUMENTATION_METADATA_KEYS = {
+    "citation",
+    "comment",
+    "comments",
+    "description",
+    "doc",
+    "docs",
+    "documentation",
+    "help",
+    "license",
+    "model_card",
+    "note",
+    "notes",
+    "readme",
+}
+_DOCUMENTATION_LINE_PREFIXES = (
+    "#",
+    "//",
+    "/*",
+    "* ",
+    "- ",
+    "```",
+    "avoid ",
+    "do not ",
+    "example",
+    "never ",
+    "note:",
+    "security note:",
+    "warning:",
+)
+_EXECUTABLE_METADATA_LINE_RE = re.compile(
+    r"(?i)^(?:from\s+|import\s+|(?:return\s+)?[A-Za-z_][\w.]*\s*\(|curl\s|wget\s|rm\s+-rf|chmod\s|"
+    r"bash\s|sh\s|python(?:\d+(?:\.\d+)*)?\s|node\s|powershell\s|pwsh\s)"
+)
 
 
 class SafeTensorsScanner(BaseScanner):
@@ -454,7 +488,11 @@ class SafeTensorsScanner(BaseScanner):
                             )
 
                         if isinstance(value, str):
-                            lower_val = value.lower()
+                            executable_value = self._metadata_value_for_executable_analysis(str(key), value)
+                            if not executable_value:
+                                continue
+
+                            lower_val = executable_value.lower()
 
                             # Check for simple code-like patterns
                             if any(s in lower_val for s in ["import ", "#!/"]):
@@ -474,7 +512,7 @@ class SafeTensorsScanner(BaseScanner):
 
                             # Check for regex-based suspicious patterns (independent of above check)
                             for pattern in SUSPICIOUS_METADATA_PATTERNS:
-                                if re.search(pattern, value):
+                                if re.search(pattern, executable_value):
                                     result.add_check(
                                         name="Metadata Pattern Check",
                                         passed=False,
@@ -576,11 +614,54 @@ class SafeTensorsScanner(BaseScanner):
                         },
                     )
 
+    @staticmethod
+    def _is_documentation_metadata_key(key: str) -> bool:
+        normalized_key = key.strip().lower().replace("-", "_")
+        return normalized_key in _DOCUMENTATION_METADATA_KEYS
+
+    @staticmethod
+    def _is_documentation_metadata_line(line: str) -> bool:
+        """Return True for a single documentation/comment line that can be ignored."""
+        lowered = line.lower()
+        if lowered.startswith(_DOCUMENTATION_LINE_PREFIXES):
+            return True
+        if _EXECUTABLE_METADATA_LINE_RE.search(line):
+            return False
+        return len(line.split()) >= 6
+
+    @classmethod
+    def _metadata_value_for_executable_analysis(cls, key: str, value: str) -> str:
+        """Return non-documentation lines from metadata values that may contain executable content."""
+        if not cls._is_documentation_metadata_key(key):
+            return value
+
+        executable_lines: list[str] = []
+        in_fenced_block = False
+        for line in value.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("```"):
+                in_fenced_block = not in_fenced_block
+                continue
+            if in_fenced_block:
+                continue
+            if cls._is_documentation_metadata_line(stripped):
+                continue
+            executable_lines.append(stripped)
+
+        return "\n".join(executable_lines)
+
     def _analyze_metadata_content(self, metadata: dict[str, Any], result: ScanResult, path: str) -> None:
         """Analyze SafeTensors metadata content for injection attacks"""
 
         # Convert metadata to string for pattern analysis
         metadata_str = json.dumps(metadata, indent=2, ensure_ascii=False)
+        executable_metadata = {
+            key: self._metadata_value_for_executable_analysis(str(key), value) if isinstance(value, str) else value
+            for key, value in metadata.items()
+        }
+        executable_metadata_str = json.dumps(executable_metadata, indent=2, ensure_ascii=False)
 
         # XSS/HTML injection patterns
         html_patterns = [
@@ -630,7 +711,7 @@ class SafeTensorsScanner(BaseScanner):
         ]
 
         for pattern in code_patterns:
-            matches = re.findall(pattern, metadata_str, re.IGNORECASE)
+            matches = re.findall(pattern, executable_metadata_str, re.IGNORECASE)
             if matches:
                 result.add_check(
                     name="SafeTensors Code Injection Detection",
