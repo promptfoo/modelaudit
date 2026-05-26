@@ -271,6 +271,22 @@ class ScannerRegistry:
 
                 scanner_class = self._load_scanner(scanner_id)
                 if scanner_class and scanner_class.can_handle(path):
+                    if scanner_id != "llamafile" and (
+                        scanner_selection is None or scanner_selection.allows("llamafile")
+                    ):
+                        from modelaudit.utils.file.detection import is_llamafile_executable
+
+                        if is_llamafile_executable(path):
+                            llamafile_class = self._load_scanner("llamafile")
+                            if llamafile_class:
+                                return llamafile_class
+                    if scanner_id != "torch7" and (scanner_selection is None or scanner_selection.allows("torch7")):
+                        from modelaudit.utils.file.detection import is_torch7_suffix_override_candidate
+
+                        if is_torch7_suffix_override_candidate(path):
+                            torch7_class = self._load_scanner("torch7")
+                            if torch7_class and torch7_class.can_handle(path):
+                                return torch7_class
                     return scanner_class
 
         # Some ZIP-backed artifacts intentionally use pickle/checkpoint suffixes.
@@ -282,18 +298,26 @@ class ScannerRegistry:
                 return scanner_class
 
         try:
-            from modelaudit.utils.file.detection import detect_file_format
+            from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension
 
             header_format = detect_file_format(path)
+            extension_format = detect_format_from_extension(path)
         except Exception:
             header_format = "unknown"
+            extension_format = "unknown"
 
         header_scanner_id = self.get_scanner_id_for_header_format(header_format)
         header_scanner_info = self._scanners.get(header_scanner_id or "")
+        extension_scanner_id = self.get_scanner_id_for_header_format(extension_format)
+        compatible_header_route = (
+            header_format == header_scanner_id
+            or extension_format == "unknown"
+            or extension_scanner_id == header_scanner_id
+        )
         if (
             header_scanner_id
             and header_scanner_info
-            and header_format == header_scanner_id
+            and compatible_header_route
             and (scanner_selection is None or scanner_selection.allows(header_scanner_id))
         ):
             scanner_class = self._load_scanner(header_scanner_id)

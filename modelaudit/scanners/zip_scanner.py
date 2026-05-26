@@ -422,6 +422,8 @@ class ZipScanner(BaseScanner):
             temp_base = os.path.join(tempfile.gettempdir(), "extract")
             extractable_entries: list[zipfile.ZipInfo] = []
             for info in entries:
+                if self._should_skip_archive_entry(info.filename):
+                    continue
                 should_extract, entry_metadata_complete = self._validate_entry_metadata(
                     z, info, path, temp_base, result
                 )

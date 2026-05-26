@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners import get_scanner_for_file
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity, ScanResult
@@ -82,8 +82,8 @@ def test_mxnet_scanner_handles_renamed_structural_symbol_graph(tmp_path: Path) -
         },
     )
 
-    assert MXNetScanner.can_handle(str(symbol_path))
-    result = MXNetScanner().scan(str(symbol_path))
+    assert not MXNetScanner.can_handle(str(symbol_path))
+    result = scan_file(str(symbol_path))
 
     assert any(issue.details.get("attribute") == "library" for issue in result.issues)
 
@@ -320,13 +320,13 @@ def test_mxnet_malformed_symbol_scan_is_inconclusive(tmp_path: Path) -> None:
     assert any(check.name == "MXNet Symbol Parse" for check in result.checks)
 
 
-def test_mxnet_unsupported_extension_scan_is_inconclusive(tmp_path: Path) -> None:
+def test_direct_mxnet_scan_of_invalid_renamed_symbol_is_inconclusive(tmp_path: Path) -> None:
     artifact_path = tmp_path / "model.mxnet"
     artifact_path.write_bytes(b"mxnet-ish content")
 
     result = MXNetScanner().scan(str(artifact_path))
 
-    _assert_inconclusive_result(result, "mxnet_unsupported_extension")
+    _assert_inconclusive_result(result, "mxnet_symbol_parse_failed")
 
 
 def test_mxnet_symbol_read_failure_scan_is_inconclusive(

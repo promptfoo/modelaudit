@@ -11,6 +11,7 @@ from typing import Any, ClassVar
 from modelaudit.detectors.suspicious_symbols import EXECUTABLE_SIGNATURES
 from modelaudit.utils.file.detection import (
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+    has_mxnet_symbol_graph_structure,
     is_mxnet_symbol_graph_file,
 )
 
@@ -153,34 +154,12 @@ class MXNetScanner(BaseScanner):
         if suffix == ".params":
             return cls._is_mxnet_params_filename(path_obj.name)
 
-        # Preserve canonical malformed symbols for fail-closed parsing, while
-        # routing renamed symbols only when their bounded structure identifies them.
-        return (suffix == ".json" and path_obj.name.lower().endswith("-symbol.json")) or (
-            suffix != ".json" and is_mxnet_symbol_graph_file(path_obj)
-        )
+        # Content-routed renamed symbols are selected by trusted format detection.
+        return suffix == ".json" and path_obj.name.lower().endswith("-symbol.json")
 
     @classmethod
     def _is_mxnet_params_filename(cls, filename: str) -> bool:
         return bool(PARAMS_NAME_RE.match(filename))
-
-    @classmethod
-    def _has_valid_symbol_structure(cls, payload: Any) -> bool:
-        if not isinstance(payload, dict):
-            return False
-
-        nodes = payload.get("nodes")
-        arg_nodes = payload.get("arg_nodes")
-        heads = payload.get("heads")
-        if not isinstance(nodes, list) or not isinstance(arg_nodes, list) or not isinstance(heads, list):
-            return False
-
-        if not nodes:
-            return False
-
-        return any(
-            isinstance(node, dict) and isinstance(node.get("op"), str) and isinstance(node.get("name"), str)
-            for node in nodes
-        )
 
     def scan(self, path: str) -> ScanResult:
         path_check_result = self._check_path(path)
@@ -198,21 +177,10 @@ class MXNetScanner(BaseScanner):
         suffix = Path(path).suffix.lower()
         analysis_complete = True
 
-        if suffix == ".params":
+        if suffix == ".params" and not is_mxnet_symbol_graph_file(path):
             analysis_complete = self._scan_params_blob(path, result)
-        elif suffix == ".json" or is_mxnet_symbol_graph_file(path):
-            analysis_complete = self._scan_symbol_graph(path, result)
         else:
-            result.add_check(
-                name="MXNet Format Dispatch",
-                passed=False,
-                message=f"Unsupported MXNet artifact extension: {suffix}",
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={"extension": suffix},
-            )
-            self._mark_inconclusive_scan_result(result, "mxnet_unsupported_extension")
-            analysis_complete = False
+            analysis_complete = self._scan_symbol_graph(path, result)
 
         self._finish_mxnet_result(result, analysis_complete=analysis_complete)
         return result
@@ -290,7 +258,7 @@ class MXNetScanner(BaseScanner):
             self._mark_inconclusive_scan_result(result, "mxnet_symbol_parse_failed")
             return False
 
-        if not self._has_valid_symbol_structure(payload):
+        if not has_mxnet_symbol_graph_structure(payload):
             result.add_check(
                 name="MXNet Symbol Structure",
                 passed=False,

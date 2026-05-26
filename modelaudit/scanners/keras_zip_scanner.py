@@ -31,6 +31,7 @@ from ..config.explanations import (
     get_pattern_explanation,
 )
 from ..utils.file.detection import _normalize_archive_member_name, _read_zip_member_bounded
+from .archive_dispatch import SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY
 from .archive_member_security import is_executable_archive_member_name
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from .keras_utils import (
@@ -349,21 +350,26 @@ class KerasZipScanner(BaseScanner):
             recursive_config["max_file_size"] = recursive_member_size_limit
         else:
             recursive_config.pop("max_file_size", None)
-        if skip_weights_entry:
-            skip_entries = recursive_config.get("skip_archive_entries", ())
-            if isinstance(skip_entries, str):
-                skip_entry_values: list[str] = [skip_entries]
-            elif isinstance(skip_entries, (list, tuple, set, frozenset)):
-                skip_entry_values = [entry for entry in skip_entries if isinstance(entry, str)]
-            else:
-                skip_entry_values = []
-            if _KERAS_WEIGHTS_ENTRY not in skip_entry_values:
-                skip_entry_values.append(_KERAS_WEIGHTS_ENTRY)
-            recursive_config["skip_archive_entries"] = skip_entry_values
+        skip_entries = recursive_config.get("skip_archive_entries", ())
+        if isinstance(skip_entries, str):
+            skip_entry_values: list[str] = [skip_entries]
+        elif isinstance(skip_entries, (list, tuple, set, frozenset)):
+            skip_entry_values = [entry for entry in skip_entries if isinstance(entry, str)]
+        else:
+            skip_entry_values = []
+        if _KERAS_METADATA_ENTRY not in skip_entry_values:
+            # Metadata is already read through Keras-specific bounded handling.
+            skip_entry_values.append(_KERAS_METADATA_ENTRY)
+        if skip_weights_entry and _KERAS_WEIGHTS_ENTRY not in skip_entry_values:
+            skip_entry_values.append(_KERAS_WEIGHTS_ENTRY)
+        recursive_config["skip_archive_entries"] = skip_entry_values
         return recursive_config
 
     def _merge_recursive_archive_scan(self, path: str, result: ScanResult) -> None:
         """Recursively scan every ZIP member through the generic archive scanner."""
+        if self.config.get(SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY):
+            return
+
         from .zip_scanner import ZipScanner
 
         has_embedded_weights_limit = self._has_embedded_weights_limit_reason(result)

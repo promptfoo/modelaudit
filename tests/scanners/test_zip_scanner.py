@@ -24,7 +24,8 @@ from modelaudit.scanners.archive_dispatch import (
 )
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.zip_scanner import ZipScanner
-from tests.helpers import create_mock_onnx
+from modelaudit.utils.file import detection as file_detection
+from tests.helpers import create_mock_mxnet_symbol, create_mock_onnx
 
 
 def _npy_payload() -> bytes:
@@ -925,6 +926,46 @@ def test_scan_nested_file_fails_closed_when_xml_root_is_beyond_bounded_probe(tmp
     assert result.metadata["operational_error_reason"] == "xml_model_routing_incomplete"
     check = next(check for check in result.checks if check.name == "XML Model Routing")
     assert "bounded probe ended before the first structural root element" in check.message
+
+
+def test_scan_nested_file_routes_renamed_mxnet_symbol_by_structure(tmp_path: Path) -> None:
+    extracted_member = create_mock_mxnet_symbol(tmp_path / "payload.dat", custom_library="../../tmp/libevil.so")
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
+def test_scan_nested_file_fails_closed_when_mxnet_structure_is_beyond_bounded_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "payload.dat"
+    extracted_member.write_text(
+        (" " * 129) + '{"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+    check = next(check for check in result.checks if check.name == "MXNet Symbol Routing")
+    assert "bounded JSON probe reached its limit" in check.message
+
+
+def test_zip_scanner_honors_configured_skipped_archive_entries(tmp_path: Path) -> None:
+    archive_path = tmp_path / "skip-metadata.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("metadata.json", '{"metadata":"' + ("x" * ((10 * 1024 * 1024) + 1)) + '"}')
+
+    result = ZipScanner({"skip_archive_entries": ["metadata.json"], "cache_enabled": False}).scan(str(archive_path))
+
+    assert result.success is True
+    assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
 
 
 def test_scan_zip_fails_closed_when_nested_recognized_header_scanner_is_unavailable(
