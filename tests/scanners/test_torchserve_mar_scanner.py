@@ -312,6 +312,24 @@ def test_scan_detects_keyword_getattr_wrapped_handler_execution_primitive(
         ),
         (b"def handle(data, context):\n    return globals()['__builtins__'].pop('eval')('1 + 1')\n"),
         (b"def handle(data, context):\n    run = globals()['__builtins__'].pop('eval')\n    return run('1 + 1')\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    if remove:\n"
+            b"        del globals()['__builtins__']['eval']\n"
+            b"    return globals()['__builtins__']['eval']('1 + 1')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    run = globals()['__builtins__']['eval']\n"
+            b"    globals()['__builtins__'].clear()\n"
+            b"    return run('1 + 1')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    if remove:\n"
+            b"        globals()['__builtins__'].clear()\n"
+            b"    return globals()['__builtins__']['eval']('1 + 1')\n"
+        ),
     ],
 )
 def test_scan_detects_implicit_builtins_handler_execution_primitive(
@@ -407,6 +425,32 @@ def test_scan_detects_implicit_builtins_handler_execution_primitive(
             b"import builtins\n"
             b"def handle(data, context):\n"
             b"    dict.pop(builtins.__dict__, 'eval')\n"
+            b"    return builtins.eval([])\n"
+        ),
+        (
+            b"import builtins\n"
+            b"def handle(data, context):\n"
+            b"    del builtins.__dict__['eval']\n"
+            b"    return builtins.eval([])\n"
+        ),
+        (
+            b"import builtins\n"
+            b"def handle(data, context):\n"
+            b"    builtins.__dict__.__delitem__('eval')\n"
+            b"    return builtins.eval([])\n"
+        ),
+        (
+            b"import builtins\n"
+            b"def handle(data, context):\n"
+            b"    import operator\n"
+            b"    operator.delitem(builtins.__dict__, 'eval')\n"
+            b"    return builtins.eval([])\n"
+        ),
+        (b"import builtins\ndef handle(data, context):\n    builtins.__dict__.clear()\n    return builtins.eval([])\n"),
+        (
+            b"import builtins\n"
+            b"def handle(data, context):\n"
+            b"    dict.clear(builtins.__dict__)\n"
             b"    return builtins.eval([])\n"
         ),
         (
@@ -530,6 +574,15 @@ def test_scan_allows_benign_builtin_shaped_handler_source(tmp_path: Path, handle
             b"import builtins\n"
             b"def handle(data, context):\n"
             b"    dict.update(builtins.__dict__, {'eval': builtins.exec})\n"
+            b"    return builtins.eval('pass')\n",
+            "builtins.exec",
+        ),
+        (
+            b"import builtins\n"
+            b"def handle(data, context):\n"
+            b"    run = builtins.exec\n"
+            b"    builtins.__dict__.clear()\n"
+            b"    builtins.__dict__.update({'eval': run})\n"
             b"    return builtins.eval('pass')\n",
             "builtins.exec",
         ),

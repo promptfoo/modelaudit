@@ -221,6 +221,15 @@ def test_scan_zip_flags_aliased_dangerous_python_member(tmp_path: Path) -> None:
         ),
         "import os\nrun = os.__dict__.pop('system')\nrun('echo hidden')\n",
         "import os\nif remove:\n    os.__dict__.pop('system')\nos.system('echo hidden')\n",
+        "import os\nif remove:\n    del os.__dict__['system']\nos.system('echo hidden')\n",
+        "import os\nif remove:\n    os.__dict__.__delitem__('system')\nos.system('echo hidden')\n",
+        (
+            "import os\nimport operator\nif remove:\n"
+            "    operator.delitem(os.__dict__, 'system')\nos.system('echo hidden')\n"
+        ),
+        "import os\nrun = os.system\nos.__dict__.clear()\nrun('echo hidden')\n",
+        "import os\nif remove:\n    os.__dict__.clear()\nos.system('echo hidden')\n",
+        "import os\nif swap:\n    os = make_module()\nos.__dict__.clear()\nos.system('echo hidden')\n",
         ("import os\ndef hide(target=os):\n    setattr(target, 'system', len)\n    os.system('echo hidden')\n"),
         ("import os\ndef hide(target=os):\n    target.system = len\n    os.system('echo hidden')\n"),
         (
@@ -281,6 +290,38 @@ def test_scan_zip_preserves_captured_dangerous_callable_before_overwrite(tmp_pat
         "import os\nos.__dict__.pop('system')\nos.system([])\n",
         "import os\nremove = os.__dict__.pop\nremove('system')\nos.system([])\n",
         "import os\ndict.pop(os.__dict__, 'system')\nos.system([])\n",
+        "import os\ndel os.__dict__['system']\nos.system([])\n",
+        "import os\ndel os.system\nos.system([])\n",
+        "import os\nos.__dict__.__delitem__('system')\nos.system([])\n",
+        "import os\nremove = os.__dict__.__delitem__\nremove('system')\nos.system([])\n",
+        "import os\ndict.__delitem__(os.__dict__, 'system')\nos.system([])\n",
+        "import os\nimport operator\noperator.delitem(os.__dict__, 'system')\nos.system([])\n",
+        "import os\nos.__dict__.clear()\nos.system([])\n",
+        "import os\nvars(os).clear()\nos.system([])\n",
+        "import os\nclear = os.__dict__.clear\nclear()\nos.system([])\n",
+        "import os\ndict.clear(os.__dict__)\nos.system([])\n",
+        (
+            "import os\n"
+            "if clear:\n"
+            "    os.__dict__.clear()\n"
+            "    os.__dict__['system'] = len\n"
+            "else:\n"
+            "    os.__dict__.clear()\n"
+            "os.system([])\n"
+        ),
+        (
+            "import os\n"
+            "import subprocess\n"
+            "os.__dict__['system'] = subprocess.run\n"
+            "if clear:\n"
+            "    os.__dict__.clear()\n"
+            "else:\n"
+            "    os.__dict__.clear()\n"
+            "os.system([])\n"
+        ),
+        "import subprocess\nsubprocess.__dict__.update({'run': len})\nsubprocess.run([])\n",
+        "import subprocess\nsubprocess.__dict__.pop('run')\nsubprocess.run([])\n",
+        "import subprocess\nsubprocess.__dict__.clear()\nsubprocess.run([])\n",
     ],
 )
 def test_scan_zip_allows_callable_captured_after_safe_overwrite(tmp_path: Path, source: str) -> None:
@@ -327,6 +368,10 @@ def test_scan_zip_flags_from_import_dangerous_python_member(tmp_path: Path) -> N
             "import os\nimport operator\nimport subprocess\n"
             "operator.setitem(os.__dict__, 'system', subprocess.run)\nos.system(['id'])\n"
         ),
+        (
+            "import os\nimport subprocess\nos.__dict__.clear()\n"
+            "os.__dict__.update({'system': subprocess.run})\nos.system(['id'])\n"
+        ),
     ],
 )
 def test_scan_zip_reports_dangerous_setattr_replacement(tmp_path: Path, source: str) -> None:
@@ -343,6 +388,39 @@ def test_scan_zip_reports_dangerous_setattr_replacement(tmp_path: Path, source: 
     ]
     assert len(python_checks) == 1
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
+
+@pytest.mark.parametrize(
+    ("source", "dangerous_name"),
+    [
+        (
+            "import os\nimport subprocess\nsubprocess.__dict__.update({'run': os.system})\nsubprocess.run('id')\n",
+            "os.system",
+        ),
+        (
+            "import subprocess\nrun = subprocess.Popen\nsubprocess.__dict__.clear()\n"
+            "subprocess.__dict__.update({'run': run})\nsubprocess.run([])\n",
+            "subprocess.Popen",
+        ),
+        ("import subprocess\nsubprocess.__dict__.pop('run')(['id'])\n", "subprocess.run"),
+    ],
+)
+def test_scan_zip_reports_dangerous_subprocess_mapping_replacement(
+    tmp_path: Path, source: str, dangerous_name: str
+) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
 
 
 def test_scan_zip_flags_wildcard_import_dangerous_python_member(tmp_path: Path) -> None:
@@ -413,6 +491,9 @@ def test_scan_zip_flags_builtins_getattr_keyword_call_dangerous_python_member(tm
         ),
         "globals()['__builtins__'].pop('eval')('1 + 1')\n",
         "run = globals()['__builtins__'].pop('eval')\nrun('1 + 1')\n",
+        "if remove:\n    del globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval']('1 + 1')\n",
+        "run = globals()['__builtins__']['eval']\nglobals()['__builtins__'].clear()\nrun('1 + 1')\n",
+        "if remove:\n    globals()['__builtins__'].clear()\nglobals()['__builtins__']['eval']('1 + 1')\n",
     ],
 )
 def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path, source: str) -> None:
@@ -465,6 +546,12 @@ def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path
         ),
         "globals()['__builtins__'].pop('eval')\nglobals()['__builtins__']['eval']([])\n",
         "remove = globals()['__builtins__'].pop\nremove('eval')\nglobals()['__builtins__']['eval']([])\n",
+        "del globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval']([])\n",
+        "globals()['__builtins__'].__delitem__('eval')\nglobals()['__builtins__']['eval']([])\n",
+        "globals()['__builtins__'].clear()\nglobals()['__builtins__']['eval']([])\n",
+        "import builtins\nbuiltins.__dict__.clear()\nbuiltins.eval([])\n",
+        "import builtins\ndict.clear(builtins.__dict__)\nbuiltins.eval([])\n",
+        "import builtins\nbuiltins.__dict__.clear()\nglobals()['__builtins__']['eval']([])\n",
     ],
 )
 def test_scan_zip_allows_benign_builtin_shaped_source(tmp_path: Path, source: str) -> None:
@@ -510,6 +597,11 @@ def test_scan_zip_allows_benign_builtin_shaped_source(tmp_path: Path, source: st
         ),
         (
             "import builtins\nbuiltins.__dict__.update({'eval': builtins.exec})\nbuiltins.eval('pass')\n",
+            "builtins.exec",
+        ),
+        (
+            "import builtins\nrun = builtins.exec\nbuiltins.__dict__.clear()\n"
+            "globals()['__builtins__']['eval'] = run\nbuiltins.eval('pass')\n",
             "builtins.exec",
         ),
     ],
