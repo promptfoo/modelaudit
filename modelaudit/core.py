@@ -42,16 +42,19 @@ from modelaudit.scanners.archive_dispatch import (
     merge_executable_zip_container_findings,
 )
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
+from modelaudit.scanners.xgboost_scanner import XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
     LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
+    XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
     detect_file_format,
     detect_file_format_from_magic,
     detect_format_from_extension,
+    detect_xgboost_ubjson_content_route,
     is_executorch_archive,
     is_keras_zip_archive,
     is_pytorch_zip_archive,
@@ -122,6 +125,7 @@ _XGBOOST_PICKLE_SPOOF_REASON = "xgboost_binary_pickle_spoof"
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
+_XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON = "xgboost_ubjson_routing_incomplete"
 _ShardFamilyKey = tuple[str, str, int | None]
 _ScanEntry = tuple[str, list[str], _ShardFamilyKey | None]
 _SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY = "shard_family_cache_fingerprint"
@@ -364,6 +368,23 @@ def _make_incomplete_nemo_routing_result(path: str) -> ScanResult:
     )
     _mark_inconclusive_scan_outcome(result, "nemo_routing_incomplete")
     _mark_operational_scan_error(result, "nemo_routing_incomplete")
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_xgboost_ubjson_routing_result(path: str) -> ScanResult:
+    """Fail closed when bounded extensionless UBJSON routing cannot confirm XGBoost."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="XGBoost UBJSON Routing",
+        passed=False,
+        message="Extensionless UBJSON routing was inconclusive because the bounded learner probe reached its limit",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON)
     result.finish(success=False)
     return result
 
@@ -1446,6 +1467,13 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     header_format = detect_file_format(path)
     ext_format = detect_format_from_extension(path)
     ext = os.path.splitext(path)[1].lower()
+    magic_format = detect_file_format_from_magic(path)
+    if int(config.get("_archive_depth", 0)) > 0 and magic_format == "unknown":
+        nested_xgboost_route = detect_xgboost_ubjson_content_route(path)
+        if nested_xgboost_route is not None:
+            header_format = magic_format = nested_xgboost_route
+            if nested_xgboost_route == "xgboost":
+                config[XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY] = True
     is_xgboost_pickle_spoof = ext in _XGBOOST_BINARY_EXTENSIONS and header_format == "pickle"
 
     # Record telemetry for file type detection
@@ -1453,7 +1481,6 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     record_file_type_detected(path, detected_format)
 
     # Validate file type consistency as a security check
-    magic_format = detect_file_format_from_magic(path)
     if header_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT or magic_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
         sr = _make_incomplete_llamafile_routing_result(path, config)
         if sr.bytes_scanned == 0 and file_size > 0:
@@ -1461,6 +1488,14 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         return sr
     if header_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT or magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
         sr = _make_incomplete_nemo_routing_result(path)
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
+    if (
+        header_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+        or magic_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    ):
+        sr = _make_incomplete_xgboost_ubjson_routing_result(path)
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
@@ -1640,6 +1675,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 sr = _make_incomplete_llamafile_routing_result(path, config)
             elif magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_nemo_routing_result(path)
+            elif magic_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_xgboost_ubjson_routing_result(path)
             elif magic_format == "unknown":
                 # Not a recognized model format — skip silently
                 sr = ScanResult(scanner_name="unknown")

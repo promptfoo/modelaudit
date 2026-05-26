@@ -114,6 +114,7 @@ class SevenZipScanner(BaseScanner):
     _SEVENZIP_MAGIC: ClassVar[bytes] = b"7z\xbc\xaf\x27\x1c"
     _NESTED_MEMBER_PROBE_BYTES: ClassVar[int] = 512
     _XGBOOST_NESTED_MEMBER_PROBE_BYTES: ClassVar[int] = XGBoostScanner._UBJSON_PROBE_READ_BYTES
+    _XGBOOST_PROBE_FORMATS: ClassVar[frozenset[str]] = frozenset({"xgboost", "structural_candidate"})
 
     _MAX_EXTENSIONLESS_PROBES: ClassVar[int] = 100
     _MAX_TOTAL_EXTRACT_SIZE: ClassVar[int] = 5 * 1024 * 1024 * 1024  # 5 GB
@@ -440,7 +441,7 @@ class SevenZipScanner(BaseScanner):
 
             # Filter for scannable model files from safe entries only
             scannable_files = self._identify_scannable_files(safe_file_names)
-            nested_archive_files, probes_complete = self._identify_extensionless_nested_7z_files(
+            nested_archive_files, nested_probe_formats, probes_complete = self._identify_extensionless_nested_7z_files(
                 archive,
                 safe_file_names,
                 path,
@@ -467,6 +468,7 @@ class SevenZipScanner(BaseScanner):
                         result,
                         depth,
                         budget=budget,
+                        nested_probe_formats=nested_probe_formats,
                     )
                     and scan_complete
                 )
@@ -494,9 +496,10 @@ class SevenZipScanner(BaseScanner):
 
     def _identify_extensionless_nested_7z_files(
         self, archive: Any, file_names: list[str], archive_path: str, result: ScanResult
-    ) -> tuple[list[str], bool]:
+    ) -> tuple[list[str], dict[str, str], bool]:
         """Inspect likely disguised nested members and keep only confirmed scannable payloads."""
         nested_archives: list[str] = []
+        nested_probe_formats: dict[str, str] = {}
         probes_complete = True
         probe_candidates: list[tuple[int, int, str]] = []
         supported_extensions = self._supported_nested_core_extensions()
@@ -535,14 +538,16 @@ class SevenZipScanner(BaseScanner):
         probe_candidates.sort(key=lambda item: (-item[0], item[1]))
         probe_targets = [file_name for _, _, file_name in probe_candidates[: self.max_extensionless_probes]]
         if not probe_targets:
-            return nested_archives, probes_complete
+            return nested_archives, nested_probe_formats, probes_complete
 
         try:
             probe_results = self._probe_extensionless_members(archive, probe_targets)
             for file_name in probe_targets:
-                if probe_results.get(file_name):
+                detected_format = probe_results.get(file_name)
+                if detected_format:
                     nested_archives.append(file_name)
-            return nested_archives, probes_complete
+                    nested_probe_formats[file_name] = detected_format
+            return nested_archives, nested_probe_formats, probes_complete
         except Exception:
             # Fall back to per-member probing if the fast path fails against a
             # particular archive layout or py7zr behavior.
@@ -550,8 +555,10 @@ class SevenZipScanner(BaseScanner):
 
         for file_name in probe_targets:
             try:
-                if self._member_probe_detected_format(archive, file_name) is not None:
+                detected_format = self._member_probe_detected_format(archive, file_name)
+                if detected_format is not None:
                     nested_archives.append(file_name)
+                    nested_probe_formats[file_name] = detected_format
             except Exception as e:
                 probes_complete = False
                 result.add_check(
@@ -563,7 +570,7 @@ class SevenZipScanner(BaseScanner):
                     details={"error": str(e)},
                 )
 
-        return nested_archives, probes_complete
+        return nested_archives, nested_probe_formats, probes_complete
 
     @classmethod
     def _nested_probe_priority(cls, file_name: str) -> int:
@@ -661,7 +668,8 @@ class SevenZipScanner(BaseScanner):
             return detected_format
 
         probe.seek(0)
-        if probe.read(1) != bytes([XGBoostScanner._UBJSON_OBJECT_START]):
+        prefix = probe.read(self._NESTED_MEMBER_PROBE_BYTES)
+        if XGBoostScanner._classify_extensionless_ubjson_probe(prefix) != "inconclusive":
             return None
 
         expanded_factory = _HeaderProbeFactory(limit=self._XGBOOST_NESTED_MEMBER_PROBE_BYTES)
@@ -678,7 +686,12 @@ class SevenZipScanner(BaseScanner):
             return None
         expanded_probe.seek(0)
         expanded_prefix = expanded_probe.read(self._XGBOOST_NESTED_MEMBER_PROBE_BYTES)
-        return "xgboost" if XGBoostScanner._is_ubjson_probe(expanded_prefix) else None
+        route = XGBoostScanner._classify_extensionless_ubjson_probe(expanded_prefix)
+        if route == "xgboost":
+            return "xgboost"
+        if route == "inconclusive":
+            return "structural_candidate"
+        return None
 
     def _check_path_traversal(self, file_names: list[str], archive_path: str, result: ScanResult) -> list[str]:
         """Check for path traversal vulnerabilities and return only safe entries."""
@@ -736,6 +749,7 @@ class SevenZipScanner(BaseScanner):
         result: ScanResult,
         depth: int,
         budget: _RecursiveScanBudget,
+        nested_probe_formats: dict[str, str] | None = None,
     ) -> bool:
         """Extract scannable files and run appropriate scanners on them"""
         scan_complete = not budget.should_stop()
@@ -838,6 +852,7 @@ class SevenZipScanner(BaseScanner):
                                 result,
                                 depth,
                                 budget=budget,
+                                probed_format=(nested_probe_formats or {}).get(file_name),
                             )
                             if not nested_scan_success:
                                 scan_complete = False
@@ -926,6 +941,30 @@ class SevenZipScanner(BaseScanner):
 
         return core.scan_file(path, nested_config)
 
+    @staticmethod
+    def _retarget_probe_confirmed_xgboost_member(extracted_path: str) -> str:
+        """Move a disguised XGBoost member to an extensionless private routing path."""
+        routed_dir = os.path.join(os.path.dirname(extracted_path), ".modelaudit_routed")
+        os.makedirs(routed_dir, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix="member_", dir=routed_dir, delete=False) as routed_file:
+            routed_path = routed_file.name
+        os.replace(extracted_path, routed_path)
+        return routed_path
+
+    @classmethod
+    def _probe_extracted_xgboost_format(cls, extracted_path: str) -> str | None:
+        """Classify an extracted member that may hide UBJSON behind another suffix."""
+        try:
+            with open(extracted_path, "rb") as extracted_file:
+                prefix = extracted_file.read(cls._XGBOOST_NESTED_MEMBER_PROBE_BYTES)
+        except OSError:
+            return None
+
+        route = XGBoostScanner._classify_extensionless_ubjson_probe(prefix)
+        if route == "inconclusive":
+            return "structural_candidate"
+        return route
+
     def _scan_extracted_file(
         self,
         extracted_path: str,
@@ -934,21 +973,29 @@ class SevenZipScanner(BaseScanner):
         result: ScanResult,
         depth: int,
         budget: _RecursiveScanBudget,
+        probed_format: str | None = None,
     ) -> bool:
         """Scan an individual extracted file using the appropriate scanner"""
         try:
-            if original_name.lower().endswith(".7z") or self._has_7z_magic(extracted_path):
+            scan_path = extracted_path
+            original_suffix = Path(original_name).suffix.lower()
+            if probed_format is None and original_suffix not in {".bst", ".model", ".ubj"}:
+                probed_format = self._probe_extracted_xgboost_format(extracted_path)
+            if probed_format in self._XGBOOST_PROBE_FORMATS:
+                scan_path = self._retarget_probe_confirmed_xgboost_member(extracted_path)
+
+            if original_name.lower().endswith(".7z") or self._has_7z_magic(scan_path):
                 file_result = self._scan_7z_file(
-                    extracted_path,
+                    scan_path,
                     depth + 1,
                     budget=budget,
                 )
             else:
                 nested_config = dict(self.config)
                 nested_config["_archive_depth"] = depth + 1
-                file_result = self._scan_nested_archive_entry(extracted_path, nested_config)
+                file_result = self._scan_nested_archive_entry(scan_path, nested_config)
 
-            self._rewrite_nested_result_context(file_result, extracted_path, archive_path, original_name)
+            self._rewrite_nested_result_context(file_result, scan_path, archive_path, original_name)
             result.merge(file_result)
             return not member_scan_incomplete(file_result)
 

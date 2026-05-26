@@ -10,10 +10,12 @@ Tests cover various XGBoost model formats and security vulnerabilities:
 """
 
 import copy
+import io
 import json
 import pickle
 import struct
 import subprocess as real_subprocess
+import tarfile
 import tempfile
 import zipfile
 from collections.abc import Callable, Iterator
@@ -27,7 +29,9 @@ from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
+from modelaudit.scanners.tar_scanner import TarScanner
 from modelaudit.scanners.xgboost_scanner import XGBOOST_JSON_ROUTING_CHUNK_BYTES, XGBoostScanner
+from modelaudit.scanners.zip_scanner import ZipScanner
 
 
 class FakeBooster:
@@ -169,18 +173,114 @@ def _ubjson_string(value: bytes) -> bytes:
     return b"SL" + len(value).to_bytes(8, byteorder="big", signed=True) + value
 
 
-def _xgboost_ubjson_probe(*, learner_padding: int = 0) -> bytes:
+def _xgboost_ubjson_probe(
+    *, root_padding: int = 0, learner_padding: int = 0, learner_noop: bool = False, malicious: bool = False
+) -> bytes:
+    root_body = b""
+    if root_padding:
+        root_body += _ubjson_key(b"metadata") + _ubjson_string(b"x" * root_padding)
     learner_body = b""
     if learner_padding:
         learner_body += _ubjson_key(b"metadata") + _ubjson_string(b"x" * learner_padding)
     learner_body += _ubjson_key(b"learner_model_param") + b"{}"
-    return b"{" + _ubjson_key(b"learner") + b"{" + learner_body + b"}" + _ubjson_key(b"version") + b"[]" + b"}"
+    if malicious:
+        learner_body += _ubjson_key(b"malicious_code") + _ubjson_string(b"system(cpu)")
+    learner_value = (b"N" if learner_noop else b"") + b"{" + learner_body + b"}"
+    return b"{" + root_body + _ubjson_key(b"learner") + learner_value + _ubjson_key(b"version") + b"[]" + b"}"
 
 
 def _xgboost_ubjson_counted_null_array_probe() -> bytes:
     max_count = ((1 << 63) - 1).to_bytes(8, byteorder="big", signed=True)
     learner = b"{" + _ubjson_key(b"learner_model_param") + b"{}" + _ubjson_key(b"payload") + b"[$Z#L" + max_count + b"}"
     return b"{" + _ubjson_key(b"learner") + learner + _ubjson_key(b"version") + b"[]" + b"}"
+
+
+def _xgboost_ubjson_counted_null_array_before_learner_probe() -> bytes:
+    max_count = ((1 << 63) - 1).to_bytes(8, byteorder="big", signed=True)
+    return (
+        b"{"
+        + _ubjson_key(b"version")
+        + b"[$Z#L"
+        + max_count
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + b"}"
+    )
+
+
+def _xgboost_ubjson_noops_before_counted_null_array_probe() -> bytes:
+    max_count = ((1 << 63) - 1).to_bytes(8, byteorder="big", signed=True)
+    return (
+        b"{"
+        + (b"N" * XGBoostScanner._UBJSON_PROBE_READ_BYTES)
+        + _ubjson_key(b"version")
+        + b"[$Z#L"
+        + max_count
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + b"}"
+    )
+
+
+def _xgboost_ubjson_uncounted_null_array_probe(item_count: int) -> bytes:
+    learner = (
+        b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + _ubjson_key(b"payload")
+        + b"["
+        + (b"Z" * item_count)
+        + b"]}"
+    )
+    return b"{" + _ubjson_key(b"learner") + learner + b"}"
+
+
+def _xgboost_ubjson_noop_before_counted_root_header_probe() -> bytes:
+    return (
+        b"{N#U\x02"
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + _ubjson_key(b"version")
+        + b"[]"
+    )
+
+
+def _ubjson_root_counted_null_array_probe() -> bytes:
+    max_count = ((1 << 63) - 1).to_bytes(8, byteorder="big", signed=True)
+    return b"[$Z#L" + max_count
+
+
+def _ubjson_noop_before_counted_null_array_probe() -> bytes:
+    max_count = ((1 << 63) - 1).to_bytes(8, byteorder="big", signed=True)
+    return b"{" + _ubjson_key(b"payload") + b"N[$Z#L" + max_count + b"}"
+
+
+def _xgboost_ubjson_deep_before_counted_null_array_probe() -> bytes:
+    max_count = ((1 << 63) - 1).to_bytes(8, byteorder="big", signed=True)
+    nested = (
+        b"[" * (XGBoostScanner._UBJSON_MAX_PROBE_DEPTH + 2) + b"Z" + b"]" * (XGBoostScanner._UBJSON_MAX_PROBE_DEPTH + 2)
+    )
+    learner = (
+        b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + _ubjson_key(b"nested")
+        + nested
+        + _ubjson_key(b"payload")
+        + b"[$Z#L"
+        + max_count
+        + b"}"
+    )
+    return b"{" + _ubjson_key(b"learner") + learner + b"}"
 
 
 class TestXGBoostScannerBasic:
@@ -215,6 +315,18 @@ class TestXGBoostScannerBasic:
 
         assert XGBoostScanner.can_handle(str(model_file))
 
+    def test_can_handle_extensionless_ubjson_with_noop_before_learner(self, temp_dir: Path) -> None:
+        model_file = temp_dir / "model"
+        model_file.write_bytes(_xgboost_ubjson_probe(learner_noop=True))
+
+        assert XGBoostScanner.can_handle(str(model_file))
+
+    def test_can_handle_extensionless_ubjson_with_noop_before_counted_root_header(self, temp_dir: Path) -> None:
+        model_file = temp_dir / "model"
+        model_file.write_bytes(_xgboost_ubjson_noop_before_counted_root_header_probe())
+
+        assert XGBoostScanner.can_handle(str(model_file))
+
     def test_extensionless_counted_null_array_probe_is_bounded(self, temp_dir: Path) -> None:
         model_file = temp_dir / "model"
         model_file.write_bytes(_xgboost_ubjson_counted_null_array_probe())
@@ -233,6 +345,21 @@ class TestXGBoostScannerBasic:
 
         assert not XGBoostScanner.can_handle(str(model_file))
 
+    def test_rejects_extensionless_ubjson_manifest_with_generic_version_key(self, temp_dir: Path) -> None:
+        model_file = temp_dir / "model"
+        model_file.write_bytes(
+            b"{"
+            + _ubjson_key(b"learner")
+            + b"{}"
+            + _ubjson_key(b"version")
+            + b"[]"
+            + _ubjson_key(b"note")
+            + _ubjson_string(b"system(cpu)")
+            + b"}"
+        )
+
+        assert not XGBoostScanner.can_handle(str(model_file))
+
     def test_rejects_extensionless_ubjson_with_marker_text_only_in_values(self, temp_dir: Path) -> None:
         model_file = temp_dir / "model"
         model_file.write_bytes(b"{" + _ubjson_key(b"note") + _ubjson_string(b"learner version system(cpu)") + b"}")
@@ -245,13 +372,8 @@ class TestXGBoostScannerBasic:
 
         assert not XGBoostScanner.can_handle(str(model_file))
 
-    def test_rejects_extensionless_ubjson_when_strong_marker_past_probe_window(self, temp_dir: Path) -> None:
-        """Extensionless files require a strong marker *within* the probe window.
-
-        `.bst`/`.model` files trust the extension and need only a root `learner`
-        key, but an extensionless file whose model-specific child key sits past
-        the probe window must be rejected rather than overclaiming coverage.
-        """
+    def test_bounded_can_handle_defers_extensionless_ubjson_with_late_model_key(self, temp_dir: Path) -> None:
+        """Selection does not scan beyond the bounded extensionless probe."""
         probe_bytes = XGBoostScanner._UBJSON_PROBE_READ_BYTES
         payload = _xgboost_ubjson_probe(learner_padding=probe_bytes)
         encoded_strong_key = _ubjson_key(b"learner_model_param")
@@ -761,24 +883,22 @@ class TestXGBoostUBJScanning:
         assert "xgboost_ubj_dependency_missing" in result.metadata["scan_outcome_reasons"]
 
     def test_invalid_ubj_detected(self, temp_dir: Path, xgboost_scanner: XGBoostScanner) -> None:
-        """Unsupported UBJ decoding should fail closed without a fabricated security finding."""
+        """Malformed UBJ should fail closed before reaching the decoder."""
         pytest.importorskip("ubjson", reason="ubjson not installed")
         ubj_file = temp_dir / "invalid.ubj"
         ubj_file.write_bytes(b"\xff\xff\xff\xff")  # Invalid UBJ data
 
-        # Mock ubjson to be available but raise exception on decode
         with (
             patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=True),
             patch("ubjson.loadb") as mock_loadb,
         ):
-            mock_loadb.side_effect = Exception("Invalid UBJ format")
-
             result = xgboost_scanner.scan(str(ubj_file))
 
-        assert any("Error analyzing XGBoost UBJ model" in str(issue.message) for issue in result.issues)
+        assert any("resource preflight could not complete" in str(issue.message) for issue in result.issues)
         assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
-        assert "xgboost_ubj_analysis_failed" in result.metadata["scan_outcome_reasons"]
+        assert "xgboost_ubj_preflight_incomplete" in result.metadata["scan_outcome_reasons"]
+        mock_loadb.assert_not_called()
         assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
@@ -1112,6 +1232,42 @@ class TestXGBoostBinaryScanning:
         assert "xgboost_ubj_array_limit_exceeded" in result.metadata["scan_outcome_reasons"]
         assert any(check.name == "UBJ Decode Resource Limit" for check in result.checks)
 
+    def test_ubjson_bst_oversized_count_before_learner_skips_loading_fallback(self, temp_dir: Path) -> None:
+        """Unsafe UBJSON arrays must be blocked even before a claimed model's learner key."""
+        ubjson_bst = temp_dir / "model.bst"
+        ubjson_bst.write_bytes(_xgboost_ubjson_counted_null_array_before_learner_probe())
+        loading_scanner = XGBoostScanner({"enable_xgb_loading": True})
+
+        with (
+            patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=False),
+            patch.object(loading_scanner, "_safe_xgboost_load") as mock_safe_load,
+        ):
+            result = loading_scanner.scan(str(ubjson_bst))
+
+        mock_safe_load.assert_not_called()
+        assert result.success is False
+        assert "xgboost_ubj_dependency_missing" in result.metadata["scan_outcome_reasons"]
+        assert "xgboost_ubj_array_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert any(check.name == "UBJ Decode Resource Limit" for check in result.checks)
+
+    def test_ubjson_bst_noops_before_oversized_count_skip_loading_fallback(self, temp_dir: Path) -> None:
+        """A bounded no-op prefix must not allow unsafe UBJSON into native loading."""
+        ubjson_bst = temp_dir / "model.bst"
+        ubjson_bst.write_bytes(_xgboost_ubjson_noops_before_counted_null_array_probe())
+        loading_scanner = XGBoostScanner({"enable_xgb_loading": True})
+
+        with (
+            patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=False),
+            patch.object(loading_scanner, "_safe_xgboost_load") as mock_safe_load,
+        ):
+            result = loading_scanner.scan(str(ubjson_bst))
+
+        mock_safe_load.assert_not_called()
+        assert result.success is False
+        assert "xgboost_ubj_dependency_missing" in result.metadata["scan_outcome_reasons"]
+        assert "xgboost_ubj_array_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert any(check.name == "UBJ Decode Resource Limit" for check in result.checks)
+
     @patch("modelaudit.scanners.xgboost_scanner._check_xgboost_available")
     @patch("modelaudit.scanners.xgboost_scanner.subprocess")
     def test_xgboost_loading_success(self, mock_subprocess: Mock, mock_check_xgb: Mock, temp_dir: Path) -> None:
@@ -1246,9 +1402,38 @@ class TestXGBoostFailClosedEndToEnd:
         assert result.success is True
         assert result.issues == []
 
+    def test_extensionless_ubjson_generic_version_manifest_remains_unclaimed(self, tmp_path: Path) -> None:
+        model_file = tmp_path / "model"
+        model_file.write_bytes(
+            b"{"
+            + _ubjson_key(b"learner")
+            + b"{}"
+            + _ubjson_key(b"version")
+            + b"[]"
+            + _ubjson_key(b"note")
+            + _ubjson_string(b"system(cpu)")
+            + b"}"
+        )
+
+        result = scan_file(str(model_file), config={"cache_enabled": False})
+
+        assert result.scanner_name == "unknown"
+        assert result.success is True
+        assert result.issues == []
+
     def test_extensionless_ubjson_text_values_do_not_trigger_xgboost_findings(self, tmp_path: Path) -> None:
         model_file = tmp_path / "model"
         model_file.write_bytes(b"{" + _ubjson_key(b"message") + _ubjson_string(b"learner version system(cpu)") + b"}")
+
+        result = scan_file(str(model_file), config={"cache_enabled": False})
+
+        assert result.scanner_name == "unknown"
+        assert result.success is True
+        assert result.issues == []
+
+    def test_extensionless_plain_json_remains_unclaimed(self, tmp_path: Path) -> None:
+        model_file = tmp_path / "model"
+        model_file.write_text('{"kind":"manifest","safe":true}', encoding="utf-8")
 
         result = scan_file(str(model_file), config={"cache_enabled": False})
 
@@ -1271,8 +1456,180 @@ class TestXGBoostFailClosedEndToEnd:
         assert determine_exit_code(result) == 2
         assert "xgboost" in result.scanner_names
         _assert_inconclusive_metadata(result, model_file, "xgboost_ubj_array_limit_exceeded")
-        assert any("declared arrays exceed" in str(issue.message) for issue in result.issues)
+        assert any("decoded arrays exceed" in str(issue.message) for issue in result.issues)
         mock_loadb.assert_not_called()
+
+    def test_extensionless_ubjson_oversized_uncounted_array_fails_closed_before_decode(self, tmp_path: Path) -> None:
+        pytest.importorskip("ubjson", reason="ubjson not installed")
+        model_file = tmp_path / "model"
+        model_file.write_bytes(_xgboost_ubjson_uncounted_null_array_probe(5))
+
+        with (
+            patch.object(XGBoostScanner, "_UBJSON_MAX_DECODED_ARRAY_ITEMS", 4),
+            patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=True),
+            patch("ubjson.loadb") as mock_loadb,
+        ):
+            result = scan_model_directory_or_file(str(model_file), cache_enabled=False)
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert "xgboost" in result.scanner_names
+        _assert_inconclusive_metadata(result, model_file, "xgboost_ubj_array_limit_exceeded")
+        assert any("decoded arrays exceed" in str(issue.message) for issue in result.issues)
+        mock_loadb.assert_not_called()
+
+    def test_ubj_root_oversized_count_fails_closed_before_decode(self, tmp_path: Path) -> None:
+        pytest.importorskip("ubjson", reason="ubjson not installed")
+        model_file = tmp_path / "model.ubj"
+        model_file.write_bytes(_ubjson_root_counted_null_array_probe())
+
+        with (
+            patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=True),
+            patch("ubjson.loadb") as mock_loadb,
+        ):
+            result = scan_model_directory_or_file(str(model_file), cache_enabled=False)
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        _assert_inconclusive_metadata(result, model_file, "xgboost_ubj_array_limit_exceeded")
+        assert any("decoded arrays exceed" in str(issue.message) for issue in result.issues)
+        mock_loadb.assert_not_called()
+
+    def test_ubj_noop_before_oversized_count_fails_closed_before_decode(self, tmp_path: Path) -> None:
+        pytest.importorskip("ubjson", reason="ubjson not installed")
+        model_file = tmp_path / "model.ubj"
+        model_file.write_bytes(_ubjson_noop_before_counted_null_array_probe())
+
+        with (
+            patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=True),
+            patch("ubjson.loadb") as mock_loadb,
+        ):
+            result = scan_model_directory_or_file(str(model_file), cache_enabled=False)
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        _assert_inconclusive_metadata(result, model_file, "xgboost_ubj_array_limit_exceeded")
+        assert any("decoded arrays exceed" in str(issue.message) for issue in result.issues)
+        mock_loadb.assert_not_called()
+
+    def test_ubj_deep_container_fails_closed_before_decode(self, tmp_path: Path) -> None:
+        pytest.importorskip("ubjson", reason="ubjson not installed")
+        model_file = tmp_path / "model.ubj"
+        model_file.write_bytes(_xgboost_ubjson_deep_before_counted_null_array_probe())
+
+        with (
+            patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=True),
+            patch("ubjson.loadb") as mock_loadb,
+        ):
+            result = scan_model_directory_or_file(str(model_file), cache_enabled=False)
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        _assert_inconclusive_metadata(result, model_file, "xgboost_ubj_preflight_incomplete")
+        assert any("resource preflight could not complete" in str(issue.message) for issue in result.issues)
+        mock_loadb.assert_not_called()
+
+    def test_extensionless_ubjson_late_model_key_fails_closed_in_routing(self, tmp_path: Path) -> None:
+        model_file = tmp_path / "model"
+        model_file.write_bytes(
+            _xgboost_ubjson_probe(learner_padding=XGBoostScanner._UBJSON_PROBE_READ_BYTES, malicious=True)
+        )
+
+        result = scan_model_directory_or_file(str(model_file), cache_enabled=False)
+
+        assert determine_exit_code(result) == 2
+        assert "xgboost" not in result.scanner_names
+        _assert_inconclusive_metadata(result, model_file, "xgboost_ubjson_routing_incomplete")
+        assert any("routing was inconclusive" in str(issue.message) for issue in result.issues)
+
+    def test_extensionless_ubjson_late_learner_fails_closed_in_routing(self, tmp_path: Path) -> None:
+        model_file = tmp_path / "model"
+        model_file.write_bytes(
+            _xgboost_ubjson_probe(root_padding=XGBoostScanner._UBJSON_PROBE_READ_BYTES, malicious=True)
+        )
+
+        result = scan_model_directory_or_file(str(model_file), cache_enabled=False)
+
+        assert determine_exit_code(result) == 2
+        assert "xgboost" not in result.scanner_names
+        _assert_inconclusive_metadata(result, model_file, "xgboost_ubjson_routing_incomplete")
+        assert any("routing was inconclusive" in str(issue.message) for issue in result.issues)
+
+    def test_extensionless_ubjson_root_noops_before_late_learner_fail_closed_in_routing(self, tmp_path: Path) -> None:
+        model_file = tmp_path / "model"
+        payload = (
+            b"{"
+            + (b"N" * XGBoostScanner._UBJSON_PROBE_READ_BYTES)
+            + _ubjson_key(b"learner")
+            + b"{"
+            + _ubjson_key(b"learner_model_param")
+            + b"{}"
+            + b"}"
+            + b"}"
+        )
+        model_file.write_bytes(payload)
+
+        result = scan_model_directory_or_file(str(model_file), cache_enabled=False)
+
+        assert determine_exit_code(result) == 2
+        assert "xgboost" not in result.scanner_names
+        _assert_inconclusive_metadata(result, model_file, "xgboost_ubjson_routing_incomplete")
+
+    def test_extensionless_ubjson_noops_before_truncated_root_header_fail_closed_in_routing(
+        self, tmp_path: Path
+    ) -> None:
+        model_file = tmp_path / "model"
+        payload = (
+            b"{"
+            + (b"N" * (XGBoostScanner._UBJSON_PROBE_READ_BYTES - 2))
+            + b"#U\x01"
+            + _ubjson_key(b"learner")
+            + b"{"
+            + _ubjson_key(b"learner_model_param")
+            + b"{}"
+            + b"}"
+        )
+        model_file.write_bytes(payload)
+
+        result = scan_model_directory_or_file(str(model_file), cache_enabled=False)
+
+        assert determine_exit_code(result) == 2
+        assert "xgboost" not in result.scanner_names
+        _assert_inconclusive_metadata(result, model_file, "xgboost_ubjson_routing_incomplete")
+
+    def test_extensionless_ubjson_noop_before_learner_fails_closed(self, tmp_path: Path) -> None:
+        pytest.importorskip("ubjson", reason="ubjson not installed")
+        model_file = tmp_path / "model"
+        model_file.write_bytes(_xgboost_ubjson_probe(learner_noop=True, malicious=True))
+
+        result = scan_model_directory_or_file(str(model_file), cache_enabled=False)
+
+        assert determine_exit_code(result) == 2
+        assert "xgboost" in result.scanner_names
+        _assert_inconclusive_metadata(result, model_file, "xgboost_ubj_analysis_failed")
+        assert any("Error analyzing XGBoost UBJ model" in str(issue.message) for issue in result.issues)
+
+    def test_extensionless_ubjson_large_manifest_fails_closed_without_attribution(self, tmp_path: Path) -> None:
+        ubjson = pytest.importorskip("ubjson", reason="ubjson not installed")
+        model_file = tmp_path / "model"
+        model_file.write_bytes(
+            ubjson.dumpb(
+                {
+                    "learner": {
+                        "metadata": "x" * XGBoostScanner._UBJSON_PROBE_READ_BYTES,
+                        "note": "system(cpu)",
+                    },
+                    "version": [1],
+                }
+            )
+        )
+
+        result = scan_model_directory_or_file(str(model_file), cache_enabled=False)
+
+        assert determine_exit_code(result) == 2
+        assert "xgboost" not in result.scanner_names
+        _assert_inconclusive_metadata(result, model_file, "xgboost_ubjson_routing_incomplete")
+        assert not any("System call in JSON" in str(issue.message) for issue in result.issues)
 
     def test_binary_read_failure_core_is_operational_not_security_finding(self, tmp_path: Path) -> None:
         binary_file = tmp_path / "unreadable.bst"
@@ -1301,6 +1658,79 @@ class TestXGBoostFailClosedEndToEnd:
         assert any(
             issue.severity == IssueSeverity.CRITICAL
             and issue.location == f"{archive_file}:models/model"
+            and "System call in JSON" in str(issue.message)
+            for issue in result.issues
+        )
+
+    @pytest.mark.parametrize(
+        ("archive_kind", "member_name"),
+        [
+            ("zip", "models/model.dat"),
+            ("zip", "models/model.json"),
+            ("zip", "models/model.onnx"),
+            ("tar", "models/model.dat"),
+            ("tar", "models/model.json"),
+            ("tar", "models/model.safetensors"),
+        ],
+    )
+    def test_misleading_suffix_nested_ubjson_detects_malicious_content(
+        self,
+        tmp_path: Path,
+        valid_xgboost_json: dict[str, Any],
+        archive_kind: str,
+        member_name: str,
+    ) -> None:
+        ubjson = pytest.importorskip("ubjson", reason="ubjson not installed")
+        valid_xgboost_json["learner"]["malicious_code"] = "os.system('touch pwned')"
+        payload = ubjson.dumpb(valid_xgboost_json)
+        archive_file = tmp_path / f"bundle.{archive_kind}"
+        if archive_kind == "zip":
+            with zipfile.ZipFile(archive_file, "w") as archive:
+                archive.writestr(member_name, payload)
+        else:
+            with tarfile.open(archive_file, "w") as archive:
+                info = tarfile.TarInfo(member_name)
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+
+        result = scan_model_directory_or_file(str(archive_file), cache_enabled=False)
+
+        assert determine_exit_code(result) == 1
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.location == f"{archive_file}:{member_name}"
+            and "System call in JSON" in str(issue.message)
+            for issue in result.issues
+        )
+
+    @pytest.mark.parametrize(
+        ("archive_kind", "member_name"), [("zip", "models/model.json"), ("tar", "models/model.dat")]
+    )
+    def test_direct_archive_dispatch_routes_misleading_suffix_ubjson(
+        self,
+        tmp_path: Path,
+        valid_xgboost_json: dict[str, Any],
+        archive_kind: str,
+        member_name: str,
+    ) -> None:
+        ubjson = pytest.importorskip("ubjson", reason="ubjson not installed")
+        valid_xgboost_json["learner"]["malicious_code"] = "os.system('touch pwned')"
+        payload = ubjson.dumpb(valid_xgboost_json)
+        archive_file = tmp_path / f"direct.{archive_kind}"
+        if archive_kind == "zip":
+            with zipfile.ZipFile(archive_file, "w") as archive:
+                archive.writestr(member_name, payload)
+            result = ZipScanner({"cache_enabled": False}).scan(str(archive_file))
+        else:
+            with tarfile.open(archive_file, "w") as archive:
+                info = tarfile.TarInfo(member_name)
+                info.size = len(payload)
+                archive.addfile(info, io.BytesIO(payload))
+            result = TarScanner({"cache_enabled": False}).scan(str(archive_file))
+
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL
+            and issue.location == f"{archive_file}:{member_name}"
             and "System call in JSON" in str(issue.message)
             for issue in result.issues
         )

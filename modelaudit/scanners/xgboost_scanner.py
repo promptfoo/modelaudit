@@ -47,6 +47,7 @@ SUSPICIOUS_JSON_PATTERNS = [
 _INERT_JSON_SECURITY_PATHS: frozenset[tuple[str | int, ...]] = frozenset({("learner", "feature_names")})
 XGBOOST_DEFAULT_MAX_FILE_READ_SIZE = 256 * 1024 * 1024
 XGBOOST_JSON_ROUTING_CHUNK_BYTES = 64 * 1024
+XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY = "_xgboost_content_routed_ubjson"
 _JSON_KEY_MAX_BYTES = 256
 _JSON_WHITESPACE_BYTES = frozenset(b" \t\r\n")
 
@@ -230,18 +231,7 @@ class XGBoostScanner(BaseScanner):
     _UBJSON_PROBE_READ_BYTES: ClassVar[int] = 256 * 1024
     _UBJSON_OBJECT_START: ClassVar[int] = ord("{")
     _UBJSON_REQUIRED_KEYS: ClassVar[frozenset[bytes]] = frozenset({b"learner"})
-    _UBJSON_STRONG_KEYS: ClassVar[frozenset[bytes]] = frozenset(
-        {
-            b"version",
-            b"gradient_booster",
-            b"learner_model_param",
-            b"gbtree_model_param",
-            b"tree_info",
-            b"gbtree",
-            b"gblinear",
-            b"dart",
-        }
-    )
+    _UBJSON_STRONG_KEYS: ClassVar[frozenset[bytes]] = frozenset({b"gradient_booster", b"learner_model_param"})
     _UBJSON_INTEGER_WIDTHS: ClassVar[dict[int, tuple[int, bool]]] = {
         ord("i"): (1, True),
         ord("U"): (1, False),
@@ -278,6 +268,7 @@ class XGBoostScanner(BaseScanner):
         "ubj_dependency_missing": "xgboost_ubj_dependency_missing",
         "ubj_analysis_failed": "xgboost_ubj_analysis_failed",
         "ubj_array_limit_exceeded": "xgboost_ubj_array_limit_exceeded",
+        "ubj_preflight_incomplete": "xgboost_ubj_preflight_incomplete",
         "binary_empty": "xgboost_binary_empty",
         "binary_structure_too_small": "xgboost_binary_structure_too_small",
         "binary_structure_unrecognized": "xgboost_binary_structure_unrecognized",
@@ -418,7 +409,9 @@ class XGBoostScanner(BaseScanner):
             # Hashing reads the model content and is part of available scan coverage.
             self.add_file_integrity_check(path, result)
 
-            if file_ext == ".json":
+            if self.config.get(XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY) is True:
+                self._scan_ubj_model(path, result)
+            elif file_ext == ".json":
                 self._scan_json_model(path, result)
             elif file_ext == ".ubj":
                 self._scan_ubj_model(path, result)
@@ -517,6 +510,16 @@ class XGBoostScanner(BaseScanner):
                 message="XGBoost UBJ model decoded successfully",
                 location=path,
             )
+
+            if not os.path.splitext(path)[1] and not self._decoded_extensionless_ubjson_confirms_xgboost(model_data):
+                result.add_check(
+                    name="UBJ Content Routing",
+                    passed=True,
+                    message="Extensionless UBJSON content does not confirm an XGBoost model",
+                    location=path,
+                    details={"detected_format": "ubjson", "xgboost_structure_confirmed": False},
+                )
+                return
 
             # Treat decoded UBJ as JSON structure for validation
             self._validate_xgboost_json_schema(model_data, result, path)
@@ -649,27 +652,35 @@ class XGBoostScanner(BaseScanner):
         with open(path, "rb") as f:
             encoded_model = f.read()
 
-        _, _, exceeds_array_limit = self._ubjson_object_keys_in_probe(encoded_model)
-        if not exceeds_array_limit:
+        _, _, exceeds_array_limit, _, parse_complete = self._ubjson_object_keys_in_probe(encoded_model)
+        if not exceeds_array_limit and parse_complete:
             return encoded_model
 
+        reason = (
+            self._INCONCLUSIVE_REASONS["ubj_array_limit_exceeded"]
+            if exceeds_array_limit
+            else self._INCONCLUSIVE_REASONS["ubj_preflight_incomplete"]
+        )
+        message = (
+            "Cannot safely decode XGBoost UBJ model: decoded arrays exceed "
+            f"{self._UBJSON_MAX_DECODED_ARRAY_ITEMS:,} materialized items"
+            if exceeds_array_limit
+            else "Cannot safely decode XGBoost UBJ model: bounded resource preflight could not complete"
+        )
         result.add_check(
             name="UBJ Decode Resource Limit",
             passed=False,
-            message=(
-                "Cannot safely decode XGBoost UBJ model: declared arrays exceed "
-                f"{self._UBJSON_MAX_DECODED_ARRAY_ITEMS:,} materialized items"
-            ),
+            message=message,
             severity=IssueSeverity.INFO,
             location=path,
             details={
                 "max_decoded_array_items": self._UBJSON_MAX_DECODED_ARRAY_ITEMS,
                 "analysis_incomplete": True,
-                "scan_outcome_reason": self._INCONCLUSIVE_REASONS["ubj_array_limit_exceeded"],
+                "scan_outcome_reason": reason,
             },
             why="Decoding attacker-controlled counted arrays can exhaust scanner memory",
         )
-        self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["ubj_array_limit_exceeded"])
+        self._mark_inconclusive_scan_result(result, reason)
         return None
 
     def _validate_xgboost_json_schema(self, data: dict[str, Any], result: ScanResult, path: str) -> None:
@@ -1061,12 +1072,23 @@ class XGBoostScanner(BaseScanner):
         return length, end
 
     @classmethod
-    def _ubjson_object_keys_in_probe(cls, probe: bytes) -> tuple[set[bytes], set[bytes], bool]:
-        """Collect UBJSON object keys and flag arrays unsafe to materialize."""
-        keys: set[bytes] = set()
+    def _decoded_extensionless_ubjson_confirms_xgboost(cls, data: Any) -> bool:
+        """Confirm content-routed UBJSON has direct XGBoost learner structure."""
+        if not isinstance(data, dict):
+            return False
+        learner = data.get("learner")
+        if not isinstance(learner, dict):
+            return False
+        return any(key.decode("ascii") in learner for key in cls._UBJSON_STRONG_KEYS)
+
+    @classmethod
+    def _ubjson_object_keys_in_probe(cls, probe: bytes) -> tuple[set[bytes], set[bytes], bool, bool, bool]:
+        """Collect root/learner UBJSON keys and detect unsafe or incomplete candidates."""
+        learner_keys: set[bytes] = set()
         top_level_keys: set[bytes] = set()
         decoded_array_items = 0
         exceeds_array_limit = False
+        root_learner_incomplete = False
 
         def read_sized_payload(offset: int) -> int | None:
             length_result = cls._read_ubjson_length(probe, offset)
@@ -1079,7 +1101,12 @@ class XGBoostScanner(BaseScanner):
         def read_container_header(offset: int) -> tuple[int | None, int | None, int] | None:
             typed_marker: int | None = None
             count: int | None = None
-            while offset < len(probe) and probe[offset] in {ord("$"), ord("#")}:
+            while offset < len(probe):
+                if probe[offset] == ord("N"):
+                    offset += 1
+                    continue
+                if probe[offset] not in {ord("$"), ord("#")}:
+                    break
                 marker = probe[offset]
                 offset += 1
                 if marker == ord("$"):
@@ -1094,12 +1121,20 @@ class XGBoostScanner(BaseScanner):
                     count, offset = length_result
             return typed_marker, count, offset
 
-        def parse_value(offset: int, depth: int, typed_marker: int | None = None) -> int | None:
-            nonlocal decoded_array_items, exceeds_array_limit
+        def parse_value(
+            offset: int,
+            depth: int,
+            typed_marker: int | None = None,
+            *,
+            direct_learner_object: bool = False,
+        ) -> int | None:
+            nonlocal decoded_array_items, exceeds_array_limit, root_learner_incomplete
             if depth > cls._UBJSON_MAX_PROBE_DEPTH:
                 return None
             marker = typed_marker
             if marker is None:
+                while offset < len(probe) and probe[offset] == ord("N"):
+                    offset += 1
                 if offset >= len(probe):
                     return None
                 marker = probe[offset]
@@ -1134,8 +1169,15 @@ class XGBoostScanner(BaseScanner):
                         return end if end <= len(probe) else None
                 item_count = 0
                 while count is None or item_count < count:
+                    while value_marker is None and offset < len(probe) and probe[offset] == ord("N"):
+                        offset += 1
                     if count is None and offset < len(probe) and probe[offset] == ord("]"):
                         return offset + 1
+                    if count is None:
+                        if decoded_array_items >= cls._UBJSON_MAX_DECODED_ARRAY_ITEMS:
+                            exceeds_array_limit = True
+                            return None
+                        decoded_array_items += 1
                     next_offset = parse_value(offset, depth + 1, value_marker)
                     if next_offset is None or next_offset <= offset:
                         return None
@@ -1149,6 +1191,8 @@ class XGBoostScanner(BaseScanner):
                 value_marker, count, offset = header
                 item_count = 0
                 while count is None or item_count < count:
+                    while offset < len(probe) and probe[offset] == ord("N"):
+                        offset += 1
                     if count is None and offset < len(probe) and probe[offset] == ord("}"):
                         return offset + 1
                     length_result = cls._read_ubjson_length(probe, offset)
@@ -1159,28 +1203,110 @@ class XGBoostScanner(BaseScanner):
                     if key_end > len(probe):
                         return None
                     key = probe[key_offset:key_end]
-                    keys.add(key)
                     if depth == 0:
                         top_level_keys.add(key)
-                    next_offset = parse_value(key_end, depth + 1, value_marker)
+                    if direct_learner_object:
+                        learner_keys.add(key)
+                    value_offset = key_end
+                    if value_marker is None:
+                        while value_offset < len(probe) and probe[value_offset] == ord("N"):
+                            value_offset += 1
+                    is_root_learner_object = (
+                        depth == 0
+                        and key == b"learner"
+                        and (
+                            value_marker == ord("{")
+                            or (value_marker is None and value_offset < len(probe) and probe[value_offset] == ord("{"))
+                        )
+                    )
+                    next_offset = parse_value(
+                        key_end,
+                        depth + 1,
+                        value_marker,
+                        direct_learner_object=is_root_learner_object,
+                    )
                     if next_offset is None:
+                        if is_root_learner_object:
+                            root_learner_incomplete = True
                         return None
                     offset = next_offset
                     item_count += 1
                 return offset + 1 if offset < len(probe) and probe[offset] == ord("}") else offset
             return None
 
-        if probe and probe[0] == cls._UBJSON_OBJECT_START:
-            parse_value(0, 0)
-        return top_level_keys, keys, exceeds_array_limit
+        parse_complete = bool(probe) and parse_value(0, 0) is not None
+        return top_level_keys, learner_keys, exceeds_array_limit, root_learner_incomplete, parse_complete
+
+    @classmethod
+    def _classify_extensionless_ubjson_probe(cls, probe: bytes) -> str | None:
+        """Classify a bounded extensionless UBJSON prefix without overclaiming."""
+        top_level_keys, learner_keys, _, _, parse_complete = cls._ubjson_object_keys_in_probe(probe)
+        if top_level_keys >= cls._UBJSON_REQUIRED_KEYS and cls._UBJSON_STRONG_KEYS & learner_keys:
+            return "xgboost"
+
+        if cls._is_incomplete_ubjson_object_probe(
+            probe,
+            has_parsed_key=bool(top_level_keys),
+            parse_complete=parse_complete,
+        ):
+            return "inconclusive"
+        return None
+
+    @classmethod
+    def _is_incomplete_ubjson_object_probe(
+        cls,
+        probe: bytes,
+        *,
+        has_parsed_key: bool,
+        parse_complete: bool,
+    ) -> bool:
+        """Recognize a bounded but plausible UBJSON object prefix."""
+        if parse_complete:
+            return False
+        root_offset = 0
+        while root_offset < len(probe) and probe[root_offset] == ord("N"):
+            root_offset += 1
+        return (
+            root_offset < len(probe)
+            and probe[root_offset] == cls._UBJSON_OBJECT_START
+            and cls._has_ubjson_object_key_prefix(probe, root_offset + 1, has_parsed_key)
+        )
+
+    @classmethod
+    def _has_ubjson_object_key_prefix(cls, probe: bytes, offset: int, has_parsed_key: bool) -> bool:
+        """Distinguish incomplete UBJSON object roots from ordinary JSON objects."""
+        if has_parsed_key:
+            return True
+        saw_noop = False
+        while offset < len(probe):
+            if probe[offset] == ord("N"):
+                saw_noop = True
+                offset += 1
+                continue
+            if probe[offset] not in {ord("$"), ord("#")}:
+                break
+            marker = probe[offset]
+            offset += 1
+            if marker == ord("$"):
+                if offset >= len(probe):
+                    return True
+                offset += 1
+            else:
+                length_result = cls._read_ubjson_length(probe, offset)
+                if length_result is None:
+                    return True
+                _, offset = length_result
+        if offset >= len(probe):
+            return saw_noop
+        return probe[offset] in cls._UBJSON_INTEGER_WIDTHS
 
     @classmethod
     def _is_ubjson_probe(cls, probe: bytes, *, require_strong_marker: bool = True) -> bool:
         """Check whether a bounded UBJSON prefix has XGBoost object structure."""
-        top_level_keys, keys, _ = cls._ubjson_object_keys_in_probe(probe)
+        top_level_keys, learner_keys, _, _, _ = cls._ubjson_object_keys_in_probe(probe)
         if not top_level_keys >= cls._UBJSON_REQUIRED_KEYS:
             return False
-        return not require_strong_marker or bool(cls._UBJSON_STRONG_KEYS & keys)
+        return not require_strong_marker or bool(cls._UBJSON_STRONG_KEYS & learner_keys)
 
     @classmethod
     def _is_ubjson_file(cls, path: str, *, require_strong_marker: bool = True) -> bool:
@@ -1188,7 +1314,24 @@ class XGBoostScanner(BaseScanner):
         try:
             with open(path, "rb") as f:
                 probe = f.read(cls._UBJSON_PROBE_READ_BYTES)
-            return cls._is_ubjson_probe(probe, require_strong_marker=require_strong_marker)
+            top_level_keys, learner_keys, exceeds_array_limit, _, parse_complete = cls._ubjson_object_keys_in_probe(
+                probe
+            )
+            if top_level_keys >= cls._UBJSON_REQUIRED_KEYS and (
+                not require_strong_marker or bool(cls._UBJSON_STRONG_KEYS & learner_keys)
+            ):
+                return True
+            return not require_strong_marker and (
+                exceeds_array_limit
+                or (
+                    len(probe) == cls._UBJSON_PROBE_READ_BYTES
+                    and cls._is_incomplete_ubjson_object_probe(
+                        probe,
+                        has_parsed_key=bool(top_level_keys),
+                        parse_complete=parse_complete,
+                    )
+                )
+            )
         except OSError:
             return False
 
