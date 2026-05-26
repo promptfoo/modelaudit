@@ -13,11 +13,12 @@ from onnx import TensorProto, helper
 from onnx.onnx_ml_pb2 import StringStringEntryProto
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
-from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.detectors.jit_script import JITScriptDetector
 from modelaudit.detectors.network_comm import NetworkCommDetector
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.onnx_scanner import (
+    ONNX_PARSE_INCONCLUSIVE_REASON,
     ONNX_STRUCTURE_INCONCLUSIVE_REASON,
     OnnxScanner,
     _confirmed_python_operator_findings,
@@ -328,7 +329,83 @@ def test_onnx_scanner_corrupted(tmp_path: Path) -> None:
     # truncate file to corrupt it
     model_path.write_bytes(data[:10])
     result = OnnxScanner().scan(str(model_path))
-    assert not result.success or any(i.severity == IssueSeverity.INFO for i in result.issues)
+
+    assert result.success is False
+    assert result.has_errors is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert ONNX_PARSE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "ONNX Model Parsing"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.INFO
+        for check in result.checks
+    )
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+def test_content_routed_corrupt_onnx_is_inconclusive_and_uncached(tmp_path: Path) -> None:
+    """A renamed malformed ONNX payload is incomplete coverage, not confirmed risk."""
+    valid_path = create_onnx_model(tmp_path)
+    model_path = tmp_path / "corrupt.payload"
+    model_path.write_bytes(valid_path.read_bytes() + b"\xff")
+    cache_dir = tmp_path / "cache"
+
+    direct_result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert direct_result.scanner_name == "onnx"
+    assert direct_result.success is False
+    assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert ONNX_PARSE_INCONCLUSIVE_REASON in direct_result.metadata["scan_outcome_reasons"]
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in direct_result.issues)
+
+    reset_cache_manager()
+    try:
+        first_result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second_result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for result in (first_result, second_result):
+            metadata = result.file_metadata[str(model_path)]
+            assert determine_exit_code(result) == 2
+            assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+            assert ONNX_PARSE_INCONCLUSIVE_REASON in metadata.get("scan_outcome_reasons", [])
+            assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_content_routed_python_operator_remains_critical(tmp_path: Path) -> None:
+    """A renamed valid ONNX model with executable operator evidence must still fail as security risk."""
+    valid_path = create_onnx_model(
+        tmp_path,
+        custom=True,
+        custom_domain="",
+        custom_op_type="PythonOp",
+        include_initializer=False,
+    )
+    model_path = tmp_path / "malicious.payload"
+    model_path.write_bytes(valid_path.read_bytes())
+
+    direct_result = scan_file(str(model_path), config={"cache_scan_results": False})
+    aggregate_result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert direct_result.scanner_name == "onnx"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
+        for issue in direct_result.issues
+    )
+    assert determine_exit_code(aggregate_result) == 1
 
 
 def test_onnx_scanner_python_op(tmp_path: Path) -> None:
