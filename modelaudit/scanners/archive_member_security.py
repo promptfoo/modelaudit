@@ -43,8 +43,11 @@ _PORTABLE_EXECUTABLE_SIGNATURE = b"PE\x00\x00"
 _EXECUTABLE_ARCHIVE_MEMBER_MAGIC_RULE_CODES = (
     ((b"\x7fELF",), "S502"),
     ((b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf", b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe"), "S503"),
-    ((b"#!",), "S504"),
 )
+_SHEBANG_SHELL_INTERPRETERS = frozenset({"ash", "bash", "dash", "fish", "ksh", "sh", "zsh"})
+_SHEBANG_POWERSHELL_INTERPRETERS = frozenset({"powershell", "pwsh"})
+_SHEBANG_JAVASCRIPT_INTERPRETERS = frozenset({"deno", "node", "nodejs"})
+_SHEBANG_PYTHON_INTERPRETER_RE = re.compile(r"^(?:python(?:[0-9]+(?:\.[0-9]+)*)?|pypy(?:[0-9]+)?)$")
 _MACHO_FAT_MAGIC_32_BE = b"\xca\xfe\xba\xbe"
 _MACHO_FAT_MAGIC_32_LE = b"\xbe\xba\xfe\xca"
 _MACHO_FAT_MAGIC_64_BE = b"\xca\xfe\xba\xbf"
@@ -136,14 +139,17 @@ def is_executable_archive_member_name(member_name: str) -> bool:
 
 def executable_archive_member_rule_code(member_name: str, *, path: str | None = None) -> str | None:
     """Return the rule code for an executable archive member name or content probe."""
+    if path is not None:
+        content_rule_code = _executable_archive_member_content_rule_code(path)
+        if content_rule_code is not None:
+            return content_rule_code
+
     normalized_name = member_name.lower()
     for suffixes, rule_code in _EXECUTABLE_ARCHIVE_MEMBER_SUFFIX_RULE_CODES:
         if normalized_name.endswith(suffixes):
             return rule_code
     if _VERSIONED_SHARED_OBJECT_SUFFIX_RE.search(normalized_name):
         return "S502"
-    if path is not None:
-        return _executable_archive_member_content_rule_code(path)
     return None
 
 
@@ -190,6 +196,60 @@ def _looks_like_macho_fat_binary(prefix: bytes) -> bool:
     return len(prefix) >= 8 + (arch_count * arch_entry_size)
 
 
+def _normalized_shebang_command_name(command: str) -> str:
+    normalized = command.rsplit("/", 1)[-1].lower()
+    if normalized.endswith(".exe"):
+        normalized = normalized.removesuffix(".exe")
+    return normalized
+
+
+def _env_shebang_command_tokens(tokens: list[str]) -> list[str]:
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-S":
+            index += 1
+            continue
+        if token in {"-i", "--ignore-environment"}:
+            index += 1
+            continue
+        if token in {"-u", "--unset"}:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        if "=" in token and not token.startswith(("/", ".")):
+            index += 1
+            continue
+        return tokens[index:]
+    return []
+
+
+def _shebang_rule_code(prefix: bytes) -> str | None:
+    if not prefix.startswith(b"#!"):
+        return None
+
+    shebang_command = prefix.splitlines()[0][2:].strip().decode("utf-8", errors="ignore")
+    if not shebang_command:
+        return "S504"
+
+    tokens = re.split(r"\s+", shebang_command)
+    command_name = _normalized_shebang_command_name(tokens[0])
+    if command_name == "env":
+        env_tokens = _env_shebang_command_tokens(tokens[1:])
+        if env_tokens:
+            command_name = _normalized_shebang_command_name(env_tokens[0])
+
+    if _SHEBANG_PYTHON_INTERPRETER_RE.fullmatch(command_name):
+        return "S507"
+    if command_name in _SHEBANG_POWERSHELL_INTERPRETERS:
+        return "S506"
+    if command_name in _SHEBANG_JAVASCRIPT_INTERPRETERS:
+        return "S508"
+    return "S504"
+
+
 def _executable_archive_member_content_rule_code(path: str) -> str | None:
     """Return the rule code for a bounded executable-content signature probe."""
     try:
@@ -198,6 +258,9 @@ def _executable_archive_member_content_rule_code(path: str) -> str | None:
     except OSError:
         return None
 
+    shebang_rule_code = _shebang_rule_code(prefix)
+    if shebang_rule_code is not None:
+        return shebang_rule_code
     for prefixes, rule_code in _EXECUTABLE_ARCHIVE_MEMBER_MAGIC_RULE_CODES:
         if prefix.startswith(prefixes):
             return rule_code
