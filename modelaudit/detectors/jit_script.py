@@ -194,7 +194,9 @@ CODE_EXECUTION_PATTERNS = [
     (rb"runpy\.(?:run_module|run_path)", _RUNPY_CODE_EXECUTION_DESCRIPTION),
     (rb"webbrowser\.open(?:_new(?:_tab)?)?", _WEBBROWSER_LAUNCH_DESCRIPTION),
     (
-        rb"ctypes\.(?:(?:CDLL|OleDLL|PyDLL|WinDLL)|(?:cdll|oledll|pydll|windll)\.LoadLibrary)",
+        rb"(?:_ctypes\.dlopen|ctypes\.(?:(?:CDLL|OleDLL|PyDLL|WinDLL)|"
+        rb"LibraryLoader\s*\([^)]*\)\.LoadLibrary|"
+        rb"(?:cdll|oledll|pydll|windll)\.(?:LoadLibrary|[A-Za-z_]\w*)))",
         _CTYPES_NATIVE_LOADING_DESCRIPTION,
     ),
     # Network patterns

@@ -407,6 +407,12 @@ def test_scan_zip_preserves_possible_webbrowser_launch_after_conditional_overwri
         ("import ctypes\nctypes.pydll.LoadLibrary('./payload.so')\n", "ctypes.pydll.LoadLibrary"),
         ("import ctypes\nctypes.windll.LoadLibrary('payload.dll')\n", "ctypes.windll.LoadLibrary"),
         ("from ctypes import CDLL as load\nload('./payload.so')\n", "ctypes.CDLL"),
+        (
+            "import ctypes\nctypes.LibraryLoader(ctypes.CDLL).LoadLibrary('./payload.so')\n",
+            "ctypes.LibraryLoader.LoadLibrary",
+        ),
+        ("import ctypes\nctypes.cdll.msvcrt.printf(b'hi')\n", "ctypes.cdll.msvcrt"),
+        ("import _ctypes\n_ctypes.dlopen('libc.so.6')\n", "_ctypes.dlopen"),
     ],
 )
 def test_scan_zip_flags_ctypes_native_loading_python_member(tmp_path: Path, source: str, dangerous_name: str) -> None:
@@ -597,6 +603,7 @@ def test_scan_zip_preserves_captured_dangerous_callable_before_overwrite(tmp_pat
         "import webbrowser\nwebbrowser.open = len\nwebbrowser.open([])\n",
         "import ctypes\nctypes.CDLL = len\nctypes.CDLL([])\n",
         "import ctypes\nctypes.cdll.LoadLibrary = len\nctypes.cdll.LoadLibrary([])\n",
+        "import ctypes\nctypes.cdll.msvcrt = len\nctypes.cdll.msvcrt([])\n",
     ],
 )
 def test_scan_zip_allows_callable_captured_after_safe_overwrite(tmp_path: Path, source: str) -> None:

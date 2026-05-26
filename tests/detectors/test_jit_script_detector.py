@@ -536,6 +536,9 @@ class TestJITScriptDetector:
             b"def payload():\n    return ctypes.pydll.LoadLibrary('./payload.so')\n",
             b"def payload():\n    return ctypes.windll.LoadLibrary('payload.dll')\n",
             b"def payload():\n    from ctypes import CDLL as load\n    return load('./payload.so')\n",
+            b"def payload():\n    return ctypes.LibraryLoader(ctypes.CDLL).LoadLibrary('./payload.so')\n",
+            b"def payload():\n    return ctypes.cdll.msvcrt.printf(b'hi')\n",
+            b"def payload():\n    import _ctypes\n    return _ctypes.dlopen('libc.so.6')\n",
         ],
     )
     def test_scan_model_detects_unmarked_ctypes_native_loading(self, source: bytes) -> None:
@@ -552,6 +555,7 @@ class TestJITScriptDetector:
         [
             b"def payload():\n    ctypes.CDLL = len\n    return ctypes.CDLL([])\n",
             b"def payload():\n    ctypes.cdll.LoadLibrary = len\n    return ctypes.cdll.LoadLibrary([])\n",
+            b"def payload():\n    ctypes.cdll.msvcrt = len\n    return ctypes.cdll.msvcrt([])\n",
         ],
     )
     def test_scan_model_ignores_certain_replaced_ctypes_native_loading(self, source: bytes) -> None:

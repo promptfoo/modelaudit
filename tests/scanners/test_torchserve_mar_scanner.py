@@ -508,6 +508,16 @@ def test_scan_allows_replaced_webbrowser_handler_api(tmp_path: Path) -> None:
             b"import ctypes\ndef handle(data, context):\n    return ctypes.windll.LoadLibrary('payload.dll')\n",
             "ctypes.windll.LoadLibrary",
         ),
+        (
+            b"import ctypes\ndef handle(data, context):\n"
+            b"    return ctypes.LibraryLoader(ctypes.CDLL).LoadLibrary('./payload.so')\n",
+            "ctypes.LibraryLoader.LoadLibrary",
+        ),
+        (
+            b"import ctypes\ndef handle(data, context):\n    return ctypes.cdll.msvcrt.printf(b'hi')\n",
+            "ctypes.cdll.msvcrt",
+        ),
+        (b"import _ctypes\ndef handle(data, context):\n    return _ctypes.dlopen('libc.so.6')\n", "_ctypes.dlopen"),
     ],
 )
 def test_scan_detects_ctypes_native_loading_handler_primitive(
@@ -537,6 +547,11 @@ def test_scan_detects_ctypes_native_loading_handler_primitive(
             b"import ctypes\ndef handle(data, context):\n"
             b"    ctypes.cdll.LoadLibrary = len\n"
             b"    return ctypes.cdll.LoadLibrary([])\n"
+        ),
+        (
+            b"import ctypes\ndef handle(data, context):\n"
+            b"    ctypes.cdll.msvcrt = len\n"
+            b"    return ctypes.cdll.msvcrt([])\n"
         ),
     ],
 )

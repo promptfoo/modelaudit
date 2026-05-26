@@ -278,6 +278,12 @@ class TestTarScanner:
             (b"import ctypes\nctypes.CDLL('./payload.so')\n", "ctypes.CDLL"),
             (b"from ctypes import PyDLL as load\nload('./payload.so')\n", "ctypes.PyDLL"),
             (b"import ctypes\nctypes.windll.LoadLibrary('payload.dll')\n", "ctypes.windll.LoadLibrary"),
+            (
+                b"import ctypes\nctypes.LibraryLoader(ctypes.CDLL).LoadLibrary('./payload.so')\n",
+                "ctypes.LibraryLoader.LoadLibrary",
+            ),
+            (b"import ctypes\nctypes.cdll.msvcrt.printf(b'hi')\n", "ctypes.cdll.msvcrt"),
+            (b"import _ctypes\n_ctypes.dlopen('libc.so.6')\n", "_ctypes.dlopen"),
         ],
     )
     def test_scan_tar_flags_ctypes_native_loading_python_member(
@@ -404,6 +410,7 @@ class TestTarScanner:
             b"import webbrowser\nwebbrowser.open = len\nwebbrowser.open([])\n",
             b"import ctypes\nctypes.CDLL = len\nctypes.CDLL([])\n",
             b"import ctypes\nctypes.cdll.LoadLibrary = len\nctypes.cdll.LoadLibrary([])\n",
+            b"import ctypes\nctypes.cdll.msvcrt = len\nctypes.cdll.msvcrt([])\n",
         ],
     )
     def test_scan_tar_allows_callable_captured_after_safe_overwrite(self, tmp_path: Path, payload: bytes) -> None:

@@ -1348,6 +1348,9 @@ def test_pytorch_zip_ignores_certain_replaced_webbrowser_launch_in_archive_data(
         b"def payload():\n    return ctypes.CDLL('./payload.so')\n",
         b"def payload():\n    from ctypes import PyDLL as load\n    return load('./payload.so')\n",
         b"def payload():\n    return ctypes.windll.LoadLibrary('payload.dll')\n",
+        b"def payload():\n    return ctypes.LibraryLoader(ctypes.CDLL).LoadLibrary('./payload.so')\n",
+        b"def payload():\n    return ctypes.cdll.msvcrt.printf(b'hi')\n",
+        b"def payload():\n    import _ctypes\n    return _ctypes.dlopen('libc.so.6')\n",
     ],
 )
 def test_pytorch_zip_scans_unmarked_ctypes_native_loading_in_archive_data(tmp_path: Path, payload: bytes) -> None:
@@ -1378,6 +1381,7 @@ def test_pytorch_zip_scans_unmarked_ctypes_native_loading_in_archive_data(tmp_pa
     [
         b"def payload():\n    ctypes.CDLL = len\n    return ctypes.CDLL([])\n",
         b"def payload():\n    ctypes.cdll.LoadLibrary = len\n    return ctypes.cdll.LoadLibrary([])\n",
+        b"def payload():\n    ctypes.cdll.msvcrt = len\n    return ctypes.cdll.msvcrt([])\n",
     ],
 )
 def test_pytorch_zip_ignores_certain_replaced_ctypes_native_loading_in_archive_data(

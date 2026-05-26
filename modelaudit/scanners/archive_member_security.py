@@ -104,7 +104,9 @@ _WEBBROWSER_LAUNCH_CALLS = frozenset(
 )
 _CTYPES_NATIVE_LIBRARY_LOADING_CALLS = frozenset(
     {
+        "_ctypes.dlopen",
         "ctypes.CDLL",
+        "ctypes.LibraryLoader.LoadLibrary",
         "ctypes.OleDLL",
         "ctypes.PyDLL",
         "ctypes.WinDLL",
@@ -114,6 +116,16 @@ _CTYPES_NATIVE_LIBRARY_LOADING_CALLS = frozenset(
         "ctypes.windll.LoadLibrary",
     }
 )
+_CTYPES_LIBRARY_LOADER_CONSTRUCTORS = frozenset({"ctypes.LibraryLoader"})
+_CTYPES_LIBRARY_LOADER_OBJECTS = frozenset(
+    {
+        "ctypes.cdll",
+        "ctypes.oledll",
+        "ctypes.pydll",
+        "ctypes.windll",
+    }
+)
+_CTYPES_LIBRARY_LOADER_NON_LOADING_ATTRIBUTES = frozenset({"LoadLibrary"})
 _HIGH_RISK_PYTHON_CALLS = {
     "__import__",
     "__builtin__.__import__",
@@ -182,11 +194,27 @@ _HIGH_RISK_PYTHON_CALL_PREFIX_RULE_CODES: tuple[tuple[str, str], ...] = (("subpr
 _FALLBACK_HIGH_RISK_RULE_CODE = "S104"
 
 
+def _ctypes_loader_attribute_load_name(reference_name: str) -> str | None:
+    parts = reference_name.split(".")
+    if len(parts) < 3:
+        return None
+
+    loader_root = ".".join(parts[:2])
+    library_name = parts[2]
+    if loader_root not in _CTYPES_LIBRARY_LOADER_OBJECTS:
+        return None
+    if library_name.startswith("_") or library_name in _CTYPES_LIBRARY_LOADER_NON_LOADING_ATTRIBUTES:
+        return None
+    return f"{loader_root}.{library_name}"
+
+
 def _rule_code_for_high_risk_call(call_name: str) -> str:
     """Return the rule code that most accurately describes ``call_name``."""
     direct = _HIGH_RISK_PYTHON_CALL_RULE_CODES.get(call_name)
     if direct is not None:
         return direct
+    if _ctypes_loader_attribute_load_name(call_name) is not None:
+        return "S110"
     for prefix, code in _HIGH_RISK_PYTHON_CALL_PREFIX_RULE_CODES:
         if call_name.startswith(prefix):
             return code
@@ -330,6 +358,21 @@ def _apply_aliases(call_name: str, alias_scopes: _AliasScopes) -> frozenset[str]
         return resolved_heads
     suffix = ".".join(tail)
     return frozenset(f"{resolved_head}.{suffix}" for resolved_head in resolved_heads)
+
+
+def _resolve_ctypes_library_loader_instance_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+    if not isinstance(node, ast.Call):
+        return None
+
+    constructor_name = _resolve_call_name(node.func)
+    if constructor_name is None:
+        return None
+    resolved_constructor_names = _apply_aliases(constructor_name, alias_scopes)
+    if resolved_constructor_names is None:
+        return None
+
+    loader_roots = resolved_constructor_names & _CTYPES_LIBRARY_LOADER_CONSTRUCTORS
+    return frozenset(loader_roots) if loader_roots else None
 
 
 _MAX_STATIC_STRING_LENGTH = 1024
@@ -539,10 +582,12 @@ def _resolve_static_attribute_names(
 
     resolved_target_roots = _resolve_global_builtin_namespace_roots(target_root_node, alias_scopes)
     if resolved_target_roots is None:
-        target_root = _resolve_call_name(target_root_node)
-        if target_root is None:
-            return None
-        resolved_target_roots = _apply_aliases(target_root, alias_scopes)
+        resolved_target_roots = _resolve_ctypes_library_loader_instance_roots(target_root_node, alias_scopes)
+        if resolved_target_roots is None:
+            target_root = _resolve_call_name(target_root_node)
+            if target_root is None:
+                return None
+            resolved_target_roots = _apply_aliases(target_root, alias_scopes)
     if resolved_target_roots is None:
         return None
     return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
@@ -726,6 +771,10 @@ def _resolve_static_reference_names(node: ast.AST, alias_scopes: _AliasScopes) -
     call_name = _resolve_call_name(node)
     if call_name is not None:
         return _apply_aliases(call_name, alias_scopes)
+    if isinstance(node, ast.Attribute):
+        attribute_names = _resolve_static_attribute_names(node.value, ast.Constant(value=node.attr), alias_scopes)
+        if attribute_names is not None:
+            return attribute_names
     getattr_names = _resolve_getattr_call_names(node, alias_scopes)
     if getattr_names is not None:
         return getattr_names
@@ -736,7 +785,9 @@ def _resolve_static_reference_names(node: ast.AST, alias_scopes: _AliasScopes) -
     if namespace_call_names is not None:
         return namespace_call_names
     namespace_roots = _resolve_namespace_dict_roots(node, alias_scopes)
-    return frozenset(f"{namespace_root}.__dict__" for namespace_root in namespace_roots) if namespace_roots else None
+    if namespace_roots:
+        return frozenset(f"{namespace_root}.__dict__" for namespace_root in namespace_roots)
+    return _resolve_ctypes_library_loader_instance_roots(node, alias_scopes)
 
 
 def _resolve_static_assignment_target_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
@@ -749,8 +800,10 @@ def _resolve_static_assignment_target_names(node: ast.AST, alias_scopes: _AliasS
 
 
 def _is_high_risk_python_call_name(name: str) -> bool:
-    return name in _HIGH_RISK_PYTHON_CALLS or (
-        name.startswith("subprocess.") and name not in _KNOWN_NON_EXECUTING_SUBPROCESS_CALLS
+    return (
+        name in _HIGH_RISK_PYTHON_CALLS
+        or (name.startswith("subprocess.") and name not in _KNOWN_NON_EXECUTING_SUBPROCESS_CALLS)
+        or (_ctypes_loader_attribute_load_name(name) is not None)
     )
 
 
@@ -779,6 +832,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def __init__(self, tracked_call_names: frozenset[str] | None = None) -> None:
         self.alias_scopes: _AliasScopes = [{}]
         self._class_scope_ids: set[int] = set()
+        self._suppress_attribute_load_detection_depth = 0
         self.risky_calls: set[str] = set()
         self.tracked_call_names = tracked_call_names
 
@@ -1047,6 +1101,13 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for name in _binding_names(target):
             self._bind_name(name, None)
 
+    def _visit_assignment_target(self, target: ast.AST) -> None:
+        self._suppress_attribute_load_detection_depth += 1
+        try:
+            self.visit(target)
+        finally:
+            self._suppress_attribute_load_detection_depth -= 1
+
     def _bind_arguments(self, arguments: ast.arguments) -> None:
         positional_args = [*arguments.posonlyargs, *arguments.args]
         positional_default_start = len(positional_args) - len(arguments.defaults)
@@ -1242,7 +1303,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self._bind_static_setattr_mutation(node.value)
         for target in node.targets:
             self._bind_target_to_value(target, node.value)
-            self.visit(target)
+            self._visit_assignment_target(target)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         if node.annotation is not None:
@@ -1255,22 +1316,22 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self._bind_target_to_value(node.target, node.value)
         else:
             self._shadow_binding_target(node.target)
-        self.visit(node.target)
+        self._visit_assignment_target(node.target)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         self.visit(node.value)
         self._shadow_binding_target(node.target)
-        self.visit(node.target)
+        self._visit_assignment_target(node.target)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)
         self._bind_target_to_value(node.target, node.value)
-        self.visit(node.target)
+        self._visit_assignment_target(node.target)
 
     def visit_Delete(self, node: ast.Delete) -> None:
         for target in node.targets:
             self._bind_static_reference_target_as_removed(target)
-            self.visit(target)
+            self._visit_assignment_target(target)
 
     def visit_Expr(self, node: ast.Expr) -> None:
         self.visit(node.value)
@@ -1290,7 +1351,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self.alias_scopes.append(body_scope)
         try:
             self._shadow_binding_target(node.target)
-            self.visit(node.target)
+            self._visit_assignment_target(node.target)
             for statement in node.body:
                 self.visit(statement)
             body_scope = dict(body_scope)
@@ -1365,7 +1426,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             self.visit(item.context_expr)
             if item.optional_vars is not None:
                 self._shadow_binding_target(item.optional_vars)
-                self.visit(item.optional_vars)
+                self._visit_assignment_target(item.optional_vars)
         for statement in node.body:
             self.visit(statement)
 
@@ -1387,8 +1448,20 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         resolved_names = self._resolve_invoked_reference_names(node.func)
         if resolved_names is not None and self._resolve_certain_static_mapping_mutator_names(node.func) is None:
             for resolved_name in resolved_names:
-                if self._is_tracked_call_name(resolved_name):
-                    self.risky_calls.add(resolved_name)
+                risk_name = _ctypes_loader_attribute_load_name(resolved_name) or resolved_name
+                if self._is_tracked_call_name(risk_name):
+                    self.risky_calls.add(risk_name)
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        if self._suppress_attribute_load_detection_depth == 0:
+            resolved_names = _resolve_static_reference_names(node, self.alias_scopes)
+            effective_names = self._effective_reference_names(resolved_names) if resolved_names is not None else None
+            if effective_names is not None:
+                for resolved_name in effective_names:
+                    load_name = _ctypes_loader_attribute_load_name(resolved_name)
+                    if load_name is not None and self._is_tracked_call_name(load_name):
+                        self.risky_calls.add(load_name)
         self.generic_visit(node)
 
 
