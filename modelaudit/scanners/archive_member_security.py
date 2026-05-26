@@ -292,6 +292,27 @@ def _resolve_static_string(node: ast.AST) -> str | None:
 _NAMESPACE_MAPPING_ACCESSORS = {"get", "__getitem__", "pop", "setdefault"}
 _GLOBAL_NAMESPACE_HELPERS = {"globals", "builtins.globals"}
 _BUILTIN_NAMESPACE_NAMES = {"__builtin__", "__builtins__"}
+_GLOBAL_NAMESPACE_MAPPING_NAME = "<globals>"
+
+
+def _resolve_global_namespace_mapping_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+    """Resolve the module global namespace mapping returned by zero-argument ``globals()``."""
+    if isinstance(node, ast.Call) and not node.args and not node.keywords:
+        helper_name = _resolve_call_name(node.func)
+        resolved_helper_names = _apply_aliases(helper_name, alias_scopes) if helper_name is not None else None
+        if resolved_helper_names is not None and resolved_helper_names & _GLOBAL_NAMESPACE_HELPERS:
+            return frozenset({_GLOBAL_NAMESPACE_MAPPING_NAME})
+
+    namespace_name = _resolve_call_name(node)
+    resolved_namespace_names = _apply_aliases(namespace_name, alias_scopes) if namespace_name is not None else None
+    if resolved_namespace_names is None:
+        return None
+    global_namespace_names = {
+        resolved_namespace_name
+        for resolved_namespace_name in resolved_namespace_names
+        if resolved_namespace_name == _GLOBAL_NAMESPACE_MAPPING_NAME
+    }
+    return frozenset(global_namespace_names) if global_namespace_names else None
 
 
 def _resolve_global_builtin_namespace_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
@@ -315,12 +336,7 @@ def _resolve_global_builtin_namespace_roots(node: ast.AST, alias_scopes: _AliasS
     attr_name = _resolve_static_string(attr_name_node)
     if attr_name not in _BUILTIN_NAMESPACE_NAMES:
         return None
-    if not isinstance(namespace_node, ast.Call) or namespace_node.args or namespace_node.keywords:
-        return None
-
-    helper_name = _resolve_call_name(namespace_node.func)
-    resolved_helper_names = _apply_aliases(helper_name, alias_scopes) if helper_name is not None else None
-    if resolved_helper_names is None or not (resolved_helper_names & _GLOBAL_NAMESPACE_HELPERS):
+    if _resolve_global_namespace_mapping_names(namespace_node, alias_scopes) is None:
         return None
     return frozenset({attr_name})
 
@@ -481,6 +497,16 @@ def _resolve_static_reference_names(node: ast.AST, alias_scopes: _AliasScopes) -
     call_name = _resolve_call_name(node)
     if call_name is not None:
         return _apply_aliases(call_name, alias_scopes)
+    global_namespace_names = _resolve_global_namespace_mapping_names(node, alias_scopes)
+    if global_namespace_names is not None:
+        return global_namespace_names
+    global_builtin_roots = _resolve_global_builtin_namespace_roots(node, alias_scopes)
+    if global_builtin_roots is not None:
+        return global_builtin_roots
+    if isinstance(node, ast.Attribute):
+        attribute_names = _resolve_static_attribute_names(node.value, ast.Constant(node.attr), alias_scopes)
+        if attribute_names is not None:
+            return attribute_names
     getattr_names = _resolve_getattr_call_names(node, alias_scopes)
     if getattr_names is not None:
         return getattr_names

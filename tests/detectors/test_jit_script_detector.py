@@ -251,6 +251,9 @@ class TestJITScriptDetector:
             b"globals()['__builtins__']['ev' + 'al']('1 + 1')\n",
             b"globals().get('__builtins__').get('eval')('1 + 1')\n",
             b"getattr(globals()['__builtins__'], 'eval')('1 + 1')\n",
+            b"globals()['__builtins__'].eval('1 + 1')\n",
+            b"builtins_ref = globals()['__builtins__']\ngetattr(builtins_ref, 'eval')('1 + 1')\n",
+            b"global_namespace = globals()\nglobal_namespace['__builtins__']['eval']('1 + 1')\n",
         ],
     )
     def test_scan_model_detects_unmarked_static_builtin_indirection(self, source: bytes) -> None:
@@ -282,6 +285,7 @@ class TestJITScriptDetector:
             b"import builtins as bi\nbi.len([1])\n",
             b"globals()['__builtins__']['len']([1])\n",
             b"globals = lambda: {'__builtins__': {'eval': len}}\nglobals()['__builtins__']['eval']([])\n",
+            b"global_namespace = {'__builtins__': {'eval': len}}\nglobal_namespace['__builtins__']['eval']([])\n",
         ],
     )
     def test_scan_model_ignores_benign_builtin_shaped_access(self, source: bytes) -> None:
