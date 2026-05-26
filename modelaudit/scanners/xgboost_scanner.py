@@ -29,6 +29,7 @@ import sys
 import tempfile
 from typing import Any, ClassVar, cast
 
+from ..scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 logger = logging.getLogger(__name__)
@@ -47,9 +48,21 @@ SUSPICIOUS_JSON_PATTERNS = [
 _INERT_JSON_SECURITY_PATHS: frozenset[tuple[str | int, ...]] = frozenset({("learner", "feature_names")})
 XGBOOST_DEFAULT_MAX_FILE_READ_SIZE = 256 * 1024 * 1024
 XGBOOST_JSON_ROUTING_CHUNK_BYTES = 64 * 1024
+XGBOOST_CONTENT_ROUTED_JSON_CONFIG_KEY = "_xgboost_content_routed_json"
 XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY = "_xgboost_content_routed_ubjson"
 _JSON_KEY_MAX_BYTES = 256
 _JSON_WHITESPACE_BYTES = frozenset(b" \t\r\n")
+
+
+def configure_content_routed_json_scan(config: dict[str, Any], *, max_bytes: int) -> None:
+    """Route renamed JSON through XGBoost while preserving the tighter discovery bound."""
+    config[XGBOOST_CONTENT_ROUTED_JSON_CONFIG_KEY] = True
+    limits = [max_bytes]
+    for key in ("max_file_read_size", "max_file_size"):
+        value = config.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            limits.append(value)
+    config["max_file_read_size"] = min(limits)
 
 
 def _check_xgboost_available() -> bool:
@@ -168,6 +181,8 @@ def _json_file_has_xgboost_markers(path: str, max_bytes: int) -> bool:
                         continue
                     started_version_array = record_value_marker(byte, awaiting_value_for)
                     awaiting_value_for = None
+                    if found_version and found_learner:
+                        return True
                 else:
                     started_version_array = False
 
@@ -265,6 +280,7 @@ class XGBoostScanner(BaseScanner):
         "json_parse_failed": "xgboost_json_parse_failed",
         "json_analysis_failed": "xgboost_json_analysis_failed",
         "json_structure_invalid": "xgboost_json_structure_invalid",
+        "json_mxnet_overlap": "xgboost_mxnet_symbol_overlap",
         "ubj_dependency_missing": "xgboost_ubj_dependency_missing",
         "ubj_analysis_failed": "xgboost_ubj_analysis_failed",
         "ubj_array_limit_exceeded": "xgboost_ubj_array_limit_exceeded",
@@ -369,7 +385,7 @@ class XGBoostScanner(BaseScanner):
         return any(marker in probe for marker in cls._JSON_STRONG_MARKERS)
 
     @classmethod
-    def _is_xgboost_json(cls, path: str) -> bool:
+    def _is_xgboost_json(cls, path: str, *, max_bytes: int | None = None) -> bool:
         """
         Bounded structural check for XGBoost JSON format.
 
@@ -384,7 +400,7 @@ class XGBoostScanner(BaseScanner):
         This matches what _validate_xgboost_json_schema() checks.
         """
         try:
-            return _json_file_has_xgboost_markers(path, cls.default_max_file_read_size)
+            return _json_file_has_xgboost_markers(path, max_bytes or cls.default_max_file_read_size)
         except OSError:
             return False
 
@@ -409,7 +425,9 @@ class XGBoostScanner(BaseScanner):
             # Hashing reads the model content and is part of available scan coverage.
             self.add_file_integrity_check(path, result)
 
-            if self.config.get(XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY) is True:
+            if self.config.get(XGBOOST_CONTENT_ROUTED_JSON_CONFIG_KEY) is True:
+                self._scan_json_model(path, result)
+            elif self.config.get(XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY) is True:
                 self._scan_ubj_model(path, result)
             elif file_ext == ".json":
                 self._scan_json_model(path, result)
@@ -459,11 +477,9 @@ class XGBoostScanner(BaseScanner):
                 details={"file_size": file_size},
             )
 
-            # Validate XGBoost JSON schema
-            self._validate_xgboost_json_schema(model_data, result, path)
-
-            # Check for suspicious content in JSON
-            self._check_json_for_malicious_content(model_data, result, path)
+            self.scan_parsed_json_security(path, model_data, result)
+            self._scan_filename_owned_json_overlap(path, result)
+            self._record_mxnet_symbol_overlap(model_data, result, path)
 
         except json.JSONDecodeError as e:
             result.add_check(
@@ -476,6 +492,7 @@ class XGBoostScanner(BaseScanner):
                 why="Malformed JSON may indicate file corruption or crafted exploit",
             )
             self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["json_parse_failed"])
+            self._scan_filename_owned_json_overlap(path, result)
         except OSError as e:
             self._record_read_failure(path, result, e)
         except Exception as e:
@@ -488,6 +505,83 @@ class XGBoostScanner(BaseScanner):
                 details={"exception": str(e)},
             )
             self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["json_analysis_failed"])
+            self._scan_filename_owned_json_overlap(path, result)
+
+    def scan_parsed_json_security(self, path: str, data: dict[str, Any], result: ScanResult) -> None:
+        """Apply XGBoost JSON-specific security checks to an already parsed overlap."""
+        self._validate_xgboost_json_schema(data, result, path)
+        self._check_json_for_malicious_content(data, result, path)
+
+    def _merge_filename_owned_result(self, result: ScanResult, owner_result: ScanResult) -> None:
+        """Merge an owner scan without dropping existing incomplete-coverage reasons."""
+        existing_reasons = list(result.metadata.get("scan_outcome_reasons", []))
+        result.merge(owner_result)
+        for reason in existing_reasons:
+            self._mark_inconclusive_scan_result(result, reason)
+
+    def _scan_filename_owned_json_overlap(self, path: str, result: ScanResult) -> None:
+        """Preserve filename-owned JSON checks for XGBoost-shaped content."""
+        from .jinja2_template_scanner import Jinja2TemplateScanner
+        from .manifest_scanner import ManifestScanner
+
+        scanner_selection = policy_from_config(self.config)
+        manifest_covered_templates = False
+        if ManifestScanner.can_handle(path):
+            if scanner_selection.allows("manifest"):
+                manifest_result = ManifestScanner(config=self.config).scan(path)
+                self._merge_filename_owned_result(result, manifest_result)
+                manifest_covered_templates = manifest_result.metadata.get("analysis_incomplete") is not True
+            elif scanner_selection.active:
+                add_scanner_selection_skip_check(
+                    result,
+                    path,
+                    "manifest",
+                    scanner_selection,
+                    context="overlapping manifest JSON analysis",
+                )
+        if not manifest_covered_templates and Jinja2TemplateScanner.can_handle(path):
+            if scanner_selection.allows("jinja2_template"):
+                self._merge_filename_owned_result(result, Jinja2TemplateScanner(config=self.config).scan(path))
+            elif scanner_selection.active:
+                add_scanner_selection_skip_check(
+                    result,
+                    path,
+                    "jinja2_template",
+                    scanner_selection,
+                    context="overlapping Jinja JSON analysis",
+                )
+
+    def _record_mxnet_symbol_overlap(self, data: object, result: ScanResult, path: str) -> None:
+        """Run MXNet security checks and fail closed when JSON ownership overlaps."""
+        from ..utils.file.detection import has_mxnet_symbol_graph_structure
+        from .mxnet_scanner import MXNetScanner
+
+        if not has_mxnet_symbol_graph_structure(data):
+            return
+
+        scanner_selection = policy_from_config(self.config)
+        if scanner_selection.allows("mxnet"):
+            MXNetScanner(config=self.config).scan_parsed_symbol_security(path, cast(dict[str, Any], data), result)
+            analysis_message = "both static analyses ran but format ownership is ambiguous"
+        else:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "mxnet",
+                scanner_selection,
+                context="overlapping JSON analysis",
+            )
+            analysis_message = "MXNet static analysis was skipped by scanner selection policy"
+        reason = self._INCONCLUSIVE_REASONS["json_mxnet_overlap"]
+        result.add_check(
+            name="XGBoost / MXNet JSON Routing",
+            passed=False,
+            message=(f"JSON model matches both XGBoost and MXNet contracts; {analysis_message}"),
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={"analysis_incomplete": True, "scan_outcome_reason": reason},
+        )
+        self._mark_inconclusive_scan_result(result, reason)
 
     def _scan_ubj_model(self, path: str, result: ScanResult) -> None:
         """Scan XGBoost UBJ (Universal Binary JSON) model for security issues."""

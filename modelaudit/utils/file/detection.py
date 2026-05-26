@@ -141,6 +141,9 @@ _XML_MODEL_ROOT_FORMATS = {
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
 MXNET_SYMBOL_SIGNATURE_READ_BYTES = 10 * 1024 * 1024
 MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT = "mxnet_symbol_routing_inconclusive"
+_JSON_NUMBER_PREFIX_RE = re.compile(rb"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
+_MXNET_SYMBOL_PREFIX_MAX_VALUES = 4096
+_MXNET_SYMBOL_MAX_KEY_BYTES = 64
 LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT = "llamafile_routing_inconclusive"
 NEMO_ROUTING_INCONCLUSIVE_FORMAT = "nemo_routing_inconclusive"
 XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT = "xgboost_ubjson_routing_inconclusive"
@@ -338,46 +341,95 @@ def has_mxnet_symbol_graph_structure(payload: object) -> bool:
     )
 
 
-def _detect_mxnet_symbol_prefix_route(prefix: bytes) -> str | None:
+def _detect_mxnet_symbol_prefix_route(
+    prefix: bytes,
+    *,
+    sample_is_prefix: bool = True,
+    fail_closed_without_hint: bool = False,
+) -> str | None:
     """Return a definite or bounded-inconclusive MXNet JSON route."""
 
     class IncompleteJSON(Exception):
+        pass
+
+    class BoundedJSON(Exception):
         pass
 
     class InvalidJSON(Exception):
         pass
 
     root_array_keys: set[str] = set()
-    node_string_keys: set[str] = set()
+    saw_root_nodes_key = False
+    saw_mxnet_heads_shape = False
+    saw_direct_node_object = False
+    saw_direct_node_contract = False
+    parsed_values = 0
+
+    def saw_mxnet_routing_hint() -> bool:
+        visible_graph_arrays = root_array_keys & {"nodes", "arg_nodes", "heads"}
+        return (
+            saw_root_nodes_key
+            or saw_mxnet_heads_shape
+            or saw_direct_node_object
+            or saw_direct_node_contract
+            or len(visible_graph_arrays) >= 2
+        )
 
     def skip_whitespace(offset: int) -> int:
         while offset < len(prefix) and prefix[offset] in b" \t\r\n":
             offset += 1
         return offset
 
-    def read_string(offset: int) -> tuple[str, int]:
+    def skip_string(offset: int) -> int:
         if offset >= len(prefix) or prefix[offset] != ord('"'):
             raise InvalidJSON
-        escaped = False
         index = offset + 1
         while index < len(prefix):
-            byte = prefix[index]
-            if escaped:
-                escaped = False
-            elif byte == ord("\\"):
-                escaped = True
-            elif byte == ord('"'):
-                try:
-                    value = json.loads(prefix[offset : index + 1].decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise InvalidJSON from exc
-                if not isinstance(value, str):
-                    raise InvalidJSON
-                return value, index + 1
+            marker = prefix[index]
+            if marker == ord('"'):
+                return index + 1
+            if marker == ord("\\"):
+                index += 1
+                if index >= len(prefix):
+                    raise IncompleteJSON
             index += 1
         raise IncompleteJSON
 
+    def read_key(offset: int) -> tuple[str | None, int]:
+        end_offset = skip_string(offset)
+        if end_offset - offset > _MXNET_SYMBOL_MAX_KEY_BYTES:
+            return None, end_offset
+        try:
+            value = json.JSONDecoder().decode(prefix[offset:end_offset].decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise InvalidJSON from exc
+        return (value if isinstance(value, str) else None), end_offset
+
+    def has_mxnet_heads_shape(offset: int) -> bool:
+        """Recognize a visible numeric MXNet output triplet."""
+        offset = skip_whitespace(offset + 1)
+        if offset >= len(prefix) or prefix[offset] != ord("["):
+            return False
+        offset = skip_whitespace(offset + 1)
+        for position in range(3):
+            number_match = _JSON_NUMBER_PREFIX_RE.match(prefix, offset)
+            if number_match is None:
+                return False
+            token = prefix[offset : number_match.end()]
+            if b"." in token or b"e" in token.lower():
+                return False
+            offset = skip_whitespace(number_match.end())
+            expected = ord("]") if position == 2 else ord(",")
+            if offset >= len(prefix) or prefix[offset] != expected:
+                return False
+            offset = skip_whitespace(offset + 1)
+        return True
+
     def parse_value(offset: int, depth: int, *, root_array_key: str | None = None) -> int:
+        nonlocal parsed_values, saw_mxnet_heads_shape
+        parsed_values += 1
+        if parsed_values > _MXNET_SYMBOL_PREFIX_MAX_VALUES:
+            raise BoundedJSON
         offset = skip_whitespace(offset)
         if offset >= len(prefix):
             raise IncompleteJSON
@@ -387,23 +439,38 @@ def _detect_mxnet_symbol_prefix_route(prefix: bytes) -> str | None:
         if marker == ord("["):
             if root_array_key in {"nodes", "arg_nodes", "heads"}:
                 root_array_keys.add(root_array_key)
+            if root_array_key == "heads" and has_mxnet_heads_shape(offset):
+                saw_mxnet_heads_shape = True
             return parse_array(offset, depth + 1, nodes_array=root_array_key == "nodes")
         if marker == ord('"'):
-            _, offset = read_string(offset)
-            return offset
-        for literal in (b"true", b"false", b"null"):
+            return skip_string(offset)
+        for literal in (b"true", b"false", b"null", b"NaN", b"Infinity", b"-Infinity"):
             if prefix.startswith(literal, offset):
                 return offset + len(literal)
             if literal.startswith(prefix[offset:]):
                 raise IncompleteJSON
-        number_match = re.match(rb"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?", prefix[offset:])
+        if offset + 1 == len(prefix) and prefix[offset] == ord("-"):
+            raise IncompleteJSON
+        number_match = _JSON_NUMBER_PREFIX_RE.match(prefix, offset)
         if number_match is None:
             raise InvalidJSON
-        return offset + number_match.end()
+        remainder_length = len(prefix) - number_match.end()
+        if remainder_length in {1, 2} and prefix[number_match.end() :] in {
+            b".",
+            b"e",
+            b"E",
+            b"e+",
+            b"e-",
+            b"E+",
+            b"E-",
+        }:
+            raise IncompleteJSON
+        return number_match.end()
 
     def parse_array(offset: int, depth: int, *, nodes_array: bool = False) -> int:
+        nonlocal saw_direct_node_object
         if depth > 64:
-            raise InvalidJSON
+            raise BoundedJSON
         offset = skip_whitespace(offset + 1)
         if offset >= len(prefix):
             raise IncompleteJSON
@@ -411,6 +478,7 @@ def _detect_mxnet_symbol_prefix_route(prefix: bytes) -> str | None:
             return offset + 1
         while True:
             if nodes_array and prefix[offset] == ord("{"):
+                saw_direct_node_object = True
                 offset = parse_object(offset, depth + 1, direct_node=True)
             else:
                 offset = parse_value(offset, depth + 1)
@@ -426,33 +494,34 @@ def _detect_mxnet_symbol_prefix_route(prefix: bytes) -> str | None:
                 raise IncompleteJSON
 
     def parse_object(offset: int, depth: int, *, root: bool = False, direct_node: bool = False) -> int:
+        nonlocal saw_direct_node_contract, saw_root_nodes_key
         if depth > 64:
-            raise InvalidJSON
+            raise BoundedJSON
+        direct_node_string_keys: set[str] = set()
         offset = skip_whitespace(offset + 1)
         if offset >= len(prefix):
             raise IncompleteJSON
         if prefix[offset] == ord("}"):
             return offset + 1
         while True:
-            key, offset = read_string(offset)
+            key, offset = read_key(offset)
             offset = skip_whitespace(offset)
             if offset >= len(prefix):
                 raise IncompleteJSON
             if prefix[offset] != ord(":"):
                 raise InvalidJSON
+            if root and key == "nodes":
+                saw_root_nodes_key = True
             value_offset = skip_whitespace(offset + 1)
-            if (
-                direct_node
-                and key in {"op", "name"}
-                and value_offset < len(prefix)
-                and prefix[value_offset] == ord('"')
-            ):
-                node_string_keys.add(key)
             offset = parse_value(
                 value_offset,
                 depth + 1,
-                root_array_key=key if root else None,
+                root_array_key=key if root and key is not None else None,
             )
+            if direct_node and key in {"op", "name"} and prefix[value_offset] == ord('"'):
+                direct_node_string_keys.add(key)
+                if {"op", "name"} <= direct_node_string_keys:
+                    saw_direct_node_contract = True
             offset = skip_whitespace(offset)
             if offset >= len(prefix):
                 raise IncompleteJSON
@@ -467,18 +536,40 @@ def _detect_mxnet_symbol_prefix_route(prefix: bytes) -> str | None:
     try:
         root_offset = skip_whitespace(0)
         if root_offset >= len(prefix):
-            return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+            return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT if sample_is_prefix and fail_closed_without_hint else None
         if prefix[root_offset] != ord("{"):
             return None
         parse_object(root_offset, 0, root=True)
     except IncompleteJSON:
-        if {"nodes", "arg_nodes", "heads"} <= root_array_keys and {"op", "name"} <= node_string_keys:
+        if not sample_is_prefix:
+            return None
+        if {"nodes", "arg_nodes", "heads"} <= root_array_keys and saw_direct_node_contract:
             return "mxnet"
-        return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+        return (
+            MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT if saw_mxnet_routing_hint() or fail_closed_without_hint else None
+        )
+    except BoundedJSON:
+        if {"nodes", "arg_nodes", "heads"} <= root_array_keys and saw_direct_node_contract:
+            return "mxnet"
+        if not sample_is_prefix and not fail_closed_without_hint:
+            # Complete JSON is already byte-capped; resolve contracts hidden
+            # behind cheap-probe padding without failing ordinary complete JSON closed.
+            try:
+                complete_payload = json.loads(prefix)
+            except (json.JSONDecodeError, RecursionError, UnicodeDecodeError, ValueError):
+                return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT if saw_mxnet_routing_hint() else None
+            if has_mxnet_symbol_graph_structure(complete_payload):
+                return "mxnet"
+            return None
+        return (
+            MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT if saw_mxnet_routing_hint() or fail_closed_without_hint else None
+        )
     except InvalidJSON:
+        if sample_is_prefix and {"nodes", "arg_nodes", "heads"} <= root_array_keys and saw_direct_node_contract:
+            return "mxnet"
         return None
 
-    if {"nodes", "arg_nodes", "heads"} <= root_array_keys and {"op", "name"} <= node_string_keys:
+    if {"nodes", "arg_nodes", "heads"} <= root_array_keys and saw_direct_node_contract:
         return "mxnet"
     return None
 
@@ -486,9 +577,11 @@ def _detect_mxnet_symbol_prefix_route(prefix: bytes) -> str | None:
 def detect_mxnet_symbol_content_route(path: str | Path) -> str | None:
     """Return a definite or bounded-inconclusive JSON MXNet symbol route.
 
-    Large JSON prefixes that do not prove or disprove the graph contract are
-    retained as inconclusive so renamed models cannot evade scanning by
-    padding fields before their structural markers.
+    JSON objects with visible MXNet-specific root keys or a symbol node
+    contract that do not resolve within the bounded probe remain inconclusive.
+    Complete generic JSON without MXNet evidence remains with its established
+    filename owner; oversized unresolved JSON cannot safely rule out a hidden
+    graph and therefore fails closed.
     """
     file_path = Path(path)
     if not file_path.is_file():
@@ -508,16 +601,18 @@ def detect_mxnet_symbol_content_route(path: str | Path) -> str | None:
     except OSError:
         return None
 
+    is_disguised_non_json = file_path.suffix.lower() != ".json"
     if file_size > MXNET_SYMBOL_SIGNATURE_READ_BYTES:
-        return _detect_mxnet_symbol_prefix_route(prefix[:MXNET_SYMBOL_SIGNATURE_READ_BYTES])
+        return _detect_mxnet_symbol_prefix_route(
+            prefix[:MXNET_SYMBOL_SIGNATURE_READ_BYTES],
+            fail_closed_without_hint=True,
+        )
 
-    try:
-        payload = json.loads(prefix)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
-    except RecursionError:
-        return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
-    return "mxnet" if has_mxnet_symbol_graph_structure(payload) else None
+    return _detect_mxnet_symbol_prefix_route(
+        prefix,
+        sample_is_prefix=False,
+        fail_closed_without_hint=is_disguised_non_json,
+    )
 
 
 def is_mxnet_symbol_graph_file(path: str | Path) -> bool:
@@ -533,9 +628,28 @@ def _could_be_renamed_mxnet_symbol(file_path: Path, prefix: bytes) -> bool:
 
 def _detect_content_routed_mxnet_symbol(file_path: Path, prefix: bytes) -> str | None:
     """Route plausible JSON symbol content or preserve bounded ambiguity."""
+    if file_path.name.lower().endswith("-symbol.json"):
+        # Canonical symbol names already belong to MXNetScanner; do not let a
+        # discovery budget prevent its bounded fail-closed analysis from running.
+        return None
     if not _could_be_renamed_mxnet_symbol(file_path, prefix):
         return None
-    return detect_mxnet_symbol_content_route(file_path)
+    mxnet_route = detect_mxnet_symbol_content_route(file_path)
+    if file_path.suffix.lower() != ".json":
+        try:
+            is_oversized_candidate = file_path.stat().st_size > MXNET_SYMBOL_SIGNATURE_READ_BYTES
+        except OSError:
+            return mxnet_route
+        if mxnet_route != "mxnet" or is_oversized_candidate:
+            return mxnet_route
+
+    # Structurally overlapping JSON must be scanned as XGBoost so its full JSON
+    # checks run; the scanner then marks MXNet overlap as incomplete coverage.
+    from ...scanners.xgboost_scanner import XGBoostScanner
+
+    if XGBoostScanner._is_xgboost_json(str(file_path), max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES):
+        return "xgboost"
+    return mxnet_route
 
 
 _MIN_BINARY_PICKLE_PROTOCOL = 1
@@ -1723,7 +1837,10 @@ def detect_file_format_from_magic(path: str) -> str:
             return "unknown"
 
         if file_path.suffix.lower() == ".meta":
-            return "tf_metagraph" if _is_tensorflow_metagraph_file(path) else "unknown"
+            if _is_tensorflow_metagraph_file(path):
+                return "tf_metagraph"
+            mxnet_route = _detect_content_routed_mxnet_symbol(file_path, b"{")
+            return mxnet_route or "unknown"
 
         with file_path.open("rb") as f:
             header = f.read(min(size, _TAR_BLOCK_SIZE))
@@ -1755,9 +1872,6 @@ def detect_file_format_from_magic(path: str) -> str:
                     return tar_route
             if format_result != "unknown":
                 return format_result
-            mxnet_route = _detect_content_routed_mxnet_symbol(file_path, header)
-            if mxnet_route is not None:
-                return mxnet_route
 
             # Protocol 0/1 pickle payloads can evade short magic-byte checks.
             # Probe a bounded prefix and require a valid opcode stream.
@@ -1818,9 +1932,6 @@ def detect_file_format_from_magic(path: str) -> str:
     if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
 
-    mxnet_route = _detect_content_routed_mxnet_symbol(file_path, magic8)
-    if mxnet_route is not None:
-        return mxnet_route
     if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
         return "onnx"
 
@@ -1912,9 +2023,6 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             return format_result
         if format_result != "unknown":
             return format_result
-        mxnet_route = _detect_content_routed_mxnet_symbol(file_path, prefix)
-        if mxnet_route is not None:
-            return mxnet_route
 
         if _could_start_proto0_or_1_pickle(prefix):
             max_probe_size = min(size, PROTO0_1_MAX_PROBE_BYTES)

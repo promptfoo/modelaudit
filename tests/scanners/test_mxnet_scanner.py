@@ -320,6 +320,24 @@ def test_mxnet_malformed_symbol_scan_is_inconclusive(tmp_path: Path) -> None:
     assert any(check.name == "MXNet Symbol Parse" for check in result.checks)
 
 
+def test_mxnet_symbol_decoder_recursion_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    symbol_path = tmp_path / "recursive-symbol.json"
+    _write_symbol_file(symbol_path)
+
+    def raise_recursion(_payload: object) -> object:
+        raise RecursionError("decoder nesting limit")
+
+    monkeypatch.setattr("modelaudit.scanners.mxnet_scanner.json.loads", raise_recursion)
+
+    result = MXNetScanner().scan(str(symbol_path))
+
+    _assert_inconclusive_result(result, "mxnet_symbol_parse_failed")
+    assert any(check.name == "MXNet Symbol Parse" for check in result.checks)
+
+
 def test_direct_mxnet_scan_of_invalid_renamed_symbol_is_inconclusive(tmp_path: Path) -> None:
     artifact_path = tmp_path / "model.mxnet"
     artifact_path.write_bytes(b"mxnet-ish content")

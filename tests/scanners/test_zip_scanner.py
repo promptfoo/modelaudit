@@ -937,12 +937,427 @@ def test_scan_nested_file_routes_renamed_mxnet_symbol_by_structure(tmp_path: Pat
     assert any(issue.details.get("attribute") == "library" for issue in result.issues)
 
 
-def test_scan_nested_file_fails_closed_when_mxnet_structure_is_beyond_bounded_probe(
+def test_scan_nested_file_canonical_mxnet_symbol_bypasses_routing_value_budget(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "large-symbol.json"
+    extracted_member.write_text(
+        '{"padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
+@pytest.mark.parametrize("filename", ["payload.params", "payload.meta"])
+def test_scan_nested_file_runs_xgboost_checks_for_renamed_mxnet_json_overlap(tmp_path: Path, filename: str) -> None:
+    extracted_member = tmp_path / filename
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
+    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
+
+
+def test_scan_nested_file_mxnet_only_selection_preserves_overlap_security_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "polyglot.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["mxnet"], "cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+    assert "xgboost" in result.metadata["skipped_scanner_ids"]
+    assert any(
+        check.name == "Scanner Selection"
+        and check.details.get("skipped_scanner_id") == "xgboost"
+        and check.details.get("kind") == "preferred"
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_mxnet_only_selection_fails_closed_for_bounded_xgboost_overlap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
-    extracted_member = tmp_path / "payload.dat"
+    monkeypatch.setattr(archive_dispatch, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "polyglot.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},"nodes":[{"op":"Custom","name":"load",'
+        '"attrs":{"library":"../../tmp/libevil.so","padding":"' + ("x" * 256) + '"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["mxnet"], "cache_enabled": False})
+
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+
+
+def test_scan_nested_file_xgboost_only_selection_skips_overlap_mxnet_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "polyglot.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert not any(issue.details.get("attribute") == "library" for issue in result.issues)
+    assert "mxnet" in result.metadata["skipped_scanner_ids"]
+
+
+def test_scan_nested_file_does_not_cap_canonical_json_overlap_to_renamed_probe_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    monkeypatch.setattr(archive_dispatch, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    extracted_member = tmp_path / "polyglot.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{},"malicious_code":"os.system()",'
+        '"padding":"'
+        + ("x" * 600)
+        + '"},"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+    assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_scan_nested_file_polyglot_manifest_preserves_jinja_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_polyglot_manifest_honors_excluded_jinja_selection(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(
+        str(extracted_member),
+        {"scanners": ["xgboost", "mxnet", "manifest"], "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "xgboost"
+    assert "jinja2_template" in result.metadata["skipped_scanner_ids"]
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+
+
+def test_scan_nested_file_xgboost_manifest_preserves_jinja_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_inconclusive_mxnet_config_preserves_jinja_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 256)
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"heads":[[0,0,0]],"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}","nodes":[{"attrs":"'
+        + ("x" * 300)
+        + '","op":"Custom","name":"load"}],"arg_nodes":[0]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_inconclusive_mxnet_tokenizer_config_preserves_direct_jinja_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 256)
+    extracted_member = tmp_path / "tokenizer_config.json"
+    extracted_member.write_text(
+        '{"heads":[[0,0,0]],"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}","nodes":[{"attrs":"'
+        + ("x" * 300)
+        + '","op":"Custom","name":"load"}],"arg_nodes":[0]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_inconclusive_mxnet_generation_config_runs_selected_jinja_when_manifest_excluded(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 256)
+    extracted_member = tmp_path / "generation_config.json"
+    extracted_member.write_text(
+        '{"heads":[[0,0,0]],"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}","nodes":[{"attrs":"'
+        + ("x" * 300)
+        + '","op":"Custom","name":"load"}],"arg_nodes":[0]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["jinja2_template"], "cache_enabled": False})
+
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "manifest" in result.metadata["skipped_scanner_ids"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_inconclusive_mxnet_malformed_generation_config_runs_jinja_after_manifest_parse_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 256)
+    extracted_member = tmp_path / "generation_config.json"
+    extracted_member.write_text(
+        '{"heads":[[0,0,0]],"arg_nodes":[0],'
+        '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}","padding":"' + ("x" * 300),
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(
+        str(extracted_member),
+        {"scanners": ["manifest", "jinja2_template"], "cache_enabled": False},
+    )
+
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "manifest_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_mxnet_shaped_tokenizer_config_preserves_direct_jinja_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "tokenizer_config.json"
+    extracted_member.write_text(
+        '{"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_mxnet_manifest_honors_excluded_jinja_selection(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(
+        str(extracted_member),
+        {"scanners": ["mxnet", "manifest"], "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "mxnet"
+    assert "jinja2_template" in result.metadata["skipped_scanner_ids"]
+    assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
+
+
+def test_scan_nested_file_mxnet_generation_config_runs_selected_jinja_when_manifest_excluded(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "generation_config.json"
+    extracted_member.write_text(
+        '{"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(
+        str(extracted_member),
+        {"scanners": ["mxnet", "jinja2_template"], "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "mxnet"
+    assert "manifest" in result.metadata["skipped_scanner_ids"]
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_mxnet_routed_tokenizer_duplicate_override_preserves_direct_jinja_analysis(
+    tmp_path: Path,
+) -> None:
+    extracted_member = tmp_path / "tokenizer_config.json"
+    extracted_member.write_text(
+        '{"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",'
+        '"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]],"nodes":[]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(
+        str(extracted_member),
+        {"scanners": ["mxnet", "jinja2_template"], "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "mxnet"
+    assert "mxnet_symbol_invalid_structure" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_xgboost_chat_template_preserves_direct_jinja_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "chat_template.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}"}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_malformed_xgboost_chat_template_preserves_direct_jinja_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "chat_template.json"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"chat_template":"{{ \'\'.__class__.__mro__[1].__subclasses__() }}",',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(
+        str(extracted_member),
+        {"scanners": ["xgboost", "jinja2_template"], "cache_enabled": False},
+    )
+
+    assert result.scanner_name == "xgboost"
+    assert "xgboost_json_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "Jinja2 Template Injection Detection" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_keeps_oversized_renamed_overlap_on_bounded_mxnet_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    monkeypatch.setattr(archive_dispatch, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    monkeypatch.setattr("modelaudit.scanners.mxnet_scanner.MAX_SYMBOL_READ_BYTES", 512)
+    extracted_member = tmp_path / "payload.meta"
+    extracted_member.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],"padding":"' + ("x" * 600) + '"}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert result.success is False
+    assert "mxnet_symbol_truncated" in result.metadata["scan_outcome_reasons"]
+    assert "mxnet_symbol_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert not any(check.name == "JSON Parsing" for check in result.checks)
+
+
+@pytest.mark.parametrize("filename", ["payload.dat", "payload.meta"])
+def test_scan_nested_file_fails_closed_when_mxnet_structure_is_beyond_bounded_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / filename
     extracted_member.write_text(
         (" " * 129) + '{"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
         encoding="utf-8",
@@ -957,15 +1372,257 @@ def test_scan_nested_file_fails_closed_when_mxnet_structure_is_beyond_bounded_pr
     assert "bounded JSON probe reached its limit" in check.message
 
 
-def test_zip_scanner_honors_configured_skipped_archive_entries(tmp_path: Path) -> None:
+def test_scan_nested_file_fails_closed_when_mxnet_prefix_exceeds_nesting_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "deep-prefix.dat"
+    extracted_member.write_text(
+        '{"metadata":'
+        + ("[" * 65)
+        + "0"
+        + ("]" * 65)
+        + ',"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]],"padding":"'
+        + ("x" * 129)
+        + '"}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+
+
+def test_scan_nested_file_small_renamed_mxnet_value_budget_before_structure_fails_closed(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "padded.jpg"
+    extracted_member.write_text(
+        '{"padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert extracted_member.stat().st_size < file_detection.MXNET_SYMBOL_SIGNATURE_READ_BYTES
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+
+
+def test_scan_nested_file_generic_json_value_budget_before_mxnet_structure_detects_library(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "model.json"
+    extracted_member.write_text(
+        '{"padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert extracted_member.stat().st_size < file_detection.MXNET_SYMBOL_SIGNATURE_READ_BYTES
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
+def test_scan_nested_file_generic_json_hint_before_value_budget_resolves_later_mxnet_structure(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "model.json"
+    extracted_member.write_text(
+        '{"heads":[[0,0,0]],"padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
+def test_scan_nested_file_generic_array_heads_before_value_budget_without_mxnet_structure_uses_existing_owner(
+    tmp_path: Path,
+) -> None:
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"heads":["classification"],"padding":[' + ",".join("0" for _ in range(5000)) + "]}",
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "manifest"
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_scan_nested_file_scalar_heads_generic_json_uses_existing_owner(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"heads":"main","padding":[' + ",".join("0" for _ in range(5000)) + "]}",
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "manifest"
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_scan_nested_file_generic_json_with_padded_node_object_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "metadata.json"
+    extracted_member.write_text(
+        '{"nodes":[{"attrs":"'
+        + ("x" * 129)
+        + '","op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+
+
+@pytest.mark.parametrize("initial_nodes", ["[]", "null"])
+def test_scan_nested_file_early_duplicate_mxnet_nodes_without_other_hints_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_nodes: str,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "metadata.json"
+    extracted_member.write_text(
+        '{"nodes":'
+        + initial_nodes
+        + ',"padding":"'
+        + ("x" * 256)
+        + '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+
+
+def test_scan_nested_file_oversized_generic_json_with_lone_array_heads_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"heads":["classification"],"padding":"' + ("x" * 256) + '"}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+
+
+def test_scan_nested_file_oversized_generic_json_with_mxnet_heads_shape_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"heads":[[0,0,0]],"padding":"'
+        + ("x" * 256)
+        + '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+
+
+def test_scan_nested_file_oversized_generic_json_with_hidden_mxnet_graph_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"padding":"'
+        + ("x" * 256)
+        + '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+
+
+def test_zip_scanner_marks_configured_skipped_archive_entries_incomplete(tmp_path: Path) -> None:
     archive_path = tmp_path / "skip-metadata.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("metadata.json", '{"metadata":"' + ("x" * ((10 * 1024 * 1024) + 1)) + '"}')
 
     result = ZipScanner({"skip_archive_entries": ["metadata.json"], "cache_enabled": False}).scan(str(archive_path))
 
-    assert result.success is True
+    assert result.success is False
+    assert "zip_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any(
+        check.name == "ZIP Member Analysis Coverage"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "metadata.json"
+        for check in result.checks
+    )
     assert not any(check.name == "MXNet Symbol Routing" for check in result.checks)
+
+
+def test_zip_scanner_checks_compression_ratio_before_skipping_archive_entry(tmp_path: Path) -> None:
+    archive_path = tmp_path / "skipped-bomb.zip"
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("model.weights.h5", b"0" * (ZipScanner.MIN_COMPRESSION_BOMB_UNCOMPRESSED_SIZE + 1))
+
+    result = ZipScanner({"skip_archive_entries": ["model.weights.h5"], "cache_enabled": False}).scan(str(archive_path))
+
+    assert any(
+        check.name == "Compression Ratio Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "model.weights.h5"
+        and check.rule_code == "S410"
+        for check in result.checks
+    )
+
+
+def test_zip_scanner_validates_traversal_before_skipping_archive_entry(tmp_path: Path) -> None:
+    archive_path = tmp_path / "skipped-traversal.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("../metadata.json", '{"keras_version": "3.0.0"}')
+
+    result = ZipScanner({"skip_archive_entries": ["../metadata.json"], "cache_enabled": False}).scan(str(archive_path))
+
+    assert any(
+        check.name == "Path Traversal Protection"
+        and check.status == CheckStatus.FAILED
+        and check.details["entry"] == "../metadata.json"
+        for check in result.checks
+    )
 
 
 def test_scan_zip_fails_closed_when_nested_recognized_header_scanner_is_unavailable(

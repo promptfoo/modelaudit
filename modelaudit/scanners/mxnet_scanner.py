@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import EXECUTABLE_SIGNATURES
+from modelaudit.scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from modelaudit.utils.file.detection import (
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     has_mxnet_symbol_graph_structure,
@@ -242,11 +243,12 @@ class MXNetScanner(BaseScanner):
                 location=path,
             )
             self._mark_inconclusive_scan_result(result, "mxnet_symbol_empty")
+            self._scan_filename_owned_json_overlap(path, result)
             return False
 
         try:
             payload = json.loads(raw_bytes.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError, TypeError) as exc:
             result.add_check(
                 name="MXNet Symbol Parse",
                 passed=False,
@@ -256,6 +258,7 @@ class MXNetScanner(BaseScanner):
                 details={"exception": str(exc), "exception_type": type(exc).__name__},
             )
             self._mark_inconclusive_scan_result(result, "mxnet_symbol_parse_failed")
+            self._scan_filename_owned_json_overlap(path, result)
             return False
 
         if not has_mxnet_symbol_graph_structure(payload):
@@ -267,6 +270,7 @@ class MXNetScanner(BaseScanner):
                 location=path,
             )
             self._mark_inconclusive_scan_result(result, "mxnet_symbol_invalid_structure")
+            self._scan_filename_owned_json_overlap(path, result)
             return False
 
         nodes = payload.get("nodes", [])
@@ -290,7 +294,75 @@ class MXNetScanner(BaseScanner):
         self._scan_graph_references(path, payload, result)
         self._scan_operator_names_for_cve_2022_24294(path, payload, result)
         self._scan_graph_metadata_payloads(path, payload, result)
+        self._scan_xgboost_overlap(path, payload, result)
+        self._scan_filename_owned_json_overlap(path, result)
         return True
+
+    def scan_parsed_symbol_security(self, path: str, payload: dict[str, Any], result: ScanResult) -> None:
+        """Apply MXNet symbol-specific security checks to an already parsed overlap."""
+        self._scan_graph_references(path, payload, result)
+        self._scan_operator_names_for_cve_2022_24294(path, payload, result)
+        self._scan_graph_metadata_payloads(path, payload, result)
+
+    def _merge_filename_owned_result(self, result: ScanResult, owner_result: ScanResult) -> None:
+        """Merge an owner scan without dropping existing incomplete-coverage reasons."""
+        existing_reasons = list(result.metadata.get("scan_outcome_reasons", []))
+        result.merge(owner_result)
+        for reason in existing_reasons:
+            self._mark_inconclusive_scan_result(result, reason)
+
+    def _scan_filename_owned_json_overlap(self, path: str, result: ScanResult) -> None:
+        """Preserve filename-owned JSON checks for symbol-shaped content."""
+        from .jinja2_template_scanner import Jinja2TemplateScanner
+        from .manifest_scanner import ManifestScanner
+
+        scanner_selection = policy_from_config(self.config)
+        manifest_covered_templates = False
+        if ManifestScanner.can_handle(path):
+            if scanner_selection.allows("manifest"):
+                manifest_result = ManifestScanner(config=self.config).scan(path)
+                self._merge_filename_owned_result(result, manifest_result)
+                manifest_covered_templates = manifest_result.metadata.get("analysis_incomplete") is not True
+            elif scanner_selection.active:
+                add_scanner_selection_skip_check(
+                    result,
+                    path,
+                    "manifest",
+                    scanner_selection,
+                    context="overlapping manifest JSON analysis",
+                )
+        if not manifest_covered_templates and Jinja2TemplateScanner.can_handle(path):
+            if scanner_selection.allows("jinja2_template"):
+                self._merge_filename_owned_result(result, Jinja2TemplateScanner(config=self.config).scan(path))
+            elif scanner_selection.active:
+                add_scanner_selection_skip_check(
+                    result,
+                    path,
+                    "jinja2_template",
+                    scanner_selection,
+                    context="overlapping Jinja JSON analysis",
+                )
+
+    def _scan_xgboost_overlap(self, path: str, payload: dict[str, Any], result: ScanResult) -> None:
+        """Run XGBoost checks when a filename-owned symbol is also XGBoost JSON."""
+        from .xgboost_scanner import XGBoostScanner
+
+        version = payload.get("version")
+        learner = payload.get("learner")
+        if not isinstance(version, list | tuple) or len(version) < 2 or not isinstance(learner, dict):
+            return
+
+        scanner_selection = policy_from_config(self.config)
+        if scanner_selection.allows("xgboost"):
+            XGBoostScanner(config=self.config).scan_parsed_json_security(path, payload, result)
+        else:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "xgboost",
+                scanner_selection,
+                context="overlapping JSON analysis",
+            )
 
     def _scan_params_blob(self, path: str, result: ScanResult) -> bool:
         path_obj = Path(path)
