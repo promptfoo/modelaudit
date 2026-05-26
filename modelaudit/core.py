@@ -42,6 +42,7 @@ from modelaudit.scanners.archive_dispatch import (
     merge_executable_zip_container_findings,
 )
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
+from modelaudit.scanners.mxnet_scanner import MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY
 from modelaudit.scanners.xgboost_scanner import (
     XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY,
     XGBoostScanner,
@@ -1557,6 +1558,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         selected_mxnet_route = detect_mxnet_symbol_content_route(path)
         if selected_mxnet_route == "mxnet":
             header_format = magic_format = "mxnet"
+            config[MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY] = str(Path(path).resolve())
             skipped_overlap_scanner_id = "xgboost"
         elif selected_mxnet_route == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
             header_format = magic_format = MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT

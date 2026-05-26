@@ -4,6 +4,7 @@ import json
 import os
 import zipfile
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from ..core_results import mark_operational_scan_error
@@ -33,6 +34,7 @@ from ..utils.file.detection import (
     is_skops_archive,
     is_torchserve_mar_archive,
 )
+from .mxnet_scanner import MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY
 from .xgboost_scanner import (
     XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY,
     XGBoostScanner,
@@ -401,6 +403,8 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
     ):
         selected_mxnet_route = detect_mxnet_symbol_content_route(path)
         if selected_mxnet_route == "mxnet":
+            config = dict(config or {})
+            config[MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY] = str(Path(path).resolve())
             trusted_content_format = "mxnet"
             skipped_overlap_scanner_id = "xgboost"
         elif selected_mxnet_route == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:

@@ -2501,13 +2501,14 @@ def test_scan_file_mxnet_only_selection_preserves_overlap_security_analysis(tmp_
     assert result.scanner_name == "mxnet"
     assert any(issue.details.get("attribute") == "library" for issue in result.issues)
     assert "xgboost" in result.metadata["skipped_scanner_ids"]
-    assert any(
-        check.name == "Scanner Selection"
-        and check.details.get("skipped_scanner_id") == "xgboost"
-        and check.details.get("context") == "overlapping JSON analysis"
-        and check.details.get("kind") == "preferred"
+    xgboost_selection_checks = [
+        check
         for check in result.checks
-    )
+        if check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "xgboost"
+    ]
+    assert len(xgboost_selection_checks) == 1
+    assert xgboost_selection_checks[0].details.get("context") == "overlapping JSON analysis"
+    assert xgboost_selection_checks[0].details.get("kind") == "preferred"
 
 
 def test_scan_file_mxnet_only_selection_fails_closed_for_bounded_xgboost_overlap(

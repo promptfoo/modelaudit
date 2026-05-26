@@ -25,6 +25,7 @@ MAX_SYMBOL_READ_BYTES = MXNET_SYMBOL_SIGNATURE_READ_BYTES
 MAX_PARAMS_READ_BYTES = 10 * 1024 * 1024
 MIN_PARAMS_SIZE_BYTES = 16
 MAX_PREVIEW_SIGNATURE_OFFSET = 4096
+MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY = "_mxnet_preferred_xgboost_skip_path"
 
 PARAMS_NAME_RE = re.compile(r"^(?P<prefix>.+)-(?P<epoch>\d{1,8})\.params$", re.IGNORECASE)
 ABSOLUTE_PATH_RE = re.compile(r"^(?:[a-zA-Z]:[\\/]|/|~)")
@@ -427,7 +428,7 @@ class MXNetScanner(BaseScanner):
         scanner_selection = policy_from_config(self.config)
         if scanner_selection.allows("xgboost"):
             XGBoostScanner(config=self.config).scan_parsed_json_security(path, payload, result)
-        else:
+        elif self.config.get(MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY) != str(Path(path).resolve()):
             add_scanner_selection_skip_check(
                 result,
                 path,
