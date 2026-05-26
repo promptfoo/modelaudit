@@ -52,6 +52,18 @@ XGBOOST_CONTENT_ROUTED_JSON_CONFIG_KEY = "_xgboost_content_routed_json"
 XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY = "_xgboost_content_routed_ubjson"
 _JSON_KEY_MAX_BYTES = 256
 _JSON_WHITESPACE_BYTES = frozenset(b" \t\r\n")
+_JSON_ROUTING_MAX_DEPTH = 64
+_XGBOOST_OVERLAP_STRONG_LEARNER_KEYS = frozenset(
+    {
+        "gradient_booster",
+        "learner_model_param",
+        "gbtree_model_param",
+        "tree_info",
+        "gbtree",
+        "gblinear",
+        "dart",
+    }
+)
 
 
 def configure_content_routed_json_scan(config: dict[str, Any], *, max_bytes: int) -> None:
@@ -210,8 +222,12 @@ def _json_file_has_xgboost_markers(path: str, max_bytes: int) -> bool:
                     continue
 
                 if byte == ord("{"):
+                    if len(stack) >= _JSON_ROUTING_MAX_DEPTH:
+                        return False
                     stack.append(ord("}"))
                 elif byte == ord("["):
+                    if len(stack) >= _JSON_ROUTING_MAX_DEPTH:
+                        return False
                     stack.append(ord("]"))
                 elif byte in {ord("}"), ord("]")}:
                     if not stack or stack[-1] != byte:
@@ -223,6 +239,143 @@ def _json_file_has_xgboost_markers(path: str, max_bytes: int) -> bool:
                     expecting_key = True
 
     return False
+
+
+def _json_file_has_probable_xgboost_overlap_markers(path: str, max_bytes: int) -> bool:
+    """Find malformed XGBoost overlap markers without matching nested MXNet metadata."""
+    found_version = False
+    found_learner = False
+    found_strong_learner_key = False
+    bytes_read = 0
+    started = False
+    stack: list[int] = []
+    in_string = False
+    escaped = False
+    collecting_key = False
+    collecting_key_depth: int | None = None
+    key_overflow = False
+    raw_key = bytearray()
+    expecting_key = False
+    awaiting_colon = False
+    pending_key: str | None = None
+    pending_key_depth: int | None = None
+    awaiting_value_for: tuple[str, int] | None = None
+    learner_depth: int | None = None
+
+    with open(path, "rb") as f:
+        initial = f.read(3)
+        if initial != b"\xef\xbb\xbf":
+            f.seek(0)
+
+        while bytes_read < max_bytes:
+            chunk = f.read(min(XGBOOST_JSON_ROUTING_CHUNK_BYTES, max_bytes - bytes_read))
+            if not chunk:
+                break
+            bytes_read += len(chunk)
+
+            for byte in chunk:
+                opened_learner_object = False
+                if in_string:
+                    if collecting_key:
+                        if len(raw_key) < _JSON_KEY_MAX_BYTES:
+                            raw_key.append(byte)
+                        else:
+                            key_overflow = True
+
+                    if escaped:
+                        escaped = False
+                    elif byte == ord("\\"):
+                        escaped = True
+                    elif byte == ord('"'):
+                        in_string = False
+                        if collecting_key:
+                            pending_key = _decode_json_key(bytes(raw_key), key_overflow)
+                            pending_key_depth = collecting_key_depth
+                            awaiting_colon = True
+                            collecting_key = False
+                            collecting_key_depth = None
+                            key_overflow = False
+                            expecting_key = False
+                    continue
+
+                if not started:
+                    if byte in _JSON_WHITESPACE_BYTES:
+                        continue
+                    if byte != ord("{"):
+                        return False
+                    started = True
+                    stack.append(ord("}"))
+                    expecting_key = True
+                    continue
+
+                if awaiting_colon:
+                    if byte in _JSON_WHITESPACE_BYTES:
+                        continue
+                    if byte != ord(":") or pending_key is None or pending_key_depth is None:
+                        return False
+                    awaiting_value_for = (pending_key, pending_key_depth)
+                    pending_key = None
+                    pending_key_depth = None
+                    awaiting_colon = False
+                    expecting_key = False
+                    continue
+
+                if awaiting_value_for is not None:
+                    if byte in _JSON_WHITESPACE_BYTES:
+                        continue
+                    key, key_depth = awaiting_value_for
+                    if key_depth == 1:
+                        if key == "version":
+                            found_version = True
+                        elif key == "learner" and byte == ord("{"):
+                            found_learner = True
+                            learner_depth = len(stack) + 1
+                            opened_learner_object = True
+                    elif (
+                        learner_depth is not None
+                        and key_depth == learner_depth
+                        and key in _XGBOOST_OVERLAP_STRONG_LEARNER_KEYS
+                    ):
+                        found_strong_learner_key = True
+                    awaiting_value_for = None
+                    if found_version and found_learner and found_strong_learner_key:
+                        return True
+
+                if byte == ord('"'):
+                    if expecting_key and (
+                        len(stack) == 1 or (learner_depth is not None and len(stack) == learner_depth)
+                    ):
+                        collecting_key = True
+                        collecting_key_depth = len(stack)
+                        raw_key = bytearray(b'"')
+                    in_string = True
+                    escaped = False
+                    continue
+
+                if byte == ord("{"):
+                    if len(stack) >= _JSON_ROUTING_MAX_DEPTH:
+                        return False
+                    stack.append(ord("}"))
+                    if opened_learner_object:
+                        expecting_key = True
+                elif byte == ord("["):
+                    if len(stack) >= _JSON_ROUTING_MAX_DEPTH:
+                        return False
+                    stack.append(ord("]"))
+                elif byte in {ord("}"), ord("]")}:
+                    if not stack or stack[-1] != byte:
+                        return False
+                    if learner_depth is not None and len(stack) == learner_depth:
+                        learner_depth = None
+                    if len(stack) == 1:
+                        return found_version and found_learner and found_strong_learner_key
+                    stack.pop()
+                elif byte == ord(",") and (
+                    len(stack) == 1 or (learner_depth is not None and len(stack) == learner_depth)
+                ):
+                    expecting_key = True
+
+    return found_version and found_learner and found_strong_learner_key
 
 
 class XGBoostScanner(BaseScanner):
@@ -383,6 +536,27 @@ class XGBoostScanner(BaseScanner):
             return False
 
         return any(marker in probe for marker in cls._JSON_STRONG_MARKERS)
+
+    @classmethod
+    def _is_probable_mxnet_overlap_candidate(cls, path: str, *, max_bytes: int | None = None) -> bool:
+        """Recognize probable XGBoost ownership using only top-level overlap fields."""
+        try:
+            return _json_file_has_probable_xgboost_overlap_markers(
+                path,
+                max_bytes or cls._JSON_PROBE_READ_BYTES,
+            )
+        except OSError:
+            return False
+
+    @classmethod
+    def _is_probable_parsed_mxnet_overlap(cls, data: dict[str, Any]) -> bool:
+        """Recognize a parsed malformed XGBoost model without matching MXNet metadata."""
+        learner = data.get("learner")
+        return (
+            "version" in data
+            and isinstance(learner, dict)
+            and any(key in learner for key in _XGBOOST_OVERLAP_STRONG_LEARNER_KEYS)
+        )
 
     @classmethod
     def _is_xgboost_json(cls, path: str, *, max_bytes: int | None = None) -> bool:

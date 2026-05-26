@@ -1566,9 +1566,15 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     if (
         header_format == "xgboost"
         and ext != ".json"
-        and XGBoostScanner._is_xgboost_json(
-            path,
-            max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+        and (
+            XGBoostScanner._is_xgboost_json(
+                path,
+                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+            )
+            or XGBoostScanner._is_probable_mxnet_overlap_candidate(
+                path,
+                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+            )
         )
     ):
         configure_content_routed_json_scan(config, max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES)

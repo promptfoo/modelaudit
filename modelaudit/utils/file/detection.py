@@ -750,13 +750,12 @@ def _detect_content_routed_mxnet_symbol(file_path: Path, prefix: bytes) -> str |
     # checks run; the scanner then marks MXNet overlap as incomplete coverage.
     from ...scanners.xgboost_scanner import XGBoostScanner
 
-    if XGBoostScanner._is_xgboost_json(str(file_path), max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES):
+    xgboost_probe_bytes = None if file_path.suffix.lower() == ".json" else MXNET_SYMBOL_SIGNATURE_READ_BYTES
+    if XGBoostScanner._is_xgboost_json(str(file_path), max_bytes=xgboost_probe_bytes):
         return "xgboost"
     if (
-        mxnet_route == "mxnet"
-        and file_path.suffix.lower() == ".json"
-        and XGBoostScanner._is_probable_xgboost_json_candidate(str(file_path))
-    ):
+        file_path.suffix.lower() == ".json" or mxnet_route == "mxnet"
+    ) and XGBoostScanner._is_probable_mxnet_overlap_candidate(str(file_path), max_bytes=xgboost_probe_bytes):
         return "xgboost"
     return mxnet_route
 

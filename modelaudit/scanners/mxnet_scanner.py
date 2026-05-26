@@ -423,10 +423,8 @@ class MXNetScanner(BaseScanner):
         version = payload.get("version")
         learner = payload.get("learner")
         is_structural_overlap = isinstance(version, list | tuple) and len(version) >= 2 and isinstance(learner, dict)
-        is_probable_json_overlap = Path(
-            path
-        ).suffix.lower() == ".json" and XGBoostScanner._is_probable_xgboost_json_candidate(path)
-        if not is_structural_overlap and not is_probable_json_overlap:
+        is_probable_overlap = XGBoostScanner._is_probable_parsed_mxnet_overlap(payload)
+        if not is_structural_overlap and not is_probable_overlap:
             return
 
         scanner_selection = policy_from_config(self.config)

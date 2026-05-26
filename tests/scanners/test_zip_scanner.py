@@ -1005,11 +1005,85 @@ def test_scan_nested_file_runs_xgboost_checks_for_probable_malformed_mxnet_json_
     assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
 
 
+@pytest.mark.parametrize("filename", ["malformed-0000.params", "malformed.jpg"])
+def test_scan_nested_file_runs_xgboost_checks_for_renamed_probable_malformed_mxnet_overlap(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    extracted_member = tmp_path / filename
+    extracted_member.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"__reduce__"},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert any(
+        "Suspicious pattern detected: Pickle-like reduction pattern in JSON" in issue.message for issue in result.issues
+    )
+
+
+def test_scan_nested_file_xgboost_only_runs_renamed_probable_malformed_mxnet_overlap(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "malformed-0000.params"
+    extracted_member.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
+
+
+def test_scan_nested_file_runs_xgboost_checks_for_bounded_probable_malformed_mxnet_overlap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "bounded-polyglot.json"
+    extracted_member.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"padding":"' + ("x" * 256) + '","nodes":[{"op":"null","name":"data"}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
+
+
 def test_scan_nested_file_keeps_benign_mxnet_json_near_match_out_of_xgboost_routing(tmp_path: Path) -> None:
     extracted_member = tmp_path / "benign-symbol.json"
     extracted_member.write_text(
         '{"learner":{"description":"benign metadata"},'
         '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert not any(check.name == "JSON Content Analysis" for check in result.checks)
+
+
+@pytest.mark.parametrize("filename", ["nested-metadata.json", "nested-metadata-symbol.json"])
+def test_scan_nested_file_keeps_nested_xgboost_marker_names_in_mxnet_metadata_out_of_xgboost_analysis(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    extracted_member = tmp_path / filename
+    extracted_member.write_text(
+        '{"nodes":[{"op":"null","name":"data","attrs":{"documentation":'
+        '{"version":"malformed","learner":{"gradient_booster":{},"note":"eval(x)"}}}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
         encoding="utf-8",
     )
 
@@ -1259,6 +1333,25 @@ def test_scan_nested_file_does_not_cap_canonical_json_overlap_to_renamed_probe_b
     assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
     assert any(issue.details.get("attribute") == "library" for issue in result.issues)
     assert "max_file_read_size_exceeded" not in result.metadata.get("scan_outcome_reasons", [])
+
+
+def test_scan_nested_file_routes_xgboost_json_with_markers_after_mxnet_probe_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    extracted_member = tmp_path / "delayed-booster.json"
+    extracted_member.write_text(
+        '{"padding":"' + ("x" * 256) + '","version":[1,7,4],'
+        '"learner":{"gradient_booster":{},"malicious_code":"os.system()"}}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert "mxnet_symbol_routing_incomplete" not in result.metadata.get("scan_outcome_reasons", [])
+    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
 
 
 def test_scan_nested_file_polyglot_manifest_preserves_jinja_analysis(tmp_path: Path) -> None:

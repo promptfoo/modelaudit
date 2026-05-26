@@ -638,7 +638,7 @@ def test_unclaimed_json_invokes_mxnet_content_route_once(
 
 
 @pytest.mark.parametrize("detector", [detect_file_format_from_magic, detect_file_format_for_skip_filter])
-def test_generic_json_xgboost_probe_uses_mxnet_routing_bound(
+def test_generic_json_xgboost_probe_uses_established_xgboost_bound(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     detector: Callable[[str], str],
@@ -657,7 +657,7 @@ def test_generic_json_xgboost_probe_uses_mxnet_routing_bound(
     monkeypatch.setattr(XGBoostScanner, "_is_xgboost_json", classmethod(record_probe))
 
     assert detector(str(config_path)) == "unknown"
-    assert seen_limits == [128]
+    assert seen_limits == [None]
 
 
 def test_detect_oversized_generic_json_with_mxnet_hint_still_fails_closed(tmp_path: Path) -> None:

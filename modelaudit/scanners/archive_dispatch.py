@@ -413,9 +413,15 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
     if (
         trusted_content_format == "xgboost"
         and os.path.splitext(path)[1].lower() != ".json"
-        and XGBoostScanner._is_xgboost_json(
-            path,
-            max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+        and (
+            XGBoostScanner._is_xgboost_json(
+                path,
+                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+            )
+            or XGBoostScanner._is_probable_mxnet_overlap_candidate(
+                path,
+                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+            )
         )
     ):
         config = dict(config or {})
