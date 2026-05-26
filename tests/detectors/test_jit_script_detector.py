@@ -294,11 +294,73 @@ class TestJITScriptDetector:
                 b"namespace = {'__builtins__': {'eval': len}}\n"
                 b"namespace['__builtins__']['eval']([])\n"
             ),
+            (
+                b"namespace = globals()\n"
+                b"namespace['__builtins__']['eval'] = len\n"
+                b"namespace['__builtins__']['eval']([])\n"
+            ),
+            b"__builtins__['eval'] = len\n__builtins__['eval']([])\n",
+            b"import builtins\nbuiltins.eval = len\nbuiltins.eval([])\n",
+            b"def payload():\n    eval = len\n    return eval([])\n",
+            (
+                b"def payload():\n"
+                b"    namespace = globals()\n"
+                b"    namespace['__builtins__']['eval'] = len\n"
+                b"    return namespace['__builtins__']['eval']([])\n"
+            ),
             b"global_namespace = {'__builtins__': {'eval': len}}\nglobal_namespace['__builtins__']['eval']([])\n",
         ],
     )
     def test_scan_model_ignores_benign_builtin_shaped_access(self, source: bytes) -> None:
         detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
+    def test_scan_model_detects_dangerous_builtin_reassignment(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"namespace = globals()\n"
+            b"namespace['__builtins__']['eval'] = __builtins__['exec']\n"
+            b"namespace['__builtins__']['eval']('pass')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(f.type == "ast_dangerous_call" and f.builtin == "exec" for f in findings)
+
+    def test_scan_model_preserves_possible_builtin_execution_after_conditional_safe_overwrite(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"namespace = globals()\n"
+            b"if replace_builtin:\n"
+            b"    namespace['__builtins__']['eval'] = len\n"
+            b"namespace['__builtins__']['eval']('1 + 1')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(f.type == "ast_dangerous_call" and f.builtin == "eval" for f in findings)
+
+    def test_scan_model_preserves_builtin_execution_after_ambiguous_namespace_overwrite(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"if replace_builtin:\n"
+            b"    namespace = globals()\n"
+            b"else:\n"
+            b"    namespace = other\n"
+            b"namespace['__builtins__']['eval'] = len\n"
+            b"__builtins__.eval('1 + 1')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(f.type == "ast_dangerous_call" and f.builtin == "eval" for f in findings)
+
+    def test_scan_model_ignores_raw_builtin_pattern_when_parsed_snippet_rebinds_builtin(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00binary-prefix\ndef benign():\n    eval = len\n    return eval([])\n"
 
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 

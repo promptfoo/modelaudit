@@ -10,6 +10,7 @@ Part of ModelAudit's critical security validation suite.
 """
 
 import ast
+import contextlib
 import re
 import textwrap
 from typing import TYPE_CHECKING, Any
@@ -133,79 +134,6 @@ _DANGEROUS_IMPORT_PATTERNS = {
     dangerous_import: _compile_dangerous_import_patterns(dangerous_import) for dangerous_import in DANGEROUS_IMPORTS
 }
 
-_MAX_STATIC_BUILTIN_NAME_LENGTH = 128
-_MAX_STATIC_BUILTIN_NAME_NODES = 31
-
-
-def _resolve_static_string(node: ast.AST) -> str | None:
-    """Resolve a small constant-string expression without executing code."""
-    pending = [node]
-    parts: list[str] = []
-    visited = 0
-    total_length = 0
-
-    while pending:
-        current = pending.pop()
-        visited += 1
-        if visited > _MAX_STATIC_BUILTIN_NAME_NODES:
-            return None
-
-        if isinstance(current, ast.Constant) and isinstance(current.value, str):
-            parts.append(current.value)
-            total_length += len(current.value)
-            if total_length > _MAX_STATIC_BUILTIN_NAME_LENGTH:
-                return None
-        elif isinstance(current, ast.BinOp) and isinstance(current.op, ast.Add):
-            pending.extend((current.right, current.left))
-        else:
-            return None
-
-    return "".join(parts)
-
-
-def _is_builtins_namespace(node: ast.AST) -> bool:
-    """Return whether a node identifies Python's implicit builtins namespace."""
-    return (isinstance(node, ast.Name) and node.id == "__builtins__") or (
-        isinstance(node, ast.Attribute)
-        and node.attr == "__dict__"
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "__builtins__"
-    )
-
-
-def _resolve_dangerous_builtin_reference(node: ast.AST) -> str | None:
-    """Resolve statically addressed dangerous builtin call targets."""
-    if isinstance(node, ast.Name):
-        return node.id if node.id in DANGEROUS_BUILTINS else None
-
-    if isinstance(node, ast.Attribute) and _is_builtins_namespace(node.value):
-        return node.attr if node.attr in DANGEROUS_BUILTINS else None
-
-    if isinstance(node, ast.Subscript) and _is_builtins_namespace(node.value):
-        name = _resolve_static_string(node.slice)
-        return name if name in DANGEROUS_BUILTINS else None
-
-    if not isinstance(node, ast.Call):
-        return None
-
-    lookup_name: ast.AST | None = None
-    if isinstance(node.func, ast.Name) and node.func.id == "getattr" and len(node.args) >= 2:
-        if _is_builtins_namespace(node.args[0]):
-            lookup_name = node.args[1]
-    elif (
-        isinstance(node.func, ast.Attribute)
-        and node.func.attr in {"get", "__getitem__"}
-        and _is_builtins_namespace(node.func.value)
-        and node.args
-    ):
-        lookup_name = node.args[0]
-
-    if lookup_name is None:
-        return None
-
-    name = _resolve_static_string(lookup_name)
-    return name if name in DANGEROUS_BUILTINS else None
-
 
 def _resolve_alias_aware_dangerous_builtins(tree: ast.AST) -> set[str]:
     """Return dangerous builtins reached through shared bounded source resolution."""
@@ -246,6 +174,13 @@ CODE_EXECUTION_PATTERNS = [
     (rb"lambda\s+.*:\s*exec", "Lambda with exec detected"),
     (rb"type\s*\(\s*['\"].*['\"],.*exec", "Dynamic type creation with exec"),
 ]
+_BUILTIN_CODE_EXECUTION_PATTERN_NAMES = {
+    "exec() call detected": "exec",
+    "eval() call detected": "eval",
+    "compile() call detected": "compile",
+    "__import__() call detected": "__import__",
+    "File write operation detected": "open",
+}
 
 
 class JITScriptDetector:
@@ -314,9 +249,6 @@ class JITScriptDetector:
                 if node.module and is_dangerous_import(node.module):
                     return True
             elif isinstance(node, ast.Call):
-                if _resolve_dangerous_builtin_reference(node.func) is not None:
-                    return True
-
                 operation = dotted_name(node.func)
                 if operation is None:
                     continue
@@ -619,11 +551,25 @@ class JITScriptDetector:
 
         bounded = data if include_full_source else data[:1000000]
         python_code_pattern = rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+"
-        matches = [bounded] if include_full_source else re.findall(python_code_pattern, bounded)
+        code_matches = (
+            [(bounded, 0, len(bounded))]
+            if include_full_source
+            else [(match.group(0), match.start(), match.end()) for match in re.finditer(python_code_pattern, bounded)]
+        )
+        bounded_dangerous_builtins: set[str] | None = None
+        safe_builtin_pattern_spans: dict[str, list[tuple[int, int]]] = {}
+        try:
+            bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
+            bounded_dangerous_builtins = _resolve_alias_aware_dangerous_builtins(bounded_tree)
+        except (SyntaxError, UnicodeDecodeError, ValueError):
+            pass
 
-        for match in matches[:10]:  # Analyze first 10 code snippets
+        for match, match_start, match_end in code_matches[:10]:  # Analyze first 10 code snippets
             try:
-                code_str = match.decode("utf-8", errors="ignore")
+                code_str = textwrap.dedent(match.decode("utf-8", errors="ignore"))
+                tree: ast.AST | None = None
+                with contextlib.suppress(SyntaxError):
+                    tree = ast.parse(code_str)
 
                 # Check for dangerous imports
                 for dangerous_import in DANGEROUS_IMPORTS:
@@ -646,33 +592,37 @@ class JITScriptDetector:
                         )
 
                 # Check for dangerous builtins
-                for builtin in DANGEROUS_BUILTINS:
-                    if builtin in code_str:
-                        findings.append(
-                            create_jit_finding(
-                                message=f"Dangerous builtin '{builtin}' used in embedded code",
-                                severity="CRITICAL",
-                                context=context,
-                                pattern=None,
-                                recommendation=f"Remove {builtin} usage - it can execute arbitrary code",
-                                confidence=0.9,
-                                framework=framework,
-                                code_snippet=code_str[:200],
-                                type="dangerous_builtin",
-                                operation=None,
-                                builtin=builtin,
-                                import_=None,
-                            )
+                dangerous_builtins = (
+                    _resolve_alias_aware_dangerous_builtins(tree)
+                    if tree is not None
+                    else {builtin for builtin in DANGEROUS_BUILTINS if builtin in code_str}
+                )
+                if tree is not None:
+                    for builtin in _BUILTIN_CODE_EXECUTION_PATTERN_NAMES.values():
+                        if builtin not in dangerous_builtins:
+                            safe_builtin_pattern_spans.setdefault(builtin, []).append((match_start, match_end))
+                for builtin in sorted(dangerous_builtins):
+                    findings.append(
+                        create_jit_finding(
+                            message=f"Dangerous builtin '{builtin}' used in embedded code",
+                            severity="CRITICAL",
+                            context=context,
+                            pattern=None,
+                            recommendation=f"Remove {builtin} usage - it can execute arbitrary code",
+                            confidence=0.9,
+                            framework=framework,
+                            code_snippet=code_str[:200],
+                            type="dangerous_builtin",
+                            operation=None,
+                            builtin=builtin,
+                            import_=None,
                         )
+                    )
 
                 # Try to parse as AST for deeper analysis
-                try:
-                    tree = ast.parse(code_str)
+                if tree is not None:
                     ast_findings = self._analyze_ast(tree, framework, context)
                     findings.extend(ast_findings)
-                except SyntaxError:
-                    # Not valid Python, might be partial or corrupted
-                    pass
 
             except Exception:
                 # Failed to process this code snippet
@@ -680,7 +630,22 @@ class JITScriptDetector:
 
         # Check for common code execution patterns in binary
         for pattern, description in CODE_EXECUTION_PATTERNS:
-            if re.search(pattern, bounded):  # Limit search size
+            builtin_name = _BUILTIN_CODE_EXECUTION_PATTERN_NAMES.get(description)
+            pattern_matches = list(re.finditer(pattern, bounded))
+            if (
+                builtin_name is not None
+                and bounded_dangerous_builtins is not None
+                and builtin_name not in bounded_dangerous_builtins
+            ):
+                continue
+            if builtin_name is not None and bounded_dangerous_builtins is None:
+                safe_spans = safe_builtin_pattern_spans.get(builtin_name, [])
+                pattern_matches = [
+                    match
+                    for match in pattern_matches
+                    if not any(start <= match.start() and match.end() <= end for start, end in safe_spans)
+                ]
+            if pattern_matches:  # Limit search size
                 findings.append(
                     create_jit_finding(
                         message=description,
@@ -761,25 +726,6 @@ class JITScriptDetector:
                 self.generic_visit(node)
 
             def visit_Call(self, node: ast.Call) -> None:
-                # Check for dangerous function calls
-                dangerous_builtin = _resolve_dangerous_builtin_reference(node.func)
-                if dangerous_builtin is not None:
-                    self.findings.append(
-                        create_jit_finding(
-                            message=f"AST analysis: Dangerous function call '{dangerous_builtin}'",
-                            severity="CRITICAL",
-                            context=context,
-                            pattern=None,
-                            recommendation="Remove dangerous function calls to prevent code execution",
-                            confidence=0.9,
-                            framework=framework,
-                            code_snippet=None,
-                            type="ast_dangerous_call",
-                            operation=None,
-                            builtin=dangerous_builtin,
-                            import_=None,
-                        )
-                    )
                 self.generic_visit(node)
 
         visitor = DangerousNodeVisitor()

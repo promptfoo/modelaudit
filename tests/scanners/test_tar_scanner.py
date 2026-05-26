@@ -222,6 +222,11 @@ class TestTarScanner:
                 b"namespace = {'__builtins__': {'eval': len}}\n"
                 b"namespace['__builtins__']['eval']([])\n"
             ),
+            (
+                b"namespace = globals()\n"
+                b"namespace['__builtins__']['eval'] = len\n"
+                b"namespace['__builtins__']['eval']([])\n"
+            ),
             b"global_namespace = {'__builtins__': {'eval': len}}\nglobal_namespace['__builtins__']['eval']([])\n",
         ],
     )
@@ -235,6 +240,26 @@ class TestTarScanner:
         result = self.scanner.scan(str(archive_path))
 
         assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+
+    def test_scan_tar_reports_dangerous_builtin_reassignment(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = (
+            b"namespace = globals()\n"
+            b"namespace['__builtins__']['eval'] = __builtins__['exec']\n"
+            b"namespace['__builtins__']['eval']('pass')\n"
+        )
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].rule_code == "S104"
+        assert python_checks[0].details["reason"] == "high-risk calls: __builtins__.exec"
 
     def test_scan_tar_flags_aliased_getattr_helper_dangerous_python_member(self, tmp_path: Path) -> None:
         """Aliased getattr helpers and module aliases should still resolve risky calls."""
