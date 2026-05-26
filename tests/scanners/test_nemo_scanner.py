@@ -5,6 +5,7 @@ import pickle
 import tarfile
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -259,6 +260,40 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert skipped_checks[0].status == CheckStatus.FAILED
         assert skipped_checks[0].details["max_scan_bytes"] == 1
 
+    def test_incomplete_checkpoint_nested_scan_fails_closed(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "checkpoint-nested-incomplete.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "model_weights.ckpt", _build_malicious_pickle())
+
+        result = NemoScanner({"max_file_read_size": 1}).scan(str(nemo_path))
+
+        incomplete_checks = [
+            check
+            for check in result.checks
+            if check.details.get("scan_outcome_reason") == "nemo_checkpoint_nested_scan_incomplete"
+        ]
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert len(incomplete_checks) == 1
+        assert incomplete_checks[0].details["nested_scanner"] == "pickle"
+        assert incomplete_checks[0].details["nested_scan_outcome_reasons"] == ["max_file_read_size_exceeded"]
+        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+
+    def test_incomplete_checkpoint_with_warning_fails_closed(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "checkpoint-nested-incomplete-with-warning.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "model_weights.ckpt", _build_malicious_pickle())
+            _add_tar_bytes(tar, "payload.sh", b"#!/bin/sh\nid\n")
+
+        result = NemoScanner({"max_file_read_size": 1}).scan(str(nemo_path))
+
+        assert result.success is False
+        assert result.has_warnings is True
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_checkpoint_nested_scan_incomplete" in result.metadata["scan_outcome_reasons"]
+
     def test_nested_checkpoint_scanner_failure_fails_closed(
         self,
         tmp_path: Path,
@@ -475,6 +510,52 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert failed_checks[0].details["exception_type"] == "RuntimeError"
         assert failed_checks[0].details["exception_message"] == "referenced nested boom"
 
+    def test_incomplete_config_referenced_nested_scan_is_exit2_and_not_cached(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "referenced-nested-incomplete.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "tokenizer": {"model": "nemo:artifacts/payload.jpg"},
+        }
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "artifacts/payload.jpg", _build_malicious_pickle())
+
+        cache_dir = tmp_path / "cache"
+        reset_cache_manager()
+        try:
+            first = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                max_file_read_size=1,
+            )
+            second = scan_model_directory_or_file(
+                str(nemo_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+                max_file_read_size=1,
+            )
+
+            for aggregate in (first, second):
+                metadata = aggregate.file_metadata[str(nemo_path)]
+                assert aggregate.success is False
+                assert determine_exit_code(aggregate) == 2
+                assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+                assert "nemo_referenced_nested_scan_incomplete" in metadata["scan_outcome_reasons"]
+                incomplete_issues = [
+                    issue
+                    for issue in aggregate.issues
+                    if issue.details.get("scan_outcome_reason") == "nemo_referenced_nested_scan_incomplete"
+                ]
+                assert len(incomplete_issues) == 1
+                assert incomplete_issues[0].details["nested_scan_outcome_reasons"] == ["max_file_read_size_exceeded"]
+                assert incomplete_issues[0].details["trusted_content_format"] == "pickle"
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
+
     def test_metadata_referenced_benign_non_checkpoint_suffix_stays_clean(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "referenced-benign-artifact.nemo"
         config = {
@@ -491,10 +572,26 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
         assert "scan_outcome" not in result.metadata
 
-    def test_nested_checkpoint_archive_traversal_not_labeled_deserialization_cve(self, tmp_path: Path) -> None:
+    def test_metadata_referenced_benign_pickle_completed_scan_stays_clean(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "referenced-benign-pickle.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "tokenizer": {"model": "nemo:artifacts/payload.jpg"},
+        }
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "artifacts/payload.jpg", pickle.dumps({"weights": [1, 2, 3]}))
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert result.success is True
+        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert "scan_outcome" not in result.metadata
+
+    def test_nested_checkpoint_archive_traversal_is_preserved_without_deserialization_cve(self, tmp_path: Path) -> None:
         nested_checkpoint = io.BytesIO()
         with zipfile.ZipFile(nested_checkpoint, "w") as zipf:
-            zipf.writestr("../../evil.pkl", b"not a pickle")
+            zipf.writestr("../../pickle_payload.bin", b"not a pickle")
 
         nemo_path = tmp_path / "checkpoint-archive-traversal.nemo"
         with tarfile.open(nemo_path, "w") as tar:
@@ -503,6 +600,94 @@ class TestNemoArchiveVulnerabilityCoverage:
 
         result = NemoScanner().scan(str(nemo_path))
 
+        traversal_checks = [check for check in result.checks if check.rule_code == "S405"]
+        assert result.success is False
+        assert len(traversal_checks) == 1
+        assert traversal_checks[0].severity == IssueSeverity.CRITICAL
+        assert traversal_checks[0].location == f"{nemo_path}:model_weights.pt:../../pickle_payload.bin"
+        assert traversal_checks[0].details["entry"] == "model_weights.pt"
+        assert traversal_checks[0].details["nested_scanner"] == "pytorch_zip"
+        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert determine_exit_code(scan_model_directory_or_file(str(nemo_path), cache_enabled=False)) == 1
+
+    def test_metadata_referenced_archive_traversal_is_preserved_without_deserialization_cve(
+        self, tmp_path: Path
+    ) -> None:
+        nested_artifact = io.BytesIO()
+        with zipfile.ZipFile(nested_artifact, "w") as zipf:
+            zipf.writestr("../../evil.pkl", b"not a pickle")
+
+        nemo_path = tmp_path / "referenced-archive-traversal.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "tokenizer": {"model": "nemo:artifacts/bundle.jpg"},
+        }
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "artifacts/bundle.jpg", nested_artifact.getvalue())
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        traversal_checks = [check for check in result.checks if check.rule_code == "S405"]
+        assert result.success is False
+        assert len(traversal_checks) == 1
+        assert traversal_checks[0].severity == IssueSeverity.CRITICAL
+        assert traversal_checks[0].location == f"{nemo_path}:artifacts/bundle.jpg:../../evil.pkl"
+        assert traversal_checks[0].details["entry"] == "artifacts/bundle.jpg"
+        assert traversal_checks[0].details["trusted_content_format"] == "zip"
+        assert traversal_checks[0].details["nested_scanner"] == "zip"
+        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert determine_exit_code(scan_model_directory_or_file(str(nemo_path), cache_enabled=False)) == 1
+
+    def test_nested_checkpoint_executable_named_pickle_is_not_deserialization_cve(self, tmp_path: Path) -> None:
+        nested_checkpoint = io.BytesIO()
+        with zipfile.ZipFile(nested_checkpoint, "w") as zipf:
+            zipf.writestr("version", "3")
+            zipf.writestr("archive/pickle_payload.exe", b"not executed")
+
+        nemo_path = tmp_path / "checkpoint-executable-attribution.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "model_weights.pt", nested_checkpoint.getvalue())
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        executable_checks = [check for check in result.checks if check.rule_code == "S501"]
+        assert result.success is False
+        assert len(executable_checks) == 1
+        assert executable_checks[0].location == f"{nemo_path}:model_weights.pt:archive/pickle_payload.exe"
+        assert executable_checks[0].details["nested_scanner"] == "pytorch_zip"
+        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert determine_exit_code(scan_model_directory_or_file(str(nemo_path), cache_enabled=False)) == 1
+
+    def test_structured_embedded_code_rules_are_not_deserialization_cves(self) -> None:
+        issue = SimpleNamespace(
+            details={},
+            message="Executable interpreter content found in archive/pickle_payload",
+            rule_code="S507",
+            type="Python script embedded",
+        )
+
+        assert NemoScanner._is_nested_checkpoint_deserialization_issue(issue) is False
+
+    def test_metadata_referenced_benign_archive_stays_clean(self, tmp_path: Path) -> None:
+        nested_artifact = io.BytesIO()
+        with zipfile.ZipFile(nested_artifact, "w") as zipf:
+            zipf.writestr("weights/data.bin", b"ordinary weights")
+
+        nemo_path = tmp_path / "referenced-benign-archive.nemo"
+        config = {
+            "model": {"_target_": "nemo.Model"},
+            "tokenizer": {"model": "nemo:artifacts/bundle.jpg"},
+        }
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(tar, "artifacts/bundle.jpg", nested_artifact.getvalue())
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert result.success is True
+        assert not [check for check in result.checks if check.name == "NeMo Nested Member Security Finding"]
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
 
 
@@ -850,7 +1035,7 @@ class TestCVE202523304HydraTarget:
         assert size_checks[0].message == (f"Config file too large: model_config.yaml ({len(oversized_config)} bytes)")
         assert size_checks[0].details["scan_outcome_reason"] == "nemo_config_size_limit"
         assert size_checks[0].details["max_config_size"] == NemoScanner.MAX_CONFIG_SIZE
-        assert result.success is True
+        assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "nemo_config_size_limit" in result.metadata["scan_outcome_reasons"]
 

@@ -523,7 +523,7 @@ def test_scan_npz_flags_executable_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.npz"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("arrays.npy", _npy_payload())
-        archive.writestr("bin/run.sh", "#!/bin/sh\necho hidden\n")
+        archive.writestr("bin/pickle_payload.sh", "#!/bin/sh\necho hidden\n")
 
     result = ZipScanner().scan(str(archive_path))
 
@@ -534,7 +534,56 @@ def test_scan_npz_flags_executable_member(tmp_path: Path) -> None:
     ]
     assert len(executable_checks) == 1
     assert executable_checks[0].severity == IssueSeverity.WARNING
-    assert executable_checks[0].details["entry"] == "bin/run.sh"
+    assert executable_checks[0].details["entry"] == "bin/pickle_payload.sh"
+    assert executable_checks[0].rule_code == "S504"
+    assert not [check for check in result.checks if check.rule_code == "S213"]
+
+
+def test_scan_npz_prefers_executable_content_signature_over_suffix(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.npz"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("bin/pickle_payload.sh", b"\x7fELF" + b"\x00" * 64)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    executable_checks = [
+        check
+        for check in result.checks
+        if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert len(executable_checks) == 1
+    assert executable_checks[0].details["entry"] == "bin/pickle_payload.sh"
+    assert executable_checks[0].rule_code == "S502"
+    assert not [check for check in result.checks if check.rule_code == "S504"]
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_rule_code"),
+    [
+        (b"#!/usr/bin/env python3\nprint('hidden')\n", "S507"),
+        (b"#!/usr/bin/env pwsh\nWrite-Host hidden\n", "S506"),
+        (b"#!/bin/bash\necho hidden\n", "S504"),
+    ],
+)
+def test_scan_npz_classifies_extensionless_shebang_interpreter(
+    tmp_path: Path, payload: bytes, expected_rule_code: str
+) -> None:
+    archive_path = tmp_path / "model_bundle.npz"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("arrays.npy", _npy_payload())
+        archive.writestr("bin/runme", payload)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    executable_checks = [
+        check
+        for check in result.checks
+        if check.name == "Executable Archive Member Detection" and check.status == CheckStatus.FAILED
+    ]
+    assert len(executable_checks) == 1
+    assert executable_checks[0].details["entry"] == "bin/runme"
+    assert executable_checks[0].rule_code == expected_rule_code
 
 
 def test_scan_npz_flags_extensionless_executable_member(tmp_path: Path) -> None:
@@ -542,7 +591,7 @@ def test_scan_npz_flags_extensionless_executable_member(tmp_path: Path) -> None:
     archive_path = tmp_path / "model_bundle.npz"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("arrays.npy", _npy_payload())
-        archive.writestr("bin/runme", b"\x7fELF" + b"\x00" * 64)
+        archive.writestr("bin/pickle_payload", b"\x7fELF" + b"\x00" * 64)
 
     result = ZipScanner().scan(str(archive_path))
 
@@ -553,7 +602,9 @@ def test_scan_npz_flags_extensionless_executable_member(tmp_path: Path) -> None:
     ]
     assert len(executable_checks) == 1
     assert executable_checks[0].severity == IssueSeverity.WARNING
-    assert executable_checks[0].details["entry"] == "bin/runme"
+    assert executable_checks[0].details["entry"] == "bin/pickle_payload"
+    assert executable_checks[0].rule_code == "S502"
+    assert not [check for check in result.checks if check.rule_code == "S213"]
 
 
 def test_scan_npz_ignores_extensionless_executable_near_match(tmp_path: Path) -> None:

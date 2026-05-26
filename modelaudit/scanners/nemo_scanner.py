@@ -13,6 +13,8 @@ import tempfile
 from typing import Any, ClassVar
 
 from ..utils import is_absolute_archive_path, sanitize_archive_path
+from ..utils.file.detection import detect_file_format_from_magic
+from ._archive_locations import rewrite_extracted_member_location
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 try:
@@ -128,6 +130,9 @@ CVE_2025_23304_REMEDIATION = (
 )
 NEMO_CHECKPOINT_MEMBER_EXTENSIONS = frozenset({".ckpt", ".pt", ".pth", ".pkl", ".pickle"})
 NEMO_MAX_CHECKPOINT_SCAN_BYTES = 50 * 1024 * 1024
+_NESTED_NON_DESERIALIZATION_RULE_CODES = frozenset(
+    {"S405", "S406", "S408", "S410", "S501", "S502", "S503", "S504", "S505", "S506", "S507", "S508", "S509"}
+)
 
 _INCONCLUSIVE_METADATA_KEY = "scan_outcome"
 _INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
@@ -160,10 +165,6 @@ def _find_suspicious_safe_prefixed_target_pattern(target: str) -> str | None:
 def _is_runtime_truthy(value: Any) -> bool:
     """Return whether a Hydra argument would be truthy when passed to Python."""
     return bool(value)
-
-
-def _scan_result_has_security_findings(result: ScanResult) -> bool:
-    return any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
 def _get_nested_scanner_for_file(path: str, *, config: dict[str, Any]) -> BaseScanner | None:
@@ -263,9 +264,7 @@ class NemoScanner(BaseScanner):
 
     @staticmethod
     def _finish_scan_result(result: ScanResult) -> None:
-        if result.metadata.get(
-            _INCONCLUSIVE_METADATA_KEY
-        ) == INCONCLUSIVE_SCAN_OUTCOME and not _scan_result_has_security_findings(result):
+        if result.metadata.get(_INCONCLUSIVE_METADATA_KEY) == INCONCLUSIVE_SCAN_OUTCOME:
             result.finish(success=False)
             return
 
@@ -621,6 +620,24 @@ class NemoScanner(BaseScanner):
                 )
                 return
 
+            self._propagate_nested_incomplete_result(
+                result,
+                nested_result,
+                reason="nemo_checkpoint_nested_scan_incomplete",
+                message=f"Nested scan was incomplete for checkpoint member: {report_entry}",
+                archive_path=archive_path,
+                entry=report_entry,
+                source_entry=member.name,
+            )
+            self._propagate_nested_security_findings(
+                result,
+                nested_result,
+                extracted_path=extracted_path,
+                archive_path=archive_path,
+                entry=report_entry,
+                source_entry=member.name,
+            )
+
             critical_issues = [
                 issue
                 for issue in nested_result.issues
@@ -730,6 +747,37 @@ class NemoScanner(BaseScanner):
                 )
                 return True
 
+            trusted_content_format = detect_file_format_from_magic(extracted_path)
+            is_declared_checkpoint = referenced_member_name.lower().endswith(tuple(NEMO_CHECKPOINT_MEMBER_EXTENSIONS))
+            if trusted_content_format != "unknown" or is_declared_checkpoint:
+                self._propagate_nested_incomplete_result(
+                    result,
+                    nested_result,
+                    reason="nemo_referenced_nested_scan_incomplete",
+                    message=f"Nested scan was incomplete for referenced member: {referenced_member_name}",
+                    archive_path=archive_path,
+                    entry=referenced_member_name,
+                    source_entry=member.name,
+                    extra_details={
+                        "config_file": config_file,
+                        "config_path": config_path,
+                        "trusted_content_format": trusted_content_format,
+                    },
+                )
+            self._propagate_nested_security_findings(
+                result,
+                nested_result,
+                extracted_path=extracted_path,
+                archive_path=archive_path,
+                entry=referenced_member_name,
+                source_entry=member.name,
+                extra_details={
+                    "config_file": config_file,
+                    "config_path": config_path,
+                    "trusted_content_format": trusted_content_format,
+                },
+            )
+
             critical_issues = [
                 issue
                 for issue in nested_result.issues
@@ -754,6 +802,83 @@ class NemoScanner(BaseScanner):
                 os.unlink(extracted_path)
             except OSError:
                 logger.debug("Failed to remove temporary NeMo referenced scan file: %s", extracted_path)
+
+    def _propagate_nested_security_findings(
+        self,
+        result: ScanResult,
+        nested_result: ScanResult,
+        *,
+        extracted_path: str,
+        archive_path: str,
+        entry: str,
+        source_entry: str,
+        extra_details: dict[str, Any] | None = None,
+    ) -> None:
+        """Preserve concrete findings from nested artifact scans with NeMo provenance."""
+        for issue in nested_result.issues:
+            if issue.severity not in (IssueSeverity.WARNING, IssueSeverity.CRITICAL):
+                continue
+            if issue.severity == IssueSeverity.CRITICAL and self._is_nested_checkpoint_deserialization_issue(issue):
+                continue
+
+            result.add_check(
+                name="NeMo Nested Member Security Finding",
+                passed=False,
+                message=issue.message,
+                severity=issue.severity,
+                location=rewrite_extracted_member_location(
+                    issue.location,
+                    extracted_path,
+                    f"{archive_path}:{entry}",
+                    preserve_non_delimited_suffix=True,
+                ),
+                details={
+                    **issue.details,
+                    "entry": entry,
+                    "source_entry": source_entry,
+                    "nested_scanner": nested_result.scanner_name,
+                    "nested_issue_type": issue.type,
+                    **(extra_details or {}),
+                },
+                why=issue.why,
+                rule_code=issue.rule_code,
+            )
+
+    def _propagate_nested_incomplete_result(
+        self,
+        result: ScanResult,
+        nested_result: ScanResult,
+        *,
+        reason: str,
+        message: str,
+        archive_path: str,
+        entry: str,
+        source_entry: str,
+        extra_details: dict[str, Any] | None = None,
+    ) -> None:
+        """Preserve explicit incomplete coverage from a nested NeMo member scan."""
+        if (
+            nested_result.metadata.get("analysis_incomplete") is not True
+            and nested_result.metadata.get(_INCONCLUSIVE_METADATA_KEY) != INCONCLUSIVE_SCAN_OUTCOME
+        ):
+            return
+
+        nested_reasons = nested_result.metadata.get(_INCONCLUSIVE_REASONS_METADATA_KEY)
+        self._mark_inconclusive_scan_result(
+            result,
+            reason=reason,
+            check_name="NeMo Checkpoint Nested Scan",
+            message=message,
+            location=f"{archive_path}:{entry}",
+            details={
+                "entry": entry,
+                "source_entry": source_entry,
+                "nested_scanner": nested_result.scanner_name,
+                "nested_scan_outcome": nested_result.metadata.get(_INCONCLUSIVE_METADATA_KEY),
+                "nested_scan_outcome_reasons": list(nested_reasons) if isinstance(nested_reasons, list) else [],
+                **(extra_details or {}),
+            },
+        )
 
     @classmethod
     def _collect_nemo_member_references(
@@ -813,6 +938,9 @@ class NemoScanner(BaseScanner):
 
     @staticmethod
     def _is_nested_checkpoint_deserialization_issue(issue: Any) -> bool:
+        if issue.rule_code in _NESTED_NON_DESERIALIZATION_RULE_CODES:
+            return False
+
         details = issue.details if isinstance(issue.details, dict) else {}
         text = " ".join(
             str(part).lower()
