@@ -24,7 +24,7 @@ DISCOVERY_ASSUMPTIONS = [
 ]
 
 _CNTK_SUPPORTED_EXTENSIONS = frozenset({".dnn", ".cmf"})
-_CNTK_CANDIDATE_EXTENSIONS = frozenset({".dnn", ".cmf", ".model"})
+_CNTK_EXCLUDED_EXTENSIONS = frozenset({".model"})
 
 _MAX_SIGNATURE_BYTES = 4096
 _MAX_SCAN_BYTES = 10 * 1024 * 1024  # 10MB parser budget per file
@@ -122,8 +122,8 @@ def _has_cntkv2_structure_markers(prefix: bytes) -> bool:
 
 
 def _detect_cntk_variant(prefix: bytes, extension: str) -> tuple[str, str]:
-    if extension not in _CNTK_CANDIDATE_EXTENSIONS:
-        return "not_cntk", "extension_not_cntk_candidate"
+    if extension in _CNTK_EXCLUDED_EXTENSIONS:
+        return "unsupported_cntk_variant", "model_extension_excluded_for_xgboost_overlap"
 
     if prefix.startswith(_CNTK_LEGACY_MAGIC):
         if _CNTK_LEGACY_VERSION_MARKER in prefix:
@@ -131,8 +131,6 @@ def _detect_cntk_variant(prefix: bytes, extension: str) -> tuple[str, str]:
         return "unsupported_cntk_variant", "legacy_marker_without_bversion_marker"
 
     if _has_cntkv2_core_markers(prefix):
-        if extension == ".model":
-            return "unsupported_cntk_variant", "cntkv2_model_extension_deferred_v1"
         if _has_cntkv2_structure_markers(prefix):
             return "cntk_v2", "protobuf_core_and_structure_markers"
         return "unsupported_cntk_variant", "protobuf_core_markers_without_structure_markers"
@@ -264,7 +262,7 @@ class CntkScanner(BaseScanner):
     """Scanner for CNTK model files with strict format detection."""
 
     name = "cntk"
-    description = "Scans CNTK .dnn/.cmf model artifacts for load-time execution indicators"
+    description = "Scans signature-validated CNTK model artifacts for load-time execution indicators"
     supported_extensions: ClassVar[list[str]] = [".dnn", ".cmf"]
 
     @classmethod
@@ -273,7 +271,7 @@ class CntkScanner(BaseScanner):
             return False
 
         extension = os.path.splitext(path)[1].lower()
-        if extension not in _CNTK_SUPPORTED_EXTENSIONS:
+        if extension in _CNTK_EXCLUDED_EXTENSIONS:
             return False
 
         try:
@@ -328,7 +326,8 @@ class CntkScanner(BaseScanner):
                 passed=False,
                 message=(
                     "Unsupported or out-of-scope CNTK variant detected. "
-                    "Current scanner supports only signature-backed .dnn/.cmf variants."
+                    "The scanner supports signature-backed CNTK artifacts but excludes .model "
+                    "because that extension overlaps with XGBoost."
                 ),
                 severity=IssueSeverity.INFO,
                 location=path,
@@ -336,6 +335,7 @@ class CntkScanner(BaseScanner):
                     "variant": variant,
                     "reason": variant_reason,
                     "supported_extensions": sorted(_CNTK_SUPPORTED_EXTENSIONS),
+                    "excluded_extensions": sorted(_CNTK_EXCLUDED_EXTENSIONS),
                 },
             )
             result.finish(success=False)
