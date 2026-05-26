@@ -428,6 +428,7 @@ def test_detect_oversized_renamed_mxnet_requires_top_level_graph_contract(tmp_pa
         + ("x" * (MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1))
         + '"}',
     ],
+    ids=["leading-padding", "string-padding", "nested-padding"],
 )
 def test_detect_oversized_renamed_mxnet_before_structure_fails_closed(tmp_path: Path, payload: str) -> None:
     model_path = tmp_path / "padded.jpg"
