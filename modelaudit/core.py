@@ -47,6 +47,7 @@ from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_
 from modelaudit.utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
     LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
+    NEMO_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
     detect_file_format,
     detect_file_format_from_magic,
@@ -346,6 +347,23 @@ def _make_incomplete_llamafile_routing_result(path: str, config: dict[str, Any])
         context="inconclusive executable ZIP polyglot",
     )
 
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_nemo_routing_result(path: str) -> ScanResult:
+    """Fail closed when bounded NeMo structural routing cannot reach a decision."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="NeMo Routing",
+        passed=False,
+        message="NeMo routing was inconclusive because the bounded TAR member probe reached its limit",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": NEMO_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, "nemo_routing_incomplete")
+    _mark_operational_scan_error(result, "nemo_routing_incomplete")
     result.finish(success=False)
     return result
 
@@ -1441,6 +1459,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
+    if header_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT or magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
+        sr = _make_incomplete_nemo_routing_result(path)
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
     if header_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT or magic_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT:
         sr = _scan_executable_zip_polyglot(path, config)
         if sr.bytes_scanned == 0 and file_size > 0:
@@ -1615,6 +1638,8 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
                 sr = _make_incomplete_xml_model_result(path)
             elif magic_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_llamafile_routing_result(path, config)
+            elif magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_nemo_routing_result(path)
             elif magic_format == "unknown":
                 # Not a recognized model format — skip silently
                 sr = ScanResult(scanner_name="unknown")
