@@ -492,6 +492,9 @@ class TestJITScriptDetector:
                 b"globals()['__builtins__']['eval']('1 + 1')\n"
             ),
             (b"import builtins\nif replace_builtin:\n    setattr(builtins, 'eval', len)\nbuiltins.eval('1 + 1')\n"),
+            (b"import builtins\nreplace_builtin and setattr(builtins, 'eval', len)\nbuiltins.eval('1 + 1')\n"),
+            (b"import builtins\nFalse and setattr(builtins, 'eval', len)\nbuiltins.eval('1 + 1')\n"),
+            (b"import builtins\nsetattr(builtins, 'eval', len) if replace_builtin else None\nbuiltins.eval('1 + 1')\n"),
             (
                 b"import builtins\n"
                 b"assign = setattr\n"

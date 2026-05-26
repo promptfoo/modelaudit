@@ -712,6 +712,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             {self._static_attribute_mutation_alias_key("setattr"): frozenset({"setattr"})}
         ]
         self._class_scope_ids: set[int] = set()
+        self._static_expression_binding_suppression_depth = 0
         self.risky_calls: set[str] = set()
         self.tracked_call_names = tracked_call_names
 
@@ -937,6 +938,16 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if target_names is None or len(target_names) != 1:
             return
         self._bind_static_reference_names_to_value(target_names, node.args[2])
+
+    def _static_expression_bindings_enabled(self) -> bool:
+        return self._static_expression_binding_suppression_depth == 0
+
+    def _visit_without_static_expression_bindings(self, node: ast.AST) -> None:
+        self._static_expression_binding_suppression_depth += 1
+        try:
+            self.visit(node)
+        finally:
+            self._static_expression_binding_suppression_depth -= 1
 
     def _bind_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
         if isinstance(target, ast.Name):
@@ -1188,8 +1199,50 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self.visit(node.value)
-        self._bind_target_to_value(node.target, node.value)
+        if self._static_expression_bindings_enabled():
+            self._bind_target_to_value(node.target, node.value)
         self.visit(node.target)
+
+    def visit_BoolOp(self, node: ast.BoolOp) -> None:
+        next_value_is_certainly_evaluated = True
+        for value in node.values:
+            if next_value_is_certainly_evaluated:
+                self.visit(value)
+            else:
+                self._visit_without_static_expression_bindings(value)
+
+            constant_bool = self._constant_bool(value)
+            if isinstance(node.op, ast.And):
+                if constant_bool is False:
+                    return
+                if constant_bool is not True:
+                    next_value_is_certainly_evaluated = False
+            else:
+                if constant_bool is True:
+                    return
+                if constant_bool is not False:
+                    next_value_is_certainly_evaluated = False
+
+    def visit_IfExp(self, node: ast.IfExp) -> None:
+        self.visit(node.test)
+        constant_bool = self._constant_bool(node.test)
+        if constant_bool is True:
+            self.visit(node.body)
+            return
+        if constant_bool is False:
+            self.visit(node.orelse)
+            return
+
+        self._visit_without_static_expression_bindings(node.body)
+        self._visit_without_static_expression_bindings(node.orelse)
+
+    def visit_Compare(self, node: ast.Compare) -> None:
+        self.visit(node.left)
+        if not node.comparators:
+            return
+        self.visit(node.comparators[0])
+        for comparator in node.comparators[1:]:
+            self._visit_without_static_expression_bindings(comparator)
 
     def visit_Expr(self, node: ast.Expr) -> None:
         self.visit(node.value)
@@ -1308,7 +1361,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 if self._is_tracked_call_name(resolved_name):
                     self.risky_calls.add(resolved_name)
         self.generic_visit(node)
-        self._bind_static_setattr_mutation(node)
+        if self._static_expression_bindings_enabled():
+            self._bind_static_setattr_mutation(node)
 
 
 def statically_resolved_python_call_names_in_tree(tree: ast.AST, tracked_call_names: frozenset[str]) -> set[str]:
