@@ -990,6 +990,19 @@ def test_detect_file_format_tar(tmp_path):
     assert detect_file_format(str(tar_path)) == "tar"
 
 
+def test_detect_file_format_tar_member_name_with_rknn_prefix(tmp_path: Path) -> None:
+    """TAR headers should win over model magic-looking member name prefixes."""
+    tar_path = tmp_path / "rknn_named_member.bin"
+    with tarfile.open(tar_path, "w") as archive:
+        payload = b"not a model"
+        info = tarfile.TarInfo("RKNN_payload.pkl")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+
+    assert detect_file_format_from_magic(str(tar_path)) == "tar"
+    assert detect_file_format(str(tar_path)) == "tar"
+
+
 def test_detect_file_format_extensionless_legacy_tar_without_ustar(tmp_path: Path) -> None:
     """Legacy TAR headers without ustar magic should still route by checksum."""
     tar_path = create_v7_tar_archive(tmp_path / "legacy-archive")

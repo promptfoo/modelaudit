@@ -551,15 +551,20 @@ class JITScriptDetector:
 
         bounded = data if include_full_source else data[:1000000]
         python_code_pattern = rb"def\s+\w+\s*\([^)]*\):[^}]+|class\s+\w+[^}]+"
-        matches = [bounded] if include_full_source else re.findall(python_code_pattern, bounded)
+        code_matches = (
+            [(bounded, 0, len(bounded))]
+            if include_full_source
+            else [(match.group(0), match.start(), match.end()) for match in re.finditer(python_code_pattern, bounded)]
+        )
         bounded_dangerous_builtins: set[str] | None = None
+        safe_builtin_pattern_spans: dict[str, list[tuple[int, int]]] = {}
         try:
             bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
             bounded_dangerous_builtins = _resolve_alias_aware_dangerous_builtins(bounded_tree)
         except (SyntaxError, UnicodeDecodeError, ValueError):
             pass
 
-        for match in matches[:10]:  # Analyze first 10 code snippets
+        for match, match_start, match_end in code_matches[:10]:  # Analyze first 10 code snippets
             try:
                 code_str = textwrap.dedent(match.decode("utf-8", errors="ignore"))
                 tree: ast.AST | None = None
@@ -592,6 +597,10 @@ class JITScriptDetector:
                     if tree is not None
                     else {builtin for builtin in DANGEROUS_BUILTINS if builtin in code_str}
                 )
+                if tree is not None:
+                    for builtin in _BUILTIN_CODE_EXECUTION_PATTERN_NAMES.values():
+                        if builtin not in dangerous_builtins:
+                            safe_builtin_pattern_spans.setdefault(builtin, []).append((match_start, match_end))
                 for builtin in sorted(dangerous_builtins):
                     findings.append(
                         create_jit_finding(
@@ -622,13 +631,21 @@ class JITScriptDetector:
         # Check for common code execution patterns in binary
         for pattern, description in CODE_EXECUTION_PATTERNS:
             builtin_name = _BUILTIN_CODE_EXECUTION_PATTERN_NAMES.get(description)
+            pattern_matches = list(re.finditer(pattern, bounded))
             if (
                 builtin_name is not None
                 and bounded_dangerous_builtins is not None
                 and builtin_name not in bounded_dangerous_builtins
             ):
                 continue
-            if re.search(pattern, bounded):  # Limit search size
+            if builtin_name is not None and bounded_dangerous_builtins is None:
+                safe_spans = safe_builtin_pattern_spans.get(builtin_name, [])
+                pattern_matches = [
+                    match
+                    for match in pattern_matches
+                    if not any(start <= match.start() and match.end() <= end for start, end in safe_spans)
+                ]
+            if pattern_matches:  # Limit search size
                 findings.append(
                     create_jit_finding(
                         message=description,
