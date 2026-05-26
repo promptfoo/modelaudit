@@ -129,6 +129,80 @@ _DANGEROUS_IMPORT_PATTERNS = {
     dangerous_import: _compile_dangerous_import_patterns(dangerous_import) for dangerous_import in DANGEROUS_IMPORTS
 }
 
+_MAX_STATIC_BUILTIN_NAME_LENGTH = 128
+_MAX_STATIC_BUILTIN_NAME_NODES = 31
+
+
+def _resolve_static_string(node: ast.AST) -> str | None:
+    """Resolve a small constant-string expression without executing code."""
+    pending = [node]
+    parts: list[str] = []
+    visited = 0
+    total_length = 0
+
+    while pending:
+        current = pending.pop()
+        visited += 1
+        if visited > _MAX_STATIC_BUILTIN_NAME_NODES:
+            return None
+
+        if isinstance(current, ast.Constant) and isinstance(current.value, str):
+            parts.append(current.value)
+            total_length += len(current.value)
+            if total_length > _MAX_STATIC_BUILTIN_NAME_LENGTH:
+                return None
+        elif isinstance(current, ast.BinOp) and isinstance(current.op, ast.Add):
+            pending.extend((current.right, current.left))
+        else:
+            return None
+
+    return "".join(parts)
+
+
+def _is_builtins_namespace(node: ast.AST) -> bool:
+    """Return whether a node identifies Python's implicit builtins namespace."""
+    return (isinstance(node, ast.Name) and node.id == "__builtins__") or (
+        isinstance(node, ast.Attribute)
+        and node.attr == "__dict__"
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "__builtins__"
+    )
+
+
+def _resolve_dangerous_builtin_reference(node: ast.AST) -> str | None:
+    """Resolve statically addressed dangerous builtin call targets."""
+    if isinstance(node, ast.Name):
+        return node.id if node.id in DANGEROUS_BUILTINS else None
+
+    if isinstance(node, ast.Attribute) and _is_builtins_namespace(node.value):
+        return node.attr if node.attr in DANGEROUS_BUILTINS else None
+
+    if isinstance(node, ast.Subscript) and _is_builtins_namespace(node.value):
+        name = _resolve_static_string(node.slice)
+        return name if name in DANGEROUS_BUILTINS else None
+
+    if not isinstance(node, ast.Call):
+        return None
+
+    lookup_name: ast.AST | None = None
+    if isinstance(node.func, ast.Name) and node.func.id == "getattr" and len(node.args) >= 2:
+        if _is_builtins_namespace(node.args[0]):
+            lookup_name = node.args[1]
+    elif (
+        isinstance(node.func, ast.Attribute)
+        and node.func.attr in {"get", "__getitem__"}
+        and _is_builtins_namespace(node.func.value)
+        and node.args
+    ):
+        lookup_name = node.args[0]
+
+    if lookup_name is None:
+        return None
+
+    name = _resolve_static_string(lookup_name)
+    return name if name in DANGEROUS_BUILTINS else None
+
+
 # Patterns that indicate code execution attempts
 CODE_EXECUTION_PATTERNS = [
     # Direct execution patterns
@@ -216,7 +290,7 @@ class JITScriptDetector:
                 if node.module and is_dangerous_import(node.module):
                     return True
             elif isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name) and node.func.id in DANGEROUS_BUILTINS:
+                if _resolve_dangerous_builtin_reference(node.func) is not None:
                     return True
 
                 operation = dotted_name(node.func)
@@ -664,10 +738,11 @@ class JITScriptDetector:
 
             def visit_Call(self, node: ast.Call) -> None:
                 # Check for dangerous function calls
-                if isinstance(node.func, ast.Name) and node.func.id in DANGEROUS_BUILTINS:
+                dangerous_builtin = _resolve_dangerous_builtin_reference(node.func)
+                if dangerous_builtin is not None:
                     self.findings.append(
                         create_jit_finding(
-                            message=f"AST analysis: Dangerous function call '{node.func.id}'",
+                            message=f"AST analysis: Dangerous function call '{dangerous_builtin}'",
                             severity="CRITICAL",
                             context=context,
                             pattern=None,
@@ -677,7 +752,7 @@ class JITScriptDetector:
                             code_snippet=None,
                             type="ast_dangerous_call",
                             operation=None,
-                            builtin=node.func.id,
+                            builtin=dangerous_builtin,
                             import_=None,
                         )
                     )

@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - inspect nested PMML extension attributes for code-shaped execution indicators
 - detect statically obscured high-risk calls in TorchServe handler source
 - avoid classifying SafeTensors documentation examples as executable metadata payloads
+- detect statically obscured builtin execution calls in embedded JIT source analysis
 
 ## [0.2.45](https://github.com/promptfoo/modelaudit/compare/v0.2.44...v0.2.45) (2026-05-03)
 

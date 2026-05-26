@@ -236,6 +236,32 @@ class TestJITScriptDetector:
 
         assert any(f.type == "dangerous_import" and f.import_ == "os" for f in findings)
 
+    @pytest.mark.parametrize(
+        "source",
+        [
+            b"getattr(__builtins__, 'eval')('1 + 1')\n",
+            b"__builtins__['eval']('1 + 1')\n",
+            b"getattr(__builtins__, 'ev' + 'al')('1 + 1')\n",
+            b"__builtins__.__dict__['ev' + 'al']('1 + 1')\n",
+            b"__builtins__.__dict__.get('ev' + 'al')('1 + 1')\n",
+            b"__builtins__.__dict__.__getitem__('eval')('1 + 1')\n",
+        ],
+    )
+    def test_scan_model_detects_unmarked_static_builtin_indirection(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(f.type == "ast_dangerous_call" and f.builtin == "eval" for f in findings)
+
+    def test_scan_model_ignores_ordinary_static_callback_mapping(self) -> None:
+        detector = JITScriptDetector()
+        source = b"callbacks = {'eval': len}\ncallbacks['eval']([])\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
     def test_scan_model_detects_late_unmarked_module_scope_python_source(self) -> None:
         detector = JITScriptDetector()
         data = b"# pad\n" * 200000 + b"import os\nos.system('id')\n"
