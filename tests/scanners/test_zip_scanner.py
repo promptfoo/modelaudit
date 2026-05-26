@@ -300,6 +300,25 @@ def test_scan_zip_preserves_captured_dangerous_callable_before_overwrite(tmp_pat
         "import os\nvars(os).clear()\nos.system([])\n",
         "import os\nclear = os.__dict__.clear\nclear()\nos.system([])\n",
         "import os\ndict.clear(os.__dict__)\nos.system([])\n",
+        (
+            "import os\n"
+            "if clear:\n"
+            "    os.__dict__.clear()\n"
+            "    os.__dict__['system'] = len\n"
+            "else:\n"
+            "    os.__dict__.clear()\n"
+            "os.system([])\n"
+        ),
+        (
+            "import os\n"
+            "import subprocess\n"
+            "os.__dict__['system'] = subprocess.run\n"
+            "if clear:\n"
+            "    os.__dict__.clear()\n"
+            "else:\n"
+            "    os.__dict__.clear()\n"
+            "os.system([])\n"
+        ),
         "import subprocess\nsubprocess.__dict__.update({'run': len})\nsubprocess.run([])\n",
         "import subprocess\nsubprocess.__dict__.pop('run')\nsubprocess.run([])\n",
         "import subprocess\nsubprocess.__dict__.clear()\nsubprocess.run([])\n",
@@ -532,6 +551,7 @@ def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path
         "globals()['__builtins__'].clear()\nglobals()['__builtins__']['eval']([])\n",
         "import builtins\nbuiltins.__dict__.clear()\nbuiltins.eval([])\n",
         "import builtins\ndict.clear(builtins.__dict__)\nbuiltins.eval([])\n",
+        "import builtins\nbuiltins.__dict__.clear()\nglobals()['__builtins__']['eval']([])\n",
     ],
 )
 def test_scan_zip_allows_benign_builtin_shaped_source(tmp_path: Path, source: str) -> None:
@@ -577,6 +597,11 @@ def test_scan_zip_allows_benign_builtin_shaped_source(tmp_path: Path, source: st
         ),
         (
             "import builtins\nbuiltins.__dict__.update({'eval': builtins.exec})\nbuiltins.eval('pass')\n",
+            "builtins.exec",
+        ),
+        (
+            "import builtins\nrun = builtins.exec\nbuiltins.__dict__.clear()\n"
+            "globals()['__builtins__']['eval'] = run\nbuiltins.eval('pass')\n",
             "builtins.exec",
         ),
     ],

@@ -298,6 +298,7 @@ _STATIC_MAPPING_MUTATION_ALIAS_PREFIX = "<static mapping mutation alias>:"
 _STATIC_UNCERTAIN_BINDING_PREFIX = "<uncertain static binding>:"
 _CAPTURED_CALLABLE_REFERENCE_PREFIX = "<captured callable>:"
 _BUILTIN_NAMESPACE_NAMES = {"__builtin__", "__builtins__"}
+_BUILTIN_NAMESPACE_ROOT_EQUIVALENTS = frozenset({"__builtin__", "__builtins__", "builtins"})
 _STATIC_MAPPING_MUTATORS = {"__delitem__", "__setitem__", "clear", "pop", "update"}
 _STATIC_ATTRIBUTE_MUTATION_HELPERS = {
     "setattr",
@@ -700,6 +701,29 @@ def _binding_names(target: ast.AST) -> Iterator[str]:
             yield from _binding_names(element)
 
 
+def _equivalent_static_namespace_roots(namespace_root: str) -> frozenset[str]:
+    if namespace_root in _BUILTIN_NAMESPACE_ROOT_EQUIVALENTS:
+        return _BUILTIN_NAMESPACE_ROOT_EQUIVALENTS
+    return frozenset({namespace_root})
+
+
+def _equivalent_static_reference_names(reference_name: str) -> frozenset[str]:
+    namespace_root, separator, attribute_name = reference_name.partition(".")
+    if not separator:
+        return frozenset({reference_name})
+    return frozenset(
+        f"{equivalent_root}.{attribute_name}" for equivalent_root in _equivalent_static_namespace_roots(namespace_root)
+    )
+
+
+def _static_reference_namespace_roots(reference_name: str) -> frozenset[str]:
+    parts = reference_name.split(".")
+    namespace_roots: set[str] = set()
+    for index in range(1, len(parts)):
+        namespace_roots.update(_equivalent_static_namespace_roots(".".join(parts[:index])))
+    return frozenset(namespace_roots)
+
+
 class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def __init__(self, tracked_call_names: frozenset[str] | None = None) -> None:
         self.alias_scopes: _AliasScopes = [{}]
@@ -742,12 +766,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         for aliases in reversed(self.alias_scopes):
             if override_key in aliases:
                 return aliases[override_key]
-            for key, value in aliases.items():
-                if (
-                    key.startswith(_STATIC_CLEARED_NAMESPACE_PREFIX)
-                    and value is None
-                    and reference_name.startswith(f"{key.removeprefix(_STATIC_CLEARED_NAMESPACE_PREFIX)}.")
-                ):
+            for namespace_root in _static_reference_namespace_roots(reference_name):
+                clear_key = self._static_cleared_namespace_key(namespace_root)
+                if clear_key in aliases and aliases[clear_key] is None:
                     return None
         return frozenset({reference_name})
 
@@ -829,20 +850,28 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def _bind_static_reference_names_to_value(self, target_names: frozenset[str], value: ast.AST) -> None:
         resolved_value_names = self._resolve_bound_value_names(value)
         for target_name in target_names:
-            self._bind_name(self._static_reference_override_key(target_name), resolved_value_names)
+            for equivalent_target_name in _equivalent_static_reference_names(target_name):
+                self._bind_name(self._static_reference_override_key(equivalent_target_name), resolved_value_names)
 
     def _bind_static_reference_names_as_removed(self, target_names: frozenset[str]) -> None:
         for target_name in target_names:
-            self._bind_name(self._static_reference_override_key(target_name), None)
+            for equivalent_target_name in _equivalent_static_reference_names(target_name):
+                self._bind_name(self._static_reference_override_key(equivalent_target_name), None)
 
-    def _bind_static_namespace_roots_as_cleared(self, namespace_roots: frozenset[str]) -> None:
+    def _discard_static_reference_overrides_for_roots(self, namespace_roots: frozenset[str]) -> None:
         current_scope = self.alias_scopes[-1]
         for namespace_root in namespace_roots:
-            reference_prefix = f"{_STATIC_REFERENCE_OVERRIDE_PREFIX}{namespace_root}."
-            for key in list(current_scope):
-                if key.startswith(reference_prefix):
-                    del current_scope[key]
-            self._bind_name(self._static_cleared_namespace_key(namespace_root), None)
+            for equivalent_root in _equivalent_static_namespace_roots(namespace_root):
+                reference_prefix = f"{_STATIC_REFERENCE_OVERRIDE_PREFIX}{equivalent_root}."
+                for key in list(current_scope):
+                    if key.startswith(reference_prefix):
+                        del current_scope[key]
+
+    def _bind_static_namespace_roots_as_cleared(self, namespace_roots: frozenset[str]) -> None:
+        self._discard_static_reference_overrides_for_roots(namespace_roots)
+        for namespace_root in namespace_roots:
+            for equivalent_root in _equivalent_static_namespace_roots(namespace_root):
+                self._bind_name(self._static_cleared_namespace_key(equivalent_root), None)
 
     def _bind_static_reference_target_as_removed(self, target: ast.AST) -> None:
         if _has_uncertain_static_binding(target, self.alias_scopes):
@@ -1053,7 +1082,20 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def _merge_conditional_branch_scopes(self, branch_scopes: list[_AliasScope]) -> None:
         current_scope = self.alias_scopes[-1]
         branch_names = {name for scope in branch_scopes for name in scope}
-        for name in branch_names:
+        cleared_namespace_names = {name for name in branch_names if name.startswith(_STATIC_CLEARED_NAMESPACE_PREFIX)}
+        remaining_branch_names = branch_names - cleared_namespace_names
+
+        for name in sorted(cleared_namespace_names):
+            cleared_base_value = current_scope.get(name, frozenset())
+            cleared_values = [scope.get(name, cleared_base_value) for scope in branch_scopes]
+            if all(value is None for value in cleared_values):
+                namespace_root = name.removeprefix(_STATIC_CLEARED_NAMESPACE_PREFIX)
+                self._discard_static_reference_overrides_for_roots(frozenset({namespace_root}))
+                current_scope[name] = None
+            else:
+                current_scope[name] = frozenset()
+
+        for name in sorted(remaining_branch_names):
             if name.startswith(_STATIC_UNCERTAIN_BINDING_PREFIX):
                 uncertainty_base_value = current_scope.get(name, frozenset())
                 uncertainty_values = [scope.get(name, uncertainty_base_value) for scope in branch_scopes]
@@ -1072,11 +1114,6 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                     if isinstance(first_value, frozenset) and all(value == first_value for value in certainty_values)
                     else None
                 )
-                continue
-            if name.startswith(_STATIC_CLEARED_NAMESPACE_PREFIX):
-                cleared_base_value = current_scope.get(name, frozenset())
-                cleared_values = [scope.get(name, cleared_base_value) for scope in branch_scopes]
-                current_scope[name] = None if all(value is None for value in cleared_values) else frozenset()
                 continue
             base_value: _AliasValue | object
             if name.startswith(_STATIC_REFERENCE_OVERRIDE_PREFIX):
