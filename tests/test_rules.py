@@ -47,6 +47,16 @@ class TestRuleRegistry:
         assert rule.name == "pty process spawn usage"
         assert rule.default_severity == Severity.CRITICAL
 
+    @pytest.mark.parametrize(
+        ("rule_code", "expected_severity"),
+        [("S112", Severity.CRITICAL), ("S113", Severity.HIGH), ("S114", Severity.MEDIUM)],
+    )
+    def test_get_dynamic_python_construction_rules(self, rule_code: str, expected_severity: Severity) -> None:
+        rule = RuleRegistry.get_rule(rule_code)
+
+        assert rule is not None
+        assert rule.default_severity == expected_severity
+
     def test_get_nonexistent_rule(self):
         """Test getting a rule that doesn't exist."""
         rule = RuleRegistry.get_rule("S9999")
@@ -100,6 +110,7 @@ class TestRuleRegistry:
         assert "S101" in rules
         assert "S110" in rules
         assert "S111" in rules
+        assert "S114" in rules
         assert "S201" not in rules  # Pickle rule, not in range
 
         # Get pickle rules (S200-S299)
@@ -231,6 +242,12 @@ S301 = "HIGH"
         assert "S801" in config.suppress
         assert config.severity["S301"] == Severity.HIGH
         assert config.severity["S701"] == Severity.CRITICAL
+
+    def test_from_cli_args_accepts_import_mapper_rule_codes(self) -> None:
+        config = ModelAuditConfig.from_cli_args(suppress=["S112"], severity={"S113": "HIGH", "S114": "MEDIUM"})
+
+        assert config.suppress == {"S112"}
+        assert config.severity == {"S113": Severity.HIGH, "S114": Severity.MEDIUM}
 
     def test_from_cli_args_rejects_unknown_rule_codes(self):
         """Unknown CLI rule codes should fail fast."""
@@ -477,6 +494,9 @@ class TestRulePatterns:
             ("import webbrowser", "S109"),
             ("import ctypes", "S110"),
             ("pty.spawn('/bin/sh')", "S111"),
+            ("code.InteractiveConsole()", "S112"),
+            ("types.FunctionType(code, globals())", "S113"),
+            ("ast.parse(source)", "S114"),
         ]
 
         for message, expected_code in test_cases:

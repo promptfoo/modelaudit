@@ -93,6 +93,27 @@ RULE_CATALOG: tuple[RuleCatalogEntry, ...] = (
         patterns=(r"pty\.spawn\s*\(",),
     ),
     RuleCatalogEntry(
+        code="S112",
+        name="interactive code execution usage",
+        severity="CRITICAL",
+        description="Interactive code execution via the code module",
+        patterns=(r"code\.(?:InteractiveConsole|InteractiveInterpreter)\b",),
+    ),
+    RuleCatalogEntry(
+        code="S113",
+        name="dynamic function construction usage",
+        severity="HIGH",
+        description="Runtime construction of code or function objects via types",
+        patterns=(r"types\.(?:CodeType|FunctionType)\b",),
+    ),
+    RuleCatalogEntry(
+        code="S114",
+        name="AST code parsing usage",
+        severity="MEDIUM",
+        description="Runtime parsing of executable Python syntax via ast",
+        patterns=(r"ast\.parse\s*\(",),
+    ),
+    RuleCatalogEntry(
         code="S115",
         name="Builtins code-execution access",
         severity="HIGH",
