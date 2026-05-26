@@ -466,6 +466,7 @@ class XGBoostScanner(BaseScanner):
         from ..utils.file.detection import inspect_mxnet_symbol_root_keys
 
         file_size = os.path.getsize(path)
+        params_overlap_composed = self._compose_content_routed_mxnet_params_security(path, result)
 
         try:
             with open(path, "rb") as f:
@@ -484,7 +485,13 @@ class XGBoostScanner(BaseScanner):
             self.scan_parsed_json_security(path, model_data, result)
             self._scan_filename_owned_json_overlap(path, result)
             self._record_duplicate_mxnet_root_keys(duplicate_mxnet_root_keys, result, path)
-            self._record_mxnet_symbol_overlap(model_data, result, path, duplicate_mxnet_root_keys)
+            self._record_mxnet_symbol_overlap(
+                model_data,
+                result,
+                path,
+                duplicate_mxnet_root_keys,
+                params_overlap_composed=params_overlap_composed,
+            )
 
         except json.JSONDecodeError as e:
             result.add_check(
@@ -511,6 +518,28 @@ class XGBoostScanner(BaseScanner):
             )
             self._mark_inconclusive_scan_result(result, self._INCONCLUSIVE_REASONS["json_analysis_failed"])
             self._scan_filename_owned_json_overlap(path, result)
+
+    def _compose_content_routed_mxnet_params_security(self, path: str, result: ScanResult) -> bool:
+        """Preserve raw params checks before JSON decoding can fail or shadow content."""
+        if self.config.get(XGBOOST_CONTENT_ROUTED_JSON_CONFIG_KEY) is not True:
+            return False
+        if os.path.splitext(path)[1].lower() != ".params":
+            return False
+
+        from .mxnet_scanner import MXNetScanner
+
+        scanner_selection = policy_from_config(self.config)
+        if scanner_selection.allows("mxnet"):
+            MXNetScanner(config=self.config).scan_params_file_security(path, result)
+        elif scanner_selection.active:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "mxnet",
+                scanner_selection,
+                context="overlapping JSON analysis",
+            )
+        return True
 
     def scan_parsed_json_security(self, path: str, data: dict[str, Any], result: ScanResult) -> None:
         """Apply XGBoost JSON-specific security checks to an already parsed overlap."""
@@ -581,6 +610,8 @@ class XGBoostScanner(BaseScanner):
         result: ScanResult,
         path: str,
         duplicate_root_keys: set[str] | None = None,
+        *,
+        params_overlap_composed: bool = False,
     ) -> None:
         """Run MXNet security checks and fail closed when JSON ownership overlaps."""
         from ..utils.file.detection import has_mxnet_symbol_graph_structure
@@ -594,19 +625,20 @@ class XGBoostScanner(BaseScanner):
         scanner_selection = policy_from_config(self.config)
         if scanner_selection.allows("mxnet"):
             mxnet_scanner = MXNetScanner(config=self.config)
-            if needs_params_byte_analysis:
+            if needs_params_byte_analysis and not params_overlap_composed:
                 mxnet_scanner.scan_params_file_security(path, result)
             if is_mxnet_symbol:
                 mxnet_scanner.scan_parsed_symbol_security(path, cast(dict[str, Any], data), result)
             analysis_message = "both static analyses ran but format ownership is ambiguous"
         else:
-            add_scanner_selection_skip_check(
-                result,
-                path,
-                "mxnet",
-                scanner_selection,
-                context="overlapping JSON analysis",
-            )
+            if not params_overlap_composed:
+                add_scanner_selection_skip_check(
+                    result,
+                    path,
+                    "mxnet",
+                    scanner_selection,
+                    context="overlapping JSON analysis",
+                )
             return
         if not is_mxnet_symbol:
             return

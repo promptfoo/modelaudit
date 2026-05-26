@@ -2370,6 +2370,21 @@ def test_scan_file_xgboost_owned_shadowed_params_preserves_raw_signature_finding
     assert any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
 
 
+def test_scan_file_xgboost_owned_analysis_failed_params_preserves_raw_signature_findings(tmp_path: Path) -> None:
+    model_path = tmp_path / "polyglot-0000.params"
+    model_path.write_bytes(
+        b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        b'"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],'
+        b'"metadata":"\x7fELF","limit":' + (b"9" * 5000) + b"}"
+    )
+
+    result = scan_file(str(model_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert "xgboost_json_analysis_failed" in result.metadata["scan_outcome_reasons"]
+    assert any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+
+
 def test_scan_file_xgboost_only_skips_overlap_params_signature_analysis(tmp_path: Path) -> None:
     model_path = tmp_path / "polyglot-0000.params"
     model_path.write_bytes(
@@ -2397,6 +2412,21 @@ def test_scan_file_xgboost_only_skips_shadowed_params_signature_analysis(tmp_pat
     result = scan_file(str(model_path), config={"scanners": ["xgboost"], "cache_enabled": False})
 
     assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
+    assert not any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+    assert "mxnet" in result.metadata["skipped_scanner_ids"]
+
+
+def test_scan_file_xgboost_only_skips_analysis_failed_params_signature_analysis(tmp_path: Path) -> None:
+    model_path = tmp_path / "polyglot-0000.params"
+    model_path.write_bytes(
+        b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        b'"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],'
+        b'"metadata":"\x7fELF","limit":' + (b"9" * 5000) + b"}"
+    )
+
+    result = scan_file(str(model_path), config={"scanners": ["xgboost"], "cache_enabled": False})
+
+    assert "xgboost_json_analysis_failed" in result.metadata["scan_outcome_reasons"]
     assert not any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
     assert "mxnet" in result.metadata["skipped_scanner_ids"]
 
