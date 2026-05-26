@@ -262,7 +262,7 @@ class MXNetScanner(BaseScanner):
         self._record_symbol_root_key_ambiguity(path, result, duplicate_root_keys)
 
         try:
-            payload = json.loads(raw_bytes.decode("utf-8"))
+            payload = json.loads(raw_bytes.decode("utf-8-sig"))
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError, TypeError) as exc:
             result.add_check(
                 name="MXNet Symbol Parse",

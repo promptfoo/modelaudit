@@ -142,6 +142,7 @@ _XML_MODEL_ROOT_FORMATS = {
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
 MXNET_SYMBOL_SIGNATURE_READ_BYTES = 10 * 1024 * 1024
 MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT = "mxnet_symbol_routing_inconclusive"
+_UTF8_BOM = b"\xef\xbb\xbf"
 _JSON_NUMBER_PREFIX_RE = re.compile(rb"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
 _MXNET_SYMBOL_PREFIX_MAX_VALUES = 4096
 _MXNET_SYMBOL_MAX_KEY_BYTES = 64
@@ -679,13 +680,15 @@ def detect_mxnet_symbol_content_route(path: str | Path) -> str | None:
         read_size = min(file_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
         with file_path.open("rb") as handle:
             prefix = handle.read(read_size)
-            trimmed_prefix = prefix.lstrip()
+            normalized_prefix = prefix[len(_UTF8_BOM) :] if prefix.startswith(_UTF8_BOM) else prefix
+            trimmed_prefix = normalized_prefix.lstrip()
             if trimmed_prefix and not trimmed_prefix.startswith(b"{"):
                 return None
     except OSError:
         return None
 
     is_disguised_non_json = file_path.suffix.lower() != ".json"
+    prefix = prefix[len(_UTF8_BOM) :] if prefix.startswith(_UTF8_BOM) else prefix
     if file_size > MXNET_SYMBOL_SIGNATURE_READ_BYTES:
         return _detect_mxnet_symbol_prefix_route(
             prefix[:MXNET_SYMBOL_SIGNATURE_READ_BYTES],
@@ -706,6 +709,7 @@ def is_mxnet_symbol_graph_file(path: str | Path) -> bool:
 
 def _could_be_renamed_mxnet_symbol(file_path: Path, prefix: bytes) -> bool:
     """Return whether content-based MXNet routing is needed for this path."""
+    prefix = prefix[len(_UTF8_BOM) :] if prefix.startswith(_UTF8_BOM) else prefix
     trimmed_prefix = prefix.lstrip()
     return bool(file_path.name) and (trimmed_prefix.startswith(b"{") or not trimmed_prefix)
 

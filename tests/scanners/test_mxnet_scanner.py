@@ -186,6 +186,19 @@ def test_mxnet_direct_params_fails_closed_for_inconclusive_symbol_route(
     assert "mxnet_params_truncated" not in result.metadata["scan_outcome_reasons"]
 
 
+def test_mxnet_direct_params_routes_bom_prefixed_symbol_content(tmp_path: Path) -> None:
+    params_path = tmp_path / "payload-0000.params"
+    params_path.write_text(
+        '\ufeff{"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = MXNetScanner().scan(str(params_path))
+
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
 def test_directory_scan_preserves_path_sensitive_companion_metadata(tmp_path: Path) -> None:
     with_params_dir = tmp_path / "with_params"
     without_params_dir = tmp_path / "without_params"

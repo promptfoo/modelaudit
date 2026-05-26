@@ -2010,6 +2010,20 @@ def test_scan_file_routes_misnamed_mxnet_symbol_and_detects_custom_library(tmp_p
     )
 
 
+def test_scan_file_routes_bom_prefixed_params_symbol_and_detects_custom_library(tmp_path: Path) -> None:
+    disguised_symbol = tmp_path / "payload-0000.params"
+    disguised_symbol.write_text(
+        '\ufeff{"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(disguised_symbol))
+
+    assert result.scanner_name == "mxnet"
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
 def test_scan_file_fails_closed_for_renamed_mxnet_shadowed_nodes(tmp_path: Path) -> None:
     disguised_symbol = tmp_path / "payload.jpg"
     disguised_symbol.write_text(
