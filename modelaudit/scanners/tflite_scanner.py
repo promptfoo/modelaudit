@@ -3,7 +3,8 @@
 import os
 from typing import Any, ClassVar
 
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
+from ..scanner_results import mark_inconclusive_scan_result
+from .base import BaseScanner, IssueSeverity, ScanResult
 
 try:
     import tflite
@@ -18,9 +19,30 @@ _TFLITE_MAGIC_OFFSET = 4
 _TFLITE_MAGIC_SIZE = 4
 _TFLITE_MIN_HEADER_SIZE = _TFLITE_MAGIC_OFFSET + _TFLITE_MAGIC_SIZE
 _TFLITE_MAGIC_BYTES = b"TFL3"
+_CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset(
+    {
+        "",
+        ".bin",
+        ".cmf",
+        ".dnn",
+        ".exe",
+        ".lgb",
+        ".lightgbm",
+        ".llamafile",
+        ".meta",
+        ".model",
+        ".net",
+        ".pb",
+        ".rknn",
+        ".t7",
+        ".th",
+    }
+)
 TFLITE_MAGIC_INCONCLUSIVE_REASON = "tflite_magic_validation_failed"
 TFLITE_PARSE_INCONCLUSIVE_REASON = "tflite_parse_incomplete"
 TFLITE_STRUCTURE_INCONCLUSIVE_REASON = "tflite_structure_validation_failed"
+TFLITE_DEPENDENCY_INCONCLUSIVE_REASON = "tflite_dependency_unavailable"
+TFLITE_READ_INCONCLUSIVE_REASON = "tflite_read_failed"
 
 
 def _has_tflite_magic_bytes(data: bytes) -> bool:
@@ -31,13 +53,13 @@ def _has_tflite_magic_bytes(data: bytes) -> bool:
 
 
 def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
-    result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-    reasons = result.metadata.get("scan_outcome_reasons")
-    if not isinstance(reasons, list):
-        reasons = []
-    if reason not in reasons:
-        reasons.append(reason)
-    result.metadata["scan_outcome_reasons"] = reasons
+    mark_inconclusive_scan_result(result, reason)
+
+
+def _mark_operational_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
+    _mark_inconclusive_scan_result(result, reason)
+    result.metadata["operational_error"] = True
+    result.metadata["operational_error_reason"] = reason
 
 
 class TFLiteScanner(BaseScanner):
@@ -52,8 +74,11 @@ class TFLiteScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        if os.path.splitext(path)[1].lower() in cls.supported_extensions:
+        ext = os.path.splitext(path)[1].lower()
+        if ext in cls.supported_extensions:
             return True
+        if ext in _CONTENT_ROUTE_BLOCKED_EXTENSIONS:
+            return False
 
         try:
             with open(path, "rb") as f:
@@ -71,13 +96,19 @@ class TFLiteScanner(BaseScanner):
         result.metadata["file_size"] = self.get_file_size(path)
 
         if not HAS_TFLITE:
+            _mark_operational_inconclusive_scan_result(result, TFLITE_DEPENDENCY_INCONCLUSIVE_REASON)
             result.add_check(
                 name="TFLite Library Check",
                 passed=False,
                 message="tflite package not installed. Install with 'pip install modelaudit[tflite]'",
-                severity=IssueSeverity.WARNING,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"required_package": "tflite"},
+                details={
+                    "required_package": "tflite",
+                    "analysis_incomplete": True,
+                    "operational_error": True,
+                    "scan_outcome_reason": TFLITE_DEPENDENCY_INCONCLUSIVE_REASON,
+                },
                 rule_code="S902",
             )
             result.finish(success=False)
@@ -85,31 +116,51 @@ class TFLiteScanner(BaseScanner):
 
         try:
             data = self._read_file_safely(path)
-            result.bytes_scanned = len(data)
+        except (OSError, ValueError) as e:
+            _mark_operational_inconclusive_scan_result(result, TFLITE_READ_INCONCLUSIVE_REASON)
+            result.add_check(
+                name="TFLite File Read",
+                passed=False,
+                message=f"Unable to read TFLite file for analysis: {e}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "operational_error": True,
+                    "scan_outcome_reason": TFLITE_READ_INCONCLUSIVE_REASON,
+                },
+                rule_code="S902",
+            )
+            result.finish(success=False)
+            return result
 
-            # Check for TFLite magic bytes "TFL3" at offset 4
-            # TFLite uses FlatBuffer format: bytes 0-3 are root table offset, bytes 4-7 are file identifier
-            if not _has_tflite_magic_bytes(data):
-                _mark_inconclusive_scan_result(result, TFLITE_MAGIC_INCONCLUSIVE_REASON)
-                result.add_check(
-                    name="TFLite Magic Bytes Check",
-                    passed=False,
-                    message="File does not have valid TFLite magic bytes (expected 'TFL3' at offset 4)",
-                    severity=IssueSeverity.INFO,
-                    location=path,
-                    details={
-                        "magic_bytes_at_offset_4": data[
-                            _TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + _TFLITE_MAGIC_SIZE
-                        ].hex()
-                        if len(data) >= _TFLITE_MIN_HEADER_SIZE
-                        else "file_too_short"
-                    },
-                    why="Valid TFLite files use FlatBuffer format with 'TFL3' identifier at bytes 4-7. "
-                    "Missing or incorrect identifier may indicate file corruption or spoofing.",
-                )
-                result.finish(success=False)
-                return result
+        result.bytes_scanned = len(data)
 
+        # Check for TFLite magic bytes "TFL3" at offset 4.
+        if not _has_tflite_magic_bytes(data):
+            _mark_inconclusive_scan_result(result, TFLITE_MAGIC_INCONCLUSIVE_REASON)
+            result.add_check(
+                name="TFLite Magic Bytes Check",
+                passed=False,
+                message="File does not have valid TFLite magic bytes (expected 'TFL3' at offset 4)",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "magic_bytes_at_offset_4": data[
+                        _TFLITE_MAGIC_OFFSET : _TFLITE_MAGIC_OFFSET + _TFLITE_MAGIC_SIZE
+                    ].hex()
+                    if len(data) >= _TFLITE_MIN_HEADER_SIZE
+                    else "file_too_short"
+                },
+                why="Valid TFLite files use FlatBuffer format with 'TFL3' identifier at bytes 4-7. "
+                "Missing or incorrect identifier may indicate file corruption or spoofing.",
+            )
+            result.finish(success=False)
+            return result
+
+        try:
             model = tflite.Model.GetRootAsModel(data, 0)
         except Exception as e:  # pragma: no cover - parse errors
             _mark_inconclusive_scan_result(result, TFLITE_PARSE_INCONCLUSIVE_REASON)

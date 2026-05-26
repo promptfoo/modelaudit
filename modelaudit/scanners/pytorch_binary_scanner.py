@@ -325,7 +325,10 @@ class PyTorchBinaryScanner(BaseScanner):
         offset: int,
     ) -> None:
         """Check for executable file signatures with context-aware detection"""
-        from modelaudit.utils.helpers.ml_context import analyze_binary_for_ml_context
+        from modelaudit.utils.helpers.ml_context import (
+            analyze_binary_for_ml_context,
+            should_ignore_executable_signature,
+        )
 
         # RULE 1: Only scan first 64KB - real executables have signatures at start
         if offset > 65536:
@@ -374,9 +377,19 @@ class PyTorchBinaryScanner(BaseScanner):
                         ignored_count += 1
                         continue  # Skip - not a real shebang
 
-                # For other signatures, check if it's in weight data
-                # High ML weight confidence means it's likely coincidental
-                if ml_context.get("weight_confidence", 0) > 0.7:
+                # Middle-of-file MZ pairs are common in weight blobs; without a
+                # PE header at file start they are too noisy to report.
+                if sig == b"MZ" and pos != 0:
+                    ignored_count += 1
+                    continue
+
+                if should_ignore_executable_signature(
+                    sig,
+                    pos,
+                    ml_context,
+                    pattern_density,
+                    len(positions),
+                ):
                     ignored_count += 1
                     continue
 

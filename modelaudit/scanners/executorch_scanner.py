@@ -19,6 +19,8 @@ from .picklescan_adapter import (
     apply_pickle_member_context,
 )
 
+CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset({".bin", ".meta", ".pb"})
+
 
 class ExecuTorchScanner(BaseScanner):
     """Scanner for PyTorch Mobile/ExecuTorch archives (.ptl, .pte)."""
@@ -38,6 +40,8 @@ class ExecuTorchScanner(BaseScanner):
         ext = os.path.splitext(path)[1].lower()
         if ext in cls.supported_extensions:
             return True
+        if ext in CONTENT_ROUTE_BLOCKED_EXTENSIONS:
+            return False
         try:
             header = cls._read_header(path, length=8)
         except OSError:
