@@ -259,8 +259,7 @@ class MXNetScanner(BaseScanner):
             return False
 
         if path_obj.suffix.lower() == ".params":
-            self._scan_params_signatures(path, raw_bytes, result)
-            self._scan_params_text_payloads(path, raw_bytes, result)
+            self.scan_params_content_security(path, raw_bytes, result)
 
         duplicate_root_keys = inspect_mxnet_symbol_root_keys(BytesIO(raw_bytes))
         self._record_symbol_root_key_ambiguity(path, result, duplicate_root_keys)
@@ -345,6 +344,37 @@ class MXNetScanner(BaseScanner):
         self._scan_graph_references(path, payload, result)
         self._scan_operator_names_for_cve_2022_24294(path, payload, result)
         self._scan_graph_metadata_payloads(path, payload, result)
+
+    def scan_params_content_security(self, path: str, raw_bytes: bytes, result: ScanResult) -> None:
+        """Apply bounded byte-level params checks on a content-routed overlap."""
+        self._scan_params_signatures(path, raw_bytes, result)
+        self._scan_params_text_payloads(path, raw_bytes, result)
+
+    def scan_params_file_security(self, path: str, result: ScanResult) -> None:
+        """Read and apply bounded params checks when another scanner owns routing."""
+        if Path(path).suffix.lower() != ".params":
+            return
+
+        try:
+            raw_bytes, _ = self._read_bounded_bytes(Path(path), MAX_PARAMS_READ_BYTES)
+        except OSError as exc:
+            result.add_check(
+                name="MXNet Params Read",
+                passed=False,
+                message=f"Failed to read MXNet params blob during overlap analysis: {exc!s}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "mxnet_params_read_failed",
+                },
+            )
+            self._mark_inconclusive_scan_result(result, "mxnet_params_read_failed")
+            return
+
+        self.scan_params_content_security(path, raw_bytes, result)
 
     def _merge_filename_owned_result(self, result: ScanResult, owner_result: ScanResult) -> None:
         """Merge an owner scan without dropping existing incomplete-coverage reasons."""

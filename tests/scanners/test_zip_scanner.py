@@ -1006,6 +1006,37 @@ def test_scan_nested_file_bom_prefixed_params_runs_xgboost_mxnet_overlap_analysi
     assert any(issue.details.get("attribute") == "library" for issue in result.issues)
 
 
+def test_scan_nested_file_xgboost_owned_params_preserves_raw_signature_findings(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "polyglot-0000.params"
+    extracted_member.write_bytes(
+        b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        b'"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],'
+        b'"metadata":"\x7fELF"}'
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
+    assert any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+
+
+def test_scan_nested_file_xgboost_only_skips_overlap_params_signature_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "polyglot-0000.params"
+    extracted_member.write_bytes(
+        b'{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        b'"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],'
+        b'"metadata":"\x7fELF"}'
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is True
+    assert not any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+    assert "mxnet" in result.metadata["skipped_scanner_ids"]
+
+
 def test_scan_nested_file_fails_closed_for_xgboost_shadowed_mxnet_nodes(tmp_path: Path) -> None:
     extracted_member = tmp_path / "polyglot.json"
     extracted_member.write_text(

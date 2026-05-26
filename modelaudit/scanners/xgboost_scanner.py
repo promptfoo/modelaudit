@@ -585,7 +585,9 @@ class XGBoostScanner(BaseScanner):
 
         scanner_selection = policy_from_config(self.config)
         if scanner_selection.allows("mxnet"):
-            MXNetScanner(config=self.config).scan_parsed_symbol_security(path, cast(dict[str, Any], data), result)
+            mxnet_scanner = MXNetScanner(config=self.config)
+            mxnet_scanner.scan_parsed_symbol_security(path, cast(dict[str, Any], data), result)
+            mxnet_scanner.scan_params_file_security(path, result)
             analysis_message = "both static analyses ran but format ownership is ambiguous"
         else:
             add_scanner_selection_skip_check(
