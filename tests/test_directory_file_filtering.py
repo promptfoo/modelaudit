@@ -32,7 +32,7 @@ def _build_malicious_tf_metagraph() -> bytes:
     return cast(bytes, metagraph.SerializeToString())
 
 
-def _build_malicious_tf_savedmodel() -> bytes:
+def _build_malicious_tf_savedmodel(*, node_name: str = "pyfunc_node") -> bytes:
     import modelaudit.protos  # noqa: F401
 
     saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
@@ -40,7 +40,7 @@ def _build_malicious_tf_savedmodel() -> bytes:
     saved_model.saved_model_schema_version = 1
     metagraph = saved_model.meta_graphs.add()
     node = metagraph.graph_def.node.add()
-    node.name = "pyfunc_node"
+    node.name = node_name
     node.op = "PyFunc"
     return cast(bytes, saved_model.SerializeToString())
 
@@ -303,7 +303,7 @@ class TestDirectoryFileFiltering:
         self, tmp_path: Path
     ) -> None:
         disguised_payload = tmp_path / "saved-malformed.jpg"
-        disguised_payload.write_bytes(_build_malicious_tf_savedmodel() + b"\xff")
+        disguised_payload.write_bytes(_build_malicious_tf_savedmodel(node_name="") + b"\xff")
 
         results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
 

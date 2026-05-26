@@ -131,7 +131,7 @@ CVE_2025_23304_REMEDIATION = (
 NEMO_CHECKPOINT_MEMBER_EXTENSIONS = frozenset({".ckpt", ".pt", ".pth", ".pkl", ".pickle"})
 NEMO_MAX_CHECKPOINT_SCAN_BYTES = 50 * 1024 * 1024
 _NESTED_NON_DESERIALIZATION_RULE_CODES = frozenset(
-    {"S405", "S406", "S408", "S410", "S501", "S502", "S503", "S504", "S505", "S506"}
+    {"S405", "S406", "S408", "S410", "S501", "S502", "S503", "S504", "S505", "S506", "S507", "S508", "S509"}
 )
 
 _INCONCLUSIVE_METADATA_KEY = "scan_outcome"
@@ -165,10 +165,6 @@ def _find_suspicious_safe_prefixed_target_pattern(target: str) -> str | None:
 def _is_runtime_truthy(value: Any) -> bool:
     """Return whether a Hydra argument would be truthy when passed to Python."""
     return bool(value)
-
-
-def _scan_result_has_security_findings(result: ScanResult) -> bool:
-    return any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
 def _get_nested_scanner_for_file(path: str, *, config: dict[str, Any]) -> BaseScanner | None:
@@ -268,9 +264,7 @@ class NemoScanner(BaseScanner):
 
     @staticmethod
     def _finish_scan_result(result: ScanResult) -> None:
-        if result.metadata.get(
-            _INCONCLUSIVE_METADATA_KEY
-        ) == INCONCLUSIVE_SCAN_OUTCOME and not _scan_result_has_security_findings(result):
+        if result.metadata.get(_INCONCLUSIVE_METADATA_KEY) == INCONCLUSIVE_SCAN_OUTCOME:
             result.finish(success=False)
             return
 

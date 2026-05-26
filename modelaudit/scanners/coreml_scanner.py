@@ -788,6 +788,62 @@ class CoreMLScanner(BaseScanner):
             "has_custom_model": has_custom_model,
         }
 
+    @staticmethod
+    def _add_custom_layer_check(
+        result: ScanResult,
+        *,
+        path: str,
+        field_path: str,
+        layer_name: str,
+        class_name: str,
+        model_type_field: int,
+        parse_error: str | None = None,
+    ) -> None:
+        details: dict[str, object] = {
+            "field_path": field_path,
+            "layer_name": layer_name,
+            "class_name": class_name or "<unknown>",
+            "model_type_field": model_type_field,
+        }
+        if parse_error is not None:
+            details["parse_error"] = parse_error
+
+        result.add_check(
+            name="CoreML Custom Layer Check",
+            passed=False,
+            message=f"Custom CoreML layer detected: '{class_name or 'unknown'}' in layer '{layer_name}'",
+            severity=IssueSeverity.CRITICAL,
+            location=path,
+            details=details,
+            why=("CoreML custom layers can load project-specific code paths and should be treated as untrusted."),
+        )
+
+    @staticmethod
+    def _add_custom_model_check(
+        result: ScanResult,
+        *,
+        path: str,
+        field_path: str,
+        class_name: str,
+        parse_error: str | None = None,
+    ) -> None:
+        details: dict[str, object] = {
+            "field_path": field_path,
+            "class_name": class_name or "<unknown>",
+        }
+        if parse_error is not None:
+            details["parse_error"] = parse_error
+
+        result.add_check(
+            name="CoreML Custom Model Class Check",
+            passed=False,
+            message=f"CoreML custom model class detected: '{class_name or 'unknown'}'",
+            severity=IssueSeverity.CRITICAL,
+            location=path,
+            details=details,
+            why="CoreML custom models execute host application code during model use and require trust validation.",
+        )
+
     def _parse_field_message(
         self,
         field: _ProtoField,
@@ -1099,6 +1155,19 @@ class CoreMLScanner(BaseScanner):
                         max_fields=self.MAX_NESTED_FIELDS,
                     )
                     if custom_error:
+                        field_path = (
+                            f"{model_path}[{model_field.field_number}].layers[{layer_index}].custom(<unparsed>)"
+                        )
+                        self._add_custom_layer_check(
+                            result,
+                            path=path,
+                            field_path=field_path,
+                            layer_name=layer_name,
+                            class_name="",
+                            model_type_field=model_field.field_number,
+                            parse_error=custom_error,
+                        )
+                        findings += 1
                         self._add_incomplete_coverage_check(
                             result,
                             name="CoreML Custom Layer Parse",
@@ -1121,22 +1190,13 @@ class CoreMLScanner(BaseScanner):
                         if class_name
                         else f"{model_path}[{model_field.field_number}].layers[{layer_index}].custom(<unnamed>)"
                     )
-                    result.add_check(
-                        name="CoreML Custom Layer Check",
-                        passed=False,
-                        message=f"Custom CoreML layer detected: '{class_name or 'unknown'}' in layer '{layer_name}'",
-                        severity=IssueSeverity.CRITICAL,
-                        location=path,
-                        details={
-                            "field_path": f"{field_path}.className",
-                            "layer_name": layer_name,
-                            "class_name": class_name or "<unknown>",
-                            "model_type_field": model_field.field_number,
-                        },
-                        why=(
-                            "CoreML custom layers can load project-specific code paths and should be treated as "
-                            "untrusted."
-                        ),
+                    self._add_custom_layer_check(
+                        result,
+                        path=path,
+                        field_path=f"{field_path}.className",
+                        layer_name=layer_name,
+                        class_name=class_name,
+                        model_type_field=model_field.field_number,
                     )
                     findings += 1
 
@@ -1154,6 +1214,14 @@ class CoreMLScanner(BaseScanner):
                 max_fields=self.MAX_NESTED_FIELDS,
             )
             if custom_model_error:
+                self._add_custom_model_check(
+                    result,
+                    path=path,
+                    field_path=f"{model_path}[555](<unparsed>)",
+                    class_name="",
+                    parse_error=custom_model_error,
+                )
+                findings += 1
                 self._add_incomplete_coverage_check(
                     result,
                     name="CoreML Custom Model Parse",
@@ -1171,17 +1239,11 @@ class CoreMLScanner(BaseScanner):
             if class_name_fields and isinstance(class_name_fields[0].value, bytes):
                 class_name = _decode_string(class_name_fields[0].value, max_length=256)
 
-            result.add_check(
-                name="CoreML Custom Model Class Check",
-                passed=False,
-                message=f"CoreML custom model class detected: '{class_name or 'unknown'}'",
-                severity=IssueSeverity.CRITICAL,
-                location=path,
-                details={
-                    "field_path": f"{model_path}[555].className",
-                    "class_name": class_name or "<unknown>",
-                },
-                why="CoreML custom models execute host application code during model use and require trust validation.",
+            self._add_custom_model_check(
+                result,
+                path=path,
+                field_path=f"{model_path}[555].className",
+                class_name=class_name,
             )
             findings += 1
 
