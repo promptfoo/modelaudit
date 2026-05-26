@@ -265,6 +265,25 @@ class CntkScanner(BaseScanner):
     description = "Scans signature-validated CNTK model artifacts for load-time execution indicators"
     supported_extensions: ClassVar[list[str]] = [".dnn", ".cmf"]
 
+    @staticmethod
+    def _finish_read_failure(result: ScanResult, path: str, exc: OSError) -> ScanResult:
+        mark_inconclusive_scan_result(result, "cntk_read_failed")
+        result.add_check(
+            name="CNTK File Read",
+            passed=False,
+            message=f"Error reading CNTK file: {exc}",
+            severity=IssueSeverity.INFO,
+            location=path,
+            details={
+                "exception": str(exc),
+                "exception_type": type(exc).__name__,
+                "analysis_incomplete": True,
+                "scan_outcome_reason": "cntk_read_failed",
+            },
+        )
+        result.finish(success=False)
+        return result
+
     @classmethod
     def can_handle(cls, path: str) -> bool:
         if not os.path.isfile(path):
@@ -299,22 +318,7 @@ class CntkScanner(BaseScanner):
         try:
             signature_prefix = _read_prefix(path)
         except OSError as e:
-            mark_inconclusive_scan_result(result, "cntk_read_failed")
-            result.add_check(
-                name="CNTK File Read",
-                passed=False,
-                message=f"Error reading CNTK file: {e}",
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={
-                    "exception": str(e),
-                    "exception_type": type(e).__name__,
-                    "analysis_incomplete": True,
-                    "scan_outcome_reason": "cntk_read_failed",
-                },
-            )
-            result.finish(success=False)
-            return result
+            return self._finish_read_failure(result, path, e)
         variant, variant_reason = _detect_cntk_variant(signature_prefix, extension)
         result.metadata["cntk_variant"] = variant
         result.metadata["variant_reason"] = variant_reason
@@ -344,22 +348,7 @@ class CntkScanner(BaseScanner):
         try:
             data, truncated = _read_bounded(path, _MAX_SCAN_BYTES)
         except OSError as e:
-            mark_inconclusive_scan_result(result, "cntk_read_failed")
-            result.add_check(
-                name="CNTK File Read",
-                passed=False,
-                message=f"Error reading CNTK file: {e}",
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={
-                    "exception": str(e),
-                    "exception_type": type(e).__name__,
-                    "analysis_incomplete": True,
-                    "scan_outcome_reason": "cntk_read_failed",
-                },
-            )
-            result.finish(success=False)
-            return result
+            return self._finish_read_failure(result, path, e)
 
         result.bytes_scanned = len(data)
         result.metadata["scan_truncated"] = truncated

@@ -13,6 +13,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import suppress
+from contextvars import copy_context
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -403,7 +404,9 @@ class ParallelShardHandler:
 
         with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL_WORKERS, total_shards)) as executor:
             # Submit all shard scans
-            future_to_shard = {executor.submit(self._scan_single_shard, shard): shard for shard in shards}
+            future_to_shard = {
+                executor.submit(copy_context().run, self._scan_single_shard, shard): shard for shard in shards
+            }
 
             # Process results as they complete
             for future in as_completed(future_to_shard):
