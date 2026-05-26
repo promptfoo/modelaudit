@@ -193,6 +193,11 @@ class TestTarScanner:
             (b"namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n"),
             b"lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
             b"lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
+            b"lookup = globals().get\nlookup.__call__('__builtins__').get('ev' + 'al')('1 + 1')\n",
+            b"lookup = globals()['__builtins__'].__dict__.get\nlookup('ev' + 'al')('1 + 1')\n",
+            b"globals()['__builtins__'].eval('1 + 1')\n",
+            b"builtins_ref = globals()['__builtins__']\ngetattr(builtins_ref, 'eval')('1 + 1')\n",
+            b"global_namespace = globals()\nglobal_namespace['__builtins__']['eval']('1 + 1')\n",
         ],
     )
     def test_scan_tar_flags_implicit_builtins_dangerous_python_member(self, tmp_path: Path, payload: bytes) -> None:
@@ -230,6 +235,8 @@ class TestTarScanner:
             ),
             b"lookup = globals().get\nlookup('__builtins__').get('len')([1])\n",
             b"mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
+            b"import builtins\nbuiltins.get = lambda name: len\nlookup = builtins.get\nlookup('eval')([])\n",
+            b"global_namespace = {'__builtins__': {'eval': len}}\nglobal_namespace['__builtins__']['eval']([])\n",
         ],
     )
     def test_scan_tar_allows_benign_builtin_shaped_source(self, tmp_path: Path, payload: bytes) -> None:

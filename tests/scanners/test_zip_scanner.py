@@ -228,6 +228,11 @@ def test_scan_zip_flags_builtins_getattr_keyword_call_dangerous_python_member(tm
         "namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n",
         "lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
         "lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
+        "lookup = globals().get\nlookup.__call__('__builtins__').get('ev' + 'al')('1 + 1')\n",
+        "lookup = globals()['__builtins__'].__dict__.get\nlookup('ev' + 'al')('1 + 1')\n",
+        "globals()['__builtins__'].eval('1 + 1')\n",
+        "builtins_ref = globals()['__builtins__']\ngetattr(builtins_ref, 'eval')('1 + 1')\n",
+        "global_namespace = globals()\nglobal_namespace['__builtins__']['eval']('1 + 1')\n",
     ],
 )
 def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path, source: str) -> None:
@@ -259,6 +264,8 @@ def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path
         ("namespace = globals()\nnamespace['__builtins__']['eval'] = len\nnamespace['__builtins__']['eval']([])\n"),
         "lookup = globals().get\nlookup('__builtins__').get('len')([1])\n",
         "mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
+        "import builtins\nbuiltins.get = lambda name: len\nlookup = builtins.get\nlookup('eval')([])\n",
+        "global_namespace = {'__builtins__': {'eval': len}}\nglobal_namespace['__builtins__']['eval']([])\n",
     ],
 )
 def test_scan_zip_allows_benign_builtin_shaped_source(tmp_path: Path, source: str) -> None:
@@ -570,6 +577,30 @@ def test_scan_zip_conditional_aliases_preserve_dangerous_branch(tmp_path: Path) 
     ]
     assert len(python_checks) == 1
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
+
+def test_scan_zip_ambiguous_global_namespace_overwrite_preserves_dangerous_call(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "if replace_builtin:\n"
+        "    namespace = globals()\n"
+        "else:\n"
+        "    namespace = other\n"
+        "namespace['__builtins__']['eval'] = len\n"
+        "__builtins__.eval('1 + 1')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].details["reason"] == "high-risk calls: __builtins__.eval"
 
 
 def test_scan_zip_loop_body_alias_survives_to_later_dangerous_call(tmp_path: Path) -> None:
