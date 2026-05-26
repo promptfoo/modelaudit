@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -55,6 +56,27 @@ class IncompleteShardScanner:
             location=shard_path,
         )
         result.finish(success=False)
+        return result
+
+
+_SHARD_SCAN_CONTEXT: ContextVar[str] = ContextVar("_SHARD_SCAN_CONTEXT", default="missing")
+
+
+class ContextRecordingShardScanner:
+    """Scanner that records worker context for propagation tests."""
+
+    name = "context_recording_shard_scanner"
+
+    def scan(self, shard_path: str) -> ScanResult:
+        result = ScanResult(scanner_name=self.name)
+        result.add_check(
+            name="Shard Context",
+            passed=True,
+            message=Path(shard_path).name,
+            severity=IssueSeverity.INFO,
+            details={"context_value": _SHARD_SCAN_CONTEXT.get()},
+        )
+        result.finish(success=True)
         return result
 
 
@@ -480,6 +502,28 @@ class TestAdvancedFileHandler:
         shard_checks = [check for check in result.checks if check.name == "Shard Scan"]
         assert len(shard_checks) == 1
         assert shard_checks[0].severity == IssueSeverity.INFO
+
+    def test_parallel_shards_inherit_scan_context(self, tmp_path: Path) -> None:
+        """Shard workers preserve an enclosing source-sensitive scan snapshot."""
+        shard_path = tmp_path / "model-00001-of-00001.safetensors"
+        shard_path.write_bytes(b"safe")
+        handler = ParallelShardHandler(
+            {
+                "shards": [str(shard_path)],
+                "total_shards": 1,
+                "total_size": shard_path.stat().st_size,
+            },
+            ContextRecordingShardScanner,
+        )
+        token = _SHARD_SCAN_CONTEXT.set("directory-snapshot")
+        try:
+            result = handler.scan_shards()
+        finally:
+            _SHARD_SCAN_CONTEXT.reset(token)
+
+        context_checks = [check for check in result.checks if check.name == "Shard Context"]
+        assert len(context_checks) == 1
+        assert context_checks[0].details["context_value"] == "directory-snapshot"
 
     def test_sharded_model_preserves_unsuccessful_shard_result(self, tmp_path: Path) -> None:
         """Non-critical shard failures must not be overwritten after aggregate merge."""
