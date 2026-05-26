@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanner_results import SCAN_OUTCOME_MESSAGE_METADATA_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.text_scanner import TextScanner
 
@@ -34,6 +35,7 @@ def test_text_metadata_read_failure_is_inconclusive_not_security_finding(
 
     assert direct.success is False
     assert direct.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert SCAN_OUTCOME_MESSAGE_METADATA_KEY in direct.metadata
     assert "text_metadata_read_failed" in direct.metadata.get("scan_outcome_reasons", [])
     assert any(
         check.name == "Text File Metadata Read"

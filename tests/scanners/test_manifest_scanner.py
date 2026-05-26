@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.scanner_results import SCAN_OUTCOME_MESSAGE_METADATA_KEY
 from modelaudit.scanners import manifest_scanner
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.manifest_scanner import _PARSE_FAILED, ManifestScanner, _is_trusted_url_domain
@@ -117,6 +118,7 @@ def test_manifest_blacklist_read_failure_is_inconclusive_not_security_finding(
 
     assert direct.success is False
     assert direct.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert SCAN_OUTCOME_MESSAGE_METADATA_KEY in direct.metadata
     assert "manifest_blacklist_read_failed" in direct.metadata.get("scan_outcome_reasons", [])
     assert any(
         check.name == "Blacklist Pattern Check"

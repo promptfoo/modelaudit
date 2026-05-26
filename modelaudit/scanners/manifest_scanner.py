@@ -9,6 +9,8 @@ from types import ModuleType
 from typing import Any, Final
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
+from modelaudit.scanner_results import mark_inconclusive_scan_result
+
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult, logger
 
 try:
@@ -739,15 +741,7 @@ class ManifestScanner(BaseScanner):
 
     def _mark_inconclusive_scan_result(self, result: ScanResult, reason: str) -> None:
         """Mark a manifest scan as inconclusive when structured analysis is incomplete."""
-        existing_reasons = result.metadata.get("scan_outcome_reasons")
-        reasons = existing_reasons if isinstance(existing_reasons, list) else []
-
-        if reason not in reasons:
-            reasons.append(reason)
-
-        result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-        result.metadata["scan_outcome_reasons"] = reasons
-        result.metadata["analysis_incomplete"] = True
+        mark_inconclusive_scan_result(result, reason)
 
     def _finish_manifest_result(self, result: ScanResult) -> None:
         """Fail closed for inconclusive manifests unless real security findings were recovered."""

@@ -18,7 +18,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - prevent picklescan call-graph alias cycles from hanging scans
 - preserve HuggingFace snapshot shard paths while grouping cache-backed families
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
-- detect Python operators declared in nested ONNX graphs and functions
 - classify unavailable manifest blacklist and ML text metadata reads as inconclusive rather than security findings
 - detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
