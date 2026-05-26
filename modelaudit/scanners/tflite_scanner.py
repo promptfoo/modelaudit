@@ -94,7 +94,7 @@ class TFLiteScanner(BaseScanner):
 
         try:
             data = self._read_file_safely(path)
-        except OSError as e:
+        except (OSError, ValueError) as e:
             _mark_operational_inconclusive_scan_result(result, TFLITE_READ_INCONCLUSIVE_REASON)
             result.add_check(
                 name="TFLite File Read",

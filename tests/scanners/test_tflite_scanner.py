@@ -145,13 +145,23 @@ def test_tflite_missing_dependency_result_is_not_cached(tmp_path: Path) -> None:
         reset_cache_manager()
 
 
-def test_tflite_read_failure_is_inconclusive_without_security_finding(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "read_exception",
+    [
+        OSError("simulated read failure"),
+        ValueError("File read exceeds limit: 128 bytes (max: 64)"),
+    ],
+)
+def test_tflite_read_failure_is_inconclusive_without_security_finding(
+    tmp_path: Path,
+    read_exception: Exception,
+) -> None:
     path = tmp_path / "model.tflite"
     path.write_bytes(b"\x00\x00\x00\x00TFL3" + b"\x00" * 100)
 
     with (
         patch("modelaudit.scanners.tflite_scanner.HAS_TFLITE", True),
-        patch.object(TFLiteScanner, "_read_file_safely", side_effect=OSError("simulated read failure")),
+        patch.object(TFLiteScanner, "_read_file_safely", side_effect=read_exception),
     ):
         result = TFLiteScanner().scan(str(path))
         aggregate = core.scan_model_directory_or_file(str(path), recursive=False, cache_scan_results=False)
