@@ -651,10 +651,7 @@ class TestJinja2TemplateScannerEdgeCases:
             for check in result.checks
         )
 
-        aggregate_result = scan_model_directory_or_file(
-            str(template_file),
-            config={"cache_scan_results": False},
-        )
+        aggregate_result = scan_model_directory_or_file(str(template_file), cache_enabled=False)
         assert aggregate_result.success is False
         assert determine_exit_code(aggregate_result) == 2
 
