@@ -1596,8 +1596,11 @@ def test_scan_file_routes_misnamed_executorch_archive_by_content(tmp_path: Path)
     result = scan_file(str(disguised_exec))
 
     assert result.scanner_name == "executorch"
-    assert any(issue.rule_code == "S507" and "evil.py" in (issue.location or "") for issue in result.issues)
-    assert any(issue.rule_code == "S104" and "evil.py" in (issue.location or "") for issue in result.issues)
+    assert any(
+        issue.rule_code == "S507" and issue.severity == IssueSeverity.CRITICAL and "evil.py" in (issue.location or "")
+        for issue in result.issues
+    )
+    assert not any(issue.rule_code == "S104" and "evil.py" in (issue.location or "") for issue in result.issues)
 
 
 def test_scan_file_does_not_route_non_pytorch_zip_with_generic_pickle(tmp_path: Path) -> None:

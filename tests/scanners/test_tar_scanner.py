@@ -8,6 +8,7 @@ from typing import Any, Literal
 import pytest
 
 from modelaudit import core
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.tar_scanner import (
@@ -1160,6 +1161,48 @@ class TestTarScanner:
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert result.metadata["analysis_incomplete"] is True
         assert "tar_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+
+    def test_corrupt_magic_confirmed_tar_is_inconclusive_and_uncached(self, tmp_path: Path) -> None:
+        """A parse failure after TAR routing is incomplete analysis, not a security finding."""
+        archive_path = tmp_path / "corrupt_magic.tar"
+        archive_path.write_bytes(b"entry" + b"\0" * 252 + b"ustar" + b"\0" * 20)
+        cache_dir = tmp_path / "cache"
+
+        direct_result = self.scanner.scan(str(archive_path))
+        assert direct_result.success is False
+        assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "tar_analysis_incomplete" in direct_result.metadata["scan_outcome_reasons"]
+        assert not any(
+            issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in direct_result.issues
+        )
+
+        reset_cache_manager()
+        try:
+            first_result = core.scan_model_directory_or_file(
+                str(archive_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+            second_result = core.scan_model_directory_or_file(
+                str(archive_path),
+                cache_enabled=True,
+                cache_dir=str(cache_dir),
+                min_cache_file_size=0,
+            )
+
+            for audit_result in (first_result, second_result):
+                metadata = audit_result.file_metadata[str(archive_path)]
+                assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+                assert "tar_analysis_incomplete" in metadata["scan_outcome_reasons"]
+                assert core.determine_exit_code(audit_result) == 2
+                assert not any(
+                    issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in audit_result.issues
+                )
+
+            assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+        finally:
+            reset_cache_manager()
 
     def test_core_tar_partial_nested_scan_without_findings_returns_exit_code_2(self, tmp_path: Path) -> None:
         """A failed nested TAR member scan with no finding should stay inconclusive in aggregate output."""

@@ -1215,6 +1215,26 @@ __import__('pickle').loads(data)
             "dropper.PS1",
         }.issubset(suspicious_filenames)
 
+    def test_attacker_controlled_member_names_preserve_hazard_rule_codes(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "named_members.keras"
+        config = {"class_name": "Sequential", "config": {"layers": []}}
+        with zipfile.ZipFile(archive_path, "w") as zf:
+            zf.writestr("config.json", json.dumps(config))
+            zf.writestr("pickle_payload.py", "value = 1\n")
+            zf.writestr("pickle_payload.exe", b"not executed")
+
+        result = KerasZipScanner().scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python File Detection"]
+        executable_checks = [check for check in result.checks if check.name == "Executable File Detection"]
+        assert len(python_checks) == 1
+        assert python_checks[0].rule_code == "S507"
+        assert len(executable_checks) == 1
+        assert executable_checks[0].severity == IssueSeverity.CRITICAL
+        assert executable_checks[0].rule_code == "S501"
+        assert not [check for check in result.checks if check.rule_code == "S213"]
+        assert determine_exit_code(scan_model_directory_or_file(str(archive_path), cache_enabled=False)) == 1
+
     def test_executable_extension_near_matches_stay_clean(self, tmp_path: Path) -> None:
         """Executable extension near matches should not be treated as executable archive members."""
         archive_path = tmp_path / "safe.keras"
