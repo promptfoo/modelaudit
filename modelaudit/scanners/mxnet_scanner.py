@@ -215,9 +215,14 @@ class MXNetScanner(BaseScanner):
                 name="MXNet Symbol Read",
                 passed=False,
                 message=f"Failed to read MXNet symbol graph: {exc!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(exc), "exception_type": type(exc).__name__},
+                details={
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "mxnet_symbol_read_failed",
+                },
             )
             self._mark_inconclusive_scan_result(result, "mxnet_symbol_read_failed")
             return False
@@ -402,9 +407,14 @@ class MXNetScanner(BaseScanner):
                 name="MXNet Params Read",
                 passed=False,
                 message=f"Failed to read MXNet params blob: {exc!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(exc), "exception_type": type(exc).__name__},
+                details={
+                    "exception": str(exc),
+                    "exception_type": type(exc).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "mxnet_params_read_failed",
+                },
             )
             self._mark_inconclusive_scan_result(result, "mxnet_params_read_failed")
             return False

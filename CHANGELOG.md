@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- fail closed when PyTorch ZIP analysis cannot complete configured blacklist inspection or a required scan phase
+- fail closed when standalone Jinja2 templates exceed the configured analysis size limit or cannot be decoded as UTF-8 text
+- classify bounded, unreadable, or malformed PMML analysis gaps as inconclusive instead of security findings
+- classify unavailable Joblib reads as inconclusive rather than security findings
 - avoid repeatedly scanning sharded model families during directory scans
 - keep shard sibling discovery within the requested scan root
 - preserve per-shard metadata when aggregating sharded model families
@@ -17,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
+- mark CatBoost text-fragment extraction limits and unavailable reads as inconclusive analysis
+- mark RKNN and Torch7 string-extraction limits and unavailable reads as inconclusive analysis
+- classify unavailable TFLite parsing coverage as inconclusive rather than a security finding
+- classify unavailable MXNet artifact reads as inconclusive rather than security findings
+- detect dangerous OpenVINO layers inside namespace-qualified IR models
+- classify unavailable pickle reads and stream coverage as inconclusive rather than security findings
 - route renamed structurally valid MXNet symbol graphs through existing suspicious-reference analysis
 - harden renamed MXNet symbol routing with fail-closed bounded ambiguity and XGBoost overlap handling
 - restore content routing for extensionless XGBoost UBJSON models and classify unavailable or undecodable XGBoost reads as inconclusive
