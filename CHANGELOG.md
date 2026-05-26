@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+- fail closed when standalone Jinja2 templates exceed the configured analysis size limit or cannot be decoded as UTF-8 text
 - classify bounded, unreadable, or malformed PMML analysis gaps as inconclusive instead of security findings
 - classify unavailable Joblib reads as inconclusive rather than security findings
 - avoid repeatedly scanning sharded model families during directory scans
