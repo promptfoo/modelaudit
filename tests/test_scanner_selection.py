@@ -649,3 +649,25 @@ def test_remote_prefilters_preserve_selected_extensionless_scanners() -> None:
         {"path": "s3://bucket/model"},
         {"path": "s3://bucket/model.exe"},
     ]
+
+
+def test_remote_prefilters_do_not_download_extensionless_xgboost_candidates() -> None:
+    policy = resolve_scanner_selection_policy(scanners=["xgboost"])
+    local_extensions = selected_scanner_extensions(policy)
+    remote_extensions = selected_scanner_extensions(policy, conservative=True)
+    files = [
+        {"path": "s3://bucket/model"},
+        {"path": "s3://bucket/model.ubj"},
+        {"path": "s3://bucket/notes.txt"},
+    ]
+
+    assert local_extensions is not None
+    assert "" in local_extensions
+    assert remote_extensions is not None
+    assert "" not in remote_extensions
+    assert filter_cloud_scannable_files(files, scannable_extensions=remote_extensions) == [
+        {"path": "s3://bucket/model.ubj"}
+    ]
+    assert filter_jfrog_scannable_files(files, scannable_extensions=remote_extensions) == [
+        {"path": "s3://bucket/model.ubj"}
+    ]

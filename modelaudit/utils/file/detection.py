@@ -141,7 +141,9 @@ _XML_MODEL_ROOT_FORMATS = {
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
 LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT = "llamafile_routing_inconclusive"
 NEMO_ROUTING_INCONCLUSIVE_FORMAT = "nemo_routing_inconclusive"
+XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT = "xgboost_ubjson_routing_inconclusive"
 EXECUTABLE_ZIP_POLYGLOT_FORMAT = "executable_zip_polyglot"
+_XGBOOST_UBJSON_ROUTE_READ_BYTES = 256 * 1024
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -1574,6 +1576,14 @@ def detect_file_format_from_magic(path: str) -> str:
             if _is_content_routed_lightgbm_signature(lightgbm_prefix):
                 return "lightgbm"
 
+            if not file_path.suffix:
+                f.seek(0)
+                xgboost_route = _detect_extensionless_xgboost_ubjson_route(
+                    f.read(min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
+                )
+                if xgboost_route is not None:
+                    return xgboost_route
+
             # Check for XML-based formats (OpenVINO and PMML) using the first
             # structural root tag rather than a short raw-byte substring.
             if _could_be_xml_prefix(header):
@@ -1611,6 +1621,34 @@ def _could_start_proto0_or_1_pickle(sample: bytes) -> bool:
     if sample[0] in PROTO0_1_START_BYTES:
         return True
     return len(sample) >= 2 and sample[0] == ord("#") and sample[1] in PROTO0_1_START_BYTES
+
+
+def _detect_extensionless_xgboost_ubjson_route(prefix: bytes) -> str | None:
+    """Return a definite or bounded-inconclusive extensionless XGBoost route."""
+    from ...scanners.xgboost_scanner import XGBoostScanner
+
+    probe_state = XGBoostScanner._classify_extensionless_ubjson_probe(prefix)
+    if probe_state == "xgboost":
+        return "xgboost"
+    if probe_state == "inconclusive":
+        return XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    return None
+
+
+def detect_xgboost_ubjson_content_route(path: str) -> str | None:
+    """Content-route a bounded UBJSON XGBoost candidate regardless of suffix."""
+    file_path = Path(path)
+    try:
+        if not file_path.is_file():
+            return None
+        size = file_path.stat().st_size
+        if size < 4:
+            return None
+        return _detect_extensionless_xgboost_ubjson_route(
+            read_magic_bytes(path, min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
+        )
+    except OSError:
+        return None
 
 
 def detect_file_format_for_skip_filter(path: str) -> str:
@@ -1690,6 +1728,14 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             prefix += f.read(lightgbm_probe_size - len(prefix))
         if _is_content_routed_lightgbm_signature(prefix[:lightgbm_probe_size]):
             return "lightgbm"
+
+        if not file_path.suffix:
+            xgboost_probe_size = min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES)
+            if len(prefix) < xgboost_probe_size:
+                prefix += f.read(xgboost_probe_size - len(prefix))
+            xgboost_route = _detect_extensionless_xgboost_ubjson_route(prefix[:xgboost_probe_size])
+            if xgboost_route is not None:
+                return xgboost_route
 
         if _could_be_xml_prefix(prefix):
             xml_probe_size = min(size, _XML_MODEL_SIGNATURE_READ_BYTES)
@@ -1962,6 +2008,12 @@ def detect_file_format(path: str) -> str:
         ".txz",
     ):
         return "tar"
+    if ext == "":
+        xgboost_route = _detect_extensionless_xgboost_ubjson_route(
+            read_magic_bytes(path, min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
+        )
+        if xgboost_route is not None:
+            return xgboost_route
     if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
     return "unknown"
