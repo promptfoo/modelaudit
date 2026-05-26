@@ -928,6 +928,20 @@ def test_scan_nested_file_fails_closed_when_xml_root_is_beyond_bounded_probe(tmp
     assert "bounded probe ended before the first structural root element" in check.message
 
 
+def test_scan_nested_file_routes_renamed_flax_msgpack_by_structure(tmp_path: Path) -> None:
+    msgpack = pytest.importorskip("msgpack")
+    extracted_member = tmp_path / "payload.jpg"
+    extracted_member.write_bytes(
+        msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
 def test_scan_nested_file_merges_torch7_security_analysis_for_signature_valid_bin(tmp_path: Path) -> None:
     extracted_member = tmp_path / "payload.bin"
     extracted_member.write_bytes(

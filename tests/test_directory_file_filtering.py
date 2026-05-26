@@ -5,6 +5,7 @@ import gzip
 import json
 import lzma
 import pickle
+import sys
 import tarfile
 import tempfile
 import zipfile
@@ -13,7 +14,11 @@ from pathlib import Path
 import pytest
 
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
-from modelaudit.utils.file.detection import LLAMAFILE_ROUTE_SCAN_BYTES, LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
+from modelaudit.utils.file.detection import (
+    FLAX_MSGPACK_STRUCTURE_READ_BYTES,
+    LLAMAFILE_ROUTE_SCAN_BYTES,
+    LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+)
 from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
 from tests.helpers import create_mock_mxnet_symbol
 
@@ -238,6 +243,137 @@ class TestDirectoryFileFiltering:
 
         assert results["files_scanned"] == 1
         assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
+
+    def test_large_disguised_malicious_flax_msgpack_with_later_root_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should preserve renamed MessagePack checkpoints for Flax analysis."""
+        msgpack = pytest.importorskip("msgpack")
+        disguised_payload = tmp_path / "payload.jpg"
+        disguised_payload.write_bytes(
+            msgpack.packb(
+                {
+                    "metadata": "x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100),
+                    "params": {"w": [1, 2, 3]},
+                    "__reduce__": "os.system",
+                },
+                use_bin_type=True,
+            )
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
+
+    def test_disguised_flax_msgpack_stream_with_malicious_trailing_object_is_scanned(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        disguised_payload = tmp_path / "stream.jpg"
+        disguised_payload.write_bytes(
+            msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
+            + msgpack.packb({"__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
+
+    def test_disguised_flax_msgpack_stream_with_later_checkpoint_object_is_scanned(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        disguised_payload = tmp_path / "stream-later-root.jpg"
+        disguised_payload.write_bytes(
+            msgpack.packb({"metadata": {"producer": "flax"}}, use_bin_type=True)
+            + msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
+
+    def test_disguised_flax_msgpack_stream_with_leading_scalar_object_is_scanned(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        disguised_payload = tmp_path / "stream-leading-scalar.jpg"
+        disguised_payload.write_bytes(
+            msgpack.packb(None, use_bin_type=True)
+            + msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
+
+    def test_scalar_padded_disguised_flax_stream_fails_closed_at_analysis_limit(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        disguised_payload = tmp_path / "stream-scalar-padding.jpg"
+        disguised_payload.write_bytes(
+            msgpack.packb(None, use_bin_type=True) * 4097
+            + msgpack.packb({"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}, use_bin_type=True)
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 2
+        assert any("Msgpack stream object count exceeds configured limit" in issue.message for issue in results.issues)
+
+    def test_disguised_flax_state_wrapper_with_malicious_attribute_is_scanned(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        disguised_payload = tmp_path / "state-wrapper.jpg"
+        disguised_payload.write_bytes(
+            msgpack.packb(
+                {"state": {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}},
+                use_bin_type=True,
+            )
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in results.issues)
+
+    def test_disguised_flax_msgpack_without_optional_dependency_is_not_skipped(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        disguised_payload = tmp_path / "model.jpg"
+        disguised_payload.write_bytes(b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03")
+        monkeypatch.setattr("modelaudit.scanners.flax_msgpack_scanner.HAS_MSGPACK", False)
+        monkeypatch.setitem(sys.modules, "msgpack", None)
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert determine_exit_code(results) == 1
+
+    def test_ambiguous_disguised_flax_msgpack_probe_limit_fails_closed_in_directory_scan(self, tmp_path: Path) -> None:
+        msgpack = pytest.importorskip("msgpack")
+        ambiguous_payload = tmp_path / "ambiguous.jpg"
+        large_metadata: dict[str, object] = {f"field{i}": i for i in range(2100)}
+        large_metadata["blob"] = "x" * (FLAX_MSGPACK_STRUCTURE_READ_BYTES + 100)
+        ambiguous_payload.write_bytes(
+            msgpack.packb({"metadata": large_metadata, "state": {"selected": True}}, use_bin_type=True)
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "flax_msgpack" in results.scanner_names
+        assert results.file_metadata[str(ambiguous_payload)]["scan_outcome"] == "inconclusive"
+        assert determine_exit_code(results) == 2
 
     def test_disguised_cntk_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         disguised_payload = tmp_path / "cntk.jpg"

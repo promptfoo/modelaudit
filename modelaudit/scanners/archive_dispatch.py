@@ -26,6 +26,7 @@ from ..utils.file.detection import (
     XML_MODEL_INCONCLUSIVE_FORMAT,
     detect_file_format,
     detect_file_format_from_magic,
+    detect_flax_msgpack_overlap_routes,
     detect_mxnet_symbol_content_route,
     detect_pytorch_binary_supplemental_format,
     detect_xgboost_ubjson_content_route,
@@ -301,6 +302,41 @@ def merge_executable_zip_container_findings(
     _deduplicate_exact_merged_findings(result)
 
 
+def merge_flax_msgpack_overlap_findings(
+    path: str,
+    result: ScanResult,
+    config: dict[str, Any] | None,
+    *,
+    context: str,
+    scanned_scanner_ids: frozenset[str] = frozenset(),
+) -> None:
+    """Preserve trusted foreign-format findings inside Flax-routed payloads."""
+    from . import _registry
+
+    scanner_selection = policy_from_config(config)
+    for scanner_id in detect_flax_msgpack_overlap_routes(path):
+        if scanner_id in scanned_scanner_ids:
+            continue
+        if scanner_selection.allows(scanner_id):
+            scanner_class = _registry.load_scanner_by_id(scanner_id)
+            if scanner_class is None:
+                overlap_result = _make_unavailable_recognized_format_result(path, scanner_id, scanner_id)
+            else:
+                overlap_result = scanner_class(config=config).scan(path)
+            primary_bytes_scanned = result.bytes_scanned
+            result.merge(overlap_result)
+            result.bytes_scanned = max(primary_bytes_scanned, overlap_result.bytes_scanned)
+        else:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                scanner_id,
+                scanner_selection,
+                context=context,
+            )
+    _deduplicate_exact_merged_findings(result)
+
+
 def _make_incomplete_llamafile_routing_result(path: str, config: dict[str, Any] | None) -> ScanResult:
     """Fail closed when bounded nested Llamafile routing cannot read its marker probe."""
     result = ScanResult(scanner_name="unknown")
@@ -530,13 +566,30 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         else None
     )
     skipped_preferred_scanner_id: str | None = None
+    trusted_flax_overlap_scanner_id: str | None = None
+    if scanner_id == "flax_msgpack" and not scanner_selection.allows(scanner_id):
+        skipped_preferred_scanner_id = scanner_id
+        trusted_flax_overlap_scanner_id = next(
+            (
+                overlap_scanner_id
+                for overlap_scanner_id in detect_flax_msgpack_overlap_routes(path)
+                if scanner_selection.allows(overlap_scanner_id)
+            ),
+            None,
+        )
+        if trusted_flax_overlap_scanner_id is not None:
+            scanner_id = trusted_flax_overlap_scanner_id
     if scanner_id and scanner_selection.allows(scanner_id):
         scanner_class = _registry.load_scanner_by_id(scanner_id)
-        if scanner_class and not _nested_scanner_can_handle(
-            scanner_class,
-            scanner_id,
-            path,
-            header_format_override,
+        if (
+            scanner_class
+            and scanner_id != trusted_flax_overlap_scanner_id
+            and not _nested_scanner_can_handle(
+                scanner_class,
+                scanner_id,
+                path,
+                header_format_override,
+            )
         ):
             scanner_class = None
     elif scanner_id:
@@ -578,6 +631,21 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
 
     scanner = scanner_class(config=config)
     result = scanner.scan_with_cache(path)
+    if result.scanner_name == "flax_msgpack":
+        merge_flax_msgpack_overlap_findings(
+            path,
+            result,
+            config,
+            context="nested Flax MessagePack overlapping content analysis",
+        )
+    elif skipped_preferred_scanner_id == "flax_msgpack":
+        merge_flax_msgpack_overlap_findings(
+            path,
+            result,
+            config,
+            context="nested Flax MessagePack overlapping content analysis",
+            scanned_scanner_ids=frozenset({result.scanner_name}),
+        )
     if skipped_overlap_scanner_id:
         add_scanner_selection_skip_check(
             result,
