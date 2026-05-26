@@ -1069,6 +1069,28 @@ def test_detect_rknn_format_by_signature(tmp_path: Path) -> None:
     assert validate_file_type(str(bad_rknn)) is False
 
 
+@pytest.mark.parametrize(
+    ("filename", "payload", "expected_format"),
+    [
+        ("prefixed.pb", b"RKNN\x01\x00\x00\x00protobuf-ish payload", "protobuf"),
+        ("flatbuffer.pb", b"\x00\x00\x00\x00TFL3protobuf-ish payload", "protobuf"),
+        ("prefixed.meta", b"RKNN\x01\x00\x00\x00metagraph-ish payload", "unknown"),
+        ("flatbuffer.meta", b"\x00\x00\x00\x00TFL3metagraph-ish payload", "unknown"),
+    ],
+)
+def test_owned_protobuf_extensions_are_not_stolen_by_raw_binary_routes(
+    tmp_path: Path,
+    filename: str,
+    payload: bytes,
+    expected_format: str,
+) -> None:
+    path = tmp_path / filename
+    path.write_bytes(payload)
+
+    assert detect_file_format(str(path)) == expected_format
+    assert detect_file_format_from_magic(str(path)) == "unknown"
+
+
 def test_detect_torch7_formats_by_signature(tmp_path: Path) -> None:
     torch7_path = tmp_path / "model.t7"
     torch7_path.write_bytes(b"T7\x00\x00torch.FloatTensor nn.Sequential\n")
@@ -1149,10 +1171,28 @@ def test_torch7_magic_rejects_malformed_ascii_version_header(tmp_path: Path) -> 
 
 
 def test_torch7_magic_keeps_binary_marker_only_routing(tmp_path: Path) -> None:
-    torch7_path = tmp_path / "renamed.bin"
+    torch7_path = tmp_path / "renamed.weights"
     torch7_path.write_bytes(b"\x01\x00torch.FloatTensor nn.Sequential\n")
 
     assert detect_file_format_from_magic(str(torch7_path)) == "torch7"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"RKNN\x01\x00\x00\x00payload" + b"\x7fELF" + b"\x00" * 128,
+        b"T7\x00\x00payload torch.FloatTensor nn.Sequential " + b"\x7fELF" + b"\x00" * 128,
+        b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x04\x00\x00\x00" + b"\x7fELF" + b"\x00" * 128,
+        b"\x00\x00\x00\x00TFL3payload" + b"\x7fELF" + b"\x00" * 128,
+    ],
+    ids=["rknn", "torch7", "executorch", "tflite"],
+)
+def test_bin_files_keep_pytorch_binary_routing_for_raw_content_signatures(tmp_path: Path, payload: bytes) -> None:
+    model_path = tmp_path / "weights.bin"
+    model_path.write_bytes(payload)
+
+    assert detect_file_format(str(model_path)) == "pytorch_binary"
+    assert detect_file_format_from_magic(str(model_path)) == "unknown"
 
 
 def test_torch7_markers_in_gzip_header_do_not_override_tar_archive(tmp_path: Path) -> None:
@@ -1657,6 +1697,15 @@ def test_detect_file_format_disguised_llamafile_by_content(tmp_path: Path) -> No
     assert detect_file_format_from_magic(str(near_match)) == "unknown"
 
 
+def test_extensionless_llamafile_route_preempts_tflite_header_bytes(tmp_path: Path) -> None:
+    extensionless_llamafile = tmp_path / "llama"
+    extensionless_llamafile.write_bytes(b"\x7fELFTFL3" + b"\x00" * 56 + b"llamafile runtime")
+
+    assert detect_file_format(str(extensionless_llamafile)) == "llamafile"
+    assert detect_file_format_from_magic(str(extensionless_llamafile)) == "llamafile"
+    assert detect_file_format_for_skip_filter(str(extensionless_llamafile)) == "llamafile"
+
+
 def test_detect_file_format_routes_extensionless_xgboost_ubjson_by_structure(tmp_path: Path) -> None:
     model_file = tmp_path / "model"
     model_file.write_bytes(
@@ -1690,6 +1739,28 @@ def test_detect_file_format_routes_extensionless_xgboost_ubjson_with_noop_before
         + b"}"
     )
 
+    assert detect_file_format(str(model_file)) == "xgboost"
+    assert detect_file_format_from_magic(str(model_file)) == "xgboost"
+    assert detect_file_format_for_skip_filter(str(model_file)) == "xgboost"
+
+
+def test_extensionless_xgboost_route_preempts_incidental_tflite_identifier(tmp_path: Path) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_bytes(
+        b"{N"
+        + _ubjson_key(b"TFL3")
+        + b"Z"
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + _ubjson_key(b"version")
+        + b"[]"
+        + b"}"
+    )
+
+    assert model_file.read_bytes()[4:8] == b"TFL3"
     assert detect_file_format(str(model_file)) == "xgboost"
     assert detect_file_format_from_magic(str(model_file)) == "xgboost"
     assert detect_file_format_for_skip_filter(str(model_file)) == "xgboost"

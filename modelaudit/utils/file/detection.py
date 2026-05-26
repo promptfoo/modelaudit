@@ -1110,6 +1110,58 @@ def _looks_like_tflite_header(header: bytes) -> bool:
     )
 
 
+_RENAMED_BINARY_CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset({".bin", ".meta", ".pb"})
+_TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset(
+    {
+        ".bin",
+        ".cmf",
+        ".dnn",
+        ".exe",
+        ".lgb",
+        ".lightgbm",
+        ".llamafile",
+        ".meta",
+        ".model",
+        ".net",
+        ".pb",
+        ".rknn",
+        ".t7",
+        ".th",
+    }
+)
+
+
+def _allows_renamed_binary_content_route(file_path: Path | None) -> bool:
+    return file_path is None or file_path.suffix.lower() not in _RENAMED_BINARY_CONTENT_ROUTE_BLOCKED_EXTENSIONS
+
+
+def detect_pytorch_binary_supplemental_format(path: str) -> str | None:
+    """Return a strict secondary scanner for a content-identified `.bin` file."""
+    file_path = Path(path)
+    if file_path.suffix.lower() != ".bin" or not file_path.is_file():
+        return None
+
+    try:
+        size = file_path.stat().st_size
+        if size < 4:
+            return None
+        prefix = read_magic_bytes(path, max(_TORCH7_SIGNATURE_READ_BYTES, 8))
+    except OSError:
+        return None
+
+    magic4 = prefix[:4]
+    magic8 = prefix[:8]
+    if magic4 == b"RKNN":
+        return "rknn"
+    if _is_torch7_signature(prefix):
+        return "torch7"
+    if _detect_executorch_content_route(file_path, magic8) == "executorch":
+        return "executorch"
+    if _looks_like_tflite_header(magic8):
+        return "tflite"
+    return None
+
+
 def _looks_like_safetensors_structure(path: Path | None, magic8: bytes, file_size: int) -> bool:
     """Validate safetensors framing: <u64 header_len><JSON header><tensor data>."""
     if file_size <= 8 or len(magic8) < 8:
@@ -1802,7 +1854,7 @@ def _is_executorch_binary_signature(prefix: bytes) -> bool:
     return len(prefix) >= 8 and prefix[4:6] == b"ET" and prefix[6:8].isdigit()
 
 
-def _is_valid_executorch_binary(path: str | Path) -> bool:
+def _is_valid_executorch_binary(path: str | Path, *, propagate_io_errors: bool = False) -> bool:
     """Validate the minimal FlatBuffers structure for ExecuTorch binaries."""
     file_path = Path(path)
     if not file_path.is_file():
@@ -1847,10 +1899,26 @@ def _is_valid_executorch_binary(path: str | Path) -> bool:
                 return False
             if root_table_offset + object_size > file_size:
                 return False
-    except (OSError, struct.error):
+    except OSError:
+        if propagate_io_errors:
+            raise
+        return False
+    except struct.error:
         return False
 
     return True
+
+
+def _detect_executorch_content_route(file_path: Path, magic8: bytes) -> str | None:
+    """Preserve signature-valid candidates when structure probing cannot complete."""
+    if not _is_executorch_binary_signature(magic8):
+        return None
+    try:
+        if _is_valid_executorch_binary(file_path, propagate_io_errors=True):
+            return "executorch"
+    except OSError:
+        return "executorch"
+    return None
 
 
 def _detect_compression_format(prefix: bytes) -> str | None:
@@ -1879,9 +1947,9 @@ def detect_format_from_magic_bytes(
     match magic4:
         case b"CBM1":
             return "catboost"
-        case b"RKNN":
+        case b"RKNN" if _allows_renamed_binary_content_route(file_path):
             return "rknn"
-        case b"T7\x00\x00":
+        case b"T7\x00\x00" if _allows_renamed_binary_content_route(file_path):
             return "torch7"
         case b"GGUF":
             return "gguf"
@@ -1962,12 +2030,6 @@ def detect_file_format_from_magic(path: str) -> str:
             magic8 = header[:8]
             magic16 = header[:16]
 
-            if _looks_like_tflite_header(magic8):
-                return "tflite"
-
-            if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
-                return "executorch"
-
             llamafile_format = _detect_llamafile_route_format(file_path, magic4)
             if llamafile_format is not None:
                 return llamafile_format
@@ -1994,7 +2056,7 @@ def detect_file_format_from_magic(path: str) -> str:
 
             f.seek(0)
             torch7_prefix = f.read(_TORCH7_SIGNATURE_READ_BYTES)
-            if _is_torch7_signature(torch7_prefix):
+            if _allows_renamed_binary_content_route(file_path) and _is_torch7_signature(torch7_prefix):
                 return "torch7"
 
             # CNTKv2 has protobuf-style serialization without a fixed first-8-byte magic.
@@ -2017,6 +2079,16 @@ def detect_file_format_from_magic(path: str) -> str:
                 if xgboost_route is not None:
                     return xgboost_route
 
+            if (
+                _allows_renamed_binary_content_route(file_path)
+                and _detect_executorch_content_route(file_path, magic8) == "executorch"
+            ):
+                return "executorch"
+            if file_path.suffix.lower() not in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS and _looks_like_tflite_header(
+                magic8
+            ):
+                return "tflite"
+
             # Check for XML-based formats (OpenVINO and PMML) using the first
             # structural root tag rather than a short raw-byte substring.
             if _could_be_xml_prefix(header):
@@ -2036,14 +2108,14 @@ def detect_file_format_from_magic(path: str) -> str:
     magic4 = header[:4]
     magic8 = header[:8]
 
-    if _looks_like_tflite_header(magic8):
-        return "tflite"
-
     if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
 
     if _looks_like_onnx_model_candidate_file(file_path, size, magic4):
         return "onnx"
+
+    if file_path.suffix.lower() not in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS and _looks_like_tflite_header(magic8):
+        return "tflite"
 
     return "unknown"
 
@@ -2116,10 +2188,6 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if _looks_like_uncompressed_tar_header(prefix):
             return _detect_tar_route(path) or "tar"
 
-        if _looks_like_tflite_header(magic8):
-            return "tflite"
-        if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
-            return "executorch"
         llamafile_format = _detect_llamafile_route_format(file_path, magic4)
         if llamafile_format is not None:
             return llamafile_format
@@ -2147,7 +2215,7 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         torch7_probe_size = min(size, _TORCH7_SIGNATURE_READ_BYTES)
         if len(prefix) < torch7_probe_size:
             prefix += f.read(torch7_probe_size - len(prefix))
-        if _is_torch7_signature(prefix):
+        if _allows_renamed_binary_content_route(file_path) and _is_torch7_signature(prefix):
             return "torch7"
 
         cntk_probe_size = min(size, _CNTK_SIGNATURE_READ_BYTES)
@@ -2169,6 +2237,16 @@ def detect_file_format_for_skip_filter(path: str) -> str:
             xgboost_route = _detect_extensionless_xgboost_ubjson_route(prefix[:xgboost_probe_size])
             if xgboost_route is not None:
                 return xgboost_route
+
+        if (
+            _allows_renamed_binary_content_route(file_path)
+            and _detect_executorch_content_route(file_path, magic8) == "executorch"
+        ):
+            return "executorch"
+        if file_path.suffix.lower() not in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS and _looks_like_tflite_header(
+            magic8
+        ):
+            return "tflite"
 
         if _could_be_xml_prefix(prefix):
             xml_probe_size = min(size, _XML_MODEL_SIGNATURE_READ_BYTES)
@@ -2305,7 +2383,7 @@ def detect_file_format(path: str) -> str:
         return "safetensors"
 
     torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
-    if _is_torch7_signature(torch7_prefix):
+    if _allows_renamed_binary_content_route(file_path) and _is_torch7_signature(torch7_prefix):
         return "torch7"
 
     signature_prefix = read_magic_bytes(path, max(_CNTK_SIGNATURE_READ_BYTES, _LIGHTGBM_SIGNATURE_READ_BYTES))
@@ -2314,11 +2392,16 @@ def detect_file_format(path: str) -> str:
     if _is_content_routed_lightgbm_signature(signature_prefix[:_LIGHTGBM_SIGNATURE_READ_BYTES]):
         return "lightgbm"
 
+    if ext == "":
+        xgboost_route = _detect_extensionless_xgboost_ubjson_route(
+            read_magic_bytes(path, min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
+        )
+        if xgboost_route is not None:
+            return xgboost_route
+
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
         magic64 = read_magic_bytes(path, 64)
-        if _looks_like_tflite_header(magic8):
-            return "tflite"
         # IMPORTANT: Check ZIP format first (PyTorch models saved with torch.save())
         if _has_zip_magic(magic4):
             return "zip"
@@ -2345,6 +2428,16 @@ def detect_file_format(path: str) -> str:
 
         # Otherwise, assume raw binary format (PyTorch weights)
         return "pytorch_binary"
+
+    if (
+        _allows_renamed_binary_content_route(file_path)
+        and _detect_executorch_content_route(file_path, magic8) == "executorch"
+    ):
+        return "executorch"
+    if _allows_renamed_binary_content_route(file_path) and magic4 == b"RKNN":
+        return "rknn"
+    if ext not in _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS and _looks_like_tflite_header(magic8):
+        return "tflite"
 
     # Extension-based detection for non-.bin files
     # For .pt/.pth/.ckpt files, check if they're ZIP format first
@@ -2444,12 +2537,6 @@ def detect_file_format(path: str) -> str:
         ".txz",
     ):
         return "tar"
-    if ext == "":
-        xgboost_route = _detect_extensionless_xgboost_ubjson_route(
-            read_magic_bytes(path, min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
-        )
-        if xgboost_route is not None:
-            return xgboost_route
     if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
     return "unknown"
@@ -2519,7 +2606,6 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
         if ext_format == "pytorch_binary" and header_format in {
             "pytorch_binary",
             "pickle",
-            "tflite",
             "zip",
             "unknown",  # .bin files can contain arbitrary binary data
         }:

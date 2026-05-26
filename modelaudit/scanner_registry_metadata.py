@@ -340,7 +340,6 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "class": "TFLiteScanner",
         "description": "Scans TensorFlow Lite model files",
         "extensions": [".tflite"],
-        "content_routed_extensions": [".bin"],
         "priority": 2,
         "dependencies": ["tflite"],
         "numpy_sensitive": True,

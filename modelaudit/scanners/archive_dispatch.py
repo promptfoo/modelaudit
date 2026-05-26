@@ -27,6 +27,7 @@ from ..utils.file.detection import (
     detect_file_format,
     detect_file_format_from_magic,
     detect_mxnet_symbol_content_route,
+    detect_pytorch_binary_supplemental_format,
     detect_xgboost_ubjson_content_route,
     is_executorch_archive,
     is_keras_zip_archive,
@@ -103,6 +104,45 @@ def _select_nested_scanner_id(path: str, header_format_override: str | None = No
 def _is_direct_header_route(scanner_id: str, header_format: str) -> bool:
     """Return whether the detected header directly maps to this scanner."""
     return header_format != "unknown" and _HEADER_FORMAT_TO_SCANNER_ID.get(header_format) == scanner_id
+
+
+def _merge_pytorch_binary_supplemental_analysis(
+    path: str,
+    result: ScanResult,
+    config: dict[str, Any] | None,
+    supplemental_scanner_id: str | None,
+) -> None:
+    """Merge strict nested `.bin` format analysis without dropping raw checks."""
+    if supplemental_scanner_id is None:
+        return
+
+    from . import _registry
+
+    scanner_selection = policy_from_config(config)
+    if not scanner_selection.allows(supplemental_scanner_id):
+        add_scanner_selection_skip_check(
+            result,
+            path,
+            supplemental_scanner_id,
+            scanner_selection,
+            context="supplemental nested .bin content analysis",
+        )
+        return
+
+    scanner_class = _registry.load_scanner_by_id(supplemental_scanner_id)
+    if scanner_class is None:
+        supplemental_result = _make_unavailable_recognized_format_result(
+            path,
+            supplemental_scanner_id,
+            supplemental_scanner_id,
+        )
+    else:
+        supplemental_result = scanner_class(config=config).scan(path)
+
+    primary_bytes_scanned = result.bytes_scanned
+    result.merge(supplemental_result)
+    result.bytes_scanned = max(primary_bytes_scanned, supplemental_result.bytes_scanned)
+    result.metadata.setdefault("supplemental_scanners", []).append(supplemental_scanner_id)
 
 
 def _nested_scanner_can_handle(
@@ -484,6 +524,11 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
 
     header_format_override = trusted_content_format if trusted_content_format in {"mxnet", "xgboost"} else None
     scanner_id = _select_nested_scanner_id(path, header_format_override)
+    pytorch_binary_supplemental_scanner_id = (
+        detect_pytorch_binary_supplemental_format(path)
+        if os.path.splitext(path)[1].lower() == ".bin" and scanner_id == "pytorch_binary"
+        else None
+    )
     skipped_preferred_scanner_id: str | None = None
     if scanner_id and scanner_selection.allows(scanner_id):
         scanner_class = _registry.load_scanner_by_id(scanner_id)
@@ -498,9 +543,15 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         skipped_preferred_scanner_id = scanner_id
 
     if scanner_class is None:
-        if scanner_selection.active:
+        if (
+            skipped_preferred_scanner_id == "pytorch_binary"
+            and pytorch_binary_supplemental_scanner_id is not None
+            and scanner_selection.allows(pytorch_binary_supplemental_scanner_id)
+        ):
+            scanner_class = _registry.load_scanner_by_id(pytorch_binary_supplemental_scanner_id)
+        if scanner_class is None and scanner_selection.active:
             scanner_class = _registry.get_scanner_for_path(path, scanner_selection=scanner_selection)
-        else:
+        elif scanner_class is None:
             scanner_class = _registry.get_scanner_for_path(path)
 
     if scanner_class is None:
@@ -544,5 +595,12 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
             scanner_selection,
             context="preferred nested scanner",
             kind=SCANNER_SELECTION_PREFERRED_KIND,
+        )
+    if scanner_id == "pytorch_binary" and result.scanner_name == "pytorch_binary":
+        _merge_pytorch_binary_supplemental_analysis(
+            path,
+            result,
+            config,
+            pytorch_binary_supplemental_scanner_id,
         )
     return result

