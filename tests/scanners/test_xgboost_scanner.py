@@ -587,6 +587,29 @@ class TestXGBoostJSONScanning:
         assert "xgboost_json_structure_invalid" in result.metadata["scan_outcome_reasons"]
         assert any(check.details["field"] == field for check in checks)
 
+    @pytest.mark.parametrize(
+        "mutate_model",
+        [
+            lambda payload: payload.update({"version": "malformed"}),
+            lambda payload: payload.update({"learner": "malformed"}),
+        ],
+    )
+    def test_malformed_top_level_json_is_inconclusive(
+        self,
+        temp_dir: Path,
+        valid_xgboost_json: dict[str, Any],
+        mutate_model: Callable[[dict[str, Any]], None],
+    ) -> None:
+        mutate_model(valid_xgboost_json)
+        json_file = temp_dir / "malformed_top_level.json"
+        json_file.write_text(json.dumps(valid_xgboost_json), encoding="utf-8")
+
+        result = XGBoostScanner().scan(str(json_file))
+
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "xgboost_json_structure_invalid" in result.metadata["scan_outcome_reasons"]
+
     def test_json_structure_validation_aggregates_many_invalid_trees(
         self, temp_dir: Path, valid_xgboost_json: dict[str, Any]
     ) -> None:
