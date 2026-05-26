@@ -88,6 +88,7 @@ _ABSOLUTE_PATH_PATTERN = re.compile(r"(?:\b[A-Za-z]:\\|^/|^~[/\\])")
 _TRAVERSAL_PATTERN = re.compile(r"(?:\.\./|\.\.\\)")
 _BASE64_PATTERN = re.compile(r"(?:[A-Za-z0-9+/]{100,}={0,2})")
 _HEX_ESCAPE_PATTERN = re.compile(r"(?:\\x[0-9a-fA-F]{2}){8,}")
+_DEDICATED_LIGHTGBM_EXTENSIONS = {".lgb", ".lightgbm"}
 
 
 def _redact_url_for_display(url: str) -> str:
@@ -157,7 +158,7 @@ class LightGBMScanner(BaseScanner):
             with open(path, "rb") as file_obj:
                 preview = file_obj.read(cls._SIGNATURE_READ_BYTES)
         except OSError:
-            return True
+            return os.path.splitext(path)[1].lower() in _DEDICATED_LIGHTGBM_EXTENSIONS
 
         signature = cls._evaluate_signature(cls._normalize_preview(preview))
         return bool(signature["looks_like"])

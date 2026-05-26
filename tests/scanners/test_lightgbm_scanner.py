@@ -78,6 +78,32 @@ def test_can_handle_rejects_xgboost_like_model_content(tmp_path: Path) -> None:
     assert not LightGBMScanner.can_handle(str(path))
 
 
+@pytest.mark.parametrize(
+    ("suffix", "expected"),
+    [
+        (".lgb", True),
+        (".lightgbm", True),
+        (".model", False),
+        (".txt", False),
+    ],
+)
+def test_can_handle_only_claims_unreadable_dedicated_lightgbm_extensions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+    expected: bool,
+) -> None:
+    path = tmp_path / f"unreadable{suffix}"
+    path.write_text(_build_lightgbm_text(), encoding="utf-8")
+
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated LightGBM signature read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.lightgbm_scanner.open", raise_os_error, raising=False)
+
+    assert LightGBMScanner.can_handle(str(path)) is expected
+
+
 def test_scan_benign_lightgbm_model_avoids_critical_false_positives(tmp_path: Path) -> None:
     path = tmp_path / "benign.lightgbm"
     path.write_text(
