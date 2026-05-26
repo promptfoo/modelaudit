@@ -559,6 +559,21 @@ def test_detect_oversized_malformed_renamed_mxnet_preserves_established_route(
     assert detect_file_format_from_magic(str(model_path)) == "mxnet"
 
 
+@pytest.mark.parametrize("suffix", [",@}", ""])
+def test_detect_small_malformed_renamed_mxnet_after_structure_preserves_established_route(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    model_path = tmp_path / "malformed.jpg"
+    model_path.write_text(
+        '{"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]' + suffix,
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "mxnet"
+    assert detect_file_format_from_magic(str(model_path)) == "mxnet"
+
+
 def test_detect_renamed_mxnet_with_many_escaped_string_characters(tmp_path: Path) -> None:
     model_path = tmp_path / "escaped-padding.jpg"
     model_path.write_text(
@@ -797,6 +812,21 @@ def test_detect_renamed_mxnet_xgboost_json_overlap_routes_for_fail_closed_scan(
     model_path.write_text(
         '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
         '"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "xgboost"
+    assert detect_file_format_from_magic(str(model_path)) == "xgboost"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "xgboost"
+
+
+def test_detect_syntactically_malformed_renamed_mxnet_xgboost_overlap_routes_for_fail_closed_scan(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "malformed.jpg"
+    model_path.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]],@}',
         encoding="utf-8",
     )
 

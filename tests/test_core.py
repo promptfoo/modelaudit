@@ -2503,6 +2503,24 @@ def test_scan_file_runs_xgboost_checks_for_renamed_probable_malformed_mxnet_over
     )
 
 
+def test_scan_file_syntactically_malformed_renamed_mxnet_xgboost_overlap_fails_closed(tmp_path: Path) -> None:
+    model_path = tmp_path / "malformed.jpg"
+    model_path.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],@}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(model_path), config={"cache_enabled": False})
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert "xgboost_json_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert aggregate.success is False
+    assert core_module.determine_exit_code(aggregate) != 0
+
+
 def test_scan_file_xgboost_only_runs_renamed_probable_malformed_mxnet_overlap(tmp_path: Path) -> None:
     model_path = tmp_path / "malformed-0000.params"
     model_path.write_text(

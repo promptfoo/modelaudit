@@ -631,10 +631,10 @@ def _detect_mxnet_symbol_prefix_route(
             return None
         parse_object(root_offset, 0, root=True)
     except IncompleteJSON:
-        if not sample_is_prefix:
-            return None
         if {"nodes", "arg_nodes", "heads"} <= root_array_keys and saw_direct_node_contract:
             return "mxnet"
+        if not sample_is_prefix:
+            return None
         return (
             MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT if saw_mxnet_routing_hint() or fail_closed_without_hint else None
         )
@@ -665,7 +665,7 @@ def _detect_mxnet_symbol_prefix_route(
             MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT if saw_mxnet_routing_hint() or fail_closed_without_hint else None
         )
     except InvalidJSON:
-        if sample_is_prefix and {"nodes", "arg_nodes", "heads"} <= root_array_keys and saw_direct_node_contract:
+        if {"nodes", "arg_nodes", "heads"} <= root_array_keys and saw_direct_node_contract:
             return "mxnet"
         return None
 
