@@ -199,6 +199,25 @@ def test_mxnet_direct_params_routes_bom_prefixed_symbol_content(tmp_path: Path) 
     assert any(issue.details.get("attribute") == "library" for issue in result.issues)
 
 
+def test_mxnet_direct_symbol_routed_params_preserves_raw_text_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.utils.file.detection.MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    monkeypatch.setattr("modelaudit.scanners.mxnet_scanner.MAX_SYMBOL_READ_BYTES", 512)
+    params_path = tmp_path / "payload-0000.params"
+    params_path.write_text(
+        '{"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],'
+        '"version":[1,7,4],"learner":{"malicious_code":"os.system()"},"padding":"' + ("x" * 1024) + '"}',
+        encoding="utf-8",
+    )
+
+    result = MXNetScanner().scan(str(params_path))
+
+    assert any("Suspicious executable token" in issue.message for issue in result.issues)
+    assert "mxnet_symbol_truncated" in result.metadata["scan_outcome_reasons"]
+
+
 def test_directory_scan_preserves_path_sensitive_companion_metadata(tmp_path: Path) -> None:
     with_params_dir = tmp_path / "with_params"
     without_params_dir = tmp_path / "without_params"

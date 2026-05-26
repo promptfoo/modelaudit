@@ -258,6 +258,10 @@ class MXNetScanner(BaseScanner):
             self._scan_filename_owned_json_overlap(path, result)
             return False
 
+        if path_obj.suffix.lower() == ".params":
+            self._scan_params_signatures(path, raw_bytes, result)
+            self._scan_params_text_payloads(path, raw_bytes, result)
+
         duplicate_root_keys = inspect_mxnet_symbol_root_keys(BytesIO(raw_bytes))
         self._record_symbol_root_key_ambiguity(path, result, duplicate_root_keys)
 

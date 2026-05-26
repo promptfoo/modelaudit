@@ -1422,6 +1422,27 @@ def test_scan_nested_file_keeps_oversized_renamed_overlap_on_bounded_mxnet_route
     assert not any(check.name == "JSON Parsing" for check in result.checks)
 
 
+def test_scan_nested_file_symbol_routed_params_preserves_raw_text_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    monkeypatch.setattr(archive_dispatch, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    monkeypatch.setattr("modelaudit.scanners.mxnet_scanner.MAX_SYMBOL_READ_BYTES", 512)
+    extracted_member = tmp_path / "payload-0000.params"
+    extracted_member.write_text(
+        '{"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],'
+        '"version":[1,7,4],"learner":{"malicious_code":"os.system()"},"padding":"' + ("x" * 1024) + '"}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert any("Suspicious executable token" in issue.message for issue in result.issues)
+    assert "mxnet_symbol_truncated" in result.metadata["scan_outcome_reasons"]
+
+
 @pytest.mark.parametrize("filename", ["payload.dat", "payload.meta"])
 def test_scan_nested_file_fails_closed_when_mxnet_structure_is_beyond_bounded_probe(
     tmp_path: Path,

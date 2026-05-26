@@ -2586,6 +2586,30 @@ def test_scan_file_keeps_oversized_renamed_overlap_on_bounded_mxnet_route(
     assert not any(check.name == "JSON Parsing" for check in result.checks)
 
 
+def test_scan_file_symbol_routed_params_preserves_raw_text_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    monkeypatch.setattr(core_module, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    monkeypatch.setattr(mxnet_scanner, "MAX_SYMBOL_READ_BYTES", 512)
+    model_path = tmp_path / "payload-0000.params"
+    model_path.write_text(
+        '{"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],'
+        '"version":[1,7,4],"learner":{"malicious_code":"os.system()"},"padding":"' + ("x" * 1024) + '"}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(model_path))
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert result.scanner_name == "mxnet"
+    assert any("Suspicious executable token" in issue.message for issue in result.issues)
+    assert "mxnet_symbol_truncated" in result.metadata["scan_outcome_reasons"]
+    assert core_module.determine_exit_code(aggregate) == 1
+    assert any("Suspicious executable token" in issue.message for issue in aggregate.issues)
+
+
 @pytest.mark.parametrize("filename", ["polyglot.jpg", "polyglot.params", "polyglot.meta"])
 def test_scan_file_runs_xgboost_checks_for_renamed_mxnet_json_overlap(tmp_path: Path, filename: str) -> None:
     model_path = tmp_path / filename
