@@ -258,6 +258,17 @@ def test_scan_detects_keyword_getattr_wrapped_handler_execution_primitive(
             b"    namespace = globals()\n"
             b"    return getattr(namespace['__builtins__'], 'eval')('1 + 1')\n"
         ),
+        b"def handle(data, context):\n    return globals()['__builtins__'].eval('1 + 1')\n",
+        (
+            b"def handle(data, context):\n"
+            b"    builtins_ref = globals()['__builtins__']\n"
+            b"    return getattr(builtins_ref, 'eval')('1 + 1')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    global_namespace = globals()\n"
+            b"    return global_namespace['__builtins__']['eval']('1 + 1')\n"
+        ),
     ],
 )
 def test_scan_detects_implicit_builtins_handler_execution_primitive(
@@ -297,6 +308,11 @@ def test_scan_detects_implicit_builtins_handler_execution_primitive(
             b"    namespace = globals()\n"
             b"    namespace = {'__builtins__': {'eval': len}}\n"
             b"    return namespace['__builtins__']['eval']([])\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    global_namespace = {'__builtins__': {'eval': len}}\n"
+            b"    return global_namespace['__builtins__']['eval']([])\n"
         ),
     ],
 )
