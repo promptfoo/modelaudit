@@ -200,7 +200,8 @@ class ScanResult:
 
         # Check if rule is suppressed
         if rule_code and config.is_suppressed(rule_code, location):
-            logger.debug(f"Suppressed {rule_code}: {message}")
+            # Messages can include matched secrets or attacker-controlled model content.
+            logger.debug("Suppressed security finding")
             return
 
         # Apply severity override only when explicitly configured by the user.
@@ -271,10 +272,10 @@ class ScanResult:
                     else (logging.INFO if severity == IssueSeverity.INFO else logging.DEBUG)
                 )
             )
-            logger.log(log_level, str(issue))
+            logger.log(log_level, "Security finding recorded")
         else:
             # Log successful checks at DEBUG level
-            logger.debug(f"Check passed: {name} - {message}")
+            logger.debug("Security check passed")
 
     def _add_issue(
         self,
