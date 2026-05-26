@@ -18,6 +18,7 @@ from modelaudit.scanner_registry_metadata import get_extension_format_map
 from modelaudit.utils.file.detection import (
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
     PROTO0_1_MAX_PROBE_BYTES,
+    XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     detect_file_format,
     detect_file_format_for_skip_filter,
     detect_file_format_from_magic,
@@ -29,6 +30,14 @@ from modelaudit.utils.file.detection import (
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.helpers import create_mock_onnx
 from tests.helpers.file_creators import create_v7_tar_archive
+
+
+def _ubjson_key(key: bytes) -> bytes:
+    return b"U" + bytes([len(key)]) + key
+
+
+def _ubjson_string(value: bytes) -> bytes:
+    return b"SL" + len(value).to_bytes(8, byteorder="big", signed=True) + value
 
 
 def _create_mar_archive(
@@ -1018,6 +1027,147 @@ def test_detect_file_format_disguised_llamafile_by_content(tmp_path: Path) -> No
     assert detect_file_format_from_magic(str(disguised_llamafile)) == "llamafile"
     assert detect_file_format(str(near_match)) == "unknown"
     assert detect_file_format_from_magic(str(near_match)) == "unknown"
+
+
+def test_detect_file_format_routes_extensionless_xgboost_ubjson_by_structure(tmp_path: Path) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_bytes(
+        b"{"
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + _ubjson_key(b"version")
+        + b"[]"
+        + b"}"
+    )
+
+    assert detect_file_format(str(model_file)) == "xgboost"
+    assert detect_file_format_from_magic(str(model_file)) == "xgboost"
+    assert detect_file_format_for_skip_filter(str(model_file)) == "xgboost"
+
+
+def test_detect_file_format_routes_extensionless_xgboost_ubjson_with_noop_before_learner(tmp_path: Path) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_bytes(
+        b"{"
+        + _ubjson_key(b"learner")
+        + b"N{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + _ubjson_key(b"version")
+        + b"[]"
+        + b"}"
+    )
+
+    assert detect_file_format(str(model_file)) == "xgboost"
+    assert detect_file_format_from_magic(str(model_file)) == "xgboost"
+    assert detect_file_format_for_skip_filter(str(model_file)) == "xgboost"
+
+
+def test_detect_file_format_routes_extensionless_xgboost_ubjson_with_noop_before_counted_root_header(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_bytes(
+        b"{N#U\x02"
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + _ubjson_key(b"version")
+        + b"[]"
+    )
+
+    assert detect_file_format(str(model_file)) == "xgboost"
+    assert detect_file_format_from_magic(str(model_file)) == "xgboost"
+    assert detect_file_format_for_skip_filter(str(model_file)) == "xgboost"
+
+
+def test_detect_file_format_fails_closed_for_bounded_extensionless_xgboost_candidate(tmp_path: Path) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_bytes(
+        b"{"
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"metadata")
+        + _ubjson_string(b"x" * (256 * 1024))
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + b"}"
+    )
+
+    assert detect_file_format(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_fails_closed_when_extensionless_xgboost_learner_is_past_budget(tmp_path: Path) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_bytes(
+        b"{"
+        + _ubjson_key(b"metadata")
+        + _ubjson_string(b"x" * (256 * 1024))
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + b"}"
+    )
+
+    assert detect_file_format(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_does_not_treat_plain_extensionless_json_as_xgboost_ubjson(tmp_path: Path) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_text('{"kind":"manifest","safe":true}', encoding="utf-8")
+
+    assert detect_file_format(str(model_file)) == "unknown"
+    assert detect_file_format_from_magic(str(model_file)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(model_file)) == "unknown"
+
+
+def test_detect_file_format_fails_closed_for_ubjson_noops_before_late_learner(tmp_path: Path) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_bytes(
+        b"{"
+        + (b"N" * (256 * 1024))
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + b"}"
+    )
+
+    assert detect_file_format(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_fails_closed_for_ubjson_header_truncated_at_budget(tmp_path: Path) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_bytes(
+        b"{"
+        + (b"N" * ((256 * 1024) - 2))
+        + b"#U\x01"
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+    )
+
+    assert detect_file_format(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
 
 
 def test_zip_magic_variants(tmp_path):
