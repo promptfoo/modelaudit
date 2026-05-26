@@ -21,6 +21,7 @@ from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_
 from ..utils import is_absolute_archive_path, is_critical_system_path, sanitize_archive_path
 from ..utils.helpers.assets import asset_from_scan_result
 from ._archive_locations import rewrite_extracted_member_location
+from .archive_member_security import executable_archive_member_rule_code
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 CRITICAL_SYSTEM_PATHS = [
@@ -1395,6 +1396,11 @@ class TorchServeMarScanner(BaseScanner):
             for path in manifest_context.get("serialized_paths", [])
             if self._is_path_like_reference("serializedFile", path)
         }
+        extra_file_refs = {
+            self._normalize_member_name(path)
+            for field, path in manifest_context.get("path_references", [])
+            if field == "extraFiles" and self._is_path_like_reference(field, path)
+        }
         archive_member_names = {
             self._normalize_member_name(info.filename)
             for info in member_infos
@@ -1586,6 +1592,22 @@ class TorchServeMarScanner(BaseScanner):
 
             try:
                 from .. import core
+
+                executable_rule_code = (
+                    executable_archive_member_rule_code(normalized_member, temp_path)
+                    if normalized_member in extra_file_refs
+                    else None
+                )
+                if executable_rule_code is not None:
+                    result.add_check(
+                        name="TorchServe Executable Extra File Detection",
+                        passed=False,
+                        message=f"Executable file found in TorchServe MAR extraFiles member: {member_name}",
+                        severity=IssueSeverity.WARNING,
+                        rule_code=executable_rule_code,
+                        location=f"{archive_path}:{member_name}",
+                        details={"entry": member_name, "manifest_field": "extraFiles"},
+                    )
 
                 nested_config = dict(self.config)
                 nested_config["_mar_depth"] = current_depth + 1
