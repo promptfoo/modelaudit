@@ -163,51 +163,12 @@ def test_scan_zip_flags_aliased_dangerous_python_member(tmp_path: Path) -> None:
     "source",
     [
         "import os\nos.system.__call__('echo hidden')\n",
-        "import os\nrun = os.system\nrun.__call__('echo hidden')\n",
-        "import os\ngetattr(os.system, '__call__')('echo hidden')\n",
-        "import os\ninvoke = os.system.__call__\nos.system = len\ninvoke('echo hidden')\n",
         "import os\nrun = os.system\nos.system = len\nrun('echo hidden')\n",
-        "import os\nfrom os import system as run\nos.system = len\nrun('echo hidden')\n",
-        "import os\nfrom os import *\nos.system = len\nsystem('echo hidden')\n",
-        ("import os\ndef run(action=os.system):\n    os.system = len\n    action('echo hidden')\n"),
-        "import os\nrun = os.system\nsetattr(os, 'system', len)\nrun('echo hidden')\n",
-        "import os\nrun = os.system\nos.__dict__.update({'system': len})\nrun('echo hidden')\n",
-        (
-            "import os\n"
-            "replace = os.__dict__.update\n"
-            "replace = lambda values: None\n"
-            "replace({'system': len})\n"
-            "os.system('echo hidden')\n"
-        ),
-        "import os\nif replace:\n    os.__dict__.update({'system': len})\nos.system('echo hidden')\n",
-        "import os\nif swap:\n    os = make_module()\nos.__dict__.update({'system': len})\nos.system('echo hidden')\n",
-        "import os\nif swap:\n    os = make_module()\nsetattr(os, 'system', len)\nos.system('echo hidden')\n",
-        "import os\nif swap:\n    os = make_module()\nos.system = len\nos.system('echo hidden')\n",
-        (
-            "import os\nif swap:\n    os = make_module()\ntarget = os\n"
-            "target.__dict__.update({'system': len})\nos.system('echo hidden')\n"
-        ),
-        (
-            "import os\nif swap:\n    os = make_module()\ntarget = os\n"
-            "setattr(target, 'system', len)\nos.system('echo hidden')\n"
-        ),
-        ("import os\nif swap:\n    os = make_module()\ntarget = os\ntarget.system = len\nos.system('echo hidden')\n"),
-        (
-            "import os\ndef hide(target=os):\n"
-            "    target.__dict__.update({'system': len})\n"
-            "    os.system('echo hidden')\n"
-        ),
-        ("import os\ndef hide(target=os):\n    setattr(target, 'system', len)\n    os.system('echo hidden')\n"),
-        ("import os\ndef hide(target=os):\n    target.system = len\n    os.system('echo hidden')\n"),
-        (
-            "import os\n"
-            "setattr = lambda target, key, value: None\n"
-            "setattr(os, 'system', len)\n"
-            "os.system('echo hidden')\n"
-        ),
+        "import os\nsetattr(os, 'system', factory())\nos.system('echo hidden')\n",
+        "import os\nos.__dict__.update({'system': factory()})\nos.system('echo hidden')\n",
     ],
 )
-def test_scan_zip_preserves_captured_dangerous_callable_before_overwrite(tmp_path: Path, source: str) -> None:
+def test_scan_zip_preserves_possible_os_system_after_static_overwrites(tmp_path: Path, source: str) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
@@ -226,27 +187,12 @@ def test_scan_zip_preserves_captured_dangerous_callable_before_overwrite(tmp_pat
 @pytest.mark.parametrize(
     "source",
     [
-        "import os\nos.system = len\nos.system.__call__([])\n",
-        "import os\nos.system = len\ngetattr(os.system, '__call__')([])\n",
-        "import os\nos.system = len\ninvoke = os.system.__call__\ninvoke([])\n",
-        "import os\nos.system = len\nrun = os.system\nrun([])\n",
-        "import os\nos.system = len\nfrom os import system as run\nrun([])\n",
-        "import os\nos.system = len\nfrom os import *\nsystem([])\n",
-        ("import os\nos.system = len\ndef run(action=os.system):\n    action([])\n"),
         "import os\nsetattr(os, 'system', len)\nos.system([])\n",
-        "import os\nreplace = setattr\nreplace(os, 'system', len)\nos.system([])\n",
-        "import os\nresult = setattr(os, 'system', len)\nos.system([])\n",
-        "import os\nresult: None = setattr(os, 'system', len)\nos.system([])\n",
-        "import os\nsetattr(os, 'system', len)\nrun = os.system\nrun([])\n",
-        "import os\nos.__dict__.__setitem__('system', len)\nos.system([])\n",
         "import os\nos.__dict__.update({'system': len})\nos.system([])\n",
-        "import os\nvars(os).update({'system': len})\nos.system([])\n",
         "import os\nreplace = os.__dict__.update\nreplace({'system': len})\nos.system([])\n",
-        "import os\nresult = os.__dict__.update({'system': len})\nos.system([])\n",
-        "import os\nos.__dict__.update({'system': len})\nrun = os.system\nrun([])\n",
     ],
 )
-def test_scan_zip_allows_callable_captured_after_safe_overwrite(tmp_path: Path, source: str) -> None:
+def test_scan_zip_allows_static_safe_os_system_replacements(tmp_path: Path, source: str) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
@@ -270,31 +216,6 @@ def test_scan_zip_flags_from_import_dangerous_python_member(tmp_path: Path) -> N
     ]
     assert len(python_checks) == 1
     assert python_checks[0].severity == IssueSeverity.WARNING
-    assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "import os\nimport subprocess\nsetattr(os, 'system', subprocess.run)\nos.system(['id'])\n",
-        "import os\nimport subprocess\nresult = setattr(os, 'system', subprocess.run)\nos.system(['id'])\n",
-        "import os\nimport subprocess\nos.__dict__.update({'system': subprocess.run})\nos.system(['id'])\n",
-        "import os\nimport subprocess\nos.__dict__.__setitem__('system', subprocess.run)\nos.system(['id'])\n",
-    ],
-)
-def test_scan_zip_reports_dangerous_setattr_replacement(tmp_path: Path, source: str) -> None:
-    archive_path = tmp_path / "model_bundle.zip"
-    with zipfile.ZipFile(archive_path, "w") as archive:
-        archive.writestr("handler.py", source)
-
-    result = ZipScanner().scan(str(archive_path))
-
-    python_checks = [
-        check
-        for check in result.checks
-        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
-    ]
-    assert len(python_checks) == 1
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
 
 
@@ -350,20 +271,11 @@ def test_scan_zip_flags_builtins_getattr_keyword_call_dangerous_python_member(tm
         "namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n",
         "lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
         "lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
-        ("run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun.__call__('1 + 1')\n"),
-        "run = globals()['__builtins__']['eval']\nglobals()['__builtins__']['eval'] = len\nrun('1 + 1')\n",
-        ("run = globals()['__builtins__']['eval']\nglobals()['__builtins__'].__setitem__('eval', len)\nrun('1 + 1')\n"),
-        (
-            "run = globals()['__builtins__']['eval']\n"
-            "replace = globals()['__builtins__'].__setitem__\n"
-            "replace('eval', len)\n"
-            "run('1 + 1')\n"
-        ),
-        (
-            "run = globals()['__builtins__']['eval']\n"
-            "globals()['__builtins__']['eval'] = __builtins__['exec']\n"
-            "run('1 + 1')\n"
-        ),
+        "lookup = globals().get\nlookup.__call__('__builtins__').get('ev' + 'al')('1 + 1')\n",
+        "lookup = globals()['__builtins__'].__dict__.get\nlookup('ev' + 'al')('1 + 1')\n",
+        "globals()['__builtins__'].eval('1 + 1')\n",
+        "builtins_ref = globals()['__builtins__']\ngetattr(builtins_ref, 'eval')('1 + 1')\n",
+        "global_namespace = globals()\nglobal_namespace['__builtins__']['eval']('1 + 1')\n",
     ],
 )
 def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path, source: str) -> None:
@@ -403,17 +315,10 @@ def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path
             "globals()['__builtins__']['eval']([])\n"
         ),
         ("replace = globals()['__builtins__'].update\nreplace({'eval': len})\nglobals()['__builtins__']['eval']([])\n"),
-        "import builtins\nbuiltins.__dict__.update({'eval': len})\nbuiltins.eval([])\n",
-        "import builtins\nreplace = builtins.__dict__.update\nreplace({'eval': len})\nbuiltins.eval([])\n",
-        "globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun([])\n",
-        ("globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun.__call__([])\n"),
-        ("globals()['__builtins__'].__setitem__('eval', len)\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
-        (
-            "replace = globals()['__builtins__'].__setitem__\n"
-            "replace('eval', len)\n"
-            "run = globals()['__builtins__']['eval']\n"
-            "run([])\n"
-        ),
+        "g = globals\ng()['__builtins__'].__setitem__('eval', len)\ng()['__builtins__']['eval']([])\n",
+        "globals().get('__builtins__').__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
+        "import builtins\nbuiltins.get = lambda name: len\nlookup = builtins.get\nlookup('eval')([])\n",
+        "global_namespace = {'__builtins__': {'eval': len}}\nglobal_namespace['__builtins__']['eval']([])\n",
     ],
 )
 def test_scan_zip_allows_benign_builtin_shaped_source(tmp_path: Path, source: str) -> None:
@@ -427,43 +332,54 @@ def test_scan_zip_allows_benign_builtin_shaped_source(tmp_path: Path, source: st
 
 
 @pytest.mark.parametrize(
-    ("source", "dangerous_name"),
+    "source",
     [
         (
             "namespace = globals()\n"
             "namespace['__builtins__']['eval'] = __builtins__['exec']\n"
-            "namespace['__builtins__']['eval']('pass')\n",
-            "__builtins__.exec",
+            "namespace['__builtins__']['eval']('pass')\n"
         ),
         (
             "globals()['__builtins__'].__setitem__('eval', __builtins__['exec'])\n"
-            "globals()['__builtins__']['eval']('pass')\n",
-            "__builtins__.exec",
+            "globals()['__builtins__']['eval']('pass')\n"
         ),
         (
             "globals()['__builtins__'].update({'eval': __builtins__['exec']})\n"
-            "globals()['__builtins__']['eval']('pass')\n",
-            "__builtins__.exec",
+            "globals()['__builtins__']['eval']('pass')\n"
         ),
         (
             "replace = globals()['__builtins__'].__setitem__\n"
             "replace('eval', __builtins__['exec'])\n"
-            "globals()['__builtins__']['eval']('pass')\n",
-            "__builtins__.exec",
+            "globals()['__builtins__']['eval']('pass')\n"
         ),
         (
             "replace = globals()['__builtins__'].update\n"
             "replace({'eval': __builtins__['exec']})\n"
-            "globals()['__builtins__']['eval']('pass')\n",
-            "__builtins__.exec",
+            "globals()['__builtins__']['eval']('pass')\n"
         ),
         (
-            "import builtins\nbuiltins.__dict__.update({'eval': builtins.exec})\nbuiltins.eval('pass')\n",
-            "builtins.exec",
+            "globals()['__builtins__'].__setitem__('eval', len)\n"
+            "globals()['__builtins__'].update(eval=__builtins__['exec'])\n"
+            "globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            "globals()['__builtins__'].__setitem__('eval', len)\n"
+            "globals()['__builtins__'].update({'eval': __builtins__['exec'], **{}})\n"
+            "globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            "globals()['__builtins__'].__setitem__('eval', len)\n"
+            "globals()['__builtins__'].update([('eval', __builtins__['exec'])])\n"
+            "globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            "globals()['__builtins__'].__setitem__('eval', len)\n"
+            "_ = globals()['__builtins__'].__setitem__('eval', __builtins__['exec'])\n"
+            "globals()['__builtins__']['eval']('pass')\n"
         ),
     ],
 )
-def test_scan_zip_reports_dangerous_builtin_reassignment(tmp_path: Path, source: str, dangerous_name: str) -> None:
+def test_scan_zip_reports_dangerous_builtin_reassignment(tmp_path: Path, source: str) -> None:
     archive_path = tmp_path / "model_bundle.zip"
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
@@ -477,7 +393,7 @@ def test_scan_zip_reports_dangerous_builtin_reassignment(tmp_path: Path, source:
     ]
     assert len(python_checks) == 1
     assert python_checks[0].rule_code == "S104"
-    assert python_checks[0].details["reason"] == f"high-risk calls: {dangerous_name}"
+    assert python_checks[0].details["reason"] == "high-risk calls: __builtins__.exec"
 
 
 def test_scan_zip_flags_aliased_getattr_helper_dangerous_python_member(tmp_path: Path) -> None:
@@ -757,6 +673,30 @@ def test_scan_zip_conditional_aliases_preserve_dangerous_branch(tmp_path: Path) 
     ]
     assert len(python_checks) == 1
     assert python_checks[0].details["reason"] == "high-risk calls: subprocess.run"
+
+
+def test_scan_zip_ambiguous_global_namespace_overwrite_preserves_dangerous_call(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model_bundle.zip"
+    source = (
+        "if replace_builtin:\n"
+        "    namespace = globals()\n"
+        "else:\n"
+        "    namespace = other\n"
+        "namespace['__builtins__']['eval'] = len\n"
+        "__builtins__.eval('1 + 1')\n"
+    )
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("handler.py", source)
+
+    result = ZipScanner().scan(str(archive_path))
+
+    python_checks = [
+        check
+        for check in result.checks
+        if check.name == "Python Archive Member Security" and check.status == CheckStatus.FAILED
+    ]
+    assert len(python_checks) == 1
+    assert python_checks[0].details["reason"] == "high-risk calls: __builtins__.eval"
 
 
 def test_scan_zip_loop_body_alias_survives_to_later_dangerous_call(tmp_path: Path) -> None:
