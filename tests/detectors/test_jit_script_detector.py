@@ -527,6 +527,57 @@ class TestJITScriptDetector:
     @pytest.mark.parametrize(
         "source",
         [
+            b"def payload():\n    return ctypes.CDLL('./payload.so')\n",
+            b"def payload():\n    return ctypes.OleDLL('payload.dll')\n",
+            b"def payload():\n    return ctypes.PyDLL('./payload.so')\n",
+            b"def payload():\n    return ctypes.WinDLL('payload.dll')\n",
+            b"def payload():\n    return ctypes.cdll.LoadLibrary('./payload.so')\n",
+            b"def payload():\n    return ctypes.oledll.LoadLibrary('payload.dll')\n",
+            b"def payload():\n    return ctypes.pydll.LoadLibrary('./payload.so')\n",
+            b"def payload():\n    return ctypes.windll.LoadLibrary('payload.dll')\n",
+            b"def payload():\n    from ctypes import CDLL as load\n    return load('./payload.so')\n",
+            b"def payload():\n    return ctypes.LibraryLoader(ctypes.CDLL).LoadLibrary('./payload.so')\n",
+            b"def payload():\n    return ctypes.cdll.msvcrt.printf(b'hi')\n",
+            b"def payload():\n    import _ctypes\n    return _ctypes.dlopen('libc.so.6')\n",
+        ],
+    )
+    def test_scan_model_detects_unmarked_ctypes_native_loading(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            b"def payload():\n    ctypes.CDLL = len\n    return ctypes.CDLL([])\n",
+            b"def payload():\n    ctypes.cdll.LoadLibrary = len\n    return ctypes.cdll.LoadLibrary([])\n",
+            b"def payload():\n    ctypes.cdll.msvcrt = len\n    return ctypes.cdll.msvcrt([])\n",
+        ],
+    )
+    def test_scan_model_ignores_certain_replaced_ctypes_native_loading(self, source: bytes) -> None:
+        detector = JITScriptDetector()
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
+
+    def test_scan_model_preserves_possible_ctypes_native_loading_after_conditional_replacement(self) -> None:
+        detector = JITScriptDetector()
+        source = b"def payload():\n    if replace:\n        ctypes.CDLL = len\n    return ctypes.CDLL('./payload.so')\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(
+            f.type == "code_execution_pattern" and f.pattern == "Native library loading detected" for f in findings
+        )
+
+    @pytest.mark.parametrize(
+        "source",
+        [
             b"getattr(__builtins__, 'eval')('1 + 1')\n",
             b"__builtins__['eval']('1 + 1')\n",
             b"getattr(__builtins__, 'ev' + 'al')('1 + 1')\n",

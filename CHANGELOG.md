@@ -42,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect embedded Python `pty.spawn` launches and report statically resolved JIT process-launch aliases
 - detect embedded Python `runpy.run_module` and `runpy.run_path` dynamic-module execution calls
 - detect embedded Python `webbrowser.open`, `open_new`, and `open_new_tab` browser-launch calls
+- detect embedded Python `ctypes` DLL constructors and `LoadLibrary` native-loader calls
 - register emitted `S112`-`S114` dynamic-code rule identifiers so they can be listed and configured
 - avoid duplicate JIT findings when a complete embedded Python source payload is analyzed through multiple paths
 - preserve embedded Python execution findings when a replacement receiver is conditional, aliased, or a runtime argument

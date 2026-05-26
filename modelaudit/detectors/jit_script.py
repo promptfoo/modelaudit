@@ -153,7 +153,9 @@ def _resolve_alias_aware_dangerous_builtins(tree: ast.AST) -> set[str]:
     return dangerous_builtins
 
 
-def _resolve_alias_aware_execution_calls(tree: ast.AST) -> tuple[set[str], set[str], set[str], set[str], set[str]]:
+def _resolve_alias_aware_execution_calls(
+    tree: ast.AST,
+) -> tuple[set[str], set[str], set[str], set[str], set[str], set[str]]:
     """Return modeled process and dynamic-module execution calls reached through static resolution."""
     from modelaudit.scanners.archive_member_security import high_risk_python_calls_in_tree
 
@@ -164,6 +166,7 @@ def _resolve_alias_aware_execution_calls(tree: ast.AST) -> tuple[set[str], set[s
         {call.name for call in calls if call.rule_code == "S111"},
         {call.name for call in calls if call.rule_code == "S108"},
         {call.name for call in calls if call.rule_code == "S109"},
+        {call.name for call in calls if call.rule_code == "S110"},
     )
 
 
@@ -173,6 +176,7 @@ _OS_CODE_EXECUTION_DESCRIPTION = "OS command execution detected"
 _PTY_CODE_EXECUTION_DESCRIPTION = "Pseudo-terminal process execution detected"
 _RUNPY_CODE_EXECUTION_DESCRIPTION = "Dynamic module execution detected"
 _WEBBROWSER_LAUNCH_DESCRIPTION = "Web browser launch detected"
+_CTYPES_NATIVE_LOADING_DESCRIPTION = "Native library loading detected"
 CODE_EXECUTION_PATTERNS = [
     # Direct execution patterns
     (rb"exec\s*\(", "exec() call detected"),
@@ -189,6 +193,12 @@ CODE_EXECUTION_PATTERNS = [
     (rb"pty\.spawn", _PTY_CODE_EXECUTION_DESCRIPTION),
     (rb"runpy\.(?:run_module|run_path)", _RUNPY_CODE_EXECUTION_DESCRIPTION),
     (rb"webbrowser\.open(?:_new(?:_tab)?)?", _WEBBROWSER_LAUNCH_DESCRIPTION),
+    (
+        rb"(?:_ctypes\.dlopen|ctypes\.(?:(?:CDLL|OleDLL|PyDLL|WinDLL)|"
+        rb"LibraryLoader\s*\([^)]*\)\.LoadLibrary|"
+        rb"(?:cdll|oledll|pydll|windll)\.(?:LoadLibrary|[A-Za-z_]\w*)))",
+        _CTYPES_NATIVE_LOADING_DESCRIPTION,
+    ),
     # Network patterns
     (rb"socket\.(socket|create_connection)", "Socket creation detected"),
     (rb"urllib\.(request|urlopen)", "URL request detected"),
@@ -252,15 +262,21 @@ class JITScriptDetector:
         """Return whether parsed Python contains modeled dangerous operations."""
         if _resolve_alias_aware_dangerous_builtins(tree):
             return True
-        os_process_calls, subprocess_calls, pty_process_calls, runpy_execution_calls, webbrowser_launch_calls = (
-            _resolve_alias_aware_execution_calls(tree)
-        )
+        (
+            os_process_calls,
+            subprocess_calls,
+            pty_process_calls,
+            runpy_execution_calls,
+            webbrowser_launch_calls,
+            ctypes_native_loading_calls,
+        ) = _resolve_alias_aware_execution_calls(tree)
         if (
             os_process_calls
             or subprocess_calls
             or pty_process_calls
             or runpy_execution_calls
             or webbrowser_launch_calls
+            or ctypes_native_loading_calls
         ):
             return True
 
@@ -594,6 +610,7 @@ class JITScriptDetector:
         bounded_pty_process_calls: set[str] | None = None
         bounded_runpy_execution_calls: set[str] | None = None
         bounded_webbrowser_launch_calls: set[str] | None = None
+        bounded_ctypes_native_loading_calls: set[str] | None = None
         try:
             bounded_tree = ast.parse(textwrap.dedent(bounded.decode("utf-8")))
             bounded_dangerous_builtins = _resolve_alias_aware_dangerous_builtins(bounded_tree)
@@ -603,6 +620,7 @@ class JITScriptDetector:
                 bounded_pty_process_calls,
                 bounded_runpy_execution_calls,
                 bounded_webbrowser_launch_calls,
+                bounded_ctypes_native_loading_calls,
             ) = _resolve_alias_aware_execution_calls(bounded_tree)
         except (SyntaxError, UnicodeDecodeError, ValueError):
             pass
@@ -724,6 +742,12 @@ class JITScriptDetector:
                 and not bounded_webbrowser_launch_calls
             ):
                 continue
+            if (
+                description == _CTYPES_NATIVE_LOADING_DESCRIPTION
+                and bounded_ctypes_native_loading_calls is not None
+                and not bounded_ctypes_native_loading_calls
+            ):
+                continue
             if re.search(pattern, bounded):  # Limit search size
                 add_code_execution_pattern_finding(description)
 
@@ -734,6 +758,7 @@ class JITScriptDetector:
             (bounded_pty_process_calls, _PTY_CODE_EXECUTION_DESCRIPTION),
             (bounded_runpy_execution_calls, _RUNPY_CODE_EXECUTION_DESCRIPTION),
             (bounded_webbrowser_launch_calls, _WEBBROWSER_LAUNCH_DESCRIPTION),
+            (bounded_ctypes_native_loading_calls, _CTYPES_NATIVE_LOADING_DESCRIPTION),
         ):
             if calls and description not in reported_patterns:
                 add_code_execution_pattern_finding(description)
