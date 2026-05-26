@@ -466,8 +466,8 @@ def test_pytorch_zip_scanner_conflicting_duplicate_data_pkl_is_info_only(tmp_pat
     assert result.metadata["pickle_files"] == ["data.pkl", "data.pkl"]
 
 
-def test_pytorch_zip_scanner_invalid_zip(tmp_path):
-    """Test scanning an invalid ZIP file."""
+def test_pytorch_zip_scanner_invalid_zip(tmp_path: Path) -> None:
+    """Invalid ZIP structure is incomplete coverage, not a detected hazard."""
     # Create an invalid ZIP file
     invalid_path = tmp_path / "invalid.pt"
     invalid_path.write_bytes(b"This is not a valid ZIP file")
@@ -475,8 +475,10 @@ def test_pytorch_zip_scanner_invalid_zip(tmp_path):
     scanner = PyTorchZipScanner()
     result = scanner.scan(str(invalid_path))
 
-    # Should have an error about invalid ZIP
-    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_format_unrecognized" in result.metadata["scan_outcome_reasons"]
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
     assert any(
         "invalid" in issue.message.lower() or "corrupt" in issue.message.lower() or "error" in issue.message.lower()
         for issue in result.issues
@@ -624,7 +626,7 @@ def test_pytorch_zip_scanner_handles_zip_metadata_oserror(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Non-BadZipFile metadata failures should return a structured scan error."""
+    """Non-BadZipFile metadata failures should fail closed without inventing a finding."""
     model_path = create_mock_pytorch_zip(tmp_path / "model.pt")
 
     def fail_namelist(self: zipfile.ZipFile) -> list[str]:
@@ -636,7 +638,97 @@ def test_pytorch_zip_scanner_handles_zip_metadata_oserror(
     result = scanner.scan(str(model_path))
 
     assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_scan_failed" in result.metadata["scan_outcome_reasons"]
     assert any("zip metadata unavailable" in check.message for check in result.checks)
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+def test_pytorch_zip_corrupt_format_is_inconclusive(tmp_path: Path) -> None:
+    model_path = tmp_path / "corrupt.pt"
+    model_path.write_bytes(b"PK\x03\x04truncated")
+
+    result = PyTorchZipScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_parse_failed" in result.metadata["scan_outcome_reasons"]
+    assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
+
+
+def test_pytorch_zip_preserves_path_traversal_when_late_scan_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "traversal_then_failure.pt")
+    with zipfile.ZipFile(model_path, "a") as zip_file:
+        zip_file.writestr("../escape.py", b"value = 1\n")
+
+    def fail_discovery(
+        self: PyTorchZipScanner,
+        zip_file: zipfile.ZipFile,
+        safe_entries: list[zipfile.ZipInfo],
+        result: ScanResult,
+    ) -> list[zipfile.ZipInfo]:
+        raise OSError("late metadata failure")
+
+    monkeypatch.setattr(PyTorchZipScanner, "_discover_pickle_files", fail_discovery)
+
+    direct_result = PyTorchZipScanner().scan(str(model_path))
+    assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_scan_failed" in direct_result.metadata["scan_outcome_reasons"]
+    assert any(issue.rule_code == "S405" and issue.severity == IssueSeverity.CRITICAL for issue in direct_result.issues)
+
+    aggregate_result = scan_model_directory_or_file(str(model_path), cache_enabled=False)
+    metadata = aggregate_result.file_metadata[str(model_path)]
+    assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "pytorch_zip_scan_failed" in metadata["scan_outcome_reasons"]
+    assert determine_exit_code(aggregate_result) == 1
+    assert any(issue.rule_code == "S405" for issue in aggregate_result.issues)
+
+
+def test_pytorch_zip_incomplete_scan_without_findings_is_not_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_mock_pytorch_zip(tmp_path / "incomplete.pt")
+    cache_dir = tmp_path / "cache"
+
+    def fail_discovery(
+        self: PyTorchZipScanner,
+        zip_file: zipfile.ZipFile,
+        safe_entries: list[zipfile.ZipInfo],
+        result: ScanResult,
+    ) -> list[zipfile.ZipInfo]:
+        raise OSError("late metadata failure")
+
+    monkeypatch.setattr(PyTorchZipScanner, "_discover_pickle_files", fail_discovery)
+
+    reset_cache_manager()
+    try:
+        first_result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second_result = scan_model_directory_or_file(
+            str(model_path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        for aggregate_result in (first_result, second_result):
+            metadata = aggregate_result.file_metadata[str(model_path)]
+            assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+            assert "pytorch_zip_scan_failed" in metadata["scan_outcome_reasons"]
+            assert determine_exit_code(aggregate_result) == 2
+            assert not any(
+                issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in aggregate_result.issues
+            )
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_pytorch_zip_timeout_marks_inconclusive(tmp_path: Path) -> None:
