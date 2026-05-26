@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.models import ModelAuditResultModel
 from modelaudit.scanners import get_scanner_for_file
@@ -58,6 +59,33 @@ def _assert_aggregate_inconclusive(result: ModelAuditResultModel, path: Path, re
     assert metadata["analysis_incomplete"] is True
     assert result.success is False
     assert determine_exit_code(result) == 2
+
+
+def _assert_aggregate_inconclusive_not_cached(path: Path, reason: str, cache_dir: Path) -> None:
+    reset_cache_manager()
+    try:
+        first_result = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second_result = scan_model_directory_or_file(
+            str(path),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for result in (first_result, second_result):
+            _assert_aggregate_inconclusive(result, path, reason)
+            assert not [
+                issue for issue in result.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+            ]
+
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
 
 
 def test_mxnet_scanner_can_handle_symbol_and_params(tmp_path: Path) -> None:
@@ -344,6 +372,31 @@ def test_mxnet_symbol_read_failure_scan_is_inconclusive(
     result = MXNetScanner().scan(str(symbol_path))
 
     _assert_inconclusive_result(result, "mxnet_symbol_read_failed")
+    read_checks = [check for check in result.checks if check.name == "MXNet Symbol Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "mxnet_symbol_read_failed"
+
+
+def test_mxnet_symbol_read_failure_aggregate_exit_code_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    symbol_path = tmp_path / "unreadable-symbol.json"
+    _write_symbol_file(symbol_path)
+    symbol_path.write_text(symbol_path.read_text(encoding="utf-8") + (" " * (10 * 1024)), encoding="utf-8")
+
+    def raise_os_error(path: Path, max_bytes: int) -> tuple[bytes, bool]:
+        raise OSError("symbol read failed")
+
+    monkeypatch.setattr(MXNetScanner, "_read_bounded_bytes", staticmethod(raise_os_error))
+
+    _assert_aggregate_inconclusive_not_cached(
+        symbol_path,
+        "mxnet_symbol_read_failed",
+        tmp_path / "symbol-read-cache",
+    )
 
 
 def test_mxnet_params_read_failure_scan_is_inconclusive(
@@ -361,6 +414,30 @@ def test_mxnet_params_read_failure_scan_is_inconclusive(
     result = MXNetScanner().scan(str(params_path))
 
     _assert_inconclusive_result(result, "mxnet_params_read_failed")
+    read_checks = [check for check in result.checks if check.name == "MXNet Params Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].details["analysis_incomplete"] is True
+    assert read_checks[0].details["scan_outcome_reason"] == "mxnet_params_read_failed"
+
+
+def test_mxnet_params_read_failure_aggregate_exit_code_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    params_path = tmp_path / "unreadable-0000.params"
+    _write_params_file(params_path)
+
+    def raise_os_error(path: Path, max_bytes: int) -> tuple[bytes, bool]:
+        raise OSError("params read failed")
+
+    monkeypatch.setattr(MXNetScanner, "_read_bounded_bytes", staticmethod(raise_os_error))
+
+    _assert_aggregate_inconclusive_not_cached(
+        params_path,
+        "mxnet_params_read_failed",
+        tmp_path / "params-read-cache",
+    )
 
 
 def test_mxnet_truncated_symbol_scan_is_inconclusive(
