@@ -650,7 +650,7 @@ class PyTorchZipScanner(BaseScanner):
 
         # Validate ZIP format
         header = read_zip_header(path)
-        if not header.startswith(b"PK"):
+        if not header.startswith(b"PK") and not zipfile.is_zipfile(path):
             result.add_check(
                 name="ZIP Format Validation",
                 passed=False,
