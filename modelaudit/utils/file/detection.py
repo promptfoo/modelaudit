@@ -1,5 +1,6 @@
 import json
 import pickletools
+import posixpath
 import re
 import struct
 import tarfile
@@ -126,6 +127,8 @@ _KERAS_CONFIG_PREFIX_CONFIG_OBJECT_RE = re.compile(r'"config"\s*:\s*\{')
 _KERAS_CONFIG_PREFIX_HINT_RE = re.compile(
     r'"(?:layers|input_layers|output_layers|build_config|compile_config|module|registered_name)"\s*:'
 )
+_NEMO_CONFIG_ENTRIES = frozenset({"model_config.yaml", "model_config.yml"})
+_NEMO_ROUTE_MAX_ENTRIES = 10_000
 _PYTORCH_ZIP_METADATA_MAX_BYTES = 64
 _SKOPS_SCHEMA_ENTRIES = frozenset({"schema", "schema.json"})
 _SKOPS_SCHEMA_MAX_BYTES = 4 * 1024 * 1024
@@ -137,6 +140,7 @@ _XML_MODEL_ROOT_FORMATS = {
 }
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
 LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT = "llamafile_routing_inconclusive"
+NEMO_ROUTING_INCONCLUSIVE_FORMAT = "nemo_routing_inconclusive"
 EXECUTABLE_ZIP_POLYGLOT_FORMAT = "executable_zip_polyglot"
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
@@ -1060,6 +1064,77 @@ def is_skops_archive(path: str) -> bool:
     return False
 
 
+def _is_nemo_root_config_member(member_name: str) -> bool:
+    """Return whether a TAR member is a safe spelling of a root NeMo config."""
+    normalized_name = _normalize_safe_tar_member_name(member_name)
+    return normalized_name is not None and normalized_name.lower() in _NEMO_CONFIG_ENTRIES
+
+
+def _normalize_safe_tar_member_name(member_name: str) -> str | None:
+    """Normalize an in-archive TAR path without permitting extraction-root escape."""
+    normalized_name = member_name.replace("\\", "/")
+    if PurePosixPath(normalized_name).is_absolute() or re.match(r"^[A-Za-z]:/", normalized_name):
+        return None
+
+    normalized_name = posixpath.normpath(normalized_name)
+    if normalized_name in {"", ".", ".."} or normalized_name.startswith("../"):
+        return None
+    return normalized_name
+
+
+def _resolve_safe_tar_link_target_name(member: tarfile.TarInfo) -> str | None:
+    """Resolve an in-archive TAR link without permitting extraction-root escape."""
+    link_name = member.linkname.replace("\\", "/")
+    if PurePosixPath(link_name).is_absolute() or re.match(r"^[A-Za-z]:/", link_name):
+        return None
+
+    member_dir = posixpath.dirname(member.name.replace("\\", "/"))
+    target_name = posixpath.normpath(posixpath.join(member_dir, link_name))
+    return _normalize_safe_tar_member_name(target_name)
+
+
+def _detect_tar_route(path: str) -> str | None:
+    """Return the safe content route for a valid TAR-backed artifact."""
+    file_path = Path(path)
+    if not file_path.is_file():
+        return None
+
+    try:
+        with tarfile.open(file_path, "r:*") as archive:
+            if file_path.suffix.lower() == ".nemo":
+                return "tar"
+            regular_member_names: set[str] = set()
+            linked_root_config_targets: set[str] = set()
+            for entry_count, member in enumerate(archive, start=1):
+                if entry_count > _NEMO_ROUTE_MAX_ENTRIES:
+                    return NEMO_ROUTING_INCONCLUSIVE_FORMAT
+                normalized_member_name = _normalize_safe_tar_member_name(member.name)
+                if member.isfile():
+                    if _is_nemo_root_config_member(member.name):
+                        return "nemo"
+                    if normalized_member_name in linked_root_config_targets:
+                        return "nemo"
+                    if normalized_member_name is not None:
+                        regular_member_names.add(normalized_member_name)
+                    continue
+                if not (member.issym() or member.islnk()) or not _is_nemo_root_config_member(member.name):
+                    continue
+                target_name = _resolve_safe_tar_link_target_name(member)
+                if target_name in regular_member_names:
+                    return "nemo"
+                if member.issym() and target_name is not None:
+                    linked_root_config_targets.add(target_name)
+    except (OSError, tarfile.TarError):
+        return None
+
+    return "tar"
+
+
+def is_nemo_archive(path: str) -> bool:
+    """Return whether a TAR-backed artifact should receive NeMo analysis."""
+    return _detect_tar_route(path) == "nemo"
+
+
 def _is_tar_archive(path: str) -> bool:
     """Return whether a path is a TAR archive, including compressed wrappers."""
     try:
@@ -1254,6 +1329,36 @@ def _is_lightgbm_signature(prefix: bytes) -> bool:
     return (starts_with_tree or "tree=" in preview) and header_hits >= 3 and tree_hits >= 2 and not xgboost_like
 
 
+def _is_lightgbm_native_tree_record(line: str) -> bool:
+    if line == "tree":
+        return True
+    if not line.startswith("tree="):
+        return False
+    return line.removeprefix("tree=").strip().isdigit()
+
+
+def _is_content_routed_lightgbm_signature(prefix: bytes) -> bool:
+    """Require native tree framing before routing a misleading suffix as LightGBM."""
+    preview = prefix.decode("utf-8", errors="ignore").replace("\x00", "\n").lower()
+    native_lines = [line.strip() for line in preview.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    if not native_lines:
+        return False
+
+    nul_offset = prefix.find(b"\x00")
+    binary_payload_lines: list[str] = []
+    if nul_offset >= 0:
+        binary_payload_preview = prefix[nul_offset + 1 :].decode("utf-8", errors="ignore").replace("\x00", "\n").lower()
+        binary_payload_lines = [
+            line.strip()
+            for line in binary_payload_preview.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+    has_tree_record = _is_lightgbm_native_tree_record(native_lines[0]) or any(
+        _is_lightgbm_native_tree_record(line) for line in binary_payload_lines
+    )
+    return has_tree_record and _is_lightgbm_signature(prefix)
+
+
 def _is_executorch_binary_signature(prefix: bytes) -> bool:
     """Recognize versioned ExecuTorch FlatBuffers binaries by their file identifier."""
     return len(prefix) >= 8 and prefix[4:6] == b"ET" and prefix[6:8].isdigit()
@@ -1358,7 +1463,7 @@ def detect_format_from_magic_bytes(
             return "sevenzip"
         case magic if _has_rar_magic(magic):
             return "rar"
-        case magic if magic == _CNTK_LEGACY_MAGIC:
+        case magic if magic == _CNTK_LEGACY_MAGIC and (file_path is None or file_path.suffix.lower() != ".model"):
             return "cntk"
         case b"\x89HDF\r\n\x1a\n":  # HDF5 magic
             return "hdf5"
@@ -1406,7 +1511,7 @@ def detect_file_format_from_magic(path: str) -> str:
             header = f.read(min(size, _TAR_BLOCK_SIZE))
 
             if _looks_like_uncompressed_tar_header(header):
-                return "tar"
+                return _detect_tar_route(path) or "tar"
 
             magic4 = header[:4]
             magic8 = header[:8]
@@ -1426,15 +1531,12 @@ def detect_file_format_from_magic(path: str) -> str:
             format_result = detect_format_from_magic_bytes(magic4, magic8, magic16, size, file_path)
             if format_result == "zip" and file_path.suffix.lower() == ".mar" and is_torchserve_mar_archive(path):
                 return "torchserve_mar"
+            if format_result in {"gzip", "bzip2", "xz"}:
+                tar_route = _detect_tar_route(path)
+                if tar_route in {"nemo", NEMO_ROUTING_INCONCLUSIVE_FORMAT}:
+                    return tar_route
             if format_result != "unknown":
                 return format_result
-
-            # CNTKv2 has protobuf-style serialization without a fixed first-8-byte magic.
-            # Use bounded signature markers for deterministic identification.
-            f.seek(0)
-            cntk_prefix = f.read(_CNTK_SIGNATURE_READ_BYTES)
-            if _is_cntk_signature(cntk_prefix):
-                return "cntk"
 
             # Protocol 0/1 pickle payloads can evade short magic-byte checks.
             # Probe a bounded prefix and require a valid opcode stream.
@@ -1450,9 +1552,16 @@ def detect_file_format_from_magic(path: str) -> str:
             if _is_torch7_signature(torch7_prefix):
                 return "torch7"
 
+            # CNTKv2 has protobuf-style serialization without a fixed first-8-byte magic.
+            # Use bounded signature markers for deterministic identification after serialized formats.
+            f.seek(0)
+            cntk_prefix = f.read(_CNTK_SIGNATURE_READ_BYTES)
+            if file_path.suffix.lower() != ".model" and _is_cntk_signature(cntk_prefix):
+                return "cntk"
+
             f.seek(0)
             lightgbm_prefix = f.read(_LIGHTGBM_SIGNATURE_READ_BYTES)
-            if _is_lightgbm_signature(lightgbm_prefix):
+            if _is_content_routed_lightgbm_signature(lightgbm_prefix):
                 return "lightgbm"
 
             # Check for XML-based formats (OpenVINO and PMML) using the first
@@ -1524,7 +1633,7 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         magic16 = header[:16]
 
         if _looks_like_uncompressed_tar_header(prefix):
-            return "tar"
+            return _detect_tar_route(path) or "tar"
 
         if _looks_like_tflite_header(magic8):
             return "tflite"
@@ -1537,23 +1646,12 @@ def detect_file_format_for_skip_filter(path: str) -> str:
         if format_result == "zip":
             return "zip"
         if format_result in {"gzip", "bzip2", "xz", "lz4", "zlib"}:
-            if _is_tar_archive(path):
-                return "tar"
+            tar_route = _detect_tar_route(path)
+            if tar_route is not None:
+                return tar_route
             return format_result
         if format_result != "unknown":
             return format_result
-
-        torch7_probe_size = min(size, _TORCH7_SIGNATURE_READ_BYTES)
-        if len(prefix) < torch7_probe_size:
-            prefix += f.read(torch7_probe_size - len(prefix))
-        if _is_torch7_signature(prefix):
-            return "torch7"
-
-        lightgbm_probe_size = min(size, _LIGHTGBM_SIGNATURE_READ_BYTES)
-        if len(prefix) < lightgbm_probe_size:
-            prefix += f.read(lightgbm_probe_size - len(prefix))
-        if _is_lightgbm_signature(prefix):
-            return "lightgbm"
 
         if _could_start_proto0_or_1_pickle(prefix):
             max_probe_size = min(size, PROTO0_1_MAX_PROBE_BYTES)
@@ -1564,6 +1662,24 @@ def detect_file_format_for_skip_filter(path: str) -> str:
                 sample_is_prefix=size > min(size, PROTO0_1_MAX_PROBE_BYTES),
             ):
                 return "pickle"
+
+        torch7_probe_size = min(size, _TORCH7_SIGNATURE_READ_BYTES)
+        if len(prefix) < torch7_probe_size:
+            prefix += f.read(torch7_probe_size - len(prefix))
+        if _is_torch7_signature(prefix):
+            return "torch7"
+
+        cntk_probe_size = min(size, _CNTK_SIGNATURE_READ_BYTES)
+        if len(prefix) < cntk_probe_size:
+            prefix += f.read(cntk_probe_size - len(prefix))
+        if file_path.suffix.lower() != ".model" and _is_cntk_signature(prefix[:cntk_probe_size]):
+            return "cntk"
+
+        lightgbm_probe_size = min(size, _LIGHTGBM_SIGNATURE_READ_BYTES)
+        if len(prefix) < lightgbm_probe_size:
+            prefix += f.read(lightgbm_probe_size - len(prefix))
+        if _is_content_routed_lightgbm_signature(prefix[:lightgbm_probe_size]):
+            return "lightgbm"
 
         if _could_be_xml_prefix(prefix):
             xml_probe_size = min(size, _XML_MODEL_SIGNATURE_READ_BYTES)
@@ -1637,7 +1753,10 @@ def detect_file_format(path: str) -> str:
 
     # Compound tar wrappers should route to TAR scanner semantics.
     if filename_lower.endswith((".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")):
-        if _detect_compression_format(header) is not None or _is_tar_archive(path):
+        tar_route = _detect_tar_route(path)
+        if tar_route is not None:
+            return tar_route
+        if _detect_compression_format(header) is not None:
             return "tar"
         torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
         if _is_torch7_signature(torch7_prefix):
@@ -1646,8 +1765,9 @@ def detect_file_format(path: str) -> str:
 
     compression_format = _detect_compression_format(header)
     if ext in _COMPRESSED_EXTENSION_CODECS:
-        if _is_tar_archive(path):
-            return "tar"
+        tar_route = _detect_tar_route(path)
+        if tar_route is not None:
+            return tar_route
         expected_codec = _COMPRESSED_EXTENSION_CODECS[ext]
         if compression_format == expected_codec:
             return "compressed"
@@ -1660,10 +1780,11 @@ def detect_file_format(path: str) -> str:
     if _has_rar_magic(magic8):
         return "rar"
     if _looks_like_uncompressed_tar_header(header):
-        return "tar"
+        return _detect_tar_route(path) or "tar"
     if compression_format:
-        if _is_tar_archive(path):
-            return "tar"
+        tar_route = _detect_tar_route(path)
+        if tar_route is not None:
+            return tar_route
         return compression_format
     # Check ZIP magic first (for .pt/.pth files that are actually zips)
     if _has_zip_magic(magic4):
@@ -1694,6 +1815,12 @@ def detect_file_format(path: str) -> str:
     torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
     if _is_torch7_signature(torch7_prefix):
         return "torch7"
+
+    signature_prefix = read_magic_bytes(path, max(_CNTK_SIGNATURE_READ_BYTES, _LIGHTGBM_SIGNATURE_READ_BYTES))
+    if ext != ".model" and _is_cntk_signature(signature_prefix[:_CNTK_SIGNATURE_READ_BYTES]):
+        return "cntk"
+    if _is_content_routed_lightgbm_signature(signature_prefix[:_LIGHTGBM_SIGNATURE_READ_BYTES]):
+        return "lightgbm"
 
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
@@ -1929,16 +2056,16 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
         }:
             return True
 
-        # TAR files must match
+        # TAR-backed NeMo artifacts remain valid under either declared container suffix.
         if ext_format == "tar":
             filename_lower = Path(path).name.lower()
             if filename_lower.endswith((".tar.gz", ".tgz")):
-                return header_format in {"tar", "gzip"}
+                return header_format in {"tar", "gzip", "nemo"}
             if filename_lower.endswith((".tar.bz2", ".tbz2")):
-                return header_format in {"tar", "bzip2"}
+                return header_format in {"tar", "bzip2", "nemo"}
             if filename_lower.endswith((".tar.xz", ".txz")):
-                return header_format in {"tar", "xz"}
-            return header_format == "tar"
+                return header_format in {"tar", "xz", "nemo"}
+            return header_format in {"tar", "nemo"}
 
         # Standalone compressed wrappers must match their declared codecs.
         if ext_format == "compressed":
@@ -1948,8 +2075,8 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
                 return False
             return header_format == expected_codec
 
-        # NeMo files are TAR archives with a dedicated extension
-        if ext_format == "nemo" and header_format == "tar":
+        # NeMo files are TAR archives with a dedicated or structurally recognized route.
+        if ext_format == "nemo" and header_format in {"tar", "nemo"}:
             return True
 
         # ExecuTorch files may be ZIP archives or valid FlatBuffers binaries.

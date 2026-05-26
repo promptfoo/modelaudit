@@ -18,6 +18,7 @@ from ..scanner_selection import (
 from ..utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
     LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
+    NEMO_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
     detect_file_format,
     detect_file_format_from_magic,
@@ -267,6 +268,23 @@ def _make_incomplete_llamafile_routing_result(path: str, config: dict[str, Any] 
     return result
 
 
+def _make_incomplete_nemo_routing_result(path: str) -> ScanResult:
+    """Fail closed when bounded nested NeMo structural routing cannot decide."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="NeMo Routing",
+        passed=False,
+        message="NeMo routing was inconclusive because the bounded TAR member probe reached its limit",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": NEMO_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    mark_inconclusive_scan_result(result, "nemo_routing_incomplete")
+    mark_operational_scan_error(result, "nemo_routing_incomplete")
+    result.finish(success=False)
+    return result
+
+
 def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanResult:
     """Scan an extracted archive member without importing `modelaudit.core`."""
     from . import _registry
@@ -276,6 +294,8 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
     trusted_content_format = detect_file_format_from_magic(path)
     if trusted_content_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
         return _make_incomplete_llamafile_routing_result(path, config)
+    if trusted_content_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
+        return _make_incomplete_nemo_routing_result(path)
     if trusted_content_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT:
         result = ScanResult(scanner_name="zip")
         merge_executable_zip_container_findings(

@@ -72,6 +72,24 @@ def _write_gzip_r_serialized(path: Path, body: str) -> Path:
     return path
 
 
+def _write_cntkv2(path: Path, include_structure: bool = True) -> Path:
+    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+    structure = b" CompositeFunction primitive_functions " if include_structure else b""
+    path.write_bytes(prefix + structure + b" inputs outputs ")
+    return path
+
+
+def _write_lightgbm(path: Path, valid: bool = True) -> Path:
+    body = "tree=0\nversion=v4\nnum_class=1\n"
+    if valid:
+        body += (
+            "num_tree_per_iteration=1\nmax_feature_idx=2\ntree_sizes=12\n"
+            "num_leaves=2\nsplit_feature=0\nleaf_value=0.1 0.2\n"
+        )
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
 def _assert_scanner_for_path(path: Path, expected_scanner_name: str) -> None:
     scanner_class = ScannerRegistry().get_scanner_for_path(str(path))
 
@@ -523,6 +541,36 @@ def test_get_scanner_for_file_rejects_rar_suffix_without_magic(tmp_path: Path) -
     assert scanner is None
 
 
+def test_get_scanner_for_file_routes_hdf5_header_alias_under_misleading_suffix(tmp_path: Path) -> None:
+    path = tmp_path / "model.jpg"
+    path.write_bytes(b"\x89HDF\r\n\x1a\n" + b"\x00" * 32)
+
+    scanner = get_scanner_for_file(str(path))
+
+    assert scanner is not None
+    assert scanner.name == "keras_h5"
+
+
+def test_get_scanner_for_file_routes_ggml_header_alias_and_rejects_near_match(tmp_path: Path) -> None:
+    path = tmp_path / "model.jpg"
+    path.write_bytes(b"GGML" + (1).to_bytes(4, "little") + b"\x00" * 24)
+    near_match = tmp_path / "not-model.jpg"
+    near_match.write_bytes(b"GGMX" + (1).to_bytes(4, "little") + b"\x00" * 24)
+
+    scanner = get_scanner_for_file(str(path))
+
+    assert scanner is not None
+    assert scanner.name == "gguf"
+    assert get_scanner_for_file(str(near_match)) is None
+
+
+def test_get_scanner_for_file_does_not_override_r_serialized_suffix_with_compressed_alias(tmp_path: Path) -> None:
+    path = tmp_path / "not-r.rds"
+    path.write_bytes(gzip.compress(pickle.dumps({"weights": [1, 2, 3]}, protocol=4)))
+
+    assert get_scanner_for_file(str(path)) is None
+
+
 def test_get_scanner_for_path_routes_valid_mar_archive_to_torchserve_mar(tmp_path: Path) -> None:
     mar_path = _write_zip_archive(
         tmp_path / "model.mar",
@@ -654,6 +702,26 @@ def test_get_scanner_for_path_routes_extensionless_malicious_llamafile(tmp_path:
     )
 
     _assert_scanner_for_path(llamafile_path, "llamafile")
+
+
+def test_get_scanner_for_path_routes_renamed_cntk_by_content(tmp_path: Path) -> None:
+    renamed_cntk = _write_cntkv2(tmp_path / "cntk.jpg")
+
+    _assert_scanner_for_path(renamed_cntk, "cntk")
+
+
+def test_get_scanner_for_path_routes_renamed_lightgbm_by_content(tmp_path: Path) -> None:
+    renamed_lightgbm = _write_lightgbm(tmp_path / "lightgbm.jpg")
+
+    _assert_scanner_for_path(renamed_lightgbm, "lightgbm")
+
+
+def test_get_scanner_for_path_does_not_route_cntk_or_lightgbm_near_matches(tmp_path: Path) -> None:
+    cntk_near_match = _write_cntkv2(tmp_path / "cntk-near-match.jpg", include_structure=False)
+    lightgbm_near_match = _write_lightgbm(tmp_path / "lightgbm-near-match.jpg", valid=False)
+
+    assert ScannerRegistry().get_scanner_for_path(str(cntk_near_match)) is None
+    assert ScannerRegistry().get_scanner_for_path(str(lightgbm_near_match)) is None
 
 
 def test_get_scanner_for_path_routes_misnamed_malicious_llamafile(tmp_path: Path) -> None:

