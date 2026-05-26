@@ -30,6 +30,7 @@ from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_ini
 from modelaudit.scanner_results import Issue, IssueSeverity, ScanResult
 from modelaudit.scanner_selection import (
     SCANNER_SELECTION_PREFERRED_KIND,
+    ScannerSelectionPolicy,
     add_scanner_selection_skip_check,
     make_scanner_selection_skip_result,
     normalize_scanner_selection_config,
@@ -54,6 +55,7 @@ from modelaudit.utils.file.detection import (
     detect_file_format,
     detect_file_format_from_magic,
     detect_format_from_extension,
+    detect_pytorch_binary_supplemental_format,
     detect_xgboost_ubjson_content_route,
     is_executorch_archive,
     is_keras_zip_archive,
@@ -233,6 +235,42 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
         return "nemo"
 
     return _registry.get_scanner_id_for_header_format(header_format)
+
+
+def _merge_pytorch_binary_supplemental_analysis(
+    path: str,
+    result: ScanResult,
+    config: dict[str, Any],
+    scanner_selection: ScannerSelectionPolicy,
+    supplemental_scanner_id: str | None,
+) -> None:
+    """Merge strict format-specific findings without dropping raw `.bin` checks."""
+    if supplemental_scanner_id is None:
+        return
+    if not scanner_selection.allows(supplemental_scanner_id):
+        add_scanner_selection_skip_check(
+            result,
+            path,
+            supplemental_scanner_id,
+            scanner_selection,
+            context="supplemental .bin content analysis",
+        )
+        return
+
+    scanner_class = _registry.load_scanner_by_id(supplemental_scanner_id)
+    if scanner_class is None:
+        supplemental_result = _make_unavailable_recognized_format_result(
+            path,
+            supplemental_scanner_id,
+            supplemental_scanner_id,
+        )
+    else:
+        supplemental_result = scanner_class(config=config).scan(path)
+
+    primary_bytes_scanned = result.bytes_scanned
+    result.merge(supplemental_result)
+    result.bytes_scanned = max(primary_bytes_scanned, supplemental_result.bytes_scanned)
+    result.metadata.setdefault("supplemental_scanners", []).append(supplemental_scanner_id)
 
 
 def _is_direct_header_route(scanner_id: str, header_format: str) -> bool:
@@ -1530,6 +1568,9 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     # Prefer scanners based on trusted structure rather than the filename alone.
     preferred_scanner: type[BaseScanner] | None = None
     scanner_id = _select_preferred_scanner_id(path, header_format, ext)
+    pytorch_binary_supplemental_scanner_id = (
+        detect_pytorch_binary_supplemental_format(path) if ext == ".bin" and header_format == "pytorch_binary" else None
+    )
     skipped_preferred_scanner_id: str | None = None
     if scanner_id and scanner_selection.allows(scanner_id):
         preferred_scanner = _registry.load_scanner_by_id(scanner_id)
@@ -1599,10 +1640,18 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             result.finish(success=False)
     else:
         # Use registry's lazy loading method to avoid loading all scanners
-        scanner_class = _registry.get_scanner_for_path(
-            path,
-            scanner_selection=scanner_selection if scanner_selection.active else None,
-        )
+        scanner_class = None
+        if (
+            skipped_preferred_scanner_id == "pytorch_binary"
+            and pytorch_binary_supplemental_scanner_id is not None
+            and scanner_selection.allows(pytorch_binary_supplemental_scanner_id)
+        ):
+            scanner_class = _registry.load_scanner_by_id(pytorch_binary_supplemental_scanner_id)
+        if scanner_class is None:
+            scanner_class = _registry.get_scanner_for_path(
+                path,
+                scanner_selection=scanner_selection if scanner_selection.active else None,
+            )
         if scanner_class:
             logger.debug(f"Using {scanner_class.name} scanner for {path}")
             scanner = scanner_class(config=config)
@@ -1687,6 +1736,15 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     if is_xgboost_pickle_spoof:
         _mark_xgboost_pickle_extension_spoof(result, path, ext)
+
+    if ext == ".bin" and header_format == "pytorch_binary" and result.scanner_name == "pytorch_binary":
+        _merge_pytorch_binary_supplemental_analysis(
+            path,
+            result,
+            config,
+            scanner_selection,
+            pytorch_binary_supplemental_scanner_id,
+        )
 
     if discrepancy_msg:
         # Determine severity based on whether it's a validation failure or just a discrepancy

@@ -1181,6 +1181,28 @@ def test_detect_file_format_routes_extensionless_xgboost_ubjson_with_noop_before
     assert detect_file_format_for_skip_filter(str(model_file)) == "xgboost"
 
 
+def test_extensionless_xgboost_route_preempts_incidental_tflite_identifier(tmp_path: Path) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_bytes(
+        b"{N"
+        + _ubjson_key(b"TFL3")
+        + b"Z"
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + _ubjson_key(b"version")
+        + b"[]"
+        + b"}"
+    )
+
+    assert model_file.read_bytes()[4:8] == b"TFL3"
+    assert detect_file_format(str(model_file)) == "xgboost"
+    assert detect_file_format_from_magic(str(model_file)) == "xgboost"
+    assert detect_file_format_for_skip_filter(str(model_file)) == "xgboost"
+
+
 def test_detect_file_format_routes_extensionless_xgboost_ubjson_with_noop_before_counted_root_header(
     tmp_path: Path,
 ) -> None:

@@ -106,7 +106,7 @@ class ExecuTorchScanner(BaseScanner):
             )
 
         should_scan_archive = header.startswith(b"PK")
-        if valid_binary_program and not should_scan_archive:
+        if not should_scan_archive:
             try:
                 should_scan_archive = zipfile.is_zipfile(path)
             except OSError as exc:

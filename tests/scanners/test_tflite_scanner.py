@@ -68,20 +68,37 @@ def test_tflite_scanner_registry_routes_renamed_model_by_magic_bytes(tmp_path: P
     assert _registry.get_scanner_for_path(str(path)) is TFLiteScanner
 
 
-def test_core_scan_file_preserves_tflite_magic_bin_for_pytorch_binary(tmp_path: Path) -> None:
-    """`.bin` keeps generic binary scanning even when bytes 4-7 look like TFLite."""
+def test_core_scan_file_preserves_tflite_bin_analysis_with_pytorch_binary_primary(tmp_path: Path) -> None:
+    """`.bin` retains raw analysis while a strict TFLite signature is still analyzed."""
     path = tmp_path / "model.bin"
     path.write_bytes(b"\x00\x00\x00\x00TFL3" + b"\x00" * 100)
 
-    result = core.scan_file(str(path))
+    with patch("modelaudit.scanners.tflite_scanner.HAS_TFLITE", False):
+        result = core.scan_file(str(path), config={"cache_scan_results": False})
 
     assert TFLiteScanner.can_handle(str(path)) is False
     assert detect_file_format(str(path)) == "pytorch_binary"
     assert result.scanner_name == "pytorch_binary"
+    assert result.metadata["supplemental_scanners"] == ["tflite"]
+    assert "tflite_dependency_unavailable" in result.metadata["scan_outcome_reasons"]
+    assert result.success is False
 
 
 def test_renamed_tflite_with_skipped_suffix_routes_through_directory_scan(tmp_path: Path) -> None:
     path = tmp_path / "model.jpg"
+    path.write_bytes(b"\x0c\x00\x00\x00TFL3" + b"\x00" * 100)
+
+    assert TFLiteScanner.can_handle(str(path))
+    assert detect_file_format(str(path)) == "tflite"
+    assert core.scan_file(str(path)).scanner_name == "tflite"
+
+    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+    assert directory.files_scanned == 1
+    assert "tflite" in directory.scanner_names
+
+
+def test_extensionless_tflite_routes_through_directory_scan(tmp_path: Path) -> None:
+    path = tmp_path / "model"
     path.write_bytes(b"\x0c\x00\x00\x00TFL3" + b"\x00" * 100)
 
     assert TFLiteScanner.can_handle(str(path))

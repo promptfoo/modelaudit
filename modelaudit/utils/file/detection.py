@@ -806,7 +806,6 @@ def _looks_like_tflite_header(header: bytes) -> bool:
 _RENAMED_BINARY_CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset({".bin", ".meta", ".pb"})
 _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset(
     {
-        "",
         ".bin",
         ".cmf",
         ".dnn",
@@ -827,6 +826,33 @@ _TFLITE_CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset(
 
 def _allows_renamed_binary_content_route(file_path: Path | None) -> bool:
     return file_path is None or file_path.suffix.lower() not in _RENAMED_BINARY_CONTENT_ROUTE_BLOCKED_EXTENSIONS
+
+
+def detect_pytorch_binary_supplemental_format(path: str) -> str | None:
+    """Return a strict secondary scanner for a content-identified `.bin` file."""
+    file_path = Path(path)
+    if file_path.suffix.lower() != ".bin" or not file_path.is_file():
+        return None
+
+    try:
+        size = file_path.stat().st_size
+        if size < 4:
+            return None
+        prefix = read_magic_bytes(path, max(_TORCH7_SIGNATURE_READ_BYTES, 8))
+    except OSError:
+        return None
+
+    magic4 = prefix[:4]
+    magic8 = prefix[:8]
+    if magic4 == b"RKNN":
+        return "rknn"
+    if _is_torch7_signature(prefix):
+        return "torch7"
+    if _is_executorch_binary_signature(magic8) and _is_valid_executorch_binary(file_path):
+        return "executorch"
+    if _looks_like_tflite_header(magic8):
+        return "tflite"
+    return None
 
 
 def _looks_like_safetensors_structure(path: Path | None, magic8: bytes, file_size: int) -> bool:
@@ -2053,6 +2079,13 @@ def detect_file_format(path: str) -> str:
     if _is_content_routed_lightgbm_signature(signature_prefix[:_LIGHTGBM_SIGNATURE_READ_BYTES]):
         return "lightgbm"
 
+    if ext == "":
+        xgboost_route = _detect_extensionless_xgboost_ubjson_route(
+            read_magic_bytes(path, min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
+        )
+        if xgboost_route is not None:
+            return xgboost_route
+
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
         magic64 = read_magic_bytes(path, 64)
@@ -2192,12 +2225,6 @@ def detect_file_format(path: str) -> str:
         ".txz",
     ):
         return "tar"
-    if ext == "":
-        xgboost_route = _detect_extensionless_xgboost_ubjson_route(
-            read_magic_bytes(path, min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
-        )
-        if xgboost_route is not None:
-            return xgboost_route
     if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
     return "unknown"

@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
 - detect and scan signature-valid CNTK and LightGBM payloads even when renamed with misleading suffixes
-- detect and scan signature-valid RKNN, TFLite, and ExecuTorch payloads when renamed with misleading suffixes, and classify unavailable ExecuTorch reads as inconclusive
+- detect and scan signature-valid RKNN, TFLite, and ExecuTorch payloads under non-conflicting renamed suffixes while preserving owned routes, and classify unavailable ExecuTorch reads as inconclusive
 - mark CatBoost text-fragment extraction limits and unavailable reads as inconclusive analysis
 - mark RKNN and Torch7 string-extraction limits and unavailable reads as inconclusive analysis
 - classify unavailable TFLite parsing coverage as inconclusive rather than a security finding

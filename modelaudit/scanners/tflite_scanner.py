@@ -21,7 +21,6 @@ _TFLITE_MIN_HEADER_SIZE = _TFLITE_MAGIC_OFFSET + _TFLITE_MAGIC_SIZE
 _TFLITE_MAGIC_BYTES = b"TFL3"
 _CONTENT_ROUTE_BLOCKED_EXTENSIONS = frozenset(
     {
-        "",
         ".bin",
         ".cmf",
         ".dnn",

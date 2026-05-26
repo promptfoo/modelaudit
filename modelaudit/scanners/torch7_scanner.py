@@ -67,7 +67,7 @@ class Torch7Scanner(BaseScanner):
 
     @classmethod
     def can_handle(cls, path: str) -> bool:
-        """Recognize Torch7 by bounded serialized-content markers, regardless of suffix."""
+        """Recognize Torch7 content unless a conflicting suffix retains primary ownership."""
         if not os.path.isfile(path):
             return False
         if os.path.splitext(path)[1].lower() in CONTENT_ROUTE_BLOCKED_EXTENSIONS:

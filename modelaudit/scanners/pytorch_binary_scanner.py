@@ -318,6 +318,20 @@ class PyTorchBinaryScanner(BaseScanner):
 
         return False
 
+    @staticmethod
+    def _is_valid_embedded_pe(data: bytes, offset_in_chunk: int) -> bool:
+        """Validate a non-leading DOS header before reporting embedded PE content."""
+        pointer_offset = offset_in_chunk + 0x3C
+        if pointer_offset + 4 > len(data):
+            return False
+        pe_offset = int.from_bytes(data[pointer_offset : pointer_offset + 4], "little")
+        signature_offset = offset_in_chunk + pe_offset
+        return (
+            pe_offset >= 0x40
+            and signature_offset + 4 <= len(data)
+            and data[signature_offset : signature_offset + 4] == b"PE\x00\x00"
+        )
+
     def _check_for_executable_signatures(
         self,
         chunk: bytes,
@@ -377,9 +391,9 @@ class PyTorchBinaryScanner(BaseScanner):
                         ignored_count += 1
                         continue  # Skip - not a real shebang
 
-                # Middle-of-file MZ pairs are common in weight blobs; without a
-                # PE header at file start they are too noisy to report.
-                if sig == b"MZ" and pos != 0:
+                # Middle-of-file MZ pairs are common in weights; retain only
+                # structurally validated embedded PE images.
+                if sig == b"MZ" and pos != 0 and not self._is_valid_embedded_pe(chunk, pos - offset):
                     ignored_count += 1
                     continue
 
