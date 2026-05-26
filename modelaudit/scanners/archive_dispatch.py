@@ -323,7 +323,9 @@ def merge_flax_msgpack_overlap_findings(
                 overlap_result = _make_unavailable_recognized_format_result(path, scanner_id, scanner_id)
             else:
                 overlap_result = scanner_class(config=config).scan(path)
+            primary_bytes_scanned = result.bytes_scanned
             result.merge(overlap_result)
+            result.bytes_scanned = max(primary_bytes_scanned, overlap_result.bytes_scanned)
         else:
             add_scanner_selection_skip_check(
                 result,

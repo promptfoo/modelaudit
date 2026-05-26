@@ -2279,6 +2279,8 @@ def detect_flax_msgpack_overlap_routes(path: str) -> tuple[str, ...]:
         path, min(size, max(_TORCH7_SIGNATURE_READ_BYTES, _CNTK_SIGNATURE_READ_BYTES, _LIGHTGBM_SIGNATURE_READ_BYTES))
     )
     routes: list[str] = []
+    if _allows_renamed_binary_content_route(file_path) and prefix[:4] == b"RKNN":
+        routes.append("rknn")
     if _is_torch7_signature(prefix[:_TORCH7_SIGNATURE_READ_BYTES]):
         routes.append("torch7")
     if file_path.suffix.lower() != ".model" and _is_cntk_signature(prefix[:_CNTK_SIGNATURE_READ_BYTES]):
