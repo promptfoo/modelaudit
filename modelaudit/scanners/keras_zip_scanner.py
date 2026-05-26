@@ -114,6 +114,7 @@ def _has_get_file_reference(values: list[str]) -> bool:
 _KERAS_METADATA_ENTRY = "metadata.json"
 _KERAS_METADATA_MAX_BYTES = 10 * 1024 * 1024
 _KERAS_WEIGHTS_ENTRY = "model.weights.h5"
+_KERAS_ZIP_ARCHIVE_READ_EXCEPTIONS = (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile)
 
 
 def _redact_url_for_display(url: str) -> str:
@@ -441,6 +442,17 @@ class KerasZipScanner(BaseScanner):
                     )
                     raw_config_text = config_data.decode("utf-8", errors="ignore")
                     model_config = json.loads(config_data)
+                except _KERAS_ZIP_ARCHIVE_READ_EXCEPTIONS as e:
+                    self._add_archive_read_failure_check(
+                        result,
+                        error=e,
+                        location=f"{path}/{config_info.filename}",
+                        entry=config_info.filename,
+                    )
+                    self._check_archive_security_members(zf, path, result)
+                    self._merge_recursive_archive_scan(path, result)
+                    self._finish_scan_result(result)
+                    return result
                 except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
                     self._mark_inconclusive_scan_result(result, "keras_zip_config_parse_failed")
                     # Fall back to a structure-aware raw scan only when the archive
@@ -508,16 +520,8 @@ class KerasZipScanner(BaseScanner):
             self._merge_recursive_archive_scan(path, result)
             result.finish(success=False)
             return result
-        except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as e:
-            self._mark_inconclusive_scan_result(result, "keras_zip_archive_read_failed")
-            result.add_check(
-                name="Keras ZIP Archive Read",
-                passed=False,
-                message=f"Unable to complete Keras ZIP scan due to archive read failure: {e!s}",
-                severity=IssueSeverity.INFO,
-                location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
-            )
+        except _KERAS_ZIP_ARCHIVE_READ_EXCEPTIONS as e:
+            self._add_archive_read_failure_check(result, error=e, location=path)
             self._finish_scan_result(result)
             return result
         except Exception as e:
@@ -547,6 +551,14 @@ class KerasZipScanner(BaseScanner):
                 _KERAS_METADATA_MAX_BYTES,
             )
             metadata = json.loads(metadata_data)
+        except _KERAS_ZIP_ARCHIVE_READ_EXCEPTIONS as e:
+            self._add_archive_read_failure_check(
+                result,
+                error=e,
+                location=f"{self.current_file_path}/{metadata_info.filename}",
+                entry=metadata_info.filename,
+            )
+            return
         except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
             return
 
@@ -588,6 +600,28 @@ class KerasZipScanner(BaseScanner):
                     details={"filename": filename},
                     rule_code=executable_archive_member_rule_code(filename),
                 )
+
+    def _add_archive_read_failure_check(
+        self,
+        result: ScanResult,
+        *,
+        error: BaseException,
+        location: str,
+        entry: str | None = None,
+    ) -> None:
+        self._mark_inconclusive_scan_result(result, "keras_zip_archive_read_failed")
+        details = {"exception": str(error), "exception_type": type(error).__name__}
+        if entry is not None:
+            details["entry"] = entry
+
+        result.add_check(
+            name="Keras ZIP Archive Read",
+            passed=False,
+            message=f"Unable to complete Keras ZIP scan due to archive read failure: {error!s}",
+            severity=IssueSeverity.INFO,
+            location=location,
+            details=details,
+        )
 
     @staticmethod
     def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
@@ -1544,6 +1578,15 @@ class KerasZipScanner(BaseScanner):
                     "Large embedded archive members can consume excessive disk space or processing time when "
                     "extracted for inspection."
                 ),
+            )
+            return
+        except _KERAS_ZIP_ARCHIVE_READ_EXCEPTIONS as exc:
+            weights_entry = weights_info.filename
+            self._add_archive_read_failure_check(
+                result,
+                error=exc,
+                location=f"{self.current_file_path}:{weights_entry}",
+                entry=weights_entry,
             )
             return
         finally:
