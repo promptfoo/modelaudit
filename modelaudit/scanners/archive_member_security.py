@@ -291,27 +291,46 @@ def _resolve_static_string(node: ast.AST) -> str | None:
 
 _NAMESPACE_MAPPING_ACCESSORS = {"get", "__getitem__", "pop", "setdefault"}
 _GLOBAL_NAMESPACE_HELPERS = {"globals", "builtins.globals"}
-_GLOBAL_NAMESPACE_MAPPING_MARKER = "<globals mapping>"
 _STATIC_REFERENCE_OVERRIDE_PREFIX = "<static reference override>:"
 _BUILTIN_NAMESPACE_NAMES = {"__builtin__", "__builtins__"}
+_GLOBAL_NAMESPACE_MAPPING_NAME = "<globals>"
 
 
-def _resolve_global_namespace_mappings(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    """Resolve the mapping returned by an unshadowed zero-argument ``globals()`` call."""
+def _resolve_global_namespace_mapping_names(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    require_definite: bool = False,
+) -> frozenset[str] | None:
+    """Resolve the module global namespace mapping returned by zero-argument ``globals()``."""
     if isinstance(node, ast.Call) and not node.args and not node.keywords:
         helper_name = _resolve_call_name(node.func)
         resolved_helper_names = _apply_aliases(helper_name, alias_scopes) if helper_name is not None else None
         if resolved_helper_names is not None and resolved_helper_names & _GLOBAL_NAMESPACE_HELPERS:
-            return frozenset({_GLOBAL_NAMESPACE_MAPPING_MARKER})
+            if require_definite and not resolved_helper_names <= _GLOBAL_NAMESPACE_HELPERS:
+                return None
+            return frozenset({_GLOBAL_NAMESPACE_MAPPING_NAME})
 
     namespace_name = _resolve_call_name(node)
     resolved_namespace_names = _apply_aliases(namespace_name, alias_scopes) if namespace_name is not None else None
-    if resolved_namespace_names is not None and _GLOBAL_NAMESPACE_MAPPING_MARKER in resolved_namespace_names:
-        return frozenset({_GLOBAL_NAMESPACE_MAPPING_MARKER})
-    return None
+    if resolved_namespace_names is None:
+        return None
+    global_namespace_names = {
+        resolved_namespace_name
+        for resolved_namespace_name in resolved_namespace_names
+        if resolved_namespace_name == _GLOBAL_NAMESPACE_MAPPING_NAME
+    }
+    if require_definite and global_namespace_names != resolved_namespace_names:
+        return None
+    return frozenset(global_namespace_names) if global_namespace_names else None
 
 
-def _resolve_global_builtin_namespace_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+def _resolve_global_builtin_namespace_roots(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    require_definite: bool = False,
+) -> frozenset[str] | None:
     """Resolve a statically addressed builtin namespace obtained from ``globals()``."""
     namespace_node: ast.AST
     attr_name_node: ast.AST
@@ -332,19 +351,34 @@ def _resolve_global_builtin_namespace_roots(node: ast.AST, alias_scopes: _AliasS
     attr_name = _resolve_static_string(attr_name_node)
     if attr_name not in _BUILTIN_NAMESPACE_NAMES:
         return None
-    if _resolve_global_namespace_mappings(namespace_node, alias_scopes) is None:
+    if (
+        _resolve_global_namespace_mapping_names(
+            namespace_node,
+            alias_scopes,
+            require_definite=require_definite,
+        )
+        is None
+    ):
         return None
     return frozenset({attr_name})
 
 
 def _resolve_static_attribute_names(
-    target_root_node: ast.AST, attr_name_node: ast.AST, alias_scopes: _AliasScopes
+    target_root_node: ast.AST,
+    attr_name_node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    require_definite: bool = False,
 ) -> frozenset[str] | None:
     attr_name = _resolve_static_string(attr_name_node)
     if attr_name is None:
         return None
 
-    resolved_target_roots = _resolve_global_builtin_namespace_roots(target_root_node, alias_scopes)
+    resolved_target_roots = _resolve_global_builtin_namespace_roots(
+        target_root_node,
+        alias_scopes,
+        require_definite=require_definite,
+    )
     if resolved_target_roots is None:
         target_root = _resolve_call_name(target_root_node)
         if target_root is None:
@@ -355,11 +389,16 @@ def _resolve_static_attribute_names(
     return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
 
 
-def _resolve_getattr_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+def _resolve_getattr_call_names(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    require_definite: bool = False,
+) -> frozenset[str] | None:
     # Resolve literal names and compile-time string concatenation. Runtime-built
     # names still fall outside this static member analysis by design.
     if isinstance(node, ast.Attribute) and node.attr == "__call__":
-        return _resolve_getattr_call_names(node.value, alias_scopes)
+        return _resolve_getattr_call_names(node.value, alias_scopes, require_definite=require_definite)
 
     if not isinstance(node, ast.Call):
         return None
@@ -383,12 +422,26 @@ def _resolve_getattr_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> fr
     if target_root_node is None or attr_name_node is None:
         return None
 
-    return _resolve_static_attribute_names(target_root_node, attr_name_node, alias_scopes)
+    return _resolve_static_attribute_names(
+        target_root_node,
+        attr_name_node,
+        alias_scopes,
+        require_definite=require_definite,
+    )
 
 
-def _resolve_dunder_getattribute_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+def _resolve_dunder_getattribute_call_names(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    require_definite: bool = False,
+) -> frozenset[str] | None:
     if isinstance(node, ast.Attribute) and node.attr == "__call__":
-        return _resolve_dunder_getattribute_call_names(node.value, alias_scopes)
+        return _resolve_dunder_getattribute_call_names(
+            node.value,
+            alias_scopes,
+            require_definite=require_definite,
+        )
 
     if not isinstance(node, ast.Call):
         return None
@@ -401,15 +454,34 @@ def _resolve_dunder_getattribute_call_names(node: ast.AST, alias_scopes: _AliasS
     }:
         if len(node.args) < 2:
             return None
-        return _resolve_static_attribute_names(node.args[0], node.args[1], alias_scopes)
+        return _resolve_static_attribute_names(
+            node.args[0],
+            node.args[1],
+            alias_scopes,
+            require_definite=require_definite,
+        )
 
     if not isinstance(node.func, ast.Attribute) or node.func.attr != "__getattribute__" or not node.args:
         return None
-    return _resolve_static_attribute_names(node.func.value, node.args[0], alias_scopes)
+    return _resolve_static_attribute_names(
+        node.func.value,
+        node.args[0],
+        alias_scopes,
+        require_definite=require_definite,
+    )
 
 
-def _resolve_namespace_dict_roots(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    global_builtin_roots = _resolve_global_builtin_namespace_roots(node, alias_scopes)
+def _resolve_namespace_dict_roots(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    require_definite: bool = False,
+) -> frozenset[str] | None:
+    global_builtin_roots = _resolve_global_builtin_namespace_roots(
+        node,
+        alias_scopes,
+        require_definite=require_definite,
+    )
     if global_builtin_roots is not None:
         return global_builtin_roots
 
@@ -424,7 +496,11 @@ def _resolve_namespace_dict_roots(node: ast.AST, alias_scopes: _AliasScopes) -> 
             target_root_node = namespace_node.args[0]
 
     if target_root_node is not None:
-        global_builtin_roots = _resolve_global_builtin_namespace_roots(target_root_node, alias_scopes)
+        global_builtin_roots = _resolve_global_builtin_namespace_roots(
+            target_root_node,
+            alias_scopes,
+            require_definite=require_definite,
+        )
         if global_builtin_roots is not None:
             return global_builtin_roots
         target_root = _resolve_call_name(target_root_node)
@@ -441,12 +517,22 @@ def _resolve_namespace_dict_roots(node: ast.AST, alias_scopes: _AliasScopes) -> 
         roots.update(
             resolved_name for resolved_name in resolved_namespace_names if resolved_name in _BUILTIN_NAMESPACE_NAMES
         )
+        if require_definite and roots != resolved_namespace_names:
+            return None
         if roots:
             return frozenset(roots)
 
-    resolved_namespace_names = _resolve_getattr_call_names(namespace_node, alias_scopes)
+    resolved_namespace_names = _resolve_getattr_call_names(
+        namespace_node,
+        alias_scopes,
+        require_definite=require_definite,
+    )
     if resolved_namespace_names is None:
-        resolved_namespace_names = _resolve_dunder_getattribute_call_names(namespace_node, alias_scopes)
+        resolved_namespace_names = _resolve_dunder_getattribute_call_names(
+            namespace_node,
+            alias_scopes,
+            require_definite=require_definite,
+        )
     if resolved_namespace_names is None:
         return None
 
@@ -455,13 +541,24 @@ def _resolve_namespace_dict_roots(node: ast.AST, alias_scopes: _AliasScopes) -> 
         for resolved_name in resolved_namespace_names
         if resolved_name.endswith(".__dict__")
     }
+    if require_definite and roots != resolved_namespace_names:
+        return None
     return frozenset(roots) if roots else None
 
 
-def _resolve_namespace_dict_call_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
+def _resolve_namespace_dict_call_names(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    require_definite: bool = False,
+) -> frozenset[str] | None:
     """Resolve bounded calls dispatched through a statically known namespace mapping."""
     if isinstance(node, ast.Attribute) and node.attr == "__call__":
-        return _resolve_namespace_dict_call_names(node.value, alias_scopes)
+        return _resolve_namespace_dict_call_names(
+            node.value,
+            alias_scopes,
+            require_definite=require_definite,
+        )
 
     namespace_node: ast.AST
     attr_name_node: ast.AST
@@ -483,38 +580,82 @@ def _resolve_namespace_dict_call_names(node: ast.AST, alias_scopes: _AliasScopes
     if attr_name is None:
         return None
 
-    resolved_target_roots = _resolve_namespace_dict_roots(namespace_node, alias_scopes)
+    resolved_target_roots = _resolve_namespace_dict_roots(
+        namespace_node,
+        alias_scopes,
+        require_definite=require_definite,
+    )
     if resolved_target_roots is None:
         return None
     return frozenset(f"{resolved_target_root}.{attr_name}" for resolved_target_root in resolved_target_roots)
 
 
-def _resolve_static_reference_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
-    global_namespace_mappings = _resolve_global_namespace_mappings(node, alias_scopes)
-    if global_namespace_mappings is not None:
-        return global_namespace_mappings
+def _resolve_static_reference_names(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+    *,
+    require_definite: bool = False,
+) -> frozenset[str] | None:
     call_name = _resolve_call_name(node)
     if call_name is not None:
         return _apply_aliases(call_name, alias_scopes)
-    getattr_names = _resolve_getattr_call_names(node, alias_scopes)
+    global_namespace_names = _resolve_global_namespace_mapping_names(
+        node,
+        alias_scopes,
+        require_definite=require_definite,
+    )
+    if global_namespace_names is not None:
+        return global_namespace_names
+    global_builtin_roots = _resolve_global_builtin_namespace_roots(
+        node,
+        alias_scopes,
+        require_definite=require_definite,
+    )
+    if global_builtin_roots is not None:
+        return global_builtin_roots
+    if isinstance(node, ast.Attribute):
+        attribute_names = _resolve_static_attribute_names(
+            node.value,
+            ast.Constant(node.attr),
+            alias_scopes,
+            require_definite=require_definite,
+        )
+        if attribute_names is not None:
+            return attribute_names
+    getattr_names = _resolve_getattr_call_names(node, alias_scopes, require_definite=require_definite)
     if getattr_names is not None:
         return getattr_names
-    getattribute_names = _resolve_dunder_getattribute_call_names(node, alias_scopes)
+    getattribute_names = _resolve_dunder_getattribute_call_names(
+        node,
+        alias_scopes,
+        require_definite=require_definite,
+    )
     if getattribute_names is not None:
         return getattribute_names
-    namespace_call_names = _resolve_namespace_dict_call_names(node, alias_scopes)
+    namespace_call_names = _resolve_namespace_dict_call_names(
+        node,
+        alias_scopes,
+        require_definite=require_definite,
+    )
     if namespace_call_names is not None:
         return namespace_call_names
-    namespace_roots = _resolve_namespace_dict_roots(node, alias_scopes)
+    namespace_roots = _resolve_namespace_dict_roots(node, alias_scopes, require_definite=require_definite)
     return frozenset(f"{namespace_root}.__dict__" for namespace_root in namespace_roots) if namespace_roots else None
 
 
 def _resolve_static_assignment_target_names(node: ast.AST, alias_scopes: _AliasScopes) -> frozenset[str] | None:
     """Resolve member targets whose later static call identity can be overwritten."""
     if isinstance(node, ast.Attribute):
-        return _resolve_static_attribute_names(node.value, ast.Constant(value=node.attr), alias_scopes)
+        target_names = _resolve_static_attribute_names(
+            node.value,
+            ast.Constant(value=node.attr),
+            alias_scopes,
+            require_definite=True,
+        )
+        return target_names if target_names is not None and len(target_names) == 1 else None
     if isinstance(node, ast.Subscript):
-        return _resolve_static_reference_names(node, alias_scopes)
+        target_names = _resolve_static_reference_names(node, alias_scopes, require_definite=True)
+        return target_names if target_names is not None and len(target_names) == 1 else None
     return None
 
 

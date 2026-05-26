@@ -254,6 +254,9 @@ class TestJITScriptDetector:
             b"namespace = globals()\nnamespace['__builtins__']['ev' + 'al']('1 + 1')\n",
             b"namespace = globals()\nnamespace.get('__builtins__').get('eval')('1 + 1')\n",
             b"namespace = globals()\ngetattr(namespace['__builtins__'], 'eval')('1 + 1')\n",
+            b"globals()['__builtins__'].eval('1 + 1')\n",
+            b"builtins_ref = globals()['__builtins__']\ngetattr(builtins_ref, 'eval')('1 + 1')\n",
+            b"global_namespace = globals()\nglobal_namespace['__builtins__']['eval']('1 + 1')\n",
         ],
     )
     def test_scan_model_detects_unmarked_static_builtin_indirection(self, source: bytes) -> None:
@@ -305,6 +308,7 @@ class TestJITScriptDetector:
                 b"    namespace['__builtins__']['eval'] = len\n"
                 b"    return namespace['__builtins__']['eval']([])\n"
             ),
+            b"global_namespace = {'__builtins__': {'eval': len}}\nglobal_namespace['__builtins__']['eval']([])\n",
         ],
     )
     def test_scan_model_ignores_benign_builtin_shaped_access(self, source: bytes) -> None:
@@ -338,6 +342,29 @@ class TestJITScriptDetector:
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
         assert any(f.type == "ast_dangerous_call" and f.builtin == "eval" for f in findings)
+
+    def test_scan_model_preserves_builtin_execution_after_ambiguous_namespace_overwrite(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"if replace_builtin:\n"
+            b"    namespace = globals()\n"
+            b"else:\n"
+            b"    namespace = other\n"
+            b"namespace['__builtins__']['eval'] = len\n"
+            b"__builtins__.eval('1 + 1')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(f.type == "ast_dangerous_call" and f.builtin == "eval" for f in findings)
+
+    def test_scan_model_ignores_raw_builtin_pattern_when_parsed_snippet_rebinds_builtin(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00binary-prefix\ndef benign():\n    eval = len\n    return eval([])\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
 
     def test_scan_model_detects_late_unmarked_module_scope_python_source(self) -> None:
         detector = JITScriptDetector()
