@@ -1059,16 +1059,16 @@ class FlaxMsgpackScanner(BaseScanner):
         if has_inconclusive_renamed_flax_msgpack_routing(path):
             result.metadata["analysis_incomplete"] = True
             result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-            result.metadata["scan_outcome_reasons"] = ["flax_msgpack_routing_probe_limit_exceeded"]
+            result.metadata["scan_outcome_reasons"] = ["flax_msgpack_routing_incomplete"]
             result.add_check(
-                name="MessagePack Routing Analysis Limit",
+                name="MessagePack Routing Analysis Incomplete",
                 passed=False,
-                message="Flax MessagePack analysis incomplete because bounded routing inspection was exhausted",
+                message="Flax MessagePack analysis incomplete because bounded routing inspection could not complete",
                 severity=IssueSeverity.INFO,
                 location=path,
                 details={
                     "analysis_incomplete": True,
-                    "scan_outcome_reason": "flax_msgpack_routing_probe_limit_exceeded",
+                    "scan_outcome_reason": "flax_msgpack_routing_incomplete",
                 },
                 rule_code="S902",
             )
