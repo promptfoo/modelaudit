@@ -219,6 +219,94 @@ class TestTarScanner:
         assert python_checks[0].rule_code == "S101"
         assert python_checks[0].details["reason"] == "high-risk calls: os.system"
 
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            b"import os\nos.__dict__['sys' + 'tem']('echo hidden')\n",
+            b"import os as operating_system\nvars(operating_system)['system']('echo hidden')\n",
+            b"import os\nos.__dict__.get('sys' + 'tem')('echo hidden')\n",
+            b"import os\nos.__dict__.get('missing', os.system)('echo hidden')\n",
+            b"import os\nvars(os).get('system')('echo hidden')\n",
+            b"import os\ngetattr(os, '__dict__')['system']('echo hidden')\n",
+            b"import os\ngetattr(os, '__dict__').get('system')('echo hidden')\n",
+            b"import os\nos.__dict__.pop('system')('echo hidden')\n",
+            b"import os\nos.__dict__.setdefault('system', None)('echo hidden')\n",
+            b"import os\nos.__dict__.setdefault('missing', os.system)('echo hidden')\n",
+            b"import os\nos.__getattribute__('system')('echo hidden')\n",
+            b"import os\nlookup = os.__getattribute__\nlookup('system')('echo hidden')\n",
+            b"import os\nobject.__getattribute__(os, 'system')('echo hidden')\n",
+            b"import os\ncommands = os.__dict__\ncommands['system']('echo hidden')\n",
+            b"import os\nlookup = os.__dict__.get\nlookup('system')('echo hidden')\n",
+            b"import os\ncommands = vars(os)\ncommands.get('system')('echo hidden')\n",
+            b"import os\ncommands = getattr(os, '__dict__')\ncommands['system']('echo hidden')\n",
+            b"import os\ndict.get(os.__dict__, 'system')('echo hidden')\n",
+            b"import os\ndict.get(os.__dict__, 'missing', os.system)('echo hidden')\n",
+            b"import os\ndict.__getitem__(os.__dict__, 'system')('echo hidden')\n",
+            b"import os\ndict.pop(os.__dict__, 'missing', os.system)('echo hidden')\n",
+            b"import os\ndict.setdefault(os.__dict__, 'missing', os.system)('echo hidden')\n",
+        ],
+        ids=[
+            "module_dict",
+            "vars_module",
+            "module_dict_get",
+            "module_dict_get_default",
+            "vars_get",
+            "getattr_dict",
+            "getattr_dict_get",
+            "module_dict_pop",
+            "module_dict_setdefault",
+            "module_dict_setdefault_default",
+            "module_getattribute",
+            "bound_getattribute_alias",
+            "object_getattribute",
+            "assigned_module_dict",
+            "bound_dict_get_alias",
+            "assigned_vars",
+            "assigned_getattr_dict",
+            "unbound_dict_get",
+            "unbound_dict_get_default",
+            "unbound_dict_getitem",
+            "unbound_dict_pop_default",
+            "unbound_dict_setdefault_default",
+        ],
+    )
+    def test_scan_tar_flags_static_namespace_dangerous_python_member(self, tmp_path: Path, payload: bytes) -> None:
+        """Static module namespace dispatch should still resolve risky calls."""
+        archive_path = tmp_path / "model_bundle.tar"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].severity == IssueSeverity.WARNING
+        assert python_checks[0].rule_code == "S101"
+        assert python_checks[0].details["reason"] == "high-risk calls: os.system"
+
+    def test_scan_tar_flags_builtins_namespace_dangerous_python_member(self, tmp_path: Path) -> None:
+        """Injected builtins namespaces should normalize to the builtins high-risk call names."""
+        archive_path = tmp_path / "model_bundle.tar"
+        payload = b"__builtins__.__dict__['eval']('1 + 1')\n"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("handler.py")
+            info.size = len(payload)
+            archive.addfile(info, tarfile.io.BytesIO(payload))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        python_checks = [check for check in result.checks if check.name == "Python Archive Member Security"]
+        assert len(python_checks) == 1
+        assert python_checks[0].status == CheckStatus.FAILED
+        assert python_checks[0].severity == IssueSeverity.WARNING
+        assert python_checks[0].rule_code == "S104"
+        assert python_checks[0].details["reason"] == "high-risk calls: builtins.eval"
+
     def test_scan_tar_flags_rebound_dangerous_python_member(self, tmp_path: Path) -> None:
         """Callable rebindings should not bypass generic TAR Python member scanning."""
         archive_path = tmp_path / "model_bundle.tar"
@@ -403,6 +491,27 @@ class TestTarScanner:
         """Benign Python source in generic TAR archives should not produce security findings."""
         archive_path = tmp_path / "model_bundle.tar"
         source = b"def preprocess(value: str) -> str:\n    return value.strip().lower()\n"
+
+        with tarfile.open(archive_path, "w") as archive:
+            info = tarfile.TarInfo("preprocess.py")
+            info.size = len(source)
+            archive.addfile(info, tarfile.io.BytesIO(source))  # type: ignore[attr-defined]
+
+        result = self.scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert not any(check.name == "Python Archive Member Security" for check in result.checks)
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    @pytest.mark.parametrize("dispatch", [b"handlers['system'](1.0)\n", b"handlers.get('system')(1.0)\n"])
+    def test_scan_tar_ignores_benign_dictionary_dispatch_python_member(self, tmp_path: Path, dispatch: bytes) -> None:
+        """Ordinary application dictionaries should not be treated as module namespaces."""
+        archive_path = tmp_path / "model_bundle.tar"
+        source = (
+            b"def normalize(value: float) -> float:\n"
+            b"    return value / 255.0\n"
+            b"handlers = {'system': normalize}\n" + dispatch
+        )
 
         with tarfile.open(archive_path, "w") as archive:
             info = tarfile.TarInfo("preprocess.py")
