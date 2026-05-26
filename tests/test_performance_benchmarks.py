@@ -4,11 +4,37 @@ import os
 import statistics
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from modelaudit.core import scan_model_directory_or_file
+
+
+def _current_rss_mb() -> float | None:
+    """Return current process RSS in MB, or None when the host cannot report it."""
+    try:
+        import psutil  # type: ignore[import-untyped]
+
+        rss_bytes = cast(int, psutil.Process(os.getpid()).memory_info().rss)
+        return float(rss_bytes) / 1024 / 1024
+    except Exception:
+        pass
+
+    try:
+        status = Path("/proc/self/status").read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+    for line in status.splitlines():
+        if line.startswith("VmRSS:"):
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    return int(parts[1]) / 1024
+                except ValueError:
+                    return None
+    return None
 
 
 @pytest.mark.performance
@@ -188,30 +214,28 @@ class TestPerformanceBenchmarks:
         if not assets_dir.exists():
             pytest.skip("Assets directory does not exist")
 
-        try:
-            import os
+        scan_kwargs: dict[str, Any] = {"cache_enabled": False}
 
-            import psutil  # type: ignore[import-untyped]
-        except ImportError:
-            pytest.skip("psutil not available for memory testing")
-
-        process = psutil.Process(os.getpid())
-
-        # Exclude lazy imports and process-scoped caches from retained-growth measurement.
-        warmup_results = scan_model_directory_or_file(str(assets_dir))
+        # Exclude lazy imports from retained-growth measurement while keeping
+        # scan-result caching out of the guarded loop.
+        warmup_results = scan_model_directory_or_file(str(assets_dir), **scan_kwargs)
         assert warmup_results.success, "Warm-up scan should succeed"
         del warmup_results
         gc.collect()
-        initial_memory = process.memory_info().rss / 1024 / 1024  # MB
+        initial_memory = _current_rss_mb()
+        if initial_memory is None:
+            pytest.skip("Current process RSS is not available for memory testing")
 
         # Keep five total scans while measuring repeat-scan stability after warm-up.
         for _ in range(4):
-            results = scan_model_directory_or_file(str(assets_dir))
+            results = scan_model_directory_or_file(str(assets_dir), **scan_kwargs)
             assert results.success, "Scan should succeed"
 
         del results
         gc.collect()
-        final_memory = process.memory_info().rss / 1024 / 1024  # MB
+        final_memory = _current_rss_mb()
+        if final_memory is None:
+            pytest.skip("Current process RSS is not available for memory testing")
         memory_growth = final_memory - initial_memory
 
         # Memory growth should be reasonable

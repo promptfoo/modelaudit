@@ -32,7 +32,7 @@ The PR benchmark lane lives in:
 
 - `tests/benchmarks/test_scan_benchmarks.py`
 - `tests/benchmarks/test_picklescan_benchmarks.py`
-- `tests/test_performance_benchmarks.py` (`test_memory_usage_stability` guard only)
+- `tests/test_performance_benchmarks.py` (`test_memory_usage_stability` cache-disabled guard only)
 - `.github/workflows/perf.yml`
 - `scripts/benchmark_report.py`
 
@@ -66,7 +66,7 @@ user-relevant workload or guards a security-critical hot path.
 
 The GitHub Actions performance workflow runs the benchmark suite on the PR base
 and head, posts a sticky summary comment, and uploads JSON plus Markdown
-artifacts. It also runs the retained-memory stability guard from
+artifacts. It also runs the cache-disabled retained-memory stability guard from
 `tests/test_performance_benchmarks.py`; older timing-sensitive tests in that
 module remain outside the PR lane. The comparative benchmark report is
 advisory, while a failed retained-memory guard fails the workflow.
