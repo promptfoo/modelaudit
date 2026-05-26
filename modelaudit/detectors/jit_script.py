@@ -635,13 +635,12 @@ class JITScriptDetector:
                 and builtin_name not in bounded_dangerous_builtins
             ):
                 continue
-            if (
-                description == _OS_CODE_EXECUTION_DESCRIPTION
-                and bounded_os_process_calls is not None
-                and not bounded_os_process_calls
-            ):
-                continue
-            if re.search(pattern, bounded):  # Limit search size
+            resolved_os_process_call = False
+            if description == _OS_CODE_EXECUTION_DESCRIPTION and bounded_os_process_calls is not None:
+                if not bounded_os_process_calls:
+                    continue
+                resolved_os_process_call = True
+            if resolved_os_process_call or re.search(pattern, bounded):  # Limit search size
                 findings.append(
                     create_jit_finding(
                         message=description,

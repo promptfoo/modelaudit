@@ -1040,6 +1040,7 @@ def test_pytorch_zip_scans_unmarked_python_blobs_in_archive_data(tmp_path: Path)
         b"def payload():\n    return os.posix_spawn('/bin/sh', ['sh'], {})\n",
         b"def payload():\n    return os.posix_spawnp('sh', ['sh'], {})\n",
         b"def payload():\n    return os.startfile('payload.exe')\n",
+        b"def payload():\n    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], {})\n",
     ],
 )
 def test_pytorch_zip_scans_unmarked_os_process_launch_in_archive_data(tmp_path: Path, payload: bytes) -> None:

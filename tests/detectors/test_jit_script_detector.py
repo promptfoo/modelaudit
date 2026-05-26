@@ -242,6 +242,7 @@ class TestJITScriptDetector:
             b"def payload():\n    return os.posix_spawn('/bin/sh', ['sh'], {})\n",
             b"def payload():\n    return os.posix_spawnp('sh', ['sh'], {})\n",
             b"def payload():\n    return os.startfile('payload.exe')\n",
+            b"def payload():\n    return getattr(os, 'posix_' + 'spawn')('/bin/sh', ['sh'], {})\n",
         ],
     )
     def test_scan_model_detects_unmarked_os_process_launch(self, source: bytes) -> None:
