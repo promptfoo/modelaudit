@@ -1024,8 +1024,16 @@ def test_scan_nested_file_xgboost_only_selection_skips_overlap_mxnet_analysis(tm
     result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
 
     assert result.scanner_name == "xgboost"
+    assert result.success is True
     assert not any(issue.details.get("attribute") == "library" for issue in result.issues)
     assert "mxnet" in result.metadata["skipped_scanner_ids"]
+    assert "xgboost_mxnet_symbol_overlap" not in result.metadata.get("scan_outcome_reasons", [])
+    assert any(
+        check.name == "Scanner Selection"
+        and check.details.get("skipped_scanner_id") == "mxnet"
+        and check.details.get("kind") == "embedded"
+        for check in result.checks
+    )
 
 
 def test_scan_nested_file_does_not_cap_canonical_json_overlap_to_renamed_probe_budget(

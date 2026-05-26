@@ -571,7 +571,7 @@ class XGBoostScanner(BaseScanner):
                 scanner_selection,
                 context="overlapping JSON analysis",
             )
-            analysis_message = "MXNet static analysis was skipped by scanner selection policy"
+            return
         reason = self._INCONCLUSIVE_REASONS["json_mxnet_overlap"]
         result.add_check(
             name="XGBoost / MXNet JSON Routing",

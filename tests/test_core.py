@@ -2344,13 +2344,54 @@ def test_scan_file_xgboost_only_selection_skips_overlap_mxnet_analysis(tmp_path:
     result = scan_file(str(model_path), config={"scanners": ["xgboost"], "cache_enabled": False})
 
     assert result.scanner_name == "xgboost"
+    assert result.success is True
     assert not any(issue.details.get("attribute") == "library" for issue in result.issues)
     assert "mxnet" in result.metadata["skipped_scanner_ids"]
+    assert "xgboost_mxnet_symbol_overlap" not in result.metadata.get("scan_outcome_reasons", [])
     assert any(
-        check.name == "XGBoost / MXNet JSON Routing"
-        and "MXNet static analysis was skipped by scanner selection policy" in check.message
+        check.name == "Scanner Selection"
+        and check.details.get("skipped_scanner_id") == "mxnet"
+        and check.details.get("kind") == "embedded"
         for check in result.checks
     )
+
+
+def test_scan_file_xgboost_only_overlap_is_clean_and_cached(tmp_path: Path) -> None:
+    model_path = tmp_path / "polyglot.json"
+    model_path.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],"padding":"'
+        + ("x" * (10 * 1024))
+        + '"}',
+        encoding="utf-8",
+    )
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(model_path),
+            scanners=["xgboost"],
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(model_path),
+            scanners=["xgboost"],
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(model_path)]
+            assert aggregate.success is True
+            assert "xgboost_mxnet_symbol_overlap" not in metadata.get("scan_outcome_reasons", [])
+            assert core_module.determine_exit_code(aggregate) == 0
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] > 0
+    finally:
+        reset_cache_manager()
 
 
 def test_scan_file_xgboost_mxnet_overlap_with_security_finding_is_exit1(tmp_path: Path) -> None:
