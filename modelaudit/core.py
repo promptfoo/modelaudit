@@ -30,6 +30,13 @@ from modelaudit.scanner_selection import (
 from modelaudit.scanners import _registry
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
+from modelaudit.scanners.routing import (
+    HEADER_FORMAT_TO_SCANNER_ID as _ROUTED_HEADER_FORMAT_TO_SCANNER_ID,
+)
+from modelaudit.scanners.routing import (
+    routed_scanner_can_handle,
+    select_routed_scanner_id,
+)
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.file.detection import (
@@ -38,11 +45,6 @@ from modelaudit.utils.file.detection import (
     detect_file_format,
     detect_file_format_from_magic,
     detect_format_from_extension,
-    is_executorch_archive,
-    is_keras_zip_archive,
-    is_pytorch_zip_archive,
-    is_skops_archive,
-    is_torchserve_mar_archive,
     validate_file_type_with_formats,
 )
 from modelaudit.utils.file.handlers import (
@@ -100,9 +102,8 @@ _normalize_unclassified_scan_failure = core_results.normalize_unclassified_scan_
 determine_exit_code = core_results.determine_exit_code
 merge_scan_result = core_results.merge_scan_result
 
-HEADER_FORMAT_TO_SCANNER_ID = _registry.get_header_format_to_scanner_ids()
-_COMPRESSED_HEADER_FORMATS = frozenset({"compressed", "gzip", "bzip2", "xz", "lz4", "zlib"})
-_R_SERIALIZED_EXTENSIONS = frozenset({".rds", ".rda", ".rdata"})
+# Compatibility export consumed by asset-extraction tests and integrations.
+HEADER_FORMAT_TO_SCANNER_ID = _ROUTED_HEADER_FORMAT_TO_SCANNER_ID
 _XGBOOST_BINARY_EXTENSIONS = frozenset({".bst"})
 _XGBOOST_PICKLE_SPOOF_REASON = "xgboost_binary_pickle_spoof"
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
@@ -188,43 +189,7 @@ def _allowed_shard_paths_from_config(config: dict[str, Any]) -> list[str] | None
 
 def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str | None:
     """Select a scanner by trusted file structure, not just suffix."""
-    if header_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
-        return "protobuf_model_candidate"
-
-    if header_format == "zip":
-        if is_torchserve_mar_archive(path):
-            return "torchserve_mar"
-        if is_keras_zip_archive(path, allow_config_only=ext == ".keras"):
-            return "keras_zip"
-        if is_pytorch_zip_archive(path):
-            return "pytorch_zip"
-        if is_executorch_archive(path):
-            return "executorch"
-        if is_skops_archive(path):
-            return "skops"
-        if ext == ".skops":
-            return "skops"
-        if ext == ".joblib":
-            return "joblib"
-        return "zip"
-
-    if ext == ".joblib" and header_format in _COMPRESSED_HEADER_FORMATS | {"pickle"}:
-        return "joblib"
-
-    if ext in _R_SERIALIZED_EXTENSIONS and header_format in _COMPRESSED_HEADER_FORMATS | {"r_serialized"}:
-        return "r_serialized"
-
-    if header_format == "tar" and ext == ".nemo":
-        return "nemo"
-
-    return _registry.get_scanner_id_for_header_format(header_format)
-
-
-def _is_direct_header_route(scanner_id: str, header_format: str) -> bool:
-    """Return whether the detected header directly maps to this scanner."""
-    if header_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
-        return scanner_id == "protobuf_model_candidate"
-    return header_format != "unknown" and HEADER_FORMAT_TO_SCANNER_ID.get(header_format) == scanner_id
+    return select_routed_scanner_id(path, header_format, extension=ext)
 
 
 def _preferred_scanner_can_handle(
@@ -234,19 +199,7 @@ def _preferred_scanner_can_handle(
     path: str,
 ) -> bool:
     """Honor trusted header routing even when scanner can_handle is suffix-gated."""
-    if scanner_class.can_handle(path):
-        return True
-
-    if os.path.exists(path) and _is_direct_header_route(scanner_id, header_format):
-        logger.debug(
-            "Using %s scanner for %s based on detected %s header despite can_handle rejection",
-            scanner_class.name,
-            path,
-            header_format,
-        )
-        return True
-
-    return False
+    return routed_scanner_can_handle(scanner_class, scanner_id, header_format, path)
 
 
 def _mark_xgboost_pickle_extension_spoof(result: ScanResult, path: str, ext: str) -> None:
