@@ -69,7 +69,7 @@ def _build_tf_metagraph_bytes(
     return cast(bytes, metagraph.SerializeToString())
 
 
-def _build_tf_savedmodel_bytes() -> bytes:
+def _build_tf_savedmodel_bytes(*, node_name: str = "const_node", node_op: str = "Const") -> bytes:
     import modelaudit.protos  # noqa: F401
 
     saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
@@ -77,8 +77,8 @@ def _build_tf_savedmodel_bytes() -> bytes:
     saved_model.saved_model_schema_version = 1
     metagraph = saved_model.meta_graphs.add()
     node = metagraph.graph_def.node.add()
-    node.name = "const_node"
-    node.op = "Const"
+    node.name = node_name
+    node.op = node_op
     return cast(bytes, saved_model.SerializeToString())
 
 
@@ -621,6 +621,27 @@ def test_detect_renamed_tf_savedmodel_by_strict_parse_without_promoting_generic_
     assert detect_file_format_from_magic(str(disguised_savedmodel)) == "tf_savedmodel"
     assert detect_file_format_for_skip_filter(str(disguised_savedmodel)) == "tf_savedmodel"
     assert detect_file_format(str(disguised_savedmodel)) == "tf_savedmodel"
+    assert detect_file_format_from_magic(str(generic_protobuf)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
+    assert detect_file_format(str(generic_protobuf)) == "unknown"
+
+
+def test_detect_renamed_malformed_tf_savedmodel_with_recovered_graph_structure(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    malformed_savedmodel = tmp_path / "saved-tail.jpg"
+    nameless_op_savedmodel = tmp_path / "saved-nameless-tail.jpg"
+    generic_protobuf = tmp_path / "generic-saved-tail.jpg"
+    malformed_savedmodel.write_bytes(_build_tf_savedmodel_bytes() + b"\xff")
+    nameless_op_savedmodel.write_bytes(_build_tf_savedmodel_bytes(node_name="", node_op="PyFunc") + b"\xff")
+    generic_protobuf.write_bytes(b"\x08\x01\x12\x02\x08\x01\xff")
+
+    for path in (malformed_savedmodel, nameless_op_savedmodel):
+        assert detect_file_format_from_magic(str(path)) == "tf_savedmodel"
+        assert detect_file_format_for_skip_filter(str(path)) == "tf_savedmodel"
+        assert detect_file_format(str(path)) == "tf_savedmodel"
+
     assert detect_file_format_from_magic(str(generic_protobuf)) == "unknown"
     assert detect_file_format_for_skip_filter(str(generic_protobuf)) == "unknown"
     assert detect_file_format(str(generic_protobuf)) == "unknown"

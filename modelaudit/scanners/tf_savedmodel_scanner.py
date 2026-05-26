@@ -35,6 +35,7 @@ DANGEROUS_TF_OPERATIONS = {
 
 # Python operations that require special handling
 PYTHON_OPS = ("PyFunc", "PyCall", "PyFuncStateless", "EagerPyFunc")
+SAVEDMODEL_PARSE_INCONCLUSIVE_REASON = "savedmodel_protobuf_parse_failed"
 
 _ASSET_SCRIPT_SHEBANG = b"#!"
 _ASSET_ELF_HEADER = b"\x7fELF"
@@ -261,7 +262,23 @@ class TensorFlowSavedModelScanner(BaseScanner):
                 result.bytes_scanned = len(content)
 
                 saved_model = SavedModel()
-                saved_model.ParseFromString(content)
+                try:
+                    saved_model.ParseFromString(content)
+                except Exception as parse_error:
+                    mark_inconclusive_scan_result(result, SAVEDMODEL_PARSE_INCONCLUSIVE_REASON)
+                    result.add_check(
+                        name="SavedModel Parsing",
+                        passed=False,
+                        message=f"Invalid or corrupt TensorFlow SavedModel protobuf: {parse_error}",
+                        severity=IssueSeverity.INFO,
+                        location=path,
+                        details={
+                            "exception": str(parse_error),
+                            "exception_type": type(parse_error).__name__,
+                            "analysis_incomplete": True,
+                            "scan_outcome_reason": SAVEDMODEL_PARSE_INCONCLUSIVE_REASON,
+                        },
+                    )
                 for op_info in self._scan_tf_operations(saved_model):
                     result.add_check(
                         name="TensorFlow Operation Security Check",

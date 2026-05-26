@@ -21,6 +21,7 @@ from modelaudit.core import scan_file, scan_model_directory_or_file
 from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.tf_metagraph_scanner import _MAX_PARSE_BYTES, METAGRAPH_PARSE_INCONCLUSIVE_REASON
+from modelaudit.scanners.tf_savedmodel_scanner import SAVEDMODEL_PARSE_INCONCLUSIVE_REASON
 from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from tests.helpers import (
@@ -84,7 +85,7 @@ def _build_malicious_collection_only_tf_metagraph() -> bytes:
     return cast(bytes, metagraph.SerializeToString())
 
 
-def _build_malicious_tf_savedmodel() -> bytes:
+def _build_malicious_tf_savedmodel(*, node_name: str = "pyfunc_node") -> bytes:
     import modelaudit.protos  # noqa: F401
 
     saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
@@ -92,8 +93,20 @@ def _build_malicious_tf_savedmodel() -> bytes:
     saved_model.saved_model_schema_version = 1
     metagraph = saved_model.meta_graphs.add()
     node = metagraph.graph_def.node.add()
-    node.name = "pyfunc_node"
+    node.name = node_name
     node.op = "PyFunc"
+    return cast(bytes, saved_model.SerializeToString())
+
+
+def _build_benign_tf_savedmodel() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
+    saved_model = saved_model_pb2.SavedModel()
+    saved_model.saved_model_schema_version = 1
+    node = saved_model.meta_graphs.add().graph_def.node.add()
+    node.name = "const_node"
+    node.op = "Const"
     return cast(bytes, saved_model.SerializeToString())
 
 
@@ -2174,6 +2187,75 @@ def test_scan_file_detects_malicious_renamed_tf_savedmodel_by_content(tmp_path: 
         issue.severity == IssueSeverity.CRITICAL and "PyFunc operation detected" in issue.message
         for issue in result.issues
     )
+
+
+def test_scan_file_marks_malformed_renamed_tf_savedmodel_inconclusive_and_uncached(tmp_path: Path) -> None:
+    disguised_savedmodel = tmp_path / "saved-malformed.jpg"
+    disguised_savedmodel.write_bytes(_build_benign_tf_savedmodel() + b"\xff")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        result = scan_file(str(disguised_savedmodel), config=config)
+        repeated_result = scan_file(str(disguised_savedmodel), config=config)
+
+        assert result.scanner_name == "tf_savedmodel"
+        assert result.success is False
+        assert repeated_result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert SAVEDMODEL_PARSE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    aggregate = scan_model_directory_or_file(str(disguised_savedmodel), cache_scan_results=False)
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_preserves_malicious_findings_from_malformed_renamed_tf_savedmodel(tmp_path: Path) -> None:
+    disguised_savedmodel = tmp_path / "saved-malicious-tail.jpg"
+    disguised_savedmodel.write_bytes(_build_malicious_tf_savedmodel() + b"\xff")
+
+    result = scan_file(str(disguised_savedmodel), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(disguised_savedmodel), cache_scan_results=False)
+
+    assert result.scanner_name == "tf_savedmodel"
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert SAVEDMODEL_PARSE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and "PyFunc operation detected" in issue.message
+        and issue.details.get("op_type") == "PyFunc"
+        for issue in result.issues
+    )
+    assert core_module.determine_exit_code(aggregate) == 1
+
+
+def test_scan_file_preserves_nameless_malicious_findings_from_malformed_renamed_tf_savedmodel(
+    tmp_path: Path,
+) -> None:
+    disguised_savedmodel = tmp_path / "saved-nameless-malicious-tail.jpg"
+    disguised_savedmodel.write_bytes(_build_malicious_tf_savedmodel(node_name="") + b"\xff")
+
+    result = scan_file(str(disguised_savedmodel), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(disguised_savedmodel), cache_scan_results=False)
+
+    assert result.scanner_name == "tf_savedmodel"
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert SAVEDMODEL_PARSE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and "PyFunc operation detected" in issue.message
+        and issue.details.get("op_type") == "PyFunc"
+        for issue in result.issues
+    )
+    assert core_module.determine_exit_code(aggregate) == 1
 
 
 def test_scan_file_routes_oversized_renamed_tf_metagraph_to_fail_closed_scan(tmp_path: Path) -> None:
