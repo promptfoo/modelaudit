@@ -183,6 +183,33 @@ def create_mock_onnx(
     return path
 
 
+def create_mock_mxnet_symbol(path: Path, *, custom_library: str | None = None) -> Path:
+    """Create a minimal MXNet symbol graph, optionally with a custom library reference."""
+    nodes: list[dict[str, Any]] = [{"op": "null", "name": "data", "inputs": []}]
+    if custom_library is not None:
+        nodes.append(
+            {
+                "op": "Custom",
+                "name": "custom_loader",
+                "attrs": {"library": custom_library, "op_type": "unsafe_loader"},
+                "inputs": [[0, 0, 0]],
+            }
+        )
+
+    path.write_text(
+        json.dumps(
+            {
+                "nodes": nodes,
+                "arg_nodes": [0],
+                "heads": [[len(nodes) - 1, 0, 0]],
+                "attrs": {"metadata": "benign metadata"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def create_mock_manifest(path: Path, content: dict[str, Any] | None = None) -> Path:
     """Create a mock model manifest JSON file.
 
