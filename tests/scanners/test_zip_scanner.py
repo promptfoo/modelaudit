@@ -1569,6 +1569,14 @@ def test_scan_nested_file_inconclusive_params_routing_honors_excluded_mxnet(tmp_
     assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
     assert not any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
     assert not any("Suspicious executable token" in issue.message for issue in result.issues)
+    assert "mxnet" in result.metadata["skipped_scanner_ids"]
+    assert any(
+        check.name == "Scanner Selection"
+        and check.details.get("skipped_scanner_id") == "mxnet"
+        and check.details.get("context") == "inconclusive MXNet params byte analysis"
+        and check.details.get("kind") == "embedded"
+        for check in result.checks
+    )
 
 
 def test_scan_nested_file_generic_json_value_budget_before_mxnet_structure_detects_library(tmp_path: Path) -> None:

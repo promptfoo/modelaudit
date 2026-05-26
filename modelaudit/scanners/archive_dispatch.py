@@ -327,8 +327,17 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
         for reason in existing_reasons:
             mark_inconclusive_scan_result(result, reason)
 
-    if scanner_selection.allows("mxnet"):
-        MXNetScanner(config=config).scan_params_file_security(path, result)
+    if os.path.splitext(path)[1].lower() == ".params":
+        if scanner_selection.allows("mxnet"):
+            MXNetScanner(config=config).scan_params_file_security(path, result)
+        elif scanner_selection.active:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "mxnet",
+                scanner_selection,
+                context="inconclusive MXNet params byte analysis",
+            )
 
     manifest_covered_templates = False
     if ManifestScanner.can_handle(path):

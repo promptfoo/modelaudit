@@ -2577,6 +2577,14 @@ def test_scan_file_inconclusive_params_routing_honors_excluded_mxnet(tmp_path: P
     assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
     assert not any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
     assert not any("Suspicious executable token" in issue.message for issue in result.issues)
+    assert "mxnet" in result.metadata["skipped_scanner_ids"]
+    assert any(
+        check.name == "Scanner Selection"
+        and check.details.get("skipped_scanner_id") == "mxnet"
+        and check.details.get("context") == "inconclusive MXNet params byte analysis"
+        and check.details.get("kind") == "embedded"
+        for check in result.checks
+    )
 
 
 def test_scan_file_xgboost_mxnet_overlap_with_security_finding_is_exit1(tmp_path: Path) -> None:
