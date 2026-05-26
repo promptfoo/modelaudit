@@ -6,7 +6,7 @@ import struct
 import tarfile
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO
+from typing import Any, BinaryIO, Literal
 
 from ...scanner_registry_metadata import get_extension_format_map
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
@@ -38,7 +38,8 @@ _CNTK_V2_STRUCTURE_MARKERS = (b"CompositeFunction", b"primitive_functions", b"Pr
 _CNTK_SIGNATURE_READ_BYTES = 4096
 _TF_METAGRAPH_MIN_BYTES = 8
 _TF_METAGRAPH_MAX_VALIDATE_BYTES = 20 * 1024 * 1024
-_TF_METAGRAPH_MAX_ROUTING_FIELDS = 4096
+_TF_METAGRAPH_MAX_ROUTING_FIELDS = 32768
+_TensorFlowProtoRoute = Literal["unknown", "tf_metagraph", "tf_savedmodel", "inconclusive"]
 _TORCH7_SIGNATURE_READ_BYTES = 4096
 _LIGHTGBM_SIGNATURE_READ_BYTES = 8192
 _ONNX_PROTO_SIGNATURE_READ_BYTES = 1024 * 1024
@@ -1443,37 +1444,48 @@ def _read_proto_varint_stream(stream: BinaryIO) -> int | None:
     return None
 
 
-def _is_tensorflow_graph_field_payload(payload: bytes) -> bool:
-    """Validate a bounded protobuf field as TensorFlow graph-bearing content."""
+def _has_tensorflow_node_signal(node: Any) -> bool:
+    return bool(node.name or node.op or node.input or node.attr)
+
+
+def _has_tensorflow_graph_signal(graph_def: Any) -> bool:
+    return any(_has_tensorflow_node_signal(node) for node in graph_def.node) or any(
+        _has_tensorflow_node_signal(node) for function in graph_def.library.function for node in function.node_def
+    )
+
+
+def _classify_tensorflow_field_two_payload(payload: bytes) -> _TensorFlowProtoRoute:
+    """Classify a bounded protobuf field 2 payload from MetaGraph/SavedModel wrappers."""
     try:
         import modelaudit.protos  # noqa: F401, I001
 
+        from google.protobuf.message import DecodeError
         from tensorflow.core.framework.graph_pb2 import GraphDef
         from tensorflow.core.protobuf.meta_graph_pb2 import MetaGraphDef
     except Exception:
-        return False
-    try:
-        graph_def = GraphDef()
-        graph_def.ParseFromString(payload)
-        if len(graph_def.node) > 0 or any(function.node_def for function in graph_def.library.function):
-            return True
-    except Exception:
-        # The payload may be a MetaGraphDef rather than a GraphDef; try that representation next.
-        pass
+        return "unknown"
     try:
         metagraph = MetaGraphDef()
         metagraph.ParseFromString(payload)
-        return metagraph.HasField("graph_def") and (
-            len(metagraph.graph_def.node) > 0
-            or any(function.node_def for function in metagraph.graph_def.library.function)
-            or len(metagraph.collection_def) > 0
-        )
+        if len(metagraph.collection_def) > 0 or (
+            metagraph.HasField("graph_def") and _has_tensorflow_graph_signal(metagraph.graph_def)
+        ):
+            return "tf_savedmodel"
+    except (DecodeError, ValueError, TypeError, AttributeError):
+        # Payload may be a raw GraphDef rather than a MetaGraphDef; try that representation next.
+        pass
+    try:
+        graph_def = GraphDef()
+        graph_def.ParseFromString(payload)
+        if _has_tensorflow_graph_signal(graph_def):
+            return "tf_metagraph"
     except Exception:
-        return False
+        return "unknown"
+    return "unknown"
 
 
-def _is_tensorflow_metainfo_payload(payload: bytes) -> bool:
-    """Return whether a bounded field looks like TensorFlow MetaGraph metadata."""
+def _is_tensorflow_collection_payload(payload: bytes) -> bool:
+    """Return whether a bounded field looks like a TensorFlow collection entry."""
     try:
         import modelaudit.protos  # noqa: F401, I001
 
@@ -1481,16 +1493,9 @@ def _is_tensorflow_metainfo_payload(payload: bytes) -> bool:
     except Exception:
         return False
     try:
-        meta_info = MetaGraphDef.MetaInfoDef()
-        meta_info.ParseFromString(payload)
-        return bool(
-            meta_info.meta_graph_version
-            or meta_info.tags
-            or meta_info.tensorflow_version
-            or meta_info.tensorflow_git_version
-            or meta_info.stripped_op_list.op
-            or meta_info.any_info.type_url
-        )
+        collection_entry = MetaGraphDef.CollectionDefEntry()
+        collection_entry.ParseFromString(payload)
+        return bool(collection_entry.key and collection_entry.value.WhichOneof("kind"))
     except Exception:
         return False
 
@@ -1544,53 +1549,57 @@ def _skip_proto_stream_value(
     return True
 
 
-def _has_bounded_tensorflow_graph_field(path: Path, file_size: int) -> bool:
+def _classify_bounded_tensorflow_protobuf(path: Path, file_size: int) -> _TensorFlowProtoRoute:
     """Seek past top-level protobuf values while looking for TensorFlow graph content."""
     try:
-        seen_tensorflow_wrapper_signal = False
         remaining_fields = [_TF_METAGRAPH_MAX_ROUTING_FIELDS]
         with path.open("rb") as stream:
             while remaining_fields[0] > 0:
                 remaining_fields[0] -= 1
                 if stream.tell() >= file_size:
-                    return False
+                    return "unknown"
                 tag = _read_proto_varint_stream(stream)
                 if tag is None:
-                    return False
+                    return "unknown"
                 field_number = tag >> 3
                 wire_type = tag & 0x07
                 if field_number == 0:
-                    return False
+                    return "unknown"
                 if field_number == 1 and wire_type == 0:
                     if _read_proto_varint_stream(stream) is None:
-                        return False
+                        return "unknown"
                     continue
                 if field_number == 1 and wire_type == 2:
                     length = _read_proto_varint_stream(stream)
                     if length is None or stream.tell() + length > file_size:
-                        return False
-                    if length <= _TF_METAGRAPH_MAX_VALIDATE_BYTES:
-                        payload = stream.read(length)
-                        if len(payload) != length:
-                            return False
-                        seen_tensorflow_wrapper_signal = (
-                            seen_tensorflow_wrapper_signal or _is_tensorflow_metainfo_payload(payload)
-                        )
-                    else:
-                        stream.seek(length, 1)
+                        return "unknown"
+                    stream.seek(length, 1)
                     continue
                 if field_number == 2 and wire_type == 2:
                     length = _read_proto_varint_stream(stream)
                     if length is None or stream.tell() + length > file_size:
-                        return False
+                        return "unknown"
                     if length > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
-                        # Preserve only oversized TensorFlow-like wrappers for fail-closed scanning.
-                        return seen_tensorflow_wrapper_signal
+                        # Field 2 is graph_def on MetaGraphDef and meta_graphs on SavedModel.
+                        return "inconclusive"
                     payload = stream.read(length)
                     if len(payload) != length:
-                        return False
-                    if _is_tensorflow_graph_field_payload(payload):
-                        return True
+                        return "unknown"
+                    payload_route = _classify_tensorflow_field_two_payload(payload)
+                    if payload_route != "unknown":
+                        return payload_route
+                    continue
+                if field_number == 4 and wire_type == 2:
+                    length = _read_proto_varint_stream(stream)
+                    if length is None or stream.tell() + length > file_size:
+                        return "unknown"
+                    if length > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+                        return "inconclusive"
+                    payload = stream.read(length)
+                    if len(payload) != length:
+                        return "unknown"
+                    if _is_tensorflow_collection_payload(payload):
+                        return "tf_metagraph"
                     continue
                 if not _skip_proto_stream_value(
                     stream,
@@ -1599,25 +1608,25 @@ def _has_bounded_tensorflow_graph_field(path: Path, file_size: int) -> bool:
                     field_number=field_number,
                     remaining_fields=remaining_fields,
                 ):
-                    return False
+                    if remaining_fields[0] <= 0:
+                        return "inconclusive"
+                    return "unknown"
     except OSError:
-        return False
-    # Treat excessive unknown fields as unresolved rather than TensorFlow content.
-    return False
+        return "unknown"
+    return "inconclusive"
 
 
 def _detect_renamed_tensorflow_protobuf(file_path: Path, file_size: int) -> str:
     """Recognize renamed MetaGraph/SavedModel protobufs after bounded field discovery."""
-    if file_path.suffix.lower() in {".meta", ".pb"} or not _has_bounded_tensorflow_graph_field(file_path, file_size):
+    if file_path.suffix.lower() == ".json":
         return "unknown"
-    if file_size > _TF_METAGRAPH_MAX_VALIDATE_BYTES:
+    route = _classify_bounded_tensorflow_protobuf(file_path, file_size)
+    if route == "unknown":
+        return "unknown"
+    if route == "inconclusive":
         # Preserve plausible oversized content for bounded fail-closed MetaGraph handling.
         return "tf_metagraph"
-    if _is_tensorflow_metagraph_file(str(file_path)):
-        return "tf_metagraph"
-    if _is_tensorflow_saved_model_file(str(file_path)):
-        return "tf_savedmodel"
-    return "unknown"
+    return route
 
 
 def _has_torch7_ascii_object_signature(prefix: bytes) -> bool:
@@ -1864,8 +1873,8 @@ def detect_file_format_from_magic(path: str) -> str:
         if size < 4:
             return "unknown"
 
-        if file_path.suffix.lower() == ".meta":
-            return "tf_metagraph" if _is_tensorflow_metagraph_file(path) else "unknown"
+        if file_path.suffix.lower() == ".meta" and _is_tensorflow_metagraph_file(path):
+            return "tf_metagraph"
 
         with file_path.open("rb") as f:
             header = f.read(min(size, _TAR_BLOCK_SIZE))
@@ -2229,6 +2238,13 @@ def detect_file_format(path: str) -> str:
         if xml_format != "unknown":
             return xml_format
 
+    if ext == "":
+        xgboost_route = _detect_extensionless_xgboost_ubjson_route(
+            read_magic_bytes(path, min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
+        )
+        if xgboost_route is not None:
+            return xgboost_route
+
     renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
     if renamed_tensorflow_format != "unknown":
         return renamed_tensorflow_format
@@ -2286,10 +2302,8 @@ def detect_file_format(path: str) -> str:
             return "zip"
         # If not ZIP, assume pickle format
         return "pickle"
-    if ext == ".meta":
-        if _is_tensorflow_metagraph_file(path):
-            return "tf_metagraph"
-        return "unknown"
+    if ext == ".meta" and _is_tensorflow_metagraph_file(path):
+        return "tf_metagraph"
     if ext in (".ptl", ".pte"):
         if _has_zip_magic(magic4):
             return "executorch"
@@ -2458,11 +2472,19 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
             return True
 
         # TensorFlow protobuf files (.pb extension)
-        if ext_format == "protobuf" and header_format in {"protobuf", "unknown", "onnx"}:
+        if ext_format == "protobuf" and header_format in {
+            "protobuf",
+            "unknown",
+            "onnx",
+            "tf_metagraph",
+            "tf_savedmodel",
+        }:
             return True
 
         # TensorFlow MetaGraph files (.meta extension) require strict protobuf validation.
         if ext_format == "tf_metagraph":
+            if header_format == "tf_savedmodel":
+                return True
             return _is_tensorflow_metagraph_file(path)
 
         # PMML files are XML-based with <PMML> tag detection
