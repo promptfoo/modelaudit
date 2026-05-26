@@ -22,9 +22,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.sevenzip_scanner import HAS_PY7ZR, SevenZipScanner, _RecursiveScanBudget
+from modelaudit.scanners.xgboost_scanner import XGBoostScanner
 
 # Skip all tests if py7zr is not available for asset generation
 pytest_plugins: list[str] = []
@@ -48,6 +50,79 @@ def _mock_scan_result(
         )
     result.finish(success=True)
     return result
+
+
+def _ubjson_key(key: bytes) -> bytes:
+    return b"U" + bytes([len(key)]) + key
+
+
+def _ubjson_string(value: bytes) -> bytes:
+    return b"SL" + len(value).to_bytes(8, byteorder="big", signed=True) + value
+
+
+def _xgboost_ubjson_probe(
+    *, root_padding: int = 0, learner_padding: int = 0, learner_noop: bool = False, malicious: bool = False
+) -> bytes:
+    root_body = b""
+    if root_padding:
+        root_body += _ubjson_key(b"metadata") + _ubjson_string(b"x" * root_padding)
+    learner_body = b""
+    if learner_padding:
+        learner_body += _ubjson_key(b"metadata") + _ubjson_string(b"x" * learner_padding)
+    learner_body += _ubjson_key(b"learner_model_param") + b"{}"
+    if malicious:
+        learner_body += _ubjson_key(b"malicious_code") + _ubjson_string(b"system(cpu)")
+    learner_value = (b"N" if learner_noop else b"") + b"{" + learner_body + b"}"
+    return b"{" + root_body + _ubjson_key(b"learner") + learner_value + _ubjson_key(b"version") + b"[]" + b"}"
+
+
+def _xgboost_ubjson_counted_null_array_probe() -> bytes:
+    max_count = ((1 << 63) - 1).to_bytes(8, byteorder="big", signed=True)
+    learner = b"{" + _ubjson_key(b"learner_model_param") + b"{}" + _ubjson_key(b"payload") + b"[$Z#L" + max_count + b"}"
+    return b"{" + _ubjson_key(b"learner") + learner + _ubjson_key(b"version") + b"[]" + b"}"
+
+
+def _xgboost_ubjson_uncounted_null_array_probe(item_count: int) -> bytes:
+    learner = (
+        b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + _ubjson_key(b"payload")
+        + b"["
+        + (b"Z" * item_count)
+        + b"]}"
+    )
+    return b"{" + _ubjson_key(b"learner") + learner + b"}"
+
+
+def _xgboost_ubjson_noop_before_counted_root_header_probe() -> bytes:
+    return (
+        b"{N#U\x02"
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + _ubjson_key(b"version")
+        + b"[]"
+    )
+
+
+def _xgboost_ubjson_deep_before_counted_null_array_probe() -> bytes:
+    max_count = ((1 << 63) - 1).to_bytes(8, byteorder="big", signed=True)
+    nested = b"[" * 66 + b"Z" + b"]" * 66
+    learner = (
+        b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + _ubjson_key(b"nested")
+        + nested
+        + _ubjson_key(b"payload")
+        + b"[$Z#L"
+        + max_count
+        + b"}"
+    )
+    return b"{" + _ubjson_key(b"learner") + learner + b"}"
 
 
 class TestSevenZipScanner:
@@ -1408,6 +1483,32 @@ class TestSevenZipScannerHardening:
             assert mock_extract.call_args.args[1] == ["payload.jpg"]
             assert result.metadata["scannable_files"] == 1
 
+    def test_probe_confirmed_disguised_xgboost_member_is_retargeted_without_suffix(self, tmp_path: Path) -> None:
+        extracted_path = tmp_path / "model.jpg"
+        extracted_path.write_bytes(_xgboost_ubjson_probe())
+        archive_result = ScanResult(scanner_name="sevenzip")
+        scanned_paths: list[str] = []
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            scanned_paths.append(path)
+            return _mock_scan_result(location=path, scanner_name="xgboost")
+
+        scanner = SevenZipScanner(config={NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan})
+        scan_complete = scanner._scan_extracted_file(
+            str(extracted_path),
+            "model.jpg",
+            str(tmp_path / "outer.7z"),
+            archive_result,
+            depth=0,
+            budget=_RecursiveScanBudget(),
+            probed_format="xgboost",
+        )
+
+        assert scan_complete is True
+        assert len(scanned_paths) == 1
+        assert Path(scanned_paths[0]).suffix == ""
+        assert not extracted_path.exists()
+
     def test_oversized_disguised_nested_zip_marks_scan_incomplete(
         self,
         tmp_path: Path,
@@ -1491,6 +1592,48 @@ class TestSevenZipScannerHardening:
             issue.location
             and f"{archive_path}:payload.jpg:payload.pkl" in issue.location
             and "system" in issue.message.lower()
+            for issue in result.issues
+        )
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_disguised_xgboost_member_detects_malicious_payload_end_to_end(self, tmp_path: Path) -> None:
+        pytest.importorskip("ubjson", reason="ubjson not installed")
+        import py7zr  # type: ignore[import-untyped]
+
+        payload_path = tmp_path / "model_payload"
+        payload_path.write_bytes(_xgboost_ubjson_probe(malicious=True))
+        archive_path = tmp_path / "disguised_xgboost.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, "models/model.jpg")
+
+        result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert determine_exit_code(result) == 1
+        assert any(
+            issue.location
+            and f"{archive_path}:models/model.jpg" in issue.location
+            and "System call in JSON" in str(issue.message)
+            for issue in result.issues
+        )
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_json_suffixed_xgboost_member_detects_malicious_payload_end_to_end(self, tmp_path: Path) -> None:
+        pytest.importorskip("ubjson", reason="ubjson not installed")
+        import py7zr  # type: ignore[import-untyped]
+
+        payload_path = tmp_path / "model_payload"
+        payload_path.write_bytes(_xgboost_ubjson_probe(malicious=True))
+        archive_path = tmp_path / "json_suffixed_xgboost.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, "models/model.json")
+
+        result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert determine_exit_code(result) == 1
+        assert any(
+            issue.location
+            and f"{archive_path}:models/model.json" in issue.location
+            and "System call in JSON" in str(issue.message)
             for issue in result.issues
         )
 
@@ -1665,6 +1808,52 @@ class TestSevenZipScannerHardening:
 
         assert scanner._probe_detected_format(probe) == "pickle"
 
+    def test_probe_detected_format_recognizes_extensionless_xgboost_ubjson(self) -> None:
+        """7z nested probes should retain extensionless XGBoost UBJSON members."""
+        scanner = SevenZipScanner()
+        probe = io.BytesIO(_xgboost_ubjson_probe())
+
+        assert scanner._probe_detected_format(probe) == "xgboost"
+
+    def test_probe_detected_format_recognizes_noop_before_xgboost_learner(self) -> None:
+        scanner = SevenZipScanner()
+        probe = io.BytesIO(_xgboost_ubjson_probe(learner_noop=True))
+
+        assert scanner._probe_detected_format(probe) == "xgboost"
+
+    def test_probe_detected_format_recognizes_noop_before_counted_root_header(self) -> None:
+        scanner = SevenZipScanner()
+        probe = io.BytesIO(_xgboost_ubjson_noop_before_counted_root_header_probe())
+
+        assert scanner._probe_detected_format(probe) == "xgboost"
+
+    def test_probe_detected_format_bounds_counted_zero_payload_xgboost_array(self) -> None:
+        """7z nested probes must not iterate attacker-controlled zero-payload arrays."""
+        scanner = SevenZipScanner()
+        probe = io.BytesIO(_xgboost_ubjson_counted_null_array_probe())
+
+        assert scanner._probe_detected_format(probe) == "xgboost"
+
+    def test_probe_detected_format_ignores_extensionless_ubjson_manifest_near_match(self) -> None:
+        scanner = SevenZipScanner()
+        payload = (
+            b"{"
+            + _ubjson_key(b"learner")
+            + b"{}"
+            + _ubjson_key(b"version")
+            + b"[]"
+            + _ubjson_key(b"note")
+            + _ubjson_string(b"system(cpu)")
+            + b"}"
+        )
+
+        assert scanner._probe_detected_format(io.BytesIO(payload)) is None
+
+    def test_probe_detected_format_ignores_plain_extensionless_json(self) -> None:
+        scanner = SevenZipScanner()
+
+        assert scanner._probe_detected_format(io.BytesIO(b'{"kind":"manifest","safe":true}')) is None
+
     def test_probe_detected_format_ignores_benign_proto0_near_match_text(self) -> None:
         """Plain text that starts with proto0-looking bytes should not route as pickle."""
         scanner = SevenZipScanner()
@@ -1775,6 +1964,302 @@ class TestSevenZipScannerHardening:
             assert result.success
             assert result.metadata["scannable_files"] == 1
             mock_scan_extracted_file.assert_called_once()
+
+    def test_extensionless_xgboost_probe_reaches_full_extraction(self, tmp_path: Path) -> None:
+        """Header probes should route extensionless XGBoost UBJSON members through extraction."""
+        scanner = SevenZipScanner()
+        archive_path = tmp_path / "xgboost_probe.7z"
+        archive_path.write_bytes(scanner._SEVENZIP_MAGIC + b"\0" * 26)
+        payload = _xgboost_ubjson_probe()
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_has_7z_magic", return_value=True),
+            patch.object(scanner, "_scan_extracted_file", return_value=_mock_scan_result()) as mock_scan_extracted_file,
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.islink", return_value=False),
+            patch("os.path.getsize", return_value=32),
+        ):
+
+            def fake_extract(*_args: Any, **kwargs: Any) -> None:
+                factory = kwargs.get("factory")
+                if factory is not None:
+                    factory.create("nested_payload").write(payload)
+
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["nested_payload"]
+            mock_archive.getinfo.return_value = MagicMock(uncompressed=len(payload), is_directory=False)
+            mock_archive.extract.side_effect = fake_extract
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(str(archive_path))
+
+            assert result.success
+            assert result.metadata["scannable_files"] == 1
+            mock_scan_extracted_file.assert_called_once()
+
+    def test_extensionless_xgboost_incomplete_learner_probe_reaches_full_extraction(self, tmp_path: Path) -> None:
+        """7z should preserve an incomplete bounded learner candidate for scanning."""
+        scanner = SevenZipScanner()
+        archive_path = tmp_path / "late_xgboost_probe.7z"
+        archive_path.write_bytes(scanner._SEVENZIP_MAGIC + b"\0" * 26)
+        payload = _xgboost_ubjson_probe(learner_padding=scanner._NESTED_MEMBER_PROBE_BYTES + 32)
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_has_7z_magic", return_value=True),
+            patch.object(scanner, "_scan_extracted_file", return_value=_mock_scan_result()) as mock_scan_extracted_file,
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.islink", return_value=False),
+            patch("os.path.getsize", return_value=32),
+        ):
+
+            def fake_extract(*_args: Any, **kwargs: Any) -> None:
+                factory = kwargs.get("factory")
+                if factory is not None:
+                    factory.create("nested_payload").write(payload)
+
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["nested_payload"]
+            mock_archive.getinfo.return_value = MagicMock(uncompressed=len(payload), is_directory=False)
+            mock_archive.extract.side_effect = fake_extract
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(str(archive_path))
+
+        assert result.success
+        assert result.metadata["scannable_files"] == 1
+        mock_scan_extracted_file.assert_called_once()
+
+    def test_extensionless_xgboost_incomplete_root_probe_reaches_full_extraction(self, tmp_path: Path) -> None:
+        """7z should expand UBJSON roots whose learner begins after the header probe."""
+        scanner = SevenZipScanner()
+        archive_path = tmp_path / "reordered_xgboost_probe.7z"
+        archive_path.write_bytes(scanner._SEVENZIP_MAGIC + b"\0" * 26)
+        payload = _xgboost_ubjson_probe(root_padding=scanner._NESTED_MEMBER_PROBE_BYTES + 32)
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_has_7z_magic", return_value=True),
+            patch.object(scanner, "_scan_extracted_file", return_value=_mock_scan_result()) as mock_scan_extracted_file,
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.islink", return_value=False),
+            patch("os.path.getsize", return_value=32),
+        ):
+
+            def fake_extract(*_args: Any, **kwargs: Any) -> None:
+                factory = kwargs.get("factory")
+                if factory is not None:
+                    factory.create("nested_payload").write(payload)
+
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["nested_payload"]
+            mock_archive.getinfo.return_value = MagicMock(uncompressed=len(payload), is_directory=False)
+            mock_archive.extract.side_effect = fake_extract
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(str(archive_path))
+
+        assert result.success
+        assert result.metadata["scannable_files"] == 1
+        mock_scan_extracted_file.assert_called_once()
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_extensionless_xgboost_late_model_key_in_7z_fails_closed_in_routing(self, tmp_path: Path) -> None:
+        import py7zr  # type: ignore[import-untyped]
+
+        payload_path = tmp_path / "model"
+        payload_path.write_bytes(
+            _xgboost_ubjson_probe(learner_padding=SevenZipScanner._XGBOOST_NESTED_MEMBER_PROBE_BYTES, malicious=True)
+        )
+        archive_path = tmp_path / "late_model.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, arcname="models/model")
+
+        result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert determine_exit_code(result) == 2
+        assert any("routing was inconclusive" in str(issue.message) for issue in result.issues)
+        assert not any("System call in JSON" in str(issue.message) for issue in result.issues)
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_disguised_xgboost_late_model_key_in_7z_fails_closed_in_routing(self, tmp_path: Path) -> None:
+        import py7zr  # type: ignore[import-untyped]
+
+        payload_path = tmp_path / "model"
+        payload_path.write_bytes(
+            _xgboost_ubjson_probe(learner_padding=SevenZipScanner._XGBOOST_NESTED_MEMBER_PROBE_BYTES, malicious=True)
+        )
+        archive_path = tmp_path / "late_disguised.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, arcname="models/model.jpg")
+
+        result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert determine_exit_code(result) == 2
+        assert any("routing was inconclusive" in str(issue.message) for issue in result.issues)
+        assert not any("System call in JSON" in str(issue.message) for issue in result.issues)
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_extensionless_xgboost_late_learner_in_7z_fails_closed_in_routing(self, tmp_path: Path) -> None:
+        import py7zr  # type: ignore[import-untyped]
+
+        payload_path = tmp_path / "model"
+        payload_path.write_bytes(
+            _xgboost_ubjson_probe(root_padding=SevenZipScanner._XGBOOST_NESTED_MEMBER_PROBE_BYTES, malicious=True)
+        )
+        archive_path = tmp_path / "late_learner.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, arcname="models/model")
+
+        result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert determine_exit_code(result) == 2
+        assert any("routing was inconclusive" in str(issue.message) for issue in result.issues)
+        assert not any("System call in JSON" in str(issue.message) for issue in result.issues)
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_extensionless_root_noops_before_late_learner_in_7z_fail_closed_in_routing(self, tmp_path: Path) -> None:
+        import py7zr  # type: ignore[import-untyped]
+
+        payload_path = tmp_path / "model"
+        payload_path.write_bytes(
+            b"{"
+            + (b"N" * SevenZipScanner._XGBOOST_NESTED_MEMBER_PROBE_BYTES)
+            + _ubjson_key(b"learner")
+            + b"{"
+            + _ubjson_key(b"learner_model_param")
+            + b"{}"
+            + b"}"
+            + b"}"
+        )
+        archive_path = tmp_path / "late_noop_learner.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, arcname="models/model")
+
+        result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert determine_exit_code(result) == 2
+        assert any("routing was inconclusive" in str(issue.message) for issue in result.issues)
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_extensionless_large_ubjson_manifest_in_7z_fails_closed_without_attribution(self, tmp_path: Path) -> None:
+        ubjson = pytest.importorskip("ubjson", reason="ubjson not installed")
+        import py7zr  # type: ignore[import-untyped]
+
+        payload_path = tmp_path / "model"
+        payload_path.write_bytes(
+            ubjson.dumpb(
+                {
+                    "learner": {
+                        "metadata": "x" * SevenZipScanner._XGBOOST_NESTED_MEMBER_PROBE_BYTES,
+                        "note": "system(cpu)",
+                    },
+                    "version": [1],
+                }
+            )
+        )
+        archive_path = tmp_path / "manifest.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, arcname="models/model")
+
+        result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert determine_exit_code(result) == 2
+        assert any("routing was inconclusive" in str(issue.message) for issue in result.issues)
+        assert not any("System call in JSON" in str(issue.message) for issue in result.issues)
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_extensionless_xgboost_oversized_count_in_7z_fails_closed_before_decode(self, tmp_path: Path) -> None:
+        """7z-routed UBJSON members must apply the decoder materialization guard."""
+        pytest.importorskip("ubjson", reason="ubjson not installed")
+        import py7zr  # type: ignore[import-untyped]
+
+        payload_path = tmp_path / "model"
+        payload_path.write_bytes(_xgboost_ubjson_counted_null_array_probe())
+        archive_path = tmp_path / "bundle.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, arcname="models/model")
+
+        with (
+            patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=True),
+            patch("ubjson.loadb") as mock_loadb,
+        ):
+            result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert any("decoded arrays exceed" in str(issue.message) for issue in result.issues)
+        mock_loadb.assert_not_called()
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_disguised_xgboost_oversized_count_in_7z_fails_closed_before_decode(self, tmp_path: Path) -> None:
+        pytest.importorskip("ubjson", reason="ubjson not installed")
+        import py7zr  # type: ignore[import-untyped]
+
+        payload_path = tmp_path / "model"
+        payload_path.write_bytes(_xgboost_ubjson_counted_null_array_probe())
+        archive_path = tmp_path / "disguised_limit.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, arcname="models/model.dat")
+
+        with (
+            patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=True),
+            patch("ubjson.loadb") as mock_loadb,
+        ):
+            result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert determine_exit_code(result) == 2
+        assert any("decoded arrays exceed" in str(issue.message) for issue in result.issues)
+        mock_loadb.assert_not_called()
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_extensionless_xgboost_oversized_uncounted_array_in_7z_fails_closed_before_decode(
+        self, tmp_path: Path
+    ) -> None:
+        pytest.importorskip("ubjson", reason="ubjson not installed")
+        import py7zr  # type: ignore[import-untyped]
+
+        payload_path = tmp_path / "model"
+        payload_path.write_bytes(_xgboost_ubjson_uncounted_null_array_probe(5))
+        archive_path = tmp_path / "uncounted.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, arcname="models/model")
+
+        with (
+            patch.object(XGBoostScanner, "_UBJSON_MAX_DECODED_ARRAY_ITEMS", 4),
+            patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=True),
+            patch("ubjson.loadb") as mock_loadb,
+        ):
+            result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert determine_exit_code(result) == 2
+        assert any("decoded arrays exceed" in str(issue.message) for issue in result.issues)
+        mock_loadb.assert_not_called()
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_extensionless_xgboost_deep_container_in_7z_fails_closed_before_decode(self, tmp_path: Path) -> None:
+        pytest.importorskip("ubjson", reason="ubjson not installed")
+        import py7zr  # type: ignore[import-untyped]
+
+        payload_path = tmp_path / "model"
+        payload_path.write_bytes(_xgboost_ubjson_deep_before_counted_null_array_probe())
+        archive_path = tmp_path / "deep.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, arcname="models/model")
+
+        with (
+            patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=True),
+            patch("ubjson.loadb") as mock_loadb,
+        ):
+            result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert determine_exit_code(result) == 2
+        assert any("resource preflight could not complete" in str(issue.message) for issue in result.issues)
+        mock_loadb.assert_not_called()
 
     # -- default config includes new limits -----------------------------------
 
