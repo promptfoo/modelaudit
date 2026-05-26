@@ -7,6 +7,7 @@ and improve test maintainability.
 
 from tests.helpers.file_creators import (
     create_malicious_pickle,
+    create_mock_coreml,
     create_mock_gguf,
     create_mock_h5,
     create_mock_manifest,
@@ -31,6 +32,7 @@ from tests.helpers.frameworks import (
 
 __all__ = [
     "create_malicious_pickle",
+    "create_mock_coreml",
     "create_mock_gguf",
     "create_mock_h5",
     "create_mock_manifest",

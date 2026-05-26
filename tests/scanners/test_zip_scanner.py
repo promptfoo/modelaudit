@@ -691,8 +691,9 @@ def test_scan_zip_python_member_emits_separate_check_per_rule_code(tmp_path: Pat
     assert python_checks[1].details["reason"] == "high-risk calls: subprocess.run"
 
 
-def test_scan_zip_honors_max_mar_python_analysis_bytes_config(tmp_path: Path) -> None:
-    """Generic ZIP Python scanning must honor the same config knob the MAR path reads."""
+def test_scan_zip_honors_max_mar_python_analysis_bytes_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Generic ZIP Python analysis stays focused on Python-source coverage."""
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
     archive_path = tmp_path / "source_bundle.zip"
     # ~60 KB payload; a 1 KB configured cap must cause the scanner to mark this
     # member analysis incomplete instead of silently reading the whole thing.
@@ -712,7 +713,9 @@ def test_scan_zip_honors_max_mar_python_analysis_bytes_config(tmp_path: Path) ->
     assert details["analysis_incomplete"] is True
     assert details["max_scan_bytes"] == 1024
     assert details["file_size"] >= 60_000
-    assert "zip_python_member_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+    reasons = result.metadata["scan_outcome_reasons"]
+    assert "zip_python_member_analysis_incomplete" in reasons
+    assert "onnx_tentative_candidate_analysis_unavailable" not in reasons
 
 
 def test_scan_zip_python_member_honors_pep263_encoding_declaration(tmp_path: Path) -> None:
@@ -941,6 +944,7 @@ def test_scan_nested_file_recovers_findings_from_budget_exhausted_onnx_candidate
 
 
 def test_scan_nested_file_rejects_ambiguous_protobuf_without_findings(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
     extracted_member = tmp_path / "ambiguous.jpg"
     extracted_member.write_bytes(b"\x12" + (b"x" * (20 * 1024 * 1024)))
 
@@ -949,9 +953,26 @@ def test_scan_nested_file_rejects_ambiguous_protobuf_without_findings(tmp_path: 
     assert result.scanner_name == "unknown"
     assert result.success is True
     assert result.issues == []
-    assert (
-        result.metadata.get("tentative_protobuf_candidate_rejected") is True
-        or result.metadata.get("tentative_protobuf_candidate_unanalyzed") == "onnx_dependency_unavailable"
+    assert result.metadata.get("tentative_protobuf_candidate_rejected") is True
+
+
+def test_scan_nested_file_preserves_ambiguous_protobuf_without_onnx(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted_member = tmp_path / "ambiguous.jpg"
+    extracted_member.write_bytes(b"\x12" + (b"x" * (20 * 1024 * 1024)))
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "onnx_tentative_candidate_analysis_unavailable" in result.metadata["scan_outcome_reasons"]
+    assert result.metadata["tentative_protobuf_candidate_unanalyzed"] == "onnx_dependency_unavailable"
+    assert any(
+        issue.severity == IssueSeverity.INFO and "dependency is unavailable" in issue.message for issue in result.issues
     )
 
 
@@ -992,7 +1013,7 @@ def test_scan_nested_file_fails_closed_when_protobuf_candidate_analyzer_is_unava
     assert result.metadata["operational_error_reason"] == "protobuf_model_routing_incomplete"
     assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
     check = next(check for check in result.checks if check.name == "Protobuf Model Routing")
-    assert "tentative ONNX analysis was unavailable" in check.message
+    assert "tentative protobuf analysis was unavailable" in check.message
 
 
 def test_scan_nested_file_keeps_budget_exhausted_coreml_candidate_owned_by_extension(
@@ -1596,6 +1617,32 @@ class TestZipScanner:
         assert compression_checks[0].status == CheckStatus.PASSED
         assert "size floor" in compression_checks[0].message
         assert compression_checks[0].details["min_uncompressed_size"] == 1024 * 1024
+
+    def test_configured_skip_entry_is_validated_but_not_recursively_scanned(self, tmp_path: Path) -> None:
+        archive_path = tmp_path / "owned-entry.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr("metadata.json", b'{"owned": true}')
+            archive.writestr("payload.bin", b"payload")
+
+        nested_scan_paths: list[str] = []
+
+        def nested_scan(path: str, _config: dict[str, Any]) -> ScanResult:
+            nested_scan_paths.append(path)
+            result = ScanResult(scanner_name="test")
+            result.finish(success=True)
+            return result
+
+        scanner = ZipScanner(
+            config={
+                NESTED_SCAN_CALLBACK_CONFIG_KEY: nested_scan,
+                "skip_archive_entries": ["metadata.json"],
+            }
+        )
+        result = scanner.scan(str(archive_path))
+
+        assert result.success is True
+        assert not any(path.endswith("_metadata.json") for path in nested_scan_paths)
+        assert any(path.endswith("_payload.bin") for path in nested_scan_paths)
 
     def test_zip_bomb_detection_skips_only_suspicious_entry(self, tmp_path: Path) -> None:
         """Suspicious entries should be skipped while safe entries still route to nested scanning."""

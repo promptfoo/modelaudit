@@ -5,7 +5,7 @@ import struct
 import tarfile
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO
+from typing import BinaryIO, Literal
 
 from ...scanner_registry_metadata import get_extension_format_map
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
@@ -46,6 +46,55 @@ _ONNX_NODE_MAX_ROUTING_FIELDS = 512
 _ONNX_MAX_ROUTING_TEXT_BYTES = 1024
 _PROTO_GROUP_MAX_ROUTING_FIELDS = 512
 _PROTO_GROUP_MAX_ROUTING_DEPTH = 8
+_COREML_PROTO_SIGNATURE_READ_BYTES = 1024 * 1024
+_COREML_PROTO_PREFIX_WIRE_TYPES = frozenset({0, 1, 2, 3, 5})
+_COREML_GROUP_BUDGET_EXHAUSTED: Literal["budget_exhausted"] = "budget_exhausted"
+_COREML_GROUP_INCOMPLETE: Literal["incomplete"] = "incomplete"
+_COREML_GROUP_MALFORMED: Literal["malformed"] = "malformed"
+_COREML_MAX_DESCRIPTION_PREFIX_FIELDS = 512
+_COREML_MAX_MODEL_PREFIX_FIELDS = 4096
+_COREML_MODEL_TYPE_FIELDS = frozenset(
+    {
+        200,
+        201,
+        202,
+        300,
+        301,
+        302,
+        303,
+        304,
+        400,
+        401,
+        402,
+        403,
+        404,
+        500,
+        501,
+        502,
+        555,
+        556,
+        560,
+        600,
+        601,
+        602,
+        603,
+        604,
+        606,
+        607,
+        609,
+        610,
+        900,
+        2000,
+        2001,
+        2002,
+        2003,
+        2004,
+        2005,
+        2006,
+        3000,
+    }
+)
+_COREML_DESCRIPTION_FIELD_HINTS = frozenset({1, 10, 20, 21, 100})
 _LIGHTGBM_HEADER_MARKERS = (
     "version=",
     "num_class=",
@@ -238,6 +287,9 @@ PROTO0_1_MAX_PROBE_BYTES: int = 64 * 1024
 # budget aligned with the byte budget so trivial padding cannot hide a later
 # dangerous opcode inside the sampled prefix.
 PROTO0_1_MAX_PROBE_OPCODES: int = PROTO0_1_MAX_PROBE_BYTES
+# Fully inspect short scalar-only text near-matches before candidate routing.
+# Longer files remain unresolved so a late model payload cannot be hidden.
+PROTO0_1_MAX_TRIVIAL_TEXT_VALIDATION_BYTES: int = 1024 * 1024
 PROTO0_1_START_BYTES: bytes = b"()]}cilp0FGIJKLMNSTUVX"
 PROTO0_1_IGNORABLE_TRAILING_BYTES: bytes = b" \t\r\n\x00"
 PROTO0_1_PREFIX_TRUNCATION_ERROR_PREFIXES: tuple[str, ...] = (
@@ -290,6 +342,109 @@ def _read_proto_length_delimited_bounds_stream(
     return length, value_start, value_end
 
 
+def _read_proto_varint(data: bytes, offset: int, end: int | None = None) -> tuple[int, int] | None:
+    """Read a protobuf varint from bounded in-memory data."""
+    limit = len(data) if end is None else min(end, len(data))
+    value = 0
+    shift = 0
+    cursor = offset
+    while cursor < limit and cursor - offset < 10:
+        byte = data[cursor]
+        cursor += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, cursor
+        shift += 7
+    return None
+
+
+def _read_length_delimited_proto_value(
+    data: bytes,
+    offset: int,
+    end: int | None = None,
+) -> tuple[int, int, int, int] | None:
+    """Return length-delimited value bounds within sampled CoreML bytes."""
+    limit = len(data) if end is None else min(end, len(data))
+    length_result = _read_proto_varint(data, offset, limit)
+    if length_result is None:
+        return None
+    length, value_start = length_result
+    value_end = value_start + length
+    if value_start > limit:
+        return None
+    return length, value_start, min(value_end, limit), value_end
+
+
+def _skip_proto_value(data: bytes, offset: int, wire_type: int, end: int | None = None) -> int | None:
+    """Skip one protobuf value, returning the next offset when the sample contains it."""
+    limit = len(data) if end is None else min(end, len(data))
+    if wire_type == 0:
+        value_result = _read_proto_varint(data, offset, limit)
+        return None if value_result is None else value_result[1]
+    if wire_type == 1:
+        next_offset = offset + 8
+        return next_offset if next_offset <= limit else None
+    if wire_type == 2:
+        bounds = _read_length_delimited_proto_value(data, offset, limit)
+        if bounds is None:
+            return None
+        _length, _value_start, _sampled_value_end, value_end = bounds
+        return value_end if value_end <= limit else None
+    if wire_type == 5:
+        next_offset = offset + 4
+        return next_offset if next_offset <= limit else None
+    return None
+
+
+def _skip_coreml_proto_group(
+    data: bytes,
+    offset: int,
+    start_field_number: int,
+    *,
+    remaining_fields: int,
+    end: int | None = None,
+) -> tuple[int, int] | Literal["budget_exhausted", "incomplete", "malformed"]:
+    """Skip a well-formed unknown CoreML protobuf group within a field budget."""
+    limit = len(data) if end is None else min(end, len(data))
+    group_stack = [start_field_number]
+    fields_seen = 0
+
+    while group_stack and offset < limit and fields_seen < remaining_fields:
+        tag_result = _read_proto_varint(data, offset, limit)
+        if tag_result is None:
+            return _COREML_GROUP_INCOMPLETE
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return _COREML_GROUP_MALFORMED
+
+        fields_seen += 1
+        if wire_type == 3:
+            group_stack.append(field_number)
+            offset = value_offset
+            continue
+        if wire_type == 4:
+            if field_number != group_stack[-1]:
+                return _COREML_GROUP_MALFORMED
+            group_stack.pop()
+            offset = value_offset
+            continue
+        if wire_type not in _COREML_PROTO_PREFIX_WIRE_TYPES:
+            return _COREML_GROUP_MALFORMED
+
+        next_offset = _skip_proto_value(data, value_offset, wire_type, limit)
+        if next_offset is None:
+            return _COREML_GROUP_INCOMPLETE
+        offset = next_offset
+
+    if group_stack:
+        if fields_seen >= remaining_fields:
+            return _COREML_GROUP_BUDGET_EXHAUSTED
+        return _COREML_GROUP_INCOMPLETE
+    return offset, fields_seen
+
+
 def _looks_like_onnx_node_proto_stream(stream: BinaryIO, end_offset: int) -> bool | None:
     """Return whether a bounded message resembles an ONNX NodeProto, or is unresolved."""
     fields_seen = 0
@@ -316,7 +471,10 @@ def _looks_like_onnx_node_proto_stream(stream: BinaryIO, end_offset: int) -> boo
                 has_op_type = bool(op_type) and all(32 <= byte < 127 for byte in op_type)
             stream.seek(value_end)
         else:
-            if not _skip_proto_stream_value(stream, wire_type, end_offset, field_number=field_number):
+            skip_status = _skip_proto_stream_value(stream, wire_type, end_offset, field_number=field_number)
+            if skip_status is None:
+                return None
+            if not skip_status:
                 return False
 
         fields_seen += 1
@@ -360,7 +518,10 @@ def _looks_like_onnx_graph_proto_stream(stream: BinaryIO, end_offset: int) -> bo
                 value_info_fields.add(field_number)
             stream.seek(value_end)
         else:
-            if not _skip_proto_stream_value(stream, wire_type, end_offset, field_number=field_number):
+            skip_status = _skip_proto_stream_value(stream, wire_type, end_offset, field_number=field_number)
+            if skip_status is None:
+                return None
+            if not skip_status:
                 return False
 
         fields_seen += 1
@@ -406,7 +567,10 @@ def _looks_like_onnx_model_proto_stream(stream: BinaryIO, end_offset: int) -> bo
                 has_graph = has_graph or graph_status
             stream.seek(value_end)
         else:
-            if not _skip_proto_stream_value(stream, wire_type, end_offset, field_number=field_number):
+            skip_status = _skip_proto_stream_value(stream, wire_type, end_offset, field_number=field_number)
+            if skip_status is None:
+                return None
+            if not skip_status:
                 return False
 
         fields_seen += 1
@@ -434,9 +598,225 @@ def _looks_like_onnx_model_candidate_file(path: Path, size: int) -> bool:
     return _looks_like_onnx_model_file(path, size) is True
 
 
+def _is_complete_trivial_proto0_or_1_text_stream(path: Path, size: int) -> bool:
+    """Return True for fully inspected scalar-only protocol-text near-matches."""
+    if size <= 0 or size > PROTO0_1_MAX_TRIVIAL_TEXT_VALIDATION_BYTES:
+        return False
+    try:
+        sample = path.read_bytes()
+        sample.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    if len(sample) < 2 or sample[0] not in PROTO0_1_START_BYTES:
+        return False
+
+    opcode_count = 0
+    try:
+        for opcode, _arg, _pos in pickletools.genops(sample):
+            opcode_count += 1
+            if opcode.name == "STOP" or opcode.name not in PROTO0_1_TRIVIAL_LEADING_OPCODES:
+                return False
+    except ValueError as exc:
+        if not str(exc).startswith("pickle exhausted before seeing STOP"):
+            return False
+    except Exception:
+        return False
+    return opcode_count >= 2
+
+
+def _is_complete_plain_text_stream(path: Path, size: int) -> bool:
+    """Return True for fully inspected plain text that should not become a protobuf candidate."""
+    if size <= 0 or size > PROTO0_1_MAX_TRIVIAL_TEXT_VALIDATION_BYTES:
+        return False
+    try:
+        sample = path.read_bytes()
+        sample.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    return all(byte in {9, 10, 13} or 32 <= byte < 127 for byte in sample)
+
+
+def _looks_like_proto_message_prefix(data: bytes) -> bool:
+    """Return whether bytes begin with a non-empty protobuf message field."""
+    if not data:
+        return False
+    tag_result = _read_proto_varint(data, 0)
+    if tag_result is None:
+        return False
+    tag, _value_offset = tag_result
+    return tag >> 3 > 0 and tag & 0x07 in _COREML_PROTO_PREFIX_WIRE_TYPES
+
+
 def _has_budget_exhausted_protobuf_model_candidate(path: Path, size: int) -> bool:
     """Return True when a bounded probe leaves a protobuf model candidate."""
-    return _looks_like_onnx_model_file(path, size) is None
+    if _is_complete_trivial_proto0_or_1_text_stream(path, size) or _is_complete_plain_text_stream(path, size):
+        return False
+    if _looks_like_onnx_model_file(path, size) is None:
+        return True
+    return _looks_like_coreml_model_file(path, size) is None
+
+
+def _looks_like_coreml_description_proto_prefix(data: bytes, *, sample_is_prefix: bool = False) -> bool | None:
+    """Return True when a bounded prefix resembles a CoreML ModelDescription."""
+    offset = 0
+    fields_seen = 0
+    while offset < len(data) and fields_seen < _COREML_MAX_DESCRIPTION_PREFIX_FIELDS:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            return None if sample_is_prefix else False
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+
+        if wire_type == 2 and field_number in _COREML_DESCRIPTION_FIELD_HINTS:
+            return True
+
+        if wire_type == 3:
+            group_result = _skip_coreml_proto_group(
+                data,
+                value_offset,
+                field_number,
+                remaining_fields=_COREML_MAX_DESCRIPTION_PREFIX_FIELDS - fields_seen - 1,
+            )
+            if group_result == _COREML_GROUP_BUDGET_EXHAUSTED:
+                return None
+            if group_result == _COREML_GROUP_INCOMPLETE:
+                return None if sample_is_prefix else False
+            if group_result == _COREML_GROUP_MALFORMED:
+                return False
+            offset, group_fields_seen = group_result
+            fields_seen += group_fields_seen
+        else:
+            next_offset = _skip_proto_value(data, value_offset, wire_type)
+            if next_offset is None:
+                return None if sample_is_prefix else False
+            offset = next_offset
+        fields_seen += 1
+
+    return None if sample_is_prefix and fields_seen >= _COREML_MAX_DESCRIPTION_PREFIX_FIELDS else False
+
+
+def _could_start_coreml_model_proto(data: bytes) -> bool:
+    """Return whether a prefix starts with a skippable protobuf field."""
+    tag_result = _read_proto_varint(data, 0)
+    if tag_result is None:
+        return False
+    tag, _value_offset = tag_result
+    return tag >> 3 > 0 and tag & 0x07 in _COREML_PROTO_PREFIX_WIRE_TYPES
+
+
+def _looks_like_coreml_model_proto_prefix(data: bytes, *, sample_is_prefix: bool = False) -> bool | None:
+    """Return whether a bounded prefix resembles, rejects, or cannot resolve CoreML Model."""
+    if not _could_start_coreml_model_proto(data):
+        return False
+
+    offset = 0
+    fields_seen = 0
+    has_specification_version = False
+    has_description = False
+    has_model_type = False
+    while offset < len(data) and fields_seen < _COREML_MAX_MODEL_PREFIX_FIELDS:
+        tag_result = _read_proto_varint(data, offset)
+        if tag_result is None:
+            return None if sample_is_prefix else False
+        tag, value_offset = tag_result
+        field_number = tag >> 3
+        wire_type = tag & 0x07
+        if field_number == 0:
+            return False
+
+        if field_number == 1 and wire_type == 0:
+            value_result = _read_proto_varint(data, value_offset)
+            if value_result is None:
+                return None if sample_is_prefix else False
+            specification_version, offset = value_result
+            has_specification_version = 0 < specification_version <= 10000
+        elif wire_type == 2:
+            bounds = _read_length_delimited_proto_value(data, value_offset)
+            if bounds is None:
+                return None if sample_is_prefix else False
+            length, value_start, value_end, actual_value_end = bounds
+            if actual_value_end > len(data):
+                if field_number == 2:
+                    return None if sample_is_prefix and has_specification_version else False
+                if field_number in _COREML_MODEL_TYPE_FIELDS and length > 0:
+                    has_model_type = True
+                    return True if has_specification_version and has_description else None
+                return None if sample_is_prefix else False
+            if field_number == 2:
+                description_status = _looks_like_coreml_description_proto_prefix(data[value_start:value_end])
+                if description_status is True:
+                    has_description = True
+                elif description_status is None:
+                    return None
+                else:
+                    return False
+            elif (
+                field_number in _COREML_MODEL_TYPE_FIELDS
+                and length > 0
+                and _looks_like_proto_message_prefix(data[value_start:value_end])
+            ):
+                has_model_type = True
+            offset = actual_value_end
+        elif wire_type == 3:
+            group_result = _skip_coreml_proto_group(
+                data,
+                value_offset,
+                field_number,
+                remaining_fields=_COREML_MAX_MODEL_PREFIX_FIELDS - fields_seen - 1,
+            )
+            if group_result == _COREML_GROUP_BUDGET_EXHAUSTED:
+                return None
+            if group_result == _COREML_GROUP_INCOMPLETE:
+                return None if sample_is_prefix else False
+            if group_result == _COREML_GROUP_MALFORMED:
+                return False
+            offset, group_fields_seen = group_result
+            fields_seen += group_fields_seen
+        else:
+            next_offset = _skip_proto_value(data, value_offset, wire_type)
+            if next_offset is None:
+                return None if sample_is_prefix else False
+            offset = next_offset
+
+        fields_seen += 1
+        if has_specification_version and has_description and has_model_type:
+            return True
+
+    if has_specification_version and has_description and has_model_type:
+        return True
+    if sample_is_prefix or fields_seen >= _COREML_MAX_MODEL_PREFIX_FIELDS:
+        return None
+    return False
+
+
+def _looks_like_coreml_model_file(path: Path, size: int) -> bool | None:
+    """Detect recognizable or unresolved CoreML Model structure with a bounded prefix read."""
+    if size < 8:
+        return False
+    try:
+        with path.open("rb") as handle:
+            prefix = handle.read(min(size, _COREML_PROTO_SIGNATURE_READ_BYTES))
+    except OSError:
+        return False
+    return _looks_like_coreml_model_proto_prefix(prefix, sample_is_prefix=size > len(prefix))
+
+
+def _looks_like_coreml_model_candidate_file(path: Path, size: int, header: bytes) -> bool:
+    """Run bounded CoreML structure recognition only for plausible model starts."""
+    if not _could_start_coreml_model_proto(header):
+        if _read_proto_varint(header, 0) is not None or len(header) >= min(size, 10):
+            return False
+        try:
+            with path.open("rb") as handle:
+                header = handle.read(min(size, 10))
+        except OSError:
+            return False
+        if not _could_start_coreml_model_proto(header):
+            return False
+    return _looks_like_coreml_model_file(path, size) is True
 
 
 def _looks_like_binary_pickle_protocol(header: bytes) -> bool:
@@ -1133,7 +1513,7 @@ def _skip_proto_stream_value(
     field_number: int | None = None,
     remaining_fields: list[int] | None = None,
     group_depth: int = 0,
-) -> bool:
+) -> bool | None:
     if wire_type == 0:
         return _read_proto_varint_stream(stream, end_offset) is not None
     if wire_type == 1:
@@ -1146,12 +1526,14 @@ def _skip_proto_stream_value(
     elif wire_type == 5:
         length = 4
     elif wire_type == 3:
-        if field_number is None or group_depth >= _PROTO_GROUP_MAX_ROUTING_DEPTH:
+        if field_number is None:
             return False
+        if group_depth >= _PROTO_GROUP_MAX_ROUTING_DEPTH:
+            return None
         for _ in range(_PROTO_GROUP_MAX_ROUTING_FIELDS):
             if remaining_fields is not None:
                 if remaining_fields[0] <= 0:
-                    return False
+                    return None
                 remaining_fields[0] -= 1
             nested_tag = _read_proto_varint_stream(stream, end_offset)
             if nested_tag is None:
@@ -1162,16 +1544,17 @@ def _skip_proto_stream_value(
                 return False
             if nested_wire_type == 4:
                 return nested_field_number == field_number
-            if not _skip_proto_stream_value(
+            nested_status = _skip_proto_stream_value(
                 stream,
                 nested_wire_type,
                 end_offset,
                 field_number=nested_field_number,
                 remaining_fields=remaining_fields,
                 group_depth=group_depth + 1,
-            ):
-                return False
-        return False
+            )
+            if nested_status is not True:
+                return nested_status
+        return None
     else:
         return False
 
@@ -1207,13 +1590,16 @@ def _has_bounded_tensorflow_graph_field(path: Path, file_size: int) -> bool:
                         # A length-delimited field alone does not establish TensorFlow structure.
                         return False
                     return _is_tensorflow_graph_field_payload(stream.read(length))
-                if not _skip_proto_stream_value(
+                skip_status = _skip_proto_stream_value(
                     stream,
                     wire_type,
                     file_size,
                     field_number=field_number,
                     remaining_fields=remaining_fields,
-                ):
+                )
+                if skip_status is None:
+                    return True
+                if not skip_status:
                     return False
     except OSError:
         return False
@@ -1380,6 +1766,8 @@ def detect_format_from_magic_bytes(
 
     if file_path is not None and _looks_like_onnx_model_candidate_file(file_path, file_size):
         return "onnx"
+    if file_path is not None and _looks_like_coreml_model_candidate_file(file_path, file_size, magic4):
+        return "coreml"
 
     # Check longer magic sequences
     match magic8:
@@ -1510,6 +1898,8 @@ def detect_file_format_from_magic(path: str) -> str:
 
     if _looks_like_onnx_model_candidate_file(file_path, size):
         return "onnx"
+    if _looks_like_coreml_model_candidate_file(file_path, size, magic4):
+        return "coreml"
     if _has_budget_exhausted_protobuf_model_candidate(file_path, size):
         return PROTOBUF_MODEL_CANDIDATE_FORMAT
 
@@ -1600,6 +1990,10 @@ def detect_file_format_for_skip_filter(path: str) -> str:
     renamed_tensorflow_format = _detect_renamed_tensorflow_protobuf(file_path, size)
     if renamed_tensorflow_format != "unknown":
         return renamed_tensorflow_format
+    if _looks_like_onnx_model_candidate_file(file_path, size):
+        return "onnx"
+    if _looks_like_coreml_model_candidate_file(file_path, size, magic4):
+        return "coreml"
     if _has_budget_exhausted_protobuf_model_candidate(file_path, size):
         return PROTOBUF_MODEL_CANDIDATE_FORMAT
 
@@ -1642,6 +2036,8 @@ def detect_file_format(path: str) -> str:
         return "numpy"
     if _looks_like_onnx_model_candidate_file(file_path, size):
         return "onnx"
+    if _looks_like_coreml_model_candidate_file(file_path, size, magic4):
+        return "coreml"
 
     # Check first 8 bytes for HDF5 magic
     hdf5_magic = b"\x89HDF\r\n\x1a\n"

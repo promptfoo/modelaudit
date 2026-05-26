@@ -10,6 +10,7 @@ from ..scanner_results import IssueSeverity, ScanResult, mark_inconclusive_scan_
 from ..scanner_selection import (
     SCANNER_SELECTION_PREFERRED_KIND,
     add_scanner_selection_skip_check,
+    allows_protobuf_model_candidate_analysis,
     make_scanner_selection_skip_result,
     policy_from_config,
 )
@@ -56,7 +57,7 @@ def _select_nested_scanner_id(path: str, *, header_format: str | None = None) ->
     ext = os.path.splitext(path)[1].lower()
 
     if header_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
-        return "onnx"
+        return "protobuf_model_candidate"
 
     if header_format == "zip":
         if is_torchserve_mar_archive(path):
@@ -90,7 +91,7 @@ def _select_nested_scanner_id(path: str, *, header_format: str | None = None) ->
 def _is_direct_header_route(scanner_id: str, header_format: str) -> bool:
     """Return whether the detected header directly maps to this scanner."""
     if header_format == PROTOBUF_MODEL_CANDIDATE_FORMAT:
-        return scanner_id == "onnx"
+        return scanner_id == "protobuf_model_candidate"
     return header_format != "unknown" and _HEADER_FORMAT_TO_SCANNER_ID.get(header_format) == scanner_id
 
 
@@ -163,7 +164,7 @@ def _make_incomplete_protobuf_model_result(path: str) -> ScanResult:
         name="Protobuf Model Routing",
         passed=False,
         message=(
-            "Protobuf model routing was inconclusive because tentative ONNX "
+            "Protobuf model routing was inconclusive because tentative protobuf "
             "analysis was unavailable for a bounded-probe candidate"
         ),
         severity=IssueSeverity.INFO,
@@ -186,7 +187,10 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
     scanner_id = _select_nested_scanner_id(path, header_format=routed_content_format)
     trusted_content_format = detect_file_format_from_magic(path)
     skipped_preferred_scanner_id: str | None = None
-    if scanner_id and scanner_selection.allows(scanner_id):
+    if scanner_id and (
+        scanner_selection.allows(scanner_id)
+        or (scanner_id == "protobuf_model_candidate" and allows_protobuf_model_candidate_analysis(scanner_selection))
+    ):
         scanner_class = _registry.load_scanner_by_id(scanner_id)
         if scanner_class and not _nested_scanner_can_handle(scanner_class, scanner_id, path):
             scanner_class = None

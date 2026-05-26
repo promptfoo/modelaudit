@@ -780,8 +780,13 @@ class TestKerasZipScanner:
         )
         assert result.success is False
 
-    def test_scan_skips_oversized_metadata_json_without_warning_noise(self, tmp_path: Path) -> None:
+    def test_scan_skips_oversized_metadata_json_without_warning_noise(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
         """Oversized optional metadata.json should be bounded and ignored without adding noisy findings."""
+        monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
         scanner = KerasZipScanner()
         keras_path = tmp_path / "oversized_metadata.keras"
         with zipfile.ZipFile(keras_path, "w") as zf:

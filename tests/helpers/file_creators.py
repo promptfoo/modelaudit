@@ -77,6 +77,52 @@ def create_malicious_pickle(path: Path, payload_type: str = "os_system") -> Path
     return path
 
 
+def _encode_proto_varint(value: int) -> bytes:
+    encoded = bytearray()
+    while value >= 0x80:
+        encoded.append((value & 0x7F) | 0x80)
+        value >>= 7
+    encoded.append(value)
+    return bytes(encoded)
+
+
+def _coreml_field_varint(field_number: int, value: int) -> bytes:
+    return _encode_proto_varint(field_number << 3) + _encode_proto_varint(value)
+
+
+def _coreml_field_bytes(field_number: int, value: bytes) -> bytes:
+    return _encode_proto_varint((field_number << 3) | 2) + _encode_proto_varint(len(value)) + value
+
+
+def create_mock_coreml(
+    path: Path,
+    *,
+    custom_class: str | None = None,
+    custom_parameter: tuple[str, str] | None = None,
+    model_type_first: bool = False,
+    model_type_padding: int = 0,
+) -> Path:
+    """Create a minimal structurally valid CoreML model fixture."""
+    metadata = _coreml_field_bytes(1, b"Mock CoreML model")
+    description = _coreml_field_bytes(100, metadata)
+    layer = _coreml_field_bytes(1, b"layer_1")
+    if custom_class is not None:
+        custom = _coreml_field_bytes(10, custom_class.encode("utf-8"))
+        if custom_parameter is not None:
+            key, value = custom_parameter
+            parameter_value = _coreml_field_bytes(20, value.encode("utf-8"))
+            parameter = _coreml_field_bytes(1, key.encode("utf-8")) + _coreml_field_bytes(2, parameter_value)
+            custom += _coreml_field_bytes(30, parameter)
+        layer += _coreml_field_bytes(500, custom)
+    neural_network = _coreml_field_bytes(1, layer) + (b"\x00" * model_type_padding)
+    fields = [_coreml_field_varint(1, 8), _coreml_field_bytes(2, description), _coreml_field_bytes(500, neural_network)]
+    if model_type_first:
+        fields = [fields[1], fields[2], fields[0]]
+    model = b"".join(fields)
+    path.write_bytes(model)
+    return path
+
+
 def create_mock_pytorch_zip(
     path: Path,
     *,

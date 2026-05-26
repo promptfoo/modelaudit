@@ -145,6 +145,16 @@ SCANNER_REGISTRY_METADATA: dict[str, dict[str, Any]] = {
         "dependencies": ["onnx"],
         "numpy_sensitive": True,
     },
+    "protobuf_model_candidate": {
+        "module": "modelaudit.scanners.protobuf_model_candidate_scanner",
+        "class": "ProtobufModelCandidateScanner",
+        "description": "Tentatively analyzes bounded protobuf model candidates",
+        "extensions": [],
+        "header_formats": ["protobuf_model_candidate"],
+        "priority": 6,
+        "dependencies": [],
+        "numpy_sensitive": False,
+    },
     "coreml": {
         "module": "modelaudit.scanners.coreml_scanner",
         "class": "CoreMLScanner",

