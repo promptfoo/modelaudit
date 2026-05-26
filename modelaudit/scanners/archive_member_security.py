@@ -713,7 +713,7 @@ def scan_archive_member_for_known_risks(
     archive_kind: str,
     archive_path: str,
     member_name: str,
-    tmp_path: str,
+    tmp_path: str | None,
     total_size: int,
     result: ScanResult,
     max_python_analysis_bytes: int,
@@ -722,7 +722,7 @@ def scan_archive_member_for_known_risks(
 ) -> None:
     """Inspect generic archive members that nested dispatch would otherwise ignore.
 
-    ``archive_kind`` is a short label (``"ZIP"`` / ``"TAR"``) used only for the
+    ``archive_kind`` is a short label (``"ZIP"`` / ``"TAR"`` / ``"NeMo"``) used only for the
     human-readable message text. The dispatcher (1) routes Python-looking
     members through bounded AST analysis unless content routing already owns
     the member, (2) flags native/script executable-suffix members, and (3)
@@ -747,6 +747,18 @@ def scan_archive_member_for_known_risks(
                     "max_scan_bytes": max_python_analysis_bytes,
                     "analysis_incomplete": True,
                 },
+            )
+            return
+
+        if tmp_path is None:
+            mark_archive_scan_incomplete(result, python_analysis_incomplete_reason)
+            result.add_check(
+                name=_PYTHON_MEMBER_CHECK_NAME,
+                passed=False,
+                message=f"Python archive member could not be extracted for bounded security analysis: {member_name}",
+                severity=IssueSeverity.INFO,
+                location=location,
+                details={"entry": member_name, "analysis_incomplete": True},
             )
             return
 
@@ -800,7 +812,9 @@ def scan_archive_member_for_known_risks(
             )
         return
 
-    if is_executable_archive_member_name(normalized_lower) or is_executable_archive_member_content(tmp_path):
+    if is_executable_archive_member_name(normalized_lower) or (
+        tmp_path is not None and is_executable_archive_member_content(tmp_path)
+    ):
         _add_executable_archive_member_check(
             archive_kind=archive_kind,
             archive_path=archive_path,
