@@ -419,6 +419,28 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert checks[0].rule_code == "S101"
         assert checks[0].details["entry"] == "handler.py"
 
+    def test_oversized_embedded_python_member_stays_incomplete_with_suffix_finding(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("modelaudit.scanners.nemo_scanner.NEMO_MAX_PYTHON_ANALYSIS_BYTES", 8)
+        nemo_path = tmp_path / "oversized-handler.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "handler.py", b"012345678")
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        assert result.success is False
+        assert result.metadata["analysis_incomplete"] is True
+        assert "nemo_python_member_analysis_incomplete" in result.metadata["scan_outcome_reasons"]
+        assert any(
+            check.name == "Python Archive Member Security" and check.details.get("analysis_incomplete") is True
+            for check in result.checks
+        )
+        assert any(check.name == "Suspicious File in NeMo Archive" for check in result.checks)
+
     def test_renamed_nemo_embedded_executable_retains_archive_member_analysis(self, tmp_path: Path) -> None:
         nemo_path = tmp_path / "embedded-executable.jpg"
         with tarfile.open(nemo_path, "w") as tar:
@@ -992,6 +1014,20 @@ class TestCVE202523304HydraTarget:
             for check in result.checks
         )
 
+    def test_core_does_not_promote_forward_hardlink_root_config(self, tmp_path: Path) -> None:
+        path = tmp_path / "forward-hardlink-config.jpg"
+        with tarfile.open(path, "w") as archive:
+            link_info = tarfile.TarInfo("model_config.yaml")
+            link_info.type = tarfile.LNKTYPE
+            link_info.linkname = "payload.txt"
+            archive.addfile(link_info)
+            _add_tar_bytes(archive, "payload.txt", b"model:\n  _target_: os.system\n  command: echo pwned\n")
+
+        result = scan_file(str(path), config={"cache_scan_results": False})
+
+        assert result.scanner_name == "tar"
+        assert not any(check.name == "CVE-2025-23304: Dangerous Hydra _target_" for check in result.checks)
+
     @pytest.mark.parametrize(
         ("config_name", "payload_name"),
         [("model_config.yaml", "payload.txt"), ("configs/../model_config.yaml", "configs/../payload.txt")],
@@ -1193,6 +1229,8 @@ class TestCVE202523304HydraTarget:
         nested_result = ScanResult(scanner_name="nemo")
         nested_result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
         nested_result.metadata["scan_outcome_reasons"] = ["nemo_routing_incomplete"]
+        nested_result.metadata["operational_error"] = True
+        nested_result.metadata["operational_error_reason"] = "nemo_routing_incomplete"
         nested_result.add_check(
             name="NeMo Routing",
             passed=False,
@@ -1222,6 +1260,69 @@ class TestCVE202523304HydraTarget:
         assert [check.name for check in result.checks] == ["NeMo Routing"]
         assert result.issues == []
         assert result.metadata["operational_error"] is True
+
+    @pytest.mark.parametrize(
+        ("reason", "check_name"),
+        [
+            ("llamafile_routing_incomplete", "Llamafile Routing"),
+            ("recognized_format_scanner_unavailable", "Format Detection"),
+            ("xml_model_routing_incomplete", "XML Model Routing"),
+        ],
+    )
+    def test_nested_operational_incomplete_outcomes_are_propagated(
+        self,
+        tmp_path: Path,
+        reason: str,
+        check_name: str,
+    ) -> None:
+        extracted_path = str(tmp_path / "nested-payload.bin")
+        result = ScanResult(scanner_name="nemo")
+        nested_result = ScanResult(scanner_name="unknown")
+        nested_result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+        nested_result.metadata["scan_outcome_reasons"] = [reason]
+        nested_result.metadata["operational_error"] = True
+        nested_result.metadata["operational_error_reason"] = reason
+        nested_result.add_check(
+            name=check_name,
+            passed=False,
+            message="Nested operational scan incomplete",
+            severity=IssueSeverity.INFO,
+            location=extracted_path,
+        )
+
+        NemoScanner._merge_nested_security_findings(
+            result,
+            nested_result,
+            extracted_path,
+            str(tmp_path / "outer.nemo"),
+            "assets/payload.bin",
+        )
+
+        assert [check.name for check in result.checks] == [check_name]
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert reason in result.metadata["scan_outcome_reasons"]
+        assert result.metadata["operational_error_reason"] == reason
+
+    def test_referenced_joblib_operational_failure_is_not_hidden_by_nemo_composition(self, tmp_path: Path) -> None:
+        path = tmp_path / "referenced-joblib-container.jpg"
+        config = {"model": {"_target_": "nemo.Model"}, "artifact": "nemo:assets/payload.joblib"}
+        with tarfile.open(path, "w") as archive:
+            _add_tar_bytes(archive, "model_config.yaml", yaml.safe_dump(config).encode())
+            _add_tar_bytes(archive, "assets/payload.joblib", b"not a pickle")
+
+        result = scan_file(str(path), config={"cache_scan_results": False})
+
+        assert result.scanner_name == "nemo"
+        assert result.success is False
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "joblib_wrapper_decode_failed" in result.metadata["scan_outcome_reasons"]
+        assert result.metadata["operational_error_reason"] == "joblib_wrapper_decode_failed"
+        assert any(
+            check.name == "Compression Bomb Detection"
+            and check.status == CheckStatus.FAILED
+            and "assets/payload.joblib" in str(check.location)
+            for check in result.checks
+        )
 
     def test_declared_nemo_scans_root_config_beyond_renamed_route_budget(
         self,

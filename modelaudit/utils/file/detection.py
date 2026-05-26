@@ -1122,7 +1122,7 @@ def _detect_tar_route(path: str) -> str | None:
                 target_name = _resolve_safe_tar_link_target_name(member)
                 if target_name in regular_member_names:
                     return "nemo"
-                if target_name is not None:
+                if member.issym() and target_name is not None:
                     linked_root_config_targets.add(target_name)
     except (OSError, tarfile.TarError):
         return None

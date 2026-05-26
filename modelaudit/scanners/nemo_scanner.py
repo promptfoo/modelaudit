@@ -13,9 +13,13 @@ import tarfile
 import tempfile
 from typing import Any, ClassVar
 
-from ..core_results import mark_operational_scan_error
+from ..core_results import (
+    OPERATIONAL_ERROR_REASON_METADATA_KEY,
+    mark_operational_scan_error,
+    scan_result_has_operational_error,
+)
 from ..utils import is_absolute_archive_path, sanitize_archive_path
-from ..utils.file.detection import NEMO_ROUTING_INCONCLUSIVE_FORMAT, is_nemo_archive
+from ..utils.file.detection import is_nemo_archive
 from ._archive_locations import rewrite_extracted_member_location
 from ._archive_outcomes import mark_archive_scan_incomplete
 from .archive_member_security import (
@@ -148,6 +152,14 @@ NEMO_EXECUTABLE_PE_PROBE_BYTES = (1024 * 1024) + 4
 
 _INCONCLUSIVE_METADATA_KEY = "scan_outcome"
 _INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
+_NESTED_OPERATIONAL_CHECK_NAMES = {
+    "joblib_wrapper_decode_failed": "Compression Bomb Detection",
+    "llamafile_routing_incomplete": "Llamafile Routing",
+    "nemo_routing_incomplete": "NeMo Routing",
+    "recognized_format_scanner_unavailable": "Format Detection",
+    "xml_model_routing_incomplete": "XML Model Routing",
+}
+_NESTED_OPERATIONAL_REASON_FALLBACK = "nemo_referenced_nested_operational_error"
 
 
 def _find_suspicious_target_pattern(target: str) -> str | None:
@@ -317,6 +329,10 @@ class NemoScanner(BaseScanner):
 
     @staticmethod
     def _finish_scan_result(result: ScanResult) -> None:
+        if result.metadata.get("analysis_incomplete") is True:
+            result.finish(success=False)
+            return
+
         if result.metadata.get(
             _INCONCLUSIVE_METADATA_KEY
         ) == INCONCLUSIVE_SCAN_OUTCOME and not _scan_result_has_security_findings(result):
@@ -1006,25 +1022,22 @@ class NemoScanner(BaseScanner):
         """Preserve actionable nested findings while NeMo adds CVE attribution."""
         archive_location = f"{archive_path}:{entry_name}"
         actionable_severities = {IssueSeverity.WARNING, IssueSeverity.CRITICAL}
-        reasons = nested_result.metadata.get(_INCONCLUSIVE_REASONS_METADATA_KEY)
-        nested_reasons = reasons if isinstance(reasons, list) else []
-        propagated_reasons = [str(reason) for reason in nested_reasons if reason == "nemo_routing_incomplete"]
-        nested_incomplete = nested_result.metadata.get(
-            _INCONCLUSIVE_METADATA_KEY
-        ) == INCONCLUSIVE_SCAN_OUTCOME and bool(propagated_reasons)
-        if nested_incomplete:
-            for reason in propagated_reasons:
-                mark_archive_scan_incomplete(result, reason)
-                mark_operational_scan_error(result, reason)
+        raw_operational_reason = nested_result.metadata.get(OPERATIONAL_ERROR_REASON_METADATA_KEY)
+        operational_reason = (
+            raw_operational_reason if isinstance(raw_operational_reason, str) else _NESTED_OPERATIONAL_REASON_FALLBACK
+        )
+        nested_operational = scan_result_has_operational_error(nested_result)
+        if nested_operational:
+            mark_archive_scan_incomplete(result, operational_reason)
+            mark_operational_scan_error(result, operational_reason)
 
         for check in nested_result.checks:
-            is_incomplete_routing_check = (
-                nested_incomplete
-                and check.name == "NeMo Routing"
-                and check.details.get("format") == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+            is_operational_diagnostic = nested_operational and (
+                check.name == _NESTED_OPERATIONAL_CHECK_NAMES.get(operational_reason)
+                or check.details.get("scan_outcome_reason") == operational_reason
             )
             if check.status != CheckStatus.FAILED or (
-                check.severity not in actionable_severities and not is_incomplete_routing_check
+                check.severity not in actionable_severities and not is_operational_diagnostic
             ):
                 continue
             check.location = rewrite_extracted_member_location(

@@ -896,6 +896,23 @@ def test_detect_file_format_routes_renamed_nemo_archive_by_linked_root_config(
     assert detect_file_format_for_skip_filter(str(archive_path)) == "nemo"
 
 
+def test_detect_file_format_keeps_forward_hardlink_root_config_on_tar_route(tmp_path: Path) -> None:
+    archive_path = tmp_path / "forward-hardlink-model.jpg"
+    with tarfile.open(archive_path, "w") as archive:
+        link_info = tarfile.TarInfo("model_config.yaml")
+        link_info.type = tarfile.LNKTYPE
+        link_info.linkname = "payload.txt"
+        archive.addfile(link_info)
+        payload = b"model:\n  _target_: os.system\n"
+        payload_info = tarfile.TarInfo("payload.txt")
+        payload_info.size = len(payload)
+        archive.addfile(payload_info, io.BytesIO(payload))
+
+    assert detect_file_format(str(archive_path)) == "tar"
+    assert detect_file_format_from_magic(str(archive_path)) == "tar"
+    assert detect_file_format_for_skip_filter(str(archive_path)) == "tar"
+
+
 @pytest.mark.parametrize(
     "config_name",
     [
