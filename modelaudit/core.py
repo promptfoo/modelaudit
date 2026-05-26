@@ -1564,6 +1564,26 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             header_format = magic_format = MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
             skipped_overlap_scanner_id = "xgboost"
     if (
+        header_format in {"mxnet", MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT}
+        and ext != ".json"
+        and scanner_selection.active
+        and scanner_selection.allows("xgboost")
+        and not scanner_selection.allows("mxnet")
+        and (
+            XGBoostScanner._is_xgboost_json(
+                path,
+                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+            )
+            or XGBoostScanner._is_probable_mxnet_overlap_candidate(
+                path,
+                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+            )
+        )
+    ):
+        # Keep default bounded ownership with MXNet, but honor explicit
+        # XGBoost-only coverage when its structure is already observable.
+        header_format = magic_format = "xgboost"
+    if (
         header_format == "xgboost"
         and ext != ".json"
         and (

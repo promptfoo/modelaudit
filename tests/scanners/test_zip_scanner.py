@@ -1652,6 +1652,29 @@ def test_scan_nested_file_keeps_oversized_renamed_overlap_on_bounded_mxnet_route
     assert not any(check.name == "JSON Parsing" for check in result.checks)
 
 
+@pytest.mark.parametrize("version", ["[1,7,4]", '"malformed"'])
+def test_scan_nested_file_xgboost_only_oversized_renamed_overlap_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version: str,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    monkeypatch.setattr(archive_dispatch, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    extracted_member = tmp_path / "payload.meta"
+    extracted_member.write_text(
+        '{"version":' + version + ',"learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],"padding":"' + ("x" * 600) + '"}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert "max_file_read_size_exceeded" in result.metadata["scan_outcome_reasons"]
+    assert any(check.name == "File Size Limit" for check in result.checks)
+
+
 def test_scan_nested_file_symbol_routed_params_preserves_raw_text_findings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

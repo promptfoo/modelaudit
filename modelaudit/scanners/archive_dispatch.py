@@ -411,6 +411,26 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
             trusted_content_format = MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
             skipped_overlap_scanner_id = "xgboost"
     if (
+        trusted_content_format in {"mxnet", MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT}
+        and os.path.splitext(path)[1].lower() != ".json"
+        and scanner_selection.active
+        and scanner_selection.allows("xgboost")
+        and not scanner_selection.allows("mxnet")
+        and (
+            XGBoostScanner._is_xgboost_json(
+                path,
+                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+            )
+            or XGBoostScanner._is_probable_mxnet_overlap_candidate(
+                path,
+                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+            )
+        )
+    ):
+        # Keep default bounded ownership with MXNet, but honor explicit
+        # XGBoost-only coverage when its structure is already observable.
+        trusted_content_format = "xgboost"
+    if (
         trusted_content_format == "xgboost"
         and os.path.splitext(path)[1].lower() != ".json"
         and (

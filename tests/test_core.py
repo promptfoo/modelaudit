@@ -2738,6 +2738,56 @@ def test_scan_file_xgboost_only_overlap_is_clean_and_cached(tmp_path: Path) -> N
         reset_cache_manager()
 
 
+@pytest.mark.parametrize("version", ["[1,7,4]", '"malformed"'])
+def test_scan_file_xgboost_only_oversized_renamed_overlap_is_not_clean_or_cached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version: str,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    monkeypatch.setattr(core_module, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 512)
+    model_path = tmp_path / "polyglot.meta"
+    model_path.write_text(
+        '{"version":' + version + ',"learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]],"padding":"' + ("x" * 600) + '"}',
+        encoding="utf-8",
+    )
+    cache_dir = tmp_path / "cache"
+    direct = scan_file(str(model_path), config={"scanners": ["xgboost"], "cache_enabled": False})
+
+    assert direct.scanner_name == "xgboost"
+    assert direct.success is False
+    assert "max_file_read_size_exceeded" in direct.metadata["scan_outcome_reasons"]
+
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(model_path),
+            scanners=["xgboost"],
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(model_path),
+            scanners=["xgboost"],
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(model_path)]
+            assert metadata["scan_outcome"] == "inconclusive"
+            assert "max_file_read_size_exceeded" in metadata["scan_outcome_reasons"]
+            assert core_module.determine_exit_code(aggregate) == 1
+            assert "xgboost" in aggregate.scanner_names
+            assert any(check.name == "File Size Limit" for check in aggregate.checks)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 def test_scan_file_inconclusive_params_routing_preserves_raw_findings(tmp_path: Path) -> None:
     params_path = tmp_path / "payload-0000.params"
     params_path.write_text(
