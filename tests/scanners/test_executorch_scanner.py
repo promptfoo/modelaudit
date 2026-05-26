@@ -193,6 +193,32 @@ def test_renamed_executorch_binary_routes_through_directory_scan(tmp_path: Path)
     assert "executorch" in directory.scanner_names
 
 
+def test_renamed_executorch_structure_read_failure_routes_to_inconclusive_scan(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    file_path = create_executorch_binary(tmp_path, filename="program.jpg")
+
+    def fail_structural_probe(_path: str | Path, *, propagate_io_errors: bool = False) -> bool:
+        if propagate_io_errors:
+            raise OSError("simulated renamed ExecuTorch structure read failure")
+        return False
+
+    monkeypatch.setattr("modelaudit.utils.file.detection._is_valid_executorch_binary", fail_structural_probe)
+    monkeypatch.setattr("modelaudit.scanners.executorch_scanner._is_valid_executorch_binary", fail_structural_probe)
+
+    assert detect_file_format(str(file_path)) == "executorch"
+
+    directory = core.scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+    metadata = directory.file_metadata[str(file_path)]
+
+    assert directory.files_scanned == 1
+    assert "executorch" in directory.scanner_names
+    assert metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "executorch_read_failed" in metadata["scan_outcome_reasons"]
+    assert core.determine_exit_code(directory) == 2
+
+
 def test_renamed_executorch_near_match_remains_skipped(tmp_path: Path) -> None:
     file_path = create_executorch_binary(tmp_path, identifier=b"ETXX", filename="program.jpg")
 

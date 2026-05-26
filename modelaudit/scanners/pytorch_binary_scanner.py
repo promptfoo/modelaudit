@@ -318,19 +318,32 @@ class PyTorchBinaryScanner(BaseScanner):
 
         return False
 
-    @staticmethod
-    def _is_valid_embedded_pe(data: bytes, offset_in_chunk: int) -> bool:
+    def _is_valid_embedded_pe(self, data: bytes, offset_in_chunk: int, absolute_offset: int) -> bool:
         """Validate a non-leading DOS header before reporting embedded PE content."""
         pointer_offset = offset_in_chunk + 0x3C
-        if pointer_offset + 4 > len(data):
+        if pointer_offset + 4 <= len(data):
+            pe_pointer = data[pointer_offset : pointer_offset + 4]
+        else:
+            try:
+                with open(self.current_file_path, "rb") as f:
+                    f.seek(absolute_offset + 0x3C)
+                    pe_pointer = f.read(4)
+            except OSError:
+                return False
+        if len(pe_pointer) != 4:
             return False
-        pe_offset = int.from_bytes(data[pointer_offset : pointer_offset + 4], "little")
+        pe_offset = int.from_bytes(pe_pointer, "little")
+        if pe_offset < 0x40:
+            return False
         signature_offset = offset_in_chunk + pe_offset
-        return (
-            pe_offset >= 0x40
-            and signature_offset + 4 <= len(data)
-            and data[signature_offset : signature_offset + 4] == b"PE\x00\x00"
-        )
+        if signature_offset + 4 <= len(data):
+            return data[signature_offset : signature_offset + 4] == b"PE\x00\x00"
+        try:
+            with open(self.current_file_path, "rb") as f:
+                f.seek(absolute_offset + pe_offset)
+                return f.read(4) == b"PE\x00\x00"
+        except OSError:
+            return False
 
     def _check_for_executable_signatures(
         self,
@@ -393,7 +406,7 @@ class PyTorchBinaryScanner(BaseScanner):
 
                 # Middle-of-file MZ pairs are common in weights; retain only
                 # structurally validated embedded PE images.
-                if sig == b"MZ" and pos != 0 and not self._is_valid_embedded_pe(chunk, pos - offset):
+                if sig == b"MZ" and pos != 0 and not self._is_valid_embedded_pe(chunk, pos - offset, pos):
                     ignored_count += 1
                     continue
 
