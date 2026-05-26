@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
+- mark CatBoost text-fragment extraction limits and unavailable reads as inconclusive analysis
 - mark RKNN and Torch7 string-extraction limits and unavailable reads as inconclusive analysis
 - classify unavailable TFLite parsing coverage as inconclusive rather than a security finding
 - classify unavailable MXNet artifact reads as inconclusive rather than security findings
