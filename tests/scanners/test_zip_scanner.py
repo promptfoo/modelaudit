@@ -1066,6 +1066,14 @@ def test_scan_nested_file_mxnet_only_selection_fails_closed_for_bounded_xgboost_
 
     assert result.success is False
     assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert "xgboost" in result.metadata["skipped_scanner_ids"]
+    assert any(
+        check.name == "Scanner Selection"
+        and check.details.get("skipped_scanner_id") == "xgboost"
+        and check.details.get("context") == "overlapping JSON analysis"
+        and check.details.get("kind") == "preferred"
+        for check in result.checks
+    )
 
 
 def test_scan_nested_file_xgboost_only_selection_skips_overlap_mxnet_analysis(tmp_path: Path) -> None:

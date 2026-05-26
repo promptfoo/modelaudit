@@ -392,6 +392,7 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
             skipped_overlap_scanner_id = "xgboost"
         elif selected_mxnet_route == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
             trusted_content_format = MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+            skipped_overlap_scanner_id = "xgboost"
     if (
         trusted_content_format == "xgboost"
         and os.path.splitext(path)[1].lower() != ".json"
@@ -414,7 +415,17 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
     if trusted_content_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
         return _make_incomplete_nemo_routing_result(path)
     if trusted_content_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
-        return _make_incomplete_mxnet_symbol_routing_result(path, config)
+        result = _make_incomplete_mxnet_symbol_routing_result(path, config)
+        if skipped_overlap_scanner_id:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                skipped_overlap_scanner_id,
+                scanner_selection,
+                context="overlapping JSON analysis",
+                kind=SCANNER_SELECTION_PREFERRED_KIND,
+            )
+        return result
     if trusted_content_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
         return _make_incomplete_xgboost_ubjson_routing_result(path)
     if trusted_content_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT:

@@ -1547,6 +1547,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
             skipped_overlap_scanner_id = "xgboost"
         elif selected_mxnet_route == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
             header_format = magic_format = MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+            skipped_overlap_scanner_id = "xgboost"
     if (
         header_format == "xgboost"
         and ext != ".json"
@@ -1584,6 +1585,15 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         or magic_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
     ):
         sr = _make_incomplete_mxnet_symbol_routing_result(path, config)
+        if skipped_overlap_scanner_id:
+            add_scanner_selection_skip_check(
+                sr,
+                path,
+                skipped_overlap_scanner_id,
+                scanner_selection,
+                context="overlapping JSON analysis",
+                kind=SCANNER_SELECTION_PREFERRED_KIND,
+            )
         if sr.bytes_scanned == 0 and file_size > 0:
             sr.bytes_scanned = file_size
         return sr
