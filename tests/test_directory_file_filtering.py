@@ -277,6 +277,17 @@ class TestDirectoryFileFiltering:
         assert determine_exit_code(results) == 1
         assert any(issue.message == "Dangerous TensorFlow operation: PyFunc" for issue in results.issues)
 
+    def test_malformed_disguised_malicious_tf_metagraph_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
+        disguised_payload = tmp_path / "malformed-payload.jpg"
+        disguised_payload.write_bytes(_build_malicious_tf_metagraph() + b"\xff")
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "tf_metagraph" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message == "Dangerous TensorFlow operation: PyFunc" for issue in results.issues)
+
     def test_disguised_malicious_tf_savedmodel_with_skipped_extension_is_scanned(self, tmp_path: Path) -> None:
         disguised_payload = tmp_path / "saved.jpg"
         disguised_payload.write_bytes(_build_malicious_tf_savedmodel())

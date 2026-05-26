@@ -12,6 +12,7 @@ from modelaudit.config.explanations import get_tf_op_explanation
 from modelaudit.detectors.suspicious_symbols import SUSPICIOUS_OPS, TENSORFLOW_DANGEROUS_OPS
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs
 
+from ..scanner_results import INCONCLUSIVE_SCAN_OUTCOME, mark_inconclusive_scan_result
 from .base import BaseScanner, IssueSeverity, ScanResult
 
 # Discovery assumptions for `.meta` support:
@@ -34,6 +35,7 @@ _MAX_FUNCTION_NODES = 100_000
 _MAX_ATTR_VALUE_BYTES = 32 * 1024
 _MAX_COLLECTION_VALUE_BYTES = 256 * 1024
 _MAX_SIGNAL_EXAMPLES = 8
+METAGRAPH_PARSE_INCONCLUSIVE_REASON = "metagraph_protobuf_parse_failed"
 
 # Align dangerous operation severity with SavedModel scanner behavior.
 # Save/Restore ops are common in benign checkpoints and are not direct
@@ -90,6 +92,14 @@ def _read_bounded(path: str, max_bytes: int) -> tuple[bytes, bool]:
 
 
 def _parse_metagraph(data: bytes) -> Any:
+    metagraph, parse_error = _parse_metagraph_preserving_partial(data)
+    if parse_error is not None:
+        raise parse_error
+    return metagraph
+
+
+def _parse_metagraph_preserving_partial(data: bytes) -> tuple[Any, Exception | None]:
+    """Return any decoded MetaGraph fields together with a trailing parse error."""
     # Import vendored protos module (sets up sys.path for tensorflow.* imports)
     # Order matters: modelaudit.protos must be imported first to set up sys.path
     import modelaudit.protos  # noqa: F401, I001
@@ -97,8 +107,11 @@ def _parse_metagraph(data: bytes) -> Any:
     from tensorflow.core.protobuf.meta_graph_pb2 import MetaGraphDef
 
     metagraph = MetaGraphDef()
-    metagraph.ParseFromString(data)
-    return metagraph
+    try:
+        metagraph.ParseFromString(data)
+    except Exception as exc:
+        return metagraph, exc
+    return metagraph, None
 
 
 @dataclass(frozen=True)
@@ -329,18 +342,40 @@ class TensorFlowMetaGraphScanner(BaseScanner):
             return result
 
         try:
-            metagraph = _parse_metagraph(content)
+            metagraph, parse_error = _parse_metagraph_preserving_partial(content)
         except Exception as e:
+            mark_inconclusive_scan_result(result, METAGRAPH_PARSE_INCONCLUSIVE_REASON)
             result.add_check(
                 name="MetaGraph Protobuf Parsing",
                 passed=False,
                 message=f"Invalid or corrupt TensorFlow MetaGraph protobuf: {e}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
-                details={"exception": str(e), "exception_type": type(e).__name__},
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": METAGRAPH_PARSE_INCONCLUSIVE_REASON,
+                },
             )
             result.finish(success=False)
             return result
+
+        if parse_error is not None:
+            mark_inconclusive_scan_result(result, METAGRAPH_PARSE_INCONCLUSIVE_REASON)
+            result.add_check(
+                name="MetaGraph Protobuf Parsing",
+                passed=False,
+                message=f"Invalid or corrupt TensorFlow MetaGraph protobuf: {parse_error}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "exception": str(parse_error),
+                    "exception_type": type(parse_error).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": METAGRAPH_PARSE_INCONCLUSIVE_REASON,
+                },
+            )
 
         structure = _collect_structure(metagraph)
         result.metadata["graph_node_count"] = structure.graph_node_count
@@ -558,5 +593,7 @@ class TensorFlowMetaGraphScanner(BaseScanner):
                 },
             )
 
-        result.finish(success=not result.has_errors)
+        result.finish(
+            success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME and not result.has_errors,
+        )
         return result

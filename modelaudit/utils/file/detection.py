@@ -1349,7 +1349,14 @@ def _is_tensorflow_metagraph_file(path: str) -> bool:
 
         content = file_path.read_bytes()
         metagraph = MetaGraphDef()
-        metagraph.ParseFromString(content)
+        parse_failed = False
+        try:
+            metagraph.ParseFromString(content)
+        except Exception:
+            # Protobuf preserves completed fields before a malformed trailing
+            # tag. Keep real graph-bearing payloads routed so scanning can
+            # report both recovered findings and incomplete coverage.
+            parse_failed = True
 
         if not metagraph.HasField("graph_def"):
             return False
@@ -1357,6 +1364,12 @@ def _is_tensorflow_metagraph_file(path: str) -> bool:
         graph_node_count = len(metagraph.graph_def.node)
         function_node_count = sum(len(function.node_def) for function in metagraph.graph_def.library.function)
         collection_count = len(metagraph.collection_def)
+        if parse_failed:
+            return (
+                any(node.op for node in metagraph.graph_def.node)
+                or any(node.op for function in metagraph.graph_def.library.function for node in function.node_def)
+                or collection_count > 0
+            )
         return graph_node_count > 0 or function_node_count > 0 or collection_count > 0
     except Exception:
         return False

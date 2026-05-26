@@ -7,11 +7,12 @@ from typing import Any, cast
 import pytest
 
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import CheckStatus, IssueSeverity
 from modelaudit.scanners.tf_metagraph_scanner import (
     _MAX_ATTR_VALUE_BYTES,
     _MAX_PARSE_BYTES,
     DISCOVERY_ASSUMPTIONS,
+    METAGRAPH_PARSE_INCONCLUSIVE_REASON,
     TensorFlowMetaGraphScanner,
     _attr_strings_with_lowered_values,
     _AttrString,
@@ -374,7 +375,73 @@ def test_tf_metagraph_scanner_corrupt_protobuf(tmp_path: Path) -> None:
 
     result = TensorFlowMetaGraphScanner().scan(str(corrupt_meta))
     assert result.success is False
-    assert any("Invalid or corrupt TensorFlow MetaGraph protobuf" in issue.message for issue in result.issues)
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert METAGRAPH_PARSE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    parse_check = next(check for check in result.checks if check.name == "MetaGraph Protobuf Parsing")
+    assert parse_check.status == CheckStatus.FAILED
+    assert parse_check.severity == IssueSeverity.INFO
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_tf_metagraph_scanner_preserves_recovered_malicious_graph_findings(tmp_path: Path) -> None:
+    malformed_meta = tmp_path / "malicious-tail.meta"
+    malformed_meta.write_bytes(_build_metagraph(graph_nodes=[{"name": "pyfunc_node", "op": "PyFunc"}]) + b"\xff")
+
+    result = TensorFlowMetaGraphScanner().scan(str(malformed_meta))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert METAGRAPH_PARSE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == "Dangerous TensorFlow operation: PyFunc"
+        and issue.details.get("op_type") == "PyFunc"
+        for issue in result.issues
+    )
+
+
+def test_tf_metagraph_scanner_preserves_recovered_nameless_malicious_graph_findings(tmp_path: Path) -> None:
+    malformed_meta = tmp_path / "nameless-malicious-tail.meta"
+    malformed_meta.write_bytes(_build_metagraph(graph_nodes=[{"name": "", "op": "PyFunc"}]) + b"\xff")
+
+    result = TensorFlowMetaGraphScanner().scan(str(malformed_meta))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert METAGRAPH_PARSE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == "Dangerous TensorFlow operation: PyFunc"
+        and issue.details.get("op_type") == "PyFunc"
+        for issue in result.issues
+    )
+
+
+def test_tf_metagraph_scanner_import_failure_is_inconclusive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    valid_meta = tmp_path / "valid.meta"
+    valid_meta.write_bytes(_build_metagraph(graph_nodes=[{"name": "const", "op": "Const"}]))
+
+    def fail_import(_data: bytes) -> tuple[Any, Exception | None]:
+        raise ImportError("simulated MetaGraph import failure")
+
+    monkeypatch.setattr(
+        "modelaudit.scanners.tf_metagraph_scanner._parse_metagraph_preserving_partial",
+        fail_import,
+    )
+
+    result = TensorFlowMetaGraphScanner().scan(str(valid_meta))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert METAGRAPH_PARSE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    parse_check = next(check for check in result.checks if check.name == "MetaGraph Protobuf Parsing")
+    assert parse_check.status == CheckStatus.FAILED
+    assert parse_check.severity == IssueSeverity.INFO
+    assert parse_check.details["exception_type"] == "ImportError"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_tf_metagraph_scanner_records_discovery_assumptions(tmp_path: Path) -> None:

