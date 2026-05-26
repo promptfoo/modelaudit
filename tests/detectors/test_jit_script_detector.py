@@ -362,6 +362,18 @@ class TestJITScriptDetector:
             b"import builtins\nsetattr(builtins, 'eval', len)\nbuiltins.eval([])\n",
             b"import builtins\nresult = setattr(builtins, 'eval', len)\nbuiltins.eval([])\n",
             (b"import builtins as bi\nfrom builtins import setattr as assign\nassign(bi, 'eval', len)\nbi.eval([])\n"),
+            b"import builtins\nbuiltins.__dict__.update({'eval': len})\nbuiltins.eval([])\n",
+            b"import builtins\nmapping = builtins.__dict__\nmapping.update({'eval': len})\nbuiltins.eval([])\n",
+            (
+                b"import builtins\n"
+                b"if cond:\n"
+                b"    target = builtins\n"
+                b"else:\n"
+                b"    target = builtins\n"
+                b"target.__dict__.update({'eval': len})\n"
+                b"builtins.eval([])\n"
+            ),
+            b"import builtins\nreplace = builtins.__dict__.update\nreplace({'eval': len})\nbuiltins.eval([])\n",
             b"def payload():\n    eval = len\n    return eval([])\n",
             (
                 b"def payload():\n"
@@ -410,6 +422,13 @@ class TestJITScriptDetector:
                 b"globals()['__builtins__']['eval']('pass')\n"
             ),
             b"import builtins\nsetattr(builtins, 'eval', builtins.exec)\nbuiltins.eval('pass')\n",
+            b"import builtins\nbuiltins.__dict__.update({'eval': builtins.exec})\nbuiltins.eval('pass')\n",
+            (
+                b"import builtins\n"
+                b"mapping = builtins.__dict__\n"
+                b"mapping.update({'eval': builtins.exec})\n"
+                b"builtins.eval('pass')\n"
+            ),
             b"import builtins\nprint(setattr(builtins, 'eval', builtins.exec))\nbuiltins.eval('pass')\n",
         ],
     )
@@ -501,6 +520,66 @@ class TestJITScriptDetector:
                 b"except Exception:\n"
                 b"    pass\n"
                 b"builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"if replace_builtin:\n"
+                b"    builtins.__dict__.update({'eval': len})\n"
+                b"builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"replace = builtins.__dict__.update\n"
+                b"replace = lambda values: None\n"
+                b"replace({'eval': len})\n"
+                b"builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"if swap:\n"
+                b"    builtins = make_namespace()\n"
+                b"builtins.__dict__.update({'eval': len})\n"
+                b"builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"if swap:\n"
+                b"    builtins = make_namespace()\n"
+                b"setattr(builtins, 'eval', len)\n"
+                b"builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"if swap:\n"
+                b"    builtins = make_namespace()\n"
+                b"builtins.eval = len\n"
+                b"builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"if swap:\n"
+                b"    builtins = make_namespace()\n"
+                b"namespace = builtins\n"
+                b"namespace.__dict__.update({'eval': len})\n"
+                b"builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"def invoke(namespace=builtins):\n"
+                b"    namespace.__dict__.update({'eval': len})\n"
+                b"    return builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"def invoke(namespace=builtins):\n"
+                b"    setattr(namespace, 'eval', len)\n"
+                b"    return builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"def invoke(namespace=builtins):\n"
+                b"    namespace.eval = len\n"
+                b"    return builtins.eval('1 + 1')\n"
             ),
         ],
     )
