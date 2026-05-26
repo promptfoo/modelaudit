@@ -221,6 +221,9 @@ def test_scan_zip_flags_builtins_getattr_keyword_call_dangerous_python_member(tm
         "globals()['__builtins__']['ev' + 'al']('1 + 1')\n",
         "globals().get('__builtins__').get('eval')('1 + 1')\n",
         "getattr(globals()['__builtins__'], 'eval')('1 + 1')\n",
+        "namespace = globals()\nnamespace['__builtins__']['ev' + 'al']('1 + 1')\n",
+        "namespace = globals()\nnamespace.get('__builtins__').get('eval')('1 + 1')\n",
+        "namespace = globals()\ngetattr(namespace['__builtins__'], 'eval')('1 + 1')\n",
         "globals()['__builtins__'].eval('1 + 1')\n",
         "builtins_ref = globals()['__builtins__']\ngetattr(builtins_ref, 'eval')('1 + 1')\n",
         "global_namespace = globals()\nglobal_namespace['__builtins__']['eval']('1 + 1')\n",
@@ -250,6 +253,8 @@ def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path
         "import builtins as bi\nbi.open('labels.json', 'r')\n",
         "globals()['__builtins__']['len']([1])\n",
         "globals = lambda: {'__builtins__': {'eval': len}}\nglobals()['__builtins__']['eval']([])\n",
+        "namespace = globals()\nnamespace['__builtins__']['len']([1])\n",
+        ("namespace = globals()\nnamespace = {'__builtins__': {'eval': len}}\nnamespace['__builtins__']['eval']([])\n"),
         "global_namespace = {'__builtins__': {'eval': len}}\nglobal_namespace['__builtins__']['eval']([])\n",
     ],
 )

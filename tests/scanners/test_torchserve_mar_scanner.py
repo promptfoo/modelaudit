@@ -243,6 +243,21 @@ def test_scan_detects_keyword_getattr_wrapped_handler_execution_primitive(
         b"def handle(data, context):\n    return globals()['__builtins__']['ev' + 'al']('1 + 1')\n",
         b"def handle(data, context):\n    return globals().get('__builtins__').get('eval')('1 + 1')\n",
         b"def handle(data, context):\n    return getattr(globals()['__builtins__'], 'eval')('1 + 1')\n",
+        (
+            b"def handle(data, context):\n"
+            b"    namespace = globals()\n"
+            b"    return namespace['__builtins__']['ev' + 'al']('1 + 1')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    namespace = globals()\n"
+            b"    return namespace.get('__builtins__').get('eval')('1 + 1')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    namespace = globals()\n"
+            b"    return getattr(namespace['__builtins__'], 'eval')('1 + 1')\n"
+        ),
         b"def handle(data, context):\n    return globals()['__builtins__'].eval('1 + 1')\n",
         (
             b"def handle(data, context):\n"
@@ -286,6 +301,13 @@ def test_scan_detects_implicit_builtins_handler_execution_primitive(
             b"def handle(data, context):\n"
             b"    globals = lambda: {'__builtins__': {'eval': len}}\n"
             b"    return globals()['__builtins__']['eval']([])\n"
+        ),
+        (b"def handle(data, context):\n    namespace = globals()\n    return namespace['__builtins__']['len']([1])\n"),
+        (
+            b"def handle(data, context):\n"
+            b"    namespace = globals()\n"
+            b"    namespace = {'__builtins__': {'eval': len}}\n"
+            b"    return namespace['__builtins__']['eval']([])\n"
         ),
         (
             b"def handle(data, context):\n"
