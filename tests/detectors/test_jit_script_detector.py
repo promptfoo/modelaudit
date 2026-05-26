@@ -6,6 +6,7 @@ import pytest
 
 from modelaudit.detectors import jit_script as jit_script_module
 from modelaudit.detectors.jit_script import JITScriptDetector, detect_jit_script_risks
+from modelaudit.scanners.archive_member_security import high_risk_python_calls_in_source
 
 
 class TestJITScriptDetector:
@@ -315,6 +316,38 @@ class TestJITScriptDetector:
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
         assert any(f.type == "ast_dangerous_call" and f.builtin == builtin for f in findings)
+
+    @pytest.mark.parametrize(
+        ("source", "builtin"),
+        [
+            (
+                b"import importlib\nimport os\ndel os.__dict__['system']\nimportlib.reload(os)\nos.system('id')\n",
+                "os.system",
+            ),
+            (
+                b"import importlib\nimport os\nos.__dict__.clear()\nimportlib.reload(os)\nos.system('id')\n",
+                "os.system",
+            ),
+            (
+                b"import os\nimport subprocess\n"
+                b"subprocess.__dict__.clear()\n"
+                b"subprocess.os = os\n"
+                b"subprocess.os.system('id')\n",
+                "os.system",
+            ),
+            (
+                b"import builtins\n"
+                b"globals()['__builtins__'] = {'eval': len}\n"
+                b"del globals()['__builtins__']['eval']\n"
+                b"builtins.eval('1 + 1')\n",
+                "builtins.eval",
+            ),
+        ],
+    )
+    def test_static_python_analysis_detects_rebuilt_namespace_calls(self, source: bytes, builtin: str) -> None:
+        calls = high_risk_python_calls_in_source(source)
+
+        assert any(call.name == builtin for call in calls)
 
     @pytest.mark.parametrize(
         "source",

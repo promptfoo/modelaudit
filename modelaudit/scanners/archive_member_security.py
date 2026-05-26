@@ -296,9 +296,13 @@ _STATIC_REFERENCE_OVERRIDE_PREFIX = "<static reference override>:"
 _STATIC_CLEARED_NAMESPACE_PREFIX = "<static cleared namespace>:"
 _STATIC_MAPPING_MUTATION_ALIAS_PREFIX = "<static mapping mutation alias>:"
 _STATIC_UNCERTAIN_BINDING_PREFIX = "<uncertain static binding>:"
+_STATIC_GLOBAL_BUILTINS_REBOUND_KEY = "<static global builtins rebound>"
 _CAPTURED_CALLABLE_REFERENCE_PREFIX = "<captured callable>:"
 _BUILTIN_NAMESPACE_NAMES = {"__builtin__", "__builtins__"}
 _BUILTIN_NAMESPACE_ROOT_EQUIVALENTS = frozenset({"__builtin__", "__builtins__", "builtins"})
+_GLOBAL_BUILTIN_NAMESPACE_REFERENCES = frozenset(
+    f"{_GLOBAL_NAMESPACE_MAPPING_MARKER}.{namespace_name}" for namespace_name in _BUILTIN_NAMESPACE_NAMES
+).union(f"{namespace_name}.__dict__" for namespace_name in _BUILTIN_NAMESPACE_NAMES)
 _STATIC_MAPPING_MUTATORS = {"__delitem__", "__setitem__", "clear", "pop", "update"}
 _STATIC_ATTRIBUTE_MUTATION_HELPERS = {
     "setattr",
@@ -320,6 +324,7 @@ _STATIC_MAPPING_FUNCTION_MUTATORS = {
     "operator.delitem": "__delitem__",
     "operator.setitem": "__setitem__",
 }
+_STATIC_RELOAD_HELPERS = {"importlib.reload"}
 
 
 def _has_uncertain_static_binding(node: ast.AST, alias_scopes: _AliasScopes) -> bool:
@@ -701,26 +706,42 @@ def _binding_names(target: ast.AST) -> Iterator[str]:
             yield from _binding_names(element)
 
 
-def _equivalent_static_namespace_roots(namespace_root: str) -> frozenset[str]:
+def _equivalent_static_namespace_roots(
+    namespace_root: str,
+    alias_scopes: _AliasScopes | None = None,
+) -> frozenset[str]:
     if namespace_root in _BUILTIN_NAMESPACE_ROOT_EQUIVALENTS:
+        if alias_scopes is not None:
+            for aliases in reversed(alias_scopes):
+                if _STATIC_GLOBAL_BUILTINS_REBOUND_KEY in aliases:
+                    if aliases[_STATIC_GLOBAL_BUILTINS_REBOUND_KEY] is None:
+                        return frozenset({namespace_root})
+                    break
         return _BUILTIN_NAMESPACE_ROOT_EQUIVALENTS
     return frozenset({namespace_root})
 
 
-def _equivalent_static_reference_names(reference_name: str) -> frozenset[str]:
+def _equivalent_static_reference_names(
+    reference_name: str,
+    alias_scopes: _AliasScopes | None = None,
+) -> frozenset[str]:
     namespace_root, separator, attribute_name = reference_name.partition(".")
     if not separator:
         return frozenset({reference_name})
     return frozenset(
-        f"{equivalent_root}.{attribute_name}" for equivalent_root in _equivalent_static_namespace_roots(namespace_root)
+        f"{equivalent_root}.{attribute_name}"
+        for equivalent_root in _equivalent_static_namespace_roots(namespace_root, alias_scopes)
     )
 
 
-def _static_reference_namespace_roots(reference_name: str) -> frozenset[str]:
+def _static_reference_namespace_roots(
+    reference_name: str,
+    alias_scopes: _AliasScopes | None = None,
+) -> frozenset[str]:
     parts = reference_name.split(".")
     namespace_roots: set[str] = set()
     for index in range(1, len(parts)):
-        namespace_roots.update(_equivalent_static_namespace_roots(".".join(parts[:index])))
+        namespace_roots.update(_equivalent_static_namespace_roots(".".join(parts[:index]), alias_scopes))
     return frozenset(namespace_roots)
 
 
@@ -762,11 +783,74 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         return f"{_STATIC_UNCERTAIN_BINDING_PREFIX}{name}"
 
     def _lookup_static_reference_override(self, reference_name: str) -> _AliasValue:
-        override_key = self._static_reference_override_key(reference_name)
         for aliases in reversed(self.alias_scopes):
+            override_names = self._lookup_static_reference_override_in_scope(aliases, reference_name)
+            if override_names is not _MISSING_ALIAS:
+                return override_names if isinstance(override_names, frozenset) else None
+            for namespace_root in _static_reference_namespace_roots(reference_name, self.alias_scopes):
+                clear_key = self._static_cleared_namespace_key(namespace_root)
+                if clear_key in aliases and aliases[clear_key] is None:
+                    return None
+        return frozenset({reference_name})
+
+    def _lookup_static_reference_override_in_scope(
+        self,
+        aliases: _AliasScope,
+        reference_name: str,
+    ) -> _AliasValue | object:
+        override_key = self._static_reference_override_key(reference_name)
+        if override_key in aliases:
+            return aliases[override_key]
+
+        equivalent_reference_names = _equivalent_static_reference_names(reference_name, self.alias_scopes)
+        for equivalent_reference_name in sorted(equivalent_reference_names - {reference_name}):
+            override_key = self._static_reference_override_key(equivalent_reference_name)
             if override_key in aliases:
                 return aliases[override_key]
-            for namespace_root in _static_reference_namespace_roots(reference_name):
+
+        parts = reference_name.split(".")
+        for index in range(len(parts) - 1, 0, -1):
+            prefix = ".".join(parts[:index])
+            suffix = ".".join(parts[index:])
+            prefix_override_key = self._static_reference_override_key(prefix)
+            if prefix_override_key in aliases:
+                override_names = aliases[prefix_override_key]
+                if override_names is None:
+                    return None
+                return frozenset(f"{override_name}.{suffix}" for override_name in override_names)
+
+            equivalent_prefixes = _equivalent_static_reference_names(prefix, self.alias_scopes)
+            for equivalent_prefix in sorted(equivalent_prefixes - {prefix}):
+                override_key = self._static_reference_override_key(equivalent_prefix)
+                if override_key not in aliases:
+                    continue
+                override_names = aliases[override_key]
+                if override_names is None:
+                    return None
+                return frozenset(f"{override_name}.{suffix}" for override_name in override_names)
+
+        return _MISSING_ALIAS
+
+    def _lookup_exact_static_reference_override(self, reference_name: str) -> _AliasValue:
+        parts = reference_name.split(".")
+        namespace_roots = [".".join(parts[:index]) for index in range(1, len(parts))]
+        for aliases in reversed(self.alias_scopes):
+            override_key = self._static_reference_override_key(reference_name)
+            if override_key in aliases:
+                return aliases[override_key]
+
+            for index in range(len(parts) - 1, 0, -1):
+                prefix = ".".join(parts[:index])
+                suffix = ".".join(parts[index:])
+                prefix_override_key = self._static_reference_override_key(prefix)
+                if prefix_override_key not in aliases:
+                    continue
+                override_names = aliases[prefix_override_key]
+                if override_names is None:
+                    return None
+                return frozenset(f"{override_name}.{suffix}" for override_name in override_names)
+
+            for namespace_root in namespace_roots:
                 clear_key = self._static_cleared_namespace_key(namespace_root)
                 if clear_key in aliases and aliases[clear_key] is None:
                     return None
@@ -849,28 +933,41 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _bind_static_reference_names_to_value(self, target_names: frozenset[str], value: ast.AST) -> None:
         resolved_value_names = self._resolve_bound_value_names(value)
+        self._mark_global_builtin_namespace_rebound(target_names)
         for target_name in target_names:
-            for equivalent_target_name in _equivalent_static_reference_names(target_name):
+            for equivalent_target_name in _equivalent_static_reference_names(target_name, self.alias_scopes):
                 self._bind_name(self._static_reference_override_key(equivalent_target_name), resolved_value_names)
 
     def _bind_static_reference_names_as_removed(self, target_names: frozenset[str]) -> None:
+        self._mark_global_builtin_namespace_rebound(target_names)
         for target_name in target_names:
-            for equivalent_target_name in _equivalent_static_reference_names(target_name):
+            for equivalent_target_name in _equivalent_static_reference_names(target_name, self.alias_scopes):
                 self._bind_name(self._static_reference_override_key(equivalent_target_name), None)
+
+    def _mark_global_builtin_namespace_rebound(self, target_names: frozenset[str]) -> None:
+        if target_names & _GLOBAL_BUILTIN_NAMESPACE_REFERENCES:
+            self._bind_name(_STATIC_GLOBAL_BUILTINS_REBOUND_KEY, None)
 
     def _discard_static_reference_overrides_for_roots(self, namespace_roots: frozenset[str]) -> None:
         current_scope = self.alias_scopes[-1]
         for namespace_root in namespace_roots:
-            for equivalent_root in _equivalent_static_namespace_roots(namespace_root):
+            for equivalent_root in _equivalent_static_namespace_roots(namespace_root, self.alias_scopes):
                 reference_prefix = f"{_STATIC_REFERENCE_OVERRIDE_PREFIX}{equivalent_root}."
                 for key in list(current_scope):
                     if key.startswith(reference_prefix):
                         del current_scope[key]
 
+    def _discard_static_namespace_state_for_roots(self, namespace_roots: frozenset[str]) -> None:
+        current_scope = self.alias_scopes[-1]
+        self._discard_static_reference_overrides_for_roots(namespace_roots)
+        for namespace_root in namespace_roots:
+            for equivalent_root in _equivalent_static_namespace_roots(namespace_root, self.alias_scopes):
+                current_scope.pop(self._static_cleared_namespace_key(equivalent_root), None)
+
     def _bind_static_namespace_roots_as_cleared(self, namespace_roots: frozenset[str]) -> None:
         self._discard_static_reference_overrides_for_roots(namespace_roots)
         for namespace_root in namespace_roots:
-            for equivalent_root in _equivalent_static_namespace_roots(namespace_root):
+            for equivalent_root in _equivalent_static_namespace_roots(namespace_root, self.alias_scopes):
                 self._bind_name(self._static_cleared_namespace_key(equivalent_root), None)
 
     def _bind_static_reference_target_as_removed(self, target: ast.AST) -> None:
@@ -972,6 +1069,20 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if target_names is None or len(target_names) != 1:
             return
         self._bind_static_reference_names_to_value(target_names, node.args[2])
+
+    def _bind_static_reload_mutation(self, node: ast.Call) -> None:
+        if len(node.args) != 1 or node.keywords:
+            return
+
+        helper_name = _resolve_call_name(node.func)
+        helper_names = _apply_aliases(helper_name, self.alias_scopes) if helper_name is not None else None
+        if helper_names is None or not (helper_names & _STATIC_RELOAD_HELPERS):
+            return
+
+        target_name = _resolve_call_name(node.args[0])
+        namespace_roots = _apply_aliases(target_name, self.alias_scopes) if target_name is not None else None
+        if namespace_roots is not None:
+            self._discard_static_namespace_state_for_roots(namespace_roots)
 
     def _bind_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
         if isinstance(target, ast.Name):
@@ -1117,9 +1228,8 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 continue
             base_value: _AliasValue | object
             if name.startswith(_STATIC_REFERENCE_OVERRIDE_PREFIX):
-                base_value = self._lookup_static_reference_override(
-                    name.removeprefix(_STATIC_REFERENCE_OVERRIDE_PREFIX)
-                )
+                reference_name = name.removeprefix(_STATIC_REFERENCE_OVERRIDE_PREFIX)
+                base_value = self._lookup_exact_static_reference_override(reference_name)
             else:
                 base_value = current_scope.get(name, _MISSING_ALIAS)
             branch_values = [scope.get(name, base_value) for scope in branch_scopes]
@@ -1351,6 +1461,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             for resolved_name in resolved_names:
                 if self._is_tracked_call_name(resolved_name):
                     self.risky_calls.add(resolved_name)
+        self._bind_static_reload_mutation(node)
         self.generic_visit(node)
 
 
