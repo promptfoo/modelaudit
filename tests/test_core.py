@@ -2116,6 +2116,22 @@ def test_scan_file_generic_json_value_budget_before_mxnet_structure_detects_libr
     assert any(issue.details.get("attribute") == "library" for issue in result.issues)
 
 
+def test_scan_file_fails_closed_for_post_budget_shadowed_mxnet_nodes(tmp_path: Path) -> None:
+    model_path = tmp_path / "config.json"
+    model_path.write_text(
+        '{"padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"nodes":[],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+
+
 @pytest.mark.parametrize("filename", ["model.json", "model.jpg"])
 def test_scan_file_mxnet_symbol_with_python_json_nonfinite_constant_detects_library(
     tmp_path: Path,
@@ -2300,6 +2316,23 @@ def test_scan_file_fails_closed_for_xgboost_mxnet_json_overlap(
     )
 
     result = scan_file(str(model_path))
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
+def test_scan_file_bom_prefixed_params_runs_xgboost_mxnet_overlap_analysis(tmp_path: Path) -> None:
+    model_path = tmp_path / "polyglot-0000.params"
+    model_path.write_text(
+        '\ufeff{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(model_path), config={"cache_enabled": False})
 
     assert result.scanner_name == "xgboost"
     assert result.success is False

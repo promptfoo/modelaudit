@@ -989,6 +989,23 @@ def test_scan_nested_file_runs_xgboost_checks_for_renamed_mxnet_json_overlap(tmp
     assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
 
 
+def test_scan_nested_file_bom_prefixed_params_runs_xgboost_mxnet_overlap_analysis(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "polyglot-0000.params"
+    extracted_member.write_text(
+        '\ufeff{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
+    assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
 def test_scan_nested_file_fails_closed_for_xgboost_shadowed_mxnet_nodes(tmp_path: Path) -> None:
     extracted_member = tmp_path / "polyglot.json"
     extracted_member.write_text(
@@ -1476,6 +1493,22 @@ def test_scan_nested_file_generic_json_value_budget_before_mxnet_structure_detec
     assert extracted_member.stat().st_size < file_detection.MXNET_SYMBOL_SIGNATURE_READ_BYTES
     assert result.scanner_name == "mxnet"
     assert any(issue.details.get("attribute") == "library" for issue in result.issues)
+
+
+def test_scan_nested_file_fails_closed_for_post_budget_shadowed_mxnet_nodes(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "config.json"
+    extracted_member.write_text(
+        '{"padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"nodes":[],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.success is False
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
 
 
 def test_scan_nested_file_generic_json_hint_before_value_budget_resolves_later_mxnet_structure(tmp_path: Path) -> None:

@@ -5,6 +5,7 @@ import re
 import struct
 import tarfile
 import zipfile
+from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
@@ -643,6 +644,8 @@ def _detect_mxnet_symbol_prefix_route(
                 complete_payload = json.loads(prefix)
             except (json.JSONDecodeError, RecursionError, UnicodeDecodeError, ValueError):
                 return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT if saw_mxnet_routing_hint() else None
+            if inspect_mxnet_symbol_root_keys(BytesIO(prefix)):
+                return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
             if has_mxnet_symbol_graph_structure(complete_payload):
                 return "mxnet"
             return None

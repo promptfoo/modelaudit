@@ -470,7 +470,7 @@ class XGBoostScanner(BaseScanner):
         try:
             with open(path, "rb") as f:
                 duplicate_mxnet_root_keys = inspect_mxnet_symbol_root_keys(f)
-            with open(path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8-sig") as f:
                 model_data = json.load(f)
 
             result.add_check(
