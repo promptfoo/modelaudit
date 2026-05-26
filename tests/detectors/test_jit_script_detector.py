@@ -254,6 +254,12 @@ class TestJITScriptDetector:
             b"namespace = globals()\nnamespace['__builtins__']['ev' + 'al']('1 + 1')\n",
             b"namespace = globals()\nnamespace.get('__builtins__').get('eval')('1 + 1')\n",
             b"namespace = globals()\ngetattr(namespace['__builtins__'], 'eval')('1 + 1')\n",
+            b"lookup = globals().get\nlookup('__builtins__').get('ev' + 'al')('1 + 1')\n",
+            (b"namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n"),
+            b"lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
+            b"lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
+            b"lookup = globals().get\nlookup.__call__('__builtins__').get('ev' + 'al')('1 + 1')\n",
+            b"lookup = globals()['__builtins__'].__dict__.get\nlookup('ev' + 'al')('1 + 1')\n",
             b"globals()['__builtins__'].eval('1 + 1')\n",
             b"builtins_ref = globals()['__builtins__']\ngetattr(builtins_ref, 'eval')('1 + 1')\n",
             b"global_namespace = globals()\nglobal_namespace['__builtins__']['eval']('1 + 1')\n",
@@ -301,6 +307,9 @@ class TestJITScriptDetector:
             ),
             b"__builtins__['eval'] = len\n__builtins__['eval']([])\n",
             b"import builtins\nbuiltins.eval = len\nbuiltins.eval([])\n",
+            b"lookup = globals().get\nlookup('__builtins__').get('len')([1])\n",
+            b"mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
+            b"import builtins\nbuiltins.get = lambda name: len\nlookup = builtins.get\nlookup('eval')([])\n",
             b"def payload():\n    eval = len\n    return eval([])\n",
             (
                 b"def payload():\n"

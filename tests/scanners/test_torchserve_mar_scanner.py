@@ -258,6 +258,37 @@ def test_scan_detects_keyword_getattr_wrapped_handler_execution_primitive(
             b"    namespace = globals()\n"
             b"    return getattr(namespace['__builtins__'], 'eval')('1 + 1')\n"
         ),
+        (
+            b"def handle(data, context):\n"
+            b"    lookup = globals().get\n"
+            b"    return lookup('__builtins__').get('ev' + 'al')('1 + 1')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    namespace = globals()\n"
+            b"    lookup = namespace.get\n"
+            b"    return lookup('__builtins__')['ev' + 'al']('1 + 1')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    lookup = globals()['__builtins__'].get\n"
+            b"    return lookup('ev' + 'al')('1 + 1')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    lookup = globals()['__builtins__'].__getitem__\n"
+            b"    return lookup('ev' + 'al')('1 + 1')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    lookup = globals().get\n"
+            b"    return lookup.__call__('__builtins__').get('ev' + 'al')('1 + 1')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    lookup = globals()['__builtins__'].__dict__.get\n"
+            b"    return lookup('ev' + 'al')('1 + 1')\n"
+        ),
         b"def handle(data, context):\n    return globals()['__builtins__'].eval('1 + 1')\n",
         (
             b"def handle(data, context):\n"
@@ -314,6 +345,24 @@ def test_scan_detects_implicit_builtins_handler_execution_primitive(
             b"    namespace = globals()\n"
             b"    namespace['__builtins__']['eval'] = len\n"
             b"    return namespace['__builtins__']['eval']([])\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    lookup = globals().get\n"
+            b"    return lookup('__builtins__').get('len')([1])\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    mapping = {'eval': len}\n"
+            b"    lookup = mapping.get\n"
+            b"    return lookup('eval')([])\n"
+        ),
+        (
+            b"import builtins\n"
+            b"def handle(data, context):\n"
+            b"    builtins.get = lambda name: len\n"
+            b"    lookup = builtins.get\n"
+            b"    return lookup('eval')([])\n"
         ),
         (
             b"def handle(data, context):\n"
