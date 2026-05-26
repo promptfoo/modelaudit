@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.sevenzip_scanner import HAS_PY7ZR, SevenZipScanner, _RecursiveScanBudget
@@ -68,7 +69,8 @@ def _xgboost_ubjson_probe(*, learner_padding: int = 0) -> bytes:
 
 def _xgboost_ubjson_counted_null_array_probe() -> bytes:
     max_count = ((1 << 63) - 1).to_bytes(8, byteorder="big", signed=True)
-    return b"{" + _ubjson_key(b"version") + b"[]" + _ubjson_key(b"learner") + b"[$Z#L" + max_count + b"}"
+    learner = b"{" + _ubjson_key(b"learner_model_param") + b"{}" + _ubjson_key(b"payload") + b"[$Z#L" + max_count + b"}"
+    return b"{" + _ubjson_key(b"learner") + learner + _ubjson_key(b"version") + b"[]" + b"}"
 
 
 class TestSevenZipScanner:
@@ -1879,6 +1881,29 @@ class TestSevenZipScannerHardening:
             assert result.metadata["scannable_files"] == 1
             assert mock_archive.extract.call_count >= 3
             mock_scan_extracted_file.assert_called_once()
+
+    @pytest.mark.skipif(not HAS_PY7ZR, reason="py7zr not available")
+    def test_extensionless_xgboost_oversized_count_in_7z_fails_closed_before_decode(self, tmp_path: Path) -> None:
+        """7z-routed UBJSON members must apply the decoder materialization guard."""
+        pytest.importorskip("ubjson", reason="ubjson not installed")
+        import py7zr  # type: ignore[import-untyped]
+
+        payload_path = tmp_path / "model"
+        payload_path.write_bytes(_xgboost_ubjson_counted_null_array_probe())
+        archive_path = tmp_path / "bundle.7z"
+        with py7zr.SevenZipFile(archive_path, "w") as archive:
+            archive.write(payload_path, arcname="models/model")
+
+        with (
+            patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=True),
+            patch("ubjson.loadb") as mock_loadb,
+        ):
+            result = scan_model_directory_or_file(str(archive_path), cache_enabled=False)
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert any("declared arrays exceed" in str(issue.message) for issue in result.issues)
+        mock_loadb.assert_not_called()
 
     # -- default config includes new limits -----------------------------------
 

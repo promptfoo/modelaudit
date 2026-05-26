@@ -179,7 +179,8 @@ def _xgboost_ubjson_probe(*, learner_padding: int = 0) -> bytes:
 
 def _xgboost_ubjson_counted_null_array_probe() -> bytes:
     max_count = ((1 << 63) - 1).to_bytes(8, byteorder="big", signed=True)
-    return b"{" + _ubjson_key(b"version") + b"[]" + _ubjson_key(b"learner") + b"[$Z#L" + max_count + b"}"
+    learner = b"{" + _ubjson_key(b"learner_model_param") + b"{}" + _ubjson_key(b"payload") + b"[$Z#L" + max_count + b"}"
+    return b"{" + _ubjson_key(b"learner") + learner + _ubjson_key(b"version") + b"[]" + b"}"
 
 
 class TestXGBoostScannerBasic:
@@ -1093,6 +1094,24 @@ class TestXGBoostBinaryScanning:
         assert any(check.name == "UBJSON Library Check" for check in result.checks)
         assert not any(check.name == "Binary Structure Validation" for check in result.checks)
 
+    def test_ubjson_bst_oversized_count_skips_loading_fallback(self, temp_dir: Path) -> None:
+        """The optional XGBoost loader must not receive unsafe counted UBJSON arrays."""
+        ubjson_bst = temp_dir / "model.bst"
+        ubjson_bst.write_bytes(_xgboost_ubjson_counted_null_array_probe())
+        loading_scanner = XGBoostScanner({"enable_xgb_loading": True})
+
+        with (
+            patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=False),
+            patch.object(loading_scanner, "_safe_xgboost_load") as mock_safe_load,
+        ):
+            result = loading_scanner.scan(str(ubjson_bst))
+
+        mock_safe_load.assert_not_called()
+        assert result.success is False
+        assert "xgboost_ubj_dependency_missing" in result.metadata["scan_outcome_reasons"]
+        assert "xgboost_ubj_array_limit_exceeded" in result.metadata["scan_outcome_reasons"]
+        assert any(check.name == "UBJ Decode Resource Limit" for check in result.checks)
+
     @patch("modelaudit.scanners.xgboost_scanner._check_xgboost_available")
     @patch("modelaudit.scanners.xgboost_scanner.subprocess")
     def test_xgboost_loading_success(self, mock_subprocess: Mock, mock_check_xgb: Mock, temp_dir: Path) -> None:
@@ -1236,6 +1255,24 @@ class TestXGBoostFailClosedEndToEnd:
         assert result.scanner_name == "unknown"
         assert result.success is True
         assert result.issues == []
+
+    def test_extensionless_ubjson_oversized_count_fails_closed_before_decode(self, tmp_path: Path) -> None:
+        pytest.importorskip("ubjson", reason="ubjson not installed")
+        model_file = tmp_path / "model"
+        model_file.write_bytes(_xgboost_ubjson_counted_null_array_probe())
+
+        with (
+            patch("modelaudit.scanners.xgboost_scanner._check_ubjson_available", return_value=True),
+            patch("ubjson.loadb") as mock_loadb,
+        ):
+            result = scan_model_directory_or_file(str(model_file), cache_enabled=False)
+
+        assert result.success is False
+        assert determine_exit_code(result) == 2
+        assert "xgboost" in result.scanner_names
+        _assert_inconclusive_metadata(result, model_file, "xgboost_ubj_array_limit_exceeded")
+        assert any("declared arrays exceed" in str(issue.message) for issue in result.issues)
+        mock_loadb.assert_not_called()
 
     def test_binary_read_failure_core_is_operational_not_security_finding(self, tmp_path: Path) -> None:
         binary_file = tmp_path / "unreadable.bst"
