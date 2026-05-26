@@ -630,6 +630,9 @@ def test_flax_msgpack_ambiguous_renamed_probe_limit_fails_closed_without_unpacki
     assert result.success is False
     assert result.metadata["scan_outcome"] == "inconclusive"
     assert result.metadata["analysis_incomplete"] is True
+    assert result.metadata["scan_outcome_message"] == (
+        "Scan analysis incomplete; failed closed because full coverage was not available."
+    )
     check = next(check for check in result.checks if check.name == "MessagePack Routing Analysis Limit")
     assert check.status == CheckStatus.FAILED
     assert check.details["scan_outcome_reason"] == "flax_msgpack_routing_probe_limit_exceeded"

@@ -6,9 +6,19 @@ import logging
 import os
 import time
 from collections.abc import Iterator
-from contextlib import suppress
+from contextlib import ExitStack, contextmanager, suppress
 from pathlib import Path
 from typing import Any
+
+try:
+    from modelaudit_picklescan import shared_source_sensitive_caches
+except ImportError:
+
+    @contextmanager
+    def shared_source_sensitive_caches() -> Iterator[None]:
+        """Preserve compatibility with older independently versioned picklescan installs."""
+        yield
+
 
 import modelaudit.core_results as core_results
 from modelaudit.integrations.license_checker import (
@@ -27,15 +37,26 @@ from modelaudit.scanner_selection import (
     selected_scanner_extensions,
 )
 from modelaudit.scanners import _registry
-from modelaudit.scanners.archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY
+from modelaudit.scanners.archive_dispatch import (
+    NESTED_SCAN_CALLBACK_CONFIG_KEY,
+    merge_executable_zip_container_findings,
+    merge_flax_msgpack_overlap_findings,
+)
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
+from modelaudit.scanners.xgboost_scanner import XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.file.detection import (
+    EXECUTABLE_ZIP_POLYGLOT_FORMAT,
+    LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
+    NEMO_ROUTING_INCONCLUSIVE_FORMAT,
+    XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
     detect_file_format,
     detect_file_format_from_magic,
+    detect_flax_msgpack_overlap_routes,
     detect_format_from_extension,
+    detect_xgboost_ubjson_content_route,
     is_executorch_archive,
     is_keras_zip_archive,
     is_pytorch_zip_archive,
@@ -105,6 +126,8 @@ _XGBOOST_BINARY_EXTENSIONS = frozenset({".bst"})
 _XGBOOST_PICKLE_SPOOF_REASON = "xgboost_binary_pickle_spoof"
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
+_LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
+_XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON = "xgboost_ubjson_routing_incomplete"
 _ShardFamilyKey = tuple[str, str, int | None]
 _ScanEntry = tuple[str, list[str], _ShardFamilyKey | None]
 _SHARD_FAMILY_CACHE_FINGERPRINT_CONFIG_KEY = "shard_family_cache_fingerprint"
@@ -309,6 +332,78 @@ def _make_incomplete_xml_model_result(path: str) -> ScanResult:
     return result
 
 
+def _make_incomplete_llamafile_routing_result(path: str, config: dict[str, Any]) -> ScanResult:
+    """Fail closed when an executable Llamafile marker probe cannot complete."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="Llamafile Routing",
+        passed=False,
+        message="Llamafile routing was inconclusive because bounded marker bytes could not be read",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _LLAMAFILE_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _LLAMAFILE_ROUTING_INCOMPLETE_REASON)
+
+    merge_executable_zip_container_findings(
+        path,
+        result,
+        config,
+        context="inconclusive executable ZIP polyglot",
+    )
+
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_nemo_routing_result(path: str) -> ScanResult:
+    """Fail closed when bounded NeMo structural routing cannot reach a decision."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="NeMo Routing",
+        passed=False,
+        message="NeMo routing was inconclusive because the bounded TAR member probe reached its limit",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": NEMO_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, "nemo_routing_incomplete")
+    _mark_operational_scan_error(result, "nemo_routing_incomplete")
+    result.finish(success=False)
+    return result
+
+
+def _make_incomplete_xgboost_ubjson_routing_result(path: str) -> ScanResult:
+    """Fail closed when bounded extensionless UBJSON routing cannot confirm XGBoost."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="XGBoost UBJSON Routing",
+        passed=False,
+        message="Extensionless UBJSON routing was inconclusive because the bounded learner probe reached its limit",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    _mark_inconclusive_scan_outcome(result, _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON)
+    _mark_operational_scan_error(result, _XGBOOST_UBJSON_ROUTING_INCOMPLETE_REASON)
+    result.finish(success=False)
+    return result
+
+
+def _scan_executable_zip_polyglot(path: str, config: dict[str, Any]) -> ScanResult:
+    """Preserve container and subtype analysis for executable-prefixed ZIPs."""
+    result = ScanResult(scanner_name="zip")
+    merge_executable_zip_container_findings(
+        path,
+        result,
+        config,
+        context="executable ZIP polyglot",
+    )
+    result.finish(success=not result.has_errors)
+    return result
+
+
 def _calculate_file_hash(file_path: str) -> str:
     """Calculate SHA256 hash of a file for deduplication purposes.
 
@@ -472,6 +567,7 @@ def scan_model_directory_or_file(
     # Track file hashes for aggregate hash computation
     file_hashes: list[str] = []
     nearby_license_cache: dict[str, list[str]] = {}
+    pickle_source_snapshot_stack = ExitStack()
 
     phase_timings: dict[str, float] | None = {} if bool(kwargs.get("profile_timings")) else None
 
@@ -777,6 +873,9 @@ def scan_model_directory_or_file(
                         duplicate_paths_by_hash.setdefault(content_hash, []).append(file_path)
                 recorded_content_hashes: set[str] = set()
 
+                if len(scan_entries) > 1:
+                    pickle_source_snapshot_stack.enter_context(shared_source_sensitive_caches())
+
                 for representative_file, scanned_file_paths, shard_family_key in scan_entries:
                     # Check for interrupts
                     check_interrupted()
@@ -1075,6 +1174,8 @@ def scan_model_directory_or_file(
             details={"exception_type": type(e).__name__},
         )
         _add_error_asset_to_results(results, path)
+    finally:
+        pickle_source_snapshot_stack.close()
 
     # Final timing is handled by finalize_statistics()
 
@@ -1368,6 +1469,13 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     header_format = detect_file_format(path)
     ext_format = detect_format_from_extension(path)
     ext = os.path.splitext(path)[1].lower()
+    magic_format = detect_file_format_from_magic(path)
+    if int(config.get("_archive_depth", 0)) > 0 and magic_format == "unknown":
+        nested_xgboost_route = detect_xgboost_ubjson_content_route(path)
+        if nested_xgboost_route is not None:
+            header_format = magic_format = nested_xgboost_route
+            if nested_xgboost_route == "xgboost":
+                config[XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY] = True
     is_xgboost_pickle_spoof = ext in _XGBOOST_BINARY_EXTENSIONS and header_format == "pickle"
 
     # Record telemetry for file type detection
@@ -1375,7 +1483,30 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     record_file_type_detected(path, detected_format)
 
     # Validate file type consistency as a security check
-    magic_format = detect_file_format_from_magic(path)
+    if header_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT or magic_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
+        sr = _make_incomplete_llamafile_routing_result(path, config)
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
+    if header_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT or magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
+        sr = _make_incomplete_nemo_routing_result(path)
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
+    if (
+        header_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+        or magic_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    ):
+        sr = _make_incomplete_xgboost_ubjson_routing_result(path)
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
+    if header_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT or magic_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT:
+        sr = _scan_executable_zip_polyglot(path, config)
+        if sr.bytes_scanned == 0 and file_size > 0:
+            sr.bytes_scanned = file_size
+        return sr
+
     file_type_valid = validate_file_type_with_formats(path, magic_format, ext_format)
     discrepancy_msg = None
 
@@ -1402,6 +1533,19 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     preferred_scanner: type[BaseScanner] | None = None
     scanner_id = _select_preferred_scanner_id(path, header_format, ext)
     skipped_preferred_scanner_id: str | None = None
+    trusted_flax_overlap_scanner_id: str | None = None
+    if scanner_id == "flax_msgpack" and not scanner_selection.allows(scanner_id):
+        skipped_preferred_scanner_id = scanner_id
+        trusted_flax_overlap_scanner_id = next(
+            (
+                overlap_scanner_id
+                for overlap_scanner_id in detect_flax_msgpack_overlap_routes(path)
+                if scanner_selection.allows(overlap_scanner_id)
+            ),
+            None,
+        )
+        if trusted_flax_overlap_scanner_id is not None:
+            scanner_id = trusted_flax_overlap_scanner_id
     if scanner_id and scanner_selection.allows(scanner_id):
         preferred_scanner = _registry.load_scanner_by_id(scanner_id)
     elif scanner_id:
@@ -1424,7 +1568,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     if (
         preferred_scanner
         and scanner_id
-        and _preferred_scanner_can_handle(preferred_scanner, scanner_id, header_format, path)
+        and (
+            scanner_id == trusted_flax_overlap_scanner_id
+            or _preferred_scanner_can_handle(preferred_scanner, scanner_id, header_format, path)
+        )
     ):
         logger.debug(
             f"Using {preferred_scanner.name} scanner for {path} based on header",
@@ -1542,6 +1689,12 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
             if magic_format == XML_MODEL_INCONCLUSIVE_FORMAT:
                 sr = _make_incomplete_xml_model_result(path)
+            elif magic_format == LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_llamafile_routing_result(path, config)
+            elif magic_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_nemo_routing_result(path)
+            elif magic_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
+                sr = _make_incomplete_xgboost_ubjson_routing_result(path)
             elif magic_format == "unknown":
                 # Not a recognized model format — skip silently
                 sr = ScanResult(scanner_name="unknown")
@@ -1552,6 +1705,36 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     if is_xgboost_pickle_spoof:
         _mark_xgboost_pickle_extension_spoof(result, path, ext)
+
+    if (
+        skipped_preferred_scanner_id == "flax_msgpack"
+        and trusted_flax_overlap_scanner_id is not None
+        and result.scanner_name == trusted_flax_overlap_scanner_id
+    ):
+        add_scanner_selection_skip_check(
+            result,
+            path,
+            skipped_preferred_scanner_id,
+            scanner_selection,
+            context="preferred scanner",
+            kind=SCANNER_SELECTION_PREFERRED_KIND,
+        )
+
+    if result.scanner_name == "flax_msgpack":
+        merge_flax_msgpack_overlap_findings(
+            path,
+            result,
+            config,
+            context="Flax MessagePack overlapping content analysis",
+        )
+    elif skipped_preferred_scanner_id == "flax_msgpack":
+        merge_flax_msgpack_overlap_findings(
+            path,
+            result,
+            config,
+            context="Flax MessagePack overlapping content analysis",
+            scanned_scanner_ids=frozenset({result.scanner_name}),
+        )
 
     if discrepancy_msg:
         # Determine severity based on whether it's a validation failure or just a discrepancy

@@ -54,6 +54,20 @@ def test_can_handle_lightgbm_binary_like_model(tmp_path: Path) -> None:
     assert LightGBMScanner.can_handle(str(path))
 
 
+def test_can_handle_lightgbm_model_with_misleading_suffix(tmp_path: Path) -> None:
+    path = tmp_path / "renamed.jpg"
+    path.write_text(_build_lightgbm_text(), encoding="utf-8")
+
+    assert LightGBMScanner.can_handle(str(path))
+
+
+def test_can_handle_rejects_renamed_lightgbm_near_match(tmp_path: Path) -> None:
+    path = tmp_path / "near_match.jpg"
+    path.write_text("tree=0\nversion=v4\nnum_class=1\n", encoding="utf-8")
+
+    assert not LightGBMScanner.can_handle(str(path))
+
+
 def test_can_handle_rejects_xgboost_like_model_content(tmp_path: Path) -> None:
     path = tmp_path / "xgb.model"
     path.write_text('{"learner":{"gradient_booster":{"name":"gbtree","tree_param":{}}}}', encoding="utf-8")

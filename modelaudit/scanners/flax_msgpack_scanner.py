@@ -7,6 +7,7 @@ import re
 from contextlib import suppress
 from typing import Any, ClassVar
 
+from ..scanner_results import mark_inconclusive_scan_result
 from ..utils.file.detection import has_inconclusive_renamed_flax_msgpack_routing, is_flax_msgpack_checkpoint_file
 
 try:
@@ -27,7 +28,7 @@ except Exception:  # pragma: no cover - optional dependency missing
     HAS_MSGPACK_EXCEPTIONS = False
     msgpack_exceptions = None  # type: ignore[assignment]
 
-from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
+from .base import BaseScanner, IssueSeverity, ScanResult
 
 _DANGEROUS_JAX_TRANSFORMS = ("jit_compile", "eval_jit", "exec_transform", "dynamic_eval", "runtime_eval")
 
@@ -1057,9 +1058,7 @@ class FlaxMsgpackScanner(BaseScanner):
         self.current_file_path = path
 
         if has_inconclusive_renamed_flax_msgpack_routing(path):
-            result.metadata["analysis_incomplete"] = True
-            result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
-            result.metadata["scan_outcome_reasons"] = ["flax_msgpack_routing_probe_limit_exceeded"]
+            mark_inconclusive_scan_result(result, "flax_msgpack_routing_probe_limit_exceeded")
             result.add_check(
                 name="MessagePack Routing Analysis Limit",
                 passed=False,
