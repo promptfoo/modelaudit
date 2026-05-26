@@ -9,6 +9,7 @@ import struct
 import tarfile
 import zipfile
 import zlib
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -18,6 +19,8 @@ from modelaudit.scanner_registry_metadata import get_extension_format_map
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
+    MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
+    MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
     PROTO0_1_MAX_PROBE_BYTES,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
@@ -388,6 +391,41 @@ def test_detect_file_format_routes_renamed_mxnet_symbol_and_rejects_near_match(t
     assert detect_file_format_for_skip_filter(str(near_match)) == "unknown"
 
 
+def test_detect_file_format_routes_renamed_mxnet_symbol_with_escaped_contract_keys(tmp_path: Path) -> None:
+    model_path = tmp_path / "escaped.jpg"
+    model_path.write_text(
+        r'{"\u006eodes":[{"op":"Custom","name":"load"}],"\u0061rg_nodes":[0],"\u0068eads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "mxnet"
+    assert detect_file_format_from_magic(str(model_path)) == "mxnet"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "mxnet"
+
+
+def test_detect_canonical_mxnet_symbol_bypasses_content_routing_value_budget(tmp_path: Path) -> None:
+    model_path = tmp_path / "large-symbol.json"
+    model_path.write_text(
+        '{"padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "mxnet"
+
+
+@pytest.mark.parametrize("filename", ["model.json", "model.onnx", "model.meta"])
+def test_detect_file_format_routes_mxnet_structure_over_generic_or_competing_suffix(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    model_path = create_mock_mxnet_symbol(tmp_path / filename)
+
+    assert detect_file_format(str(model_path)) == "mxnet"
+    assert detect_file_format_from_magic(str(model_path)) == "mxnet"
+
+
 def test_detect_file_format_routes_renamed_mxnet_after_leading_whitespace(tmp_path: Path) -> None:
     model_path = tmp_path / "whitespace.jpg"
     model_path.write_text(
@@ -399,12 +437,8 @@ def test_detect_file_format_routes_renamed_mxnet_after_leading_whitespace(tmp_pa
     assert detect_file_format_for_skip_filter(str(model_path)) == "mxnet"
 
 
-def test_detect_oversized_renamed_mxnet_requires_top_level_graph_contract(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
-    padding = "x" * 256
+def test_detect_oversized_renamed_mxnet_requires_top_level_graph_contract(tmp_path: Path) -> None:
+    padding = "x" * (MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
     delayed_nodes = tmp_path / "delayed-nodes.jpg"
     delayed_nodes.write_text(
         '{"arg_nodes":[0],"heads":[[0,0,0]],"nodes":[{"attrs":"' + padding + '","op":"Custom","name":"load"}]}',
@@ -415,25 +449,542 @@ def test_detect_oversized_renamed_mxnet_requires_top_level_graph_contract(
         '{"nodes":[],"op":"Custom","name":"load","attrs":"' + padding + '"}',
         encoding="utf-8",
     )
-    nested_markers = tmp_path / "nested-markers.jpg"
-    nested_markers.write_text(
-        '{"metadata":{"nodes":[],"arg_nodes":[],"heads":[]},"padding":"' + padding + '"}',
+    decided_unrelated = tmp_path / "decided-unrelated.jpg"
+    decided_unrelated.write_text(
+        '{"nodes":[],"op":"Custom","name":"load"}' + (" " * (MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)),
         encoding="utf-8",
     )
-    string_markers = tmp_path / "string-markers.jpg"
-    string_markers.write_text(
-        '{"description":"\\"nodes\\": [] \\"arg_nodes\\": [] \\"heads\\": []","padding":"' + padding + '"}',
+    string_near_match = tmp_path / "string-near-match.jpg"
+    string_near_match.write_text(
+        '{"metadata":"nodes op name arg_nodes heads ' + padding + '"}',
         encoding="utf-8",
     )
 
-    assert detect_file_format(str(delayed_nodes)) == "mxnet"
-    assert detect_file_format_for_skip_filter(str(delayed_nodes)) == "mxnet"
-    assert detect_file_format(str(unrelated)) == "unknown"
-    assert detect_file_format_for_skip_filter(str(unrelated)) == "unknown"
-    assert detect_file_format(str(nested_markers)) == "unknown"
-    assert detect_file_format_for_skip_filter(str(nested_markers)) == "unknown"
-    assert detect_file_format(str(string_markers)) == "unknown"
-    assert detect_file_format_for_skip_filter(str(string_markers)) == "unknown"
+    assert detect_file_format(str(delayed_nodes)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(delayed_nodes)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format(str(unrelated)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(unrelated)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format(str(decided_unrelated)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(decided_unrelated)) == "unknown"
+    assert detect_file_format(str(string_near_match)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(string_near_match)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        (" " * (MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1))
+        + '{"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        '{"metadata":"'
+        + ("x" * (MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1))
+        + '","nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        '{"metadata":'
+        + ("[" * 65)
+        + "0"
+        + ("]" * 65)
+        + ',"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]],"padding":"'
+        + ("x" * (MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1))
+        + '"}',
+    ],
+    ids=["leading-padding", "string-padding", "nested-padding"],
+)
+def test_detect_oversized_renamed_mxnet_before_structure_fails_closed(tmp_path: Path, payload: str) -> None:
+    model_path = tmp_path / "padded.jpg"
+    model_path.write_text(payload, encoding="utf-8")
+
+    assert detect_file_format(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_oversized_renamed_mxnet_partial_number_token_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    prefix = '{"padding":' + (" " * 115) + "1e"
+    assert len(prefix.encode("utf-8")) == 128
+    model_path = tmp_path / "partial-number.jpg"
+    model_path.write_text(
+        prefix + '2,"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_small_renamed_mxnet_value_budget_before_structure_fails_closed(tmp_path: Path) -> None:
+    model_path = tmp_path / "padded.jpg"
+    model_path.write_text(
+        '{"padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert model_path.stat().st_size < MXNET_SYMBOL_SIGNATURE_READ_BYTES
+    assert detect_file_format(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_generic_json_value_budget_before_mxnet_structure_routes_mxnet_without_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "model.json"
+    model_path.write_text(
+        '{"padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    def reject_materialization(_payload: object) -> object:
+        raise AssertionError("format detection must not decode a padded generic JSON object")
+
+    monkeypatch.setattr(file_detection.json, "loads", reject_materialization)
+
+    assert model_path.stat().st_size < MXNET_SYMBOL_SIGNATURE_READ_BYTES
+    assert detect_file_format(str(model_path)) == "mxnet"
+    assert detect_file_format_from_magic(str(model_path)) == "mxnet"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "mxnet"
+
+
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+@pytest.mark.parametrize("filename", ["model.json", "model.jpg"])
+def test_detect_mxnet_symbol_with_python_json_nonfinite_constant_routes_mxnet(
+    tmp_path: Path,
+    constant: str,
+    filename: str,
+) -> None:
+    model_path = tmp_path / filename
+    model_path.write_text(
+        '{"padding":'
+        + constant
+        + ',"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "mxnet"
+    assert detect_file_format_from_magic(str(model_path)) == "mxnet"
+
+
+def test_detect_generic_json_hint_before_value_budget_resolves_later_mxnet_structure(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.json"
+    model_path.write_text(
+        '{"heads":[[0,0,0]],"padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0]}',
+        encoding="utf-8",
+    )
+
+    assert model_path.stat().st_size < MXNET_SYMBOL_SIGNATURE_READ_BYTES
+    assert detect_file_format(str(model_path)) == "mxnet"
+    assert detect_file_format_from_magic(str(model_path)) == "mxnet"
+
+
+def test_detect_generic_array_heads_before_value_budget_without_mxnet_structure_remains_unclaimed(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "config.json"
+    model_path.write_text(
+        '{"heads":["classification"],"padding":[' + ",".join("0" for _ in range(5000)) + "]}",
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "unknown"
+    assert detect_file_format_from_magic(str(model_path)) == "unknown"
+
+
+def test_detect_oversized_malformed_renamed_mxnet_preserves_established_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 256)
+    model_path = tmp_path / "malformed.jpg"
+    model_path.write_text(
+        '{"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]],"padding":@}' + (" " * 256),
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "mxnet"
+    assert detect_file_format_from_magic(str(model_path)) == "mxnet"
+
+
+@pytest.mark.parametrize("suffix", [",@}", ""])
+def test_detect_small_malformed_renamed_mxnet_after_structure_preserves_established_route(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    model_path = tmp_path / "malformed.jpg"
+    model_path.write_text(
+        '{"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]' + suffix,
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "mxnet"
+    assert detect_file_format_from_magic(str(model_path)) == "mxnet"
+
+
+@pytest.mark.parametrize("suffix", ["@}", ""])
+def test_detect_small_malformed_renamed_mxnet_before_heads_value_fails_closed(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    model_path = tmp_path / "malformed.jpg"
+    model_path.write_text(
+        '{"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":' + suffix,
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_renamed_mxnet_with_many_escaped_string_characters(tmp_path: Path) -> None:
+    model_path = tmp_path / "escaped-padding.jpg"
+    model_path.write_text(
+        '{"padding":"'
+        + (r"\\" * 10000)
+        + '","nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "mxnet"
+
+
+def test_detect_oversized_generic_json_without_mxnet_hint_fails_closed(tmp_path: Path) -> None:
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text(
+        '{"metadata":"' + ("x" * (MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)) + '"}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(metadata_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(metadata_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_whitespace_prefixed_generic_json_without_mxnet_hint_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    config_path = tmp_path / "config.json"
+    config_path.write_text((" " * 129) + '{"metadata":"safe"}', encoding="utf-8")
+
+    assert detect_file_format(str(config_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(config_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+@pytest.mark.parametrize("initial_nodes", ["[]", "null"])
+def test_detect_oversized_generic_json_with_early_duplicate_nodes_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_nodes: str,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        '{"nodes":'
+        + initial_nodes
+        + ',"padding":"'
+        + ("x" * 256)
+        + '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(config_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(config_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+@pytest.mark.parametrize("detector", [detect_file_format_from_magic, detect_file_format_for_skip_filter])
+def test_unclaimed_json_invokes_mxnet_content_route_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    detector: Callable[[str], str],
+) -> None:
+    config_path = tmp_path / "metadata.json"
+    config_path.write_text('{"metadata":"safe"}', encoding="utf-8")
+    calls = 0
+
+    def count_route(_file_path: Path, _prefix: bytes) -> str | None:
+        nonlocal calls
+        calls += 1
+        return None
+
+    monkeypatch.setattr(file_detection, "_detect_content_routed_mxnet_symbol", count_route)
+
+    assert detector(str(config_path)) == "unknown"
+    assert calls == 1
+
+
+@pytest.mark.parametrize("detector", [detect_file_format_from_magic, detect_file_format_for_skip_filter])
+def test_generic_json_xgboost_probe_uses_established_xgboost_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    detector: Callable[[str], str],
+) -> None:
+    from modelaudit.scanners.xgboost_scanner import XGBoostScanner
+
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    config_path = tmp_path / "metadata.json"
+    config_path.write_text('{"metadata":"safe"}', encoding="utf-8")
+    seen_limits: list[int | None] = []
+
+    def record_probe(_cls: type[XGBoostScanner], _path: str, *, max_bytes: int | None = None) -> bool:
+        seen_limits.append(max_bytes)
+        return False
+
+    monkeypatch.setattr(XGBoostScanner, "_is_xgboost_json", classmethod(record_probe))
+
+    assert detector(str(config_path)) == "unknown"
+    assert seen_limits == [None]
+
+
+def test_detect_oversized_generic_json_with_mxnet_hint_still_fails_closed(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.json"
+    model_path.write_text(
+        '{"heads":[[0,0,0]],"nodes":[{"attrs":"' + ("x" * (MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)) + '"}]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_oversized_generic_json_with_padded_node_object_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    model_path = tmp_path / "metadata.json"
+    model_path.write_text(
+        '{"nodes":[{"attrs":"'
+        + ("x" * 129)
+        + '","op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_oversized_generic_json_with_lone_array_heads_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    model_path = tmp_path / "config.json"
+    model_path.write_text(
+        '{"heads":["classification"],"padding":"' + ("x" * 256) + '"}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_oversized_generic_json_with_mxnet_heads_shape_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    model_path = tmp_path / "model.json"
+    model_path.write_text(
+        '{"heads":[[0,0,0]],"padding":"'
+        + ("x" * 256)
+        + '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_oversized_generic_json_with_hidden_mxnet_graph_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    model_path = tmp_path / "model.json"
+    model_path.write_text(
+        '{"padding":"'
+        + ("x" * 256)
+        + '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_conclusive_xgboost_json_preempts_ambiguous_mxnet_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    model_path = tmp_path / "booster.json"
+    model_path.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{},"padding":"' + ("x" * 256) + '"}}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "xgboost"
+    assert detect_file_format_from_magic(str(model_path)) == "xgboost"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "xgboost"
+
+
+def test_detect_unhinted_oversized_json_with_nested_xgboost_markers_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    model_path = tmp_path / "attack.json"
+    model_path.write_text(
+        '{"attrs":{"version":[1,7,4],"learner":{"gradient_booster":{}},"padding":"'
+        + ("x" * 256)
+        + '"},"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        + '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_conclusive_mxnet_xgboost_json_overlap_routes_for_fail_closed_scan(tmp_path: Path) -> None:
+    model_path = tmp_path / "polyglot.json"
+    model_path.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "xgboost"
+    assert detect_file_format_from_magic(str(model_path)) == "xgboost"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "xgboost"
+
+
+@pytest.mark.parametrize("filename", ["polyglot.jpg", "polyglot.params", "polyglot.meta"])
+def test_detect_renamed_mxnet_xgboost_json_overlap_routes_for_fail_closed_scan(
+    tmp_path: Path,
+    filename: str,
+) -> None:
+    model_path = tmp_path / filename
+    model_path.write_text(
+        '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+        '"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "xgboost"
+    assert detect_file_format_from_magic(str(model_path)) == "xgboost"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "xgboost"
+
+
+def test_detect_syntactically_malformed_renamed_mxnet_xgboost_overlap_routes_for_fail_closed_scan(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "malformed.jpg"
+    model_path.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]],@}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "xgboost"
+    assert detect_file_format_from_magic(str(model_path)) == "xgboost"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "xgboost"
+
+
+def test_detect_renamed_mxnet_decoder_recursion_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = create_mock_mxnet_symbol(tmp_path / "recursive.jpg")
+
+    def raise_recursion(_payload: object) -> object:
+        raise RecursionError("decoder nesting limit")
+
+    monkeypatch.setattr(file_detection.json, "loads", raise_recursion)
+
+    assert detect_file_format(str(model_path)) == "mxnet"
+    assert detect_file_format_from_magic(str(model_path)) == "mxnet"
+
+
+def test_detect_generic_mxnet_hint_decoder_recursion_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_path = tmp_path / "recursive.json"
+    model_path.write_text(
+        '{"heads":[[0,0,0]],"nodes":' + ("[" * 65) + "0" + ("]" * 65) + ',"arg_nodes":[0]}',
+        encoding="utf-8",
+    )
+
+    def raise_recursion(_payload: object) -> object:
+        raise RecursionError("decoder nesting limit")
+
+    monkeypatch.setattr(file_detection.json, "loads", raise_recursion)
+
+    assert detect_file_format(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_generic_depth_budget_without_mxnet_hint_fails_closed(
+    tmp_path: Path,
+) -> None:
+    model_path = tmp_path / "recursive-config.json"
+    model_path.write_text(
+        '{"metadata":' + ("[" * 65) + "0" + ("]" * 65) + "}",
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_generic_json_value_budget_without_mxnet_hint_remains_unclaimed(tmp_path: Path) -> None:
+    model_path = tmp_path / "many-values.json"
+    model_path.write_text('{"metadata":[' + ",".join('""' for _ in range(5000)) + "]}", encoding="utf-8")
+
+    assert detect_file_format(str(model_path)) == "unknown"
+    assert detect_file_format_from_magic(str(model_path)) == "unknown"
+
+
+def test_detect_generic_scalar_heads_value_budget_remains_unclaimed(tmp_path: Path) -> None:
+    model_path = tmp_path / "metadata.json"
+    model_path.write_text(
+        '{"heads":"main","padding":[' + ",".join("0" for _ in range(5000)) + "]}",
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "unknown"
+    assert detect_file_format_from_magic(str(model_path)) == "unknown"
+
+
+def test_detect_mxnet_integer_decode_limit_fails_closed(tmp_path: Path) -> None:
+    model_path = tmp_path / "broken.json"
+    model_path.write_text(
+        '{"n":' + ("9" * 5000) + ',"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == "mxnet"
+    assert detect_file_format_from_magic(str(model_path)) == "mxnet"
 
 
 def test_detect_r_serialized_magic_headers(tmp_path: Path) -> None:
@@ -548,6 +1099,18 @@ def test_detect_tf_metagraph_rejects_renamed_non_protobuf(tmp_path: Path) -> Non
     assert validate_file_type(str(fake_metagraph)) is False
 
 
+def test_detect_failed_metagraph_probe_preserves_bounded_mxnet_route(tmp_path: Path) -> None:
+    model_path = tmp_path / "padded.meta"
+    model_path.write_text(
+        '{"nodes":[{"attrs":"'
+        + ("x" * (MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1))
+        + '","op":"Custom","name":"load"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    assert detect_file_format_from_magic(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
 def test_detect_rknn_format_by_signature(tmp_path: Path) -> None:
     rknn_path = tmp_path / "model.rknn"
     rknn_path.write_bytes(b"RKNN\x01\x00\x00\x00runtime=rockchip\n")
@@ -562,6 +1125,28 @@ def test_detect_rknn_format_by_signature(tmp_path: Path) -> None:
     assert detect_file_format(str(bad_rknn)) == "rknn"
     assert detect_file_format_from_magic(str(bad_rknn)) == "unknown"
     assert validate_file_type(str(bad_rknn)) is False
+
+
+@pytest.mark.parametrize(
+    ("filename", "payload", "expected_format"),
+    [
+        ("prefixed.pb", b"RKNN\x01\x00\x00\x00protobuf-ish payload", "protobuf"),
+        ("flatbuffer.pb", b"\x00\x00\x00\x00TFL3protobuf-ish payload", "protobuf"),
+        ("prefixed.meta", b"RKNN\x01\x00\x00\x00metagraph-ish payload", "unknown"),
+        ("flatbuffer.meta", b"\x00\x00\x00\x00TFL3metagraph-ish payload", "unknown"),
+    ],
+)
+def test_owned_protobuf_extensions_are_not_stolen_by_raw_binary_routes(
+    tmp_path: Path,
+    filename: str,
+    payload: bytes,
+    expected_format: str,
+) -> None:
+    path = tmp_path / filename
+    path.write_bytes(payload)
+
+    assert detect_file_format(str(path)) == expected_format
+    assert detect_file_format_from_magic(str(path)) == "unknown"
 
 
 def test_detect_torch7_formats_by_signature(tmp_path: Path) -> None:
@@ -644,10 +1229,28 @@ def test_torch7_magic_rejects_malformed_ascii_version_header(tmp_path: Path) -> 
 
 
 def test_torch7_magic_keeps_binary_marker_only_routing(tmp_path: Path) -> None:
-    torch7_path = tmp_path / "renamed.bin"
+    torch7_path = tmp_path / "renamed.weights"
     torch7_path.write_bytes(b"\x01\x00torch.FloatTensor nn.Sequential\n")
 
     assert detect_file_format_from_magic(str(torch7_path)) == "torch7"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"RKNN\x01\x00\x00\x00payload" + b"\x7fELF" + b"\x00" * 128,
+        b"T7\x00\x00payload torch.FloatTensor nn.Sequential " + b"\x7fELF" + b"\x00" * 128,
+        b"\x0c\x00\x00\x00ET13\x04\x00\x04\x00\x04\x00\x00\x00" + b"\x7fELF" + b"\x00" * 128,
+        b"\x00\x00\x00\x00TFL3payload" + b"\x7fELF" + b"\x00" * 128,
+    ],
+    ids=["rknn", "torch7", "executorch", "tflite"],
+)
+def test_bin_files_keep_pytorch_binary_routing_for_raw_content_signatures(tmp_path: Path, payload: bytes) -> None:
+    model_path = tmp_path / "weights.bin"
+    model_path.write_bytes(payload)
+
+    assert detect_file_format(str(model_path)) == "pytorch_binary"
+    assert detect_file_format_from_magic(str(model_path)) == "unknown"
 
 
 def test_torch7_markers_in_gzip_header_do_not_override_tar_archive(tmp_path: Path) -> None:
@@ -1152,6 +1755,15 @@ def test_detect_file_format_disguised_llamafile_by_content(tmp_path: Path) -> No
     assert detect_file_format_from_magic(str(near_match)) == "unknown"
 
 
+def test_extensionless_llamafile_route_preempts_tflite_header_bytes(tmp_path: Path) -> None:
+    extensionless_llamafile = tmp_path / "llama"
+    extensionless_llamafile.write_bytes(b"\x7fELFTFL3" + b"\x00" * 56 + b"llamafile runtime")
+
+    assert detect_file_format(str(extensionless_llamafile)) == "llamafile"
+    assert detect_file_format_from_magic(str(extensionless_llamafile)) == "llamafile"
+    assert detect_file_format_for_skip_filter(str(extensionless_llamafile)) == "llamafile"
+
+
 def test_detect_file_format_routes_extensionless_xgboost_ubjson_by_structure(tmp_path: Path) -> None:
     model_file = tmp_path / "model"
     model_file.write_bytes(
@@ -1185,6 +1797,28 @@ def test_detect_file_format_routes_extensionless_xgboost_ubjson_with_noop_before
         + b"}"
     )
 
+    assert detect_file_format(str(model_file)) == "xgboost"
+    assert detect_file_format_from_magic(str(model_file)) == "xgboost"
+    assert detect_file_format_for_skip_filter(str(model_file)) == "xgboost"
+
+
+def test_extensionless_xgboost_route_preempts_incidental_tflite_identifier(tmp_path: Path) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_bytes(
+        b"{N"
+        + _ubjson_key(b"TFL3")
+        + b"Z"
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + _ubjson_key(b"version")
+        + b"[]"
+        + b"}"
+    )
+
+    assert model_file.read_bytes()[4:8] == b"TFL3"
     assert detect_file_format(str(model_file)) == "xgboost"
     assert detect_file_format_from_magic(str(model_file)) == "xgboost"
     assert detect_file_format_for_skip_filter(str(model_file)) == "xgboost"

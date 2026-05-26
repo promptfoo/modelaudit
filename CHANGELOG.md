@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - stop flagging a false-positive ONNX Python operator when tensor weight bytes coincidentally spell `PyOp`
 - detect Python operators declared in nested ONNX graphs, functions, and function-default graphs
 - distinguish ASCII-serialized Torch7 artifacts from plain PyTorch source text
+- detect and scan signature-valid CNTK and LightGBM payloads even when renamed with misleading suffixes
+- detect and scan signature-valid RKNN, TFLite, and ExecuTorch payloads under non-conflicting renamed suffixes while preserving owned routes, and classify unavailable ExecuTorch reads as inconclusive
 - mark CatBoost text-fragment extraction limits and unavailable reads as inconclusive analysis
 - mark RKNN and Torch7 string-extraction limits and unavailable reads as inconclusive analysis
 - classify unavailable TFLite parsing coverage as inconclusive rather than a security finding
@@ -29,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - detect dangerous OpenVINO layers inside namespace-qualified IR models
 - classify unavailable pickle reads and stream coverage as inconclusive rather than security findings
 - route renamed structurally valid MXNet symbol graphs through existing suspicious-reference analysis
+- harden renamed MXNet symbol routing with fail-closed bounded ambiguity and XGBoost overlap handling
 - restore content routing for extensionless XGBoost UBJSON models and classify unavailable or undecodable XGBoost reads as inconclusive
 - route renamed TAR-backed NeMo archives with relative archive-root model configs through Hydra `_target_` analysis while retaining generic embedded-member checks
 - honor descriptor-owned header aliases during helper scanner selection for renamed HDF5, GGML, and compressed payloads

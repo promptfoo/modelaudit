@@ -4,6 +4,7 @@ import json
 import os
 import zipfile
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from ..core_results import mark_operational_scan_error
@@ -18,12 +19,16 @@ from ..scanner_selection import (
 from ..utils.file.detection import (
     EXECUTABLE_ZIP_POLYGLOT_FORMAT,
     LLAMAFILE_ROUTING_INCONCLUSIVE_FORMAT,
+    MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
+    MXNET_SYMBOL_SIGNATURE_READ_BYTES,
     NEMO_ROUTING_INCONCLUSIVE_FORMAT,
     XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     XML_MODEL_INCONCLUSIVE_FORMAT,
     detect_file_format,
     detect_file_format_from_magic,
     detect_flax_msgpack_overlap_routes,
+    detect_mxnet_symbol_content_route,
+    detect_pytorch_binary_supplemental_format,
     detect_xgboost_ubjson_content_route,
     is_executorch_archive,
     is_keras_zip_archive,
@@ -31,7 +36,12 @@ from ..utils.file.detection import (
     is_skops_archive,
     is_torchserve_mar_archive,
 )
-from .xgboost_scanner import XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY
+from .mxnet_scanner import MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY
+from .xgboost_scanner import (
+    XGBOOST_CONTENT_ROUTED_UBJSON_CONFIG_KEY,
+    XGBoostScanner,
+    configure_content_routed_json_scan,
+)
 
 NESTED_SCAN_CALLBACK_CONFIG_KEY = "_archive_nested_scan_callback"
 NestedScanCallback = Callable[[str, dict[str, Any] | None], ScanResult]
@@ -54,6 +64,7 @@ _R_SERIALIZED_EXTENSIONS: frozenset[str] = frozenset({".rds", ".rda", ".rdata"})
 _RECOGNIZED_FORMAT_SCANNER_UNAVAILABLE_REASON = "recognized_format_scanner_unavailable"
 _XML_MODEL_ROUTING_INCOMPLETE_REASON = "xml_model_routing_incomplete"
 _LLAMAFILE_ROUTING_INCOMPLETE_REASON = "llamafile_routing_incomplete"
+_MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON = "mxnet_symbol_routing_incomplete"
 SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY = "_skip_composed_archive_member_scan"
 
 
@@ -94,6 +105,45 @@ def _select_nested_scanner_id(path: str, header_format_override: str | None = No
 def _is_direct_header_route(scanner_id: str, header_format: str) -> bool:
     """Return whether the detected header directly maps to this scanner."""
     return header_format != "unknown" and _HEADER_FORMAT_TO_SCANNER_ID.get(header_format) == scanner_id
+
+
+def _merge_pytorch_binary_supplemental_analysis(
+    path: str,
+    result: ScanResult,
+    config: dict[str, Any] | None,
+    supplemental_scanner_id: str | None,
+) -> None:
+    """Merge strict nested `.bin` format analysis without dropping raw checks."""
+    if supplemental_scanner_id is None:
+        return
+
+    from . import _registry
+
+    scanner_selection = policy_from_config(config)
+    if not scanner_selection.allows(supplemental_scanner_id):
+        add_scanner_selection_skip_check(
+            result,
+            path,
+            supplemental_scanner_id,
+            scanner_selection,
+            context="supplemental nested .bin content analysis",
+        )
+        return
+
+    scanner_class = _registry.load_scanner_by_id(supplemental_scanner_id)
+    if scanner_class is None:
+        supplemental_result = _make_unavailable_recognized_format_result(
+            path,
+            supplemental_scanner_id,
+            supplemental_scanner_id,
+        )
+    else:
+        supplemental_result = scanner_class(config=config).scan(path)
+
+    primary_bytes_scanned = result.bytes_scanned
+    result.merge(supplemental_result)
+    result.bytes_scanned = max(primary_bytes_scanned, supplemental_result.bytes_scanned)
+    result.metadata.setdefault("supplemental_scanners", []).append(supplemental_scanner_id)
 
 
 def _nested_scanner_can_handle(
@@ -324,6 +374,73 @@ def _make_incomplete_nemo_routing_result(path: str) -> ScanResult:
     return result
 
 
+def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, Any] | None = None) -> ScanResult:
+    """Fail closed when bounded nested MXNet symbol routing cannot decide."""
+    result = ScanResult(scanner_name="unknown")
+    result.add_check(
+        name="MXNet Symbol Routing",
+        passed=False,
+        message="MXNet symbol routing was inconclusive because the bounded JSON probe reached its limit",
+        severity=IssueSeverity.INFO,
+        location=path,
+        details={"format": MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT, "path": path},
+    )
+    mark_inconclusive_scan_result(result, _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON)
+    mark_operational_scan_error(result, _MXNET_SYMBOL_ROUTING_INCOMPLETE_REASON)
+
+    from .jinja2_template_scanner import Jinja2TemplateScanner
+    from .manifest_scanner import ManifestScanner
+    from .mxnet_scanner import MXNetScanner
+
+    scanner_selection = policy_from_config(config)
+
+    def merge_owner_result(owner_result: ScanResult) -> None:
+        existing_reasons = list(result.metadata.get("scan_outcome_reasons", []))
+        result.merge(owner_result)
+        for reason in existing_reasons:
+            mark_inconclusive_scan_result(result, reason)
+
+    if os.path.splitext(path)[1].lower() == ".params":
+        if scanner_selection.allows("mxnet"):
+            MXNetScanner(config=config).scan_params_file_security(path, result)
+        elif scanner_selection.active:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "mxnet",
+                scanner_selection,
+                context="inconclusive MXNet params byte analysis",
+            )
+
+    manifest_covered_templates = False
+    if ManifestScanner.can_handle(path):
+        if scanner_selection.allows("manifest"):
+            manifest_result = ManifestScanner(config=config).scan(path)
+            merge_owner_result(manifest_result)
+            manifest_covered_templates = manifest_result.metadata.get("analysis_incomplete") is not True
+        elif scanner_selection.active:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "manifest",
+                scanner_selection,
+                context="overlapping manifest JSON analysis",
+            )
+    if not manifest_covered_templates and Jinja2TemplateScanner.can_handle(path):
+        if scanner_selection.allows("jinja2_template"):
+            merge_owner_result(Jinja2TemplateScanner(config=config).scan(path))
+        elif scanner_selection.active:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                "jinja2_template",
+                scanner_selection,
+                context="overlapping Jinja JSON analysis",
+            )
+    result.finish(success=False)
+    return result
+
+
 def _make_incomplete_xgboost_ubjson_routing_result(path: str) -> ScanResult:
     """Fail closed when bounded nested UBJSON routing cannot decide."""
     result = ScanResult(scanner_name="unknown")
@@ -348,6 +465,58 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
     scanner_selection = policy_from_config(config)
     scanner_class = None
     trusted_content_format = detect_file_format_from_magic(path)
+    skipped_overlap_scanner_id: str | None = None
+    if (
+        trusted_content_format == "xgboost"
+        and scanner_selection.active
+        and scanner_selection.allows("mxnet")
+        and not scanner_selection.allows("xgboost")
+    ):
+        selected_mxnet_route = detect_mxnet_symbol_content_route(path)
+        if selected_mxnet_route == "mxnet":
+            config = dict(config or {})
+            config[MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY] = str(Path(path).resolve())
+            trusted_content_format = "mxnet"
+            skipped_overlap_scanner_id = "xgboost"
+        elif selected_mxnet_route == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
+            trusted_content_format = MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+            skipped_overlap_scanner_id = "xgboost"
+    if (
+        trusted_content_format in {"mxnet", MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT}
+        and os.path.splitext(path)[1].lower() != ".json"
+        and scanner_selection.active
+        and scanner_selection.allows("xgboost")
+        and not scanner_selection.allows("mxnet")
+        and (
+            XGBoostScanner._is_xgboost_json(
+                path,
+                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+            )
+            or XGBoostScanner._is_probable_mxnet_overlap_candidate(
+                path,
+                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+            )
+        )
+    ):
+        # Keep default bounded ownership with MXNet, but honor explicit
+        # XGBoost-only coverage when its structure is already observable.
+        trusted_content_format = "xgboost"
+    if (
+        trusted_content_format == "xgboost"
+        and os.path.splitext(path)[1].lower() != ".json"
+        and (
+            XGBoostScanner._is_xgboost_json(
+                path,
+                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+            )
+            or XGBoostScanner._is_probable_mxnet_overlap_candidate(
+                path,
+                max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+            )
+        )
+    ):
+        config = dict(config or {})
+        configure_content_routed_json_scan(config, max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES)
     if trusted_content_format == "unknown":
         xgboost_route = detect_xgboost_ubjson_content_route(path)
         if xgboost_route is not None:
@@ -359,6 +528,18 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         return _make_incomplete_llamafile_routing_result(path, config)
     if trusted_content_format == NEMO_ROUTING_INCONCLUSIVE_FORMAT:
         return _make_incomplete_nemo_routing_result(path)
+    if trusted_content_format == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT:
+        result = _make_incomplete_mxnet_symbol_routing_result(path, config)
+        if skipped_overlap_scanner_id:
+            add_scanner_selection_skip_check(
+                result,
+                path,
+                skipped_overlap_scanner_id,
+                scanner_selection,
+                context="overlapping JSON analysis",
+                kind=SCANNER_SELECTION_PREFERRED_KIND,
+            )
+        return result
     if trusted_content_format == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT:
         return _make_incomplete_xgboost_ubjson_routing_result(path)
     if trusted_content_format == EXECUTABLE_ZIP_POLYGLOT_FORMAT:
@@ -372,8 +553,13 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         result.finish(success=not result.has_errors)
         return result
 
-    header_format_override = trusted_content_format if trusted_content_format == "xgboost" else None
+    header_format_override = trusted_content_format if trusted_content_format in {"mxnet", "xgboost"} else None
     scanner_id = _select_nested_scanner_id(path, header_format_override)
+    pytorch_binary_supplemental_scanner_id = (
+        detect_pytorch_binary_supplemental_format(path)
+        if os.path.splitext(path)[1].lower() == ".bin" and scanner_id == "pytorch_binary"
+        else None
+    )
     skipped_preferred_scanner_id: str | None = None
     trusted_flax_overlap_scanner_id: str | None = None
     if scanner_id == "flax_msgpack" and not scanner_selection.allows(scanner_id):
@@ -405,9 +591,15 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
         skipped_preferred_scanner_id = scanner_id
 
     if scanner_class is None:
-        if scanner_selection.active:
+        if (
+            skipped_preferred_scanner_id == "pytorch_binary"
+            and pytorch_binary_supplemental_scanner_id is not None
+            and scanner_selection.allows(pytorch_binary_supplemental_scanner_id)
+        ):
+            scanner_class = _registry.load_scanner_by_id(pytorch_binary_supplemental_scanner_id)
+        if scanner_class is None and scanner_selection.active:
             scanner_class = _registry.get_scanner_for_path(path, scanner_selection=scanner_selection)
-        else:
+        elif scanner_class is None:
             scanner_class = _registry.get_scanner_for_path(path)
 
     if scanner_class is None:
@@ -449,6 +641,15 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
             context="nested Flax MessagePack overlapping content analysis",
             scanned_scanner_ids=frozenset({result.scanner_name}),
         )
+    if skipped_overlap_scanner_id:
+        add_scanner_selection_skip_check(
+            result,
+            path,
+            skipped_overlap_scanner_id,
+            scanner_selection,
+            context="overlapping JSON analysis",
+            kind=SCANNER_SELECTION_PREFERRED_KIND,
+        )
     if skipped_preferred_scanner_id:
         add_scanner_selection_skip_check(
             result,
@@ -457,5 +658,12 @@ def scan_nested_file(path: str, config: dict[str, Any] | None = None) -> ScanRes
             scanner_selection,
             context="preferred nested scanner",
             kind=SCANNER_SELECTION_PREFERRED_KIND,
+        )
+    if scanner_id == "pytorch_binary" and result.scanner_name == "pytorch_binary":
+        _merge_pytorch_binary_supplemental_analysis(
+            path,
+            result,
+            config,
+            pytorch_binary_supplemental_scanner_id,
         )
     return result
