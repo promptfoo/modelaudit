@@ -165,6 +165,27 @@ def test_mxnet_scanner_reports_missing_companion_files(tmp_path: Path) -> None:
     assert any("No matching MXNet symbol companion file found" in issue.message for issue in params_result.issues)
 
 
+def test_mxnet_direct_params_fails_closed_for_inconclusive_symbol_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.utils.file.detection.MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    monkeypatch.setattr("modelaudit.scanners.mxnet_scanner.MAX_SYMBOL_READ_BYTES", 128)
+    params_path = tmp_path / "payload-0000.params"
+    params_path.write_text(
+        '{"padding":"'
+        + ("x" * 256)
+        + '","nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = MXNetScanner().scan(str(params_path))
+
+    _assert_inconclusive_result(result, "mxnet_symbol_truncated")
+    assert "mxnet_params_truncated" not in result.metadata["scan_outcome_reasons"]
+
+
 def test_directory_scan_preserves_path_sensitive_companion_metadata(tmp_path: Path) -> None:
     with_params_dir = tmp_path / "with_params"
     without_params_dir = tmp_path / "without_params"

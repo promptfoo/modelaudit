@@ -12,10 +12,11 @@ from typing import Any, ClassVar
 from modelaudit.detectors.suspicious_symbols import EXECUTABLE_SIGNATURES
 from modelaudit.scanner_selection import add_scanner_selection_skip_check, policy_from_config
 from modelaudit.utils.file.detection import (
+    MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT,
     MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+    detect_mxnet_symbol_content_route,
     has_mxnet_symbol_graph_structure,
     inspect_mxnet_symbol_root_keys,
-    is_mxnet_symbol_graph_file,
 )
 
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
@@ -180,8 +181,12 @@ class MXNetScanner(BaseScanner):
         suffix = Path(path).suffix.lower()
         analysis_complete = True
 
-        if suffix == ".params" and not is_mxnet_symbol_graph_file(path):
-            analysis_complete = self._scan_params_blob(path, result)
+        if suffix == ".params":
+            symbol_route = detect_mxnet_symbol_content_route(path)
+            if symbol_route in {"mxnet", MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT}:
+                analysis_complete = self._scan_symbol_graph(path, result)
+            else:
+                analysis_complete = self._scan_params_blob(path, result)
         else:
             analysis_complete = self._scan_symbol_graph(path, result)
 
