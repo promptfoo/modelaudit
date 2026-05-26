@@ -1029,28 +1029,40 @@ class XGBoostScanner(BaseScanner):
         # Validate version
         version = data.get("version")
         if not isinstance(version, list | tuple) or len(version) < 2:
+            reason = self._INCONCLUSIVE_REASONS["json_structure_invalid"]
             result.add_check(
                 name="XGBoost Version Validation",
                 passed=False,
                 message=f"Invalid XGBoost version format: {version}",
                 severity=IssueSeverity.INFO,
                 location=path,
-                details={"version": version},
+                details={
+                    "version": version,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": reason,
+                },
                 why="Invalid version information may indicate file tampering",
             )
+            self._mark_inconclusive_scan_result(result, reason)
 
         # Validate learner structure
         learner = data.get("learner", {})
         if not isinstance(learner, dict):
+            reason = self._INCONCLUSIVE_REASONS["json_structure_invalid"]
             result.add_check(
                 name="Learner Structure Validation",
                 passed=False,
                 message="XGBoost learner section is not a dictionary",
                 severity=IssueSeverity.INFO,
                 location=path,
-                details={"learner_type": type(learner).__name__},
+                details={
+                    "learner_type": type(learner).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": reason,
+                },
                 why="Invalid learner structure may indicate malformed or malicious content",
             )
+            self._mark_inconclusive_scan_result(result, reason)
             return
 
         # Check learner parameters for sanity

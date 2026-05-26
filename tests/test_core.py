@@ -2558,6 +2558,44 @@ def test_scan_file_xgboost_only_runs_renamed_probable_malformed_mxnet_overlap(tm
     assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
 
 
+def test_scan_file_xgboost_only_malformed_overlap_is_exit2_and_not_cached(tmp_path: Path) -> None:
+    model_path = tmp_path / "malformed-0000.params"
+    model_path.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{}},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+    cache_dir = tmp_path / "cache"
+
+    reset_cache_manager()
+    try:
+        first = scan_model_directory_or_file(
+            str(model_path),
+            scanners=["xgboost"],
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+        second = scan_model_directory_or_file(
+            str(model_path),
+            scanners=["xgboost"],
+            cache_enabled=True,
+            cache_dir=str(cache_dir),
+            min_cache_file_size=0,
+        )
+
+        for aggregate in (first, second):
+            metadata = aggregate.file_metadata[str(model_path)]
+            assert aggregate.success is False
+            assert metadata["scan_outcome"] == "inconclusive"
+            assert "xgboost_json_structure_invalid" in metadata["scan_outcome_reasons"]
+            assert core_module.determine_exit_code(aggregate) == 2
+            assert "mxnet" in metadata["skipped_scanner_ids"]
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+
 def test_scan_file_runs_xgboost_checks_for_bounded_probable_malformed_mxnet_overlap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
