@@ -25,6 +25,13 @@ def test_can_handle_valid_torch7_file(tmp_path: Path) -> None:
     assert Torch7Scanner.can_handle(str(path))
 
 
+def test_can_handle_valid_torch7_file_with_misleading_suffix(tmp_path: Path) -> None:
+    payload = b"T7\x00\x00torch.FloatTensor nn.Sequential model_name=resnet\n"
+    path = _write_torch7_file(tmp_path, payload, filename="payload.jpg")
+
+    assert Torch7Scanner.can_handle(str(path))
+
+
 def test_can_handle_rejects_non_torch7_content(tmp_path: Path) -> None:
     path = _write_torch7_file(tmp_path, b"this is not a torch7 file", filename="fake.t7")
 
