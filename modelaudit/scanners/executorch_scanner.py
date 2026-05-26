@@ -5,6 +5,7 @@ import tempfile
 import zipfile
 from typing import Any, BinaryIO, ClassVar, cast
 
+from ..scanner_results import mark_inconclusive_scan_result
 from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils import sanitize_archive_path
 from ..utils.file.detection import (
@@ -88,11 +89,12 @@ class ExecuTorchScanner(BaseScanner):
                 name="ExecuTorch Archive Format Validation",
                 passed=False,
                 message=f"Not a valid ExecuTorch archive: {path}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"path": path},
-                rule_code="S104",
+                rule_code="S902",
             )
+            mark_inconclusive_scan_result(result, "executorch_format_unrecognized")
             result.finish(success=False)
             return result
 
@@ -148,19 +150,10 @@ class ExecuTorchScanner(BaseScanner):
                             name="Python File Detection",
                             passed=False,
                             message=f"Python code file found in ExecuTorch model: {name}",
-                            severity=IssueSeverity.INFO,
-                            location=f"{path}:{name}",
-                            details={"file": name},
-                            rule_code="S507",  # Python embedded code
-                        )
-                        result.add_check(
-                            name="Executable File Detection",
-                            passed=False,
-                            message=f"Executable file found in ExecuTorch model: {name}",
                             severity=IssueSeverity.CRITICAL,
                             location=f"{path}:{name}",
                             details={"file": name},
-                            rule_code="S104",
+                            rule_code="S507",  # Python embedded code
                         )
 
                 result.bytes_scanned = bytes_scanned
@@ -169,11 +162,12 @@ class ExecuTorchScanner(BaseScanner):
                 name="ZIP File Format Validation",
                 passed=False,
                 message=f"Not a valid zip file: {path}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"path": path},
                 rule_code="S902",
             )
+            mark_inconclusive_scan_result(result, "executorch_zip_parse_failed")
             result.finish(success=False)
             return result
         except Exception as e:  # pragma: no cover - unexpected errors
@@ -181,7 +175,7 @@ class ExecuTorchScanner(BaseScanner):
                 name="ExecuTorch File Scan",
                 passed=False,
                 message=f"Error scanning ExecuTorch file: {e!s}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={
                     "exception": str(e),
@@ -189,6 +183,7 @@ class ExecuTorchScanner(BaseScanner):
                 },
                 rule_code="S902",
             )
+            mark_inconclusive_scan_result(result, "executorch_scan_failed")
             result.finish(success=False)
             return result
 

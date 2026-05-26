@@ -22,7 +22,7 @@ from ..utils.file.detection import PROTO0_1_MAX_PROBE_BYTES, PROTO0_1_START_BYTE
 from ._archive_config import get_archive_depth
 from ._archive_locations import rewrite_extracted_member_location
 from .archive_dispatch import NESTED_SCAN_CALLBACK_CONFIG_KEY, scan_nested_file
-from .archive_member_security import is_executable_archive_member_name
+from .archive_member_security import executable_archive_member_rule_code, is_executable_archive_member_name
 from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult
 from .pickle_scanner import PickleScanner
 from .picklescan_adapter import apply_pickle_member_context
@@ -301,6 +301,7 @@ class PyTorchZipScanner(BaseScanner):
         # Start timeout tracking
         self._start_scan_timer()
         self._relaxed_crc_tracker.reset()
+        result: ScanResult | None = None
 
         try:
             # Initial validation and setup
@@ -353,6 +354,8 @@ class PyTorchZipScanner(BaseScanner):
 
         except TimeoutError as e:
             # Handle timeout gracefully
+            if result is None:
+                result = self._create_result()
             mark_inconclusive_scan_result(result, "pytorch_zip_scan_timeout")
             result.add_check(
                 name="Scan Timeout",
@@ -365,10 +368,11 @@ class PyTorchZipScanner(BaseScanner):
             result.finish(success=False)
             return result
         except zipfile.BadZipFile:
-            return self._handle_bad_zip_error(path)
+            return self._handle_bad_zip_error(path, result)
         except Exception as e:
-            return self._handle_scan_error(path, e)
+            return self._handle_scan_error(path, e, result)
 
+        assert result is not None
         result.finish(success=result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME)
         return result
 
@@ -655,11 +659,12 @@ class PyTorchZipScanner(BaseScanner):
                 name="ZIP Format Validation",
                 passed=False,
                 message=f"Not a valid zip file: {path}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"path": path},
                 rule_code="S902",
             )
+            mark_inconclusive_scan_result(result, "pytorch_zip_format_unrecognized")
             result.finish(success=False)
             return result
         else:
@@ -680,11 +685,12 @@ class PyTorchZipScanner(BaseScanner):
                 name="PyTorch ZIP Format Validation",
                 passed=False,
                 message=f"Not a valid zip file: {path}",
-                severity=IssueSeverity.CRITICAL,
+                severity=IssueSeverity.INFO,
                 location=path,
                 details={"path": path},
                 rule_code="S902",
             )
+            mark_inconclusive_scan_result(result, "pytorch_zip_parse_failed")
             result.finish(success=False)
             return result
 
@@ -1658,6 +1664,7 @@ class PyTorchZipScanner(BaseScanner):
                     passed=False,
                     message=f"Executable file found in PyTorch model: {name}",
                     severity=IssueSeverity.CRITICAL,
+                    rule_code=executable_archive_member_rule_code(name),
                     location=f"{path}:{name}",
                     details={"file": name},
                 )
@@ -1935,31 +1942,37 @@ class PyTorchZipScanner(BaseScanner):
             },
         )
 
-    def _handle_bad_zip_error(self, path: str) -> ScanResult:
+    def _handle_bad_zip_error(self, path: str, result: ScanResult | None = None) -> ScanResult:
         """Handle BadZipFile errors"""
-        result = self._create_result()
+        if result is None:
+            result = self._create_result()
         result.add_check(
             name="PyTorch ZIP Format Validation",
             passed=False,
             message=f"Not a valid zip file: {path}",
-            severity=IssueSeverity.CRITICAL,
+            severity=IssueSeverity.INFO,
             location=path,
             details={"path": path},
+            rule_code="S902",
         )
+        mark_inconclusive_scan_result(result, "pytorch_zip_parse_failed")
         result.finish(success=False)
         return result
 
-    def _handle_scan_error(self, path: str, error: Exception) -> ScanResult:
+    def _handle_scan_error(self, path: str, error: Exception, result: ScanResult | None = None) -> ScanResult:
         """Handle general scan errors"""
-        result = self._create_result()
+        if result is None:
+            result = self._create_result()
         result.add_check(
             name="PyTorch ZIP Scan",
             passed=False,
             message=f"Error scanning PyTorch zip file: {error!s}",
-            severity=IssueSeverity.CRITICAL,
+            severity=IssueSeverity.INFO,
             location=path,
             details={"exception": str(error), "exception_type": type(error).__name__},
+            rule_code="S902",
         )
+        mark_inconclusive_scan_result(result, "pytorch_zip_scan_failed")
         result.finish(success=False)
         return result
 

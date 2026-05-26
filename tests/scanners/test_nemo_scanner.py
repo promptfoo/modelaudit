@@ -624,6 +624,27 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
         assert determine_exit_code(scan_model_directory_or_file(str(nemo_path), cache_enabled=False)) == 1
 
+    def test_nested_checkpoint_executable_named_pickle_is_not_deserialization_cve(self, tmp_path: Path) -> None:
+        nested_checkpoint = io.BytesIO()
+        with zipfile.ZipFile(nested_checkpoint, "w") as zipf:
+            zipf.writestr("version", "3")
+            zipf.writestr("archive/pickle_payload.exe", b"not executed")
+
+        nemo_path = tmp_path / "checkpoint-executable-attribution.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "model_weights.pt", nested_checkpoint.getvalue())
+
+        result = NemoScanner().scan(str(nemo_path))
+
+        executable_checks = [check for check in result.checks if check.rule_code == "S501"]
+        assert result.success is False
+        assert len(executable_checks) == 1
+        assert executable_checks[0].location == f"{nemo_path}:model_weights.pt:archive/pickle_payload.exe"
+        assert executable_checks[0].details["nested_scanner"] == "pytorch_zip"
+        assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
+        assert determine_exit_code(scan_model_directory_or_file(str(nemo_path), cache_enabled=False)) == 1
+
     def test_metadata_referenced_benign_archive_stays_clean(self, tmp_path: Path) -> None:
         nested_artifact = io.BytesIO()
         with zipfile.ZipFile(nested_artifact, "w") as zipf:

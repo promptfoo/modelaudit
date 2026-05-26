@@ -130,7 +130,9 @@ CVE_2025_23304_REMEDIATION = (
 )
 NEMO_CHECKPOINT_MEMBER_EXTENSIONS = frozenset({".ckpt", ".pt", ".pth", ".pkl", ".pickle"})
 NEMO_MAX_CHECKPOINT_SCAN_BYTES = 50 * 1024 * 1024
-_NESTED_ARCHIVE_SAFETY_RULE_CODES = frozenset({"S405", "S406", "S408", "S410"})
+_NESTED_NON_DESERIALIZATION_RULE_CODES = frozenset(
+    {"S405", "S406", "S408", "S410", "S501", "S502", "S503", "S504", "S505", "S506"}
+)
 
 _INCONCLUSIVE_METADATA_KEY = "scan_outcome"
 _INCONCLUSIVE_REASONS_METADATA_KEY = "scan_outcome_reasons"
@@ -942,7 +944,7 @@ class NemoScanner(BaseScanner):
 
     @staticmethod
     def _is_nested_checkpoint_deserialization_issue(issue: Any) -> bool:
-        if issue.rule_code in _NESTED_ARCHIVE_SAFETY_RULE_CODES:
+        if issue.rule_code in _NESTED_NON_DESERIALIZATION_RULE_CODES:
             return False
 
         details = issue.details if isinstance(issue.details, dict) else {}
