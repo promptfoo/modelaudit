@@ -363,6 +363,16 @@ class TestJITScriptDetector:
             b"import builtins\nresult = setattr(builtins, 'eval', len)\nbuiltins.eval([])\n",
             (b"import builtins as bi\nfrom builtins import setattr as assign\nassign(bi, 'eval', len)\nbi.eval([])\n"),
             b"import builtins\nbuiltins.__dict__.update({'eval': len})\nbuiltins.eval([])\n",
+            b"import builtins\nmapping = builtins.__dict__\nmapping.update({'eval': len})\nbuiltins.eval([])\n",
+            (
+                b"import builtins\n"
+                b"if cond:\n"
+                b"    target = builtins\n"
+                b"else:\n"
+                b"    target = builtins\n"
+                b"target.__dict__.update({'eval': len})\n"
+                b"builtins.eval([])\n"
+            ),
             b"import builtins\nreplace = builtins.__dict__.update\nreplace({'eval': len})\nbuiltins.eval([])\n",
             b"def payload():\n    eval = len\n    return eval([])\n",
             (
@@ -413,6 +423,13 @@ class TestJITScriptDetector:
             ),
             b"import builtins\nsetattr(builtins, 'eval', builtins.exec)\nbuiltins.eval('pass')\n",
             b"import builtins\nbuiltins.__dict__.update({'eval': builtins.exec})\nbuiltins.eval('pass')\n",
+            (
+                b"import builtins\n"
+                b"mapping = builtins.__dict__\n"
+                b"mapping.update({'eval': builtins.exec})\n"
+                b"builtins.eval('pass')\n"
+            ),
+            b"import builtins\nprint(setattr(builtins, 'eval', builtins.exec))\nbuiltins.eval('pass')\n",
         ],
     )
     def test_scan_model_detects_dangerous_builtin_reassignment(self, source: bytes) -> None:
@@ -475,6 +492,21 @@ class TestJITScriptDetector:
                 b"globals()['__builtins__']['eval']('1 + 1')\n"
             ),
             (b"import builtins\nif replace_builtin:\n    setattr(builtins, 'eval', len)\nbuiltins.eval('1 + 1')\n"),
+            (
+                b"import builtins\n"
+                b"assign = setattr\n"
+                b"if replace_builtin:\n"
+                b"    assign = lambda target, key, value: None\n"
+                b"assign(builtins, 'eval', len)\n"
+                b"builtins.eval('1 + 1')\n"
+            ),
+            (
+                b"import builtins\n"
+                b"if replace_builtin:\n"
+                b"    setattr = lambda target, key, value: None\n"
+                b"setattr(builtins, 'eval', len)\n"
+                b"builtins.eval('1 + 1')\n"
+            ),
             (
                 b"import builtins\n"
                 b"setattr = lambda target, key, value: None\n"
