@@ -484,7 +484,7 @@ class XGBoostScanner(BaseScanner):
             self.scan_parsed_json_security(path, model_data, result)
             self._scan_filename_owned_json_overlap(path, result)
             self._record_duplicate_mxnet_root_keys(duplicate_mxnet_root_keys, result, path)
-            self._record_mxnet_symbol_overlap(model_data, result, path)
+            self._record_mxnet_symbol_overlap(model_data, result, path, duplicate_mxnet_root_keys)
 
         except json.JSONDecodeError as e:
             result.add_check(
@@ -575,19 +575,29 @@ class XGBoostScanner(BaseScanner):
         )
         self._mark_inconclusive_scan_result(result, reason)
 
-    def _record_mxnet_symbol_overlap(self, data: object, result: ScanResult, path: str) -> None:
+    def _record_mxnet_symbol_overlap(
+        self,
+        data: object,
+        result: ScanResult,
+        path: str,
+        duplicate_root_keys: set[str] | None = None,
+    ) -> None:
         """Run MXNet security checks and fail closed when JSON ownership overlaps."""
         from ..utils.file.detection import has_mxnet_symbol_graph_structure
         from .mxnet_scanner import MXNetScanner
 
-        if not has_mxnet_symbol_graph_structure(data):
+        is_mxnet_symbol = has_mxnet_symbol_graph_structure(data)
+        needs_params_byte_analysis = os.path.splitext(path)[1].lower() == ".params"
+        if not is_mxnet_symbol and not (duplicate_root_keys and needs_params_byte_analysis):
             return
 
         scanner_selection = policy_from_config(self.config)
         if scanner_selection.allows("mxnet"):
             mxnet_scanner = MXNetScanner(config=self.config)
-            mxnet_scanner.scan_parsed_symbol_security(path, cast(dict[str, Any], data), result)
-            mxnet_scanner.scan_params_file_security(path, result)
+            if needs_params_byte_analysis:
+                mxnet_scanner.scan_params_file_security(path, result)
+            if is_mxnet_symbol:
+                mxnet_scanner.scan_parsed_symbol_security(path, cast(dict[str, Any], data), result)
             analysis_message = "both static analyses ran but format ownership is ambiguous"
         else:
             add_scanner_selection_skip_check(
@@ -597,6 +607,8 @@ class XGBoostScanner(BaseScanner):
                 scanner_selection,
                 context="overlapping JSON analysis",
             )
+            return
+        if not is_mxnet_symbol:
             return
         reason = self._INCONCLUSIVE_REASONS["json_mxnet_overlap"]
         result.add_check(
