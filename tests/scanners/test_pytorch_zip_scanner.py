@@ -1131,6 +1131,16 @@ def test_pytorch_zip_scans_aliased_modeled_builtins_in_archive_data(
         b"mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
         b"globals()['__builtins__'].__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
         b"globals()['__builtins__'].update({'eval': len})\nglobals()['__builtins__']['eval']([])\n",
+        (
+            b"replace = globals()['__builtins__'].__setitem__\n"
+            b"replace('eval', len)\n"
+            b"globals()['__builtins__']['eval']([])\n"
+        ),
+        (
+            b"replace = globals()['__builtins__'].update\n"
+            b"replace({'eval': len})\n"
+            b"globals()['__builtins__']['eval']([])\n"
+        ),
         b"g = globals\ng()['__builtins__'].__setitem__('eval', len)\ng()['__builtins__']['eval']([])\n",
         b"globals().get('__builtins__').__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
         b"import builtins\nbuiltins.get = lambda name: len\nlookup = builtins.get\nlookup('eval')([])\n",
@@ -1174,6 +1184,16 @@ def test_pytorch_zip_ignores_benign_builtin_shaped_access_in_archive_data(tmp_pa
         ),
         (
             b"globals()['__builtins__'].update({'eval': __builtins__['exec']})\n"
+            b"globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            b"replace = globals()['__builtins__'].__setitem__\n"
+            b"replace('eval', __builtins__['exec'])\n"
+            b"globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            b"replace = globals()['__builtins__'].update\n"
+            b"replace({'eval': __builtins__['exec']})\n"
             b"globals()['__builtins__']['eval']('pass')\n"
         ),
         (

@@ -311,6 +311,16 @@ class TestJITScriptDetector:
             b"mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
             b"globals()['__builtins__'].__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
             b"globals()['__builtins__'].update({'eval': len})\nglobals()['__builtins__']['eval']([])\n",
+            (
+                b"replace = globals()['__builtins__'].__setitem__\n"
+                b"replace('eval', len)\n"
+                b"globals()['__builtins__']['eval']([])\n"
+            ),
+            (
+                b"replace = globals()['__builtins__'].update\n"
+                b"replace({'eval': len})\n"
+                b"globals()['__builtins__']['eval']([])\n"
+            ),
             b"g = globals\ng()['__builtins__'].__setitem__('eval', len)\ng()['__builtins__']['eval']([])\n",
             b"globals().get('__builtins__').__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
             b"import builtins\nbuiltins.get = lambda name: len\nlookup = builtins.get\nlookup('eval')([])\n",
@@ -345,6 +355,16 @@ class TestJITScriptDetector:
             ),
             (
                 b"globals()['__builtins__'].update({'eval': __builtins__['exec']})\n"
+                b"globals()['__builtins__']['eval']('pass')\n"
+            ),
+            (
+                b"replace = globals()['__builtins__'].__setitem__\n"
+                b"replace('eval', __builtins__['exec'])\n"
+                b"globals()['__builtins__']['eval']('pass')\n"
+            ),
+            (
+                b"replace = globals()['__builtins__'].update\n"
+                b"replace({'eval': __builtins__['exec']})\n"
                 b"globals()['__builtins__']['eval']('pass')\n"
             ),
             (
@@ -400,6 +420,42 @@ class TestJITScriptDetector:
                 b"if replace_globals:\n"
                 b"    get_names = lambda: {'__builtins__': {'eval': len}}\n"
                 b"get_names()['__builtins__'].__setitem__('eval', len)\n"
+                b"globals()['__builtins__']['eval']('1 + 1')\n"
+            ),
+            (
+                b"replace = globals()['__builtins__'].__setitem__\n"
+                b"if replace_mutator:\n"
+                b"    replace = lambda key, value: None\n"
+                b"replace('eval', len)\n"
+                b"globals()['__builtins__']['eval']('1 + 1')\n"
+            ),
+            (
+                b"replace = globals()['__builtins__'].update\n"
+                b"if replace_mutator:\n"
+                b"    replace = lambda values: None\n"
+                b"replace({'eval': len})\n"
+                b"globals()['__builtins__']['eval']('1 + 1')\n"
+            ),
+            (
+                b"replace = globals()['__builtins__'].__setitem__\n"
+                b"from helpers import replace\n"
+                b"replace('eval', len)\n"
+                b"globals()['__builtins__']['eval']('1 + 1')\n"
+            ),
+            (
+                b"replace = globals()['__builtins__'].update\n"
+                b"import helpers as replace\n"
+                b"replace({'eval': len})\n"
+                b"globals()['__builtins__']['eval']('1 + 1')\n"
+            ),
+            (
+                b"replace = globals()['__builtins__'].__setitem__\n"
+                b"replace('eval', unknown)\n"
+                b"globals()['__builtins__']['eval']('1 + 1')\n"
+            ),
+            (
+                b"replace = globals()['__builtins__'].update\n"
+                b"replace({'eval': unknown})\n"
                 b"globals()['__builtins__']['eval']('1 + 1')\n"
             ),
         ],

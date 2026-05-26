@@ -292,9 +292,33 @@ def _resolve_static_string(node: ast.AST) -> str | None:
 _NAMESPACE_MAPPING_ACCESSORS = {"get", "__getitem__", "pop", "setdefault"}
 _GLOBAL_NAMESPACE_HELPERS = {"globals", "builtins.globals"}
 _STATIC_REFERENCE_OVERRIDE_PREFIX = "<static reference override>:"
+_STATIC_DIRECT_MUTATION_ALIAS_PREFIX = "<static direct mutation alias>:"
 _BUILTIN_NAMESPACE_NAMES = {"__builtin__", "__builtins__"}
 _GLOBAL_NAMESPACE_MAPPING_NAME = "<globals>"
 _UNKNOWN_ALIAS_NAME = "<unknown>"
+_STATIC_MAPPING_MUTATORS = {"__setitem__", "update"}
+_STATIC_SAFE_BUILTIN_REPLACEMENTS = frozenset(
+    {
+        "abs",
+        "all",
+        "any",
+        "bool",
+        "bytes",
+        "dict",
+        "float",
+        "int",
+        "len",
+        "list",
+        "max",
+        "min",
+        "object",
+        "repr",
+        "set",
+        "str",
+        "sum",
+        "tuple",
+    }
+)
 
 
 def _resolve_global_namespace_mapping_names(
@@ -593,6 +617,24 @@ def _resolve_namespace_dict_roots(
     return frozenset(roots) if roots else None
 
 
+def _resolve_direct_global_builtin_mutator_names(
+    node: ast.AST,
+    alias_scopes: _AliasScopes,
+) -> frozenset[str] | None:
+    """Resolve mutator methods bound from a definite builtin namespace mapping."""
+    if not isinstance(node, ast.Attribute) or node.attr not in _STATIC_MAPPING_MUTATORS:
+        return None
+
+    target_roots = _resolve_namespace_dict_roots(
+        node.value,
+        alias_scopes,
+        require_definite=True,
+    )
+    if target_roots is None:
+        return None
+    return frozenset(f"{target_root}.{node.attr}" for target_root in target_roots)
+
+
 def _resolve_namespace_dict_call_names(
     node: ast.AST,
     alias_scopes: _AliasScopes,
@@ -803,14 +845,20 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self.tracked_call_names = tracked_call_names
 
     def _record_import(self, alias: ast.alias, import_name: str) -> None:
-        self.alias_scopes[-1][alias.asname or alias.name] = frozenset({import_name})
+        self._bind_name(alias.asname or alias.name, frozenset({import_name}))
 
     def _bind_name(self, name: str, resolved_names: _AliasValue) -> None:
         self.alias_scopes[-1][name] = resolved_names
+        if not name.startswith("<") and self._lookup_static_direct_mutation_alias(name) is not None:
+            self.alias_scopes[-1][self._static_direct_mutation_alias_key(name)] = None
 
     @staticmethod
     def _static_reference_override_key(reference_name: str) -> str:
         return f"{_STATIC_REFERENCE_OVERRIDE_PREFIX}{reference_name}"
+
+    @staticmethod
+    def _static_direct_mutation_alias_key(name: str) -> str:
+        return f"{_STATIC_DIRECT_MUTATION_ALIAS_PREFIX}{name}"
 
     def _lookup_static_reference_override(self, reference_name: str) -> _AliasValue:
         override_key = self._static_reference_override_key(reference_name)
@@ -818,6 +866,21 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             if override_key in aliases:
                 return aliases[override_key]
         return frozenset({reference_name})
+
+    def _lookup_static_direct_mutation_alias(self, name: str) -> _AliasValue:
+        alias_key = self._static_direct_mutation_alias_key(name)
+        for aliases in reversed(self.alias_scopes):
+            if alias_key in aliases:
+                return aliases[alias_key]
+        return None
+
+    def _resolve_certain_direct_builtin_mutator_names(self, node: ast.AST) -> frozenset[str] | None:
+        direct_mutator_names = _resolve_direct_global_builtin_mutator_names(node, self.alias_scopes)
+        if direct_mutator_names is not None:
+            return direct_mutator_names
+        if isinstance(node, ast.Name):
+            return self._lookup_static_direct_mutation_alias(node.id)
+        return None
 
     def _resolve_reference_names(self, node: ast.AST) -> frozenset[str] | None:
         resolved_names = _resolve_static_reference_names(node, self.alias_scopes)
@@ -840,6 +903,14 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _bind_static_reference_names_to_value(self, target_names: frozenset[str], value: ast.AST) -> None:
         resolved_value_names = self._resolve_reference_names(value)
+        if (
+            isinstance(value, ast.Name)
+            and not any(value.id in aliases for aliases in reversed(self.alias_scopes))
+            and value.id not in _STATIC_SAFE_BUILTIN_REPLACEMENTS
+            and value.id not in _HIGH_RISK_PYTHON_CALLS
+            and (self.tracked_call_names is None or value.id not in self.tracked_call_names)
+        ):
+            resolved_value_names = None
         for target_name in target_names:
             self._bind_name(
                 self._static_reference_override_key(target_name),
@@ -880,20 +951,18 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
 
     def _bind_direct_builtin_namespace_mutation(self, node: ast.Call) -> None:
         """Model unconditional mutations of a directly addressed builtin mapping."""
-        if not isinstance(node.func, ast.Attribute):
+        mutator_names = self._resolve_certain_direct_builtin_mutator_names(node.func)
+        if mutator_names is None:
             return
-
-        target_roots = _resolve_namespace_dict_roots(
-            node.func.value,
-            self.alias_scopes,
-            require_definite=True,
-        )
-        if target_roots is None:
+        methods = {mutator_name.rsplit(".", maxsplit=1)[1] for mutator_name in mutator_names}
+        if len(methods) != 1:
             return
+        method = next(iter(methods))
+        target_roots = frozenset(mutator_name.rsplit(".", maxsplit=1)[0] for mutator_name in mutator_names)
 
         mutations: list[tuple[frozenset[str], ast.AST]] = []
         should_invalidate = False
-        if node.func.attr == "__setitem__":
+        if method == "__setitem__":
             if len(node.args) != 2 or node.keywords:
                 return
             attr_name = _resolve_static_string(node.args[0])
@@ -901,7 +970,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 self._invalidate_builtin_namespace_roots(target_roots)
                 return
             mutations.append((frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), node.args[1]))
-        elif node.func.attr == "update":
+        elif method == "update":
             if len(node.args) > 1:
                 self._invalidate_builtin_namespace_roots(target_roots)
                 return
@@ -936,6 +1005,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
     def _bind_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
         if isinstance(target, ast.Name):
             self._bind_name(target.id, self._resolve_reference_names(value))
+            direct_mutator_names = self._resolve_certain_direct_builtin_mutator_names(value)
+            if direct_mutator_names is not None:
+                self._bind_name(self._static_direct_mutation_alias_key(target.id), direct_mutator_names)
         elif isinstance(target, (ast.Attribute, ast.Subscript)):
             self._bind_static_reference_target_to_value(target, value)
         elif isinstance(target, ast.Starred):
@@ -1033,6 +1105,16 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         current_scope = self.alias_scopes[-1]
         branch_names = {name for scope in branch_scopes for name in scope}
         for name in branch_names:
+            if name.startswith(_STATIC_DIRECT_MUTATION_ALIAS_PREFIX):
+                certainty_base_value = current_scope.get(name, _MISSING_ALIAS)
+                values = [scope.get(name, certainty_base_value) for scope in branch_scopes]
+                first_value = values[0]
+                current_scope[name] = (
+                    first_value
+                    if isinstance(first_value, frozenset) and all(value == first_value for value in values)
+                    else None
+                )
+                continue
             base_value: _AliasValue | object
             if name.startswith(_STATIC_REFERENCE_OVERRIDE_PREFIX):
                 base_value = self._lookup_static_reference_override(

@@ -266,6 +266,12 @@ def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path
         "mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
         "globals()['__builtins__'].__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
         "globals()['__builtins__'].update({'eval': len})\nglobals()['__builtins__']['eval']([])\n",
+        (
+            "replace = globals()['__builtins__'].__setitem__\n"
+            "replace('eval', len)\n"
+            "globals()['__builtins__']['eval']([])\n"
+        ),
+        ("replace = globals()['__builtins__'].update\nreplace({'eval': len})\nglobals()['__builtins__']['eval']([])\n"),
         "g = globals\ng()['__builtins__'].__setitem__('eval', len)\ng()['__builtins__']['eval']([])\n",
         "globals().get('__builtins__').__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
         "import builtins\nbuiltins.get = lambda name: len\nlookup = builtins.get\nlookup('eval')([])\n",
@@ -296,6 +302,16 @@ def test_scan_zip_allows_benign_builtin_shaped_source(tmp_path: Path, source: st
         ),
         (
             "globals()['__builtins__'].update({'eval': __builtins__['exec']})\n"
+            "globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            "replace = globals()['__builtins__'].__setitem__\n"
+            "replace('eval', __builtins__['exec'])\n"
+            "globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            "replace = globals()['__builtins__'].update\n"
+            "replace({'eval': __builtins__['exec']})\n"
             "globals()['__builtins__']['eval']('pass')\n"
         ),
         (
