@@ -59,6 +59,11 @@ def _build_custom_parameter(key: str, string_value: str) -> bytes:
     return _field_bytes(1, key.encode("utf-8")) + _field_bytes(2, param_value)
 
 
+def _build_field_limit_padded_custom_payload(class_name: str) -> bytes:
+    filler = _field_varint(100, 1) * CoreMLScanner.MAX_NESTED_FIELDS
+    return filler + _field_bytes(10, class_name.encode("utf-8"))
+
+
 def _build_layer(name: str, *, custom_class: str | None = None, custom_params: dict[str, str] | None = None) -> bytes:
     layer = _field_bytes(1, name.encode("utf-8"))
     if custom_class is None:
@@ -714,15 +719,6 @@ def test_coreml_routed_malformed_neural_block_is_inconclusive_and_uncached(tmp_p
             ),
             "CoreML Layer Parse",
         ),
-        (
-            _build_model(
-                description=_build_description(metadata=_build_metadata()),
-                neural_network=_build_neural_network(
-                    layers=[_field_bytes(1, b"safe") + _field_bytes(500, b"\x0a\x05abc")],
-                ),
-            ),
-            "CoreML Custom Layer Parse",
-        ),
     ],
 )
 def test_coreml_malformed_nested_parse_surfaces_are_inconclusive(
@@ -744,6 +740,40 @@ def test_coreml_malformed_nested_parse_surfaces_are_inconclusive(
     assert not any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
 
 
+def test_coreml_incomplete_custom_layer_parse_preserves_custom_layer_finding_exit1(tmp_path: Path) -> None:
+    custom_payload = _build_field_limit_padded_custom_payload("DelayedRuntimeLayer")
+    model_path = _write_model(
+        tmp_path / "padded_custom_layer.mlmodel",
+        _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            neural_network=_build_neural_network(
+                layers=[_field_bytes(1, b"danger") + _field_bytes(500, custom_payload)],
+            ),
+        ),
+    )
+
+    direct_result = scan_file(str(model_path), config={"cache_scan_results": False})
+    aggregate_result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert direct_result.scanner_name == "coreml"
+    assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "coreml_analysis_incomplete" in direct_result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and "Custom CoreML layer detected" in issue.message
+        and issue.details.get("layer_name") == "danger"
+        and issue.details.get("class_name") == "<unknown>"
+        for issue in direct_result.issues
+    )
+    assert any(
+        issue.severity == IssueSeverity.INFO
+        and "Unable to parse CoreML custom layer block" in issue.message
+        and str(issue.details.get("parse_error", "")).startswith("field count exceeded limit")
+        for issue in direct_result.issues
+    )
+    assert determine_exit_code(aggregate_result) == 1
+
+
 def test_coreml_scanner_malformed_custom_model_fails_closed(tmp_path: Path) -> None:
     model_path = _write_model(
         tmp_path / "malformed_custom_model.mlmodel",
@@ -763,6 +793,42 @@ def test_coreml_scanner_malformed_custom_model_fails_closed(tmp_path: Path) -> N
         and issue.details.get("field_path") == "model[555]"
         for issue in result.issues
     )
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and "CoreML custom model class detected" in issue.message
+        and issue.details.get("class_name") == "<unknown>"
+        for issue in result.issues
+    )
+
+
+def test_coreml_incomplete_custom_model_parse_preserves_custom_model_finding_exit1(tmp_path: Path) -> None:
+    custom_model = _build_field_limit_padded_custom_payload("DelayedRuntimeModel")
+    model_path = _write_model(
+        tmp_path / "padded_custom_model.mlmodel",
+        _field_varint(1, 8)
+        + _field_bytes(2, _build_description(metadata=_build_metadata()))
+        + _field_bytes(555, custom_model),
+    )
+
+    direct_result = scan_file(str(model_path), config={"cache_scan_results": False})
+    aggregate_result = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert direct_result.scanner_name == "coreml"
+    assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert "coreml_analysis_incomplete" in direct_result.metadata["scan_outcome_reasons"]
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and "CoreML custom model class detected" in issue.message
+        and issue.details.get("class_name") == "<unknown>"
+        for issue in direct_result.issues
+    )
+    assert any(
+        issue.severity == IssueSeverity.INFO
+        and "Unable to parse CoreML custom model block" in issue.message
+        and str(issue.details.get("parse_error", "")).startswith("field count exceeded limit")
+        for issue in direct_result.issues
+    )
+    assert determine_exit_code(aggregate_result) == 1
 
 
 def test_coreml_scanner_truncated_linked_model_file_fails_closed(tmp_path: Path) -> None:
