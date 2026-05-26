@@ -2,6 +2,7 @@ import bz2
 import gzip
 import importlib
 import io
+import json
 import lzma
 import pickle
 import struct
@@ -14,9 +15,11 @@ from typing import cast
 import pytest
 
 from modelaudit.scanner_registry_metadata import get_extension_format_map
+from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
-    MXNET_SYMBOL_SIGNATURE_READ_BYTES,
+    NEMO_ROUTING_INCONCLUSIVE_FORMAT,
     PROTO0_1_MAX_PROBE_BYTES,
+    XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT,
     detect_file_format,
     detect_file_format_for_skip_filter,
     detect_file_format_from_magic,
@@ -28,6 +31,14 @@ from modelaudit.utils.file.detection import (
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.helpers import create_mock_mxnet_symbol, create_mock_onnx
 from tests.helpers.file_creators import create_v7_tar_archive
+
+
+def _ubjson_key(key: bytes) -> bytes:
+    return b"U" + bytes([len(key)]) + key
+
+
+def _ubjson_string(value: bytes) -> bytes:
+    return b"SL" + len(value).to_bytes(8, byteorder="big", signed=True) + value
 
 
 def _create_mar_archive(
@@ -330,8 +341,12 @@ def test_detect_file_format_routes_renamed_mxnet_after_leading_whitespace(tmp_pa
     assert detect_file_format_for_skip_filter(str(model_path)) == "mxnet"
 
 
-def test_detect_oversized_renamed_mxnet_requires_top_level_graph_contract(tmp_path: Path) -> None:
-    padding = "x" * (MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
+def test_detect_oversized_renamed_mxnet_requires_top_level_graph_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(file_detection, "MXNET_SYMBOL_SIGNATURE_READ_BYTES", 128)
+    padding = "x" * 256
     delayed_nodes = tmp_path / "delayed-nodes.jpg"
     delayed_nodes.write_text(
         '{"arg_nodes":[0],"heads":[[0,0,0]],"nodes":[{"attrs":"' + padding + '","op":"Custom","name":"load"}]}',
@@ -342,11 +357,25 @@ def test_detect_oversized_renamed_mxnet_requires_top_level_graph_contract(tmp_pa
         '{"nodes":[],"op":"Custom","name":"load","attrs":"' + padding + '"}',
         encoding="utf-8",
     )
+    nested_markers = tmp_path / "nested-markers.jpg"
+    nested_markers.write_text(
+        '{"metadata":{"nodes":[],"arg_nodes":[],"heads":[]},"padding":"' + padding + '"}',
+        encoding="utf-8",
+    )
+    string_markers = tmp_path / "string-markers.jpg"
+    string_markers.write_text(
+        '{"description":"\\"nodes\\": [] \\"arg_nodes\\": [] \\"heads\\": []","padding":"' + padding + '"}',
+        encoding="utf-8",
+    )
 
     assert detect_file_format(str(delayed_nodes)) == "mxnet"
     assert detect_file_format_for_skip_filter(str(delayed_nodes)) == "mxnet"
     assert detect_file_format(str(unrelated)) == "unknown"
     assert detect_file_format_for_skip_filter(str(unrelated)) == "unknown"
+    assert detect_file_format(str(nested_markers)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(nested_markers)) == "unknown"
+    assert detect_file_format(str(string_markers)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(string_markers)) == "unknown"
 
 
 def test_detect_r_serialized_magic_headers(tmp_path: Path) -> None:
@@ -373,6 +402,67 @@ def test_detect_cntk_formats_by_signature(tmp_path: Path) -> None:
     assert detect_format_from_extension(str(v2_path)) == "cntk"
     assert detect_file_format(str(v2_path)) == "cntk"
     assert detect_file_format_from_magic(str(v2_path)) == "cntk"
+
+
+def test_detect_renamed_cntk_by_strict_signature_only(tmp_path: Path) -> None:
+    renamed = tmp_path / "graph.jpg"
+    renamed.write_bytes(
+        b"\x0a\x07version\x12\x031.0\x12\x09\x0a\x03uid\x12\x02ab CompositeFunction primitive_functions"
+    )
+    near_match = tmp_path / "notes.jpg"
+    near_match.write_bytes(b"\x0a\x07version\x12\x031.0\x12\x09\x0a\x03uid\x12\x02ab")
+
+    assert detect_file_format(str(renamed)) == "cntk"
+    assert detect_file_format_from_magic(str(renamed)) == "cntk"
+    assert detect_file_format(str(near_match)) == "unknown"
+    assert detect_file_format_from_magic(str(near_match)) == "unknown"
+
+
+def test_detect_cntk_model_extension_remains_excluded_for_xgboost_overlap(tmp_path: Path) -> None:
+    deferred = tmp_path / "deferred.model"
+    deferred.write_bytes(
+        b"\x0a\x07version\x12\x031.0\x12\x09\x0a\x03uid\x12\x02ab CompositeFunction primitive_functions"
+    )
+    legacy_deferred = tmp_path / "legacy.model"
+    legacy_deferred.write_bytes(
+        b"B\x00C\x00N\x00\x00\x00" + b"B\x00V\x00e\x00r\x00s\x00i\x00o\x00n\x00\x00\x00" + b"inputs outputs"
+    )
+
+    assert detect_file_format(str(deferred)) != "cntk"
+    assert detect_file_format_from_magic(str(deferred)) != "cntk"
+    assert detect_file_format(str(legacy_deferred)) != "cntk"
+    assert detect_file_format_from_magic(str(legacy_deferred)) != "cntk"
+
+
+def test_detect_renamed_lightgbm_by_strict_signature_only(tmp_path: Path) -> None:
+    renamed = tmp_path / "tree.jpg"
+    renamed.write_text(
+        "tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
+        "tree_sizes=12\nTree=0\nnum_leaves=2\nsplit_feature=0\nleaf_value=0.1 0.2\n",
+        encoding="utf-8",
+    )
+    near_match = tmp_path / "tree-notes.jpg"
+    near_match.write_text("tree=0\nversion=v4\nnum_class=1\n", encoding="utf-8")
+
+    assert detect_file_format(str(renamed)) == "lightgbm"
+    assert detect_file_format_from_magic(str(renamed)) == "lightgbm"
+    assert detect_file_format(str(near_match)) == "unknown"
+    assert detect_file_format_from_magic(str(near_match)) == "unknown"
+
+
+def test_detect_renamed_lightgbm_does_not_promote_embedded_model_text(tmp_path: Path) -> None:
+    model_text = (
+        "tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
+        "tree_sizes=12\nTree=0\nnum_leaves=2\nsplit_feature=0\nleaf_value=0.1 0.2\n"
+    )
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps({"example": model_text}), encoding="utf-8")
+    safetensors_path = tmp_path / "model.safetensors"
+    header = json.dumps({"__metadata__": {"example": model_text}}).encode()
+    safetensors_path.write_bytes(struct.pack("<Q", len(header)) + header)
+
+    assert detect_file_format(str(config_path)) == "unknown"
+    assert detect_file_format(str(safetensors_path)) == "safetensors"
 
 
 def test_detect_tf_metagraph_by_strict_parse(tmp_path: Path) -> None:
@@ -442,6 +532,52 @@ def test_torch7_magic_routes_ascii_serialized_models(tmp_path: Path) -> None:
     assert validate_file_type(str(torch7_path)) is True
 
 
+def test_torch7_content_routes_renamed_ascii_serialized_models(tmp_path: Path) -> None:
+    torch7_path = tmp_path / "payload.jpg"
+    torch7_path.write_bytes(b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n")
+    near_match = tmp_path / "source.jpg"
+    near_match.write_text("import torch\nimport torch.nn as nn\n\nclass Model(nn.Module):\n    pass\n")
+
+    assert detect_file_format(str(torch7_path)) == "torch7"
+    assert detect_file_format_from_magic(str(torch7_path)) == "torch7"
+    assert detect_file_format(str(near_match)) == "unknown"
+    assert detect_file_format_from_magic(str(near_match)) == "unknown"
+
+
+@pytest.mark.parametrize("filename", ["payload.onnx", "payload.pt", "payload.gz", "payload.tar.gz"])
+def test_torch7_content_takes_priority_over_recognized_suffix(tmp_path: Path, filename: str) -> None:
+    torch7_path = tmp_path / filename
+    torch7_path.write_bytes(b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n")
+
+    assert detect_file_format(str(torch7_path)) == "torch7"
+    assert detect_file_format_from_magic(str(torch7_path)) == "torch7"
+
+
+@pytest.mark.parametrize(
+    "embedded_signature",
+    [
+        b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+        + b" CompositeFunction primitive_functions ",
+        (
+            b"\x00tree=0\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
+            b"tree_sizes=12\nnum_leaves=2\nsplit_feature=0\nleaf_value=0.1 0.2\n"
+        ),
+    ],
+    ids=["cntk", "lightgbm"],
+)
+def test_torch7_content_takes_priority_over_embedded_content_signatures(
+    tmp_path: Path,
+    embedded_signature: bytes,
+) -> None:
+    torch7_path = tmp_path / "mixed-payload.jpg"
+    torch7_path.write_bytes(
+        b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n" + embedded_signature
+    )
+
+    assert detect_file_format(str(torch7_path)) == "torch7"
+    assert detect_file_format_from_magic(str(torch7_path)) == "torch7"
+
+
 def test_torch7_magic_rejects_malformed_ascii_version_header(tmp_path: Path) -> None:
     source_path = tmp_path / "malformed-header.py"
     source_path.write_bytes(b"4\n1\n9\nV payload\n13\nnn.Sequential\n")
@@ -454,6 +590,23 @@ def test_torch7_magic_keeps_binary_marker_only_routing(tmp_path: Path) -> None:
     torch7_path.write_bytes(b"\x01\x00torch.FloatTensor nn.Sequential\n")
 
     assert detect_file_format_from_magic(str(torch7_path)) == "torch7"
+
+
+def test_torch7_markers_in_gzip_header_do_not_override_tar_archive(tmp_path: Path) -> None:
+    tar_payload = io.BytesIO()
+    with tarfile.open(fileobj=tar_payload, mode="w") as archive:
+        info = tarfile.TarInfo("weights.bin")
+        info.size = len(b"safe weights")
+        archive.addfile(info, io.BytesIO(b"safe weights"))
+
+    archive_path = tmp_path / "weights.tar.gz"
+    with (
+        archive_path.open("wb") as target,
+        gzip.GzipFile(filename="torch_tensor", mode="wb", fileobj=target) as compressed,
+    ):
+        compressed.write(tar_payload.getvalue())
+
+    assert detect_file_format(str(archive_path)) == "tar"
 
 
 def test_detect_executorch_binary_requires_valid_flatbuffer_structure(tmp_path: Path) -> None:
@@ -776,6 +929,312 @@ def test_detect_file_format_disguised_compressed_tar_by_content(tmp_path: Path) 
     assert validate_file_type(str(archive_path)) is False
 
 
+@pytest.mark.parametrize("config_name", ["model_config.yaml", "./model_config.yaml", "configs/../model_config.yaml"])
+def test_detect_file_format_routes_renamed_nemo_archive_by_root_config(tmp_path: Path, config_name: str) -> None:
+    archive_path = tmp_path / "model.jpg"
+    with tarfile.open(archive_path, "w") as archive:
+        info = tarfile.TarInfo(config_name)
+        payload = b"model:\n  _target_: os.system\n"
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+
+    assert detect_file_format(str(archive_path)) == "nemo"
+    assert detect_file_format_from_magic(str(archive_path)) == "nemo"
+    assert detect_file_format_for_skip_filter(str(archive_path)) == "nemo"
+
+
+@pytest.mark.parametrize("link_type", [tarfile.SYMTYPE, tarfile.LNKTYPE])
+@pytest.mark.parametrize(
+    ("config_name", "payload_name"),
+    [("model_config.yaml", "payload.txt"), ("configs/../model_config.yaml", "configs/../payload.txt")],
+)
+def test_detect_file_format_routes_renamed_nemo_archive_by_linked_root_config(
+    tmp_path: Path,
+    link_type: bytes,
+    config_name: str,
+    payload_name: str,
+) -> None:
+    archive_path = tmp_path / "linked-model.jpg"
+    with tarfile.open(archive_path, "w") as archive:
+        payload = b"model:\n  _target_: os.system\n"
+        payload_info = tarfile.TarInfo(payload_name)
+        payload_info.size = len(payload)
+        archive.addfile(payload_info, io.BytesIO(payload))
+        link_info = tarfile.TarInfo(config_name)
+        link_info.type = link_type
+        link_info.linkname = "payload.txt"
+        archive.addfile(link_info)
+
+    assert detect_file_format(str(archive_path)) == "nemo"
+    assert detect_file_format_from_magic(str(archive_path)) == "nemo"
+    assert detect_file_format_for_skip_filter(str(archive_path)) == "nemo"
+
+
+def test_detect_file_format_keeps_forward_hardlink_root_config_on_tar_route(tmp_path: Path) -> None:
+    archive_path = tmp_path / "forward-hardlink-model.jpg"
+    with tarfile.open(archive_path, "w") as archive:
+        link_info = tarfile.TarInfo("model_config.yaml")
+        link_info.type = tarfile.LNKTYPE
+        link_info.linkname = "payload.txt"
+        archive.addfile(link_info)
+        payload = b"model:\n  _target_: os.system\n"
+        payload_info = tarfile.TarInfo("payload.txt")
+        payload_info.size = len(payload)
+        archive.addfile(payload_info, io.BytesIO(payload))
+
+    assert detect_file_format(str(archive_path)) == "tar"
+    assert detect_file_format_from_magic(str(archive_path)) == "tar"
+    assert detect_file_format_for_skip_filter(str(archive_path)) == "tar"
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    [
+        "docs/model_config.yaml",
+        "/model_config.yaml",
+        "../model_config.yaml",
+        " model_config.yaml",
+        "model_config.yaml ",
+    ],
+)
+def test_detect_file_format_keeps_non_root_config_names_on_tar_route(tmp_path: Path, config_name: str) -> None:
+    archive_path = tmp_path / "generic.jpg"
+    with tarfile.open(archive_path, "w") as archive:
+        info = tarfile.TarInfo(config_name)
+        payload = b"model:\n  _target_: os.system\n"
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+
+    assert detect_file_format(str(archive_path)) == "tar"
+    assert detect_file_format_from_magic(str(archive_path)) == "tar"
+    assert detect_file_format_for_skip_filter(str(archive_path)) == "tar"
+
+
+def test_detect_file_format_keeps_unsafe_linked_root_config_on_tar_route(tmp_path: Path) -> None:
+    archive_path = tmp_path / "unsafe-linked-generic.jpg"
+    with tarfile.open(archive_path, "w") as archive:
+        link_info = tarfile.TarInfo("model_config.yaml")
+        link_info.type = tarfile.SYMTYPE
+        link_info.linkname = "../payload.txt"
+        archive.addfile(link_info)
+
+    assert detect_file_format(str(archive_path)) == "tar"
+    assert detect_file_format_from_magic(str(archive_path)) == "tar"
+    assert detect_file_format_for_skip_filter(str(archive_path)) == "tar"
+
+
+def test_detect_file_format_bounds_late_linked_root_config_targets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.utils.file.detection._NEMO_ROUTE_MAX_ENTRIES", 2)
+    archive_path = tmp_path / "late-linked-model.jpg"
+    with tarfile.open(archive_path, "w") as archive:
+        link_info = tarfile.TarInfo("model_config.yaml")
+        link_info.type = tarfile.SYMTYPE
+        link_info.linkname = "payload.txt"
+        archive.addfile(link_info)
+        filler_info = tarfile.TarInfo("assets/filler.bin")
+        filler_info.size = 1
+        archive.addfile(filler_info, io.BytesIO(b"x"))
+        payload = b"model:\n  _target_: os.system\n"
+        payload_info = tarfile.TarInfo("payload.txt")
+        payload_info.size = len(payload)
+        archive.addfile(payload_info, io.BytesIO(payload))
+
+    assert detect_file_format(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_fails_closed_when_nemo_route_probe_limit_is_reached(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.utils.file.detection._NEMO_ROUTE_MAX_ENTRIES", 2)
+    archive_path = tmp_path / "large-generic.jpg"
+    with tarfile.open(archive_path, "w") as archive:
+        for name in ("one.bin", "two.bin", "three.bin"):
+            info = tarfile.TarInfo(name)
+            info.size = 1
+            archive.addfile(info, io.BytesIO(b"x"))
+
+    assert detect_file_format(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_propagates_inconclusive_compressed_nemo_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("modelaudit.utils.file.detection._NEMO_ROUTE_MAX_ENTRIES", 2)
+    archive_path = tmp_path / "payload.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as archive:
+        for name in ("one.bin", "two.bin", "model_config.yaml"):
+            payload = b"x"
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+    assert detect_file_format(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(archive_path)) == NEMO_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_disguised_llamafile_by_content(tmp_path: Path) -> None:
+    disguised_llamafile = tmp_path / "payload.jpg"
+    disguised_llamafile.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile runtime")
+    near_match = tmp_path / "tool.jpg"
+    near_match.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llama-file runtime")
+
+    assert detect_file_format(str(disguised_llamafile)) == "llamafile"
+    assert detect_file_format_from_magic(str(disguised_llamafile)) == "llamafile"
+    assert detect_file_format(str(near_match)) == "unknown"
+    assert detect_file_format_from_magic(str(near_match)) == "unknown"
+
+
+def test_detect_file_format_routes_extensionless_xgboost_ubjson_by_structure(tmp_path: Path) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_bytes(
+        b"{"
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + _ubjson_key(b"version")
+        + b"[]"
+        + b"}"
+    )
+
+    assert detect_file_format(str(model_file)) == "xgboost"
+    assert detect_file_format_from_magic(str(model_file)) == "xgboost"
+    assert detect_file_format_for_skip_filter(str(model_file)) == "xgboost"
+
+
+def test_detect_file_format_routes_extensionless_xgboost_ubjson_with_noop_before_learner(tmp_path: Path) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_bytes(
+        b"{"
+        + _ubjson_key(b"learner")
+        + b"N{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + _ubjson_key(b"version")
+        + b"[]"
+        + b"}"
+    )
+
+    assert detect_file_format(str(model_file)) == "xgboost"
+    assert detect_file_format_from_magic(str(model_file)) == "xgboost"
+    assert detect_file_format_for_skip_filter(str(model_file)) == "xgboost"
+
+
+def test_detect_file_format_routes_extensionless_xgboost_ubjson_with_noop_before_counted_root_header(
+    tmp_path: Path,
+) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_bytes(
+        b"{N#U\x02"
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + _ubjson_key(b"version")
+        + b"[]"
+    )
+
+    assert detect_file_format(str(model_file)) == "xgboost"
+    assert detect_file_format_from_magic(str(model_file)) == "xgboost"
+    assert detect_file_format_for_skip_filter(str(model_file)) == "xgboost"
+
+
+def test_detect_file_format_fails_closed_for_bounded_extensionless_xgboost_candidate(tmp_path: Path) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_bytes(
+        b"{"
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"metadata")
+        + _ubjson_string(b"x" * (256 * 1024))
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + b"}"
+    )
+
+    assert detect_file_format(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_fails_closed_when_extensionless_xgboost_learner_is_past_budget(tmp_path: Path) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_bytes(
+        b"{"
+        + _ubjson_key(b"metadata")
+        + _ubjson_string(b"x" * (256 * 1024))
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + b"}"
+    )
+
+    assert detect_file_format(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_does_not_treat_plain_extensionless_json_as_xgboost_ubjson(tmp_path: Path) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_text('{"kind":"manifest","safe":true}', encoding="utf-8")
+
+    assert detect_file_format(str(model_file)) == "unknown"
+    assert detect_file_format_from_magic(str(model_file)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(model_file)) == "unknown"
+
+
+def test_detect_file_format_fails_closed_for_ubjson_noops_before_late_learner(tmp_path: Path) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_bytes(
+        b"{"
+        + (b"N" * (256 * 1024))
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+        + b"}"
+    )
+
+    assert detect_file_format(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+
+
+def test_detect_file_format_fails_closed_for_ubjson_header_truncated_at_budget(tmp_path: Path) -> None:
+    model_file = tmp_path / "model"
+    model_file.write_bytes(
+        b"{"
+        + (b"N" * ((256 * 1024) - 2))
+        + b"#U\x01"
+        + _ubjson_key(b"learner")
+        + b"{"
+        + _ubjson_key(b"learner_model_param")
+        + b"{}"
+        + b"}"
+    )
+
+    assert detect_file_format(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_file)) == XGBOOST_UBJSON_ROUTING_INCONCLUSIVE_FORMAT
+
+
 def test_zip_magic_variants(tmp_path):
     """Ensure alternate PK signatures are detected as ZIP."""
     for sig in (b"PK\x06\x06", b"PK\x06\x07"):
@@ -987,7 +1446,7 @@ def test_validate_file_type(tmp_path):
     assert detect_file_format_from_magic(str(invalid_executorch_path)) == "unknown"
     assert validate_file_type(str(invalid_executorch_path)) is False
 
-    # Llamafile wrappers validate by extension with scanner-level marker checks.
+    # Llamafile extensions remain eligible for scanner-level executable and marker checks.
     llamafile_path = tmp_path / "model.llamafile"
     llamafile_path.write_bytes(b"\x7fELF" + b"\x00" * 32 + b"llamafile")
     assert validate_file_type(str(llamafile_path)) is True

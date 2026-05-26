@@ -15,6 +15,7 @@ from typing import Any, ClassVar
 
 from ..utils.file.detection import is_skops_archive, read_magic_bytes
 from ._archive_outcomes import mark_archive_scan_incomplete
+from .archive_dispatch import SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 
 
@@ -418,6 +419,9 @@ class SkopsScanner(BaseScanner):
 
     def _scan_archive_members(self, path: str, result: ScanResult) -> None:
         """Recursively scan embedded archive members through the generic ZIP pipeline."""
+        if self.config.get(SKIP_COMPOSED_ARCHIVE_MEMBER_SCAN_CONFIG_KEY):
+            return
+
         from .zip_scanner import ZipScanner
 
         zip_scanner = ZipScanner(config=self.config)
@@ -443,7 +447,7 @@ class SkopsScanner(BaseScanner):
 
             # Verify it's a ZIP file
             magic = read_magic_bytes(path, 4)
-            if not magic.startswith(b"PK"):
+            if not magic.startswith(b"PK") and not zipfile.is_zipfile(path):
                 result.add_check(
                     name="Skops File Format Check",
                     passed=False,
