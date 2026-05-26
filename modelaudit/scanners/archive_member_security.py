@@ -294,6 +294,7 @@ _GLOBAL_NAMESPACE_HELPERS = {"globals", "builtins.globals"}
 _STATIC_REFERENCE_OVERRIDE_PREFIX = "<static reference override>:"
 _BUILTIN_NAMESPACE_NAMES = {"__builtin__", "__builtins__"}
 _GLOBAL_NAMESPACE_MAPPING_NAME = "<globals>"
+_UNKNOWN_ALIAS_NAME = "<unknown>"
 
 
 def _resolve_global_namespace_mapping_names(
@@ -835,9 +836,102 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         if target_names is None:
             return
 
+        self._bind_static_reference_names_to_value(target_names, value)
+
+    def _bind_static_reference_names_to_value(self, target_names: frozenset[str], value: ast.AST) -> None:
         resolved_value_names = self._resolve_reference_names(value)
         for target_name in target_names:
-            self._bind_name(self._static_reference_override_key(target_name), resolved_value_names)
+            self._bind_name(
+                self._static_reference_override_key(target_name),
+                resolved_value_names if resolved_value_names is not None else frozenset({target_name}),
+            )
+
+    def _invalidate_static_reference_names(self, target_names: frozenset[str]) -> None:
+        for target_name in target_names:
+            self._bind_name(self._static_reference_override_key(target_name), frozenset({target_name}))
+
+    def _invalidate_builtin_namespace_roots(self, target_roots: frozenset[str]) -> None:
+        target_names = frozenset(
+            call_name
+            for target_root in target_roots
+            for call_name in _HIGH_RISK_PYTHON_CALLS
+            if call_name.startswith(f"{target_root}.")
+        )
+        if target_names:
+            self._invalidate_static_reference_names(target_names)
+
+    @staticmethod
+    def _static_update_pair_nodes(node: ast.AST) -> Iterator[tuple[ast.AST, ast.AST] | None]:
+        if isinstance(node, ast.Dict):
+            for key_node, value_node in zip(node.keys, node.values, strict=True):
+                if key_node is not None:
+                    yield key_node, value_node
+                elif not isinstance(value_node, ast.Dict) or value_node.keys:
+                    yield None
+            return
+        if isinstance(node, (ast.List, ast.Tuple)):
+            for element in node.elts:
+                if isinstance(element, (ast.List, ast.Tuple)) and len(element.elts) == 2:
+                    yield element.elts[0], element.elts[1]
+                else:
+                    yield None
+            return
+        yield None
+
+    def _bind_direct_builtin_namespace_mutation(self, node: ast.Call) -> None:
+        """Model unconditional mutations of a directly addressed builtin mapping."""
+        if not isinstance(node.func, ast.Attribute):
+            return
+
+        target_roots = _resolve_namespace_dict_roots(
+            node.func.value,
+            self.alias_scopes,
+            require_definite=True,
+        )
+        if target_roots is None:
+            return
+
+        mutations: list[tuple[frozenset[str], ast.AST]] = []
+        should_invalidate = False
+        if node.func.attr == "__setitem__":
+            if len(node.args) != 2 or node.keywords:
+                return
+            attr_name = _resolve_static_string(node.args[0])
+            if attr_name is None:
+                self._invalidate_builtin_namespace_roots(target_roots)
+                return
+            mutations.append((frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), node.args[1]))
+        elif node.func.attr == "update":
+            if len(node.args) > 1:
+                self._invalidate_builtin_namespace_roots(target_roots)
+                return
+            if node.args:
+                for pair_nodes in self._static_update_pair_nodes(node.args[0]):
+                    if pair_nodes is None:
+                        should_invalidate = True
+                        continue
+                    attr_name_node, value_node = pair_nodes
+                    attr_name = _resolve_static_string(attr_name_node)
+                    if attr_name is None:
+                        should_invalidate = True
+                        continue
+                    mutations.append(
+                        (frozenset(f"{target_root}.{attr_name}" for target_root in target_roots), value_node)
+                    )
+            for keyword in node.keywords:
+                if keyword.arg is None:
+                    should_invalidate = True
+                    continue
+                mutations.append(
+                    (frozenset(f"{target_root}.{keyword.arg}" for target_root in target_roots), keyword.value)
+                )
+        else:
+            return
+
+        for target_names, value in mutations:
+            self._bind_static_reference_names_to_value(target_names, value)
+        if should_invalidate:
+            self._invalidate_builtin_namespace_roots(target_roots)
 
     def _bind_target_to_value(self, target: ast.AST, value: ast.AST) -> None:
         if isinstance(target, ast.Name):
@@ -949,7 +1043,10 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
             values = [scope.get(name, base_value) for scope in branch_scopes]
             concrete_aliases = frozenset(alias for value in values if isinstance(value, frozenset) for alias in value)
             if concrete_aliases:
-                current_scope[name] = concrete_aliases
+                if any(value is None for value in values):
+                    current_scope[name] = concrete_aliases | frozenset({_UNKNOWN_ALIAS_NAME})
+                else:
+                    current_scope[name] = concrete_aliases
             elif any(value is None for value in values):
                 current_scope[name] = None
 
@@ -1042,6 +1139,9 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
         self.visit(node.value)
         self._bind_target_to_value(node.target, node.value)
         self.visit(node.target)
+
+    def visit_Expr(self, node: ast.Expr) -> None:
+        self.visit(node.value)
 
     def _visit_loop(self, node: ast.For | ast.AsyncFor) -> None:
         self.visit(node.iter)
@@ -1159,6 +1259,7 @@ class _HighRiskPythonCallVisitor(ast.NodeVisitor):
                 ):
                     self.risky_calls.add(resolved_name)
         self.generic_visit(node)
+        self._bind_direct_builtin_namespace_mutation(node)
 
 
 def statically_resolved_python_call_names_in_tree(tree: ast.AST, tracked_call_names: frozenset[str]) -> set[str]:

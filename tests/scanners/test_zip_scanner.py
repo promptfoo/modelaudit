@@ -264,6 +264,10 @@ def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path
         ("namespace = globals()\nnamespace['__builtins__']['eval'] = len\nnamespace['__builtins__']['eval']([])\n"),
         "lookup = globals().get\nlookup('__builtins__').get('len')([1])\n",
         "mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
+        "globals()['__builtins__'].__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
+        "globals()['__builtins__'].update({'eval': len})\nglobals()['__builtins__']['eval']([])\n",
+        "g = globals\ng()['__builtins__'].__setitem__('eval', len)\ng()['__builtins__']['eval']([])\n",
+        "globals().get('__builtins__').__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
         "import builtins\nbuiltins.get = lambda name: len\nlookup = builtins.get\nlookup('eval')([])\n",
         "global_namespace = {'__builtins__': {'eval': len}}\nglobal_namespace['__builtins__']['eval']([])\n",
     ],
@@ -278,13 +282,46 @@ def test_scan_zip_allows_benign_builtin_shaped_source(tmp_path: Path, source: st
     assert not any(check.name == "Python Archive Member Security" for check in result.checks)
 
 
-def test_scan_zip_reports_dangerous_builtin_reassignment(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "source",
+    [
+        (
+            "namespace = globals()\n"
+            "namespace['__builtins__']['eval'] = __builtins__['exec']\n"
+            "namespace['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            "globals()['__builtins__'].__setitem__('eval', __builtins__['exec'])\n"
+            "globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            "globals()['__builtins__'].update({'eval': __builtins__['exec']})\n"
+            "globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            "globals()['__builtins__'].__setitem__('eval', len)\n"
+            "globals()['__builtins__'].update(eval=__builtins__['exec'])\n"
+            "globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            "globals()['__builtins__'].__setitem__('eval', len)\n"
+            "globals()['__builtins__'].update({'eval': __builtins__['exec'], **{}})\n"
+            "globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            "globals()['__builtins__'].__setitem__('eval', len)\n"
+            "globals()['__builtins__'].update([('eval', __builtins__['exec'])])\n"
+            "globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            "globals()['__builtins__'].__setitem__('eval', len)\n"
+            "_ = globals()['__builtins__'].__setitem__('eval', __builtins__['exec'])\n"
+            "globals()['__builtins__']['eval']('pass')\n"
+        ),
+    ],
+)
+def test_scan_zip_reports_dangerous_builtin_reassignment(tmp_path: Path, source: str) -> None:
     archive_path = tmp_path / "model_bundle.zip"
-    source = (
-        "namespace = globals()\n"
-        "namespace['__builtins__']['eval'] = __builtins__['exec']\n"
-        "namespace['__builtins__']['eval']('pass')\n"
-    )
     with zipfile.ZipFile(archive_path, "w") as archive:
         archive.writestr("handler.py", source)
 

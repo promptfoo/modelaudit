@@ -358,6 +358,27 @@ def test_scan_detects_implicit_builtins_handler_execution_primitive(
             b"    return lookup('eval')([])\n"
         ),
         (
+            b"def handle(data, context):\n"
+            b"    globals()['__builtins__'].__setitem__('eval', len)\n"
+            b"    return globals()['__builtins__']['eval']([])\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    globals()['__builtins__'].update({'eval': len})\n"
+            b"    return globals()['__builtins__']['eval']([])\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    g = globals\n"
+            b"    g()['__builtins__'].__setitem__('eval', len)\n"
+            b"    return g()['__builtins__']['eval']([])\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    globals().get('__builtins__').__setitem__('eval', len)\n"
+            b"    return globals()['__builtins__']['eval']([])\n"
+        ),
+        (
             b"import builtins\n"
             b"def handle(data, context):\n"
             b"    builtins.get = lambda name: len\n"
@@ -388,14 +409,53 @@ def test_scan_allows_benign_builtin_shaped_handler_source(tmp_path: Path, handle
     assert _failed_checks(result, "TorchServe Handler Static Analysis") == []
 
 
-def test_scan_detects_dangerous_builtin_reassignment_in_handler_source(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "handler_source",
+    [
+        (
+            b"def handle(data, context):\n"
+            b"    namespace = globals()\n"
+            b"    namespace['__builtins__']['eval'] = __builtins__['exec']\n"
+            b"    return namespace['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    globals()['__builtins__'].__setitem__('eval', __builtins__['exec'])\n"
+            b"    return globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    globals()['__builtins__'].update({'eval': __builtins__['exec']})\n"
+            b"    return globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    globals()['__builtins__'].__setitem__('eval', len)\n"
+            b"    globals()['__builtins__'].update(eval=__builtins__['exec'])\n"
+            b"    return globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    globals()['__builtins__'].__setitem__('eval', len)\n"
+            b"    globals()['__builtins__'].update({'eval': __builtins__['exec'], **{}})\n"
+            b"    return globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    globals()['__builtins__'].__setitem__('eval', len)\n"
+            b"    globals()['__builtins__'].update([('eval', __builtins__['exec'])])\n"
+            b"    return globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    globals()['__builtins__'].__setitem__('eval', len)\n"
+            b"    _ = globals()['__builtins__'].__setitem__('eval', __builtins__['exec'])\n"
+            b"    return globals()['__builtins__']['eval']('pass')\n"
+        ),
+    ],
+)
+def test_scan_detects_dangerous_builtin_reassignment_in_handler_source(tmp_path: Path, handler_source: bytes) -> None:
     manifest = {"model": {"handler": "handler.py", "serializedFile": "weights.bin"}}
-    handler_source = (
-        b"def handle(data, context):\n"
-        b"    namespace = globals()\n"
-        b"    namespace['__builtins__']['eval'] = __builtins__['exec']\n"
-        b"    return namespace['__builtins__']['eval']('pass')\n"
-    )
     mar_path = _create_mar_archive(
         tmp_path,
         manifest=manifest,
