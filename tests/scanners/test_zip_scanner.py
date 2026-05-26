@@ -1445,6 +1445,28 @@ def test_scan_nested_file_polyglot_manifest_honors_excluded_jinja_selection(tmp_
     assert not any(check.name == "Jinja2 Template Injection Detection" for check in result.checks)
 
 
+def test_zip_scan_preserves_skipped_scanner_ids_from_multiple_members(tmp_path: Path) -> None:
+    archive_path = tmp_path / "model.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(
+            "overlap.json",
+            '{"version":[1,7,4],"learner":{"gradient_booster":{}},'
+            '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        )
+        archive.writestr(
+            "config.json",
+            '{"chat_template":"{{ user }}","nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        )
+
+    result = ZipScanner({"scanners": ["zip", "mxnet", "manifest"], "cache_enabled": False}).scan(str(archive_path))
+
+    assert set(result.metadata["skipped_scanner_ids"]) >= {"xgboost", "jinja2_template"}
+    selection_ids = {
+        check.details.get("skipped_scanner_id") for check in result.checks if check.name == "Scanner Selection"
+    }
+    assert selection_ids >= {"xgboost", "jinja2_template"}
+
+
 def test_scan_nested_file_xgboost_manifest_preserves_jinja_analysis(tmp_path: Path) -> None:
     extracted_member = tmp_path / "config.json"
     extracted_member.write_text(
