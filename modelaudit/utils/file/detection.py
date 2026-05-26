@@ -432,6 +432,7 @@ def _detect_mxnet_symbol_prefix_route(
     *,
     sample_is_prefix: bool = True,
     fail_closed_without_hint: bool = False,
+    enforce_value_budget: bool = True,
 ) -> str | None:
     """Return a definite or bounded-inconclusive MXNet JSON route."""
 
@@ -439,6 +440,9 @@ def _detect_mxnet_symbol_prefix_route(
         pass
 
     class BoundedJSON(Exception):
+        pass
+
+    class ValueBudgetExceeded(Exception):
         pass
 
     class InvalidJSON(Exception):
@@ -514,8 +518,8 @@ def _detect_mxnet_symbol_prefix_route(
     def parse_value(offset: int, depth: int, *, root_array_key: str | None = None) -> int:
         nonlocal parsed_values, saw_mxnet_heads_shape
         parsed_values += 1
-        if parsed_values > _MXNET_SYMBOL_PREFIX_MAX_VALUES:
-            raise BoundedJSON
+        if enforce_value_budget and parsed_values > _MXNET_SYMBOL_PREFIX_MAX_VALUES:
+            raise ValueBudgetExceeded
         offset = skip_whitespace(offset)
         if offset >= len(prefix):
             raise IncompleteJSON
@@ -634,21 +638,29 @@ def _detect_mxnet_symbol_prefix_route(
         return (
             MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT if saw_mxnet_routing_hint() or fail_closed_without_hint else None
         )
-    except BoundedJSON:
+    except ValueBudgetExceeded:
         if {"nodes", "arg_nodes", "heads"} <= root_array_keys and saw_direct_node_contract:
             return "mxnet"
         if not sample_is_prefix and not fail_closed_without_hint:
-            # Complete JSON is already byte-capped; resolve contracts hidden
-            # behind cheap-probe padding without failing ordinary complete JSON closed.
-            try:
-                complete_payload = json.loads(prefix)
-            except (json.JSONDecodeError, RecursionError, UnicodeDecodeError, ValueError):
-                return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT if saw_mxnet_routing_hint() else None
-            if inspect_mxnet_symbol_root_keys(BytesIO(prefix)):
+            # Resolve a graph hidden behind scalar padding with parser state only;
+            # the byte and nesting limits still bound this second traversal.
+            rescanned_route = _detect_mxnet_symbol_prefix_route(
+                prefix,
+                sample_is_prefix=False,
+                fail_closed_without_hint=False,
+                enforce_value_budget=False,
+            )
+            if rescanned_route == "mxnet" and inspect_mxnet_symbol_root_keys(BytesIO(prefix)):
                 return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
-            if has_mxnet_symbol_graph_structure(complete_payload):
-                return "mxnet"
-            return None
+            return rescanned_route
+        return (
+            MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT if saw_mxnet_routing_hint() or fail_closed_without_hint else None
+        )
+    except BoundedJSON:
+        if {"nodes", "arg_nodes", "heads"} <= root_array_keys and saw_direct_node_contract:
+            return "mxnet"
+        if not sample_is_prefix:
+            return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
         return (
             MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT if saw_mxnet_routing_hint() or fail_closed_without_hint else None
         )
@@ -739,6 +751,12 @@ def _detect_content_routed_mxnet_symbol(file_path: Path, prefix: bytes) -> str |
     from ...scanners.xgboost_scanner import XGBoostScanner
 
     if XGBoostScanner._is_xgboost_json(str(file_path), max_bytes=MXNET_SYMBOL_SIGNATURE_READ_BYTES):
+        return "xgboost"
+    if (
+        mxnet_route == "mxnet"
+        and file_path.suffix.lower() == ".json"
+        and XGBoostScanner._is_probable_xgboost_json_candidate(str(file_path))
+    ):
         return "xgboost"
     return mxnet_route
 

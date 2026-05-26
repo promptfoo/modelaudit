@@ -2447,6 +2447,51 @@ def test_scan_file_runs_xgboost_checks_for_conclusive_mxnet_json_overlap(tmp_pat
     assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
 
 
+def test_scan_file_runs_xgboost_checks_for_probable_malformed_mxnet_json_overlap(tmp_path: Path) -> None:
+    model_path = tmp_path / "malformed-polyglot.json"
+    model_path.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(model_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "xgboost"
+    assert result.success is False
+    assert "xgboost_mxnet_symbol_overlap" in result.metadata["scan_outcome_reasons"]
+    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
+
+
+def test_scan_file_keeps_benign_mxnet_json_near_match_out_of_xgboost_routing(tmp_path: Path) -> None:
+    model_path = tmp_path / "benign-symbol.json"
+    model_path.write_text(
+        '{"learner":{"description":"benign metadata"},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(model_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert not any(check.name == "JSON Content Analysis" for check in result.checks)
+
+
+def test_scan_file_canonical_mxnet_symbol_composes_probable_xgboost_security_analysis(tmp_path: Path) -> None:
+    model_path = tmp_path / "malformed-symbol.json"
+    model_path.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(model_path), config={"cache_enabled": False})
+
+    assert result.scanner_name == "mxnet"
+    assert result.success is False
+    assert any("Suspicious pattern detected: System call in JSON" in issue.message for issue in result.issues)
+
+
 def test_scan_file_fails_closed_for_xgboost_shadowed_mxnet_nodes(tmp_path: Path) -> None:
     model_path = tmp_path / "polyglot.json"
     model_path.write_text(

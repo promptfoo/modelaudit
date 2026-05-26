@@ -472,7 +472,10 @@ def test_detect_small_renamed_mxnet_value_budget_before_structure_fails_closed(t
     assert detect_file_format_for_skip_filter(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
 
 
-def test_detect_generic_json_value_budget_before_mxnet_structure_routes_mxnet(tmp_path: Path) -> None:
+def test_detect_generic_json_value_budget_before_mxnet_structure_routes_mxnet_without_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     model_path = tmp_path / "model.json"
     model_path.write_text(
         '{"padding":['
@@ -481,6 +484,11 @@ def test_detect_generic_json_value_budget_before_mxnet_structure_routes_mxnet(tm
         '"arg_nodes":[0],"heads":[[0,0,0]]}',
         encoding="utf-8",
     )
+
+    def reject_materialization(_payload: object) -> object:
+        raise AssertionError("format detection must not decode a padded generic JSON object")
+
+    monkeypatch.setattr(file_detection.json, "loads", reject_materialization)
 
     assert model_path.stat().st_size < MXNET_SYMBOL_SIGNATURE_READ_BYTES
     assert detect_file_format(str(model_path)) == "mxnet"
@@ -831,9 +839,8 @@ def test_detect_generic_mxnet_hint_decoder_recursion_fails_closed(
     assert detect_file_format_from_magic(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
 
 
-def test_detect_generic_decoder_recursion_without_mxnet_hint_remains_unclaimed(
+def test_detect_generic_depth_budget_without_mxnet_hint_fails_closed(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model_path = tmp_path / "recursive-config.json"
     model_path.write_text(
@@ -841,13 +848,8 @@ def test_detect_generic_decoder_recursion_without_mxnet_hint_remains_unclaimed(
         encoding="utf-8",
     )
 
-    def raise_recursion(_payload: object) -> object:
-        raise RecursionError("decoder nesting limit")
-
-    monkeypatch.setattr(file_detection.json, "loads", raise_recursion)
-
-    assert detect_file_format(str(model_path)) == "unknown"
-    assert detect_file_format_from_magic(str(model_path)) == "unknown"
+    assert detect_file_format(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
 
 
 def test_detect_generic_json_value_budget_without_mxnet_hint_remains_unclaimed(tmp_path: Path) -> None:
