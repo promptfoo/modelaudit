@@ -13,6 +13,7 @@ from contextlib import suppress
 from typing import Any, ClassVar
 
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
+from ..scanner_results import mark_inconclusive_scan_result
 from ..scanner_selection import add_scanner_selection_skip_check, embedded_pickle_scanner
 from ..utils.file.detection import read_magic_bytes
 from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
@@ -500,6 +501,25 @@ class JoblibScanner(BaseScanner):
                     result.finish(success=False)
                     return result
                 self._scan_pickle_payload(decompressed, result, f"{path} (decompressed)")
+        except OSError as e:
+            mark_inconclusive_scan_result(result, "joblib_read_failed")
+            result.add_check(
+                name="Joblib File Read",
+                passed=False,
+                message=f"Unable to read joblib file for analysis: {e!s}",
+                severity=IssueSeverity.INFO,
+                location=path,
+                details={
+                    "exception": str(e),
+                    "exception_type": type(e).__name__,
+                    "analysis_incomplete": True,
+                    "scan_outcome_reason": "joblib_read_failed",
+                },
+                rule_code="S902",
+            )
+            self._record_joblib_operational_error(result, "joblib_read_failed")
+            result.finish(success=False)
+            return result
         except Exception as e:  # pragma: no cover
             result.add_check(
                 name="Joblib File Scan",
