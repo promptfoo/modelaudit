@@ -11,6 +11,8 @@ import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core_results import merge_scan_result
+from modelaudit.models import create_initial_audit_result
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
     ALWAYS_DANGEROUS_FUNCTIONS,
@@ -1235,6 +1237,33 @@ def test_scan_stream_fails_closed_when_supplemental_raw_analysis_cannot_read() -
         for issue in result.issues
     )
     assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_scan_stream_marks_supplemental_read_failure_operational_with_security_finding() -> None:
+    payload = pickle.dumps(MaliciousPayload(), protocol=4)
+
+    result = PickleScanner().scan_stream(
+        BrokenSupplementalReadStream(payload),
+        len(payload),
+        source="partial-malicious-stream.pkl",
+    )
+    result.metadata["file_path"] = "partial-malicious-stream.pkl"
+    aggregate_result = create_initial_audit_result()
+    merge_scan_result(aggregate_result, result)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["stream_raw_read_failed"]
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "stream_raw_read_failed"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any(
+        issue.details.get("category") == "stream_raw_read_failed"
+        and issue.details.get("operational_error") is True
+        and issue.severity == IssueSeverity.INFO
+        for issue in result.issues
+    )
+    assert determine_exit_code(aggregate_result) == 2
 
 
 def test_scan_stream_marks_non_seekable_read_failure_inconclusive_without_security_finding() -> None:

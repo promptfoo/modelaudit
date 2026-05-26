@@ -1432,7 +1432,7 @@ class PickleScanner(BaseScanner):
 
     def _record_stream_coverage_failure(self, result: ScanResult, source: str, error: Exception) -> None:
         reason = "stream_raw_read_failed"
-        mark_inconclusive_scan_result(result, reason)
+        self._mark_operational_incomplete(result, reason)
         result.add_check(
             name="Pickle Stream Supplemental Analysis",
             passed=False,
@@ -1443,6 +1443,7 @@ class PickleScanner(BaseScanner):
                 "category": reason,
                 "exception": str(error),
                 "exception_type": type(error).__name__,
+                "operational_error": True,
                 "analysis_incomplete": True,
                 "scan_outcome_reason": reason,
             },
