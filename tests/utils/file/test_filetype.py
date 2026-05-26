@@ -574,6 +574,22 @@ def test_detect_small_malformed_renamed_mxnet_after_structure_preserves_establis
     assert detect_file_format_from_magic(str(model_path)) == "mxnet"
 
 
+@pytest.mark.parametrize("suffix", ["@}", ""])
+def test_detect_small_malformed_renamed_mxnet_before_heads_value_fails_closed(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    model_path = tmp_path / "malformed.jpg"
+    model_path.write_text(
+        '{"nodes":[{"op":"Custom","name":"load"}],"arg_nodes":[0],"heads":' + suffix,
+        encoding="utf-8",
+    )
+
+    assert detect_file_format(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
+
+
 def test_detect_renamed_mxnet_with_many_escaped_string_characters(tmp_path: Path) -> None:
     model_path = tmp_path / "escaped-padding.jpg"
     model_path.write_text(

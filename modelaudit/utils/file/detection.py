@@ -633,11 +633,11 @@ def _detect_mxnet_symbol_prefix_route(
     except IncompleteJSON:
         if {"nodes", "arg_nodes", "heads"} <= root_array_keys and saw_direct_node_contract:
             return "mxnet"
+        if saw_mxnet_routing_hint():
+            return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
         if not sample_is_prefix:
             return None
-        return (
-            MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT if saw_mxnet_routing_hint() or fail_closed_without_hint else None
-        )
+        return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT if fail_closed_without_hint else None
     except ValueBudgetExceeded:
         if {"nodes", "arg_nodes", "heads"} <= root_array_keys and saw_direct_node_contract:
             return "mxnet"
@@ -667,6 +667,8 @@ def _detect_mxnet_symbol_prefix_route(
     except InvalidJSON:
         if {"nodes", "arg_nodes", "heads"} <= root_array_keys and saw_direct_node_contract:
             return "mxnet"
+        if saw_mxnet_routing_hint():
+            return MXNET_SYMBOL_ROUTING_INCONCLUSIVE_FORMAT
         return None
 
     if {"nodes", "arg_nodes", "heads"} <= root_array_keys and saw_direct_node_contract:

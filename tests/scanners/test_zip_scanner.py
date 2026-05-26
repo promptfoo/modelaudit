@@ -1041,6 +1041,26 @@ def test_scan_nested_file_syntactically_malformed_renamed_mxnet_xgboost_overlap_
     assert "xgboost_json_parse_failed" in result.metadata["scan_outcome_reasons"]
 
 
+@pytest.mark.parametrize("suffix", ["@}", ""])
+def test_scan_nested_file_partial_malformed_renamed_mxnet_xgboost_overlap_fails_closed(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    extracted_member = tmp_path / "malformed.jpg"
+    extracted_member.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":' + suffix,
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+
+
 def test_scan_nested_file_xgboost_only_runs_renamed_probable_malformed_mxnet_overlap(tmp_path: Path) -> None:
     extracted_member = tmp_path / "malformed-0000.params"
     extracted_member.write_text(

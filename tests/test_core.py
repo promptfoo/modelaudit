@@ -2521,6 +2521,29 @@ def test_scan_file_syntactically_malformed_renamed_mxnet_xgboost_overlap_fails_c
     assert core_module.determine_exit_code(aggregate) != 0
 
 
+@pytest.mark.parametrize("suffix", ["@}", ""])
+def test_scan_file_partial_malformed_renamed_mxnet_xgboost_overlap_fails_closed(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    model_path = tmp_path / "malformed.jpg"
+    model_path.write_text(
+        '{"version":"malformed","learner":{"gradient_booster":{},"malicious_code":"os.system()"},'
+        '"nodes":[{"op":"Custom","name":"load","attrs":{"library":"../../tmp/libevil.so"}}],'
+        '"arg_nodes":[0],"heads":' + suffix,
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(model_path), config={"cache_enabled": False})
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert aggregate.success is False
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
 def test_scan_file_xgboost_only_runs_renamed_probable_malformed_mxnet_overlap(tmp_path: Path) -> None:
     model_path = tmp_path / "malformed-0000.params"
     model_path.write_text(
