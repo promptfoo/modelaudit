@@ -1042,6 +1042,12 @@ def test_pytorch_zip_scans_unmarked_python_blobs_in_archive_data(tmp_path: Path)
         b"__builtins__.__dict__.get('eval')('1 + 1')\n",
         b"import builtins as bi\nbi.eval('1 + 1')\n",
         b"from builtins import eval as run\nrun('1 + 1')\n",
+        b"globals()['__builtins__']['ev' + 'al']('1 + 1')\n",
+        b"globals().get('__builtins__').get('eval')('1 + 1')\n",
+        b"getattr(globals()['__builtins__'], 'eval')('1 + 1')\n",
+        b"globals()['__builtins__'].eval('1 + 1')\n",
+        b"builtins_ref = globals()['__builtins__']\ngetattr(builtins_ref, 'eval')('1 + 1')\n",
+        b"global_namespace = globals()\nglobal_namespace['__builtins__']['eval']('1 + 1')\n",
     ],
 )
 def test_pytorch_zip_scans_static_builtin_indirection_in_archive_data(tmp_path: Path, payload: bytes) -> None:
@@ -1103,6 +1109,9 @@ def test_pytorch_zip_scans_aliased_modeled_builtins_in_archive_data(
     [
         b"callbacks = {'eval': len}\ncallbacks['eval']([])\n",
         b"import builtins as bi\nbi.len([1])\n",
+        b"globals()['__builtins__']['len']([1])\n",
+        b"globals = lambda: {'__builtins__': {'eval': len}}\nglobals()['__builtins__']['eval']([])\n",
+        b"global_namespace = {'__builtins__': {'eval': len}}\nglobal_namespace['__builtins__']['eval']([])\n",
     ],
 )
 def test_pytorch_zip_ignores_benign_builtin_shaped_access_in_archive_data(tmp_path: Path, payload: bytes) -> None:

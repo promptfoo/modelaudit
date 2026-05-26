@@ -294,7 +294,11 @@ def test_detect_file_format_routes_renamed_coreml_structure_and_rejects_near_mat
 
 @pytest.mark.parametrize(
     ("format_name", "payload"),
-    [("cntk", _build_cntkv2_bytes()), ("lightgbm", _build_lightgbm_text())],
+    [
+        ("cntk", _build_cntkv2_bytes()),
+        ("lightgbm", _build_lightgbm_text()),
+        ("rknn", b"RKNN\x01\x00\x00\x00runtime=rockchip\n"),
+    ],
 )
 def test_detect_file_format_routes_renamed_strict_signature_formats(
     tmp_path: Path,
@@ -311,7 +315,11 @@ def test_detect_file_format_routes_renamed_strict_signature_formats(
 
 @pytest.mark.parametrize(
     "payload",
-    [_build_cntkv2_bytes(include_structure=False), _build_lightgbm_text(include_tree_details=False)],
+    [
+        _build_cntkv2_bytes(include_structure=False),
+        _build_lightgbm_text(include_tree_details=False),
+        b"RKNX\x01\x00\x00\x00runtime=rockchip\n",
+    ],
 )
 def test_detect_file_format_rejects_renamed_signature_near_matches(tmp_path: Path, payload: bytes) -> None:
     model_path = tmp_path / "near-match.jpg"
@@ -977,6 +985,19 @@ def test_detect_file_format_tar(tmp_path):
     with tarfile.open(tar_path, "w") as tar:
         info = tarfile.TarInfo(name="test.txt")
         tar.addfile(info, io.BytesIO(b"content"))
+
+    assert detect_file_format_from_magic(str(tar_path)) == "tar"
+    assert detect_file_format(str(tar_path)) == "tar"
+
+
+def test_detect_file_format_tar_member_name_with_rknn_prefix(tmp_path: Path) -> None:
+    """TAR headers should win over model magic-looking member name prefixes."""
+    tar_path = tmp_path / "rknn_named_member.bin"
+    with tarfile.open(tar_path, "w") as archive:
+        payload = b"not a model"
+        info = tarfile.TarInfo("RKNN_payload.pkl")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
 
     assert detect_file_format_from_magic(str(tar_path)) == "tar"
     assert detect_file_format(str(tar_path)) == "tar"

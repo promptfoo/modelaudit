@@ -2017,9 +2017,14 @@ def detect_file_format(path: str) -> str:
     if magic8 == hdf5_magic:
         return "hdf5"
 
+    if _looks_like_uncompressed_tar_header(header):
+        return "tar"
+
     # Check for GGUF/GGML magic bytes
     if magic4 == b"CBM1":
         return "catboost"
+    if magic4 == b"RKNN":
+        return "rknn"
     if magic4 == b"GGUF":
         return "gguf"
     if magic4 in GGML_MAGIC_VARIANTS:
@@ -2044,8 +2049,6 @@ def detect_file_format(path: str) -> str:
         return "sevenzip"
     if _has_rar_magic(magic8):
         return "rar"
-    if _looks_like_uncompressed_tar_header(header):
-        return "tar"
     if compression_format:
         if _is_tar_archive(path):
             return "tar"

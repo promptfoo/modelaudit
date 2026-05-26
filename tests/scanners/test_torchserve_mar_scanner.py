@@ -240,6 +240,20 @@ def test_scan_detects_keyword_getattr_wrapped_handler_execution_primitive(
         b"def handle(data, context):\n    return __builtins__['ev' + 'al']('1 + 1')\n",
         b"def handle(data, context):\n    return getattr(__builtins__, 'eval')('1 + 1')\n",
         b"def handle(data, context):\n    return __builtins__.__dict__.get('eval')('1 + 1')\n",
+        b"def handle(data, context):\n    return globals()['__builtins__']['ev' + 'al']('1 + 1')\n",
+        b"def handle(data, context):\n    return globals().get('__builtins__').get('eval')('1 + 1')\n",
+        b"def handle(data, context):\n    return getattr(globals()['__builtins__'], 'eval')('1 + 1')\n",
+        b"def handle(data, context):\n    return globals()['__builtins__'].eval('1 + 1')\n",
+        (
+            b"def handle(data, context):\n"
+            b"    builtins_ref = globals()['__builtins__']\n"
+            b"    return getattr(builtins_ref, 'eval')('1 + 1')\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    global_namespace = globals()\n"
+            b"    return global_namespace['__builtins__']['eval']('1 + 1')\n"
+        ),
     ],
 )
 def test_scan_detects_implicit_builtins_handler_execution_primitive(
@@ -267,6 +281,17 @@ def test_scan_detects_implicit_builtins_handler_execution_primitive(
     [
         b"def handle(data, context):\n    callbacks = {'eval': len}\n    return callbacks['eval']([])\n",
         b"import builtins as bi\ndef handle(data, context):\n    return bi.open('labels.json', 'r')\n",
+        b"def handle(data, context):\n    return globals()['__builtins__']['len']([1])\n",
+        (
+            b"def handle(data, context):\n"
+            b"    globals = lambda: {'__builtins__': {'eval': len}}\n"
+            b"    return globals()['__builtins__']['eval']([])\n"
+        ),
+        (
+            b"def handle(data, context):\n"
+            b"    global_namespace = {'__builtins__': {'eval': len}}\n"
+            b"    return global_namespace['__builtins__']['eval']([])\n"
+        ),
     ],
 )
 def test_scan_allows_benign_builtin_shaped_handler_source(tmp_path: Path, handler_source: bytes) -> None:

