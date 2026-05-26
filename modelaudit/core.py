@@ -396,6 +396,7 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
 
     from modelaudit.scanners.jinja2_template_scanner import Jinja2TemplateScanner
     from modelaudit.scanners.manifest_scanner import ManifestScanner
+    from modelaudit.scanners.mxnet_scanner import MXNetScanner
 
     scanner_selection = policy_from_config(config)
 
@@ -404,6 +405,9 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
         result.merge(owner_result)
         for reason in existing_reasons:
             _mark_inconclusive_scan_outcome(result, reason)
+
+    if scanner_selection.allows("mxnet"):
+        MXNetScanner(config=config).scan_params_file_security(path, result)
 
     manifest_covered_templates = False
     if ManifestScanner.can_handle(path):

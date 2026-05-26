@@ -317,6 +317,7 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
 
     from .jinja2_template_scanner import Jinja2TemplateScanner
     from .manifest_scanner import ManifestScanner
+    from .mxnet_scanner import MXNetScanner
 
     scanner_selection = policy_from_config(config)
 
@@ -325,6 +326,9 @@ def _make_incomplete_mxnet_symbol_routing_result(path: str, config: dict[str, An
         result.merge(owner_result)
         for reason in existing_reasons:
             mark_inconclusive_scan_result(result, reason)
+
+    if scanner_selection.allows("mxnet"):
+        MXNetScanner(config=config).scan_params_file_security(path, result)
 
     manifest_covered_templates = False
     if ManifestScanner.can_handle(path):

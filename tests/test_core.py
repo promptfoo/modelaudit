@@ -2539,6 +2539,46 @@ def test_scan_file_xgboost_only_overlap_is_clean_and_cached(tmp_path: Path) -> N
         reset_cache_manager()
 
 
+def test_scan_file_inconclusive_params_routing_preserves_raw_findings(tmp_path: Path) -> None:
+    params_path = tmp_path / "payload-0000.params"
+    params_path.write_text(
+        '{"metadata":"\u007fELF os.system()","padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(params_path), config={"scanners": ["mxnet"], "cache_enabled": False})
+    aggregate = scan_model_directory_or_file(
+        str(params_path),
+        scanners=["mxnet"],
+        cache_scan_results=False,
+    )
+
+    assert result.scanner_name == "unknown"
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+    assert any("Suspicious executable token" in issue.message for issue in result.issues)
+    assert any("Potential executable signature found in params blob" in issue.message for issue in aggregate.issues)
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_inconclusive_params_routing_honors_excluded_mxnet(tmp_path: Path) -> None:
+    params_path = tmp_path / "payload-0000.params"
+    params_path.write_text(
+        '{"metadata":"\u007fELF os.system()","padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(params_path), config={"scanners": ["xgboost"], "cache_enabled": False})
+
+    assert "mxnet_symbol_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert not any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+    assert not any("Suspicious executable token" in issue.message for issue in result.issues)
+
+
 def test_scan_file_xgboost_mxnet_overlap_with_security_finding_is_exit1(tmp_path: Path) -> None:
     model_path = tmp_path / "malicious-polyglot.json"
     model_path.write_text(

@@ -1538,6 +1538,39 @@ def test_scan_nested_file_small_renamed_mxnet_value_budget_before_structure_fail
     assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
 
 
+def test_scan_nested_file_inconclusive_params_routing_preserves_raw_findings(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "payload-0000.params"
+    extracted_member.write_text(
+        '{"metadata":"\u007fELF os.system()","padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["mxnet"], "cache_enabled": False})
+
+    assert result.scanner_name == "unknown"
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+    assert any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+    assert any("Suspicious executable token" in issue.message for issue in result.issues)
+
+
+def test_scan_nested_file_inconclusive_params_routing_honors_excluded_mxnet(tmp_path: Path) -> None:
+    extracted_member = tmp_path / "payload-0000.params"
+    extracted_member.write_text(
+        '{"metadata":"\u007fELF os.system()","padding":['
+        + ",".join("0" for _ in range(5000))
+        + '],"nodes":[{"op":"null","name":"data"}],"arg_nodes":[0],"heads":[[0,0,0]]}',
+        encoding="utf-8",
+    )
+
+    result = scan_nested_file(str(extracted_member), {"scanners": ["xgboost"], "cache_enabled": False})
+
+    assert result.metadata["operational_error_reason"] == "mxnet_symbol_routing_incomplete"
+    assert not any("Potential executable signature found in params blob" in issue.message for issue in result.issues)
+    assert not any("Suspicious executable token" in issue.message for issue in result.issues)
+
+
 def test_scan_nested_file_generic_json_value_budget_before_mxnet_structure_detects_library(tmp_path: Path) -> None:
     extracted_member = tmp_path / "model.json"
     extracted_member.write_text(
