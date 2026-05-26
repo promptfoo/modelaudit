@@ -9,7 +9,7 @@ from io import BytesIO
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
-from ...scanner_registry_metadata import get_extension_format_map
+from ...scanner_registry_metadata import get_extension_format_map, get_registered_scanner_extensions
 from ..helpers.types import FileExtension, FileFormat, FilePath, MagicBytes
 from ._compression import is_zlib_header
 
@@ -143,10 +143,18 @@ _XML_MODEL_ROOT_FORMATS = {
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
 FLAX_MSGPACK_STRUCTURE_READ_BYTES = 1024 * 1024
 _FLAX_MSGPACK_ROUTING_KEYS = frozenset({"params", "opt_state", "model_state"})
-_FLAX_MSGPACK_NATIVE_SUFFIXES = frozenset({".msgpack", ".flax", ".orbax", ".jax"})
+_FLAX_MSGPACK_STATE_WRAPPER_KEY = "state"
+_FLAX_MSGPACK_SCANNER_SUFFIXES = frozenset({".msgpack", ".flax", ".orbax", ".jax"})
+_FLAX_MSGPACK_OVERLAP_SUFFIXES = frozenset({".ckpt", ".checkpoint", ".orbax-checkpoint"})
+_FLAX_MSGPACK_CONTENT_ROUTE_EXCLUDED_SUFFIXES = frozenset({".py", ".pyw"})
+_FLAX_MSGPACK_DECLARED_SUFFIXES = frozenset(get_registered_scanner_extensions())
+_FLAX_MSGPACK_NATIVE_SUFFIXES = _FLAX_MSGPACK_SCANNER_SUFFIXES
 _FLAX_MSGPACK_PROBE_MAX_NODES = 4096
 _FLAX_MSGPACK_PROBE_MAX_DEPTH = 32
 _FLAX_MSGPACK_PROBE_MAX_KEY_BYTES = 64
+# Keep cheap top-level padding bounded without treating ordinary 1 MiB data
+# as an incomplete nested structure walk.
+_FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS = FLAX_MSGPACK_STRUCTURE_READ_BYTES
 _FLAX_MSGPACK_PROBE_SCALAR_SIZES = {
     0xCA: 4,
     0xCB: 8,
@@ -1969,19 +1977,6 @@ def _detect_compression_format(prefix: bytes) -> str | None:
     return None
 
 
-def _msgpack_map_key_offset(prefix: bytes) -> int | None:
-    """Return the first-key offset for a MessagePack map, if its header is complete."""
-    if not prefix:
-        return None
-    if 0x80 <= prefix[0] <= 0x8F:
-        return 1
-    if prefix[0] == 0xDE and len(prefix) >= 3:
-        return 3
-    if prefix[0] == 0xDF and len(prefix) >= 5:
-        return 5
-    return None
-
-
 class _MsgpackProbeInvalid(ValueError):
     """Raised when bounded MessagePack structure probing sees invalid data."""
 
@@ -2068,9 +2063,12 @@ def _skip_msgpack_probe_value_after_marker(
         _skip_msgpack_probe_value(stream, file_size, remaining_nodes, depth + 1)
 
 
-def _read_msgpack_probe_map_count(stream: BinaryIO, remaining_nodes: list[int]) -> int | None:
-    marker = _read_msgpack_probe_bytes(stream, 1)[0]
-    _consume_msgpack_probe_node(remaining_nodes)
+def _is_inline_msgpack_probe_scalar(marker: int) -> bool:
+    """Return whether a marker is a complete single-byte scalar value."""
+    return marker <= 0x7F or marker >= 0xE0 or marker in {0xC0, 0xC2, 0xC3}
+
+
+def _read_msgpack_probe_map_count_after_marker(stream: BinaryIO, marker: int) -> int | None:
     if 0x80 <= marker <= 0x8F:
         return marker & 0x0F
     if marker == 0xDE:
@@ -2108,44 +2106,79 @@ def _read_msgpack_probe_key(
         return None
 
 
+def _has_bounded_flax_msgpack_state_root(
+    stream: BinaryIO,
+    file_size: int,
+    remaining_nodes: list[int],
+    recognized_checkpoint_root: list[bool],
+) -> bool:
+    """Recognize a standard state wrapper without accepting generic state maps."""
+    marker = _read_msgpack_probe_bytes(stream, 1)[0]
+    _consume_msgpack_probe_node(remaining_nodes)
+    map_count = _read_msgpack_probe_map_count_after_marker(stream, marker)
+    if map_count is None:
+        _skip_msgpack_probe_value_after_marker(stream, marker, file_size, remaining_nodes, 1)
+        return False
+
+    has_checkpoint_root = False
+    for _ in range(map_count):
+        if _read_msgpack_probe_key(stream, file_size, remaining_nodes) in _FLAX_MSGPACK_ROUTING_KEYS:
+            recognized_checkpoint_root[0] = True
+            _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 2)
+            has_checkpoint_root = True
+        else:
+            _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 2)
+    return has_checkpoint_root
+
+
 def _has_bounded_flax_msgpack_routing_key(path: Path, file_size: int) -> bool | None:
-    """Inspect large maps, returning None when safe routing cannot complete."""
+    """Inspect streamed maps, returning None when safe routing cannot complete."""
     remaining_nodes = [_FLAX_MSGPACK_PROBE_MAX_NODES]
+    inline_scalars_seen = 0
+    recognized_checkpoint_root = [False]
     try:
         with path.open("rb") as stream:
-            map_count = _read_msgpack_probe_map_count(stream, remaining_nodes)
-            if map_count is None:
-                return False
-            for _ in range(map_count):
-                if _read_msgpack_probe_key(stream, file_size, remaining_nodes) in _FLAX_MSGPACK_ROUTING_KEYS:
+            while stream.tell() < file_size:
+                marker = _read_msgpack_probe_bytes(stream, 1)[0]
+                map_count = _read_msgpack_probe_map_count_after_marker(stream, marker)
+                if map_count is None and _is_inline_msgpack_probe_scalar(marker):
+                    inline_scalars_seen += 1
+                    if inline_scalars_seen > _FLAX_MSGPACK_PROBE_MAX_INLINE_SCALARS:
+                        raise _MsgpackProbeLimit
+                    continue
+
+                _consume_msgpack_probe_node(remaining_nodes)
+                if map_count is None:
+                    _skip_msgpack_probe_value_after_marker(stream, marker, file_size, remaining_nodes, 0)
+                    continue
+                has_checkpoint_root = False
+                for _ in range(map_count):
+                    key = _read_msgpack_probe_key(stream, file_size, remaining_nodes)
+                    if key in _FLAX_MSGPACK_ROUTING_KEYS:
+                        recognized_checkpoint_root[0] = True
+                        _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
+                        has_checkpoint_root = True
+                    if key == _FLAX_MSGPACK_STATE_WRAPPER_KEY:
+                        if _has_bounded_flax_msgpack_state_root(
+                            stream,
+                            file_size,
+                            remaining_nodes,
+                            recognized_checkpoint_root,
+                        ):
+                            has_checkpoint_root = True
+                    elif key not in _FLAX_MSGPACK_ROUTING_KEYS:
+                        _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
+                if has_checkpoint_root:
                     return True
-                _skip_msgpack_probe_value(stream, file_size, remaining_nodes, 1)
     except _MsgpackProbeLimit:
-        # A valid map might expose checkpoint roots beyond the bounded walk.
-        return None
+        # Once a root is recognized, run the scanner so it can analyze sibling
+        # security fields even if routing validation exhausts its budget.
+        return True if recognized_checkpoint_root[0] else None
     except OSError:
         return None
     except _MsgpackProbeInvalid:
         return False
     return False
-
-
-def _has_flax_msgpack_checkpoint_structure(payload: object) -> bool:
-    """Return whether a decoded MessagePack map exposes checkpoint-state roots."""
-    if not isinstance(payload, dict):
-        return False
-
-    normalized_keys: set[str] = set()
-    for key in payload:
-        if isinstance(key, str):
-            normalized_keys.add(key)
-        elif isinstance(key, bytes):
-            try:
-                normalized_keys.add(key.decode("utf-8"))
-            except UnicodeDecodeError:
-                continue
-
-    return bool(normalized_keys & _FLAX_MSGPACK_ROUTING_KEYS)
 
 
 def _probe_flax_msgpack_checkpoint_file(file_path: Path) -> bool | None:
@@ -2156,29 +2189,15 @@ def _probe_flax_msgpack_checkpoint_file(file_path: Path) -> bool | None:
         file_size = file_path.stat().st_size
         if file_size < 2:
             return False
-        if file_size > FLAX_MSGPACK_STRUCTURE_READ_BYTES:
-            return _has_bounded_flax_msgpack_routing_key(file_path, file_size)
-        with file_path.open("rb") as f:
-            sample = f.read(FLAX_MSGPACK_STRUCTURE_READ_BYTES + 1)
     except OSError:
         return None
 
-    key_offset = _msgpack_map_key_offset(sample)
-    if key_offset is None:
-        return False
-
-    try:
-        import msgpack
-
-        payload = msgpack.unpackb(sample, raw=False, strict_map_key=False)
-    except Exception:
-        return False
-    return _has_flax_msgpack_checkpoint_structure(payload)
+    return _has_bounded_flax_msgpack_routing_key(file_path, file_size)
 
 
 def is_flax_msgpack_checkpoint_file(path: str | Path) -> bool:
-    """Recognize plausible Flax/JAX MessagePack checkpoints with bounded reads."""
-    return _probe_flax_msgpack_checkpoint_file(Path(path)) is True
+    """Preserve recognized and inconclusive Flax candidates for scanning."""
+    return _probe_flax_msgpack_checkpoint_file(Path(path)) is not False
 
 
 def has_inconclusive_renamed_flax_msgpack_routing(path: str | Path) -> bool:
@@ -2189,13 +2208,84 @@ def has_inconclusive_renamed_flax_msgpack_routing(path: str | Path) -> bool:
     return _probe_flax_msgpack_checkpoint_file(file_path) is None
 
 
-def _could_be_renamed_flax_msgpack(file_path: Path, prefix: bytes) -> bool:
-    """Limit structure probing to files outside native checkpoint suffixes."""
+def _is_complete_structured_json_document(file_path: Path, file_size: int) -> bool:
+    """Keep complete renamed JSON documents within their structured routing path."""
+    read_size = min(file_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
+    prefix = read_magic_bytes(str(file_path), read_size)
+    normalized_prefix = prefix[len(_UTF8_BOM) :] if prefix.startswith(_UTF8_BOM) else prefix
+    try:
+        decoded_prefix = normalized_prefix.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+
+    stripped_prefix = decoded_prefix.lstrip()
+    if not stripped_prefix.startswith(("{", "[")):
+        return False
+    try:
+        _, end_offset = json.JSONDecoder().raw_decode(stripped_prefix)
+    except (json.JSONDecodeError, RecursionError, ValueError):
+        return False
+    if stripped_prefix[end_offset:].strip():
+        return False
+    if read_size == file_size:
+        return True
+
+    try:
+        with file_path.open("rb") as stream:
+            stream.seek(read_size)
+            while trailing_bytes := stream.read(_MXNET_SYMBOL_STREAM_CHUNK_BYTES):
+                if trailing_bytes.strip(b" \t\r\n"):
+                    return False
+    except OSError:
+        return False
+    return True
+
+
+def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
+    """Route declared Flax formats and renamed candidates without claiming overlaps."""
+    ext = file_path.suffix.lower()
+    if ext in _FLAX_MSGPACK_CONTENT_ROUTE_EXCLUDED_SUFFIXES:
+        return False
+    try:
+        size = file_path.stat().st_size
+    except OSError:
+        return False
+    if ext not in _FLAX_MSGPACK_SCANNER_SUFFIXES and _is_complete_structured_json_document(file_path, size):
+        return False
+    if ext == "":
+        xgboost_route = _detect_extensionless_xgboost_ubjson_route(
+            read_magic_bytes(str(file_path), min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
+        )
+        if xgboost_route is not None:
+            return False
     return (
-        file_path.suffix.lower() not in _FLAX_MSGPACK_NATIVE_SUFFIXES
-        and _msgpack_map_key_offset(prefix) is not None
-        and _probe_flax_msgpack_checkpoint_file(file_path) is not False
+        ext in _FLAX_MSGPACK_SCANNER_SUFFIXES
+        or ext in _FLAX_MSGPACK_OVERLAP_SUFFIXES
+        or ext not in _FLAX_MSGPACK_DECLARED_SUFFIXES
+    ) and is_flax_msgpack_checkpoint_file(file_path)
+
+
+def detect_flax_msgpack_overlap_routes(path: str) -> tuple[str, ...]:
+    """Return trusted foreign content routes that also occur in a Flax candidate."""
+    file_path = Path(path)
+    try:
+        if not file_path.is_file() or not is_flax_msgpack_checkpoint_file(file_path):
+            return ()
+        size = file_path.stat().st_size
+    except OSError:
+        return ()
+
+    prefix = read_magic_bytes(
+        path, min(size, max(_TORCH7_SIGNATURE_READ_BYTES, _CNTK_SIGNATURE_READ_BYTES, _LIGHTGBM_SIGNATURE_READ_BYTES))
     )
+    routes: list[str] = []
+    if _is_torch7_signature(prefix[:_TORCH7_SIGNATURE_READ_BYTES]):
+        routes.append("torch7")
+    if file_path.suffix.lower() != ".model" and _is_cntk_signature(prefix[:_CNTK_SIGNATURE_READ_BYTES]):
+        routes.append("cntk")
+    if _is_content_routed_lightgbm_signature(prefix[:_LIGHTGBM_SIGNATURE_READ_BYTES]):
+        routes.append("lightgbm")
+    return tuple(routes)
 
 
 def detect_format_from_magic_bytes(
@@ -2258,7 +2348,15 @@ def detect_format_from_magic_bytes(
     if b'"__metadata__"' in magic16 and _looks_like_safetensors_structure(file_path, magic8, file_size):
         return "safetensors"
 
-    if file_path is not None and _could_be_renamed_flax_msgpack(file_path, magic16):
+    if file_path is not None:
+        pickle_probe_sample = _read_pickle_probe_sample(file_path, file_size, magic16)
+        if _looks_like_proto0_or_1_pickle(
+            pickle_probe_sample,
+            sample_is_prefix=file_size > len(pickle_probe_sample),
+        ):
+            return "pickle"
+
+    if file_path is not None and _could_be_content_routed_flax_msgpack(file_path):
         return "flax_msgpack"
 
     return "unknown"
@@ -2648,6 +2746,9 @@ def detect_file_format(path: str) -> str:
     if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
 
+    if ext in _FLAX_MSGPACK_SCANNER_SUFFIXES or _could_be_content_routed_flax_msgpack(file_path):
+        return "flax_msgpack"
+
     torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
     if _allows_renamed_binary_content_route(file_path) and _is_torch7_signature(torch7_prefix):
         return "torch7"
@@ -2664,10 +2765,6 @@ def detect_file_format(path: str) -> str:
         )
         if xgboost_route is not None:
             return xgboost_route
-
-    if _could_be_renamed_flax_msgpack(file_path, header):
-        return "flax_msgpack"
-
     # For .bin files, do more sophisticated detection
     if ext == ".bin":
         magic64 = read_magic_bytes(path, 64)

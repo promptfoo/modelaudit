@@ -41,6 +41,7 @@ from modelaudit.scanners import _registry
 from modelaudit.scanners.archive_dispatch import (
     NESTED_SCAN_CALLBACK_CONFIG_KEY,
     merge_executable_zip_container_findings,
+    merge_flax_msgpack_overlap_findings,
 )
 from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, BaseScanner
 from modelaudit.scanners.mxnet_scanner import MXNET_PREFERRED_XGBOOST_SKIP_PATH_CONFIG_KEY
@@ -61,6 +62,7 @@ from modelaudit.utils.file.detection import (
     XML_MODEL_INCONCLUSIVE_FORMAT,
     detect_file_format,
     detect_file_format_from_magic,
+    detect_flax_msgpack_overlap_routes,
     detect_format_from_extension,
     detect_mxnet_symbol_content_route,
     detect_pytorch_binary_supplemental_format,
@@ -1719,6 +1721,19 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         detect_pytorch_binary_supplemental_format(path) if ext == ".bin" and header_format == "pytorch_binary" else None
     )
     skipped_preferred_scanner_id: str | None = None
+    trusted_flax_overlap_scanner_id: str | None = None
+    if scanner_id == "flax_msgpack" and not scanner_selection.allows(scanner_id):
+        skipped_preferred_scanner_id = scanner_id
+        trusted_flax_overlap_scanner_id = next(
+            (
+                overlap_scanner_id
+                for overlap_scanner_id in detect_flax_msgpack_overlap_routes(path)
+                if scanner_selection.allows(overlap_scanner_id)
+            ),
+            None,
+        )
+        if trusted_flax_overlap_scanner_id is not None:
+            scanner_id = trusted_flax_overlap_scanner_id
     if scanner_id and scanner_selection.allows(scanner_id):
         preferred_scanner = _registry.load_scanner_by_id(scanner_id)
     elif scanner_id:
@@ -1741,7 +1756,10 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
     if (
         preferred_scanner
         and scanner_id
-        and _preferred_scanner_can_handle(preferred_scanner, scanner_id, header_format, path)
+        and (
+            scanner_id == trusted_flax_overlap_scanner_id
+            or _preferred_scanner_can_handle(preferred_scanner, scanner_id, header_format, path)
+        )
     ):
         logger.debug(
             f"Using {preferred_scanner.name} scanner for {path} based on header",
@@ -1895,6 +1913,36 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     if is_xgboost_pickle_spoof:
         _mark_xgboost_pickle_extension_spoof(result, path, ext)
+
+    if (
+        skipped_preferred_scanner_id == "flax_msgpack"
+        and trusted_flax_overlap_scanner_id is not None
+        and result.scanner_name == trusted_flax_overlap_scanner_id
+    ):
+        add_scanner_selection_skip_check(
+            result,
+            path,
+            skipped_preferred_scanner_id,
+            scanner_selection,
+            context="preferred scanner",
+            kind=SCANNER_SELECTION_PREFERRED_KIND,
+        )
+
+    if result.scanner_name == "flax_msgpack":
+        merge_flax_msgpack_overlap_findings(
+            path,
+            result,
+            config,
+            context="Flax MessagePack overlapping content analysis",
+        )
+    elif skipped_preferred_scanner_id == "flax_msgpack":
+        merge_flax_msgpack_overlap_findings(
+            path,
+            result,
+            config,
+            context="Flax MessagePack overlapping content analysis",
+            scanned_scanner_ids=frozenset({result.scanner_name}),
+        )
 
     if ext == ".bin" and header_format == "pytorch_binary" and result.scanner_name == "pytorch_binary":
         _merge_pytorch_binary_supplemental_analysis(

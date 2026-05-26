@@ -143,6 +143,41 @@ def test_detect_msgpack_checkpoint_overlap_suffixes_as_flax_msgpack(tmp_path: Pa
     assert detect_file_format(str(checkpoint)) == "flax_msgpack"
 
 
+def test_detect_renamed_flax_state_wrapper_with_checkpoint_root_without_promoting_generic_state(tmp_path: Path) -> None:
+    msgpack = pytest.importorskip("msgpack")
+    disguised_checkpoint = tmp_path / "checkpoint.jpg"
+    generic_map = tmp_path / "metadata.jpg"
+    disguised_checkpoint.write_bytes(
+        msgpack.packb({"state": {"params": {"w": [1, 2, 3]}, "__reduce__": "os.system"}}, use_bin_type=True)
+    )
+    generic_map.write_bytes(msgpack.packb({"state": {"selected": True}, "__reduce__": "os.system"}, use_bin_type=True))
+
+    assert detect_file_format_from_magic(str(disguised_checkpoint)) == "flax_msgpack"
+    assert detect_file_format_for_skip_filter(str(disguised_checkpoint)) == "flax_msgpack"
+    assert detect_file_format(str(disguised_checkpoint)) == "flax_msgpack"
+    assert detect_file_format_from_magic(str(generic_map)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(generic_map)) == "unknown"
+    assert detect_file_format(str(generic_map)) == "unknown"
+
+
+def test_detect_python_source_member_does_not_route_as_renamed_flax_msgpack(tmp_path: Path) -> None:
+    source_near_match = tmp_path / "handler.py"
+    source_near_match.write_text("import os\nos.system('echo hidden')\n" + ("# pad\n" * 10_000), encoding="utf-8")
+
+    assert detect_file_format_from_magic(str(source_near_match)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(source_near_match)) == "unknown"
+    assert detect_file_format(str(source_near_match)) == "unknown"
+
+
+def test_detect_large_inline_scalar_stream_does_not_route_as_renamed_flax_msgpack(tmp_path: Path) -> None:
+    ordinary_data = tmp_path / "bulk-data.dat"
+    ordinary_data.write_bytes(b"A" * FLAX_MSGPACK_STRUCTURE_READ_BYTES)
+
+    assert detect_file_format_from_magic(str(ordinary_data)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(ordinary_data)) == "unknown"
+    assert detect_file_format(str(ordinary_data)) == "unknown"
+
+
 def test_detect_file_format_rejects_pk_prefix_near_match(tmp_path: Path) -> None:
     near_match = tmp_path / "not-a-zip.dat"
     near_match.write_bytes(b"PKNOPE harmless text")
