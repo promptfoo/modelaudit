@@ -691,6 +691,23 @@ _PYTHON_MEMBER_CHECK_NAME = "Python Archive Member Security"
 _EXECUTABLE_MEMBER_CHECK_NAME = "Executable Archive Member Detection"
 
 
+def _add_executable_archive_member_check(
+    *,
+    archive_kind: str,
+    archive_path: str,
+    member_name: str,
+    result: ScanResult,
+) -> None:
+    result.add_check(
+        name=_EXECUTABLE_MEMBER_CHECK_NAME,
+        passed=False,
+        message=f"Executable file found in {archive_kind} archive: {member_name}",
+        severity=IssueSeverity.WARNING,
+        location=f"{archive_path}:{member_name}",
+        details={"entry": member_name},
+    )
+
+
 def scan_archive_member_for_known_risks(
     *,
     archive_kind: str,
@@ -737,6 +754,15 @@ def scan_archive_member_for_known_risks(
             with open(tmp_path, "rb") as member_file:
                 calls = high_risk_python_calls_in_source(member_file.read())
         except PythonArchiveMemberParseError as exc:
+            if is_executable_archive_member_content(tmp_path):
+                _add_executable_archive_member_check(
+                    archive_kind=archive_kind,
+                    archive_path=archive_path,
+                    member_name=member_name,
+                    result=result,
+                )
+                return
+
             mark_archive_scan_incomplete(result, python_analysis_incomplete_reason)
             result.add_check(
                 name=_PYTHON_MEMBER_CHECK_NAME,
@@ -775,11 +801,9 @@ def scan_archive_member_for_known_risks(
         return
 
     if is_executable_archive_member_name(normalized_lower) or is_executable_archive_member_content(tmp_path):
-        result.add_check(
-            name=_EXECUTABLE_MEMBER_CHECK_NAME,
-            passed=False,
-            message=f"Executable file found in {archive_kind} archive: {member_name}",
-            severity=IssueSeverity.WARNING,
-            location=location,
-            details={"entry": member_name},
+        _add_executable_archive_member_check(
+            archive_kind=archive_kind,
+            archive_path=archive_path,
+            member_name=member_name,
+            result=result,
         )

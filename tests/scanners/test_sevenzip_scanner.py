@@ -1683,13 +1683,16 @@ class TestSevenZipScannerHardening:
         elf_path = tmp_path / "payload.dat"
         pe_path = tmp_path / "loader.txt"
         supported_path = tmp_path / "declared.pkl"
+        python_named_path = tmp_path / "payload.py"
         elf_path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
         pe_path.write_bytes(bytes(distant_pe_header))
         supported_path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
+        python_named_path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + (b"\x00" * 64))
         with py7zr.SevenZipFile(archive_path, "w") as archive:
             archive.write(elf_path, "assets/payload.dat")
             archive.write(pe_path, "assets/loader.txt")
             archive.write(supported_path, "assets/declared.pkl")
+            archive.write(python_named_path, "assets/payload.py")
 
         result = SevenZipScanner().scan(str(archive_path))
         security_messages = {
@@ -1701,6 +1704,7 @@ class TestSevenZipScannerHardening:
         assert "Executable file found in 7z archive: assets/payload.dat" in security_messages
         assert "Executable file found in 7z archive: assets/loader.txt" in security_messages
         assert "Executable file found in 7z archive: assets/declared.pkl" in security_messages
+        assert "Executable file found in 7z archive: assets/payload.py" in security_messages
         aggregate = scan_model_directory_or_file(str(archive_path), cache_scan_results=False)
         assert determine_exit_code(aggregate) == 1
 
