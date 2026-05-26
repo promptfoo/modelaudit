@@ -1078,12 +1078,16 @@ class XGBoostScanner(BaseScanner):
                 if header is None:
                     return None
                 value_marker, count, offset = header
+                if value_marker is not None and cls._UBJSON_FIXED_VALUE_WIDTHS.get(value_marker) == 0:
+                    if count is None:
+                        return offset + 1 if offset < len(probe) and probe[offset] == ord("]") else None
+                    return offset + 1 if offset < len(probe) and probe[offset] == ord("]") else offset
                 item_count = 0
                 while count is None or item_count < count:
                     if count is None and offset < len(probe) and probe[offset] == ord("]"):
                         return offset + 1
                     next_offset = parse_value(offset, depth + 1, value_marker)
-                    if next_offset is None:
+                    if next_offset is None or next_offset <= offset:
                         return None
                     offset = next_offset
                     item_count += 1

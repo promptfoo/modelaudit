@@ -66,6 +66,11 @@ def _xgboost_ubjson_probe(*, learner_padding: int = 0) -> bytes:
     return b"{" + _ubjson_key(b"learner") + b"{" + learner_body + b"}" + _ubjson_key(b"version") + b"[]" + b"}"
 
 
+def _xgboost_ubjson_counted_null_array_probe() -> bytes:
+    max_count = ((1 << 63) - 1).to_bytes(8, byteorder="big", signed=True)
+    return b"{" + _ubjson_key(b"version") + b"[]" + _ubjson_key(b"learner") + b"[$Z#L" + max_count + b"}"
+
+
 class TestSevenZipScanner:
     """Test suite for SevenZipScanner functionality"""
 
@@ -1685,6 +1690,13 @@ class TestSevenZipScannerHardening:
         """7z nested probes should retain extensionless XGBoost UBJSON members."""
         scanner = SevenZipScanner()
         probe = io.BytesIO(_xgboost_ubjson_probe())
+
+        assert scanner._probe_detected_format(probe) == "xgboost"
+
+    def test_probe_detected_format_bounds_counted_zero_payload_xgboost_array(self) -> None:
+        """7z nested probes must not iterate attacker-controlled zero-payload arrays."""
+        scanner = SevenZipScanner()
+        probe = io.BytesIO(_xgboost_ubjson_counted_null_array_probe())
 
         assert scanner._probe_detected_format(probe) == "xgboost"
 

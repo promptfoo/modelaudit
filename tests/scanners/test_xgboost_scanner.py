@@ -177,6 +177,11 @@ def _xgboost_ubjson_probe(*, learner_padding: int = 0) -> bytes:
     return b"{" + _ubjson_key(b"learner") + b"{" + learner_body + b"}" + _ubjson_key(b"version") + b"[]" + b"}"
 
 
+def _xgboost_ubjson_counted_null_array_probe() -> bytes:
+    max_count = ((1 << 63) - 1).to_bytes(8, byteorder="big", signed=True)
+    return b"{" + _ubjson_key(b"version") + b"[]" + _ubjson_key(b"learner") + b"[$Z#L" + max_count + b"}"
+
+
 class TestXGBoostScannerBasic:
     """Test basic XGBoost scanner functionality."""
 
@@ -206,6 +211,12 @@ class TestXGBoostScannerBasic:
     def test_can_handle_extensionless_ubjson_with_xgboost_markers(self, temp_dir: Path) -> None:
         model_file = temp_dir / "model"
         model_file.write_bytes(_xgboost_ubjson_probe())
+
+        assert XGBoostScanner.can_handle(str(model_file))
+
+    def test_extensionless_counted_null_array_probe_is_bounded(self, temp_dir: Path) -> None:
+        model_file = temp_dir / "model"
+        model_file.write_bytes(_xgboost_ubjson_counted_null_array_probe())
 
         assert XGBoostScanner.can_handle(str(model_file))
 
