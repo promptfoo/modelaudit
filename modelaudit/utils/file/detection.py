@@ -1257,28 +1257,39 @@ def _is_tensorflow_metagraph_file(path: str) -> bool:
         return False
 
 
-def _has_torch7_ascii_object_signature(prefix: bytes) -> bool:
-    """Return whether text contains a Torch7 ASCII serialized Torch object header."""
+def _find_torch7_ascii_object_signature_offset(prefix: bytes) -> int | None:
+    """Return the offset of a Torch7 ASCII serialized Torch object header."""
     fields = prefix.splitlines()
-    for offset in range(len(fields) - 5):
-        if fields[offset] != b"4":
+    field_offsets: list[int] = []
+    position = 0
+    for field in prefix.splitlines(keepends=True):
+        field_offsets.append(position)
+        position += len(field)
+
+    for field_offset in range(len(fields) - 5):
+        if fields[field_offset] != b"4":
             continue
         try:
-            object_index = int(fields[offset + 1])
-            version_length = int(fields[offset + 2])
-            class_name_length = int(fields[offset + 4])
+            object_index = int(fields[field_offset + 1])
+            version_length = int(fields[field_offset + 2])
+            class_name_length = int(fields[field_offset + 4])
         except ValueError:
             continue
 
-        version = fields[offset + 3]
-        class_name = fields[offset + 5]
+        version = fields[field_offset + 3]
+        class_name = fields[field_offset + 5]
         if object_index <= 0 or version_length != len(version) or class_name_length != len(class_name):
             continue
         if re.fullmatch(rb"V [+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", version) is None:
             continue
         if class_name.startswith((b"torch.", b"nn.", b"cunn.", b"cutorch.")):
-            return True
-    return False
+            return field_offsets[field_offset]
+    return None
+
+
+def _has_torch7_ascii_object_signature(prefix: bytes) -> bool:
+    """Return whether text contains a Torch7 ASCII serialized Torch object header."""
+    return _find_torch7_ascii_object_signature_offset(prefix) is not None
 
 
 def _is_torch7_signature(prefix: bytes) -> bool:
@@ -1296,13 +1307,12 @@ def _is_torch7_signature(prefix: bytes) -> bool:
     return has_torch_marker and has_structure_marker
 
 
-def has_structural_torch7_signature(path: str) -> bool:
-    """Return whether a file contains an explicit serialized Torch7 object signature."""
-    try:
-        prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
-    except OSError:
-        return False
-    return prefix.startswith(b"T7\x00\x00") or _has_torch7_ascii_object_signature(prefix)
+def find_structural_torch7_offset(payload: bytes) -> int | None:
+    """Return the earliest explicit serialized Torch7 signature offset in bytes."""
+    binary_offset = payload.find(b"T7\x00\x00")
+    ascii_offset = _find_torch7_ascii_object_signature_offset(payload)
+    offsets = [offset for offset in (binary_offset, ascii_offset) if offset is not None and offset >= 0]
+    return min(offsets) if offsets else None
 
 
 def is_torch7_suffix_override_candidate(path: str) -> bool:

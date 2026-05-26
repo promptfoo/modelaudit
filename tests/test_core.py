@@ -1085,16 +1085,29 @@ def test_scan_file_preserves_zip_findings_in_llamafile_polyglot(tmp_path: Path, 
     _assert_system_pickle_detected(result, "payload.pkl")
 
 
-def test_scan_file_preserves_torch7_findings_in_llamafile_polyglot(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("runtime_padding", "torch7_payload"),
+    [
+        (
+            b"",
+            b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\ncmd = os.execute('id')\n",
+        ),
+        (b"", b"T7\x00\x00torch.FloatTensor nn.Sequential\ncmd = os.execute('id')\n"),
+        (
+            b"A" * (64 * 1024),
+            b"4\n1\n3\nV 1\n13\nnn.Sequential\n4\n2\n3\nV 1\n17\ntorch.FloatTensor\ncmd = os.execute('id')\n",
+        ),
+    ],
+    ids=["ascii", "binary", "late-ascii"],
+)
+def test_scan_file_preserves_torch7_findings_in_llamafile_polyglot(
+    tmp_path: Path,
+    runtime_padding: bytes,
+    torch7_payload: bytes,
+) -> None:
     polyglot = tmp_path / "payload.jpg"
     polyglot.write_bytes(
-        b"\x7fELF"
-        + b"\x02\x01\x01\x00"
-        + b"\x00" * 56
-        + b"llamafile runtime\n"
-        + b"4\n1\n3\nV 1\n13\nnn.Sequential\n"
-        + b"4\n2\n3\nV 1\n17\ntorch.FloatTensor\n"
-        + b"cmd = os.execute('id')\n"
+        b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 56 + b"llamafile runtime\n" + runtime_padding + torch7_payload
     )
 
     result = scan_file(str(polyglot), config={"cache_scan_results": False})
