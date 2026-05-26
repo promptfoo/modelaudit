@@ -388,6 +388,44 @@ class TestKerasZipScanner:
         finally:
             reset_cache_manager()
 
+    def test_corrupt_config_member_still_checks_archive_members(self, tmp_path: Path) -> None:
+        """A bad config read should not hide independent archive-member findings."""
+        keras_path = tmp_path / "corrupt_config_with_payload.keras"
+        config_bytes = json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode()
+        with zipfile.ZipFile(keras_path, "w", compression=zipfile.ZIP_STORED) as zf:
+            zf.writestr("config.json", config_bytes)
+            zf.writestr("payload.py", "import os\nos.system('id')\n")
+        _corrupt_stored_member_contents(keras_path, config_bytes)
+
+        result = KerasZipScanner().scan(str(keras_path))
+        aggregate_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
+
+        python_checks = [check for check in result.checks if check.name == "Python File Detection"]
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_archive_read_failed" in result.metadata["scan_outcome_reasons"]
+        assert any(check.details["filename"] == "payload.py" for check in python_checks)
+        assert determine_exit_code(aggregate_result) == 1
+
+    def test_corrupt_metadata_member_still_checks_archive_members(self, tmp_path: Path) -> None:
+        """Optional metadata read failures should not stop member-name scanning."""
+        keras_path = tmp_path / "corrupt_metadata_with_payload.keras"
+        config = json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode()
+        metadata = json.dumps({"keras_version": "3.13.2"}).encode()
+        with zipfile.ZipFile(keras_path, "w", compression=zipfile.ZIP_STORED) as zf:
+            zf.writestr("config.json", config)
+            zf.writestr("metadata.json", metadata)
+            zf.writestr("payload.py", "import os\nos.system('id')\n")
+        _corrupt_stored_member_contents(keras_path, metadata)
+
+        result = KerasZipScanner().scan(str(keras_path))
+        aggregate_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
+
+        python_checks = [check for check in result.checks if check.name == "Python File Detection"]
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_archive_read_failed" in result.metadata["scan_outcome_reasons"]
+        assert any(check.details["filename"] == "payload.py" for check in python_checks)
+        assert determine_exit_code(aggregate_result) == 1
+
     def test_corrupt_metadata_member_preserves_security_finding(self, tmp_path: Path) -> None:
         """A later archive-read failure must not erase detected Keras CVE evidence."""
         keras_path = tmp_path / "malicious_with_corrupt_metadata.keras"
@@ -416,6 +454,34 @@ class TestKerasZipScanner:
         assert "keras_zip_archive_read_failed" in result.metadata["scan_outcome_reasons"]
         assert len(cve_issues) == 1
         assert cve_issues[0].severity == IssueSeverity.CRITICAL
+        assert determine_exit_code(aggregate_result) == 1
+
+    def test_corrupt_weights_member_still_checks_archive_members(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Bad embedded weights should not stop filename-based payload detection."""
+        monkeypatch.setattr(keras_zip_scanner_module, "HAS_H5PY", True)
+
+        keras_path = tmp_path / "corrupt_weights_with_payload.keras"
+        config = json.dumps({"class_name": "Sequential", "config": {"layers": []}}).encode()
+        metadata = json.dumps({"keras_version": "3.13.2"}).encode()
+        weights = b"corrupt hdf5 weights bytes"
+        with zipfile.ZipFile(keras_path, "w", compression=zipfile.ZIP_STORED) as zf:
+            zf.writestr("config.json", config)
+            zf.writestr("metadata.json", metadata)
+            zf.writestr("model.weights.h5", weights)
+            zf.writestr("payload.py", "import os\nos.system('id')\n")
+        _corrupt_stored_member_contents(keras_path, weights)
+
+        result = KerasZipScanner().scan(str(keras_path))
+        aggregate_result = scan_model_directory_or_file(str(keras_path), config={"cache_scan_results": False})
+
+        python_checks = [check for check in result.checks if check.name == "Python File Detection"]
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "keras_zip_archive_read_failed" in result.metadata["scan_outcome_reasons"]
+        assert any(check.details["filename"] == "payload.py" for check in python_checks)
         assert determine_exit_code(aggregate_result) == 1
 
     def test_inconclusive_compile_config_preserves_security_exit1(self, tmp_path: Path) -> None:
