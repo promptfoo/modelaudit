@@ -280,6 +280,20 @@ class TestNemoArchiveVulnerabilityCoverage:
         assert incomplete_checks[0].details["nested_scan_outcome_reasons"] == ["max_file_read_size_exceeded"]
         assert not [check for check in result.checks if check.details.get("cve_id") == "CVE-2025-23249"]
 
+    def test_incomplete_checkpoint_with_warning_fails_closed(self, tmp_path: Path) -> None:
+        nemo_path = tmp_path / "checkpoint-nested-incomplete-with-warning.nemo"
+        with tarfile.open(nemo_path, "w") as tar:
+            _add_tar_bytes(tar, "model_config.yaml", b"model: safe\n")
+            _add_tar_bytes(tar, "model_weights.ckpt", _build_malicious_pickle())
+            _add_tar_bytes(tar, "payload.sh", b"#!/bin/sh\nid\n")
+
+        result = NemoScanner({"max_file_read_size": 1}).scan(str(nemo_path))
+
+        assert result.success is False
+        assert result.has_warnings is True
+        assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+        assert "nemo_checkpoint_nested_scan_incomplete" in result.metadata["scan_outcome_reasons"]
+
     def test_nested_checkpoint_scanner_failure_fails_closed(
         self,
         tmp_path: Path,
@@ -1021,7 +1035,7 @@ class TestCVE202523304HydraTarget:
         assert size_checks[0].message == (f"Config file too large: model_config.yaml ({len(oversized_config)} bytes)")
         assert size_checks[0].details["scan_outcome_reason"] == "nemo_config_size_limit"
         assert size_checks[0].details["max_config_size"] == NemoScanner.MAX_CONFIG_SIZE
-        assert result.success is True
+        assert result.success is False
         assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
         assert "nemo_config_size_limit" in result.metadata["scan_outcome_reasons"]
 

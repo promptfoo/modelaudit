@@ -167,10 +167,6 @@ def _is_runtime_truthy(value: Any) -> bool:
     return bool(value)
 
 
-def _scan_result_has_security_findings(result: ScanResult) -> bool:
-    return any(issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL) for issue in result.issues)
-
-
 def _get_nested_scanner_for_file(path: str, *, config: dict[str, Any]) -> BaseScanner | None:
     """Resolve nested scanners lazily to avoid scanner registry import cycles."""
     from modelaudit.scanners import get_scanner_for_file
@@ -268,9 +264,7 @@ class NemoScanner(BaseScanner):
 
     @staticmethod
     def _finish_scan_result(result: ScanResult) -> None:
-        if result.metadata.get(
-            _INCONCLUSIVE_METADATA_KEY
-        ) == INCONCLUSIVE_SCAN_OUTCOME and not _scan_result_has_security_findings(result):
+        if result.metadata.get(_INCONCLUSIVE_METADATA_KEY) == INCONCLUSIVE_SCAN_OUTCOME:
             result.finish(success=False)
             return
 
