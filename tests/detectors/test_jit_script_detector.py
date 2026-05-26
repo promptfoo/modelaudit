@@ -258,6 +258,11 @@ class TestJITScriptDetector:
             (b"namespace = globals()\nlookup = namespace.get\nlookup('__builtins__')['ev' + 'al']('1 + 1')\n"),
             b"lookup = globals()['__builtins__'].get\nlookup('ev' + 'al')('1 + 1')\n",
             b"lookup = globals()['__builtins__'].__getitem__\nlookup('ev' + 'al')('1 + 1')\n",
+            b"lookup = globals().get\nlookup.__call__('__builtins__').get('ev' + 'al')('1 + 1')\n",
+            b"lookup = globals()['__builtins__'].__dict__.get\nlookup('ev' + 'al')('1 + 1')\n",
+            b"globals()['__builtins__'].eval('1 + 1')\n",
+            b"builtins_ref = globals()['__builtins__']\ngetattr(builtins_ref, 'eval')('1 + 1')\n",
+            b"global_namespace = globals()\nglobal_namespace['__builtins__']['eval']('1 + 1')\n",
         ],
     )
     def test_scan_model_detects_unmarked_static_builtin_indirection(self, source: bytes) -> None:
@@ -306,6 +311,9 @@ class TestJITScriptDetector:
             b"mapping = {'eval': len}\nlookup = mapping.get\nlookup('eval')([])\n",
             b"globals()['__builtins__'].__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
             b"globals()['__builtins__'].update({'eval': len})\nglobals()['__builtins__']['eval']([])\n",
+            b"g = globals\ng()['__builtins__'].__setitem__('eval', len)\ng()['__builtins__']['eval']([])\n",
+            b"globals().get('__builtins__').__setitem__('eval', len)\nglobals()['__builtins__']['eval']([])\n",
+            b"import builtins\nbuiltins.get = lambda name: len\nlookup = builtins.get\nlookup('eval')([])\n",
             b"def payload():\n    eval = len\n    return eval([])\n",
             (
                 b"def payload():\n"
@@ -313,6 +321,7 @@ class TestJITScriptDetector:
                 b"    namespace['__builtins__']['eval'] = len\n"
                 b"    return namespace['__builtins__']['eval']([])\n"
             ),
+            b"global_namespace = {'__builtins__': {'eval': len}}\nglobal_namespace['__builtins__']['eval']([])\n",
         ],
     )
     def test_scan_model_ignores_benign_builtin_shaped_access(self, source: bytes) -> None:
@@ -336,6 +345,26 @@ class TestJITScriptDetector:
             ),
             (
                 b"globals()['__builtins__'].update({'eval': __builtins__['exec']})\n"
+                b"globals()['__builtins__']['eval']('pass')\n"
+            ),
+            (
+                b"globals()['__builtins__'].__setitem__('eval', len)\n"
+                b"globals()['__builtins__'].update(eval=__builtins__['exec'])\n"
+                b"globals()['__builtins__']['eval']('pass')\n"
+            ),
+            (
+                b"globals()['__builtins__'].__setitem__('eval', len)\n"
+                b"globals()['__builtins__'].update({'eval': __builtins__['exec'], **{}})\n"
+                b"globals()['__builtins__']['eval']('pass')\n"
+            ),
+            (
+                b"globals()['__builtins__'].__setitem__('eval', len)\n"
+                b"globals()['__builtins__'].update([('eval', __builtins__['exec'])])\n"
+                b"globals()['__builtins__']['eval']('pass')\n"
+            ),
+            (
+                b"globals()['__builtins__'].__setitem__('eval', len)\n"
+                b"_ = globals()['__builtins__'].__setitem__('eval', __builtins__['exec'])\n"
                 b"globals()['__builtins__']['eval']('pass')\n"
             ),
         ],
@@ -383,6 +412,29 @@ class TestJITScriptDetector:
         findings = detector.scan_model(source, "pytorch", "payload.bin")
 
         assert any(f.type == "ast_dangerous_call" and f.builtin == "eval" for f in findings)
+
+    def test_scan_model_preserves_builtin_execution_after_ambiguous_namespace_overwrite(self) -> None:
+        detector = JITScriptDetector()
+        source = (
+            b"if replace_builtin:\n"
+            b"    namespace = globals()\n"
+            b"else:\n"
+            b"    namespace = other\n"
+            b"namespace['__builtins__']['eval'] = len\n"
+            b"__builtins__.eval('1 + 1')\n"
+        )
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert any(f.type == "ast_dangerous_call" and f.builtin == "eval" for f in findings)
+
+    def test_scan_model_ignores_raw_builtin_pattern_when_parsed_snippet_rebinds_builtin(self) -> None:
+        detector = JITScriptDetector()
+        source = b"\x00binary-prefix\ndef benign():\n    eval = len\n    return eval([])\n"
+
+        findings = detector.scan_model(source, "pytorch", "payload.bin")
+
+        assert findings == []
 
     def test_scan_model_detects_late_unmarked_module_scope_python_source(self) -> None:
         detector = JITScriptDetector()
