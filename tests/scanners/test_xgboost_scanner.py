@@ -161,8 +161,20 @@ def _assert_inconclusive_metadata(result: ModelAuditResultModel, path: Path, rea
     assert reason in metadata.get("scan_outcome_reasons", [])
 
 
-def _xgboost_ubjson_probe() -> bytes:
-    return b"{L" + (b"\0" * 8) + b"learner" + b"learner_model_param" + b"version"
+def _ubjson_key(key: bytes) -> bytes:
+    return b"U" + bytes([len(key)]) + key
+
+
+def _ubjson_string(value: bytes) -> bytes:
+    return b"SL" + len(value).to_bytes(8, byteorder="big", signed=True) + value
+
+
+def _xgboost_ubjson_probe(*, learner_padding: int = 0) -> bytes:
+    learner_body = b""
+    if learner_padding:
+        learner_body += _ubjson_key(b"metadata") + _ubjson_string(b"x" * learner_padding)
+    learner_body += _ubjson_key(b"learner_model_param") + b"{}"
+    return b"{" + _ubjson_key(b"learner") + b"{" + learner_body + b"}" + _ubjson_key(b"version") + b"[]" + b"}"
 
 
 class TestXGBoostScannerBasic:
@@ -205,7 +217,13 @@ class TestXGBoostScannerBasic:
 
     def test_rejects_extensionless_ubjson_with_only_learner_marker(self, temp_dir: Path) -> None:
         model_file = temp_dir / "model"
-        model_file.write_bytes(b"{L" + (b"\0" * 8) + b"learner")
+        model_file.write_bytes(b"{" + _ubjson_key(b"learner") + b"{}" + b"}")
+
+        assert not XGBoostScanner.can_handle(str(model_file))
+
+    def test_rejects_extensionless_ubjson_with_marker_text_only_in_values(self, temp_dir: Path) -> None:
+        model_file = temp_dir / "model"
+        model_file.write_bytes(b"{" + _ubjson_key(b"note") + _ubjson_string(b"learner version system(cpu)") + b"}")
 
         assert not XGBoostScanner.can_handle(str(model_file))
 
@@ -218,18 +236,15 @@ class TestXGBoostScannerBasic:
     def test_rejects_extensionless_ubjson_when_strong_marker_past_probe_window(self, temp_dir: Path) -> None:
         """Extensionless files require a strong marker *within* the probe window.
 
-        `.bst`/`.model` files trust the extension and need only `learner`, but an
-        extensionless file with `learner` early and every strong marker past the
-        probe window must be rejected so unrelated archives that happen to embed
-        `{L...learner` near the top are not misrouted to the UBJ scanner.
+        `.bst`/`.model` files trust the extension and need only a root `learner`
+        key, but an extensionless file whose model-specific child key sits past
+        the probe window must be rejected rather than overclaiming coverage.
         """
         probe_bytes = XGBoostScanner._UBJSON_PROBE_READ_BYTES
-        # `learner` sits near the start; all strong markers live past the probe cap.
-        prefix = b"{L" + (b"\0" * 8) + b"learner"
-        padding_len = probe_bytes - len(prefix) + 32
-        payload = prefix + (b"\0" * padding_len) + b"version" + b"gbtree"
-        assert all(marker not in payload[:probe_bytes] for marker in XGBoostScanner._UBJSON_STRONG_MARKERS)
-        assert any(marker in payload for marker in XGBoostScanner._UBJSON_STRONG_MARKERS)
+        payload = _xgboost_ubjson_probe(learner_padding=probe_bytes)
+        encoded_strong_key = _ubjson_key(b"learner_model_param")
+        assert encoded_strong_key not in payload[:probe_bytes]
+        assert encoded_strong_key in payload
 
         model_file = temp_dir / "model"
         model_file.write_bytes(payload)
@@ -834,9 +849,7 @@ class TestXGBoostBinaryScanning:
     def test_bst_with_late_ubjson_strong_marker_routes_to_ubj_scan(self, temp_dir: Path) -> None:
         """Large UBJSON .bst files should not require strong markers in the probe window."""
         binary_file = temp_dir / "modern_large.bst"
-        binary_file.write_bytes(
-            b"{L" + (b"\0" * 8) + b"learner" + (b"\0" * XGBoostScanner._UBJSON_PROBE_READ_BYTES) + b"version"
-        )
+        binary_file.write_bytes(_xgboost_ubjson_probe(learner_padding=XGBoostScanner._UBJSON_PROBE_READ_BYTES))
         scanner = XGBoostScanner()
 
         with (
@@ -1195,7 +1208,17 @@ class TestXGBoostFailClosedEndToEnd:
 
     def test_extensionless_ubjson_near_match_remains_unclaimed(self, tmp_path: Path) -> None:
         model_file = tmp_path / "model"
-        model_file.write_bytes(b"{L" + (b"\0" * 8) + b"learner")
+        model_file.write_bytes(b"{" + _ubjson_key(b"learner") + b"{}" + b"}")
+
+        result = scan_file(str(model_file), config={"cache_enabled": False})
+
+        assert result.scanner_name == "unknown"
+        assert result.success is True
+        assert result.issues == []
+
+    def test_extensionless_ubjson_text_values_do_not_trigger_xgboost_findings(self, tmp_path: Path) -> None:
+        model_file = tmp_path / "model"
+        model_file.write_bytes(b"{" + _ubjson_key(b"message") + _ubjson_string(b"learner version system(cpu)") + b"}")
 
         result = scan_file(str(model_file), config={"cache_enabled": False})
 

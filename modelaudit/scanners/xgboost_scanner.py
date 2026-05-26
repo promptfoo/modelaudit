@@ -229,18 +229,41 @@ class XGBoostScanner(BaseScanner):
     )
     _UBJSON_PROBE_READ_BYTES: ClassVar[int] = 256 * 1024
     _UBJSON_OBJECT_START: ClassVar[int] = ord("{")
-    _UBJSON_NEXT_VALID: ClassVar[frozenset[int]] = frozenset(b"iUIlLdDSC#$}")
-    _UBJSON_REQUIRED_MARKERS: ClassVar[tuple[bytes, ...]] = (b"learner",)
-    _UBJSON_STRONG_MARKERS: ClassVar[tuple[bytes, ...]] = (
-        b"version",
-        b"gradient_booster",
-        b"learner_model_param",
-        b"gbtree_model_param",
-        b"tree_info",
-        b"gbtree",
-        b"gblinear",
-        b"dart",
+    _UBJSON_REQUIRED_KEYS: ClassVar[frozenset[bytes]] = frozenset({b"learner"})
+    _UBJSON_STRONG_KEYS: ClassVar[frozenset[bytes]] = frozenset(
+        {
+            b"version",
+            b"gradient_booster",
+            b"learner_model_param",
+            b"gbtree_model_param",
+            b"tree_info",
+            b"gbtree",
+            b"gblinear",
+            b"dart",
+        }
     )
+    _UBJSON_INTEGER_WIDTHS: ClassVar[dict[int, tuple[int, bool]]] = {
+        ord("i"): (1, True),
+        ord("U"): (1, False),
+        ord("I"): (2, True),
+        ord("l"): (4, True),
+        ord("L"): (8, True),
+    }
+    _UBJSON_FIXED_VALUE_WIDTHS: ClassVar[dict[int, int]] = {
+        ord("Z"): 0,
+        ord("N"): 0,
+        ord("T"): 0,
+        ord("F"): 0,
+        ord("i"): 1,
+        ord("U"): 1,
+        ord("I"): 2,
+        ord("l"): 4,
+        ord("L"): 8,
+        ord("d"): 4,
+        ord("D"): 8,
+        ord("C"): 1,
+    }
+    _UBJSON_MAX_PROBE_DEPTH: ClassVar[int] = 64
     _BINARY_MIN_STRUCTURE_BYTES: ClassVar[int] = 32
     _LEGACY_HEADER_BYTES: ClassVar[int] = 136
     _LEGACY_HEADER_PATTERNS: ClassVar[tuple[str, ...]] = ("gbtree", "gblinear", "dart", "reg:", "binary:", "multi:")
@@ -986,17 +1009,124 @@ class XGBoostScanner(BaseScanner):
             return False
 
     @classmethod
+    def _read_ubjson_length(cls, probe: bytes, offset: int) -> tuple[int, int] | None:
+        """Read a bounded UBJSON integer length and return the next offset."""
+        if offset >= len(probe):
+            return None
+        width_spec = cls._UBJSON_INTEGER_WIDTHS.get(probe[offset])
+        if width_spec is None:
+            return None
+        width, signed = width_spec
+        end = offset + 1 + width
+        if end > len(probe):
+            return None
+        length = int.from_bytes(probe[offset + 1 : end], byteorder="big", signed=signed)
+        if length < 0:
+            return None
+        return length, end
+
+    @classmethod
+    def _ubjson_object_keys_in_probe(cls, probe: bytes) -> tuple[set[bytes], set[bytes]]:
+        """Collect structurally encoded object keys from a bounded UBJSON prefix."""
+        keys: set[bytes] = set()
+        top_level_keys: set[bytes] = set()
+
+        def read_sized_payload(offset: int) -> int | None:
+            length_result = cls._read_ubjson_length(probe, offset)
+            if length_result is None:
+                return None
+            length, payload_offset = length_result
+            end = payload_offset + length
+            return end if end <= len(probe) else None
+
+        def read_container_header(offset: int) -> tuple[int | None, int | None, int] | None:
+            typed_marker: int | None = None
+            count: int | None = None
+            while offset < len(probe) and probe[offset] in {ord("$"), ord("#")}:
+                marker = probe[offset]
+                offset += 1
+                if marker == ord("$"):
+                    if offset >= len(probe):
+                        return None
+                    typed_marker = probe[offset]
+                    offset += 1
+                else:
+                    length_result = cls._read_ubjson_length(probe, offset)
+                    if length_result is None:
+                        return None
+                    count, offset = length_result
+            return typed_marker, count, offset
+
+        def parse_value(offset: int, depth: int, typed_marker: int | None = None) -> int | None:
+            if depth > cls._UBJSON_MAX_PROBE_DEPTH:
+                return None
+            marker = typed_marker
+            if marker is None:
+                if offset >= len(probe):
+                    return None
+                marker = probe[offset]
+                offset += 1
+
+            fixed_width = cls._UBJSON_FIXED_VALUE_WIDTHS.get(marker)
+            if fixed_width is not None:
+                end = offset + fixed_width
+                return end if end <= len(probe) else None
+            if marker in {ord("S"), ord("H")}:
+                return read_sized_payload(offset)
+            if marker == ord("["):
+                header = read_container_header(offset)
+                if header is None:
+                    return None
+                value_marker, count, offset = header
+                item_count = 0
+                while count is None or item_count < count:
+                    if count is None and offset < len(probe) and probe[offset] == ord("]"):
+                        return offset + 1
+                    next_offset = parse_value(offset, depth + 1, value_marker)
+                    if next_offset is None:
+                        return None
+                    offset = next_offset
+                    item_count += 1
+                return offset + 1 if offset < len(probe) and probe[offset] == ord("]") else offset
+            if marker == ord("{"):
+                header = read_container_header(offset)
+                if header is None:
+                    return None
+                value_marker, count, offset = header
+                item_count = 0
+                while count is None or item_count < count:
+                    if count is None and offset < len(probe) and probe[offset] == ord("}"):
+                        return offset + 1
+                    length_result = cls._read_ubjson_length(probe, offset)
+                    if length_result is None:
+                        return None
+                    key_length, key_offset = length_result
+                    key_end = key_offset + key_length
+                    if key_end > len(probe):
+                        return None
+                    key = probe[key_offset:key_end]
+                    keys.add(key)
+                    if depth == 0:
+                        top_level_keys.add(key)
+                    next_offset = parse_value(key_end, depth + 1, value_marker)
+                    if next_offset is None:
+                        return None
+                    offset = next_offset
+                    item_count += 1
+                return offset + 1 if offset < len(probe) and probe[offset] == ord("}") else offset
+            return None
+
+        if probe and probe[0] == cls._UBJSON_OBJECT_START:
+            parse_value(0, 0)
+        return top_level_keys, keys
+
+    @classmethod
     def _is_ubjson_probe(cls, probe: bytes, *, require_strong_marker: bool = True) -> bool:
-        """Check if a bounded prefix is probably an XGBoost UBJSON model."""
-        is_ubjson_with_required_markers = (
-            len(probe) >= 2
-            and probe[0] == cls._UBJSON_OBJECT_START
-            and probe[1] in cls._UBJSON_NEXT_VALID
-            and all(marker in probe for marker in cls._UBJSON_REQUIRED_MARKERS)
-        )
-        if not is_ubjson_with_required_markers:
+        """Check whether a bounded UBJSON prefix has XGBoost object structure."""
+        top_level_keys, keys = cls._ubjson_object_keys_in_probe(probe)
+        if not top_level_keys >= cls._UBJSON_REQUIRED_KEYS:
             return False
-        return not require_strong_marker or any(marker in probe for marker in cls._UBJSON_STRONG_MARKERS)
+        return not require_strong_marker or bool(cls._UBJSON_STRONG_KEYS & keys)
 
     @classmethod
     def _is_ubjson_file(cls, path: str, *, require_strong_marker: bool = True) -> bool:

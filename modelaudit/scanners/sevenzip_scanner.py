@@ -113,6 +113,7 @@ class SevenZipScanner(BaseScanner):
     supported_extensions: ClassVar[list[str]] = [".7z"]
     _SEVENZIP_MAGIC: ClassVar[bytes] = b"7z\xbc\xaf\x27\x1c"
     _NESTED_MEMBER_PROBE_BYTES: ClassVar[int] = 512
+    _XGBOOST_NESTED_MEMBER_PROBE_BYTES: ClassVar[int] = XGBoostScanner._UBJSON_PROBE_READ_BYTES
 
     _MAX_EXTENSIONLESS_PROBES: ClassVar[int] = 100
     _MAX_TOTAL_EXTRACT_SIZE: ClassVar[int] = 5 * 1024 * 1024 * 1024  # 5 GB
@@ -655,7 +656,29 @@ class SevenZipScanner(BaseScanner):
         probe = probe_factory.get(file_name)
         if probe is None:
             probe = next(iter(probe_factory.products.values()), None)
-        return self._probe_detected_format(probe)
+        detected_format = self._probe_detected_format(probe)
+        if detected_format is not None or probe is None:
+            return detected_format
+
+        probe.seek(0)
+        if probe.read(1) != bytes([XGBoostScanner._UBJSON_OBJECT_START]):
+            return None
+
+        expanded_factory = _HeaderProbeFactory(limit=self._XGBOOST_NESTED_MEMBER_PROBE_BYTES)
+        try:
+            with suppress(_HeaderProbeComplete):
+                archive.extract(targets=[file_name], factory=expanded_factory)
+        finally:
+            with suppress(Exception):
+                archive.reset()
+        expanded_probe = expanded_factory.get(file_name)
+        if expanded_probe is None:
+            expanded_probe = next(iter(expanded_factory.products.values()), None)
+        if expanded_probe is None:
+            return None
+        expanded_probe.seek(0)
+        expanded_prefix = expanded_probe.read(self._XGBOOST_NESTED_MEMBER_PROBE_BYTES)
+        return "xgboost" if XGBoostScanner._is_ubjson_probe(expanded_prefix) else None
 
     def _check_path_traversal(self, file_names: list[str], archive_path: str, result: ScanResult) -> list[str]:
         """Check for path traversal vulnerabilities and return only safe entries."""

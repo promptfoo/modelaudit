@@ -50,6 +50,22 @@ def _mock_scan_result(
     return result
 
 
+def _ubjson_key(key: bytes) -> bytes:
+    return b"U" + bytes([len(key)]) + key
+
+
+def _ubjson_string(value: bytes) -> bytes:
+    return b"SL" + len(value).to_bytes(8, byteorder="big", signed=True) + value
+
+
+def _xgboost_ubjson_probe(*, learner_padding: int = 0) -> bytes:
+    learner_body = b""
+    if learner_padding:
+        learner_body += _ubjson_key(b"metadata") + _ubjson_string(b"x" * learner_padding)
+    learner_body += _ubjson_key(b"learner_model_param") + b"{}"
+    return b"{" + _ubjson_key(b"learner") + b"{" + learner_body + b"}" + _ubjson_key(b"version") + b"[]" + b"}"
+
+
 class TestSevenZipScanner:
     """Test suite for SevenZipScanner functionality"""
 
@@ -1668,7 +1684,7 @@ class TestSevenZipScannerHardening:
     def test_probe_detected_format_recognizes_extensionless_xgboost_ubjson(self) -> None:
         """7z nested probes should retain extensionless XGBoost UBJSON members."""
         scanner = SevenZipScanner()
-        probe = io.BytesIO(b"{L" + (b"\0" * 8) + b"learner" + b"learner_model_param" + b"version")
+        probe = io.BytesIO(_xgboost_ubjson_probe())
 
         assert scanner._probe_detected_format(probe) == "xgboost"
 
@@ -1788,7 +1804,7 @@ class TestSevenZipScannerHardening:
         scanner = SevenZipScanner()
         archive_path = tmp_path / "xgboost_probe.7z"
         archive_path.write_bytes(scanner._SEVENZIP_MAGIC + b"\0" * 26)
-        payload = b"{L" + (b"\0" * 8) + b"learner" + b"learner_model_param" + b"version"
+        payload = _xgboost_ubjson_probe()
 
         with (
             patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
@@ -1815,6 +1831,41 @@ class TestSevenZipScannerHardening:
 
             assert result.success
             assert result.metadata["scannable_files"] == 1
+            mock_scan_extracted_file.assert_called_once()
+
+    def test_extensionless_xgboost_probe_expands_for_late_structural_key(self, tmp_path: Path) -> None:
+        """7z should probe UBJSON candidates beyond its ordinary 512-byte header read."""
+        scanner = SevenZipScanner()
+        archive_path = tmp_path / "late_xgboost_probe.7z"
+        archive_path.write_bytes(scanner._SEVENZIP_MAGIC + b"\0" * 26)
+        payload = _xgboost_ubjson_probe(learner_padding=scanner._NESTED_MEMBER_PROBE_BYTES + 32)
+
+        with (
+            patch("modelaudit.scanners.sevenzip_scanner.HAS_PY7ZR", True),
+            patch("modelaudit.scanners.sevenzip_scanner.py7zr") as mock_py7zr,
+            patch.object(scanner, "_has_7z_magic", return_value=True),
+            patch.object(scanner, "_scan_extracted_file", return_value=_mock_scan_result()) as mock_scan_extracted_file,
+            patch("os.path.isfile", return_value=True),
+            patch("os.path.islink", return_value=False),
+            patch("os.path.getsize", return_value=32),
+        ):
+
+            def fake_extract(*_args: Any, **kwargs: Any) -> None:
+                factory = kwargs.get("factory")
+                if factory is not None:
+                    factory.create("nested_payload").write(payload)
+
+            mock_archive = MagicMock()
+            mock_archive.getnames.return_value = ["nested_payload"]
+            mock_archive.getinfo.return_value = MagicMock(uncompressed=len(payload), is_directory=False)
+            mock_archive.extract.side_effect = fake_extract
+            mock_py7zr.SevenZipFile.return_value.__enter__.return_value = mock_archive
+
+            result = scanner.scan(str(archive_path))
+
+            assert result.success
+            assert result.metadata["scannable_files"] == 1
+            assert mock_archive.extract.call_count >= 3
             mock_scan_extracted_file.assert_called_once()
 
     # -- default config includes new limits -----------------------------------
