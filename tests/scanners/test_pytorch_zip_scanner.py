@@ -1154,6 +1154,7 @@ def test_pytorch_zip_scans_aliased_modeled_builtins_in_archive_data(
             b"replace({'eval': len})\n"
             b"globals()['__builtins__']['eval']([])\n"
         ),
+        b"setattr(globals()['__builtins__'], 'eval', len)\nglobals()['__builtins__']['eval']([])\n",
         (b"globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
         (b"globals()['__builtins__']['eval'] = len\nrun = globals()['__builtins__']['eval']\nrun.__call__([])\n"),
         (b"globals()['__builtins__'].__setitem__('eval', len)\nrun = globals()['__builtins__']['eval']\nrun([])\n"),
@@ -1212,6 +1213,10 @@ def test_pytorch_zip_ignores_benign_builtin_shaped_access_in_archive_data(tmp_pa
         (
             b"replace = globals()['__builtins__'].update\n"
             b"replace({'eval': __builtins__['exec']})\n"
+            b"globals()['__builtins__']['eval']('pass')\n"
+        ),
+        (
+            b"setattr(globals()['__builtins__'], 'eval', __builtins__['exec'])\n"
             b"globals()['__builtins__']['eval']('pass')\n"
         ),
     ],
