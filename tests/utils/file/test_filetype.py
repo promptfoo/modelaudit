@@ -27,7 +27,12 @@ from modelaudit.utils.file.detection import (
 )
 from modelaudit.utils.tensorflow_compat import has_tensorflow_protobuf_stubs as _has_tf_protos
 from tests.helpers import create_mock_coreml, create_mock_onnx, prefix_mock_onnx_with_unknown_field
-from tests.helpers.file_creators import create_v7_tar_archive
+from tests.helpers.file_creators import (
+    _coreml_field_bytes,
+    _coreml_field_varint,
+    _encode_proto_varint,
+    create_v7_tar_archive,
+)
 
 
 def _create_mar_archive(
@@ -310,6 +315,71 @@ def test_detect_file_format_routes_renamed_coreml_with_large_model_payload(tmp_p
     assert detect_file_format(str(model_path)) == "coreml"
     assert detect_file_format_from_magic(str(model_path)) == "coreml"
     assert detect_file_format_for_skip_filter(str(model_path)) == "coreml"
+
+
+def test_detect_file_format_routes_renamed_coreml_after_long_varint_prefix(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(tmp_path / "long-varint-prefix.jpg")
+    long_unknown_key = _encode_proto_varint((1 << 35) << 3 | 2)
+    model_path.write_bytes(long_unknown_key + b"\x00" + model_path.read_bytes())
+
+    assert detect_file_format(str(model_path)) == "coreml"
+    assert detect_file_format_from_magic(str(model_path)) == "coreml"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "coreml"
+
+
+def test_detect_file_format_routes_renamed_coreml_serialized_model(tmp_path: Path) -> None:
+    description = _coreml_field_bytes(100, _coreml_field_bytes(1, b"Mock CoreML model"))
+    serialized_model = (
+        _coreml_field_varint(1, 8)
+        + _coreml_field_bytes(2, description)
+        + _coreml_field_bytes(3000, _coreml_field_bytes(1, b"payload"))
+    )
+    model_path = tmp_path / "serialized-model.jpg"
+    model_path.write_bytes(serialized_model)
+
+    assert detect_file_format(str(model_path)) == "coreml"
+    assert detect_file_format_from_magic(str(model_path)) == "coreml"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "coreml"
+
+
+def test_detect_file_format_rejects_empty_renamed_coreml_model_payload(tmp_path: Path) -> None:
+    description = _coreml_field_bytes(100, _coreml_field_bytes(1, b"Mock CoreML model"))
+    near_match = _coreml_field_varint(1, 8) + _coreml_field_bytes(2, description) + _coreml_field_bytes(500, b"")
+    model_path = tmp_path / "empty-model-type.jpg"
+    model_path.write_bytes(near_match)
+
+    assert detect_file_format(str(model_path)) == "unknown"
+    assert detect_file_format_from_magic(str(model_path)) == "unknown"
+    assert detect_file_format_for_skip_filter(str(model_path)) == "unknown"
+
+
+def test_detect_file_format_retains_oversized_coreml_description_candidate(tmp_path: Path) -> None:
+    model_path = tmp_path / "large-description.jpg"
+    model_path.write_bytes(
+        _coreml_field_varint(1, 8)
+        + _encode_proto_varint((2 << 3) | 2)
+        + _encode_proto_varint((1024 * 1024) + 1)
+        + (b"a" * ((1024 * 1024) + 1))
+        + _coreml_field_bytes(500, _coreml_field_bytes(1, b"layer"))
+    )
+
+    assert detect_file_format(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+
+
+def test_detect_file_format_retains_oversized_unknown_coreml_prefix_candidate(tmp_path: Path) -> None:
+    model_path = create_mock_coreml(tmp_path / "large-unknown-prefix.jpg")
+    model_path.write_bytes(
+        _encode_proto_varint((123 << 3) | 2)
+        + _encode_proto_varint((1024 * 1024) + 1)
+        + (b"x" * ((1024 * 1024) + 1))
+        + model_path.read_bytes()
+    )
+
+    assert detect_file_format(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_from_magic(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
+    assert detect_file_format_for_skip_filter(str(model_path)) == PROTOBUF_MODEL_CANDIDATE_FORMAT
 
 
 def test_detect_file_format_onnx_pb_content_hint_preempts_protobuf_extension(tmp_path: Path) -> None:

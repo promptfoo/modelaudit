@@ -348,6 +348,7 @@ class CoreMLScanner(BaseScanner):
             2004,
             2005,
             2006,
+            3000,
         }
     )
     NEURAL_NETWORK_FIELDS: ClassVar[frozenset[int]] = frozenset({303, 403, 500})
@@ -389,6 +390,15 @@ class CoreMLScanner(BaseScanner):
         return isinstance(format_validation, dict) and (
             format_validation.get("routed_format") == PROTOBUF_MODEL_CANDIDATE_FORMAT
         )
+
+    @staticmethod
+    def _is_inconclusive_result(result: ScanResult) -> bool:
+        return result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME
+
+    @staticmethod
+    def _preserve_tentative_inconclusive(result: ScanResult) -> None:
+        result.scanner_name = "unknown"
+        result.metadata["tentative_protobuf_candidate_unresolved"] = "coreml_analysis_incomplete"
 
     @staticmethod
     def _reject_tentative_candidate(result: ScanResult) -> ScanResult:
@@ -444,7 +454,13 @@ class CoreMLScanner(BaseScanner):
         if not description_fields:
             return False
 
-        has_model_type = any(field.field_number in cls.MODEL_TYPE_FIELDS and field.wire_type == 2 for field in fields)
+        has_model_type = any(
+            field.field_number in cls.MODEL_TYPE_FIELDS
+            and field.wire_type == 2
+            and isinstance(field.value, bytes)
+            and len(field.value) > 0
+            for field in fields
+        )
         if not has_model_type:
             return False
 
@@ -519,10 +535,8 @@ class CoreMLScanner(BaseScanner):
         )
         if parse_error:
             if parse_error.startswith("field count exceeded limit"):
-                if self._is_tentative_protobuf_route():
-                    return self._reject_tentative_candidate(result)
                 mark_inconclusive_scan_result(result, "coreml_top_level_field_limit")
-            elif self._is_tentative_protobuf_route():
+            elif self._is_tentative_protobuf_route() and not self._is_inconclusive_result(result):
                 return self._reject_tentative_candidate(result)
             result.add_check(
                 name="CoreML Protobuf Parse",
@@ -532,11 +546,13 @@ class CoreMLScanner(BaseScanner):
                 location=path,
                 details={"parse_error": parse_error},
             )
+            if self._is_tentative_protobuf_route() and self._is_inconclusive_result(result):
+                self._preserve_tentative_inconclusive(result)
             result.finish(success=False)
             return result
 
         if not self._has_coreml_structure(top_fields):
-            if self._is_tentative_protobuf_route():
+            if self._is_tentative_protobuf_route() and not self._is_inconclusive_result(result):
                 return self._reject_tentative_candidate(result)
             result.add_check(
                 name="CoreML Structural Validation",
@@ -545,6 +561,8 @@ class CoreMLScanner(BaseScanner):
                 severity=IssueSeverity.INFO,
                 location=path,
             )
+            if self._is_tentative_protobuf_route() and self._is_inconclusive_result(result):
+                self._preserve_tentative_inconclusive(result)
             result.finish(success=False)
             return result
 

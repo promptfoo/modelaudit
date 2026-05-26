@@ -692,7 +692,7 @@ def test_scan_zip_python_member_emits_separate_check_per_rule_code(tmp_path: Pat
 
 
 def test_scan_zip_honors_max_mar_python_analysis_bytes_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Generic ZIP Python analysis reasons survive nested inconclusive routing."""
+    """Generic ZIP Python analysis stays focused on Python-source coverage."""
     monkeypatch.setattr("modelaudit.scanners.onnx_scanner._check_onnx", lambda: False)
     archive_path = tmp_path / "source_bundle.zip"
     # ~60 KB payload; a 1 KB configured cap must cause the scanner to mark this
@@ -715,7 +715,7 @@ def test_scan_zip_honors_max_mar_python_analysis_bytes_config(tmp_path: Path, mo
     assert details["file_size"] >= 60_000
     reasons = result.metadata["scan_outcome_reasons"]
     assert "zip_python_member_analysis_incomplete" in reasons
-    assert "onnx_tentative_candidate_analysis_unavailable" in reasons
+    assert "onnx_tentative_candidate_analysis_unavailable" not in reasons
 
 
 def test_scan_zip_python_member_honors_pep263_encoding_declaration(tmp_path: Path) -> None:

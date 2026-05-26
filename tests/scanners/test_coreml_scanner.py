@@ -3,9 +3,13 @@ from __future__ import annotations
 import base64
 from pathlib import Path
 
-from modelaudit.scanners.base import IssueSeverity
+from modelaudit.scanners.base import FORMAT_VALIDATION_CONFIG_KEY, IssueSeverity
 from modelaudit.scanners.coreml_scanner import CoreMLScanner
-from modelaudit.utils.file.detection import detect_file_format, detect_format_from_extension
+from modelaudit.utils.file.detection import (
+    PROTOBUF_MODEL_CANDIDATE_FORMAT,
+    detect_file_format,
+    detect_format_from_extension,
+)
 
 
 def _encode_varint(value: int) -> bytes:
@@ -123,6 +127,38 @@ def test_coreml_scanner_can_handle_strict_detection(tmp_path: Path) -> None:
     renamed_text = tmp_path / "not_coreml.mlmodel"
     renamed_text.write_text("not a protobuf model", encoding="utf-8")
     assert CoreMLScanner.can_handle(str(renamed_text)) is False
+
+
+def test_coreml_scanner_rejects_empty_model_type_payload(tmp_path: Path) -> None:
+    model_path = _write_model(
+        tmp_path / "empty_model_type.mlmodel",
+        _field_varint(1, 8) + _field_bytes(2, _build_description(metadata=_build_metadata())) + _field_bytes(500, b""),
+    )
+
+    result = CoreMLScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert any(check.name == "CoreML Structural Validation" for check in result.checks)
+
+
+def test_coreml_tentative_candidate_field_limit_remains_inconclusive(tmp_path: Path) -> None:
+    model_path = _write_model(
+        tmp_path / "field_budget_candidate.jpg",
+        (b"\x9a\x06\x00" * (CoreMLScanner.MAX_TOP_LEVEL_FIELDS + 1))
+        + _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            neural_network=_build_neural_network(layers=[_build_layer("dense_1")]),
+        ),
+    )
+
+    result = CoreMLScanner(
+        config={FORMAT_VALIDATION_CONFIG_KEY: {"routed_format": PROTOBUF_MODEL_CANDIDATE_FORMAT}}
+    ).scan(str(model_path))
+
+    assert result.scanner_name == "unknown"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "coreml_top_level_field_limit" in result.metadata["scan_outcome_reasons"]
 
 
 def test_coreml_scanner_benign_model(tmp_path: Path) -> None:
