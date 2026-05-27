@@ -11,6 +11,8 @@ import pytest
 
 from modelaudit.cache import get_cache_manager, reset_cache_manager
 from modelaudit.core import determine_exit_code, scan_model_directory_or_file
+from modelaudit.core_results import merge_scan_result
+from modelaudit.models import create_initial_audit_result
 from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.pickle_scanner import (
     ALWAYS_DANGEROUS_FUNCTIONS,
@@ -58,6 +60,50 @@ class BrokenTellStream(io.BytesIO):
 
     def tell(self) -> int:
         raise OSError("tell failed")
+
+
+class BrokenRewindStream(io.BytesIO):
+    def seekable(self) -> bool:
+        return True
+
+    def seek(self, *_args: object, **_kwargs: object) -> int:
+        raise OSError("rewind failed")
+
+
+class BrokenSupplementalReadStream(io.BytesIO):
+    def __init__(self, initial_bytes: bytes) -> None:
+        super().__init__(initial_bytes)
+        self._native_scan_complete = False
+
+    def seekable(self) -> bool:
+        return True
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        position = super().seek(offset, whence)
+        if offset == 0 and whence == 0:
+            self._native_scan_complete = True
+        return position
+
+    def read(self, size: int | None = -1) -> bytes:
+        if self._native_scan_complete:
+            raise OSError("supplemental read failed")
+        return super().read(size)
+
+
+class BrokenNonSeekableReadStream(io.BytesIO):
+    def seekable(self) -> bool:
+        return False
+
+    def read(self, size: int | None = -1) -> bytes:
+        raise OSError("stream read failed")
+
+
+class BrokenNativeReadStream(io.BytesIO):
+    def seekable(self) -> bool:
+        return True
+
+    def read(self, size: int | None = -1) -> bytes:
+        raise OSError("native read failed")
 
 
 def _short_binunicode(data: bytes) -> bytes:
@@ -1137,14 +1183,176 @@ def test_scan_stream_accepts_unknown_size_stream() -> None:
     assert result.metadata["pickle_primary_engine"] == "rust"
 
 
-def test_scan_stream_handles_seekable_stream_position_failures() -> None:
+def test_scan_stream_marks_seekable_position_failure_inconclusive_without_security_finding() -> None:
     payload = pickle.dumps({"safe": True}, protocol=4)
 
     result = PickleScanner().scan_stream(BrokenTellStream(payload), len(payload), source="broken-tell.pkl")
 
     assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["stream_position_failed"]
     assert result.metadata["operational_error_reason"] == "stream_position_failed"
-    assert any(issue.details.get("category") == "stream_position_failed" for issue in result.issues)
+    assert any(
+        issue.details.get("category") == "stream_position_failed" and issue.severity == IssueSeverity.INFO
+        for issue in result.issues
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_scan_stream_marks_rewind_failure_inconclusive_without_security_finding() -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+
+    result = PickleScanner().scan_stream(BrokenRewindStream(payload), len(payload), source="broken-rewind.pkl")
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["stream_rewind_failed"]
+    assert result.metadata["operational_error_reason"] == "stream_rewind_failed"
+    assert any(
+        issue.details.get("category") == "stream_rewind_failed" and issue.severity == IssueSeverity.INFO
+        for issue in result.issues
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_scan_stream_fails_closed_when_supplemental_raw_analysis_cannot_read() -> None:
+    payload = pickle.dumps({"endpoint": "https://attacker.example.com/exfil"}, protocol=4)
+
+    readable_result = PickleScanner().scan_stream(io.BytesIO(payload), len(payload), source="readable.pkl")
+    result = PickleScanner().scan_stream(
+        BrokenSupplementalReadStream(payload),
+        len(payload),
+        source="unreadable-supplement.pkl",
+    )
+
+    assert any(
+        check.name == "Network Communication Detection" and check.status == CheckStatus.FAILED
+        for check in readable_result.checks
+    )
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["stream_raw_read_failed"]
+    assert any(
+        issue.details.get("category") == "stream_raw_read_failed" and issue.severity == IssueSeverity.INFO
+        for issue in result.issues
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_scan_stream_marks_supplemental_read_failure_operational_with_security_finding() -> None:
+    payload = pickle.dumps(MaliciousPayload(), protocol=4)
+
+    result = PickleScanner().scan_stream(
+        BrokenSupplementalReadStream(payload),
+        len(payload),
+        source="partial-malicious-stream.pkl",
+    )
+    result.metadata["file_path"] = "partial-malicious-stream.pkl"
+    aggregate_result = create_initial_audit_result()
+    merge_scan_result(aggregate_result, result)
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["stream_raw_read_failed"]
+    assert result.metadata["operational_error"] is True
+    assert result.metadata["operational_error_reason"] == "stream_raw_read_failed"
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+    assert any(
+        issue.details.get("category") == "stream_raw_read_failed"
+        and issue.details.get("operational_error") is True
+        and issue.severity == IssueSeverity.INFO
+        for issue in result.issues
+    )
+    assert determine_exit_code(aggregate_result) == 2
+
+
+def test_scan_stream_marks_non_seekable_read_failure_inconclusive_without_security_finding() -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+
+    result = PickleScanner().scan_stream(
+        BrokenNonSeekableReadStream(payload),
+        len(payload),
+        source="unreadable-input.pkl",
+    )
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["stream_read_failed"]
+    assert result.metadata["operational_error_reason"] == "stream_read_failed"
+    assert any(
+        issue.details.get("category") == "stream_read_failed" and issue.severity == IssueSeverity.INFO
+        for issue in result.issues
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_scan_stream_maps_native_io_error_to_inconclusive_without_security_finding() -> None:
+    payload = pickle.dumps({"safe": True}, protocol=4)
+
+    result = PickleScanner().scan_stream(BrokenNativeReadStream(payload), len(payload), source="native-read.pkl")
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["io_error"]
+    assert result.metadata["operational_error_reason"] == "io_error"
+    assert any(
+        issue.details.get("category") == "io_error" and issue.severity == IssueSeverity.INFO for issue in result.issues
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_scan_file_read_failure_is_inconclusive_without_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "unreadable.pkl"
+    path.write_bytes(pickle.dumps({"safe": True}, protocol=4))
+
+    def fail_primary_read(*_args: object, **_kwargs: object) -> ScanResult:
+        raise OSError("simulated pickle read failure")
+
+    monkeypatch.setattr(PickleScanner, "_scan_standalone_stream", fail_primary_read)
+
+    direct_result = PickleScanner().scan(str(path))
+    aggregate_result = scan_model_directory_or_file(str(path), cache_scan_results=False)
+
+    assert direct_result.success is False
+    assert direct_result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert direct_result.metadata["scan_outcome_reasons"] == ["pickle_file_open_failed"]
+    assert direct_result.metadata["operational_error_reason"] == "pickle_file_open_failed"
+    assert any(
+        issue.details.get("category") == "pickle_file_open_failed" and issue.severity == IssueSeverity.INFO
+        for issue in direct_result.issues
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in direct_result.issues)
+    assert determine_exit_code(aggregate_result) == 2
+    assert not any(
+        issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in aggregate_result.issues
+    )
+
+
+def test_scan_file_jax_read_failure_is_inconclusive_without_security_finding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "jax-state.pkl"
+    path.write_bytes(pickle.dumps({"payload": "jax"}, protocol=4))
+
+    def fail_jax_read(*_args: object, **_kwargs: object) -> None:
+        raise OSError("simulated JAX delegated read failure")
+
+    monkeypatch.setattr(PickleScanner, "_scan_jax_checkpoint_patterns_if_needed", fail_jax_read)
+
+    result = PickleScanner().scan(str(path))
+
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == INCONCLUSIVE_SCAN_OUTCOME
+    assert result.metadata["scan_outcome_reasons"] == ["pickle_file_open_failed"]
+    assert any(
+        issue.details.get("category") == "pickle_file_open_failed" and issue.severity == IssueSeverity.INFO
+        for issue in result.issues
+    )
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
 
 
 def test_scan_stream_unknown_size_non_seekable_payload_above_root_cap_returns_truncated_result() -> None:
