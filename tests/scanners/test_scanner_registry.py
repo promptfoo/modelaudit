@@ -808,3 +808,36 @@ def test_get_scanner_for_path_routes_generic_pkl_zip_without_pytorch_markers_to_
     model_path = _write_zip_archive(tmp_path / "generic.pkl", {"payload.txt": b"not a pytorch archive"})
 
     _assert_scanner_for_path(model_path, "zip")
+
+
+def test_get_scanner_for_path_preserves_metadata_owner_after_failed_zip_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    readme_path = tmp_path / "README.md"
+    readme_path.write_text("# Metadata whose later read becomes unavailable\n", encoding="utf-8")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+
+    scanner_class = ScannerRegistry().get_scanner_for_path(str(readme_path))
+
+    assert scanner_class is not None
+    assert scanner_class.name == "metadata"
+
+
+def test_get_scanner_for_path_does_not_claim_non_metadata_text_after_failed_zip_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text_path = tmp_path / "vocab.txt"
+    text_path.write_text("token\n", encoding="utf-8")
+
+    def raise_zip_error(_path: str) -> bool:
+        raise OSError("simulated ZIP probe read failure")
+
+    monkeypatch.setattr("modelaudit.scanners.zipfile.is_zipfile", raise_zip_error)
+
+    assert ScannerRegistry().get_scanner_for_path(str(text_path)) is None

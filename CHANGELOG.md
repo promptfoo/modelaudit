@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
-- classify unavailable metadata document reads as inconclusive rather than security findings
+- classify unavailable metadata document reads and timed-out metadata scans as operationally incomplete rather than security findings
 - route renamed structured JAX/Orbax JSON checkpoints and fail closed for oversized identified metadata
 - route renamed structurally valid Flax/JAX MessagePack checkpoints through bounded, fail-closed security analysis
 - avoid emitting sensitive scanner finding or loader error payloads in logs
