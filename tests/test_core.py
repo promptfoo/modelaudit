@@ -25,6 +25,8 @@ from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.utils.file import detection as file_detection
 from modelaudit.utils.file.detection import (
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
+    JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES,
+    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
 )
@@ -2421,6 +2423,129 @@ def test_scan_file_routes_jax_pickles_through_jax_specific_analysis(tmp_path: Pa
         and check.details["pattern"] == r"jax\.experimental\.io_callback"
         for check in result.checks
     )
+
+
+def test_scan_file_routes_malicious_renamed_jax_json_without_routing_ajax_near_match(tmp_path: Path) -> None:
+    model_path = tmp_path / "state.jpg"
+    native_model_path = tmp_path / "state.checkpoint"
+    near_match_path = tmp_path / "ajax.jpg"
+    malicious_payload = (" " * 1024) + json.dumps(
+        {
+            "framework": "jax",
+            "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+        }
+    )
+    model_path.write_text(malicious_payload, encoding="utf-8")
+    native_model_path.write_text(malicious_payload, encoding="utf-8")
+    near_match_path.write_text(
+        json.dumps({"framework": "ajax", "payload": "jax.experimental.host_callback.call(os.system, 'id')"}),
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+    native_result = scan_file(str(native_model_path), config={"cache_scan_results": False})
+    near_match_result = scan_file(str(near_match_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jax_checkpoint"
+    assert native_result.scanner_name == "jax_checkpoint"
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED
+        for check in native_result.checks
+    )
+    assert near_match_result.scanner_name == "unknown"
+    assert near_match_result.success is True
+
+
+@pytest.mark.parametrize("suffix", [".ckpt", ".pickle"])
+def test_scan_file_routes_jax_json_on_pickle_owned_suffixes_through_json_analysis(tmp_path: Path, suffix: str) -> None:
+    model_path = tmp_path / f"state{suffix}"
+    model_path.write_text(
+        json.dumps({"framework": "jax", "payload": "jax.experimental.host_callback.call(os.system, 'id')"}),
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jax_checkpoint"
+    assert any(
+        check.name == "JSON Pattern Security Check" and check.status == CheckStatus.FAILED for check in result.checks
+    )
+
+
+@pytest.mark.parametrize("suffix", [".ckpt", ".pickle"])
+def test_scan_file_accepts_benign_jax_json_on_pickle_owned_suffixes(tmp_path: Path, suffix: str) -> None:
+    model_path = tmp_path / f"benign-state{suffix}"
+    model_path.write_text(json.dumps({"framework": "jax", "weights": [1, 2, 3]}), encoding="utf-8")
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jax_checkpoint"
+    assert result.success is True
+    assert not any(
+        check.name in {"File Type Validation", "Format Validation"} and check.status == CheckStatus.FAILED
+        for check in result.checks
+    )
+
+
+def test_scan_file_fails_closed_for_oversized_renamed_jax_json_and_does_not_cache_result(tmp_path: Path) -> None:
+    model_path = tmp_path / "large-state.jpg"
+    near_match_path = tmp_path / "large-ajax.jpg"
+    padding = "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)
+    model_path.write_text(
+        json.dumps(
+            {
+                "padding": padding,
+                "framework": "jax",
+                "payload": "jax.experimental.host_callback.call(os.system, 'id')",
+            }
+        ),
+        encoding="utf-8",
+    )
+    near_match_path.write_text(json.dumps({"padding": padding, "framework": "ajax"}), encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+    config = {
+        "cache_enabled": True,
+        "cache_dir": str(cache_dir),
+        "min_cache_file_size": 0,
+    }
+
+    reset_cache_manager()
+    try:
+        first = scan_file(str(model_path), config=config)
+        second = scan_file(str(model_path), config=config)
+        near_match_result = scan_file(str(near_match_path), config={"cache_scan_results": False})
+
+        assert first.scanner_name == "jax_checkpoint"
+        assert first.success is False
+        assert second.success is False
+        assert first.metadata["scan_outcome"] == "inconclusive"
+        assert "jax_json_checkpoint_analysis_size_limit" in first.metadata["scan_outcome_reasons"]
+        assert near_match_result.scanner_name == "unknown"
+        assert near_match_result.success is True
+        assert get_cache_manager(str(cache_dir), enabled=True).get_stats()["total_entries"] == 0
+    finally:
+        reset_cache_manager()
+
+    aggregate = scan_model_directory_or_file(str(model_path), cache_scan_results=False)
+    assert core_module.determine_exit_code(aggregate) == 2
+
+
+def test_scan_file_fails_closed_when_renamed_jax_json_root_is_past_routing_budget(tmp_path: Path) -> None:
+    model_path = tmp_path / "late-root.jpg"
+    model_path.write_text(
+        (" " * (JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1)) + json.dumps({"framework": "jax"}),
+        encoding="utf-8",
+    )
+
+    result = scan_file(str(model_path), config={"cache_scan_results": False})
+
+    assert result.scanner_name == "jax_checkpoint"
+    assert result.success is False
+    assert result.metadata["scan_outcome"] == "inconclusive"
+    assert "jax_json_checkpoint_analysis_size_limit" in result.metadata["scan_outcome_reasons"]
 
 
 def test_scan_file_routes_raw_bin_without_zip_structure_to_pytorch_binary(tmp_path: Path) -> None:

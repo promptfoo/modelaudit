@@ -141,6 +141,20 @@ _XML_MODEL_ROOT_FORMATS = {
     "pmml": "pmml",
 }
 XML_MODEL_INCONCLUSIVE_FORMAT = "xml_model_inconclusive"
+JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES = 1024 * 1024
+JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES = 2 * JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES
+_JAX_JSON_CHECKPOINT_IDENTITY_KEYS = frozenset(
+    {"framework", "library", "backend", "serialization", "format", "type", "checkpoint_type"}
+)
+_JAX_JSON_CHECKPOINT_MARKER_KEYS = frozenset({"orbax_version", "__orbax_metadata__"})
+_JAX_JSON_CHECKPOINT_SCANNER_SUFFIXES = frozenset({".ckpt", ".checkpoint", ".orbax-checkpoint", ".pickle"})
+_JAX_JSON_CHECKPOINT_CONTENT_ROUTE_EXCLUDED_SUFFIXES = frozenset({".json", ".py", ".pyw"})
+_JAX_JSON_CHECKPOINT_DECLARED_SUFFIXES = frozenset(get_registered_scanner_extensions())
+_JAX_JSON_CHECKPOINT_IDENTITY_RE = re.compile(
+    r"(?<![a-z0-9])(?:jax|flax|haiku|orbax|jaxlib|arrayimpl|device_array)(?![a-z0-9])",
+    re.IGNORECASE,
+)
+_STRUCTURED_JSON_TRAILING_READ_BYTES = 64 * 1024
 FLAX_MSGPACK_STRUCTURE_READ_BYTES = 1024 * 1024
 _FLAX_MSGPACK_ROUTING_KEYS = frozenset({"params", "opt_state", "model_state"})
 _FLAX_MSGPACK_STATE_WRAPPER_KEY = "state"
@@ -1977,6 +1991,82 @@ def _detect_compression_format(prefix: bytes) -> str | None:
     return None
 
 
+def _could_start_json_object(prefix: bytes) -> bool:
+    """Return True when a bounded prefix begins a JSON object after whitespace/BOM."""
+    normalized_prefix = prefix.lstrip()
+    if normalized_prefix.startswith(b"\xef\xbb\xbf"):
+        normalized_prefix = normalized_prefix[3:].lstrip()
+    return normalized_prefix.startswith(b"{")
+
+
+def _has_jax_json_checkpoint_structure(payload: object) -> bool:
+    """Return whether parsed metadata explicitly identifies a JAX-family checkpoint."""
+    if not isinstance(payload, dict):
+        return False
+
+    if _JAX_JSON_CHECKPOINT_MARKER_KEYS & payload.keys():
+        return True
+
+    for key in _JAX_JSON_CHECKPOINT_IDENTITY_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and _JAX_JSON_CHECKPOINT_IDENTITY_RE.search(value):
+            return True
+    return False
+
+
+def _probe_jax_json_checkpoint_file(file_path: Path) -> bool | None:
+    """Return True for JAX JSON, None for bounded ambiguity, else False."""
+    try:
+        if not file_path.is_file():
+            return False
+        file_size = file_path.stat().st_size
+        with file_path.open("rb") as stream:
+            prefix = stream.read(min(file_size, JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES + 1))
+    except OSError:
+        return None
+
+    if not _could_start_json_object(prefix):
+        normalized_prefix = prefix.lstrip()
+        if normalized_prefix.startswith(b"\xef\xbb\xbf"):
+            normalized_prefix = normalized_prefix[3:].lstrip()
+        if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES and not normalized_prefix:
+            return None
+        return False
+
+    try:
+        payload = json.loads(prefix.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        if file_size > JAX_JSON_CHECKPOINT_ROUTING_READ_BYTES:
+            return None
+        return False
+    return _has_jax_json_checkpoint_structure(payload)
+
+
+def is_jax_json_checkpoint_file(path: str | Path) -> bool:
+    """Preserve confirmed and bounded-inconclusive JAX JSON candidates for scanning."""
+    return _probe_jax_json_checkpoint_file(Path(path)) is not False
+
+
+def _probe_content_routed_jax_json_checkpoint(file_path: Path) -> bool | None:
+    """Return the bounded JAX JSON probe state for content-routable suffixes."""
+    ext = file_path.suffix.lower()
+    if ext in _JAX_JSON_CHECKPOINT_CONTENT_ROUTE_EXCLUDED_SUFFIXES:
+        return False
+    if not (ext in _JAX_JSON_CHECKPOINT_SCANNER_SUFFIXES or ext not in _JAX_JSON_CHECKPOINT_DECLARED_SUFFIXES):
+        return False
+    return _probe_jax_json_checkpoint_file(file_path)
+
+
+def _is_confirmed_content_routed_jax_json_checkpoint(file_path: Path) -> bool:
+    """Return whether bounded routing positively identifies JAX JSON metadata."""
+    return _probe_content_routed_jax_json_checkpoint(file_path) is True
+
+
+def _could_be_content_routed_jax_json_checkpoint(file_path: Path) -> bool:
+    """Route JAX-owned or renamed JSON candidates without claiming foreign suffixes."""
+    return _probe_content_routed_jax_json_checkpoint(file_path) is not False
+
+
 class _MsgpackProbeInvalid(ValueError):
     """Raised when bounded MessagePack structure probing sees invalid data."""
 
@@ -2205,11 +2295,16 @@ def has_inconclusive_renamed_flax_msgpack_routing(path: str | Path) -> bool:
     file_path = Path(path)
     if file_path.suffix.lower() in _FLAX_MSGPACK_NATIVE_SUFFIXES:
         return False
+    try:
+        if _probe_complete_structured_json_document(file_path, file_path.stat().st_size) is None:
+            return True
+    except OSError:
+        return True
     return _probe_flax_msgpack_checkpoint_file(file_path) is None
 
 
-def _is_complete_structured_json_document(file_path: Path, file_size: int) -> bool:
-    """Keep complete renamed JSON documents within their structured routing path."""
+def _probe_complete_structured_json_document(file_path: Path, file_size: int) -> bool | None:
+    """Return whether bounded inspection proves a renamed JSON document complete."""
     read_size = min(file_size, MXNET_SYMBOL_SIGNATURE_READ_BYTES + 1)
     prefix = read_magic_bytes(str(file_path), read_size)
     normalized_prefix = prefix[len(_UTF8_BOM) :] if prefix.startswith(_UTF8_BOM) else prefix
@@ -2233,12 +2328,15 @@ def _is_complete_structured_json_document(file_path: Path, file_size: int) -> bo
     try:
         with file_path.open("rb") as stream:
             stream.seek(read_size)
-            while trailing_bytes := stream.read(_MXNET_SYMBOL_STREAM_CHUNK_BYTES):
-                if trailing_bytes.strip(b" \t\r\n"):
-                    return False
+            trailing_read_size = min(file_size - read_size, _STRUCTURED_JSON_TRAILING_READ_BYTES)
+            trailing_bytes = stream.read(trailing_read_size)
     except OSError:
+        return None
+    if len(trailing_bytes) != trailing_read_size:
+        return None
+    if trailing_bytes.strip(b" \t\r\n"):
         return False
-    return True
+    return True if read_size + trailing_read_size == file_size else None
 
 
 def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
@@ -2250,8 +2348,12 @@ def _could_be_content_routed_flax_msgpack(file_path: Path) -> bool:
         size = file_path.stat().st_size
     except OSError:
         return False
-    if ext not in _FLAX_MSGPACK_SCANNER_SUFFIXES and _is_complete_structured_json_document(file_path, size):
-        return False
+    if ext not in _FLAX_MSGPACK_SCANNER_SUFFIXES:
+        json_document_probe = _probe_complete_structured_json_document(file_path, size)
+        if json_document_probe is True:
+            return False
+        if json_document_probe is None:
+            return True
     if ext == "":
         xgboost_route = _detect_extensionless_xgboost_ubjson_route(
             read_magic_bytes(str(file_path), min(size, _XGBOOST_UBJSON_ROUTE_READ_BYTES))
@@ -2358,8 +2460,14 @@ def detect_format_from_magic_bytes(
         ):
             return "pickle"
 
+    if file_path is not None and _is_confirmed_content_routed_jax_json_checkpoint(file_path):
+        return "jax_checkpoint"
+
     if file_path is not None and _could_be_content_routed_flax_msgpack(file_path):
         return "flax_msgpack"
+
+    if file_path is not None and _could_be_content_routed_jax_json_checkpoint(file_path):
+        return "jax_checkpoint"
 
     return "unknown"
 
@@ -2526,9 +2634,8 @@ def detect_file_format_for_skip_filter(path: str) -> str:
     """Cheap content detection for skipped-extension preservation.
 
     This intentionally recognizes only content-derived format signals. It avoids
-    extension-based routing and uses one bounded prefix read for common skipped
-    files. Executable-header candidates may receive bounded Llamafile marker
-    prefix/tail probes so disguised executable payloads reach full scans.
+    extension-based routing and uses bounded content probes so disguised payloads
+    reach full scans without unbounded prefilter reads.
     """
     file_path = Path(path)
     if file_path.is_dir():
@@ -2748,8 +2855,14 @@ def detect_file_format(path: str) -> str:
     if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
 
+    if _is_confirmed_content_routed_jax_json_checkpoint(file_path):
+        return "jax_checkpoint"
+
     if ext in _FLAX_MSGPACK_SCANNER_SUFFIXES or _could_be_content_routed_flax_msgpack(file_path):
         return "flax_msgpack"
+
+    if _could_be_content_routed_jax_json_checkpoint(file_path):
+        return "jax_checkpoint"
 
     torch7_prefix = read_magic_bytes(path, _TORCH7_SIGNATURE_READ_BYTES)
     if _allows_renamed_binary_content_route(file_path) and _is_torch7_signature(torch7_prefix):
@@ -2967,7 +3080,7 @@ def validate_file_type_with_formats(path: str, header_format: str, ext_format: s
         # before doing the unknown header check
 
         # Pickle files can be stored in various ways
-        if ext_format == "pickle" and header_format in {"pickle", "zip"}:
+        if ext_format == "pickle" and header_format in {"pickle", "zip", "jax_checkpoint"}:
             return True
 
         # PyTorch binary files are flexible in format

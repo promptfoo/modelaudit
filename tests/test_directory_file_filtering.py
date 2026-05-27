@@ -16,6 +16,7 @@ import pytest
 from modelaudit.core import _is_huggingface_cache_file, determine_exit_code, scan_file, scan_model_directory_or_file
 from modelaudit.utils.file.detection import (
     FLAX_MSGPACK_STRUCTURE_READ_BYTES,
+    JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES,
     LLAMAFILE_ROUTE_SCAN_BYTES,
     LLAMAFILE_ROUTE_TAIL_SCAN_BYTES,
 )
@@ -243,6 +244,38 @@ class TestDirectoryFileFiltering:
 
         assert results["files_scanned"] == 1
         assert any("payload.jpg" in (issue.location or "") for issue in results.issues)
+
+    def test_disguised_malicious_jax_json_checkpoint_is_scanned_without_ajax_near_match(self, tmp_path: Path) -> None:
+        """Directory scans should preserve JAX metadata content but not `ajax` lookalikes."""
+        payload = "jax.experimental.host_callback.call(os.system, 'id')"
+        (tmp_path / "payload.jpg").write_text(
+            (" " * 1024) + json.dumps({"framework": "jax", "payload": payload}),
+            encoding="utf-8",
+        )
+        (tmp_path / "ajax.jpg").write_text(
+            json.dumps({"framework": "ajax", "payload": payload}),
+            encoding="utf-8",
+        )
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "jax_checkpoint" in results.scanner_names
+        assert determine_exit_code(results) == 1
+        assert any(issue.message.startswith("Suspicious pattern in JSON checkpoint") for issue in results.issues)
+
+    def test_oversized_disguised_jax_json_checkpoint_fails_closed_after_late_identity(self, tmp_path: Path) -> None:
+        """Directory filtering should preserve bounded JAX identity routing for large JSON."""
+        padding = "x" * (JAX_JSON_CHECKPOINT_STRUCTURE_READ_BYTES + 16)
+        (tmp_path / "payload.jpg").write_text(json.dumps({"padding": padding, "framework": "jax"}), encoding="utf-8")
+        (tmp_path / "ajax.jpg").write_text(json.dumps({"padding": padding, "framework": "ajax"}), encoding="utf-8")
+
+        results = scan_model_directory_or_file(str(tmp_path))
+
+        assert results["files_scanned"] == 1
+        assert "jax_checkpoint" in results.scanner_names
+        assert results.success is False
+        assert determine_exit_code(results) == 2
 
     def test_large_disguised_malicious_flax_msgpack_with_later_root_is_scanned(self, tmp_path: Path) -> None:
         """Directory scans should preserve renamed MessagePack checkpoints for Flax analysis."""
